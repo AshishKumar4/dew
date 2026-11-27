@@ -52,27 +52,27 @@ def _template(state):
 
 
 def _read(written: dict, restored: dict) -> dict:
-    """Whether each packed matrix `restored` holds is `written`'s: its type and form, and every shard this
-    process holds of its leaves, bit for bit (a process holding none of a matrix reads none of it)."""
+    """Whether each packed matrix `restored` holds is `written`'s: its type and form, each leaf's shape and
+    dtype, and the bytes of every shard this process holds of it (a process holding none of a matrix reads
+    none of it)."""
     import jax
 
-    def own(tree) -> list[np.ndarray]:
-        return [np.asarray(shard.data) for leaf in jax.tree.leaves(tree) for shard in leaf.addressable_shards]
+    def own(tree) -> list[tuple]:
+        return [(leaf.shape, leaf.dtype, [np.asarray(held.data).tobytes() for held in leaf.addressable_shards])
+                for leaf in jax.tree.leaves(tree)]
 
     return {name: type(restored[name]) is type(matrix) and restored[name].form == matrix.form
-            and len(own(matrix)) == len(own(restored[name]))
-            and all(np.array_equal(left, right) for left, right in zip(own(matrix), own(restored[name]),
-                                                                        strict=True))
-            for name, matrix in written.items()}
+            and own(matrix) == own(restored[name]) for name, matrix in written.items()}
 
 
 def local_packed(args, *, lost: bool = False) -> dict:
     """A pool's train state holding a frozen quantized collection beside its own (its packed matrices
     placed whole on the run's mesh, so each process holds a replica of every shard), saved on the local tier
     alone (`Checkpoints.save_local`) and restored into its template: each packed matrix as written on every
-    process. Where `lost`, process 1's local copy is gone before the restore, as a replaced host's is: its
-    matrices come from process 0's replica. Then a step whose window is under another encoder's form,
-    refused as every process reads it (`process_support.refusal`)."""
+    process. Then a step whose window is under another encoder's form, refused as every process reads it
+    (`process_support.refusal`). Where `lost`, process 1's local copy of each step is gone before its
+    restore, as a replaced host's is: its records, the foreign digest too, come from process 0's
+    replica."""
     import shutil
 
     import jax
@@ -89,30 +89,31 @@ def local_packed(args, *, lost: bool = False) -> dict:
         assert made is not None
         return made
 
+    def saved(step: int, held: dict):
+        # Saved on the local tier alone; where `lost`, process 1's copy then gone, as a replaced host's is,
+        # so its restore reads process 0's replica (`Checkpoints._recovered`).
+        written = dataclasses.replace(placed, step=placed.step + step,
+                                      variables={**placed.variables, QUANTIZATION: held})
+        writer = checkpoints_of()
+        writer.save_local(step, written, None)
+        writer.wait()
+        if lost:
+            if jax.process_index() == 1:
+                shutil.rmtree(Path(args.local_dir) / "process1")
+            multihost_utils.sync_global_devices(f"local copy {step} lost")
+        return written
+
     trainer = build_trainer(args.name, args.run_dir, args.fsdp_size, local_dir=args.local_dir, local_every=1)
-    checkpoints = trainer.checkpoints
-    assert checkpoints is not None
     placed, _, _ = trainer.place()
     packed = _packed(NamedSharding(trainer.device_mesh, PartitionSpec()))
-    state = dataclasses.replace(placed, step=placed.step + 1,
-                                variables={**placed.variables, QUANTIZATION: packed})
-    checkpoints.save_local(1, state, None)
-    checkpoints.wait()
-    if lost:
-        if jax.process_index() == 1:
-            shutil.rmtree(Path(args.local_dir) / "process1")
-        multihost_utils.sync_global_devices("local copy lost")
-        checkpoints = checkpoints_of()
+    state = saved(1, packed)
     try:
-        restored, _ = checkpoints.restore(_template(state), 1)
+        restored, _ = checkpoints_of().restore(_template(state), 1)
     except (ValueError, PeerFailure) as error:
         # Its message beside the refusal's type: a failing assertion shows what refused the read.
         return {"read": {**refusal(error), "message": str(error)}, "foreign": None}
     read = _read(packed, restored.variables[QUANTIZATION])
-    foreign = dataclasses.replace(state, step=state.step + 1,
-                                  variables={**placed.variables, QUANTIZATION: _foreign(packed)})
-    checkpoints.save_local(2, foreign, None)
-    checkpoints.wait()
+    saved(2, _foreign(packed))
     try:
         checkpoints_of().restore(_template(state), 2)
     except (ValueError, PeerFailure) as error:
@@ -135,24 +136,24 @@ def stage_packed(args) -> dict:
     from jax.sharding import NamedSharding, PartitionSpec
     from multiprocess_worker import pipeline_trainer
 
+    from stage_save_worker import paired_devices
+
     from dew._coordination import PeerFailure
     from dew.checkpoints import Checkpoints, _Laid
     from dew.quantization import QUANTIZATION
     from dew.training import MeshSpec
     from dew.training.stages import stage_mesh
 
-    paired = [device for pair in zip(*(sorted((device for device in jax.devices()
-                                                if device.process_index == rank), key=lambda d: d.id)
-                                               for rank in range(jax.process_count())), strict=True)
-              for device in pair]
+    paired = paired_devices()
     trainer = pipeline_trainer(2, 2, 2)
     trainer.device_mesh = MeshSpec(fsdp=2, stage=2).build(paired)
     placed, _, _ = trainer.place()
     packed = _packed(NamedSharding(stage_mesh(trainer.device_mesh, 1), PartitionSpec()))
-    # The pipeline's own seams: its rows saved held apart, and read onto its stages' devices.
-    staging, laid = trainer._staging, _Laid(held_apart=True)
-    own = dataclasses.replace(placed, variables={**placed.variables, QUANTIZATION: packed})
-    template = staging.state(_template(own), staging.checkpointed)
+    # The pipeline's own seams (a run's checkpoint envelope's and its resume's): its rows saved held apart
+    # where its staging holds them so, and restored onto its stages' devices and restacked there.
+    staging = trainer._staging
+    laid, template = _Laid(held_apart=staging.apart), _template(
+        dataclasses.replace(placed, variables={**placed.variables, QUANTIZATION: packed}))
     reports = {}
     for step, held in ((1, packed), (2, _foreign(packed))):
         # The state a step left, which the step it is saved under names (`_filled`).
@@ -163,7 +164,7 @@ def stage_packed(args) -> dict:
         checkpoints.save(step, staging.saved(state), _laid=laid)
         checkpoints.wait()
         try:
-            restored, _ = Checkpoints(str(directory)).restore(template, step)
+            restored, _ = staging.restore(Checkpoints(str(directory)), template, step)
         except (ValueError, PeerFailure) as error:
             # Its message beside the refusal's type: a failing assertion shows what refused the read.
             reports[step] = refusal(error) if step == 2 else {**refusal(error), "message": str(error)}

@@ -34,10 +34,7 @@ def mode_stage_save(args) -> dict:
 
     from test_stage_local import ADAM, decoder, stream, trainer
 
-    paired = [device for pair in zip(*(sorted((device for device in jax.devices()
-                                                if device.process_index == rank), key=lambda d: d.id)
-                                               for rank in range(jax.process_count())), strict=True)
-              for device in pair]
+    paired = paired_devices()
     mesh = MeshSpec(fsdp=2, stage=2)
     staged_values, refused = _handled(mesh.build(paired), args.run_dir)
     persistent = Checkpoints(str(args.run_dir))
@@ -58,6 +55,18 @@ def mode_stage_save(args) -> dict:
     return {"process_index": jax.process_index(), "finite": read, "steps": steps, "handled": staged_values,
             "refused": refused, "stray_refused": _stray(mesh.build(paired), args.run_dir),
             "lost": _lost(paired, args.run_dir, args.local_dir)}
+
+
+def paired_devices() -> list:
+    """The pool's devices interleaved one of each process's at a time (each process's sorted by id), so a
+    mesh whose last axis is the stage axis pairs one of each process's: its stages each one process's
+    devices alone."""
+    import jax
+
+    return [device for pair in zip(*(sorted((device for device in jax.devices()
+                                             if device.process_index == rank), key=lambda d: d.id)
+                                     for rank in range(jax.process_count())), strict=True)
+            for device in pair]
 
 
 def _lost(paired, run_dir, local_dir) -> list[int]:
