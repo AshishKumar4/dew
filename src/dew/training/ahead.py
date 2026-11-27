@@ -803,7 +803,7 @@ def _saved[Saved: (AheadOfTime, AheadPrograms)](path: str | Path, kind: type[Sav
     return loaded
 
 
-def _same_fields(path: str | Path, loaded: object, what: str) -> None:
+def _same_fields(path: str | Path, loaded: AheadOfTime | AheadPrograms | AheadProgram, what: str) -> None:
     """Refuse `loaded`, a dataclass a pickle restored, where the Dew that saved it held other fields than this
     one's: fewer, as a pickle restores those it held alone and a field's class default would stand in for what
     it never said (rows 8459, 8759), or more, which this Dew reads otherwise (a step's program fingerprinted
