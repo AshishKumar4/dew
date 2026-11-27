@@ -57,7 +57,13 @@ def test_a_frontier_keeps_the_plan_its_search_admits_in_two_compiles(tmp_path, m
     _, alone = planned(limit)
     monkeypatch.setenv("DEW_RUNG_RECORDS", str(tmp_path / "rungs"))
     trainer, plan = planned(limit, frontier=True)
-    assert [probe["fits"] for probe in probed(plan)] == [False, True], plan["probes"]
+    probes = probed(plan)
+    assert [probe["fits"] for probe in probes] == [False, True], plan["probes"]
+    # The second compile the jump's, not a fallback climb's: the jump names its rung and split.
+    jump = record(plan["jump"], "jump")
+    assert jump["jumped"] is True and jump["split"] == probes[1]["split"], jump
+    named = {name: value for name, value in record(jump["rung"], "rung").items() if name in RUNG}
+    assert "remat" in named and named == {name: probes[1][name] for name in named}, (jump, probes[1])
     assert {name: plan[name] for name in RUNG} == {name: alone[name] for name in RUNG}
     assert held_at(trainer, plan)
     lighter = listed(plan["lighter"], "lighter", read=record, what="lighter")
