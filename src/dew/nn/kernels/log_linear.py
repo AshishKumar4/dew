@@ -9,15 +9,21 @@ highest bit in which they differ: the bucket `[l` with its low `j` bits cleared,
 cleared`)` at level `j`), `lambda` a token's level weights `[levels]`. Grouped keys serve `H / G` value heads
 each; packed documents each count positions from their first token and see their own keys alone.
 
-An orchestrator over the recurrence and a blocked attention (kernel-templates.md, Table 3 and Appendix B):
-the pairs within a `WITHIN`-aligned block of a document's positions (levels zero to `log2 WITHIN`) are one
-masked attention over each block, each pair at its query's weight of its level (`_within`); level `j` above
-is the decayed linear recurrence (`recurrence_chunk.chunk`, a decay a head, no delta rule) over the keys in
-the left half of each `2^j`-aligned block, its memory reset where each block starts, read by the queries in
-the right half at their weight `lambda[j]`. Each level above is one linear pass over the sequence, where a
-masked attention over every query and key took `T^2` of each array (a 4096-token call's scores alone 64 MiB
-in fp32); a level within, as a recurrence, laid each of its blocks as a chunk of its own, level one's
-2-token blocks 32 times its tokens in 64-token chunks (row 1446)."""
+An orchestrator over a blocked attention and the levels' memories (kernel-templates.md, Table 3 and Appendix
+B): the pairs within a `WITHIN`-aligned block of a document's positions (levels zero to `log2 WITHIN`) are one
+masked attention over each block, each pair at its query's weight of its level (`_within`); at level `j`
+above, the keys in the left half of each `2^j`-aligned block write a memory that only the queries in its
+right half read, at their weight `lambda[j]`. A bf16 call in the fast forms that packs no document takes
+fla's chunked arithmetic (`_fla_levels`): a block's memory the left half's keys against its values decayed
+to the half's end, one product a block, and its reads the right half's weighed queries against it decayed
+from there, one more (`_levels_above`), no pair within a half and no walk of memories, which the recurrence
+(`recurrence_chunk.chunk`, a decay a head, no delta rule, its memory reset at each block) spent its scores
+and walks on, 896 us of a GH200's 2008 us forward against fla's 712 whole, its documents' layout 221 more
+(M-JS-287). Any other call, and packed documents, whose blocks do not align to the row, take the
+recurrence a level. Each level above is one linear pass over the sequence, where a masked attention over
+every query and key took `T^2` of each array (a 4096-token call's scores alone 64 MiB in fp32); a level
+within, as a recurrence, laid each of its blocks as a chunk of its own, level one's 2-token blocks 32 times
+its tokens in 64-token chunks (row 1446)."""
 
 from __future__ import annotations
 
@@ -28,7 +34,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from dew.algebra import scan
-from dew.nn.kernels import generation, recurrence
+from dew.nn.kernels import generation, recurrence, selection
 from dew.nn.kernels.recurrence_chunk import Chunk, chunk
 from dew.nn.precision import at_least_fp32
 
@@ -48,9 +54,11 @@ def log_linear_attention(query, key, value, g, level_scales, *, scale: float | N
     `level_scales` `[B, T, H, levels(T)]` each query's weight of each level, `scale` `N ** -0.5` where None,
     `starts` `[B, T]` each packed document's first token, at most `max_segments` a row (every token where
     None): the output `[B, T, H, P]` in the operands' dtype, computed in at least fp32: the levels within a
-    `WITHIN` block one masked attention, a recurrence a level above, level `j`'s at most `ceil(T / 2^j)`
-    blocks a row past its documents (`chunk`'s `max_segments`, which a kernel laying each from a chunk's edge
-    sizes its layout by)."""
+    `WITHIN` block one masked attention, the levels above two products a block where a bf16 call in the fast
+    forms packs no document (`_fla_levels`, fla's chunked arithmetic), else a recurrence a level (the
+    portable recurrence's range, fp32's, fp16's and the accurate forms' among them), level `j`'s at most
+    `ceil(T / 2^j)` blocks a row past its documents (`chunk`'s `max_segments`, which a kernel laying each
+    from a chunk's edge sizes its layout by)."""
     dtype = jnp.result_type(query, key, value)
     work = at_least_fp32(dtype)
     rows, length, _, width = query.shape
@@ -62,7 +70,13 @@ def log_linear_attention(query, key, value, g, level_scales, *, scale: float | N
     # Each token's position in its document, which its levels' blocks align to.
     positions = tokens - first
     documents = 1 if starts is None else length if max_segments is None else max_segments
-    out = _within(q, k, v, g, weights, positions, scale=scale, documents=documents, packed=starts is not None)
+    # fla's chunked form scales the within and the levels' reads once, summed (its `b_o * SCALE`): scaled
+    # apart, a pair of them cancelling read infinity less infinity.
+    fla = starts is None and _fla_levels(dtype)
+    out = _within(q, k, v, g, weights, positions, scale=1.0 if fla else scale, documents=documents,
+                  packed=starts is not None)
+    if fla:
+        return (scale * _levels_above(query, key, value, g, weights, within=out)).astype(dtype)
     hooks = recurrence.Hooks(decay='scalar', delta=False, scale=scale)
     for level in range(WITHIN.bit_length(), levels(length)):
         half = 1 << (level - 1)
@@ -77,6 +91,129 @@ def log_linear_attention(query, key, value, g, level_scales, *, scale: float | N
                         max_segments=blocks, dtype=work)
         out = out + read * jnp.where(left[..., None], 0.0, weights[..., level])[..., None]
     return out.astype(dtype)
+
+
+def _fla_levels(dtype) -> bool:
+    """Whether a call's levels above `WITHIN` take fla's chunked arithmetic (`_levels_above`): a bf16 call in
+    the fast forms (`generation.numerics`), fast by default and accurate one option away
+    (docs/design/testing.md). Its range is fla's chunked form's and no more (a bf16 query of 2^127 at a
+    weight past 1 reads infinity there as in fla's); every other call, fp32's, fp16's (whose range a reader
+    or a memory rounded to it leaves) and any in the accurate forms, takes the recurrence a level, the
+    portable recurrence's range: a values' decay applied to its memory, not to each value before its key
+    (a key of 2^100 under three decays of -40 kept, where `e^-120` on its unit value rounded to zero). A
+    call within `generation.chosen` naming the recurrence's kernel (`gated_delta_rule`) takes that kernel a
+    level, as an A/B of its kernels asks (tools/benchmark_recurrence.py's `mosaic` and `xla` arms)."""
+    return (jnp.dtype(dtype) == jnp.bfloat16 and generation.numerics().forms != 'accurate'
+            and selection.forced(generation.Choice.GATED_DELTA_RULE) is None)
+
+
+def _levels_above(query, key, value, g, weights, *, within):
+    """The levels above `WITHIN` of an unpacked bf16 call in the fast forms (`_fla_levels`;
+    `log_linear_attention`'s operands, `g` and `weights` in fp32) added to `within` (the levels within a
+    chunk's reads, unscaled) a level at a time from the lowest, as fla's `b_o` sums them (a pair cancelling
+    within and at level 7 read beside level 8's where the levels summed first overflowed), `[B, T, H, P]`
+    fp32 before the scale, as
+    fla's chunked form computes them (fla/ops/log_linear_attn/chunk.py at 413ad2c), at its chunks' bounds
+    and roundings: each 64-token chunk's memory its keys against its values decayed to the chunk's end and
+    rounded to bf16 (`b_v`), one product a chunk, in fp32; a `2^j` block's memory its two halves' joined, the
+    left's decayed across the right in fp32 (fla's `kv *= exp(b_g_last)`, `kv += kv`), level by level; and
+    at level `j`, each 64-token chunk of a block's right half reading its left half's memory decayed in fp32
+    to that chunk's start and rounded once (`kv.to(b_q.dtype)`), each query times its level weight rounded
+    (`b_l * b_q`), the read decayed within its chunk after its product, the products the tensor cores' over
+    fp32 sums, the scale the caller's at the output (`SCALE`); a row padded to whole top-level blocks with
+    tokens no output keeps. Each chunk's decays are its own compensated sums (`_half_decays`), applied as a
+    decay a value takes alone (`scan.scaled_exp`), a value through a vanished one zero and a read through
+    one selected out. A level-8 write of `2^-60` under a key of `2^100`, decayed by `e^-80` across the next
+    chunk, is kept as fla keeps it, where its whole decay on the value before its key rounded to zero."""
+    length, groups, heads, columns = query.shape[1], query.shape[2], *value.shape[2:]
+    top = levels(length) - 1
+    if top < WITHIN.bit_length():
+        return within
+    padded = -(-length // (1 << top)) * (1 << top)
+
+    def chunked(x):
+        x = jnp.pad(x, [(0, 0), (0, padded - length), *[(0, 0)] * (x.ndim - 2)])
+        return x.reshape(x.shape[0], padded // WITHIN, WITHIN, *x.shape[2:])
+
+    def by_head(x):
+        # A head axis's value heads beside their key head's: `[..., G, E]`.
+        return x.reshape(*x.shape[:-1], groups, heads // groups)
+
+    decays = chunked(g)
+    to_end, past = _half_decays(decays, to_end=True)
+    entered, crossed = _half_decays(decays, to_end=False)
+    written = scan.scaled_exp(chunked(value).astype(g.dtype), jnp.where(past, -jnp.inf, to_end)[..., None])
+    written = written.astype(value.dtype).reshape(*written.shape[:3], groups, -1, columns)
+    memory = jnp.einsum('bmtgk,bmtgep->bmgkep', chunked(key), written, preferred_element_type=jnp.float32)
+    # Each chunk's whole decay, -inf through a vanished token, and whether it holds one.
+    cut = crossed[:, :, -1]
+    chunk_whole = jnp.where(cut, -jnp.inf, entered[:, :, -1])
+    whole = chunk_whole
+    queries, chunk_weights = chunked(query), chunked(weights)
+    out = within
+    for level in range(WITHIN.bit_length(), top + 1):
+        # The pyramid at the level's half blocks of `chunks` chunks: `memory` `[B, 2 n, G, K, E, P]`, `whole`
+        # `[B, 2 n, H]`.
+        chunks = 1 << (level - WITHIN.bit_length())
+
+        def halves(x, chunks=chunks):
+            return x.reshape(x.shape[0], -1, 2, chunks, *x.shape[2:])
+
+        # Each right-half chunk's decay from the half's start to its own start, and whether a vanished
+        # token before it cuts it.
+        right, cuts = halves(chunk_whole)[:, :, 1], halves(cut)[:, :, 1]
+        # The sums before each chunk, shifted a chunk: no -inf less itself (NaN), no large sum less a term.
+        before = jnp.concatenate([jnp.zeros_like(right[:, :, :1]), jnp.cumsum(right, axis=2)[:, :, :-1]], 2)
+        severed = jnp.cumsum(cuts, axis=2) - cuts > 0
+        local, inside = halves(entered)[:, :, 1], halves(crossed)[:, :, 1]
+        # A read through a vanished decay, within its chunk or before it in its half, discarded: its reader
+        # zeroed before its product and its read before its decay and after, as the recurrence selects one
+        # out. Masked after the product alone, an overflowed reader's pullback was `0 * inf` (dk, dv at a
+        # query of 2^127 weighed 2 severed by -1000), an overflowed read's decay's derivative too (dg at
+        # 2^70 by 2^70).
+        vanished = inside | severed[..., None, :]
+        # A chunk whose every read is discarded (severed before it, or its first token vanished): its held
+        # memory zero, its decay's operands too, so no pullback meets an overflowed memory's `0 * inf`.
+        emptied = by_head(severed | inside[..., 0, :])[..., None, :, None]
+        start = by_head(before)[..., None, :, None]
+        held = scan.scaled_exp(jnp.where(emptied, 0.0, memory[:, 0::2, None]), jnp.where(emptied, 0.0, start))
+        held = jnp.where(emptied, 0.0, held).astype(value.dtype)
+        weight = by_head(halves(chunk_weights[..., level])[:, :, 1])
+        readers = halves(queries)[:, :, 1][..., None, :].astype(g.dtype) * weight[..., None]
+        readers = jnp.where(by_head(vanished)[..., None], 0.0, readers).astype(query.dtype)
+        read = jnp.einsum('bnrtgek,bnrgkep->bnrtgep', readers, held, preferred_element_type=jnp.float32)
+        read = read.reshape(*read.shape[:4], heads, columns)
+        decayed = scan.scaled_exp(jnp.where(vanished[..., None], 0.0, read),
+                                  jnp.where(vanished, 0.0, local)[..., None])
+        read = jnp.where(vanished[..., None], 0.0, decayed)
+        laid = jnp.stack([jnp.zeros_like(read), read], axis=2)
+        out = out + laid.reshape(laid.shape[0], -1, heads, columns)[:, :length]
+        # The next level's half blocks: two of these joined, the left decayed across the right, zero where a
+        # vanished token in the right cuts it (an overflowed left memory times its zero decay was NaN, a
+        # level-8 read at token 128 of 2^70 by 2^70 cut by -1000 at token 64).
+        across = by_head(whole[:, 1::2])[:, :, :, None, :, None]
+        gone = jnp.isneginf(across)
+        joined = scan.scaled_exp(jnp.where(gone, 0.0, memory[:, 0::2]), jnp.where(gone, 0.0, across))
+        memory, whole = jnp.where(gone, 0.0, joined) + memory[:, 1::2], whole[:, 0::2] + whole[:, 1::2]
+    return out
+
+
+def _half_decays(exponents, *, to_end: bool):
+    """Each token's decay exponent within its half `exponents` `[B, blocks, half, H]` (natural units) and
+    whether its span reaches a vanished token (`scan.vanished`): from the half's first token through it, or
+    with `to_end` from after it through the half's last; a compensated sum (`scan.compensated`) of the
+    half's live exponents, so no span's sum holds a vanished token's (a -2**70 rounds a later -1 away)."""
+    live, cut = scan.vanished(exponents)
+    if to_end:
+        high, low = scan.compensated(live, axis=2, reverse=True)
+        # From after each token: the next token's suffix, the last's empty.
+        high, low, cut = (jnp.concatenate([x[:, :, 1:], jnp.zeros_like(x[:, :, :1])], axis=2)
+                          for x in (high, low, cut))
+        crossed = jnp.flip(jnp.cumsum(jnp.flip(cut, 2), axis=2), 2) > 0
+    else:
+        high, low = scan.compensated(live, axis=2)
+        crossed = jnp.cumsum(cut, axis=2) > 0
+    return high + low, crossed
 
 
 def _levels(count: int) -> np.ndarray:

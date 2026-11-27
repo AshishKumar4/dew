@@ -2029,7 +2029,7 @@ def test_a_large_write_through_a_later_walks_gates_is_kept_by_the_merge(side, de
     """Two-sided GLA's tokens walked in two halves, a large write the first's last token and three gates on
     its key's or its value's side the second's first (`isolated_draw`, `DEPTHS`), merged: the final state on
     par with the token scan's from float64 (check 1), the later walk's decay applied as normal factors in
-    turn (`scan._scaled_exp`), where a floor at the vanished exponent (-105) zeroed `e^-120` (row 9660) and
+    turn (`scan.scaled_exp`), where a floor at the vanished exponent (-105) zeroed `e^-120` (row 9660) and
     two factors' second past their reach (`e^-175.125`) was subnormal and flushed to zero."""
     forms = scan.derive_scan(TWO_SIDED_FORMS, saturation=SATURATION)
     half = TOKENS // CHUNK // 2
