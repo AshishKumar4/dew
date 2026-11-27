@@ -114,13 +114,15 @@ class _MultiscaleProjection(nn.Module):
 def linear_attention(query: jax.Array, key: jax.Array, value: jax.Array) -> jax.Array:
     """ReLU linear attention over `[batch, positions, heads, width]` queries and keys past their ReLU
     (`SanaMultiscaleLinearAttention.apply_linear_attention`): each query's product with the keys'
-    value-weighted sum, over its product with the keys' sum. Its sums over the positions, the values' and
-    keys' products and, backward, the cotangents' and queries', are each taken in groups met by a
-    compensated sum, `_FEWEST_GROUPS` of them or groups of `_GROUP_POSITIONS` where there are more: one
-    float32 sum over the positions left the queries', keys' and values' gradients 1.6-2x Diffusers' error
-    from float64 at 96 to 4096 positions, as did 4 groups at 4096 and either sum alone grouped (check 1,
-    row 13524). Each sum stages its groups' `[heads, width + 1, width]` products: past 4096 positions
-    about an eighth of the queries' size at a 32-wide head, below it sixteen products."""
+    value-weighted sum, over its product with the keys' sum. Its sums over the positions are each taken
+    in groups of at most `_GROUP_POSITIONS` (`_FEWEST_GROUPS` of them, or `ceil(N / 256)` where there are
+    more), zero-padded to a whole count: the values' and keys' products summed per group and joined by a
+    compensated sum, and, backward, the cotangents' and queries' per group and joined as `broadcast_summed`'s
+    transpose joins a spread (`precision.spread`'s blocked sums on a CPU). One float32 sum over the
+    positions left the queries', keys' and values' gradients 1.5-2x Diffusers' error from float64 at 96 to
+    16384 positions, as did 4 groups at 4096 and either sum alone grouped (check 1, row 13524). Each sum
+    stages its groups' `[heads, width + 1, width]` products: past 4096 positions about an eighth of the
+    queries' size at a 32-wide head, below it sixteen products."""
     batch, positions, heads, width = key.shape
     value = jnp.concatenate([value, jnp.ones_like(value[..., :1])], axis=-1)
     groups = max(_FEWEST_GROUPS, -(-positions // _GROUP_POSITIONS))

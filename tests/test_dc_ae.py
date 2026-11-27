@@ -222,12 +222,13 @@ def test_a_level_without_blocks_resamples_nothing_and_the_factor_counts_it():
     assert model.apply(variables, latent, method=DCAE.decode).shape == image.shape
 
 
-def test_the_linear_attention_and_its_gradients_are_on_par_with_diffusers():
+def test_the_linear_attention_and_its_gradients_are_on_par_with_diffusers(monkeypatch):
     """DC-AE's ReLU linear attention (`linear_attention`) over 1024 positions of four 32-wide heads, a
     released DC-AE's head width, and its queries', keys' and values' gradients, check 1 against Diffusers'
     `apply_linear_attention` in float32, the truth its float64 run. The queries and keys keep two channels
     positive, so every normalizer sums its positions, the rest drawn on both sides of the ReLU off its
-    kink (row 13524: one float32 sum over the positions left the gradients 1.6-2x Diffusers' error)."""
+    kink (row 13524: one float32 sum over the positions left the gradients 1.5-2x Diffusers' error). Its
+    CPU arithmetic a library process's, float32 products summed in float32, not the suite's wide sums."""
     import torch
     from arm_forms import as_given
     from diffusers.models.attention_processor import SanaMultiscaleLinearAttention
@@ -235,6 +236,9 @@ def test_the_linear_attention_and_its_gradients_are_on_par_with_diffusers():
 
     from _dew_torch.precision import float64
     from dew.nn.autoencoders.dc_ae import linear_attention
+    from dew.nn.precision import WIDE_CPU_ARITHMETIC
+
+    monkeypatch.delenv(WIDE_CPU_ARITHMETIC, raising=False)
 
     positions, heads, width = 1024, 4, 32
     attention = SanaMultiscaleLinearAttention(heads * width, heads * width, attention_head_dim=width).eval()
