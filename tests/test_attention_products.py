@@ -135,17 +135,21 @@ def test_banded_products_are_on_par_on_the_mosaic_mainloop_interpreted(device, f
         (placeholder,) * 2, (placeholder,) * 2, placeholder, spans, combine)
 
     def layout(q1, q2, k1, k2, value):
-        return attention_products.selected((q1, q2), (k1, k2), value, spans, combine)[:3]
+        # The keys' and the value's copies wide, their gradients summed unrounded (`attend`'s).
+        wide = [k.astype(jnp.float32) for k in (k1, k2)]
+        return attention_products.selected((q1, q2), wide, value.astype(jnp.float32), spans, combine)[:3]
 
     def ours(q1, q2, k1, k2, value, dout):
-        (query, key, values), pull = jax.vjp(layout, q1, q2, k1, k2, value)
+        (query, wide_key, wide_values), pull = jax.vjp(layout, q1, q2, k1, k2, value)
+        key, values = wide_key.astype(value.dtype), wide_values.astype(value.dtype)
         with generation.assumed(device, interpreted=True):
             out, *residuals = attention_mosaic.forward(query, key, values, chosen, hooks, scale=SCALE,
                                                        natural=natural, residuals=template.Kept.SPLIT,
                                                        interpret=True)
             grads = attention_mosaic.backward(query, key, values, chosen, hooks, dout, residuals=residuals,
-                                              scale=SCALE, natural=natural, accurate=accurate, interpret=True)
-        return out, *pull((grads.query, grads.key, grads.value))
+                                              scale=SCALE, natural=natural, accurate=accurate, interpret=True,
+                                              rounded=False)
+        return out, *pull((grads.query.astype(query.dtype), grads.key, grads.value))
 
     assert_as_exact(jax.jit(ours), jax.jit(with_gradients(_banded_reference(spans, combine.bands))), _draw(2),
                     f"banded products on the Mosaic mainloop {device} {form}", seeds=SEEDS)

@@ -1284,7 +1284,8 @@ class MosaicForward(_Mainloop[Tiles]):
                                           else (self.query_mod, self.query_kinds, self.query_dtypes)),
                                 prescaled=spec.prescale != 1.0, rewalk_prescaled=taken != 1.0,
                                 out_dtype=self.out_dtype,
-                                has_output_mod=self.output_mod is not None)
+                                output=(None if self.output_mod is None
+                                        else (self.output_mod, self.output_kinds, self.output_dtypes)))
 
     def refusal(self, ba: tokamax.BoundArguments, family: mosaic.Family) -> Refusal | None:
         query, value = ba.arguments["query"], ba.arguments["value"]
