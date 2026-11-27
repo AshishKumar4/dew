@@ -88,8 +88,10 @@ def ternary_weight_product(lhs: jax.Array, weights: TernaryWeights, group_sizes:
                         None, None, None, out_dtype="float32", trans_rhs=False, interpret=interpret_on_cpu,
                         dense=dense, exact_sums=False)
     with xla_products.interpreted_context(interpret_on_cpu):
+        # Whole as its launch reads its operands, the rows and the words: the scale multiplies its product
+        # after it (`factored`), placed as it is (train 1407's review).
         case = gemm.WordPackedCase(functools.partial(gemm._planned, launch, bound),
-                                   launched_whole(lhs, weights, group_sizes))
+                                   launched_whole(lhs, words, sizes))
         mosaic = selection.select(TERNARY_WEIGHT, case).kernel == "mosaic"
     if mosaic:
         one = jnp.ones((), jnp.float32)
