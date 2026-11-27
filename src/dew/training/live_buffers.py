@@ -37,6 +37,7 @@ from typing import Any
 import jax
 
 from dew.telemetry import hlo
+from dew.telemetry.instrumentation import call_scratch, custom_call_kind
 
 
 @dataclasses.dataclass(frozen=True)
@@ -237,7 +238,10 @@ class Assignment:
         if shape.tuple_shapes:
             return None
         metadata = instruction.metadata
-        named = instruction.frontend_attributes.map.get("checkpoint_name")
+        # The defining instruction's name, where it names the element defined (`_names_output`): a tuple
+        # call's names its result alone, an unknown call's none of its elements.
+        named = (instruction.frontend_attributes.map.get("checkpoint_name")
+                 if _names_output(instruction, index) else None)
         written = None if named else _aliased_named(self.aliases.get(buffer.id, ()), self.instructions,
                                                      self.computations)
         if written is not None:
@@ -313,18 +317,11 @@ def _maker(instruction, index: tuple[int, ...], instructions,
             return made, index, getter
 
 
-_SCRATCHED = frozenset(("__cublas$gemm", "__cublas$lt$matmul", "__cublas$lt$matmul$f8",
-                        "__cublas$lt$matmul$mx", "__cublas$lt$groupedMatmul", "__cublas$triangularSolve"))
-"""The cuBLAS calls of the pinned XLA (xla/service/gpu/cublas_cudnn.h), each a tuple of its result first and
-its scratch last (the gemm rewriter's workspace, `triangular_solve_rewriter.cc`'s temp bytes), the call
-carrying the frontend attributes of the instruction it replaced; a call of any other target lays out no such
-tuple."""
-
-
 def _cublas(maker) -> bool:
-    """Whether `maker` is a cuBLAS call of the pinned XLA (`_SCRATCHED`), its result leading its tuple and its
-    scratch last."""
-    return maker.opcode == "custom-call" and maker.custom_call_target in _SCRATCHED
+    """Whether `maker` is a custom call whose output is its result first and its scratch last (every cuBLAS
+    call of the pinned XLA: `dew.telemetry.instrumentation.call_scratch`, the one record of what a call's
+    target is), carrying the frontend attributes of the instruction it replaced."""
+    return maker.opcode == "custom-call" and call_scratch(maker.custom_call_target)
 
 
 def _names_output(maker, index: tuple[int, ...]) -> bool:
@@ -526,11 +523,6 @@ _DESCENDED_FROM_NONE = frozenset((
 
 _PER_OPERAND = frozenset(("sort", "scatter"))
 """Ops whose outputs are their leading operands', one each, as they are."""
-
-_GEMMS = frozenset(("__cublas$gemm", "__cublas$lt$matmul", "__cublas$lt$matmul$f8"))
-"""cuBLAS custom calls, whose backend config states their dot's dimension numbers
-(`gemm_backend_config.dot_dimension_numbers`)."""
-
 
 def provenance(module, argument: Callable[[int], int | None] | None = None):
     """Each instruction's provenance in `HloModuleProto` `module`, by its id: an array's `Dims`, a tuple's a
@@ -819,7 +811,7 @@ def _custom(instruction, operands, shape):
                 # Stated unknown (null), or past the outputs stated (a kernel's scratch): unknown.
                 outputs.append(_filled(element, None))
         return outputs if shape.tuple_shapes else outputs[0]
-    if instruction.custom_call_target in _GEMMS:
+    if custom_call_kind(instruction.custom_call_target) == "gemm":
         config = json.loads(instruction.backend_config or "{}")
         numbers = config.get("gemm_backend_config", {}).get("dot_dimension_numbers")
         if numbers is not None:

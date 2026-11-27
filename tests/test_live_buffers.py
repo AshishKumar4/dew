@@ -183,6 +183,29 @@ def test_a_tuple_makers_name_is_its_result_alone_not_its_workspace(call, solved)
         ((2,), "jit(f)/pair", (), "workspace" if solved else "")]
 
 
+DIRECT = (FIXTURES / "direct.hlo").read_text()
+
+
+@pytest.mark.parametrize(("call", "named"), [("__cublas$lt$matmul", True), ("pair", False)])
+def test_a_tuple_call_outside_a_fusion_names_its_result_alone(call, named):
+    """A custom call the module's entry makes directly, not a fusion's root, defines its tuple's elements
+    itself: its checkpoint name names a cuBLAS call's result alone, its scratch a workspace no name names,
+    and an unknown call's elements none (train 1366's review F6)."""
+    module = module_bytes(DIRECT.replace("CALL", call))
+    defined = instruction_ids(module, "e")
+    assignment: Any = empty_assignment()
+    assignment.buffer_allocations.add(index=0, size=64 * 32 * 4 + 1024)
+    peak = assignment.peak_buffers.add(index=0)
+    for buffer_id, (index, size) in enumerate((([0], 64 * 32 * 4), ([1], 1024))):
+        buffer = assignment.logical_buffers.add(id=buffer_id, size=size)
+        buffer.defined_at.instruction_id = defined["c"].id
+        buffer.defined_at.shape_index.extend(index)
+        peak.logical_buffer_ids.append(buffer_id)
+    live = read(assignment, module).live()
+    assert [(each.names, each.role) for each in live] == [
+        (("down_proj",) if named else (), ""), ((), "workspace" if named else "")]
+
+
 def _saved_hidden(step) -> tuple[LiveBuffer, ...]:
     """The buffers live at the peak of `step`'s weight gradient, checkpointed saving the "hidden" residual
     alone, over 2048 rows of 256."""

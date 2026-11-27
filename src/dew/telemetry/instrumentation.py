@@ -189,18 +189,24 @@ class _Fused:
 
 @dataclass(frozen=True)
 class _Call:
-    """What one custom-call target computes (`custom_call_kind`), with the facts its reader needs: a fused
-    attention's operands, a cuDNN convolution's direction (`forward`, `input`, `filter`: which gradient,
-    if any, it computes)."""
+    """What one custom-call target computes (`custom_call_kind`; None for a call nothing here sizes), with
+    the facts its readers need: a fused attention's operands, a cuDNN convolution's direction (`forward`,
+    `input`, `filter`: which gradient, if any, it computes), and whether its output is a tuple of its
+    result first and its scratch last (`scratched`: a cuBLAS call's, `call_scratch`)."""
 
-    kind: str
+    kind: str | None
     attention: Attention | None = None
     direction: str = "forward"
+    scratched: bool = False
 
 
 _XLA_CALLS: dict[str, _Call] = {
-    **{target: _Call("gemm") for target in (
+    **{target: _Call("gemm", scratched=True) for target in (
         "__cublas$gemm", "__cublas$lt$matmul", "__cublas$lt$matmul$f8", "__cublas$lt$matmul$mx")},
+    # cuBLAS calls nothing here sizes, each its result and its scratch (the triangular solve's temp bytes,
+    # `triangular_solve_rewriter.cc`).
+    **{target: _Call(None, scratched=True) for target in (
+        "__cublas$lt$groupedMatmul", "__cublas$triangularSolve")},
     **{target: _Call("convolution", direction=direction) for target, direction in (
         ("__cudnn$convForward", "forward"), ("__cudnn$convBiasActivationForward", "forward"),
         ("__cudnn$convForwardGraph", "forward"), ("__cudnn$convBackwardInput", "input"),
@@ -226,9 +232,9 @@ read from its source at d867969800d4 (the revision jaxlib 0.12.0.1 builds): xla/
 cuBLAS, cuDNN and CUB targets, xla/service/memory_annotations.h's placements,
 xla/service/spmd/shardy/constants.h's sharding marks and Shardy's round trip, xla/service/topk_rewriter.cc's
 "TopK". JAX's own targets JAX states (`jax.extend.custom_call_targets`), which `_calls` reads. A target
-this table and its owners' (`_calls`) do not hold, a cuBLAS triangular solve or grouped matmul and cuDNN's
-block-scaled dot among them, is one nothing here sizes. A fused attention's backward reads its query first;
-an F8 attention's form is its own target."""
+whose kind is None, a cuBLAS triangular solve or grouped matmul, or that this table and its owners'
+(`_calls`) do not hold, cuDNN's block-scaled dot among them, is one nothing here sizes. A fused attention's
+backward reads its query first; an F8 attention's form is its own target."""
 
 
 @functools.cache
@@ -552,6 +558,14 @@ def _fused_attention_flops(instruction: _Instruction, shapes: dict[str, tuple[in
     pairs = _MAC * batch * heads * _reached(length, key[1], _window(attention, instruction.config))
     model = (2 if attention.backward else 1) * pairs * (width + value[3])
     return model, model + (pairs * width if attention.backward else 0.0)
+
+
+def call_scratch(target: str) -> bool:
+    """Whether a custom call of `target` outputs a tuple of its result first and its scratch last (every
+    cuBLAS call of the pinned XLA: the gemm rewriter's workspace, the triangular solve's temp bytes), the
+    call carrying the frontend attributes of the instruction it replaced (`_Call.scratched`)."""
+    call = _calls().get(target)
+    return call is not None and call.scratched
 
 
 def custom_call_kind(target: str) -> str | None:
