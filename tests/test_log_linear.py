@@ -11,7 +11,7 @@ import numpy as np
 import pytest
 from test_recurrence_chunk import assert_packed_on_par, hosted, sigmoid
 
-from dew.nn.kernels.log_linear import levels, log_linear_attention
+from dew.nn.kernels.log_linear import WITHIN, levels, log_linear_attention
 
 ROWS, LENGTH, GROUPS, HEADS, WIDTH, VALUES = 2, 136, 1, 2, 16, 8
 """Two rows of 136 tokens (nine levels: zero to six within a 64-token block, `log_linear.WITHIN`, seven and
@@ -44,6 +44,12 @@ def naive(query, key, value, g, level_scales, *, starts=None):
                       level_scales[row:row + 1, begin:end, :, :levels(end - begin)])
                 for begin, end in zip(begins, ends, strict=True)], axis=1))
         return jnp.concatenate(pieces)
+    every = range(math.ceil(math.log2(query.shape[1])) + 1)
+    return (_masked(query, key, value, g, level_scales, every) * WIDTH ** -0.5).astype(value.dtype)
+
+
+def _masked(query, key, value, g, level_scales, among) -> jax.Array:
+    """`naive`'s sum over the levels `among` of one sequence, in at least fp32 and unscaled."""
     length = query.shape[1]
     work = jnp.promote_types(value.dtype, jnp.float32)
     q, k = (jnp.repeat(x.astype(work), value.shape[2] // query.shape[2], axis=2) for x in (query, key))
@@ -51,35 +57,76 @@ def naive(query, key, value, g, level_scales, *, starts=None):
     causal = np.tril(np.ones((length, length), bool))
     decay = jnp.exp(jnp.where(causal, running[..., :, None] - running[..., None, :], -jnp.inf))
     weights = level_scales.astype(work).transpose(0, 2, 1, 3)
-    mixed = sum(decay * level_mask(level, length) * weights[..., level, None]
-                for level in range(math.ceil(math.log2(length)) + 1))
+    mixed = sum(decay * level_mask(level, length) * weights[..., level, None] for level in among)
     scores = jnp.einsum('bhlc,blhn,bchn->bhlc', mixed, q, k)
-    return (jnp.einsum('bhlc,bchp->blhp', scores, value.astype(work)) * WIDTH ** -0.5).astype(value.dtype)
+    return jnp.einsum('bhlc,bchp->blhp', scores, value.astype(work))
 
 
-def draw(seed: int, groups: int = GROUPS, heads: int = HEADS):
-    """fp32 operands from `seed`, `groups` key heads serving `heads` value heads: unit queries and keys, a
-    log decay `log sigmoid`, level weights about one, and a cotangent of the output."""
+def fla_chunked(query, key, value, g, level_scales, *, starts=None):
+    """fla's chunked arithmetic for one sequence (fla/ops/log_linear_attn/chunk.py at 413ad2c), a 16-bit
+    call's roundings where fla rounds: the levels within a 64-token chunk as `naive`'s; each level above
+    read at each 64-token chunk of its blocks' right halves from its keys' memory in fp32, each left-half
+    chunk's values decayed to that chunk's end and rounded before its keys (`b_v`), the memory decayed to
+    the reading chunk's start and rounded there (`kv.to(b_q.dtype)`), the query times its level weight
+    rounded (`b_l * b_q`), the read decayed within its chunk after its product, the scale at the output
+    (`SCALE`). An fp32 or a float64 call rounds none."""
+    assert starts is None, "one sequence"
+    length, chunk = query.shape[1], WITHIN
+    work = jnp.promote_types(value.dtype, jnp.float32)
+
+    def rounded(x):
+        return x.astype(value.dtype).astype(work) if jnp.dtype(value.dtype).itemsize < 4 else x
+
+    q, k = (jnp.repeat(x.astype(work), value.shape[2] // query.shape[2], axis=2) for x in (query, key))
+    v, running, weights = value.astype(work), jnp.cumsum(g.astype(work), axis=1), level_scales.astype(work)
+    out = _masked(query, key, value, g, level_scales, range(WITHIN.bit_length()))
+    for level in range(WITHIN.bit_length(), levels(length)):
+        half = 1 << (level - 1)
+        for middle in range(half, length, 2 * half):
+            for reading in range(middle, min(middle + half, length), chunk):
+                read = slice(reading, min(reading + chunk, middle + half, length))
+                memory = 0.0
+                for source in range(middle - half, middle, chunk):
+                    taken = slice(source, source + chunk)
+                    end = running[:, source + chunk - 1]
+                    values = rounded(v[:, taken] * jnp.exp(end[:, None] - running[:, taken])[..., None])
+                    memory = memory + jnp.exp(running[:, reading - 1] - end)[..., None, None] * jnp.einsum(
+                        'bnhk,bnhp->bhkp', k[:, taken], values)
+                reader = rounded(q[:, read] * weights[:, read, :, level, None])
+                product = jnp.einsum('bnhk,bhkp->bnhp', reader, rounded(memory))
+                decayed = jnp.exp(running[:, read] - running[:, reading - 1, None])[..., None]
+                out = out.at[:, read].add(product * decayed)
+    return (out * WIDTH ** -0.5).astype(value.dtype)
+
+
+def draw(seed: int, groups: int = GROUPS, heads: int = HEADS, dtype=jnp.float32):
+    """Operands from `seed`, `groups` key heads serving `heads` value heads: unit queries and keys and
+    values in `dtype`, a log decay `log sigmoid` and level weights about one in fp32, and a cotangent of the
+    output in `dtype`."""
     normal = np.random.default_rng([seed, 3]).standard_normal
     q, k = (normal((ROWS, LENGTH, groups, WIDTH)) for _ in range(2))
     q, k = (x / np.linalg.norm(x, axis=-1, keepdims=True) for x in (q, k))
     v = normal((ROWS, LENGTH, heads, VALUES))
     g = np.log(sigmoid(normal((ROWS, LENGTH, heads)) + 2.0))
     weights = 1.0 + 0.3 * normal((ROWS, LENGTH, heads, levels(LENGTH)))
-    return *(hosted(x) for x in (q, k, v, g, weights)), hosted(normal((ROWS, LENGTH, heads, VALUES)))
+    return (*(hosted(x, dtype) for x in (q, k, v)), *(hosted(x) for x in (g, weights)),
+            hosted(normal((ROWS, LENGTH, heads, VALUES)), dtype))
 
 
-@pytest.mark.parametrize('packed', (False, True))
-def test_the_masked_form_is_as_exact_as_flas_level_by_level(packed):
+@pytest.mark.parametrize(('packed', 'dtype'), [(False, jnp.float32), (True, jnp.float32),
+                                               (False, jnp.bfloat16)], ids=['fp32', 'fp32 packed', 'bf16'])
+def test_the_masked_form_is_as_exact_as_flas_level_by_level(packed, dtype):
     """The output and every operand's gradient, the level weights' included, of the masked form (each key's
     level its position's highest bit apart from the query's) on par with fla's reference building each
     level's mask, from float64, one sequence and packed documents counting positions from their own first
-    tokens (check 1)."""
+    tokens, and one bf16 sequence, its levels above a block fla's chunked arithmetic, held to fla's chunked
+    form's roundings at its precision (`fla_chunked`; check 1)."""
     # Packed, each row's documents bound its levels' blocks (`max_segments`).
     dew = functools.partial(log_linear_attention, max_segments=max(map(len, DOCUMENTS))) if packed else \
         log_linear_attention
-    assert_packed_on_par(dew, naive, draw, 'log-linear attention', packed=packed, documents=DOCUMENTS,
-                         length=LENGTH, seeds=SEEDS[packed])
+    reference = naive if dtype == jnp.float32 else fla_chunked
+    assert_packed_on_par(dew, reference, functools.partial(draw, dtype=dtype), 'log-linear attention',
+                         packed=packed, documents=DOCUMENTS, length=LENGTH, seeds=SEEDS[packed])
 
 
 def test_key_heads_serve_their_own_value_heads_packed():
@@ -170,14 +217,154 @@ def test_a_blocks_pairs_keep_a_decay_past_a_vanished_one_and_no_future_overflow(
         assert all(np.isfinite(np.asarray(grad)).all() for grad in grads)
 
 
-@pytest.mark.parametrize("target", ["sm80", "sm90", "sm100", "sm120"])
-def test_log_linear_levels_train_on_the_template_on_each_gpu_family(target):
-    """A log-linear call of Kimi's geometry (64 value heads on one key head of 128, bf16), traced as each
-    GPU family's device: each level's recurrence takes the recurrence template for its forward and its
-    gradient (`generation.routes`), where a key head's value heads summed in one program held sm120's
-    consumer-fed scores' gradient launch past 255 registers and every level trained on the portable math,
-    1091 ms of a step against its forward's 4.6 (row 10522)."""
+def _across_a_block(query, key, g, *, scale: float = 1.0, weight: float = 1.0, dtype=jnp.bfloat16):
+    """65 tokens whose one weighed level is the 128-token blocks' (7, the first above `log_linear.WITHIN`),
+    at token 64 alone, the block's right half partial and padded: a unit value at token 0, `query` and `key`
+    at tokens 64 and 0, `g` at token 64 and `weight` its level weight there, every other operand zero, the
+    query, key and value in `dtype`; the call of its query, key and log decay, and those operands."""
+    def at(where, value, kind=dtype):
+        return jnp.zeros((1, 65, 1, 1), kind).at[0, where].set(value)
+
+    weights = jnp.zeros((1, 65, 1, levels(65)), jnp.float32).at[0, 64, 0, 7].set(weight)
+
+    def call(q, k, decay):
+        return log_linear_attention(q, k, at(0, 1.0), decay, weights, scale=scale)
+
+    return call, (at(64, query), at(0, key), at(64, g, jnp.float32)[..., 0])
+
+
+def test_a_levels_read_through_a_vanished_decay_reads_zero_its_overflow_selected_out():
+    """A bf16 level's read whose decay from its half's first token vanishes (-1000 at token 64) reads zero and
+    every gradient stays finite though its product overflows (2^70 by 2^70), as the recurrence selects out a
+    read through a vanished decay (`log_linear._levels_above`), where the overflow times the zero decay was
+    NaN."""
+    call, operands = _across_a_block(2.0 ** 70, 2.0 ** 70, -1000.0)
+    out, pull = jax.vjp(call, *operands)
+    np.testing.assert_array_equal(np.asarray(out, np.float32), np.zeros(out.shape, np.float32))
+    assert all(np.isfinite(np.asarray(x)).all() for x in pull(jnp.ones_like(out)))
+
+
+def test_a_bf16_levels_write_decays_across_a_later_chunk_as_its_memory_as_flas():
+    """A bf16 level-8 read (129 tokens, its block's left half two chunks) of a key of 2^100 against a value
+    of 2^-60 at token 0, decayed by `e^-80` across the next chunk (-40 at tokens 64 and 65), reads that
+    write's `2^40 e^-80`, its chunk's memory formed first and decayed in fp32 as fla's (`kv *=
+    exp(b_g_last)`; `log_linear._levels_above`), where the value decayed across the whole half before its
+    key rounded to zero."""
+    def at(where, value, dtype=jnp.bfloat16):
+        return jnp.zeros((1, 129, 1, 1), dtype).at[0, where].set(value)
+
+    weights = jnp.zeros((1, 129, 1, levels(129)), jnp.float32).at[0, 128, 0, 8].set(1.0)
+    g = jnp.zeros((1, 129, 1), jnp.float32).at[0, 64:66].set(-40.0)
+    out = log_linear_attention(at(128, 1.0), at(0, 2.0 ** 100), at(0, 2.0 ** -60), g, weights, scale=1.0)
+    expected = (2.0 ** 40 * jnp.exp(jnp.float32(-80.0))).astype(jnp.bfloat16)
+    np.testing.assert_array_equal(np.asarray(out, np.float32)[0, :, 0, 0],
+                                  np.where(np.arange(129) == 128, np.float32(expected), np.float32(0.0)))
+
+
+def _tokens(length: int, where, values):
+    """A bf16 operand `[1, length, 1, 1]`, zero but at the tokens `where`, which take `values`."""
+    return jnp.zeros((1, length, 1, 1), jnp.bfloat16).at[0, jnp.asarray(where)].set(
+        jnp.asarray(values).reshape(-1, 1, 1))
+
+
+def test_a_bf16_calls_within_and_level_reads_are_summed_before_their_scale_as_flas():
+    """A bf16 call whose token 64 reads its own key of 2^100 (level 0) and token 0's of -2^100 (level 7),
+    unit values, at a scale of 2^30 reads zero, the within and the levels' reads summed before the scale
+    as fla's `b_o * SCALE` (`log_linear.log_linear_attention`), where each scaled apart read infinity less
+    infinity."""
+    weights = jnp.zeros((1, 65, 1, levels(65)), jnp.float32).at[0, 64, 0, jnp.asarray([0, 7])].set(1.0)
+    out = log_linear_attention(_tokens(65, [64], [1.0]), _tokens(65, [0, 64], [-2.0 ** 100, 2.0 ** 100]),
+                               _tokens(65, [0, 64], [1.0, 1.0]), jnp.zeros((1, 65, 1), jnp.float32), weights,
+                               scale=2.0 ** 30)
+    np.testing.assert_array_equal(np.asarray(out, np.float32), np.zeros(out.shape, np.float32))
+
+
+def test_a_bf16_calls_reads_are_summed_from_the_within_up_a_level_at_a_time_as_flas():
+    """A bf16 call (193 tokens) whose token 192 reads its own key of -2^127 (level 0), token 128's of 2^127
+    (level 7) and token 0's of 2^127 (level 8), unit values, reads 2^127: the within read first, then each
+    level's from the lowest, as fla's `b_o` sums them (`log_linear._levels_above`), where the levels
+    summed before the within overflowed."""
+    weights = jnp.zeros((1, 193, 1, levels(193)), jnp.float32).at[0, 192, 0, jnp.asarray([0, 7, 8])].set(1.0)
+    keys = _tokens(193, [0, 128, 192], [2.0 ** 127, 2.0 ** 127, -2.0 ** 127])
+    out = log_linear_attention(_tokens(193, [192], [1.0]), keys, _tokens(193, [0, 128, 192], [1.0] * 3),
+                               jnp.zeros((1, 193, 1), jnp.float32), weights, scale=1.0)
+    np.testing.assert_array_equal(np.asarray(out, np.float32)[0, :, 0, 0],
+                                  np.where(np.arange(193) == 192, np.float32(2.0 ** 127), np.float32(0.0)))
+
+
+@pytest.mark.parametrize(("query", "key", "weight"), [(2.0 ** 70, 2.0 ** 70, 1.0), (2.0 ** 127, 1.0, 2.0)],
+                         ids=["an overflowed read", "an overflowed reader"])
+def test_a_bf16_levels_read_severed_earlier_in_its_half_reads_zero_its_gradients_finite(query, key, weight):
+    """A bf16 level-8 read (193 tokens) at token 192 of token 0's key against a value of 1, its right half's
+    first chunk holding a vanished decay (-1000 at token 128), reads zero and every gradient stays finite,
+    the read discarded before its product and its decay (`log_linear._levels_above`): masked after them, an
+    overflowed read (2^70 by 2^70) times its zero decay's derivative was NaN at token 192's decay, and an
+    overflowed reader (2^127 weighed 2) times its zero cotangent NaN at the key's and value's (train reviews
+    of bdaf24f63 and 6dfb161ea)."""
+    weights = jnp.zeros((1, 193, 1, levels(193)), jnp.float32).at[0, 192, 0, 8].set(weight)
+    g = jnp.zeros((1, 193, 1), jnp.float32).at[0, 128].set(-1000.0)
+
+    def call(q, k, v, decay):
+        return log_linear_attention(q, k, v, decay, weights, scale=1.0)
+
+    operands = (_tokens(193, [192], [query]), _tokens(193, [0], [key]), _tokens(193, [0], [1.0]), g)
+    out, pull = jax.vjp(call, *operands)
+    np.testing.assert_array_equal(np.asarray(out, np.float32), np.zeros(out.shape, np.float32))
+    assert all(np.isfinite(np.asarray(x, np.float32)).all() for x in pull(jnp.ones_like(out)))
+
+
+def test_a_bf16_levels_memory_cut_across_its_half_joins_as_zero():
+    """A bf16 level-8 read (129 tokens) at token 128 of token 0's key and value of 2^70, the next chunk of its
+    block's left half holding a vanished decay (-1000 at token 64), reads zero, its forward and gradients
+    finite, the left chunk's memory joined across the cut as zero (`log_linear._levels_above`), where its
+    overflowed memory times the zero decay was NaN (a train review of 6dfb161ea)."""
+    weights = jnp.zeros((1, 129, 1, levels(129)), jnp.float32).at[0, 128, 0, 8].set(1.0)
+    g = jnp.zeros((1, 129, 1), jnp.float32).at[0, 64].set(-1000.0)
+
+    def call(k, v, decay):
+        return log_linear_attention(_tokens(129, [128], [1.0]), k, v, decay, weights, scale=1.0)
+
+    out, pull = jax.vjp(call, _tokens(129, [0], [2.0 ** 70]), _tokens(129, [0], [2.0 ** 70]), g)
+    np.testing.assert_array_equal(np.asarray(out, np.float32), np.zeros(out.shape, np.float32))
+    assert all(np.isfinite(np.asarray(x, np.float32)).all() for x in pull(jnp.ones_like(out)))
+
+
+def test_a_bf16_calls_levels_take_the_recurrence_its_kernel_choice_names():
+    """An unpacked bf16 call within `generation.chosen` naming the recurrence's kernel (`gated_delta_rule`,
+    as tools/benchmark_recurrence.py's `mosaic` and `xla` arms do) runs each level above a block on that
+    kernel, its routes the recurrence's, where the fast levels' products took none (a train review of
+    bdaf24f63: the A/B's arms were one program)."""
     from dew.nn.kernels import generation
+
+    q, k, v, g, weights, _ = draw(0, dtype=jnp.bfloat16)
+    for kernel in ("xla", "mosaic_gpu", None):
+        named = {} if kernel is None else {"gated_delta_rule": kernel}
+        with generation.assumed("sm90"), generation.chosen(**named), generation.routes() as found:
+            jax.eval_shape(log_linear_attention, q, k, v, g, weights)
+        taken = {route.forced for route in found if route.choice == generation.Choice.GATED_DELTA_RULE}
+        assert taken == (set() if kernel is None else {kernel}), (kernel, taken)
+
+
+def test_a_bf16_levels_read_weighs_its_query_before_its_product_as_flas():
+    """A bf16 level's read of a query of 2^127 at a level weight of 2^-12 against a memory of 2^8 reads
+    2^123, its weight on its query before the product and the scale at the output, as fla's chunked form
+    (`b_l * b_q`, then `SCALE`; `log_linear._levels_above`), where a weight after the product overflowed."""
+    call, operands = _across_a_block(2.0 ** 127, 2.0 ** 8, 0.0, weight=2.0 ** -12)
+    np.testing.assert_array_equal(np.asarray(call(*operands), np.float64)[0, :, 0, 0],
+                                  np.where(np.arange(65) == 64, 2.0 ** 123, 0.0))
+
+
+@pytest.mark.parametrize("target", ["sm80", "sm90", "sm100", "sm120"])
+def test_packed_levels_train_on_the_template_and_unpacked_ones_take_no_recurrence(target):
+    """A log-linear call of Kimi's geometry (64 value heads on one key head of 128, bf16), traced as each
+    GPU family's device: over two packed documents each level's recurrence takes the recurrence template
+    for its forward and its gradient (`generation.routes`), where a key head's value heads summed in one
+    program held sm120's consumer-fed scores' gradient launch past 255 registers and every level trained on
+    the portable math, 1091 ms of a step against its forward's 4.6 (row 10522); unpacked, no level takes a
+    recurrence (each two products a block, `log_linear._levels_above`) and no route refuses; and unpacked in
+    the accurate forms each level takes its recurrence, the portable recurrence's range."""
+    from dew.nn.kernels import generation
+    from dew.nn.precision import Numerics
 
     length, heads = 512, 64
     shapes = [jax.ShapeDtypeStruct(shape, dtype) for shape, dtype in (
@@ -185,14 +372,25 @@ def test_log_linear_levels_train_on_the_template_on_each_gpu_family(target):
         ((1, length, heads, 64), jnp.bfloat16), ((1, length, heads), jnp.float32),
         ((1, length, heads, levels(length)), jnp.bfloat16))]
 
-    def call(*operands):
-        return log_linear_attention(*operands, scale=1.0)
+    def routed(starts):
+        def call(*operands):
+            return log_linear_attention(*operands, scale=1.0, starts=starts,
+                                        max_segments=None if starts is None else 2)
 
-    with generation.assumed(target), generation.routes() as found:
-        jax.eval_shape(lambda *x: jax.vjp(call, *x)[1](call(*x)), *shapes)
+        with generation.assumed(target), generation.routes() as found:
+            jax.eval_shape(lambda *x: jax.vjp(call, *x)[1](call(*x)), *shapes)
+        return found
+
+    starts = jnp.zeros((1, length), bool).at[0, jnp.asarray([0, length // 2])].set(True)
     taken = {(route.kernel, None if route.refusal is None else route.refusal.code)
-             for route in found if route.choice == generation.Choice.GATED_DELTA_RULE}
+             for route in routed(starts) if route.choice == generation.Choice.GATED_DELTA_RULE}
     assert taken == {("mosaic_gpu", None)}, taken
+    unpacked = [route for route in routed(None)
+                if route.choice == generation.Choice.GATED_DELTA_RULE or route.refusal is not None]
+    assert not unpacked, unpacked
+    with generation.run_precision(Numerics(forms='accurate')):
+        accurate = {route.choice for route in routed(None)}
+    assert generation.Choice.GATED_DELTA_RULE in accurate, accurate
 
 
 def test_a_level_weights_forward_derivative_is_its_tangents_gathered():

@@ -661,10 +661,10 @@ def _merged(a, b, carried, issue: Callable) -> Walk:
     its own, each touched by it alone)."""
     if not (isinstance(a, Walk) and isinstance(b, Walk)):
         raise Refused("a merge of walks init did not start from their operands' shapes")
-    entered = a.h if b.across is None else _scaled_exp(a.h, b.across[None, :])
+    entered = a.h if b.across is None else scaled_exp(a.h, b.across[None, :])
     if b.transfer is None:
-        h = _scaled_exp(entered, b.decay[:, None]) + b.h
-        transfer = None if a.transfer is None else _scaled_exp(a.transfer, b.decay[:, None])
+        h = scaled_exp(entered, b.decay[:, None]) + b.h
+        transfer = None if a.transfer is None else scaled_exp(a.transfer, b.decay[:, None])
     else:
         h = issue("transfer_apply", b.transfer, entered) + b.h
         transfer = (issue("transfer_decay", accurate_exp(a.decay), b.transfer) if a.transfer is None
@@ -1704,9 +1704,15 @@ def _factors(base2: bool, exponent, kept) -> _Split:
     return _Split(jnp.where(kept, first, -0.0), *(jnp.where(kept, factor, 1.0) for factor in rest))
 
 
-def _scaled_exp(value, exponent):
-    """`value` times `exp(exponent)` (natural units, at most 0: a walk's decay), its factors in turn
-    (`_Split`'s, `_exponents`)."""
+def scaled_exp(value, exponent):
+    """`value` times `exp(exponent)`, `exponent` in natural units and at most 0 (a decay's: a walk's, a
+    span's): the factor applied as three in turn (`_Split`'s, `_exponents`), the first two held at fp32's
+    least normal exponent and the last the rest, each to fp32's rounding (`precision.accurate_exp`), so the
+    product falls monotonically to the value's decayed one and keeps it where that is normal (row 9660: a
+    decay of `e^-120` takes 2^100 to `e^-51`, which one exponential's underflow zeroed); an exponent of -inf
+    zeroes a finite value and keeps a NaN or an infinite one NaN. Its derivative is autodiff's through the
+    factors: the value's tangent times the same factors, and the exponent's tangent times the product, the
+    three parts' tangents summing to it."""
     for part in _exponents(exponent, _normal_floor(exponent.dtype, base2=False)):
         value = value * accurate_exp(part)
     return value
@@ -1752,7 +1758,7 @@ def _walked(exponents, base2: bool) -> jax.Array:
 
 def _vanished_walk(dtype) -> float:
     """A walk's vanished decay in natural units: twice its dtype's vanished exponent (`vanishing`), so its
-    factors applied in turn (`_scaled_exp`) are zero, where a walk's decay of `e^-120` (three gates of -40)
+    factors applied in turn (`scaled_exp`) are zero, where a walk's decay of `e^-120` (three gates of -40)
     takes a state of 2^100 to a normal `e^-51`, which a floor at the vanished exponent itself (-105) zeroed
     (row 9660); its last factor at it normal (`e^-36` in fp32), so every decay above it is kept."""
     return 2.0 * vanishing(dtype, base2=False)
