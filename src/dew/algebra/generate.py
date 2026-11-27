@@ -37,7 +37,6 @@ from dew.nn import programs
 from dew.nn.kernels import generation
 from dew.nn.precision import Numerics
 
-
 POLICIES = ("default", "accurate")
 """The precision policies a declaration is generated for (§1.5): under default numerics a candidate is
 admitted against the form as written, under the accurate numerics against every other candidate."""
