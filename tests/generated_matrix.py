@@ -2,8 +2,8 @@
 bodies take (`dew.algebra.generated`) run with the choice `generated` named "generated", at its component's
 declared cases, on par with the same site named "written", from its declaration's float64 truth.
 
-The sites are the templates' own functions: the selective scan's decay and readout
-(`recurrence_algebra.selective_decay`, `selective_read`) and the derived split-KV merge
+The sites are the templates' own functions, each its component's declared function: the selective scan's decay
+and readout (`recurrence_algebra.selective_decay`, `selective_read`) and the derived split-KV merge
 (`attention_algebra.merge`). Every cell asserts the generated body ran (`generated.taken`): a site that fell
 back to its written math would hold check 1 trivially. The cases are each component's declared ones
 (`dew.algebra.component_cases`), keyed by the generation they were generated for, the one this family names.
@@ -11,6 +11,7 @@ back to its written math would hold check 1 trivially. The cases are each compon
 
 import functools
 
+import jax.numpy as jnp
 import pytest
 from generation_support import pinned
 from gpu_flow import cell
@@ -18,8 +19,7 @@ from kernel_matrix import AXES
 from reference_error import assert_as_exact
 
 from dew.algebra import component_cases, generate, generated
-from dew.nn.kernels import generation, recurrence_algebra
-from dew.nn.kernels.templates import attention_algebra
+from dew.nn.kernels import generation
 
 CHOICES = frozenset({"generated"})
 """The `generation.CHOICES` entries the cells run: each cell names `generated` both ways."""
@@ -28,31 +28,10 @@ KERNELS = {}
 own choice of their body, which has no kernels to list."""
 
 
-def _read(*operands):
-    """The selective readout over its declared flat operands (`component_cases.selective_read`'s ABI)."""
-    count = (len(operands) - 2) // 2
-    return recurrence_algebra.selective_read(list(operands[:count]), list(operands[count:2 * count]),
-                                             *operands[-2:])
-
-
-def _merge(left, left_peak, left_total, right, right_peak, right_total):
-    """The derived merge of two unscaled states of the declared spec's forms, its sums in order."""
-    state = attention_algebra.merge(attention_algebra.GENERATED_MERGE,
-                                    attention_algebra.Partial(left, left_peak, left_total),
-                                    attention_algebra.Partial(right, right_peak, right_total))
-    return state.acc, state.m, state.total
-
-
-SITES = {"selective_decay": recurrence_algebra.selective_decay, "selective_read": _read,
-         "split_kv_merge": _merge}
-"""Each site by its component's name in `dew.algebra.component_cases`, called over the component's flat ABI."""
-
-
 def supported(case: dict[str, str]) -> bool:
     """Whether the site serves `case` (tests/kernel_matrix.py): its component is declared for the case's
     generation."""
-    form = generate.DECLARATIONS[f"{component_cases.__name__}.{case['site']}"]
-    return case["generation"] in form.cases.targets
+    return case["generation"] in generate.DECLARATIONS[f"{component_cases.__name__}.{case['site']}"].cases.targets
 
 
 CASES = (
@@ -71,12 +50,14 @@ def a_generated_body_is_on_par(case: tuple[str, ...]) -> None:
     run at every case."""
     named = dict(zip(AXES["generated"], case, strict=True))
     qualified = f"{component_cases.__name__}.{named['site']}"
-    form, site = generate.DECLARATIONS[qualified], SITES[named["site"]]
+    form = generate.DECLARATIONS[qualified]
+    assert isinstance(form, generate.ComponentForm)
+    site = form.function  # Each declared function is its site's own call.
 
     def under(kernel: str):
         def run(*values):
             with generation.chosen(generated=kernel):
-                return site(*values)
+                return site(*map(jnp.asarray, values))
         return run
 
     for operands in form.cases.operands:
