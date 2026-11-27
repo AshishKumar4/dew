@@ -201,6 +201,29 @@ def test_a_step_compiled_ahead_is_refused_by_a_run_that_compiles_under_other_opt
     assert not isinstance(loading.value, NotTheStepCompiledAhead), loading.value
 
 
+def test_a_step_saved_with_its_options_apart_from_its_program_is_compiled_again(tmp_path):
+    """A step an earlier Dew compiled ahead, its program's fingerprint without its options and the options
+    saved beside it (train 1349's review F7), is refused as it loads, asking for it compiled again: its
+    fingerprint matches a run of the program under no options whatever it compiled under."""
+    import pickle
+
+    import jax
+    import jax.numpy as jnp
+    import pytest
+
+    from dew.nn.kernels.options import program_digest
+    from dew.training.ahead import AheadOfTime, Executable
+
+    lowered = jax.jit(lambda x: jnp.sin(x) * 2).lower(jnp.ones(4))
+    earlier = AheadOfTime("sm90", 1, {}, program_digest(lowered), Executable(b"", ()), None, 0, 0, 0, 0, 0,
+                          {})
+    object.__setattr__(earlier, "options", {"xla_gpu_enable_triton_gemm": False})
+    path = tmp_path / "earlier.dew-aot"
+    path.write_bytes(pickle.dumps(earlier))
+    with pytest.raises(ValueError):
+        AheadOfTime.load(path)
+
+
 def test_a_lowerings_program_is_rendered_once_for_its_key_and_every_fingerprint(monkeypatch):
     """A lowering's program is rendered once for as long as it lives: its process-local key
     (`program_key`) and its fingerprints a file of programs holds it by, under any options

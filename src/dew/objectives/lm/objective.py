@@ -93,6 +93,7 @@ from dew.nn.protocols import (
     CrossAttending,
     DecoderTraining,
     ForkedCalls,
+    Generating,
     Lacks,
     LayerStates,
     Looped,
@@ -1360,8 +1361,7 @@ class TokenScorer(HeadedObjective[Ratio | RoutedStatistics, Variables]):
         settings = self.samples
         if settings is None or settings.max_new_tokens <= 0:
             return None
-        refusal = getattr(self.model, "generation_refusal", None)
-        return None if refusal is None else refusal()
+        return self.model.generation_refusal() if isinstance(self.model, Generating) else None
 
     def preview(self, params, batch, step: Step, *, scored=None):
         """Sample the configured prompt once, then decode only on process zero.

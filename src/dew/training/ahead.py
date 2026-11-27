@@ -484,6 +484,8 @@ class AheadOfTime:
             raise ValueError(f"{path} holds a step compiled ahead before its plan said whether XLA tuned it "
                              "(`autotuned`); compile it ahead again")
         sampled = [] if step.sampled is None else [step.sampled.executable]
+        if step.sampled is not None:
+            _same_fields(path, step.sampled, "a sampled step")
         _current(path, "step", [step.executable, *sampled])
         return step
 
@@ -793,16 +795,24 @@ class AheadPrograms:
 
 def _saved[Saved: (AheadOfTime, AheadPrograms)](path: str | Path, kind: type[Saved], what: str) -> Saved:
     """What a `save` of `kind` wrote to `path`, refused where it is not one (`what` it holds), or where it
-    was saved by a Dew whose `kind` held fewer fields than this one's (a pickle restores those it held
-    alone, and a field's class default would stand in for what it never said: rows 8459, 8759)."""
+    was saved by a Dew whose `kind` held other fields than this one's (`_same_fields`)."""
     loaded = pickle.loads(Path(path).read_bytes())
     if not isinstance(loaded, kind):
         raise ValueError(f"{path} holds no {what} compiled ahead of time")
-    missing = [field.name for field in dataclasses.fields(kind) if field.name not in vars(loaded)]
-    if missing:
-        raise ValueError(f"{path} holds {what} compiled ahead by an earlier Dew, before its files held "
-                         f"{', '.join(missing)}: compile it ahead again")
+    _same_fields(path, loaded, what)
     return loaded
+
+
+def _same_fields(path: str | Path, loaded: object, what: str) -> None:
+    """Refuse `loaded`, a dataclass a pickle restored, where the Dew that saved it held other fields than this
+    one's: fewer, as a pickle restores those it held alone and a field's class default would stand in for what
+    it never said (rows 8459, 8759), or more, which this Dew reads otherwise (a step's program fingerprinted
+    apart from its XLA options, `_fingerprint`, which an earlier Dew saved beside it)."""
+    held, known = set(vars(loaded)), {field.name for field in dataclasses.fields(type(loaded))}
+    if held != known:
+        differ = ", ".join(sorted(held ^ known))
+        raise ValueError(f"{path} holds {what} compiled ahead by another Dew, whose files held other fields "
+                         f"({differ}): compile it ahead again")
 
 
 def _current(path: str | Path, what: str, held: Sequence[object]) -> None:
@@ -1678,7 +1688,8 @@ def _planned_ahead[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Ba
                 start.placing, start.initializer, shapes_of(start.key),
                 start.abstract, start.shardings, trainer.device_mesh)
             stepped = step_batch(trainer, batch)
-            planned = trainer._compiled_plan(start.abstract, stepped, None, frontier)
+            # Its layers' gathers sized over the variables as placed, as a run's own start sizes them.
+            planned = trainer._compiled_plan(start.abstract, stepped, None, frontier, start.placed_variables)
             with attempting(begun):
                 starts = started(trainer, start, planned, plan)
     except Unlowerable as refused:

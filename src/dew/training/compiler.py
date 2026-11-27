@@ -1167,12 +1167,14 @@ class StepCompiler[L, E]:
             raise refusal
 
     def plan(self, stepping: Stepping, state: TrainState, batch: Batch,
-             trials: Trials | None, frontier: bool = False) -> tuple[Planned, Compiled]:
+             trials: Trials | None, frontier: bool = False, placed: Variables | None = None
+             ) -> tuple[Planned, Compiled]:
         """The shared device-step planner: the plan it admitted and what its compile found (`Compiled`, its
         step none: the caller reads its lowering before releasing it, `compile`, or serializing its
         executable, `compile_ahead`), with `frontier` the rungs above it (`FitSearch.above`), its rung
-        recorded (`keep_rung`)."""
-        planned, compiled, keep = self._plan(stepping, state, batch, trials, frontier)
+        recorded (`keep_rung`); `placed`, the variables as placed, where `state` holds their shapes alone
+        (`_plan`)."""
+        planned, compiled, keep = self._plan(stepping, state, batch, trials, frontier, placed=placed)
         keep()
         return planned, compiled
 

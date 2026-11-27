@@ -512,6 +512,9 @@ def lowered_for[LossT, EffectsT](stepping: Stepping[LossT, EffectsT], objective:
         placement, replicated = batch_shardings(mesh, batch), NamedSharding(mesh, P())
         candidate = candidate_for(stepping, state, batch, schedule, placement, replicated, split, narrow,
                                   mesh=mesh, platforms=('cuda',))
-        gathered = layer_gathers(objective, state.variables, mesh.size)
-        return candidate.lowered, unlimited(step_options(objective, candidate.micro,
-                                                         candidate.prepared.variables, mesh, gathered))
+        # The plan's sizing of its largest layer over the variables as the target's mesh places them, as a
+        # run's search sizes it over its placed ones (`StepCompiler`'s `gathered`).
+        variables = candidate.prepared.variables
+        gathered = layer_gathers(objective, variables, mesh.size)
+        options = step_options(objective, candidate.micro, variables, mesh, gathered)
+        return candidate.lowered, unlimited(options)
