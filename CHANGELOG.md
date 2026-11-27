@@ -17,7 +17,6 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
   BF16, and the selective scan's token update, backward step lift and per-state tangent; production
   dispatch is unchanged. The dev-time chooser measures each distinct candidate program once.
 
-
 - A generated surrogate now uses its written value and derivative when an unhashable static argument
   cannot select a generated case.
 
