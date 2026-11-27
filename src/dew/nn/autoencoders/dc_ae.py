@@ -25,12 +25,14 @@ from dew.nn.dense import Dense
 from ..activations import gated_product, silu
 from ..conv import Conv
 from ..norms import rms_normalized
-from ..precision import at_least_fp32, float32_dot_general, float32_einsum
+from ..precision import at_least_fp32, broadcast_summed, compensated_sum, float32_dot_general, float32_einsum
 from ..scan_orders import pixel_shuffle, pixel_unshuffle
 from .api import LatentNormalization, ModuleAutoEncoder
 
 _EPS = 1e-5
 _ATTENTION_EPS = 1e-15
+_FEWEST_GROUPS = 16
+_GROUP_POSITIONS = 256
 ACTIVATIONS = {"relu": nn.relu, "relu6": nn.relu6, "silu": silu}
 
 
@@ -109,6 +111,31 @@ class _MultiscaleProjection(nn.Module):
         return _conv(self.features, 1, self.dtype, "per_head", groups=3 * self.heads, bias=False)(x)
 
 
+def linear_attention(query: jax.Array, key: jax.Array, value: jax.Array) -> jax.Array:
+    """ReLU linear attention over `[batch, positions, heads, width]` queries and keys past their ReLU
+    (`SanaMultiscaleLinearAttention.apply_linear_attention`): each query's product with the keys'
+    value-weighted sum, over its product with the keys' sum. Its sums over the positions, the values' and
+    keys' products and, backward, the cotangents' and queries', are each taken in groups met by a
+    compensated sum, `_FEWEST_GROUPS` of them or groups of `_GROUP_POSITIONS` where there are more: one
+    float32 sum over the positions left the queries', keys' and values' gradients 1.6-2x Diffusers' error
+    from float64 at 96 to 4096 positions, as did 4 groups at 4096 and either sum alone grouped (check 1,
+    row 13524). Each sum stages its groups' `[heads, width + 1, width]` products: past 4096 positions
+    about an eighth of the queries' size at a 32-wide head, below it sixteen products."""
+    batch, positions, heads, width = key.shape
+    value = jnp.concatenate([value, jnp.ones_like(value[..., :1])], axis=-1)
+    groups = max(_FEWEST_GROUPS, -(-positions // _GROUP_POSITIONS))
+    padding = ((0, 0), (0, -positions % groups), (0, 0), (0, 0))
+
+    def grouped(array: jax.Array) -> jax.Array:
+        return jnp.pad(array, padding).reshape(batch, groups, -1, heads, array.shape[-1])
+
+    products = compensated_sum(float32_einsum("btngd,btnge->btgde", grouped(value), grouped(key)), (1,))
+    spread_products = broadcast_summed(products, (batch, groups, *products.shape[1:]), (0, 2, 3, 4))
+    attended = float32_einsum("btgde,btnge->btngd", spread_products, grouped(query))
+    attended = attended.reshape(batch, -1, heads, width + 1)[:, :positions]
+    return attended[..., :-1] / (attended[..., -1:] + _ATTENTION_EPS)
+
+
 class _LinearAttention(nn.Module):
     """`SanaMultiscaleLinearAttention` with its residual."""
 
@@ -152,10 +179,7 @@ class _LinearAttention(nn.Module):
             scores = scores / (jnp.sum(scores, axis=2, keepdims=True) + _ATTENTION_EPS)
             attended = float32_einsum("bmgd,bgmn->bngd", value, scores.astype(value.dtype))
         else:
-            value = jnp.concatenate([value, jnp.ones_like(value[..., :1])], axis=-1)
-            scores = float32_einsum("bngd,bnge->bgde", value, key)
-            attended = float32_einsum("bgde,bnge->bngd", scores, query)
-            attended = (attended[..., :-1] / (attended[..., -1:] + _ATTENTION_EPS)).astype(x.dtype)
+            attended = linear_attention(query, key, value).astype(x.dtype)
         attended = attended.reshape(batch, height, width, -1)
         out = Dense(self.features, use_bias=False, dtype=self.dtype, name="to_out",
                     dot_general=float32_dot_general)(attended)
