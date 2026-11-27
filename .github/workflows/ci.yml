@@ -148,6 +148,9 @@ jobs:
   derived:
     if: github.event_name == 'release'
     runs-on: ubuntu-latest
+    env:
+      # The generations a release's wheel carries derivations of, each one at least (tools/ci/package.sh).
+      GENERATIONS: sm80 sm90 sm100
     steps:
     - uses: actions/checkout@v4
     - uses: oven-sh/setup-bun@v2
@@ -158,13 +161,28 @@ jobs:
         ARMADA_URL: ${{ secrets.ARMADA_URL }}
         ARMADA_TOKEN: ${{ secrets.ARMADA_TOKEN }}
       run: |
-        # armada's map exits 1 where an item's command does, 2 where one could not run; each generation's row is
-        # read as well, so a generation that did not derive ships nothing in its place, whatever armada's exit.
-        printf '%s\n' sm80 sm90 sm100 | armada map --commit=${{ github.sha }} --items=- --size=large \
-          --label="derived-$GITHUB_REF_NAME" --artifacts="$RUNNER_TEMP/derived" --json -- \
+        # Each generation's row read whatever armada's exit (1 where an item's command failed, 2 where one could
+        # not run), and printed where any is not green: a generation green with its artifacts lost (`artifactsLost`)
+        # is no catalogue. Each generation's entries are moved to a directory named for it (armada's are by index),
+        # and every one must hold one entry at least (tools/ci/package.sh checks it again before it builds).
+        set +e
+        printf '%s\n' $GENERATIONS | armada map --commit=${{ github.sha }} --items=- --size=large \
+          --label="derived-$GITHUB_REF_NAME" --artifacts="$RUNNER_TEMP/runs" --json -- \
           sh -c 'sh tools/ci/derived.sh "$1" "$2/derived"' sh '{item}' '{artifacts}' > "$RUNNER_TEMP/derived.jsonl"
-        jq -se '[.[] | select(has("index"))] | length == 3 and all(.kind == "ok" and .exitCode == 0)' \
-          "$RUNNER_TEMP/derived.jsonl" > /dev/null || { cat "$RUNNER_TEMP/derived.jsonl"; exit 1; }
+        mapped=$?
+        set -e
+        jq -c 'select(has("index")) | {index, item, kind, exitCode, artifacts, artifactsLost}' \
+          "$RUNNER_TEMP/derived.jsonl" | tee "$RUNNER_TEMP/rows.jsonl"
+        [ "$mapped" = 0 ] || { echo "armada map exited $mapped"; exit 1; }
+        mkdir -p "$RUNNER_TEMP/derived"
+        for generation in $GENERATIONS; do
+          from=$(jq -r --arg g "$generation" 'select(.item == $g and .kind == "ok" and .exitCode == 0
+            and (.artifactsLost | not) and .artifacts != null) | .artifacts' "$RUNNER_TEMP/rows.jsonl")
+          [ -n "$from" ] && [ -n "$(ls "$from/derived"/*.json 2> /dev/null)" ] ||
+            { echo "$generation derived no catalogue"; exit 1; }
+          mv "$from/derived" "$RUNNER_TEMP/derived/$generation"
+          echo "$generation: $(ls "$RUNNER_TEMP/derived/$generation" | wc -l) derivations"
+        done
     - uses: actions/upload-artifact@v4
       with:
         name: derived
@@ -191,6 +209,7 @@ jobs:
     - name: Build, check, install and run the sdist and wheel; resolve the accelerator extras
       env:
         DEW_DERIVED: ${{ github.event_name == 'release' && format('{0}/derived', runner.temp) || '' }}
+        DEW_GENERATIONS: ${{ github.event_name == 'release' && 'sm80 sm90 sm100' || '' }}
       run: sh tools/ci/package.sh dist
     # A release publishes this sdist and wheel, the ones built and smoked here (python-publish.yml).
     - if: github.event_name == 'release'
