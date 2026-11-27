@@ -1243,6 +1243,31 @@ def test_a_resume_under_other_numerics_is_refused_whatever_its_objective_records
     with jax.default_matmul_precision("float32"):
         assert int(trainer(ambient, "ambient").fit(dataset(), steps=2).step) == 2
     assert int(trainer(Numerics(full, matmul="highest"), "ambient").fit(dataset(), steps=3).step) == 3
+    # A dot algorithm preset of JAX's default leaves JAX's own precision as "default" does: what its
+    # products computed at is JAX's then, refused where that moved.
+    preset = Numerics(full, matmul=jax.lax.DotAlgorithmPreset.DEFAULT)
+    with jax.default_matmul_precision("highest"):
+        trainer(preset, "preset").fit(dataset(), steps=1)
+    with pytest.raises(ValueError), jax.default_matmul_precision("high"):
+        trainer(preset, "preset").fit(dataset(), steps=2)
+    with jax.default_matmul_precision("highest"):
+        assert int(trainer(preset, "preset").fit(dataset(), steps=2).step) == 2
+
+
+def test_a_step_an_earlier_dew_wrote_states_its_products_by_its_declared_precision():
+    """A checkpoint's training record a Dew wrote before it recorded the precision its products computed at
+    (`products`) states it by its numerics' declared `matmul` where that names one, so a resume under
+    another is refused as one this Dew wrote; "default", which left JAX's own unrecorded, states none, and a
+    record stating `products` keeps its own (row 13708)."""
+    from dew.nn.precision import precision_names
+    from dew.training.startup import products_stated
+
+    def written(matmul: str) -> dict:
+        return {"numerics": {"matmul": matmul, "forms": "fast"}}
+
+    assert products_stated(written("highest"))["products"] == [*sorted(precision_names("highest"))]
+    assert "products" not in products_stated(written("default"))
+    assert products_stated({**written("highest"), "products": []})["products"] == []
 
 
 def test_a_resume_under_another_loss_setting_is_refused_as_a_fresh_run_beside_its_model_is(tmp_path):

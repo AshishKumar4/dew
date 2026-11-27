@@ -355,8 +355,10 @@ def test_an_indexed_reader_holds_the_declared_file_it_checked(tmp_path):
         holding[1]
 
 
-@pytest.mark.parametrize("scheme", ["hf", "privatehub"], ids=["the hub", "a named hub profile"])
-@pytest.mark.parametrize("transport", ["", "simplecache::"], ids=["direct", "through a transport cache"])
+@pytest.mark.parametrize(("scheme", "transport"), [
+    ("hf", ""), ("hf", "simplecache::"), ("privatehub", ""), ("privatehub", "simplecache::"), ("", "")],
+    ids=["the hub", "the hub through a transport cache", "a named hub profile",
+         "a named hub profile through a transport cache", "the hub its options name"])
 def test_a_hub_export_read_by_its_branch_reads_every_file_at_the_commit_it_named(monkeypatch, tmp_path,
                                                                               transport, scheme):
     """An export on a Hub repository read by its branch, directly or through a transport cache over the Hub
@@ -365,7 +367,8 @@ def test_a_hub_export_read_by_its_branch_reads_every_file_at_the_commit_it_named
     commit whose files hold other records, the source reads the records its manifest listed, from the files
     it listed (row 13554: through a cache, its files were read at the moved branch), through the Hub
     filesystem its URL names, a named profile's (`privatehub://`, its credential its own) as the Hub's
-    own (row 13709: its files were reopened through the plain Hub, which holds no credential of it)."""
+    own (row 13709: its files were reopened through the plain Hub, which holds no credential of it), and a
+    path its storage options name the Hub of (`protocol`) as a path still."""
     from types import SimpleNamespace
 
     from huggingface_hub import HfApi, HfFileSystem, parse_hf_uri
@@ -423,10 +426,12 @@ def test_a_hub_export_read_by_its_branch_reads_every_file_at_the_commit_it_named
     # The real Hub's filesystem again once the test ends.
     registry = importlib.import_module("fsspec.registry")._registry
     monkeypatch.setitem(registry, "hf", LocalHub if scheme == "hf" else Unreadable)
-    monkeypatch.setitem(registry, scheme, LocalHub if scheme == "hf" else Profiled)
-    source = Files(f"{transport}{scheme}://datasets/owner/data@main/export", format="parquet",
-                   storage_options={"simplecache": {"cache_storage": str(tmp_path / "cache")}} if transport
-                   else None)
+    if scheme:
+        monkeypatch.setitem(registry, scheme, LocalHub if scheme == "hf" else Profiled)
+    options = {"simplecache": {"cache_storage": str(tmp_path / "cache")}} if transport else (
+        None if scheme else {"protocol": "hf"})
+    url = f"{transport}{scheme}{'://' * bool(scheme)}datasets/owner/data@main/export"
+    source = Files(url, format="parquet", storage_options=options)
     # Its manifest read, none of its files yet, as a run's identity is taken before its reads.
     assert source.committed is not None
     branch["main"] = "1" * 40

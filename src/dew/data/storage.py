@@ -664,8 +664,9 @@ class Store:
         # Hub filesystem it names, a storage profile's with its credential among them (`privatehub://`,
         # `_profile`; row 13709).
         chain, _, last = self.url.rpartition("::")
-        scheme = last.split("://", 1)[0]
-        return replace(self, url=f"{chain}::" * bool(chain) + f"{scheme}://" + _hub_commit(hub, path)[1])
+        # Its scheme as it is written, none where its storage options name its filesystem (`protocol`).
+        scheme = last.split("://", 1)[0] + "://" if "://" in last else ""
+        return replace(self, url=f"{chain}::" * bool(chain) + scheme + _hub_commit(hub, path)[1])
 
     def cached(self) -> Store:
         if self.url.startswith("dewcache::"):

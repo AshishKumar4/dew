@@ -171,29 +171,9 @@ class PhasePasses[L, E]:
         (`dew.training.startup.computation_differs`): `objective`'s settings (`Objective.training_record`),
         the law a pass count drawn per microbatch follows (`SampledPasses`), whose change would draw
         another schedule of passes from the same key and positions (row 10783), and the numerics its
-        programs run under where it is read (`generation.numerics`: a trainer's `TrainerAdvanced.numerics`, a
-        run config's precision, else JAX's own) as they compute: the precision its unpinned products resolve
-        to there (`effective_precision`) in place of the precision they declare, which names one only beside
-        JAX's own setting ("default" and "highest" under JAX's "highest" compute alike; row 13708), and its
-        forms, recipe and outputs, which no tree or loss scale shows, whatever its objective records for
-        inference (row 13537)."""
-        from dew.nn.kernels import generation
-        from dew.nn.precision import Numerics, effective_precision, precision_names
-        from dew.registry import to_record
-
+        programs run under (`numerics_record`)."""
         sampled = {} if self.sampled is None else {"sampled_passes": asdict(self.sampled)}
-        policy = generation.numerics()
-        numerics = to_record(policy, Numerics)
-        # Its declared product precision is no evidence of what its products computed: `products` is.
-        if isinstance(numerics, dict):
-            numerics.pop("matmul", None)
-        # The precision an unpinned product multiplies at, resolved: the numerics' own where they name one,
-        # else JAX's as it is read (`effective_precision`), named canonically (`precision_names`: 'highest'
-        # and 'float32' one), none where neither is set: numerics at "default" leave JAX's own setting,
-        # which another context may set otherwise.
-        stated = None if policy.matmul == "default" else policy.matmul
-        products: list[JSON] = [*sorted(precision_names(effective_precision(stated)))]
-        return {**objective.training_record(), **sampled, "numerics": numerics, "products": products}
+        return {**objective.training_record(), **sampled, **numerics_record()}
 
     def drawn_cap(self) -> int | None:
         """The cap of the pass count a run draws per microbatch, a batch's counted work's width
@@ -429,3 +409,23 @@ def _about_mode(mode: float, dispersion: float) -> float:
     total = sum(integrate.quad(integrand, start, end, epsabs=0, epsrel=1e-13, limit=200)[0]
                 for edges in halves for start, end in itertools.pairwise(edges))
     return log_width + math.log(total)
+
+
+def numerics_record() -> dict[str, JSON]:
+    """The numerics a run's programs run under where it is read (`generation.numerics`: a trainer's
+    `TrainerAdvanced.numerics`, a run config's precision, else JAX's own) as they compute, which a
+    checkpoint's training record holds (`PhasePasses.training_record`): the precision its unpinned products
+    multiply at as it is read, resolved (`effective_precision`: a dot algorithm preset of JAX's default, as
+    "default", JAX's own setting) and named canonically (`precision_names`: 'highest' and 'float32' one),
+    none where JAX's is unset, in place of the precision they declare ("default" and "highest" under JAX's
+    "highest" compute alike; row 13708), and its forms, recipe and outputs, which no tree or loss scale
+    shows (row 13537)."""
+    from dew.nn.kernels import generation
+    from dew.nn.precision import Numerics, effective_precision, precision_names
+    from dew.registry import to_record
+
+    numerics = to_record(generation.numerics(), Numerics)
+    if isinstance(numerics, dict):
+        numerics.pop("matmul", None)
+    products: list[JSON] = [*sorted(precision_names(effective_precision(None)))]
+    return {"numerics": numerics, "products": products}
