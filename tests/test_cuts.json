@@ -232,7 +232,7 @@
 "tests/test_attention_decode_template.py::test_a_paged_decode_step_of_pages_smaller_than_its_tile_compiles_for_an_h100[4]",
 "tests/test_attention_decode_template.py::test_a_paged_decode_step_through_the_template_is_on_par_interpreted[one-query-sm80-4]",
 "tests/test_attention_decode_template.py::test_a_paged_decode_step_through_the_template_is_on_par_interpreted[verify-four-sm80-4]",
-"tests/test_attention_decode_template.py::test_a_split_absorbed_mla_decode_step_whose_values_are_its_keys_leading_columns_is_on_par_interpreted",
+"tests/test_attention_decode_template.py::test_a_split_decode_step_at_aligned_keys_beside_an_empty_row_is_on_par_interpreted",
 "tests/test_attention_decode_template.py::test_a_split_decode_steps_price_includes_the_native_merges_bytes_and_span",
 "tests/test_attention_decode_template.py::test_a_verify_blocks_drafts_read_their_prefix_causally_interpreted[16]",
 "tests/test_attention_decode_template.py::test_an_a100s_decode_walk_prices_its_larger_key_tile_at_or_below_its_smaller[1-32768-128]",
@@ -371,7 +371,7 @@
 "tests/test_attention_mosaic.py::test_the_forward_is_on_par_over_every_call_form_interpreted[sm80-cross-causal-lengths-starts]",
 "tests/test_attention_mosaic.py::test_the_forward_is_on_par_over_every_call_form_interpreted[sm90-causal-documents-window]",
 "tests/test_attention_mosaic.py::test_the_forward_is_on_par_over_every_call_form_interpreted[sm90-cross-causal-window]",
-"tests/test_attention_mosaic.py::test_the_forward_is_on_par_over_every_call_form_interpreted[sm90-documents]",
+"tests/test_attention_mosaic.py::test_the_forward_is_on_par_over_every_call_form_interpreted[sm90-full]",
 "tests/test_attention_mosaic.py::test_the_forward_is_on_par_under_every_hook_interpreted[alibi-float16-natural-sm80]",
 "tests/test_attention_mosaic.py::test_the_forward_is_on_par_under_every_hook_interpreted[all-float16-sm90]",
 "tests/test_attention_mosaic.py::test_the_forward_is_on_par_under_every_hook_interpreted[custom-vjp-bfloat16-sm80]",
@@ -512,7 +512,7 @@
 "tests/test_attention_mosaic_compile.py::test_the_forward_compiles_spill_free_as_its_model_decides[sm86-128-NONE-bfloat16-temperature]",
 "tests/test_attention_mosaic_compile.py::test_the_forward_compiles_spill_free_as_its_model_decides[sm86-128-OUTPUT-bfloat16-none]",
 "tests/test_attention_mosaic_compile.py::test_the_forward_compiles_spill_free_as_its_model_decides[sm86-128-SPLIT-bfloat16-none]",
-"tests/test_attention_mosaic_compile.py::test_the_forward_compiles_spill_free_as_its_model_decides[sm86-128-SPLIT-bfloat16-softcap]",
+"tests/test_attention_mosaic_compile.py::test_the_forward_compiles_spill_free_as_its_model_decides[sm86-128-SPLIT-bfloat16-temperature]",
 "tests/test_attention_mosaic_compile.py::test_the_forward_compiles_spill_free_as_its_model_decides[sm86-256-NONE-bfloat16-softcap]",
 "tests/test_attention_mosaic_compile.py::test_the_forward_compiles_spill_free_as_its_model_decides[sm86-64-NONE-bfloat16-none]",
 "tests/test_attention_mosaic_compile.py::test_the_forward_compiles_spill_free_as_its_model_decides[sm86-64-SPLIT-bfloat16-none]",
@@ -719,7 +719,7 @@
 ],
 "tests/test_attention_triton.py": [
 "tests/test_attention_triton.py::test_a_float32_call_compiles_spill_free_for_an_h100[256 packed rows]",
-"tests/test_attention_triton.py::test_a_forward_at_its_own_config_compiles_within_an_a100s_block[OUTPUT]",
+"tests/test_attention_triton.py::test_a_float32_call_compiles_spill_free_for_an_h100[512 a row]",
 "tests/test_attention_triton.py::test_a_forward_at_its_own_config_compiles_within_an_a100s_block[SPLIT]",
 "tests/test_attention_triton.py::test_a_program_whose_block_xla_refuses_steps_its_triton_launch_down",
 "tests/test_attention_triton.py::test_a_triton_launchs_shared_memory_is_what_triton_allocates[a100-bf16-128-forward-128x64]",
@@ -780,7 +780,7 @@
 "tests/test_attention_triton_backward.py::test_the_backward_is_on_par_over_the_core_s_other_call_forms[cross-block-causal-window]",
 "tests/test_attention_triton_backward.py::test_the_backward_is_on_par_over_the_core_s_other_call_forms[cross-causal]",
 "tests/test_attention_triton_backward.py::test_the_backward_is_on_par_over_the_core_s_other_call_forms[documents-block-causal-window]",
-"tests/test_attention_triton_backward.py::test_the_backward_is_on_par_over_the_core_s_other_call_forms[documents-window-valid-places]",
+"tests/test_attention_triton_backward.py::test_the_backward_is_on_par_over_the_core_s_other_call_forms[documents-lengths]",
 "tests/test_attention_triton_backward.py::test_the_backward_is_on_par_over_the_core_s_other_call_forms[lengths]",
 "tests/test_attention_triton_backward.py::test_the_backward_is_on_par_over_the_core_s_other_call_forms[widest-window]",
 "tests/test_attention_triton_backward.py::test_the_plain_backward_is_on_par_over_runs[runs-Tiles(block_q=64, block_k=32, warps=4, stages=2)-default]",
@@ -792,8 +792,8 @@
 "tests/test_attention_triton_hooks.py": [
 "tests/test_attention_triton_hooks.py::test_the_backward_is_on_par_under_every_score_hook[alibi-float16-default]",
 "tests/test_attention_triton_hooks.py::test_the_backward_is_on_par_under_every_score_hook[band-bias-bfloat16-accurate]",
-"tests/test_attention_triton_hooks.py::test_the_backward_is_on_par_under_every_score_hook[band-bias-float32-accurate]",
-"tests/test_attention_triton_hooks.py::test_the_backward_is_on_par_under_every_score_hook[custom-vjp-float16-accurate]",
+"tests/test_attention_triton_hooks.py::test_the_backward_is_on_par_under_every_score_hook[band-bias-float32-default]",
+"tests/test_attention_triton_hooks.py::test_the_backward_is_on_par_under_every_score_hook[custom-vjp-float16-default]",
 "tests/test_attention_triton_hooks.py::test_the_backward_is_on_par_under_every_score_hook[key-bias-bfloat16-accurate]",
 "tests/test_attention_triton_hooks.py::test_the_backward_is_on_par_under_every_score_hook[key-bias-float16-default]",
 "tests/test_attention_triton_hooks.py::test_the_backward_is_on_par_under_every_score_hook[key-bias-float32-default]",
@@ -1376,9 +1376,6 @@
 "tests/test_decision_workflow.py::test_a_cell_of_the_workflow_holds_the_conservation_contract[question-plain-0.0-share]",
 "tests/test_decision_workflow.py::test_the_workflows_resumed_run_ends_on_its_uninterrupted_run_from_its_compiled_programs",
 "tests/test_decision_workflow.py::test_the_workflows_task_answers_from_its_compiled_programs"
-],
-"tests/test_declared_cells_memory.py": [
-"tests/test_declared_cells_memory.py::test_a_gated_stacks_backward_holds_no_layers_outputs_past_its_layer[sm90-one device]"
 ],
 "tests/test_decode_attention.py": [
 "tests/test_decode_attention.py::test_the_decode_kernel_applies_sinks_and_a_softcap_at_every_config[bfloat16-both-fold-16]",
@@ -2179,7 +2176,9 @@
 "tests/test_inkling2.py::test_its_logits_are_on_par_with_transformers[inkling2-tiny-stepped_logits]"
 ],
 "tests/test_inkling2_draft.py": [
-"tests/test_inkling2_draft.py::test_a_drafts_taps_mix_by_their_weights_rounded",
+"tests/test_inkling2_draft.py::test_a_load_keeping_no_prediction_depths_reads_no_draft",
+"tests/test_inkling2_draft.py::test_a_replayed_block_drafts_as_a_prefill_of_its_history",
+"tests/test_inkling2_draft.py::test_its_taps_and_draft_are_on_par_with_the_releases[draft-float32-context]",
 "tests/test_inkling2_draft.py::test_its_taps_and_draft_are_on_par_with_the_releases[draft_bf16-bfloat16-context]",
 "tests/test_inkling2_draft.py::test_speculative_decoding_with_its_draft_emits_the_greedy_walk",
 "tests/test_inkling2_draft.py::test_taps_past_the_targets_visits_are_refused[past]"
@@ -2636,7 +2635,7 @@
 "tests/test_lowering.py::test_a_mamba2_layer_lowers_for_every_gpu[sm120]",
 "tests/test_lowering.py::test_a_mamba_layer_lowers_its_template_scan_for_each_gpu_it_takes[sm90]",
 "tests/test_lowering.py::test_a_packed_recurrence_runs_on_each_devices_own_rows",
-"tests/test_lowering.py::test_a_remat_rung_keeping_the_delta_rules_residuals_runs_the_templates_forward_once",
+"tests/test_lowering.py::test_a_route_off_its_preferred_kernel_is_logged_once_at_info_and_one_on_it_not_at_all",
 "tests/test_lowering.py::test_a_step_compiles_ahead_here_for_a_tpu_topology_and_states_each_devices_memory",
 "tests/test_lowering.py::test_every_kernel_launch_takes_its_own_devices_rows_on_a_two_device_mesh[sm80-attention]",
 "tests/test_lowering.py::test_every_kernel_launch_takes_its_own_devices_rows_on_a_two_device_mesh[sm80-expert layer]",
