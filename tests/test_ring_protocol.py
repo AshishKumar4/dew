@@ -909,6 +909,55 @@ def test_an_emitted_copy_of_a_slots_first_rows_holds_their_reads_alone(rows, ref
     assert bool(ring_protocol.cp_async_violations(events)) == refused
 
 
+@pytest.mark.parametrize(("second", "refused"), [((8, 16), False), ((4, 12), True)],
+                         ids=["the-slots-last-rows", "rows-the-first-copy-writes"])
+def test_a_copy_beside_a_pending_one_clashes_only_where_their_rows_meet(second, refused):
+    """Two cp.async copies into one slot, the first pending as the second issues (each its own group, none
+    waited for), interpreted (`programs`): rows 0:8 and 8:16 are apart, no clash, and once both land a read
+    of a row of each is held; rows 0:8 and 4:12 meet and clash (`cp_async_violations`), though every pair
+    shares one alias location, the slot (`_shares`)."""
+    from jax.experimental import pallas as pl
+    from jax.experimental.pallas import mosaic_gpu as plgpu
+
+    def body(source_gmem, out_gmem):
+        def scoped(ring):
+            plgpu.copy_gmem_to_smem(source_gmem.at[0:8], ring.at[0, 0:8], None)
+            plgpu.copy_gmem_to_smem(source_gmem.at[second[0]:second[1]], ring.at[0, second[0]:second[1]],
+                                    None)
+            plgpu.wait_gmem_to_smem(0)
+            out_gmem[0] = (ring[0, 2][0] + ring[0, 9][0]).astype(jnp.float32)
+
+        pl.run_scoped(scoped, plgpu.SMEM((2, 16, 64), jnp.bfloat16))
+
+    kernel = plgpu.kernel(body, out_type=jax.ShapeDtypeStruct((1,), jnp.float32))
+    (events,), _ = programs(kernel, jnp.zeros((16, 64), jnp.bfloat16), threads=1)
+    # The clash alone: each read lies within one landed copy.
+    assert len(ring_protocol.cp_async_violations(events)) == int(refused)
+
+
+@pytest.mark.parametrize(("rows", "refused"), [((0, 8), False), ((8, 16), True)],
+                         ids=["the-copied-rows", "the-rows-past-them"])
+def test_a_reshaped_view_read_whole_is_held_at_the_rows_it_views(rows, refused):
+    """A cp.async copy of a 16-row slot's first 8 rows, committed and waited for (`programs`), then a read of
+    a view of 8 of its rows reshaped flat and taken whole (`ring.at[0, lo:hi].reshape(512)[0:512]`): held
+    where the view's rows are the copied ones and refused where they are not, the whole view's indexer no
+    index of the slot's (`_extent`), never the slot's whole alias in their place."""
+    from jax.experimental import pallas as pl
+    from jax.experimental.pallas import mosaic_gpu as plgpu
+
+    def body(source_gmem, out_gmem):
+        def scoped(ring):
+            plgpu.copy_gmem_to_smem(source_gmem.at[0:8], ring.at[0, 0:8], None)
+            plgpu.wait_gmem_to_smem(0)
+            out_gmem[0] = ring.at[0, rows[0]:rows[1]].reshape(512)[0:512][0].astype(jnp.float32)
+
+        pl.run_scoped(scoped, plgpu.SMEM((2, 16, 64), jnp.bfloat16))
+
+    kernel = plgpu.kernel(body, out_type=jax.ShapeDtypeStruct((1,), jnp.float32))
+    (events,), _ = programs(kernel, jnp.zeros((16, 64), jnp.bfloat16), threads=1)
+    assert bool(ring_protocol.cp_async_violations(events)) == refused
+
+
 @pytest.mark.parametrize(("view", "within", "refused"),
                          [((0, 8), 2, False), ((0, 8), (2, 6), False), ((8, 16), 1, True),
                           ((4, 12), 3, False), ((4, 12), 4, True)],
