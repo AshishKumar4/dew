@@ -18,7 +18,7 @@ import functools
 from collections.abc import Iterator
 from pathlib import Path
 
-import lint_scopes as scopes
+from tools import lint_scopes as scopes
 
 DERIVATIVE_MAKERS = frozenset({"custom_jvp", "custom_vjp", "surrogate", "declared_derivative",
                                "declared_tangent", "linear_tangent"})

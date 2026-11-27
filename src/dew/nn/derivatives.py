@@ -440,7 +440,7 @@ type TangentKind = Protected | KernelGlue | Algebra
 """The kinds a tangent rule is declared as (`declared_tangent`): a surrogate's forward mode is `surrogate`'s
 alone, the one route whose rule reads the surrogate's own value."""
 
-marked_call_p = create_call_primitive("marked_call")
+marked_call_p = programs.register_call(create_call_primitive("marked_call"))
 """A marked span: a call of its body's jaxpr (`call_jaxpr`) under its `kind`, whose JVP, linearization,
 transpose, batching, partial evaluation and checkpointing are JAX's call primitive's, each a marked call of
 the same kind; lowered by inlining its body, so it costs nothing compiled, inside a Pallas kernel's body too

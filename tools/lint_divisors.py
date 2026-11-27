@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TypeGuard
 
-import lint_scopes as scopes
+from tools import lint_scopes as scopes
 
 ARRAY_MODULES = ("jax.numpy", "jax.lax", "jax.nn", "jax.random", "jax.scipy")
 """The modules whose functions return JAX arrays (but `ARRAY_FACTS`), which SLOP024 proves an operand by."""

@@ -68,8 +68,8 @@ case "${1:-}" in
     }
     changed_ruff() { changed_files $ruff_inputs && xargs -0r "$PYTHON" -m ruff check < "$listed"; }
     changed_slop() {
-      changed_files $("$PYTHON" tools/lint_slop.py --print-roots) &&
-        JAX_PLATFORMS=cpu xargs -0r "$PYTHON" tools/lint_slop.py < "$listed"
+      changed_files $("$PYTHON" -m tools.lint_slop --print-roots) &&
+        JAX_PLATFORMS=cpu xargs -0r "$PYTHON" -m tools.lint_slop < "$listed"
     }
     # Pyright over the changed files under its inputs (`pyright_inputs`, tools/lint_inputs.sh): its gate's own
     # command, the files, each one word as git names it, in place of its inputs (2026-11-10: read off the command's

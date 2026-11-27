@@ -28,8 +28,16 @@ def _weights(weights, scale):
     return ((jnp.abs(weights) + 0.25) * scale).at[:, 0].set(0.0)
 
 
+_SECOND = frozenset({"jvp of grad", "jvp of grad, nested jit", "jvp of grad, remat", "jvp of grad, scanned",
+                     "grad of grad-mesh"})
+"""The weighted walk's orders whose program, both gradients' leaves at once, peaked at 6.9 to 9.1 GiB of a
+CI container's 10 (armada at main 448d44837, alone in a fresh process; Train 1357's OOM kill at 10.0 GiB):
+each runs a leaf at a time (`result_leaf`), its program the leaf's own."""
+
+
 @pytest.mark.parametrize(("orders", "placement"),
-                         [case for case in _ORDERS if case.id != "grad of grad-local"])
+                         [case for case in _ORDERS
+                          if case.id != "grad of grad-local" and case.id not in _SECOND])
 def test_the_weighted_moments_walk_holds_every_order(orders, placement):
     _weighted_contract(orders, placement, EDGES)
 
@@ -42,6 +50,12 @@ def _value_gradient(result):
 def _weight_gradient(result):
     _, weight = result
     return weight
+
+
+@pytest.mark.parametrize("result_leaf", [_value_gradient, _weight_gradient], ids=["value", "weight"])
+@pytest.mark.parametrize(("orders", "placement"), [case for case in _ORDERS if case.id in _SECOND])
+def test_the_weighted_moments_walk_holds_each_second_orders_leaf(orders, placement, result_leaf):
+    _weighted_contract(orders, placement, EDGES, result_leaf=result_leaf)
 
 
 @pytest.mark.fresh_process
