@@ -10,6 +10,9 @@
 "tests/test_aggregation.py::test_a_prefill_flown_a_window_at_a_time_writes_the_replay_one_pass_writes[False]",
 "tests/test_aggregation.py::test_an_agent_trained_to_imitate_labels_learns_the_labels_not_the_actions_taken"
 ],
+"tests/test_ahead_certification.py": [
+"tests/test_ahead_certification.py::test_a_steps_planner_certifies_its_launches_beside_the_trace_that_reaches_them"
+],
 "tests/test_algebra_bounds.py": [
 "tests/test_algebra_bounds.py::test_every_bound_stated_from_a_floor_holds_every_output_its_operands_reach[over a logistic and a constant-float16--3-7]",
 "tests/test_algebra_bounds.py::test_every_bound_stated_from_a_floor_holds_every_output_its_operands_reach[over an exponential-bfloat16-0-2]",
@@ -17,31 +20,31 @@
 "tests/test_algebra_bounds.py::test_every_stated_bound_holds_every_output_its_operands_reach[reduce_max-uint16-(0,)]"
 ],
 "tests/test_algebra_derive.py": [
-"tests/test_algebra_derive.py::test_a_stationary_weight_direction_cannot_erase_another_samples_tangent[merge]",
-"tests/test_algebra_derive.py::test_a_stationary_weight_direction_cannot_erase_another_samples_tangent[walk]",
-"tests/test_algebra_derive.py::test_an_equation_outside_the_language_over_a_walks_total_is_refused",
+"tests/test_algebra_derive.py::test_a_stationary_weight_direction_cannot_erase_another_samples_tangent[value-walk]",
+"tests/test_algebra_derive.py::test_central_moment_derivation_handles_keepdims_scalar_1d_and_square_op",
 "tests/test_algebra_derive.py::test_chunked_covariance_keeps_its_large_weight_tangents[2-merge]",
+"tests/test_algebra_derive.py::test_chunked_covariance_preserves_zero_weight_derivatives_and_extreme_anchors[merge]",
 "tests/test_algebra_derive.py::test_chunked_covariance_preserves_zero_weight_derivatives_and_extreme_anchors[walk]",
-"tests/test_algebra_derive.py::test_chunked_mean_balances_higher_weight_derivatives[2-merge]",
-"tests/test_algebra_derive.py::test_chunked_moment_value_gradient_keeps_its_mixed_zero_weight_direction[all-zero-mean-walk]",
-"tests/test_algebra_derive.py::test_chunked_moment_value_gradient_keeps_its_mixed_zero_weight_direction[one-zero-mean-merge]",
+"tests/test_algebra_derive.py::test_chunked_mean_balances_higher_weight_derivatives[1-walk]",
+"tests/test_algebra_derive.py::test_chunked_moment_value_gradient_keeps_its_mixed_zero_weight_direction[all-zero-variance-merge]",
 "tests/test_algebra_derive.py::test_chunked_moment_value_gradient_keeps_its_mixed_zero_weight_direction[one-zero-variance-walk]",
+"tests/test_algebra_derive.py::test_chunked_moments_balanced_quotient_direction_jvp[2-merge]",
 "tests/test_algebra_derive.py::test_chunked_moments_balances_unequal_scales_value_gradients_and_explicit_sharding",
 "tests/test_algebra_derive.py::test_chunked_moments_contract_broadcasts_promotes_scans_and_rejects_empty",
-"tests/test_algebra_derive.py::test_chunked_moments_handles_narrow_float16_and_bfloat16_inputs[walk-bfloat16]",
-"tests/test_algebra_derive.py::test_chunked_moments_move_value_cotangents_along_weights[2-merge]",
-"tests/test_algebra_derive.py::test_chunked_moments_preserve_the_large_mean_cotangent[1-walk]",
-"tests/test_algebra_derive.py::test_chunked_moments_preserves_zero_weight_derivatives_and_extreme_anchors[walk]",
-"tests/test_algebra_derive.py::test_chunked_variance_cancels_joint_value_weight_directions[1-merge]",
+"tests/test_algebra_derive.py::test_chunked_moments_handles_narrow_float16_and_bfloat16_inputs[merge-float16]",
+"tests/test_algebra_derive.py::test_chunked_moments_move_value_cotangents_along_weights[1-merge]",
+"tests/test_algebra_derive.py::test_chunked_moments_move_weight_cotangents_along_values[2-walk]",
+"tests/test_algebra_derive.py::test_chunked_moments_preserves_extreme_anchors[opposite-sign-vjp-walk]",
+"tests/test_algebra_derive.py::test_chunked_moments_preserves_zero_weight_derivatives[variance-vjp-2-walk]",
+"tests/test_algebra_derive.py::test_chunked_variance_cancels_joint_value_weight_directions[1-walk]",
 "tests/test_algebra_derive.py::test_chunked_variance_cancels_joint_value_weight_directions[2-walk]",
-"tests/test_algebra_derive.py::test_direct_weighted_moment_forms_keep_zero_weight_jvp[shifted-walk]",
-"tests/test_algebra_derive.py::test_jitted_chunked_moment_value_gradient_matches_the_direct_zero_weight_gradient[one-zero-mean-walk]",
-"tests/test_algebra_derive.py::test_subnormal_weight_dispatch_keeps_explicit_row_sharding[direct]",
-"tests/test_algebra_derive.py::test_weighted_central_moments_derive_and_match_float64_at_high_mean[walk]",
+"tests/test_algebra_derive.py::test_direct_weighted_moment_forms_keep_zero_weight_jvp[one-zero-merge]",
+"tests/test_algebra_derive.py::test_mixed_covariance_in_a_constant_direction_is_zero[1-65536]",
+"tests/test_algebra_derive.py::test_the_derived_walk_computes_the_declared_function[products-walked]",
+"tests/test_algebra_derive.py::test_weighted_moments_exclude_nonfinite_zero_weight_samples_without_losing_finite_directions[direct]",
 "tests/test_algebra_derive.py::test_weighted_moments_exclude_nonfinite_zero_weight_samples_without_losing_finite_directions[walk]",
-"tests/test_algebra_derive.py::test_weighted_moments_keep_subnormal_mass_in_their_mean_variance_and_pullback[direct-batched]",
-"tests/test_algebra_derive.py::test_zero_mass_scaled_covariance_ad",
-"tests/test_algebra_derive.py::test_zero_weighted_values_keep_zero_tangents_when_finite_weights_overflow_the_mass[merge]"
+"tests/test_algebra_derive.py::test_weighted_moments_keep_the_direction_when_dividing_first_would_flush[walk]",
+"tests/test_algebra_derive.py::test_zero_mass_scaled_covariance_ad"
 ],
 "tests/test_algebra_fusion.py": [
 "tests/test_algebra_fusion.py::test_a_layer_under_the_pass_computes_what_it_does_as_written[sm80-named-biased]",
@@ -49,14 +52,16 @@
 "tests/test_algebra_fusion.py::test_a_parts_prepare_holds_a_prologues_custom_derivative_by_its_name"
 ],
 "tests/test_algebra_generate.py": [
-"tests/test_algebra_generate.py::test_new_template_components_certify_every_primitive_on_the_cpu[written-gdn_value_pullback]"
+"tests/test_algebra_generate.py::test_new_template_components_certify_every_primitive_on_the_cpu[written-key_dropped_cotangents]",
+"tests/test_algebra_generate.py::test_the_command_checks_the_declaring_modules_own_declarations[qualified]",
+"tests/test_algebra_generate.py::test_the_written_modules_are_what_generation_writes"
 ],
 "tests/test_algebra_laws.py": [
 "tests/test_algebra_laws.py::test_every_structure_of_the_backward_tile_is_certified[True-False-False]"
 ],
 "tests/test_algebra_merged_state.py": [
-"tests/test_algebra_merged_state.py::test_a_merged_state_is_on_par_with_its_output_and_its_total_and_their_derivatives[jitted-its value]",
-"tests/test_algebra_merged_state.py::test_a_merged_state_is_on_par_with_its_output_and_its_total_and_their_derivatives[op by op-batched]"
+"tests/test_algebra_merged_state.py::test_a_merged_state_is_on_par_with_its_output_and_its_total_and_their_derivatives[jitted-batched]",
+"tests/test_algebra_merged_state.py::test_a_merged_state_is_on_par_with_its_output_and_its_total_and_their_derivatives[op by op-its value]"
 ],
 "tests/test_algebra_merged_state_derivatives.py": [
 "tests/test_algebra_merged_state_derivatives.py::test_a_merged_states_gradients_derivatives_are_on_par_with_its_parts[on a tpu-two masses]",
@@ -147,8 +152,8 @@
 "tests/test_attention_algebra.py": [
 "tests/test_attention_algebra.py::test_a_plain_call_of_no_keys_reads_its_initial_state_or_zero_in_both_mainloops[full-fp32-least]",
 "tests/test_attention_algebra.py::test_a_querys_gradient_over_keys_near_fp32s_largest_is_finite_at_any_scale_and_slope[slope-2]",
-"tests/test_attention_algebra.py::test_a_resumed_state_carried_far_is_as_exact_as_the_references[default]",
-"tests/test_attention_algebra.py::test_an_fp16_backward_keeps_a_gradient_whose_scores_are_large_but_cancel[8]",
+"tests/test_attention_algebra.py::test_a_quotient_below_the_least_normal_is_correctly_rounded_on_a_flushing_cpu",
+"tests/test_attention_algebra.py::test_an_fp16_backward_keeps_a_gradient_whose_scores_are_large_but_cancel[128]",
 "tests/test_attention_algebra.py::test_the_forwards_split_sums_give_the_first_passes_gradients[none]",
 "tests/test_attention_algebra.py::test_the_merges_derivative_along_drawn_directions_is_on_par[masses-near-2^126-along-least-normal-jitted]",
 "tests/test_attention_algebra.py::test_the_merges_derivative_along_its_denominators_is_on_par[subunit-masses-under-large-outputs-as written]",
@@ -748,59 +753,59 @@
 "tests/test_attention_triton.py::test_the_forward_is_on_par_over_every_call_form[causal-documents-window-Tiles(block_q=64, block_k=32, warps=4, stages=2)]",
 "tests/test_attention_triton.py::test_the_forward_is_on_par_over_every_call_form[cross-causal-lengths-starts-Tiles(block_q=128, block_k=64, warps=4, stages=2)]",
 "tests/test_attention_triton.py::test_the_forward_is_on_par_over_every_call_form[full-Tiles(block_q=32, block_k=32, warps=4, stages=2)]",
-"tests/test_attention_triton.py::test_the_forward_is_on_par_over_every_call_form[two-sided-window-Tiles(block_q=64, block_k=32, warps=4, stages=2)]",
+"tests/test_attention_triton.py::test_the_forward_is_on_par_over_the_core_s_other_call_forms[block-causal]",
 "tests/test_attention_triton.py::test_the_forward_is_on_par_over_the_core_s_other_call_forms[cross-documents]",
-"tests/test_attention_triton.py::test_the_forward_is_on_par_over_the_core_s_other_call_forms[widest-window]",
-"tests/test_attention_triton.py::test_the_forward_is_on_par_under_every_hook[all-float32-natural]",
-"tests/test_attention_triton.py::test_the_forward_is_on_par_under_every_hook[none-float32-natural]",
-"tests/test_attention_triton.py::test_the_forward_is_on_par_under_every_hook[softcap-bfloat16-fold]",
-"tests/test_attention_triton.py::test_the_frozen_mainloop_is_on_par_over_runs[runs-Tiles(block_q=32, block_k=32, warps=4, stages=2)]",
+"tests/test_attention_triton.py::test_the_forward_is_on_par_over_the_core_s_other_call_forms[valid]",
+"tests/test_attention_triton.py::test_the_forward_is_on_par_under_every_hook[all-float16-fold]",
+"tests/test_attention_triton.py::test_the_forward_is_on_par_under_every_hook[none-float16-natural]",
+"tests/test_attention_triton.py::test_the_forward_is_on_par_under_every_hook[sinks-float16-fold]",
+"tests/test_attention_triton.py::test_the_forward_is_on_par_under_every_hook[softcap-float32-natural]",
 "tests/test_attention_triton.py::test_the_frozen_mainloop_is_on_par_over_runs[runs-Tiles(block_q=64, block_k=32, warps=4, stages=2)]",
-"tests/test_attention_triton.py::test_the_frozen_mainloop_is_on_par_over_runs[runs-causal-Tiles(block_q=64, block_k=32, warps=4, stages=2)]",
-"tests/test_attention_triton.py::test_the_frozen_mainloop_is_on_par_over_runs[runs-documents-valid-Tiles(block_q=32, block_k=32, warps=4, stages=2)]",
-"tests/test_attention_triton.py::test_the_plain_forward_is_on_par_over_runs[runs-Tiles(block_q=128, block_k=64, warps=4, stages=2)]"
+"tests/test_attention_triton.py::test_the_frozen_mainloop_is_on_par_over_runs[runs-chunk-places-Tiles(block_q=32, block_k=32, warps=4, stages=2)]",
+"tests/test_attention_triton.py::test_the_frozen_mainloop_is_on_par_over_runs[runs-documents-valid-Tiles(block_q=64, block_k=32, warps=4, stages=2)]",
+"tests/test_attention_triton.py::test_the_plain_forward_is_on_par_over_runs[runs-causal-Tiles(block_q=64, block_k=32, warps=4, stages=2)]"
 ],
 "tests/test_attention_triton_backward.py": [
-"tests/test_attention_triton_backward.py::test_the_backward_is_on_par_over_every_call_form[causal-window-Tiles(block_q=64, block_k=32, warps=4, stages=2)-accurate]",
-"tests/test_attention_triton_backward.py::test_the_backward_is_on_par_over_every_call_form[cross-causal-lengths-starts-Tiles(block_q=32, block_k=32, warps=4, stages=2)-accurate]",
-"tests/test_attention_triton_backward.py::test_the_backward_is_on_par_over_every_call_form[cross-causal-lengths-starts-Tiles(block_q=64, block_k=32, warps=4, stages=2)-default]",
-"tests/test_attention_triton_backward.py::test_the_backward_is_on_par_over_every_call_form[documents-Tiles(block_q=32, block_k=32, warps=4, stages=2)-default]",
+"tests/test_attention_triton_backward.py::test_the_backward_is_on_par_over_every_call_form[causal-window-Tiles(block_q=32, block_k=32, warps=4, stages=2)-default]",
+"tests/test_attention_triton_backward.py::test_the_backward_is_on_par_over_every_call_form[cross-causal-lengths-starts-Tiles(block_q=128, block_k=64, warps=4, stages=2)-accurate]",
+"tests/test_attention_triton_backward.py::test_the_backward_is_on_par_over_every_call_form[cross-causal-lengths-starts-Tiles(block_q=64, block_k=32, warps=4, stages=2)-accurate]",
+"tests/test_attention_triton_backward.py::test_the_backward_is_on_par_over_every_call_form[documents-Tiles(block_q=32, block_k=32, warps=4, stages=2)-accurate]",
 "tests/test_attention_triton_backward.py::test_the_backward_is_on_par_over_every_call_form[documents-Tiles(block_q=64, block_k=32, warps=4, stages=2)-default]",
-"tests/test_attention_triton_backward.py::test_the_backward_is_on_par_over_every_call_form[full-Tiles(block_q=32, block_k=32, warps=4, stages=2)-accurate]",
+"tests/test_attention_triton_backward.py::test_the_backward_is_on_par_over_every_call_form[full-Tiles(block_q=32, block_k=32, warps=4, stages=2)-default]",
 "tests/test_attention_triton_backward.py::test_the_backward_is_on_par_over_every_call_form[two-sided-window-Tiles(block_q=128, block_k=64, warps=4, stages=2)-accurate]",
-"tests/test_attention_triton_backward.py::test_the_backward_is_on_par_over_every_call_form[two-sided-window-Tiles(block_q=32, block_k=32, warps=4, stages=2)-default]",
+"tests/test_attention_triton_backward.py::test_the_backward_is_on_par_over_every_call_form[two-sided-window-Tiles(block_q=64, block_k=32, warps=4, stages=2)-accurate]",
 "tests/test_attention_triton_backward.py::test_the_backward_is_on_par_over_the_core_s_other_call_forms[causal-chunk]",
 "tests/test_attention_triton_backward.py::test_the_backward_is_on_par_over_the_core_s_other_call_forms[causal-widest-window]",
 "tests/test_attention_triton_backward.py::test_the_backward_is_on_par_over_the_core_s_other_call_forms[chunk]",
 "tests/test_attention_triton_backward.py::test_the_backward_is_on_par_over_the_core_s_other_call_forms[cross-block-causal-window]",
-"tests/test_attention_triton_backward.py::test_the_backward_is_on_par_over_the_core_s_other_call_forms[cross-causal-window-valid]",
-"tests/test_attention_triton_backward.py::test_the_backward_is_on_par_over_the_core_s_other_call_forms[documents-block-causal-window]",
+"tests/test_attention_triton_backward.py::test_the_backward_is_on_par_over_the_core_s_other_call_forms[cross-causal]",
+"tests/test_attention_triton_backward.py::test_the_backward_is_on_par_over_the_core_s_other_call_forms[cross-window]",
 "tests/test_attention_triton_backward.py::test_the_backward_is_on_par_over_the_core_s_other_call_forms[documents-causal-chunk-places]",
-"tests/test_attention_triton_backward.py::test_the_backward_is_on_par_over_the_core_s_other_call_forms[documents-causal-valid]",
-"tests/test_attention_triton_backward.py::test_the_backward_is_on_par_over_the_core_s_other_call_forms[documents-lengths]",
+"tests/test_attention_triton_backward.py::test_the_backward_is_on_par_over_the_core_s_other_call_forms[documents-window-valid-places]",
 "tests/test_attention_triton_backward.py::test_the_backward_is_on_par_over_the_core_s_other_call_forms[lengths]",
-"tests/test_attention_triton_backward.py::test_the_plain_backward_is_on_par_over_runs[runs-Tiles(block_q=64, block_k=32, warps=4, stages=2)-accurate]",
-"tests/test_attention_triton_backward.py::test_the_plain_backward_is_on_par_over_runs[runs-causal-Tiles(block_q=32, block_k=32, warps=4, stages=2)-accurate]",
+"tests/test_attention_triton_backward.py::test_the_plain_backward_is_on_par_over_runs[runs-Tiles(block_q=32, block_k=32, warps=4, stages=2)-default]",
+"tests/test_attention_triton_backward.py::test_the_plain_backward_is_on_par_over_runs[runs-causal-Tiles(block_q=32, block_k=32, warps=4, stages=2)-default]",
 "tests/test_attention_triton_backward.py::test_the_plain_backward_is_on_par_over_runs[runs-causal-Tiles(block_q=64, block_k=32, warps=4, stages=2)-default]",
-"tests/test_attention_triton_backward.py::test_the_plain_backward_is_on_par_over_runs[runs-documents-valid-Tiles(block_q=64, block_k=32, warps=4, stages=2)-default]"
+"tests/test_attention_triton_backward.py::test_the_plain_backward_is_on_par_over_runs[runs-documents-valid-Tiles(block_q=32, block_k=32, warps=4, stages=2)-accurate]",
+"tests/test_attention_triton_backward.py::test_the_plain_backward_is_on_par_over_runs[runs-window-places-Tiles(block_q=32, block_k=32, warps=4, stages=2)-default]"
 ],
 "tests/test_attention_triton_hooks.py": [
-"tests/test_attention_triton_hooks.py::test_the_backward_is_on_par_under_every_score_hook[alibi-float16-accurate]",
-"tests/test_attention_triton_hooks.py::test_the_backward_is_on_par_under_every_score_hook[band-bias-bfloat16-default]",
+"tests/test_attention_triton_hooks.py::test_the_backward_is_on_par_under_every_score_hook[alibi-float16-default]",
+"tests/test_attention_triton_hooks.py::test_the_backward_is_on_par_under_every_score_hook[band-bias-bfloat16-accurate]",
+"tests/test_attention_triton_hooks.py::test_the_backward_is_on_par_under_every_score_hook[band-bias-float16-default]",
 "tests/test_attention_triton_hooks.py::test_the_backward_is_on_par_under_every_score_hook[custom-vjp-bfloat16-accurate]",
+"tests/test_attention_triton_hooks.py::test_the_backward_is_on_par_under_every_score_hook[custom-vjp-float32-accurate]",
 "tests/test_attention_triton_hooks.py::test_the_backward_is_on_par_under_every_score_hook[key-bias-bfloat16-default]",
 "tests/test_attention_triton_hooks.py::test_the_backward_is_on_par_under_every_score_hook[key-bias-float32-default]",
-"tests/test_attention_triton_hooks.py::test_the_backward_is_on_par_under_every_score_hook[none-float16-accurate]",
-"tests/test_attention_triton_hooks.py::test_the_backward_is_on_par_under_every_score_hook[none-float32-default]",
-"tests/test_attention_triton_hooks.py::test_the_backward_is_on_par_under_every_score_hook[resumed-float16-default]",
+"tests/test_attention_triton_hooks.py::test_the_backward_is_on_par_under_every_score_hook[none-float16-default]",
+"tests/test_attention_triton_hooks.py::test_the_backward_is_on_par_under_every_score_hook[resumed-bfloat16-default]",
 "tests/test_attention_triton_hooks.py::test_the_backward_is_on_par_under_every_score_hook[row-indexed-bfloat16-accurate]",
-"tests/test_attention_triton_hooks.py::test_the_backward_is_on_par_under_every_score_hook[row-indexed-float16-default]",
 "tests/test_attention_triton_hooks.py::test_the_backward_is_on_par_under_every_score_hook[row-indexed-float32-accurate]",
 "tests/test_attention_triton_hooks.py::test_the_backward_is_on_par_under_every_score_hook[row-indexed-float32-default]",
-"tests/test_attention_triton_hooks.py::test_the_backward_is_on_par_under_every_score_hook[sinks-float16-accurate]",
-"tests/test_attention_triton_hooks.py::test_the_backward_is_on_par_under_every_score_hook[sinks-float32-default]",
+"tests/test_attention_triton_hooks.py::test_the_backward_is_on_par_under_every_score_hook[sinks-bfloat16-default]",
+"tests/test_attention_triton_hooks.py::test_the_backward_is_on_par_under_every_score_hook[sinks-float32-accurate]",
 "tests/test_attention_triton_hooks.py::test_the_backward_is_on_par_under_every_score_hook[softcap-bfloat16-accurate]",
-"tests/test_attention_triton_hooks.py::test_the_backward_is_on_par_under_every_score_hook[softcap-bfloat16-default]",
+"tests/test_attention_triton_hooks.py::test_the_backward_is_on_par_under_every_score_hook[softcap-float16-default]",
 "tests/test_attention_triton_hooks.py::test_the_backward_is_on_par_under_every_score_hook[softcap-float32-default]",
 "tests/test_attention_triton_hooks.py::test_the_backward_is_on_par_under_every_score_hook[softcap-sinks-alibi-bfloat16-default]",
 "tests/test_attention_triton_hooks.py::test_the_backward_is_on_par_under_every_score_hook[softcap-sinks-alibi-float16-accurate]",
@@ -808,11 +813,15 @@
 "tests/test_attention_triton_hooks.py::test_the_backward_is_on_par_under_every_score_hook[temperature-bfloat16-default]",
 "tests/test_attention_triton_hooks.py::test_the_backward_is_on_par_under_every_score_hook[temperature-float16-accurate]",
 "tests/test_attention_triton_hooks.py::test_the_backward_is_on_par_under_every_score_hook[temperature-float16-default]",
-"tests/test_attention_triton_hooks.py::test_the_backward_is_on_par_under_every_score_hook[tile-bias-bfloat16-accurate]",
+"tests/test_attention_triton_hooks.py::test_the_backward_is_on_par_under_every_score_hook[tile-bias-bfloat16-default]",
 "tests/test_attention_triton_hooks.py::test_the_backward_is_on_par_under_every_score_hook[tile-bias-float32-accurate]"
 ],
 "tests/test_attention_witness.py": [
-"tests/test_attention_witness.py::test_each_stored_state_and_the_output_lie_in_their_step_enclosures[0-full]"
+"tests/test_attention_witness.py::test_each_fault_is_refused_at_its_elements",
+"tests/test_attention_witness.py::test_each_gradient_of_the_fast_backward_lies_in_its_enclosure[capped]",
+"tests/test_attention_witness.py::test_each_gradient_of_the_fast_backward_lies_in_its_enclosure[full]",
+"tests/test_attention_witness.py::test_each_stored_state_and_the_output_lie_in_their_step_enclosures[0-causal]",
+"tests/test_attention_witness.py::test_each_stored_state_and_the_output_lie_in_their_step_enclosures[1-causal]"
 ],
 "tests/test_autoencoder.py": [
 "tests/test_autoencoder.py::test_every_built_in_autoencoder_rebuilds_from_its_saved_record_alone[flux2]"
@@ -3035,9 +3044,6 @@
 "tests/test_norm_swiglu.py::test_rms_weight_gradient_accumulates_a_full_step_of_rows[float32-distinct]",
 "tests/test_norm_swiglu.py::test_seam_and_product_run_per_shard_as_on_one_device[fsdp]"
 ],
-"tests/test_online_loader.py": [
-"tests/test_online_loader.py::test_a_stage_declaring_its_pool_runs_there_and_reads_in_order_and_resumes[indexed-processes-flat_map]"
-],
 "tests/test_optim.py": [
 "tests/test_optim.py::test_a_matrix_declared_on_one_side_is_orthogonalized_as_one_matrix[output-whole]",
 "tests/test_optim.py::test_a_scheduled_rate_is_as_near_float64_as_optaxs[cosine]",
@@ -3799,6 +3805,9 @@
 "tests/test_saved_sources.py::test_a_run_resumes_under_another_kernel_choice_and_refuses_its_experts_packed_otherwise",
 "tests/test_saved_sources.py::test_a_run_started_from_a_saved_run_resumes_and_serves_on_hosts_whose_caches_lack_its_releases",
 "tests/test_saved_sources.py::test_a_run_whose_mixture_no_family_writes_exports_and_loads_back_answering_as_its_run"
+],
+"tests/test_scaled_contraction.py": [
+"tests/test_scaled_contraction.py::test_a_quotients_transposes_transpose_keeps_its_unit_beside_the_divisors_factors"
 ],
 "tests/test_scenario_learning.py": [
 "tests/test_scenario_learning.py::test_a_masked_diffusion_lm_learns_its_language",
