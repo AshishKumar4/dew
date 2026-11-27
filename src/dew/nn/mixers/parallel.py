@@ -28,7 +28,7 @@ from dew.nn.protocols import (
 )
 
 if TYPE_CHECKING:
-    from dew.nn.mla import MLAMixer
+    from dew.nn.protocols import IndexedMixer
 
 
 @dataclasses.dataclass(frozen=True)
@@ -188,7 +188,7 @@ class ParallelMixer(MixerBase):
         return frozenset(reads), frozenset(writes)
 
     @property
-    def indexed_mixers(self) -> tuple[MLAMixer, ...]:
+    def indexed_mixers(self) -> tuple[IndexedMixer, ...]:
         return tuple(indexed for branch in self.branches for indexed in branch.mixer.indexed_mixers)
 
     @property

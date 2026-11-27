@@ -419,6 +419,48 @@ def test_packing_carried_by_the_model_inputs_scores_the_same_kl(phase, topk):
             == float(by_columns.metrics["indexer_kl"]))
 
 
+def test_an_msa_decoder_trains_its_index_branch_by_the_indexer_objective_alone():
+    """A decoder of block-selected attention by MSA's selection (`selection="msa"`, row 13528) trained in
+    the indexer's sparse phase: its index branch's gradient is the objective's indexer KL's (`indexer_kl`,
+    `block_sparse.msa_query_kls`), non-zero and scaling with its weight, and the main weights' gradient is
+    the cross entropy's whatever the weight; without the term the branch moves nowhere. MSA has no dense
+    warm-up, which is refused."""
+    from test_mixers import tiny
+
+    from dew.registry import mixers
+
+    selected = mixers.build("block_sparse_attention", selection="msa", block=4, top_k=2, index_width=8)
+    model = tiny(mixer=selected, dtype="float32", max_seq_len=SEQ, vocab_size=VOCAB)
+    batch = token_batch()
+    plain = LMObjective(model, SEQ)
+    params = nn.unbox(plain.init(jax.random.key(0)))
+
+    def branch(path) -> bool:
+        return "msa_indexer" in jax.tree_util.keystr(path)
+
+    def gradients(objective) -> tuple[list, list, float]:
+        """The index branch's gradient leaves, every other leaf's, and the cross entropy."""
+        (_, aux), grads = jax.value_and_grad(lambda p: objective.scalar_loss(p, batch, step_at()),
+                                             has_aux=True)(params)
+        leaves = jax.tree_util.tree_leaves_with_path(grads["params"])
+        return ([np.asarray(leaf) for path, leaf in leaves if branch(path)],
+                [np.asarray(leaf) for path, leaf in leaves if not branch(path)], float(aux.metrics["ce"]))
+
+    untrained, main, ce = gradients(plain)
+    assert untrained and all(not leaf.any() for leaf in untrained)
+    seen = {}
+    for weight in (0.5, 2.0):
+        seen[weight], weighted_main, weighted_ce = gradients(
+            LMObjective(model, SEQ, indexer=IndexerTraining("sparse", weight=weight)))
+        assert weighted_ce == ce and any(leaf.any() for leaf in seen[weight])
+        for got, plain_leaf in zip(weighted_main, main, strict=True):
+            np.testing.assert_array_equal(got, plain_leaf)
+    for heavy, light in zip(seen[2.0], seen[0.5], strict=True):
+        np.testing.assert_array_equal(heavy, 4 * light)
+    with pytest.raises(ValueError):
+        LMObjective(model, SEQ, indexer=IndexerTraining("warmup"))
+
+
 @pytest.mark.parametrize("phase, topk", [("warmup", None), ("sparse", 4)])
 def test_padding_the_model_inputs_mask_leaves_out_counts_no_query(phase, topk):
     """One document, then padding whose ids are real tokens. The attention

@@ -537,9 +537,16 @@ def _export(capture: Path, converter: _Converter | None, metadata: dict[str, JSO
     it has a `converter` and its manifest (`_reports`, `_manifest`), raising every failure of the stop
     (`failures`) and of the export together, or the export's alone as `ExportFailed` where the stop
     failed in nothing."""
-    reasons = [] if failures else held_back(capture, metadata)
-    metadata["capture_status"] = "failed" if failures else "partial" if reasons else "completed"
-    metadata["capture_errors"] = [str(error) for error in failures]
+    # Its trace read where it stopped cleanly: a trace it cannot read (an OSError past its absence) fails
+    # its export, its manifest saying so, which the export writes first (`exported`).
+    inspected: list[Exception] = []
+    reasons: list[str] = []
+    try:
+        reasons = [] if failures else held_back(capture, metadata)
+    except OSError as error:
+        inspected.append(error)
+    metadata["capture_status"] = "failed" if failures or inspected else "partial" if reasons else "completed"
+    metadata["capture_errors"] = [str(error) for error in [*failures, *inspected]]
     metadata["capture_reasons"] = [*reasons]
     stopped = bool(failures)
     try:
@@ -550,12 +557,15 @@ def _export(capture: Path, converter: _Converter | None, metadata: dict[str, JSO
             _reports(capture, converter, metadata)
     except Exception as error:
         if not stopped:
-            raise ExportFailed(f"writing {capture}'s reports or manifest failed", [error]) from None
+            raise ExportFailed(f"reading {capture}'s trace or writing its reports or manifest failed",
+                               [*inspected, error]) from None
         failures.append(error)
     except BaseException as error:
         failures.append(error)
     if failures:
-        raise BaseExceptionGroup("Profile cleanup or export failed", failures)
+        raise BaseExceptionGroup("Profile cleanup or export failed", [*failures, *inspected])
+    if inspected:
+        raise ExportFailed(f"reading {capture}'s trace failed", inspected)
 
 
 def exporting(capture: str, metadata: dict[str, JSON]) -> None:

@@ -69,7 +69,6 @@ if TYPE_CHECKING:
     from dew.nn.hyper_connections import HyperConnections
     from dew.nn.inputs import DenoisingCondition
     from dew.nn.kv_cache import KVCache
-    from dew.nn.mla import MLAMixer
     from dew.nn.norms import NormBounds
     from dew.quantization import InputQuantizer
 
@@ -336,17 +335,6 @@ class ReadsTrain(Protocol):
 
     @property
     def reads_train(self) -> bool: ...
-
-
-@runtime_checkable
-class ReadsFormed(Protocol):
-    """A linear layer whose call takes `formed` (`dew.nn.kernels.projections.FormedInput`: its input formed
-    entrywise from other values, a gated MLP's hidden activation from its gate and up projections), which its
-    product multiplies holding those values for reverse mode in place of the input: its owner hands them where
-    `reads_formed` says the call reads them, whatever the layer's class."""
-
-    @property
-    def reads_formed(self) -> bool: ...
 
 
 @runtime_checkable
@@ -1409,13 +1397,22 @@ class DecoderTraining(Predicting, Protocol):
     depths (arXiv 2412.19437, section 2.2; `apply`'s `method='mtp_hidden_states'`
     and `'mtp_logits'`, `Predicting`), which with `mtp_hyper_connections` set
     read the residual streams a forward sows under `prediction_inputs/states`,
-    and the MLA mixers it declares with DeepSeek's lightning indexer."""
+    and the mixers it declares with an indexer an objective trains (`IndexedMixer`)."""
 
     @property
     def mtp_hyper_connections(self) -> HyperConnections | None: ...
 
     @property
-    def indexed_mixers(self) -> tuple[MLAMixer, ...]: ...
+    def indexed_mixers(self) -> tuple[IndexedMixer, ...]: ...
+
+
+class IndexedMixer(Protocol):
+    """A mixer kind carrying an indexer an objective trains (`MixerBase.indexed_mixers`): DeepSeek's lightning
+    indexer (`MLAMixer`), MSA's index branch (`BlockSparseAttentionMixer`); `sparse` where its selection
+    picks the keys each query attends, its indexer trained beside dense attention where not."""
+
+    @property
+    def sparse(self) -> bool: ...
 
 
 @runtime_checkable

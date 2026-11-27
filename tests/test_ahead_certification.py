@@ -174,3 +174,52 @@ print(json.dumps({"unstacks": len(digests), "carried": [digest in ahead.starts f
     result = fresh(script, cache_dir=tmp_path / "cache", platforms="cpu",
                    variables={"CUDA_VISIBLE_DEVICES": ""}, flags=untuned)
     assert result["unstacks"] >= 2 and all(result["carried"]), result
+
+
+def test_a_step_compiled_ahead_is_refused_by_a_run_that_compiles_under_other_options():
+    """A step compiled ahead is held to the XLA options it compiled under (`AheadOfTime.options`, a
+    compile's limit aside) beside its program: a run of its program that compiles under an option it took
+    none of, a scoped `compiled_with` one, refuses it, as its own compile would have sent XLA that option
+    (row 13553: it loaded it, the option dropped); under its own options, a compile's limit beside them,
+    the run goes on to load it (here refused as no process's to load, `built` None)."""
+    import jax
+    import jax.numpy as jnp
+    import pytest
+
+    from dew.nn.kernels.options import program_digest
+    from dew.training.ahead import AheadOfTime, Executable, NotTheStepCompiledAhead
+    from dew.training.memory import LIMIT_EXIT
+
+    lowered = jax.jit(lambda x: jnp.sin(x) * 2).lower(jnp.ones(4))
+    options = {"xla_gpu_enable_triton_gemm": False}
+    ahead = AheadOfTime("sm90", 1, {}, program_digest(lowered), Executable(b"", ()), None, 0, 0, 0, 0, 0, {},
+                        options=options)
+    with pytest.raises(NotTheStepCompiledAhead):
+        ahead.taken(lowered, {**options, "xla_gpu_enable_command_buffer": ""})
+    with pytest.raises(ValueError) as loading:
+        ahead.taken(lowered, {**options, LIMIT_EXIT: 1 << 30})
+    assert not isinstance(loading.value, NotTheStepCompiledAhead), loading.value
+
+
+def test_a_lowerings_program_is_rendered_once_for_its_key_and_every_fingerprint(monkeypatch):
+    """A lowering's program is rendered once for as long as it lives: its process-local key
+    (`program_key`) and its fingerprints a file of programs holds it by, under any options
+    (`program_digest`), read the one rendering (row 13555: a step handed an executable compiled ahead
+    rendered and hashed its whole program twice as it started)."""
+    import jax
+    import jax.numpy as jnp
+
+    from dew.nn.kernels.options import program_digest, program_key
+
+    rendered = []
+    render = jax.stages.Lowered.as_text
+
+    def counted(lowered, *args, **kwargs):
+        rendered.append(lowered)
+        return render(lowered, *args, **kwargs)
+
+    monkeypatch.setattr(jax.stages.Lowered, "as_text", counted)
+    lowered = jax.jit(lambda x: jnp.sin(x) * 2).lower(jnp.ones(4))
+    program_key(lowered)
+    plain, optioned = program_digest(lowered), program_digest(lowered, {"xla_gpu_enable_command_buffer": ""})
+    assert plain != optioned and len(rendered) == 1

@@ -68,6 +68,10 @@ class Placed:
     prefix: str = ""
     strip: str = ""
     stated: Mapping[str, object] = dataclasses.field(default_factory=dict)
+    sidecars: Mapping[str, str] = dataclasses.field(default_factory=dict)
+    """The files beside the root's weights that hold more of its tensors (`DecoderFamily.sidecars`, Inkling
+    2's `mtp.safetensors`), each by the prefix its tensors carry in the root's table: written there under
+    their own names, the prefix off, as a load reads them back (`sources.with_sidecars`)."""
 
     def root(self) -> Part:
         """The root part as the release holds it: its config with what the format states, its tensors
@@ -174,12 +178,32 @@ class ReleasePlan:
             if folder:
                 _part(root / folder, config, tensors, max_shard_size)
         config, tensors = model.root()
+        tensors = _sidecars_written(tensors, model.sidecars, root)
         if self.head is not None and self.head.merged:
             tensors = joined_tensors({"the model": tensors, "its head": self.head.tensors})
         # The root's weights at the release's root; its config there or in the format's folder.
         save_sharded(tensors, root, max_shard_size)
         (root / model.folder).mkdir(parents=True, exist_ok=True)
         write_atomically(str(root / model.folder / CONFIG_FILE), json.dumps(config, indent=2))
+
+
+def _sidecars_written(tensors: Mapping[str, np.ndarray], sidecars: Mapping[str, str],
+                      root: Path) -> Mapping[str, np.ndarray]:
+    """Each sidecar's tensors of `tensors` (`Placed.sidecars`) written to its own file at `root`, the
+    prefix off their names, and the rest returned for the root's shards, each read as it is written."""
+    specs = tensor_specs(tensors)
+    taken: set[str] = set()
+    for filename, prefix in sidecars.items():
+        names = {name.removeprefix(prefix): name for name in specs if name.startswith(prefix)}
+        if names:
+            write_file(LazyTensors({name: specs[source] for name, source in names.items()},
+                                   lambda name, names=names: tensors[names[name]]),
+                       root / filename, {"format": "pt"})
+            taken.update(names.values())
+    if not taken:
+        return tensors
+    return LazyTensors({name: spec for name, spec in specs.items() if name not in taken},
+                       lambda name: tensors[name])
 
 
 def _part(directory: Path, config: Mapping[str, object], tensors: Mapping[str, np.ndarray],
@@ -214,7 +238,7 @@ def bundle_plan(bundle: Pretrained, variables: Mapping[str, object] | None = Non
     its processor's or tokenizer's files and generation config, and the record of the run behind it where
     it has one (`dew.interop.release.release_record`)."""
     from dew.inference.tasks import TextSettings
-    from dew.interop import sources
+    from dew.interop import hf_decoders as decoders, sources
     from dew.interop.generation_config import unconfigured
     from dew.interop.release import release_record
 
@@ -232,7 +256,8 @@ def bundle_plan(bundle: Pretrained, variables: Mapping[str, object] | None = Non
                     generation_config=dict(bundle.generation_config), named=bundle.names_tokenizer)
     envelope = (Release() if bundle.settings is None
                 else release_record(bundle.settings, bundle.numerics, bundle.model, values, bundle.kernels))
-    return ReleasePlan(Placed(parts, files), assets=assets, envelope=envelope)
+    return ReleasePlan(Placed(parts, files, sidecars=decoders.sidecars(bundle.config)), assets=assets,
+                       envelope=envelope)
 
 
 def native_plan(variables: Variables, record: Mapping[str, object], step: int, *, why: str = "",

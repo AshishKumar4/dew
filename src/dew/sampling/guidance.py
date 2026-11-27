@@ -190,8 +190,15 @@ def _guided_derivative(primals, tangents, value):
     del value
     conditional, unconditional, scale = primals
     along_conditional, along_unconditional, along_scale = tangents
-    # The predictions' direction in the affine order, the conditional's own at a unit scale.
-    predicted = jnp.where(scale == 1, along_conditional,
+    # The predictions' direction in the affine order, which forms their difference first (two directions of
+    # 1e38 at a scale of 4 differ by 0, where 4 times one less 3 times the other overflows); at a unit scale
+    # each weighed apart, scale along the conditional's and one less the scale along the unconditional's: the
+    # conditional's own exactly (0 times a finite direction), differentiable there as the affine combination
+    # is (a derivative of it along the scale and the conditional is one at every scale, which the
+    # conditional's direction alone made zero there: 512 of 1024 unit-scale elements of a mixed derivative
+    # missed). Linear in the directions, as a derivative a gradient transposes is: no choice by their values
+    # (a direction that is not finite at a unit scale is weighed by zero as the affine combination weighs it).
+    predicted = jnp.where(scale == 1, scale * along_conditional + (1 - scale) * along_unconditional,
                           along_unconditional + scale * (along_conditional - along_unconditional))
     # The scale's: the predictions' difference, formed `_spread` as the value is.
     held, unheld, half = _spread(conditional, unconditional)

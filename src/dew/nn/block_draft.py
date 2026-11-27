@@ -45,6 +45,7 @@ from dew.nn.kv_cache import (
     compute_dtype,
     cursor,
     kept,
+    unpaged,
 )
 from dew.nn.norms import RMSNorm
 from dew.nn.precision import at_least_fp32, capped_logits, float32_dot_general
@@ -145,23 +146,41 @@ class Context(NamedTuple):
     anchor: jax.Array
 
 
+PLACES = 'places'
+"""A windowed context store's leaf holding each slot's place plus one, 0 where none was written
+(`ContextStore`)."""
+
+
 class ContextStore(nn.Module):
     """A draft layer's cached context: each row's keys and values in a store of its own (`KVSpec`), its
-    cursor each row's count of context tokens."""
+    cursor each row's count of context tokens. A local layer's (`window`) holds its last `window` places
+    alone, a ring each place written at its place modulo the window, every slot's place beside it
+    (`PLACES`): its keys rotated at their places as they are written, it reads no place a window refuses
+    and keeps no store a row's whole capacity long (row 13541)."""
 
     kv_cache: KVCache
     capacity: int
     kv_heads: int
     head_dim: int
+    window: int | None = None
+
+    @nn.nowrap
+    def slots(self) -> int:
+        """The slots each row's store holds: its window's where it has one, else the capacity."""
+        return self.capacity if self.window is None else min(self.window, self.capacity)
 
     @nn.nowrap
     def spec(self, rows: int, dtype: jnp.dtype) -> KVSpec:
-        return KVSpec(self.kv_cache, rows, self.capacity, self.kv_heads, self.head_dim, dtype)
+        """Its store: the cache's own layout, a window's ring unpaged (`unpaged`, its format kept), whose
+        length no page size need divide."""
+        layout = self.kv_cache if self.window is None else unpaged(self.kv_cache)
+        return KVSpec(layout, rows, self.slots(), self.kv_heads, self.head_dim, dtype)
 
     @nn.nowrap
     def cache_spec(self, rows: int, dtype: jnp.dtype) -> CacheSpec:
-        """The store for `rows` rows of `dtype`, with its cursor."""
-        return {**self.spec(rows, dtype).leaves(), **cursor(rows)}
+        """The store for `rows` rows of `dtype`, with its cursor and, windowed, its slots' places."""
+        places = {} if self.window is None else {PLACES: Opened((rows, self.slots()), jnp.int32)}
+        return {**self.spec(rows, dtype).leaves(), **cursor(rows), **places}
 
     @nn.compact
     def __call__(self, mixed, valid, rows: int, dtype: jnp.dtype, project: Callable) -> Context:
@@ -169,16 +188,31 @@ class ContextStore(nn.Module):
         (`valid`, every one where None) after those the store holds, each projected at its count
         (`project(mixed, places)`, its keys and values); `mixed` None writes none."""
         store = KVStore.open(self, self.spec(rows, dtype))
+        held = None if self.window is None else cache_variables(
+            self, {PLACES: Opened((rows, self.slots()), jnp.int32)})[PLACES]
         if mixed is not None:
-            slots = cache_positions(self, rows, mixed.shape[1], valid)
-            keys, values = project(mixed, jnp.maximum(slots, 0))
-            store.write(keys, values, slots)
+            places = cache_positions(self, rows, mixed.shape[1], valid)
+            keys, values = project(mixed, jnp.maximum(places, 0))
+            if held is None:
+                store.write(keys, values, places)
+            else:
+                # Only the window's last places reach the ring, one write a slot however long the call.
+                size, count = self.slots(), self.get_variable('cache', CURSOR)
+                kept_here = (places >= 0) & (places >= count[:, None] - size)
+                ring = jnp.where(kept_here, places % size, -1)
+                store.write(keys, values, ring)
+                written = held.value.at[jnp.arange(rows)[:, None], jnp.where(kept_here, ring, size)].set(
+                    places + 1, mode='drop')
+                kept(held, written, PLACES)
         else:
             cache_variables(self, cursor(rows))
         keys, values = store.read()
         count = self.get_variable('cache', CURSOR)
-        places = jnp.broadcast_to(jnp.arange(keys.shape[1])[None], (rows, keys.shape[1]))
-        return Context(store.plain(keys), values, places, places < count[:, None], count)
+        if held is None:
+            places = jnp.broadcast_to(jnp.arange(keys.shape[1])[None], (rows, keys.shape[1]))
+            return Context(store.plain(keys), values, places, places < count[:, None], count)
+        places = held.value - 1
+        return Context(store.plain(keys), values, places, places >= 0, count)
 
 
 class Carried(nn.Module):
@@ -225,7 +259,8 @@ class DraftAttention(nn.Module):
         self.o_proj = dense(self.emb_features)
         norm = functools.partial(RMSNorm, epsilon=spec.norm_eps, dtype=self.dtype)
         self.q_norm, self.k_norm, self.k_norm_ctx = norm(), norm(), norm()
-        self.held_context = ContextStore(self.kv_cache, self.max_seq_len, spec.num_kv_heads, spec.head_dim)
+        self.held_context = ContextStore(self.kv_cache, self.max_seq_len, spec.num_kv_heads, spec.head_dim,
+                                         window=spec.window if self.local else None)
 
     def _heads(self, x, count: int):
         return x.reshape(*x.shape[:-1], count, self.spec.head_dim)
@@ -417,9 +452,13 @@ class BlockDrafter(nn.Module):
         """Each layer's context store for `rows` rows (`ContextStore`), and each row's carried taps
         (`Carried`), each under its holder's name."""
         spec, dtype = self.spec, compute_dtype(self, self.dtype)
-        store = ContextStore(self.kv_cache, self.max_seq_len, spec.num_kv_heads, spec.head_dim, parent=None)
+
+        def store(index: int) -> ContextStore:
+            return ContextStore(self.kv_cache, self.max_seq_len, spec.num_kv_heads, spec.head_dim,
+                                window=spec.window if index in spec.local_layers else None, parent=None)
+
         carried = Carried(self.emb_features, parent=None)
-        return {**{f'layers_{index}': {'self_attn': {'held_context': store.cache_spec(rows, dtype)}}
+        return {**{f'layers_{index}': {'self_attn': {'held_context': store(index).cache_spec(rows, dtype)}}
                    for index in range(spec.layers)},
                 'carried': carried.cache_spec(rows, dtype)}
 

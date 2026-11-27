@@ -1,20 +1,31 @@
-"""Check 2's native step witness for the Mosaic attention forward (tests/attention_witness.py, row 2084 (f)),
-on Mosaic GPU's interpreter: the certify launch's states and output inside their step enclosures (nulls),
-and each fault the witness exists for refused at its elements: a dropped rescale, a maximum from the wrong
-tile, sums rounded to bf16 where the walk holds fp32, and a mask off by one key. A GPU's native launches
-run the same checks in the native certificates' flow (tests/test_native_certificates.py)."""
+"""Check 2's native witness for the Mosaic attention template (tests/attention_witness.py, rows 2084 (f) and
+6130), on Mosaic GPU's interpreter: the forward's certify launch's states and output inside their step
+enclosures (nulls), full, causal, windowed, over packed documents and capped, and each fault the witness
+exists for refused at its elements: a dropped rescale, a maximum from the wrong tile, sums rounded to bf16
+where the walk holds fp32, a mask off by one key, a window's or the documents' records held as one
+undivided call's, and a cap's read; and the fast backward's gradients inside their enclosures, capped
+too, its faults (a wrong scale, a sixty-fourth off, a mask, a cap) refused. A GPU's native launches run
+the same checks in the native certificates' flow (tests/test_native_certificates.py)."""
 
-import attention_oracle
 import jax
 import numpy as np
 import pytest
-from attention_witness import SHAPE, assert_faults_refused, assert_witnessed, launched, operands
+from attention_witness import (
+    BACKWARD_FORMS,
+    FORMS,
+    assert_backward_faults_refused,
+    assert_backward_witnessed,
+    assert_faults_refused,
+    assert_witnessed,
+    launched,
+    operands,
+)
 
 
-@pytest.mark.parametrize("causal", [True, False], ids=["causal", "full"])
+@pytest.mark.parametrize("form", FORMS)
 @pytest.mark.parametrize("seed", [0, 1])
-def test_each_stored_state_and_the_output_lie_in_their_step_enclosures(causal, seed):
-    assert_witnessed(seed, causal, interpret=True)
+def test_each_stored_state_and_the_output_lie_in_their_step_enclosures(form, seed):
+    assert_witnessed(seed, form, interpret=True)
 
 
 def test_each_fault_is_refused_at_its_elements():
@@ -26,10 +37,9 @@ def test_the_certify_launch_writes_every_record_it_declares():
     refs start from (`certified_walk`): under JAX's NaN check (`jax.debug_nans`), which the interpreter's
     unwritten outputs (NaN) trip, run op by op, its records bit for bit the unchecked run's (NSNAN-2)."""
     q, k, v = operands(0)
-    causal = attention_oracle.kept(SHAPE[1], SHAPE[1], causal=True)
-    unchecked = launched(q, k, v, causal, interpret=True)
+    unchecked = launched(q, k, v, "causal", interpret=True)
     with jax.debug_nans(new_val=True):
-        checked = launched(q, k, v, causal, interpret=True)
+        checked = launched(q, k, v, "causal", interpret=True)
     for name in ("out", "m", "l", "acc"):
         assert np.asarray(checked[name]).tobytes() == np.asarray(unchecked[name]).tobytes(), name
 
@@ -66,3 +76,12 @@ def test_native_attention_witness_cells_prepare_without_deferring(tmp_path, monk
     for expected in ("attention witness, witness, causal,", "attention witness, witness, full,",
                      "attention witness, faults, causal,", "attention witness, faults, full,"):
         assert any(expected in label for label in labels), (expected, labels)
+
+
+@pytest.mark.parametrize("form", BACKWARD_FORMS)
+def test_each_gradient_of_the_fast_backward_lies_in_its_enclosure(form):
+    assert_backward_witnessed(0, form, interpret=True)
+
+
+def test_each_backward_fault_is_refused_at_its_elements():
+    assert_backward_faults_refused(interpret=True)

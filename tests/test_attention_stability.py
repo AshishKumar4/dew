@@ -1324,10 +1324,12 @@ def test_the_mosaic_forward_of_values_at_fp32s_largest_is_as_exact_as_the_refere
 
     def forward(query, key, value, extra):
         spans = _spans(family, query, key)
+        # An fp32 call's Mosaic parts are the default precision's alone (`MosaicForward.refusal`); the suite
+        # runs at HIGHEST.
         if INTERPRETED:
-            with generation.assumed("sm90"):
+            with generation.assumed("sm90"), jax.default_matmul_precision("default"):
                 return attention_mosaic.forward(query, key, value, spans, None, interpret=True)
-        with generation.chosen(attention_mainloop="mosaic"):
+        with generation.chosen(attention_mainloop="mosaic"), jax.default_matmul_precision("default"):
             return attention_route.attend(query, key, value, spans, None)
 
     with generation.routes() as routes:
@@ -1841,7 +1843,8 @@ def test_the_template_decode_is_finite_and_as_exact_as_the_reference_at_fp32s_ed
         hooks = (None if sinks is None
                  else template.Hooks(initial=template.sinks(sinks, query.shape[0], 1, value.shape[-1])))
         target = generation.assumed("sm90") if INTERPRETED else contextlib.nullcontext()
-        with target:
+        # An fp32 step's Mosaic parts are the default precision's alone (`MosaicForward.refusal`).
+        with target, jax.default_matmul_precision("default"):
             return attention_decode.attend(query, key, value, spans, hooks, interpret=INTERPRETED)
 
     def forward(seed):

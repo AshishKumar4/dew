@@ -309,7 +309,7 @@ def _check_spans(label: str, spans: template.KeySpans | Callable[[], template.Ke
                  gate: bool = False, dtype=jnp.bfloat16, natural: bool = False, seeds: int | None = None,
                  width: int = 64, param_rows: int | None = None, pins: tuple | None = None,
                  target: generation.GpuTarget | None = None, routed: bool = True,
-                 keys: int | None = None):
+                 keys: int | None = None, precision: str | None = None):
     """The forward, or the backward in the form `form` names (`_backward_form`), over `spans` at `_form_tiles`
     (64 wide) under the score hooks `score` (`test_attention_triton.score_hooks`, their parameters and
     initial state drawn with the operands) and with `gate` an output gate (`hooks_for`), draws of `shape`
@@ -318,7 +318,8 @@ def _check_spans(label: str, spans: template.KeySpans | Callable[[], template.Ke
     values, the hook's parameters and the initial state, over `seeds` draws where given (the site's own,
     else the template site's); its launches at the forward's and backward's configs `pins` where given
     (`_pinned`), interpreted for `target` where given (`_device`), the backward the one the route takes
-    where `routed`, else this mainloop's (a TPU core's, which the route's CUDA facts do not read)."""
+    where `routed`, else this mainloop's (a TPU core's, which the route's CUDA facts do not read); the native
+    arm alone at `precision` where given (`jax.default_matmul_precision`), the reference at the suite's."""
     rows, queries, heads, _ = shape
     make_spans = spans if callable(spans) else (lambda: spans)
     if keys is not None:
@@ -348,7 +349,8 @@ def _check_spans(label: str, spans: template.KeySpans | Callable[[], template.Ke
     def ours(query, key, value, dout, params, initial):
         built_spans = make_spans()
         hooks = hooked(params, initial)
-        with _device_at(interpret, where), _pinned(*pinned):
+        stated = contextlib.nullcontext() if precision is None else jax.default_matmul_precision(precision)
+        with _device_at(interpret, where), _pinned(*pinned), stated:
             if not backward:
                 return attention_mosaic.forward(query, key, value, built_spans, hooks, natural=natural,
                                                 interpret=interpret)
@@ -1757,6 +1759,40 @@ def test_a_block_selected_call_holds_check_1_walking_its_selected_tiles_interpre
 
 
 @INTERPRETS
+def test_a_block_mask_prefill_over_fp8_keys_and_values_is_on_par_interpreted():
+    """A block-mask sparse prefill whose keys and values are FP8 codes with a token's fp32 scale
+    (kernel-templates.md §A row 64, FlagAttention's Hy3): a caller's block mask (`block_selected`'s, each
+    query block its own block and two earlier ones) as the indexed block lists (`runs`), the codes
+    dequantized in the walk (`scales`, rows 45 and 46), causal over 512 tokens as an H100 runs it under the
+    interpreter: on par with the reference path over the keys and values the codes dequantize to under the
+    same mask (check 1)."""
+    from dew.nn.kv_cache import dequantize, quantize
+
+    tokens, heads, kv_heads, width = 512, 4, 2, 64
+    spans = template.spans(tokens, tokens, 1, causal=True, runs=jnp.asarray(block_selected(tokens, 64)))
+
+    def draw(seed: int):
+        streams = jax.random.split(jax.random.key(seed), 3)
+        query = jax.random.normal(streams[0], (1, tokens, heads, width), jnp.bfloat16)
+        key, value = (jax.random.normal(stream, (1, tokens, kv_heads, width), jnp.bfloat16)
+                      for stream in streams[1:])
+        return query, *quantize(key, "float8_e4m3fn"), *quantize(value, "float8_e4m3fn")
+
+    def ours(query, k_codes, k_scale, v_codes, v_scale):
+        scales = tuple(jnp.swapaxes(scale, 1, 2) for scale in (k_scale, v_scale))
+        with generation.assumed("sm90"):
+            return attention_mosaic.forward(query, k_codes, v_codes, spans, None, scales=scales,
+                                            interpret=True)
+
+    def reference(query, k_codes, k_scale, v_codes, v_scale):
+        return template.reference(query, dequantize(k_codes, k_scale, query.dtype),
+                                  dequantize(v_codes, v_scale, query.dtype), spans)
+
+    assert_as_exact(jax.jit(ours), jax.jit(reference), draw, "mosaic block-mask prefill fp8 keys and values",
+                    seeds=SEEDS)
+
+
+@INTERPRETS
 @on_each_family_for(("case", "form"), _walked(RUN_CASES, ["forward", *BACKWARD_FORMS]), ids=str,
                     mechanisms_elsewhere="case")
 def test_a_call_over_runs_is_on_par_interpreted(case, form):
@@ -1772,11 +1808,32 @@ def test_a_call_over_runs_is_on_par_interpreted(case, form):
 @pytest.mark.parametrize("score", [(), ("softcap",)], ids=["plain", "softcap"])
 @pytest.mark.parametrize("call", CALLS)
 def test_an_fp32_forward_walks_its_operands_bf16_parts_interpreted(call, score):
-    """An fp32 call's forward on the one mainloop (`MosaicForward.parts`): its operands as three bf16 parts
-    each, every product its parts' six (`product.terms`), on par with the reference path in fp32 (check
-    1), under no hook and a score hook."""
+    """An fp32 call's forward on the one mainloop (`MosaicForward.parts`) at the default precision, which
+    alone takes its parts: its operands as three bf16 parts each, every product its parts' six
+    (`product.terms`), on par with the reference path in fp32 (check 1), under no hook and a score hook."""
     spans = template.spans(128, 128, 1, **CALLS[call])
-    _check_spans(f"{call} fp32 parts", spans, (1, 128, 2, 1), interpret=True, score=score, dtype=jnp.float32)
+    # Its parts are the default precision's alone (`MosaicForward.refusal`); the suite runs at HIGHEST.
+    _check_spans(f"{call} fp32 parts", spans, (1, 128, 2, 1), interpret=True, score=score, dtype=jnp.float32,
+                 precision="default")
+
+
+def test_an_fp32_forwards_parts_are_refused_above_the_default_precision():
+    """An fp32 inference call's Mosaic forward on an H100 (its operands' bf16 parts, `MosaicForward.parts`)
+    at the default precision is taken, and refused under HIGHEST (row 13498): its parts' products sum in
+    the tensor cores' accumulator, 11.8 to 16.8 times the reference's error there (M-NA-48), which an fp32
+    product above the default precision asks exact (`product.promoted`); another mainloop takes it."""
+    query = jnp.zeros((1, 128, 2, 64), jnp.float32)
+    spans = template.spans(128, 128, 1, causal=True)
+    with generation.assumed("sm90"):
+        family = attention_mosaic_program.bundle("sm90", jnp.float32)
+        op, args = attention_mosaic._forward_call(query, query, query, spans, None, scale=None, natural=False)
+        bound = op.bind(*args, residuals=template.Kept.NONE, interpret=False)
+        assert op.parts > 1
+        with jax.default_matmul_precision("default"):
+            assert op.refusal(bound, family) is None
+        with jax.default_matmul_precision("highest"):
+            refused = op.refusal(bound, family)
+    assert refused is not None and refused.code == "dtype"
 
 
 @ON_EACH_FAMILY

@@ -569,7 +569,8 @@ def test_an_fp32_forward_compiles_spill_free_as_its_model_decides(generation_nam
     query = jax.ShapeDtypeStruct((1, queries, 4, width), jnp.float32)
     key = jax.ShapeDtypeStruct((1, queries, 2, width), jnp.float32)
     zeros = [jnp.zeros(array.shape, array.dtype) for array in (query, key, key)]
-    with generation.assumed(generation_name):
+    # Its parts are the default precision's alone (`MosaicForward.refusal`); the suite runs at HIGHEST.
+    with generation.assumed(generation_name), jax.default_matmul_precision("default"):
         op, args = attention_mosaic._forward_call(*zeros, spans, None, scale=None,
                                                   natural=attention_mosaic.NATURAL)
         ba = op.bind(*args, residuals=template.Kept.NONE, interpret=False)
@@ -1375,7 +1376,7 @@ def test_fp32_forward_derives_parted_wgmma_and_consumer_choice_uses_launch_secon
     from kernel_compile import compile_mosaic_kernels, mosaic_failures
 
     spans = template.spans(512, 512, 1, causal=True)
-    with generation.assumed("sm90"):
+    with generation.assumed("sm90"), jax.default_matmul_precision("default"):
         target = generation.gpu_target()
         q32 = jnp.zeros((1, 512, 8, 64), jnp.float32)
         op32, args32 = attention_mosaic._forward_call(q32, q32, q32, spans, None, scale=None,

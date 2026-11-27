@@ -4,10 +4,75 @@ finite."""
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 import pytest
 from contract_support import EDGES, ORDER_SETS, assert_contract, normal_draw
 
 from dew.algebra import means, scan, windows
+
+
+@pytest.mark.parametrize("dtype", [jnp.bfloat16, jnp.float16])
+def test_generated_rounded_bodies_keep_the_written_surrogate_law(dtype):
+    from dew.algebra import component_cases, component_cases_derived as emitted
+    from dew.nn import precision
+
+    composed = component_cases.ROUNDED.assembled(lambda name: getattr(emitted, name))
+
+    def rounded(value):
+        return composed(value, dtype=dtype)
+
+    gradient = jax.grad(lambda x: jnp.sum(rounded(x) ** 2))
+
+    for shape in ((16, 32), (3, 5)):  # generated geometry and the written fallback
+        x = np.full(shape, 1.003, np.float32)
+        dx = np.full_like(x, 1.007)
+        primal, direction = jax.jit(lambda x, dx: jax.jvp(rounded, (x,), (dx,)))(x, dx)
+        np.testing.assert_array_equal(primal, precision.rounded_operand(x, dtype))
+        np.testing.assert_array_equal(direction, dx)
+        _, pullback = jax.vjp(rounded, jnp.asarray(x))
+        np.testing.assert_array_equal(pullback(jnp.asarray(dx))[0], dx)
+        _, higher = jax.jit(lambda x, dx: jax.jvp(gradient, (x,), (dx,)))(x, dx)
+        np.testing.assert_array_equal(higher, 2 * dx)
+
+
+def test_generated_quantized_straight_through_holds_signed_zero_and_higher_orders():
+    from dew.algebra import component_cases, component_cases_derived as emitted
+    from dew.nn import fake_quant
+
+    composed = component_cases.QUANTIZED_STE.assembled(lambda name: getattr(emitted, name))
+    x = jnp.full((16, 32), 7.0, jnp.float32)
+    stored = jnp.full(x.shape, -0.0, jnp.bfloat16)
+    tangent = jnp.full_like(x, 3)
+    rounded_tangent = jnp.ones_like(stored)
+    primal, moved = jax.jit(lambda a, b, da, db: jax.jvp(composed, (a, b), (da, db)))(
+        x, stored, tangent, rounded_tangent)
+    np.testing.assert_array_equal(np.asarray(primal).view(np.uint32),
+                                  np.asarray(fake_quant.straight_through(x, stored)).view(np.uint32))
+    np.testing.assert_array_equal(moved, tangent)
+    gradient = jax.grad(lambda arg: jnp.square(composed(arg, stored)).sum())
+    _, higher = jax.jvp(gradient, (x,), (tangent,))
+    np.testing.assert_array_equal(higher, 2 * tangent)
+
+
+def test_generated_guidance_preserves_the_scale_direction_at_both_endpoints():
+    from dew.sampling import guidance_cases, guidance_cases_derived as emitted
+
+    composed = guidance_cases.GUIDED.assembled(lambda name: getattr(emitted, name))
+    c = jnp.full((16, 64), 3.0, jnp.float32)
+    u = jnp.full_like(c, 1)
+    weight = jnp.broadcast_to(jnp.arange(16, dtype=jnp.float32)[:, None] % 2, (16, 1))
+
+    def moved_at(scale):
+        return jax.jvp(lambda w: composed(c, u, w), (scale,), (jnp.ones_like(scale),))
+
+    primal, moved = jax.jit(moved_at)(weight)
+    np.testing.assert_array_equal(primal, jnp.where(weight == 0, u, c))
+    np.testing.assert_array_equal(moved, c - u)
+    def higher(fn):
+        gradient = jax.grad(lambda arg, w: jnp.sum(fn(arg, u, w)), argnums=0)
+        return jax.jvp(lambda w: gradient(c, w), (weight,), (jnp.ones_like(weight),))[1]
+
+    np.testing.assert_array_equal(higher(composed), jnp.ones_like(c))
 
 
 def _plain(outputs, totals, anchors):

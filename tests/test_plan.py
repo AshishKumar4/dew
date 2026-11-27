@@ -306,12 +306,14 @@ class Counted(LMObjective):
 
 
 def lm(split="auto", accumulation=1, objective=LMObjective, *, seq=SEQ, width=16, layers=1, vocab=64,
-       policy="auto", **fields):
+       policy="auto", optimizer=None, **fields):
     """A tiny LM's trainer on one device: its step's batch read in `split` microbatches, `accumulation`
-    steps an update, recomputing as its fit `policy` asks (`FitPolicy.remat`), its model's `fields` given."""
+    steps an update, recomputing as its fit `policy` asks (`FitPolicy.remat`), its model's `fields` given,
+    updated by `optimizer` (SGD at 1e-2 where none is given)."""
     model = CausalTransformer(vocab_size=vocab, emb_features=width, num_layers=layers, num_heads=2,
                               mlp_features=2 * width, max_seq_len=seq, **fields)
-    return one_device(Trainer(objective(model, seq_len=seq), optax.sgd(1e-2), key=jax.random.key(0),
+    optimizer = optax.sgd(1e-2) if optimizer is None else optimizer
+    return one_device(Trainer(objective(model, seq_len=seq), optimizer, key=jax.random.key(0),
                               accumulation=accumulation,
                               split=split, remat=policy))
 
@@ -1772,8 +1774,10 @@ remat at their own head, each read as asked (`climbed`): no other rung's need is
 @pytest.mark.parametrize(("shape", "target"), [
     pytest.param("decoder", "cpu", id="decoder-cpu"),
     pytest.param("decoder", "h100", id="decoder-h100"),
+    # Six places a task at most: the cut weighs each span by its own measured rate (tools/armada/costs.py's
+    # Cost.cut), so the walk's heavy first places are a task alone and its light ones merge (row 8611).
     pytest.param("delta-scanned", "h100", id="delta-scanned-h100",
-                 marks=pytest.mark.shards(units=18, per_task=2)),
+                 marks=pytest.mark.shards(units=18, per_task=6)),
 ])
 def test_a_starts_climb_settles_the_lightest_rung_an_exhaustive_walk_finds_fits(monkeypatch, shape, target,
                                                                                     request, tmp_path):
@@ -2072,6 +2076,29 @@ def test_a_rung_key_states_the_settings_a_step_computes_by():
     assert first == key(lm()) and skipped != first and chunks != first
 
 
+def test_a_rung_key_states_a_raw_optimizers_functions_by_what_they_read():
+    """A raw optimizer (an Optax transformation handed in built) names its rung record by its functions and
+    what they read: two of one state's type (`optax.EmptyState`) whose updates scale by other factors name
+    two records, SGD at two rates two, and the same values one (row 13556: every raw optimizer named one,
+    so a stored split was tried first for a step that updates otherwise)."""
+    from dew.training.rungs import rung_key
+
+    def scaled(factor: float) -> optax.GradientTransformation:
+        return optax.GradientTransformation(
+            lambda params: optax.EmptyState(),
+            lambda updates, state, params=None: (jax.tree.map(lambda u: -factor * u, updates), state))
+
+    def key(optimizer):
+        trainer = lm(optimizer=optimizer)
+        state, _, _ = trainer.place()
+        return rung_key(trainer.objective.program_key(), (state, BATCH), [1, 2], trainer.device_mesh,
+                        settings=trainer._settings())
+
+    once, twice = key(scaled(1.0)), key(scaled(2.0))
+    assert None not in (once, twice) and once == key(scaled(1.0)) != twice
+    assert key(optax.sgd(1e-2)) == key(optax.sgd(1e-2)) != key(optax.sgd(2e-2))
+
+
 def test_a_rung_key_holds_a_flag_given_twice_by_its_order(monkeypatch):
     """A flag given twice is read by its last value, so a rung record's key states the flags in their order:
     two orders of one flag's two values compute apart and key apart (row 10797: sorted, they were one key),
@@ -2197,17 +2224,16 @@ def test_a_gemm_autotuner_out_of_memory_is_a_refusal_for_memory(code, message, r
     assert (outcome, refusals) == ((None, [error]) if refused else (error, []))
 
 
-@pytest.mark.parametrize("width, between, seq", [
+@pytest.mark.parametrize("width, between", [
     # Its temporaries scaled by its rows (a narrow layer).
-    (16, (1, 2), SEQ),
+    (16, (1, 2)),
     # They fall faster than its rows.
-    (16, (2, 4), SEQ),
-    # Mostly fixed (a wide layer over few tokens: the gradients of its weights), its rows long enough that
-    # the whole batch's activations still pass a quarter's beside its accumulator.
-    (1024, (2, 4), 24),
+    (16, (2, 4)),
+    # Mostly fixed (a wide layer over few tokens: the gradients of its weights).
+    (1024, (2, 4)),
 ])
 def test_a_tight_start_settles_the_split_beside_one_that_missed_and_compiles_once_warm(monkeypatch, tmp_path,
-                                                                                        width, between, seq):
+                                                                                        width, between):
     """What a run pays at its start where its batch does not fit whole (the owner's contract: "a single
     trace and compile most often"): cold, the plan is the split seen to fit beside the next coarser seen
     to miss, those `between`, each split compiled once at most, no more than the splits there are; warm,
@@ -2215,20 +2241,14 @@ def test_a_tight_start_settles_the_split_beside_one_that_missed_and_compiles_onc
     one compile, its step the one it runs. The devices' memory lies between the fewest's need and the least
     of the whole batch's and the first's, so both miss: the whole batch's need, its accumulator absent, is
     not the most of every split's."""
-    batch = {"text": jnp.asarray((np.arange(ROWS * (seq + 1)).reshape(ROWS, seq + 1) * 7) % 64, jnp.int32)}
-
-    def need(split):
-        trainer = lm(split=split, width=width, seq=seq)
-        return needs(monkeypatch, trainer, lambda: trained(trainer, steps=0, batch=batch))
-
-    whole, fewer, fewest = (need(split) for split in (1, *between))
+    whole, fewer, fewest = (needs(monkeypatch, lm(split=split, width=width)) for split in (1, *between))
     missing = min(whole, fewer)
     assert fewest < missing, (fewest, whole, fewer)
     monkeypatch.setenv("DEW_RUNG_RECORDS", str(tmp_path))
     free(monkeypatch, (missing + fewest) // 2)
-    cold_run, warm = lm(width=width, seq=seq), lm(width=width, seq=seq)
+    cold_run, warm = lm(width=width), lm(width=width)
     with Compiles("step") as compiles:
-        trained(cold_run, steps=0, batch=batch)
+        trained(cold_run, steps=0)
     probes = cold_run.plan["probes"]
     assert cold_run.plan["split"] == between[1], probes
     assert any(probe["split"] == between[0] and not probe["fits"] for probe in probes), probes
@@ -2236,7 +2256,7 @@ def test_a_tight_start_settles_the_split_beside_one_that_missed_and_compiles_onc
     assert len(set(asked)) == len(asked) <= ROWS and compiles.count <= len(asked), (compiles.count, probes)
     # A warm process: the cold one's record, none of its executables, which no trainer holds past itself.
     with Compiles("step") as compiles:
-        trained(warm, steps=0, batch=batch)
+        trained(warm, steps=0)
     assert compiles.count == 1 and warm.plan["split"] == between[1]
 
 

@@ -660,6 +660,20 @@ def _recurrence_call(layer: str, length: int, documents: int, depth: int = 0, bo
             return chunk_gated_delta_rule(query, key, value, jnp.where(kept, gate, 0.0),
                                           jnp.where(kept, beta, 0.0), state, starts=starts,
                                           max_segments=bound, write_bound=1.0, **table)
+    elif layer == "Mamba-1":
+        from functools import partial
+
+        from dew.nn.kernels.recurrence_chunk import selective_scan
+        from dew.nn.mixers.mamba import CHUNK_SIZE as MAMBA_CHUNK, selective_scan as portable
+
+        memory, chunk = (8, 4), MAMBA_CHUNK
+        operands = [shaped(length, 8), shaped(length, 8), shaped(length, 4), shaped(length, 4)]
+        rate, skip = -jnp.ones((8, 4)), jnp.ones((8,))
+
+        def run(x, dt, keys, queries, *, valid, starts, state=None, **table):
+            step = jnp.where(valid[:, :, None], jax.nn.softplus(dt), 0.0)
+            return selective_scan(x, step, rate, keys, queries, skip, state, starts,
+                                  portable=partial(portable, chunk_size=MAMBA_CHUNK), **table)
     else:
         memory, chunk = (4, 8, 8), SSD_CHUNK
         operands = [shaped(length, 4, 8), shaped(length, 4), shaped(length, 1, 8), shaped(length, 1, 8)]
@@ -699,6 +713,23 @@ def test_a_forked_recurrence_holds_its_documents_not_their_bound(layer, depth):
     temporaries = [_compiled_cost(call, layout, operands, "cpu")[0]
                    for call, layout, operands, _, _ in (own, loose)]
     assert temporaries[0] == temporaries[1], temporaries
+
+
+@pytest.mark.parametrize("depth", [1, 3], ids=["a state and its questions", "a chain three deep"])
+@pytest.mark.parametrize("bound", [6, 24], ids=["its documents' own bound", "four times it"])
+def test_mamba1s_forked_scan_holds_no_more_than_its_packed_row(bound, depth):
+    """Mamba-1's forked selective scan on the portable walk (`mamba._forked_row`) walks its documents in
+    place, each segment's scan checkpointed: its gradient's temporaries on the CPU at most its packed row's
+    (the same six documents, unforked), at its documents' own bound and at four times it (5.9 and 7.3 MB
+    against the packed row's 13.5, where laid from chunks' edges they took 18.8 and 26.8, row 7380). Its
+    walk's trips stay the bound's, each one's residual its derivative's, so they grow with it, where the
+    gated delta net's and the SSD's adjoint walks the table back
+    (`test_a_forked_recurrence_holds_its_documents_not_their_bound`)."""
+    forked, packed = (_recurrence_call("Mamba-1", FORKED_LENGTH, 6, given, bound=bound if given else None)
+                      for given in (depth, 0))
+    temporaries = [_compiled_cost(call, layout, operands, "cpu")[0]
+                   for call, layout, operands, _, _ in (forked, packed)]
+    assert temporaries[0] <= temporaries[1], temporaries
 
 
 @pytest.mark.parametrize("counter", ["sm80", "sm90"], ids=["an A100's routes", "an H100's routes"])

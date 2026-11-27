@@ -17,6 +17,8 @@ LIMIT = 1 << 40
 
 
 @pytest.mark.gpu(reason="a compile's memory limit applies on a GPU alone (`memory.compile_limit`)")
+@pytest.mark.compiles_at_run(reason="its first fit, run on the GPU, measures the headroom its second "
+                             "fit's room is read from, and places the LoRA base each fit keeps")
 def test_a_lora_start_keeping_its_base_compiles_in_the_room_its_admission_reads(monkeypatch, tmp_path,
                                                                                caplog):
     """A LoRA run's fresh start whose base its devices hold already, kept as it is through the start

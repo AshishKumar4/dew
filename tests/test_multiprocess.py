@@ -1945,6 +1945,14 @@ def test_a_pool_draws_every_prompts_continuations_on_the_process_that_asked(tmp_
         assert report["global_rows"] == 24 and report["rows"] == 9
         assert len(report["tokens"]) == 9
         assert len(report["rejected"]) == 1 and "agree across processes" in report["rejected"][0]
+    # Each rank's rows fold from its own root by global row index (row 13493).
+    import jax
+
+    for rank, report in enumerate(reports):
+        root = jax.random.key(100 + rank)
+        expected = [jax.random.key_data(jax.random.fold_in(root, rank * report["rows_each"] + row)).tolist()
+                    for row in range(report["rows_each"])]
+        assert report["row_keys"] == expected, rank
     assert single["rows"] == 18 and single["global_rows"] == 18
     assert reports[0]["tokens"] + reports[1]["tokens"] == single["tokens"]
     assert reports[0]["lengths"] + reports[1]["lengths"] == single["lengths"]

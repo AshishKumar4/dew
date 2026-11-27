@@ -136,6 +136,7 @@ from dew.nn.kernels.templates.attention_mosaic_registers import BackwardRegister
 from dew.nn.kernels.templates.attention_mosaic_scores import step_live_tiles
 from dew.nn.kernels.templates.base import Template
 from dew.nn.kernels.templates.hooks import NO_HOOK, TRACED_TILE, Hook, Side
+from dew.nn.precision import asks_default_precision
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1299,6 +1300,13 @@ class MosaicForward(_Mainloop[Tiles]):
             # 64: 48 bytes on two consumers, 24 on one): the Pallas-Triton mainloop's.
             return Refusal('dtype', "the Mosaic mainloop's fp32 parts walk an inference call over dense "
                            "operands, no dropout")
+        if self.parts > 1 and not asks_default_precision(None, configured=True):
+            # Its parts' products sum in the tensor cores' accumulator, which an fp32 product above the
+            # default precision asks exact (`product.promoted`): on an H100 its forward was 11.8 to 16.8
+            # times the reference's error under HIGHEST, its accurate form alike (M-NA-48, row 13498), where
+            # the Pallas-Triton mainloop's held check 1.
+            return Refusal('dtype', "the Mosaic mainloop's fp32 parts sum in the tensor cores' accumulator, "
+                           "an fp32 product's sums above the default precision unpromoted")
         if self.parts > 1 and not loads_parts(family):
             return Refusal('dtype', f"the Mosaic mainloop's fp32 parts load in pieces, which {family.name}'s "
                            "pipeline does not")
@@ -1608,6 +1616,36 @@ def producer_raised(family: mosaic.Family, target: generation.GpuTarget) -> bool
         return family.registers(family.consumers) > resources.entry_registers(held)
 
 
+def _columns_legal(ba: tokamax.BoundArguments, config: BackwardTiles, family: mosaic.Family, dtype) -> bool:
+    """Whether a backward config's consumers and programs split the call's widths as `family` stages them
+    (`MosaicBackward.legal`'s last part): a shared key block's consumers each their share of the columns, a
+    width split among programs its shares."""
+    if config.shared_keys:
+        # Every consumer's share of the keys whole rows of a swizzle the exchange stages them at
+        # (`swizzling.swizzle_for`), its share of the columns whole swizzled rows
+        # (`attention_mosaic_coop`).
+        share = _width(ba.arguments["query"].shape[-1], family, dtype) // config.consumers
+        narrowest = family.narrowest_columns(dtype)
+        return (config.fused and config.queries_first and config.consumers > 1 and config.columns == 1
+                and (config.block_k // config.consumers) % narrowest == 0
+                and share % family.column_unit(dtype) == 0)
+    # A width split among programs adds its dQ once, in no fused launch, each share whole swizzled rows
+    # and, where its family's products read their right operand's columns from a block staged at its
+    # whole width (`Family.operands_in_registers`), whole swizzle tiles of that block: an A100's accurate
+    # dQ under a score hook split 64 columns in two, its keys' 64-column tile sliced at 32, and failed to
+    # lower ("slice size (32) divisible by the tile size (64)", FS-A100CHECK1d, acchook3).
+    widths = [_width(ba.arguments[name].shape[-1], family, dtype) for name in ("query", "value")]
+    def unit(width: int) -> int:
+        if not family.operands_in_registers:
+            return family.column_unit(dtype)
+        tile = swizzling.swizzle_columns(dtype, swizzling.swizzle_for(dtype, width))
+        return max(family.column_unit(dtype), tile)
+
+    units = [unit(width) for width in widths]
+    return config.columns == 1 or (not config.fused and all(
+        (width / config.columns) % unit == 0 for width, unit in zip(widths, units, strict=True)))
+
+
 @dataclasses.dataclass(frozen=True)
 class MosaicBackward(_Mainloop[BackwardTiles]):
     """The template's backward on this mainloop (`gradients`) over the call's own arrays (`backward` gives
@@ -1813,30 +1851,7 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
                 and not _fewer_hooked(self.score_mod, family)):
             # takes none fewer (`_fewer_hooked`): a hooked call's tiles of fewer fail to lower there.
             return False
-        if config.shared_keys:
-            # Every consumer's share of the keys whole rows of a swizzle the exchange stages them at
-            # (`swizzling.swizzle_for`), its share of the columns whole swizzled rows
-            # (`attention_mosaic_coop`).
-            share = _width(ba.arguments["query"].shape[-1], family, dtype) // config.consumers
-            narrowest = family.narrowest_columns(dtype)
-            return (config.fused and config.queries_first and config.consumers > 1 and config.columns == 1
-                    and (config.block_k // config.consumers) % narrowest == 0
-                    and share % family.column_unit(dtype) == 0)
-        # A width split among programs adds its dQ once, in no fused launch, each share whole swizzled rows
-        # and, where its family's products read their right operand's columns from a block staged at its
-        # whole width (`Family.operands_in_registers`), whole swizzle tiles of that block: an A100's accurate
-        # dQ under a score hook split 64 columns in two, its keys' 64-column tile sliced at 32, and failed to
-        # lower ("slice size (32) divisible by the tile size (64)", FS-A100CHECK1d, acchook3).
-        widths = [_width(ba.arguments[name].shape[-1], family, dtype) for name in ("query", "value")]
-        def unit(width: int) -> int:
-            if not family.operands_in_registers:
-                return family.column_unit(dtype)
-            tile = swizzling.swizzle_columns(dtype, swizzling.swizzle_for(dtype, width))
-            return max(family.column_unit(dtype), tile)
-
-        units = [unit(width) for width in widths]
-        return config.columns == 1 or (not config.fused and all(
-            (width / config.columns) % unit == 0 for width, unit in zip(widths, units, strict=True)))
+        return _columns_legal(ba, config, family, dtype)
 
     def walked(self, ba: tokamax.BoundArguments, target: generation.GpuTarget) -> BackwardTiles | None:
         """The config whose launches tcgen05's walked placements take for the call (`walked_layouts`,
