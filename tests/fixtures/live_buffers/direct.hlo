@@ -1,0 +1,7 @@
+HloModule m, entry_computation_layout={(f32[64,128]{1,0}, f32[128,32]{1,0})->(f32[64,32]{1,0}, s8[1024]{0})}
+
+ENTRY e {
+  a = f32[64,128]{1,0} parameter(0)
+  b = f32[128,32]{1,0} parameter(1)
+  ROOT c = (f32[64,32]{1,0}, s8[1024]{0}) custom-call(a, b), custom_call_target="CALL", metadata={op_name="jit(f)/down_proj/dot_general"}, frontend_attributes={checkpoint_name="down_proj"}
+}
