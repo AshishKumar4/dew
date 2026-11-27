@@ -83,9 +83,11 @@ def _arms(model, params, *, mask_on_host: bool):
         return {**_draft(ops, settled.state, first, fed),
                 "emitted": jnp.where(settled.kept, settled.tokens, -1)}
 
-    # A block's device checks discharged as a decode loop's are (`text._generate`), raised here.
+    # A block's device checks discharged as a decode loop's are (`text._generate`) and raised on the host: run
+    # as given, the gate tracing none of it, as the loop's caller runs it.
     checked = jax.jit(checkify.checkify(settled_draft, errors=checkify.user_checks))
 
+    @as_given
     def replayed(prompts, greedy, counts, fed):
         error, leaves = checked(prompts, greedy, counts, fed)
         error.throw()
