@@ -420,16 +420,18 @@ def weight_stem(name: str) -> str | None:
     return None
 
 
-def weight_shard(name: str) -> bool:
-    """Whether a directory's entry `name` is a shard of a stem's weights (`_shards`), not its single file or
-    its index."""
-    return any(_shards(stem).fullmatch(name) for stem in WEIGHT_STEMS)
+def first_shard(name: str) -> str | None:
+    """The stem a directory's entry `name` is a shard of, named as a first save names it, under no token
+    (`save_sharded`, as its library names it); None for any other entry."""
+    return next((stem for stem in WEIGHT_STEMS if _shards(stem, tokened=False).fullmatch(name)), None)
 
 
-def _shards(stem: str) -> re.Pattern[str]:
-    """A weights stem's shards, named as `save_sharded` (`<stem>-<token>-00001-of-00002`) and transformers'
-    and diffusers' `save_pretrained` (`<stem>-00001-of-00002`) name them."""
-    return re.compile(rf"{re.escape(stem)}-(?:[0-9a-f]{{8}}-)?\d{{5}}-of-\d{{5}}\.safetensors")
+def _shards(stem: str, *, tokened: bool = True) -> re.Pattern[str]:
+    """A weights stem's shards, named as `save_sharded` (`<stem>-<token>-00001-of-00002`, a replacement's)
+    and transformers' and diffusers' `save_pretrained` (`<stem>-00001-of-00002`) name them; the latter
+    alone where not `tokened`."""
+    token = r"(?:[0-9a-f]{8}-)?" if tokened else ""
+    return re.compile(rf"{re.escape(stem)}-{token}\d{{5}}-of-\d{{5}}\.safetensors")
 
 
 def _replaced(stem: str) -> re.Pattern[str]:

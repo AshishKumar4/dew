@@ -621,3 +621,39 @@ def test_two_first_saves_written_together_publish_one_under_its_names(tmp_path):
     assert not os.path.lexists(staging)
     shards = sorted(path.name for path in target.glob('model-*.safetensors'))
     assert len(shards) > 1 and all(name.startswith('model-0') for name in shards), shards
+
+
+def test_a_first_save_a_third_replaced_between_is_refused_its_names(tmp_path):
+    """A save begun while the destination held nothing, which names its shards as a first save does, is
+    refused where another save published there and a third replaced that one while it was written: a reader
+    holding the first published save's index opens none of its shards under the names it reads, but finds
+    them gone, the third save's values published (train 1414's review: the shards were compared with the
+    third save's names alone, and the reader silently read this save's)."""
+    import json
+    import os
+
+    from safetensors.numpy import load_file
+
+    from dew._files import swapped
+    from dew.interop.releases import ConcurrentRelease, Placed, ReleasePlan, refused_entries
+
+    weight = np.arange(4096, dtype=np.float32).reshape(64, 64)
+    target = tmp_path / 'release'
+
+    def plan(scale):
+        return ReleasePlan(Placed({'': ({'model_type': 'tiny'}, {'model.a': weight * scale,
+                                                                 'model.b': weight + scale})}))
+
+    with pytest.raises(ConcurrentRelease), swapped(target, refused_entries) as staging:
+        plan(3).write(staging, max_shard_size=20000, fresh=True)
+        plan(1).write(target, max_shard_size=20000)
+        # A reader opens the first published save's index, then a third save replaces that save.
+        first = json.loads((target / 'model.safetensors.index.json').read_text())['weight_map']
+        plan(2).write(target, max_shard_size=20000)
+    assert not os.path.lexists(staging)
+    assert not any((target / name).exists() for name in set(first.values()))
+    index = json.loads((target / 'model.safetensors.index.json').read_text())['weight_map']
+    published = {name: value for file in set(index.values())
+                 for name, value in load_file(target / file).items()}
+    np.testing.assert_array_equal(published['model.a'], weight * 2)
+    np.testing.assert_array_equal(published['model.b'], weight + 2)
