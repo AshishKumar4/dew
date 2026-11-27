@@ -851,7 +851,7 @@ class RunConfig:
             node[field] = value
         # Built once, every field of the point in place, so its checks read the run it describes: a live
         # record, its chains' too, strict within a saved run's reading (`_records.reading_saved`).
-        with _records.reading_saved(False):
+        with _records.reading_saved(saved=False):
             chains = _overridden({name: getattr(self, name) for name in CHAINS}, chained)
             return dataclasses.replace(type(self).from_dict(record), **chains)
 
@@ -1070,7 +1070,7 @@ class RunConfig:
         holds (a saved run's is read by `load`), even where a saved run's decoder
         reads it (`_records.reading_saved`)."""
         run_class, fields = cls._named(record, trust)
-        with _records.reading_saved(False):
+        with _records.reading_saved(saved=False):
             return run_class.from_dict(fields)
 
     @classmethod

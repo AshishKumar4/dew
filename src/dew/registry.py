@@ -2250,7 +2250,7 @@ def built_arguments(member: type | Callable[..., Configured], fields: Mapping[st
 def _live_record[Value](annotation: type[Value], value: Configured) -> Value:
     """A command line's record of `annotation`, read live: strict within a saved run's reading too
     (`_records.reading_saved`)."""
-    with _records.reading_saved(False):
+    with _records.reading_saved(saved=False):
         return from_record(annotation, value, dtypes=False)
 
 
