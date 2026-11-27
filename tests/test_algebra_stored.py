@@ -560,18 +560,42 @@ def test_a_part_of_objects_keys_nothing():
     assert _keyed(_broadcasts((1, 1)), (np.array([object()], dtype=object),)) is None
 
 
-@pytest.mark.parametrize("linked", [False, True], ids=["named", "linked"])
-def test_a_read_only_store_that_is_dews_cache_is_never_written(storing, tmp_path, monkeypatch, linked):
-    """A read-only store (`DEW_DERIVATIONS`) that resolves to Dew's cache, named or through a link, is never
-    written: a derivation there is derived and counted unstorable, the store left empty."""
-    Path(stored.directory()).mkdir(parents=True, exist_ok=True)
-    alias = tmp_path / "alias"
-    if linked:
-        alias.symlink_to(stored.directory())
-    monkeypatch.setenv("DEW_DERIVATIONS", str(alias if linked else stored.directory()))
+def test_a_read_only_store_one_directory_with_dews_cache_by_another_path_is_never_written(storing, tmp_path,
+                                                                                        monkeypatch):
+    """A read-only store that is Dew's cache's directory by another path no resolution joins (two mounts of
+    one) is never written: here a link whose resolution the test withholds, so the two paths differ and only
+    the directories' identity (`os.path.samefile`) tells them one."""
+    cache = Path(stored.directory())
+    cache.mkdir(parents=True)
+    (tmp_path / "mount").symlink_to(cache)
+    monkeypatch.setenv("DEW_DERIVATIONS", str(tmp_path / "mount"))
+    withheld = {os.path.abspath(path) for path in (cache, tmp_path / "mount")}
+    resolved = os.path.realpath
+
+    def realpath(path, *args, **kwargs):
+        held = os.path.abspath(path)
+        return held if held in withheld else resolved(path, *args, **kwargs)
+
+    monkeypatch.setattr(os.path, "realpath", realpath)
     _derived("walk")
     assert storing.stored == {"unstorable": 1}
-    assert not list(Path(stored.directory()).glob("*.json"))
+    assert not list(cache.glob("*.json"))
+
+
+@pytest.mark.parametrize("alias", ["named", "linked", "not yet made"])
+def test_a_read_only_store_that_is_dews_cache_is_never_written(storing, tmp_path, monkeypatch, alias):
+    """A read-only store (`DEW_DERIVATIONS`) that is Dew's cache, named, through a link, or named before
+    either is made, is never written: a derivation there is derived and counted unstorable, the store
+    left empty."""
+    cache = Path(stored.directory())
+    if alias != "not yet made":
+        cache.mkdir(parents=True, exist_ok=True)
+    if alias == "linked":
+        (tmp_path / "alias").symlink_to(cache)
+    monkeypatch.setenv("DEW_DERIVATIONS", str(tmp_path / "alias" if alias == "linked" else cache))
+    _derived("walk")
+    assert storing.stored == {"unstorable": 1}
+    assert not list(cache.glob("*.json"))
 
 
 def test_an_entry_is_a_stores_own_file_not_its_name(storing, tmp_path):
@@ -583,3 +607,6 @@ def test_an_entry_is_a_stores_own_file_not_its_name(storing, tmp_path):
     named = tmp_path / entry.name
     named.write_text('{"format": 5}')
     assert not stored.entry(named) and not stored.entry(tmp_path / "missing.json")
+    # Its digest read before its body: a body nested past Python's depth, not its own, is never parsed.
+    named.write_text("0" * 40 + "\n" + "[" * 100_000 + "]" * 100_000)
+    assert not stored.entry(named)
