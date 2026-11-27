@@ -13,7 +13,6 @@ and the main model's apart, and a packed batch scores its documents as it
 would alone. Everything runs at fp32 on CPU.
 """
 
-import dataclasses
 import json
 from pathlib import Path
 
@@ -587,7 +586,9 @@ def test_an_index_branchs_kl_pools_by_its_queries_across_a_split_step():
     branch's among them, as the unsplit step does over the same rows, held to the whole update computed in
     float64 by the same model in float64 by check 1 (row 13705: an average of the parts' means weighs the
     padded part's queries up)."""
-    from rl_split_support import prepare_split_whole_steps
+    from arm_arithmetic import summed_as_run
+    from arm_forms import dew_path
+    from rl_split_support import SplitAndWhole
 
     from dew.objectives.routing import RoutedStatistics
 
@@ -602,30 +603,35 @@ def test_an_index_branchs_kl_pools_by_its_queries_across_a_split_step():
         return packed_batch(packed(seed))
 
     template = rows(0)
-    split_start, whole_start, split_step, whole_step, update_key = prepare_split_whole_steps(
-        objective, rate, jax.random.key(3), template, template)
+    steps = SplitAndWhole(objective, rate, jax.random.key(3), template, template)
+    whole_start = steps.whole_start
 
     def draw(seed: int):
-        params = nn.unbox(jax.jit(objective.init)(jax.random.key(seed)))["params"]
-        batch = rows(seed)
-        def stepped(step, start):
-            held = dataclasses.replace(start, variables={**start.variables, "params": params})
-            return step(jax.tree.map(jnp.copy, held), batch)[0].variables["params"]
+        return nn.unbox(jax.jit(objective.init)(jax.random.key(seed)))["params"], rows(seed)
 
-        moved = [stepped(*pair) for pair in ((split_step, split_start), (whole_step, whole_start))]
-        return params, batch, *moved
+    def moved(split: int):
+        # A step compiled on the host and run as given (`as_given`), the check's arithmetic its compile's.
+        @as_given
+        def stepped(params, batch):
+            return steps.stepped(split, batch, variables={"params": params}).variables["params"]
+        # The whole step Dew's own path, under the rewrite its split runs under (`dew_path`): the claim is
+        # the split's invariance.
+        return stepped if split == 2 else dew_path(stepped)
 
     wide = LMObjective(deepseek_stack(4, dtype="float64"), SEQ, indexer=IndexerTraining("sparse"))
 
-    def whole_update(params, batch, _split, _whole):
+    def whole_update(params, batch):
         step = Step(jnp.zeros((), jnp.int32), jax.random.fold_in(whole_start.key, 0), None,
-                    committed=jnp.zeros((), jnp.int32), example_key=update_key,
+                    committed=jnp.zeros((), jnp.int32), example_key=steps.update_key,
                     example_index=jnp.arange(4, dtype=jnp.int32), example_count=4)
         grads = jax.grad(lambda p: wide.scalar_loss({**whole_start.variables, "params": p}, batch,
                                                     step)[0])(params)
         return jax.tree.map(lambda leaf, grad: leaf - rate * grad, params, grads)
 
-    params, _, split_moved, _ = draw(0)
+    params, batch = draw(0)
+    # Compiled in the arithmetic check 1 runs its arms in, which its first call fixes.
+    with summed_as_run():
+        split_moved = moved(2)(params, batch)
     # The parts' query masses as the split takes them, alternate rows: unequal.
     def queries(start: int) -> float:
         stats = objective.loss({"params": params}, packed_batch(packed(0)[start::2]), step_at())[0]
@@ -638,8 +644,7 @@ def test_an_index_branchs_kl_pools_by_its_queries_across_a_split_step():
                for (path, after), before in zip(jax.tree_util.tree_leaves_with_path(split_moved),
                                                 jax.tree.leaves(params), strict=True)
                if INDEXER in jax.tree_util.keystr(path))
-    assert_as_exact(lambda _p, _b, split, _w: split, lambda _p, _b, _s, whole: whole, draw,
-                    "an indexer's split update", seeds=8, truth_fn=whole_update)
+    assert_as_exact(moved(2), moved(1), draw, "an indexer's split update", seeds=8, truth_fn=whole_update)
 
 
 @pytest.mark.parametrize("phase, topk", [("warmup", None), ("sparse", 4)])

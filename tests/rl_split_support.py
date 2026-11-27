@@ -1,5 +1,7 @@
 """Shared helpers for control PPO and Dreamer filled-batch, split-step and mid-window resume tests."""
 
+import dataclasses
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -124,31 +126,45 @@ def assert_mid_window_resume(objective, batch_a, batch_b, directory: str, *, nud
     return planned, mesh
 
 
-def prepare_split_whole_steps(objective, rate: float, run_key: jax.Array, template, filled_template):
-    """Compile paired `split=2` (on `filled_template`) and `split=1` (on `template`) SGD steps and return
-    `(split_start, whole_start, split_step, whole_step, update_key)`, the split start holding its step's
-    empty window."""
-    from dew.objectives.base import EXAMPLE_STREAM
+class SplitAndWhole:
+    """Paired SGD steps of `objective` at `rate`, a `split=2` one over `filled_template`'s shape and a
+    `split=1` one over `template`'s, for a check of their updates: the whole step's start and the update's
+    example key (`update_key`) known at once, for the truth, and each step compiled at its first call, in
+    the arithmetic its check runs its arms in (`summed_as_run`), not the suite's wide one (audit PT02)."""
 
-    mesh = MeshSpec().build(jax.devices()[:1])
-    split_trainer = Trainer(objective, optax.sgd(rate), key=run_key, split=2, checkpoints=None,
-                            tracker=None)
-    split_trainer.device_mesh = mesh
-    whole_trainer = Trainer(objective, optax.sgd(rate), key=run_key, split=1, checkpoints=None,
-                            tracker=None)
-    whole_trainer.device_mesh = mesh
-    split_start, whole_start = split_trainer.initial_state(), whole_trainer.initial_state()
-    split_step = split_trainer.compile(split_start, filled_template)
-    whole_step = whole_trainer.compile(whole_start, template)
-    # The split start holding the window its step builds, once (its first call's): a call per seed over it
-    # steps alone, building none (an eval_shape of the objective's batch statistics each, row 7849). A step
-    # a window long leaves its window committed, holding no microbatch (`Accumulation.fill` 0), whose next
-    # first microbatch replaces what it left; the start takes it.
-    stepped = split_step(jax.tree.map(jnp.copy, split_start), filled_template)[0]
-    window, size = stepped.accumulation, stepped.window_size
-    assert window is not None and window.fill is not None and size is not None
-    assert (int(size), int(window.fill)) == (2, 0), "a step a window long left its window uncommitted"
-    split_start = split_start.replace(accumulation=stepped.accumulation, window_size=stepped.window_size)
-    update_key = jax.random.fold_in(jax.random.fold_in(jax.random.fold_in(split_start.key, EXAMPLE_STREAM),
-                                                       0), 0)
-    return split_start, whole_start, split_step, whole_step, update_key
+    def __init__(self, objective, rate: float, run_key: jax.Array, template, filled_template):
+        from dew.objectives.base import EXAMPLE_STREAM
+
+        mesh = MeshSpec().build(jax.devices()[:1])
+        self._trainers = {split: Trainer(objective, optax.sgd(rate), key=run_key, split=split, mesh=mesh,
+                                         checkpoints=None, tracker=None) for split in (2, 1)}
+        self._templates = {2: filled_template, 1: template}
+        self._starts = {split: trainer.initial_state() for split, trainer in self._trainers.items()}
+        self.whole_start = self._starts[1]
+        self.update_key = jax.random.fold_in(jax.random.fold_in(jax.random.fold_in(
+            self._starts[2].key, EXAMPLE_STREAM), 0), 0)
+        self._steps = {}
+
+    def stepped(self, split: int, batch, *, variables=None, ema=None):
+        """The state after one step at `split` (2 or 1) over `batch` from its start, the collections of
+        `variables` and the `ema` given in place of its own, compiled at its first call."""
+        if split not in self._steps:
+            start = self._starts[split]
+            step = self._trainers[split].compile(start, self._templates[split])
+            if split == 2:
+                # The split start holding the window its step builds, once (its first call's): a call per
+                # seed over it steps alone, building none (an eval_shape of the objective's batch statistics
+                # each, row 7849). A step a window long leaves its window committed, holding no microbatch
+                # (`Accumulation.fill` 0), whose next first microbatch replaces what it left; the start
+                # takes it.
+                ran = step(jax.tree.map(jnp.copy, start), self._templates[split])[0]
+                window, size = ran.accumulation, ran.window_size
+                assert window is not None and window.fill is not None and size is not None
+                assert (int(size), int(window.fill)) == (2, 0), "a step a window long left its window open"
+                self._starts[split] = dataclasses.replace(start, accumulation=ran.accumulation,
+                                                          window_size=ran.window_size)
+            self._steps[split] = step
+        start = self._starts[split]
+        given = dataclasses.replace(start, variables={**start.variables, **(variables or {})},
+                                    ema=start.ema if ema is None else ema)
+        return self._steps[split](jax.tree.map(jnp.copy, given), batch)[0]
