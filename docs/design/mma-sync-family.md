@@ -84,6 +84,11 @@ fork.
    - The ring stays only where a stated limit forces it: dynamic grouped step counts (static grids only),
      step counts not divisible by the stages, or the in-flight wgmma release (`delay_release` refused). The
      note then names that limit and the measurement.
+   - Measured (M-FS-94b, GH200, 128x256x64 at four stages, two consumers, three alternating rounds): the two
+     forms tie wherever the pipeline of pipelines compiles (2048x4096x4096 0.998, 8192x4096x4096 and
+     16384x2048x2048 1.000), and it walks one tile axis, so a launch of two (4096x4096x14336) runs on the ring
+     alone. The ring stays for every wgmma launch: nothing is gained where both run, and only it runs where
+     a launch takes two tile axes.
 4. **mma.sync streaming across tiles.** Today each mma.sync tile's `emit_pipeline` drains. The existing
    alternative is one flattened `emit_pipeline` over (tile, step), carrying the accumulator in `init_carry`,
    storing and resetting it at tile boundaries while JAX prefetches across them (:320-323, :416-427,
