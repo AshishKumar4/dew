@@ -320,6 +320,6 @@ def test_gemm_over_a_window_computes_what_its_call_asks(compute, precision):
     window = Bf16Window.of(finite).checked()
     x = jnp.full((8, 256), 1 + 2.0 ** -9, jnp.float32)
     with jax.default_matmul_precision(precision or "default"):
-        served = gemm.gemm(x, window, None, out_dtype=jnp.float32, compute=compute, interpret_on_cpu=True)
-        decoded = gemm.gemm(x, finite, None, out_dtype=jnp.float32, compute=compute, interpret_on_cpu=True)
+        served = gemm.gemm(x, window, None, out_dtype=jnp.float32, compute=compute)
+        decoded = gemm.gemm(x, finite, None, out_dtype=jnp.float32, compute=compute)
     np.testing.assert_array_equal(np.asarray(served).view(np.uint32), np.asarray(decoded).view(np.uint32))
