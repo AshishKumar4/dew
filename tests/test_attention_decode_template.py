@@ -1754,38 +1754,35 @@ def test_softcap_and_windowed_decode_compile_spill_free(generation_name, case):
     assert not (failed := mosaic_failures(found)), "\n".join(failed)
 
 
-@pytest.mark.parametrize("width", [64, 32])
 @pytest.mark.parametrize("finished", [True, False], ids=["finished", "state"])
-def test_a_decode_plan_prices_the_merge_its_walk_launches(finished, width):
-    """An H100's step of four query heads over two key heads and 32768 keys, finished under an output gate (a
-    parameter of its output's layout) or unfinished and unhooked: its plan's merge (`merge_launch_for`, the
-    launch `_merge_seconds` prices) the one its walk's own outputs make (`merged.merge_launch` of the types
-    its pinned launch writes, as `attend` runs it): their operands' shapes, its walk's units at the call's
-    scale, its initial state, the rows and columns it keeps, the dtype and heads it writes and its output
-    hook alike (train 1402's K-F3 review); values 64 and 32 wide, the latter's columns its family's column
-    unit's, 64."""
+def test_a_decode_plan_prices_the_merge_its_walk_launches(finished):
+    """An H100's step of four query heads over two key heads and 4096 keys, finished under an output gate (a
+    parameter of its output's layout) or unfinished and unhooked, its walk pinned to a WGMMA tile and two
+    slices, its values 32 wide: its priced merge (`merge_launch_for`, the launch `_merge_seconds` prices) the
+    one its walk's own outputs make (`merged.merge_launch` of the types its pinned launch writes, as
+    `attend` runs it): their operands' shapes, its columns its family's column unit's past `head_width`'s,
+    which alone priced fewer than it writes, its walk's units at the call's scale, the rows and columns it
+    keeps, the dtype and heads it writes and its output hook alike (train 1402's K-F3 review)."""
+    width, slices = 32, 2
+    tiles = attention_mosaic.Tiles(64, 64, 2, 1, family="wgmma")
     query = jnp.zeros((1, 1, 4, width), jnp.bfloat16)
-    key = jax.ShapeDtypeStruct((1, 32768, 2, width), jnp.bfloat16)
-    spans = template.spans(1, 32768, 1, causal=False)
+    key = jax.ShapeDtypeStruct((1, 4096, 2, width), jnp.bfloat16)
+    spans = template.spans(1, 4096, 1, causal=False)
     gate = jnp.ones((1, 1, 4, width), jnp.bfloat16)
     hooks = (template.Hooks(output=Hook(lambda out, gate: out * gate, (Side(gate, template.Kind.OUTPUT),)))
              if finished else template.Hooks())
     descriptor = (hooks.output, 4) if finished else None
     with generation.assumed("sm90"):
         target = generation.gpu_target()
-        work, rows, row_spans, whole = attention_decode.planned(query, key, key, spans, hooks,
-                                                                finished=finished)
-        assert work is not None
-        at = work["plain"]
-        assert at.slices > 1
-        priced = attention_decode.merge_launch_for(rows, key, row_spans, whole, at.config, at.slices,
-                                                   scale=None, target=target, initial=None,
-                                                   finished=descriptor, deferred=False)
+        _, rows, row_spans, whole = attention_decode.planned(query, key, key, spans, hooks, finished=finished)
+        priced = attention_decode.merge_launch_for(rows, key, row_spans, whole, tiles, slices, scale=None,
+                                                   target=target, initial=None, finished=descriptor,
+                                                   deferred=False)
         stateless = dataclasses.replace(whole, initial=None, output=NO_HOOK)
-        with tuning.pinned({attention_mosaic.MosaicForward: at.config}):
+        with tuning.pinned({attention_mosaic.MosaicForward: tiles}):
             walked = jax.eval_shape(lambda rows, key: attention_mosaic.forward(
                 rows, key, key, row_spans, stateless, residuals=template.Kept.OUTPUT, out_dtype=jnp.float32,
-                splits=at.slices, natural=False, subtracted=True, masked=True), rows, key)
+                splits=slices, natural=False, subtracted=True, masked=True), rows, key)
         emitted = merged.merge_launch(attention_decode.merge_spec(rows, row_spans, whole, scale=None),
                                       walked.padded, walked.stacked, queries=rows.shape[1], width=width,
                                       out_dtype=query.dtype if finished else None,
@@ -1793,3 +1790,4 @@ def test_a_decode_plan_prices_the_merge_its_walk_launches(finished, width):
     assert priced is not None
     assert priced._replace(output=NO_HOOK) == emitted._replace(output=NO_HOOK)
     assert priced.output is emitted.output
+    assert emitted.padded.shape[-1] > attention_mosaic_forward.head_width(width)
