@@ -425,7 +425,7 @@ def test_a_hub_export_read_by_its_branch_reads_every_file_at_the_commit_it_named
                         SimpleNamespace(sha=branch.get(revision or "main", revision)))
     # The real Hub's filesystem again once the test ends.
     registry = importlib.import_module("fsspec.registry")._registry
-    monkeypatch.setitem(registry, "hf", LocalHub if scheme == "hf" else Unreadable)
+    monkeypatch.setitem(registry, "hf", Unreadable if scheme == "privatehub" else LocalHub)
     if scheme:
         monkeypatch.setitem(registry, scheme, LocalHub if scheme == "hf" else Profiled)
     options = {"simplecache": {"cache_storage": str(tmp_path / "cache")}} if transport else (
