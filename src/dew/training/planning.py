@@ -512,8 +512,9 @@ def _stated(rung: Rung) -> RecomputeStatement | None:
     return next(iter(stated)) if len(stated) == 1 else None
 
 
-def kept_at(rung: Rung, start: Rung) -> Callable[[Held], bool] | None:
-    """Which of the buffers the step held at `start` it holds at `rung` (`LiveProfile.peak`'s `kept`), each
+def kept_at(rung: Rung, start: Rung) -> tuple[Callable[[Held], bool], Callable[[Held], bool]] | None:
+    """Which of the buffers the step held at `start` it holds at `rung` (`LiveProfile.peak`'s `kept`), and
+    which of those it does not it recomputes, made by its forward all the same (`recomputed`), each
     dropped at most once: none of the residuals `rung`'s recomputation drops (`RecomputeStatement`,
     `Held.residual`), none of its whole head's logits where `rung` tiles a head `start` held whole, fused or
     not (`HEAD_SCOPE`; what the tile holds in their place is `priced`'s), none of its narrow copies' casts
@@ -528,11 +529,14 @@ def kept_at(rung: Rung, start: Rung) -> Callable[[Held], bool] | None:
         return None
     copies = start.narrow and not rung.narrow
 
-    def kept(buffer: Held) -> bool:
-        recomputed = said is not None and buffer.residual and said.drops(buffer.op_name, buffer.names)
-        return not (recomputed or (tiles and HEAD_SCOPE in buffer.op_name)
-                    or (copies and COPIES_SCOPE in buffer.op_name))
-    return kept
+    def gone(buffer: Held) -> bool:
+        return (tiles and HEAD_SCOPE in buffer.op_name) or (copies and COPIES_SCOPE in buffer.op_name)
+
+    def recomputed(buffer: Held) -> bool:
+        return (said is not None and buffer.residual and said.drops(buffer.op_name, buffer.names)
+                and not gone(buffer))
+
+    return (lambda buffer: not (gone(buffer) or recomputed(buffer))), recomputed
 
 
 Tiled = Callable[[tuple[int, int], tuple[int, int], bool], int | None]
@@ -555,6 +559,7 @@ def priced(rung: Rung, start: Rung, profile: LiveProfile, bank: int, tiled: Tile
     kept = kept_at(rung, start)
     if kept is None:
         return None
+    keeps, recomputed = kept
     added: list[Held] = []
     if start.tile is None and rung.tile is not None:
         calls = [buffer for buffer in profile.held if WHOLE_LOGITS in buffer.names]
@@ -569,7 +574,7 @@ def priced(rung: Rung, start: Rung, profile: LiveProfile, bank: int, tiled: Tile
             added.append(Held(held, call.op_name, (), scaled=False, residual=False, trace=call.trace,
                               start=call.start, end=call.end, buffer=-1, storage=-1 - len(added)))
     released = bank if start.narrow and not rung.narrow else 0
-    return profile.most - profile.peak(kept, ratio, added) + released
+    return profile.most - profile.peak(keeps, ratio, added, recomputed) + released
 
 
 def predicted_short(rung: Rung, measured: Sequence[tuple[Rung, int]], start: Rung) -> int | None:

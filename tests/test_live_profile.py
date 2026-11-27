@@ -60,14 +60,14 @@ def test_a_rung_frees_what_its_peak_falls_by_wherever_the_peak_then_stands():
     (the 4B decoder's peak moved from its layers' backward to its head); a rung drops residuals alone, never
     the head's own values or a backward's temporaries."""
     profile = LiveProfile((held(50, 4, 10, 0, names=("mlp",), residual=True),
-                           held(40, 6, 8, 1, op_name=BACKWARD), held(45, 1, 3, 2, op_name=HEAD)))
+                           held(40, 6, 8, 1, op_name=BACKWARD), held(55, 1, 3, 2, op_name=HEAD)))
     assert profile.peak() == 90
-    assert profile.frees(lambda op_name, names: "mlp" in names) == 90 - 45
-    assert profile.frees(lambda op_name, names: True) == 90 - 45
+    assert profile.frees(lambda op_name, names: "mlp" in names) == 90 - 55
+    assert profile.frees(lambda op_name, names: True) == 90 - 55
     at_peak = LiveSet(0, 0, ((50, FORWARD, ("mlp",)), (40, BACKWARD, ())))
     assert at_peak.frees(lambda op_name, names: "mlp" in names) == 50
     profiled = LiveSet(0, 0, at_peak.made, profile)
-    assert profiled.frees(lambda op_name, names: "mlp" in names) == 45
+    assert profiled.frees(lambda op_name, names: "mlp" in names) == 35
 
 
 def test_a_residual_is_a_forward_value_live_into_the_backward():
@@ -87,7 +87,7 @@ def test_a_recomputed_residual_is_held_through_its_forwards_last_read():
     """A residual a rung recomputes is made by its forward all the same, and held until the forward last
     reads it (`LiveInterval.uses`, `Held.until`): where it shares the forward's peak with its scratch,
     dropping it frees none of that peak, though it is alone in the backward; read last before the scratch,
-    it frees its bytes there."""
+    it frees its bytes past its own position."""
     def profile(read: int) -> LiveProfile:
         found = LiveProfile.of((interval(100, 0, 6, 0, uses=((read, FORWARD), (5, BACKWARD))),
                                 interval(70, 1, 3, 1), interval(10, 4, 6, 2, op_name=BACKWARD)), frozenset())
@@ -96,7 +96,7 @@ def test_a_recomputed_residual_is_held_through_its_forwards_last_read():
 
     assert profile(2).most == profile(0).most == 170
     assert profile(2).frees(lambda op_name, names: True) == 0
-    assert profile(0).frees(lambda op_name, names: True) == 100
+    assert profile(0).frees(lambda op_name, names: True) == 170 - 100
 
 
 def test_a_heaps_pages_hold_their_buffers_together_and_heaps_apart_read_no_profile():
@@ -141,21 +141,23 @@ def test_a_whole_heads_tile_frees_its_logits_and_holds_its_tile_where_they_were(
 
 
 def test_a_place_frees_each_buffer_once_and_the_copies_bank_where_it_drops_them():
-    """A place recomputing the forward and reading no narrow copies frees each residual once, the copies'
-    casts (`COPIES_SCOPE`) and their bank among the step's arguments; a place reading copies the start read
-    none of is priced by none."""
+    """A place recomputing the forward and reading no narrow copies frees each buffer once: a residual its
+    span past its forward's last read of it, the copies' casts (`COPIES_SCOPE`) whole, made by no step that
+    reads none, and their bank among the step's arguments; a place reading copies the start read none of is
+    priced by none."""
     casts = f"jit(step)/{COPIES_SCOPE}/convert"
-    profile = LiveProfile((held(64, 0, 6, 0, residual=True), held(16, 1, 6, 1, op_name=casts, residual=True),
+    profile = LiveProfile((held(64, 2, 6, 0, residual=True, until=3),
+                           held(16, 1, 6, 1, op_name=casts, residual=True),
                            held(8, 4, 6, 2, op_name=BACKWARD)))
-    assert priced(rung((Remat(),), narrow=False), START, profile, 32, None) == 88 - 8 + 32
+    assert priced(rung((Remat(),), narrow=False), START, profile, 32, None) == 88 - 64 + 32
     assert priced(START, rung(narrow=False), profile, 0, None) is None
 
 
 def test_a_finer_split_frees_its_rows_share_beside_what_the_place_drops():
     """Priced at twice the microbatches its profile read, a place frees half of each buffer a microbatch's
-    rows scale too."""
-    profile = LiveProfile((held(64, 0, 6, 0, residual=True), held(40, 0, 6, 1, scaled=True)))
-    assert priced(rung((Remat(),)), START, profile, 0, None, ratio=2) == 104 - 20
+    rows scale."""
+    profile = LiveProfile((held(64, 0, 6, 0), held(40, 0, 6, 1, scaled=True)))
+    assert priced(START, START, profile, 0, None, ratio=2) == 104 - (64 + 20)
 
 
 def test_a_heads_tile_holds_what_its_route_holds():

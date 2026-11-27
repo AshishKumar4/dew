@@ -1006,19 +1006,21 @@ class LiveProfile:
         return self.peak()
 
     def peak(self, kept: Callable[[Held], bool] = lambda buffer: True, split: int = 1,
-             added: Sequence[Held] = ()) -> int:
+             added: Sequence[Held] = (), recomputed: Callable[[Held], bool] = lambda buffer: False) -> int:
         """The most bytes the schedule holds at any position, of the buffers `kept` keeps and those `added`
         in their place (a tiled head's tile over the positions its whole logits held): each storage of each
         trace once, at the most bytes of the buffers kept in it that are live there, a buffer a microbatch's
         rows scale at its share of `split` (rounded up), as the heap simulation counts the memory it occupies
-        (a storage reused after it was freed held again where a buffer reusing it is live). A residual it
-        does not keep is held through its forward's last read of it (`Held.until`): a rung recomputing it
-        frees its span past that alone, the forward making and reading it all the same."""
+        (a storage reused after it was freed held again where a buffer reusing it is live). A buffer it does
+        not keep and `recomputed` says a rung recomputes is held through its forward's last read of it
+        (`Held.until`): the rung frees its span past that alone, its forward making and reading it all the
+        same; one it does not keep otherwise (a tiled head's whole logits, the copies' casts) is made none."""
         held = self.held + tuple(added)
         keeps = [kept(buffer) for buffer in self.held] + [True] * len(added)
         # A residual not kept ends where its forward last reads it, ahead of any end at that position.
+        remade = [not keeps[index] and recomputed(buffer) for index, buffer in enumerate(self.held)]
         cut = sorted((buffer.start + 1 if buffer.until is None else buffer.until, -1, index)
-                     for index, buffer in enumerate(self.held) if not keeps[index] and buffer.residual)
+                     for index, buffer in enumerate(self.held) if remade[index])
         extra = sorted(event for at, buffer in enumerate(added, len(self.held))
                        for event in ((buffer.start, 1, at), (buffer.end, 0, at)))
         events: Iterable[tuple[int, int, int]] = (self._events if not added and not cut
@@ -1043,7 +1045,7 @@ class LiveProfile:
                 moved(index, starts=False)
             elif keeps[index]:
                 moved(index, bool(starts))
-            elif starts and held[index].residual:
+            elif starts and index < len(remade) and remade[index]:
                 moved(index, starts=True)
         return most
 
@@ -1051,10 +1053,11 @@ class LiveProfile:
         """What its schedule's peak would fall by at `split` without the residuals (`Held.residual`) that
         `dropped` says a rung would not keep: the peak of every buffer less the peak of the rest, wherever in
         the schedule each falls."""
-        def kept(buffer: Held) -> bool:
-            return not (buffer.residual and dropped(buffer.op_name, buffer.names))
+        def recomputed(buffer: Held) -> bool:
+            return buffer.residual and dropped(buffer.op_name, buffer.names)
 
-        return (self.most if split == 1 else self.peak(split=split)) - self.peak(kept, split)
+        return ((self.most if split == 1 else self.peak(split=split))
+                - self.peak(lambda buffer: not recomputed(buffer), split, recomputed=recomputed))
 
 
 CONTROL_SCOPES = re.compile(r"cond|while|body|body_fun|cond_fun|branch_\d+_fun")
