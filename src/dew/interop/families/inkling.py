@@ -443,7 +443,7 @@ _STACK_NAMES = MappingProxyType({
 the fields `_FIELDS` declares: the one spelling `_stacks` names them by and `_RESERVED` recognizes them by."""
 
 _FIELDS = MappingProxyType({
-    'index': r'\d+', 'layer': r'\d+', 'expert': r'\d+', 'site': ('attn', 'k', 'v', 'mlp'), 'conv': ('k', 'v'),
+    'index': r'\d+', 'layer': r'\d+', 'expert': r'\d+', 'site': tuple(_SITES.values()), 'conv': ('k', 'v'),
     'bank': ('w13', 'w2'), 'part': ('gate_proj', 'up_proj', 'down_proj'),
     'leaf': ('down_weight', 'forget_weight', 'gain_weight', 'input_down', 'message_down', 'forget', 'gain',
              'query'),
@@ -482,7 +482,7 @@ def _query(name: str, parts: tuple[str, ...], width: int) -> Stacked:
 
 def _sites(kind: Mapping[str, object]) -> tuple[str, ...]:
     """A layer's attention query sites: a global layer's query, key and value, a local one's one."""
-    return ('attn', 'k', 'v') if kind.get('depth_sites') else ('attn',)
+    return tuple(_SITES[site] for site in (('q', 'k', 'v') if kind.get('depth_sites') else ('q',)))
 
 
 def _stacks(config: Mapping[str, object]) -> list[Stacked]:
@@ -537,7 +537,7 @@ def _stacks(config: Mapping[str, object]) -> list[Stacked]:
         return stacks
     span = range(*_records.integers(loop['layers'], 'loop.layers'))
     for layer in span:
-        for site in ('attn', 'mlp', 'k', 'v'):
+        for site in _SITES.values():
             def leaf(name: str, layer=layer, site=site) -> str:
                 return _named('controller', layer=layer, site=site, leaf=name)
 
@@ -549,7 +549,8 @@ def _stacks(config: Mapping[str, object]) -> list[Stacked]:
         stacks += [Stacked(_named('messages', stack=stack),
                            tuple(_named('controller', layer=layer, site=site, leaf='query')
                                  for layer in span for site in sites), (Split(1),), shape=(1, width))
-                   for stack, sites in (('queries', ('attn', 'mlp')), ('kv_queries', ('k', 'v')))]
+                   for stack, sites in (('queries', (_SITES['q'], _SITES['mlp'])),
+                                        ('kv_queries', (_SITES['k'], _SITES['v'])))]
     return stacks
 
 
