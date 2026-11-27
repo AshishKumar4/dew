@@ -1366,12 +1366,19 @@ class Trainer(Generic[Loss, Effects]):
                                                  tokens=tokens, accumulation=self.accumulation,
                                                  checkpointed=self.checkpoints is not None,
                                                  examples=self._shape.examples)
-        self._preflight(loader, plateau, suites, preview=preview, stated=dataset,
-                        loss=(self.checkpoints is not None or restore_best) and not selection)
+        # A preview is the tracker's, which rank 0 alone may hold: its ask is the pool's, so every rank
+        # refuses it or none does, where one refusing alone would leave its peers at the next collective
+        # (audit P02).
+        previewed = bool(broadcast_from_process_zero(preview and self.tracker is not None))
+        # Its refusals each rank's own checks make (an objective's preview refusal, its run tokenizer),
+        # agreed: a rank refusing alone leaves its peers at the next collective (train 1421's F1).
+        agreed("fit preflight", functools.partial(
+            self._preflight, loader, plateau, suites, previewed=previewed, stated=dataset,
+            loss=(self.checkpoints is not None or restore_best) and not selection))
         return FitPlan(
             dataset=loader, steps=steps, log_every=logged, eval_every=evaluated, tokens=tokens,
             checkpoint_every=saved, checkpoint_final=checkpoint_final, local_every=local,
-            metrics=metrics, preview=preview and self.tracker is not None, best=selection, stop=plateau,
+            metrics=metrics, preview=previewed, best=selection, stop=plateau,
             suites=suites, pause=pause, scored_to=None if scored_to is None else os.fspath(scored_to),
             held_best=restore_best and self.checkpoints is None, restore_best=restore_best, observe=observe,
             summaries=tuple(summaries), startup=startup, declared=declared, branches=() if cooldowns is None
@@ -2270,7 +2277,7 @@ class Trainer(Generic[Loss, Effects]):
         return None if self._shape.examples is None else sum(interval.consumed for interval in intervals)
 
     def _preflight(self, dataset: Loader, stop, suites: Mapping[str, EvalSuite], *,
-                   preview: bool, stated: Dataset | Loader | Handed, loss: bool) -> None:
+                   previewed: bool, stated: Dataset | Loader | Handed, loss: bool) -> None:
         """The refusals `fit` makes before it places anything: validation nothing reads, a rollout that
         checkpoints its state in a pool (`_rollout_admitted`), and a pipeline's batch, whose placement could
         take minutes or run out of memory before the error. Every other mesh's batch is checked with its
@@ -2279,7 +2286,8 @@ class Trainer(Generic[Loss, Effects]):
         declaration is built (`_artifact`), resolving the tokenizer whose files it states and the checkpoints
         hold (`Checkpoints.save`), held to be the objective's run tokenizer (`declared_tokenizer`): a host
         that cannot resolve it, or an objective whose run tokenizer is not the one its record states, refuses
-        before step 0, not at the first checkpoint (train 972's and 978's reviews)."""
+        before step 0, not at the first checkpoint (train 972's and 978's reviews). `previewed` is the pool's
+        preview (`fit`'s ask where rank 0's tracker takes it), so each refusal is every rank's."""
         if self.checkpoints is not None:
             from dew.inference.tasks import declared_tokenizer
 
@@ -2291,8 +2299,7 @@ class Trainer(Generic[Loss, Effects]):
                 type(self.objective).__name__, stated, optimized=self._config is not None,
                 seeded=self.seed is not None, mesh=self.mesh, given=given))
         # A preview samples where a validation of batches runs (`Evaluation.run`), refused where it would.
-        previewing = preview and self.tracker is not None and any(
-            not episodic(suite.data) for suite in suites.values())
+        previewing = previewed and any(not episodic(suite.data) for suite in suites.values())
         if previewing and (refusal := self.objective.preview_refusal()) is not None:
             raise ValueError(f"preview=True samples the model, which refuses generation: {refusal}")
         for name, suite in suites.items():
@@ -2300,7 +2307,7 @@ class Trainer(Generic[Loss, Effects]):
                 self.objective._check_validation_loss()
             if (stop is None or not isinstance(stop.metric, TrainingScalar)) and suite.every:
                 read = self.objective.defines_validation_loss or self.checkpoints is not None or loss
-                validation_read(name, suite, read=read, previewed=preview and self.tracker is not None)
+                validation_read(name, suite, read=read, previewed=previewed)
         if self.device_mesh.shape.get(STAGE_AXIS, 1) > 1 and self.rollout is None:
             check_batch(dataset.batch, self.device_mesh, self.microbatches)
 
