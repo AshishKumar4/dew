@@ -57,7 +57,7 @@ def _arms(model, params, *, mask_on_host: bool):
     next draft's logits at each place, and the block's emitted tokens (-1 past a row's count), which the
     fresh arm takes as the walk's. With `mask_on_host`, the fresh prefill reads its rows' real tokens on
     the host, as a sparse attention's prefill does (DSpark's), and runs as given; otherwise it is compiled
-    whole."""
+    whole. Each arm's next token its own logits' greedy choice (`next`), which opens its next draft."""
     ops = decode_ops(model, params, 0, 0)
 
     def settled_draft(prompts, greedy, counts, fed):
@@ -79,8 +79,10 @@ def _arms(model, params, *, mask_on_host: bool):
         transforms, finishing, plan = policy.components()
         settled = block_step(state, start, jnp.zeros(rows, bool), plan, _controlled(ops, proposals),
                              decoding.chain(transforms), decoding.finish(finishing), block + 1)
-        first = jnp.take_along_axis(greedy, counts[:, None], axis=1)[:, 0]
-        return {**_draft(ops, settled.state, first, fed),
+        # The next token the settled block's own logits choose (greedy), which opens its next draft: a block
+        # that kept stale logits opens it, and chooses it, apart from the fresh prefill's.
+        first = jnp.argmax(settled.state.logits, axis=-1).astype(jnp.int32)
+        return {**_draft(ops, settled.state, first, fed), "next": first,
                 "emitted": jnp.where(settled.kept, settled.tokens, -1)}
 
     # A block's device checks discharged as a decode loop's are (`text._generate`) and raised on the host: run
@@ -107,8 +109,9 @@ def _arms(model, params, *, mask_on_host: bool):
 
     def prefilled(ids, valid, emitted, greedy, counts, fed):
         inputs = ModelInputs(jnp.asarray(ids, jnp.int32), {"attention_mask": jnp.asarray(valid)})
-        first = jnp.take_along_axis(jnp.asarray(greedy), jnp.asarray(counts)[:, None], axis=1)[:, 0]
-        return {**_draft(ops, prefill_state(model, params, inputs, ops)[0], first, jnp.asarray(fed)),
+        state = prefill_state(model, params, inputs, ops)[0]
+        first = jnp.argmax(state.logits, axis=-1).astype(jnp.int32)
+        return {**_draft(ops, state, first, jnp.asarray(fed)), "next": first,
                 "emitted": jnp.asarray(emitted)}
 
     if not mask_on_host:
