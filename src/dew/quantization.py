@@ -678,10 +678,13 @@ def _resident_window(kernel: jax.Array, site: str):
                          "it where it lives on a mesh")
     depth, width = kernel.shape
     rows, columns = (*sharding.spec, None, None)[:2]
-    if rows is not None:
+    # The depth's partition's size: a named axis of one device leaves each column whole.
+    named = (rows,) if isinstance(rows, str) else rows or ()
+    split = math.prod(sharding.mesh.shape[axis] for axis in named)
+    if split > 1:
         raise ValueError(f"{site}'s kernel is split by its depth ({rows!r}), which its window's decode reads "
                          "whole for each column: window it split by its columns alone")
-    planes = NamedSharding(sharding.mesh, PartitionSpec(columns, None))
+    planes = NamedSharding(sharding.mesh, PartitionSpec(columns, rows))
     encoded: dict[tuple, Bf16Window] = {}
     words, meta = [], []
     for shard in kernel.addressable_shards:

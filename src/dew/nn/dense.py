@@ -487,8 +487,11 @@ class Dense(_LinearEnvelope, nn.Dense):
         if isinstance(kernel, Bf16Window) and not _windowed(self, width, bias):
             # A window's weights are its kernel's bits again: a layer whose product is not the window's
             # multiplies them as its kernel, promoted as any (its dtype not bfloat16, its own
-            # `dot_general`'s: a float32 result, the run's recipe's, its bias stored fp32).
-            kernel = kernel.decoded()
+            # `dot_general`'s: a float32 result, the run's recipe's, its bias stored fp32), once its format
+            # admits it (`window.admitted`, as the window's product and gemm's decode ask).
+            from dew.nn.kernels.templates.gemm.window import admitted
+
+            kernel = admitted(kernel).decoded()
         if isinstance(kernel, PACKED_FORMATS):
             return self._packed(inputs, kernel, bias)
         stored = bias

@@ -3,6 +3,7 @@ again decoded, a group past its escapes refused by its site's name, and a Dense 
 kernel (`quantization.bf16_windows`), its variables' kernels back bitwise (`decoded_bf16_windows`)."""
 
 import contextlib
+import dataclasses
 import functools
 
 import jax
@@ -355,6 +356,11 @@ def test_a_windowed_dense_with_an_fp32_bias_keeps_its_declared_tangent():
     plain, served = tangent({"params": params}), tangent(windowed)
     np.testing.assert_array_equal(served.view(np.uint32), plain.view(np.uint32))
     assert plain[0, 0] == 0.0
+    # Another encoder's window, its digest not this Dew's, is refused on this path as on the window's own.
+    held = windowed[quantization.QUANTIZATION]["kernel"]
+    foreign = dataclasses.replace(held, form=np.asarray(held.form) ^ np.uint8(1))
+    with pytest.raises(ValueError):
+        tangent({**windowed, quantization.QUANTIZATION: {"kernel": foreign}})
 
 
 @pytest.mark.distributed

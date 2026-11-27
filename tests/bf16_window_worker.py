@@ -23,8 +23,10 @@ def width_split(args) -> dict:
 
     rng = np.random.default_rng(13702)
     kernel = (rng.normal(size=(256, 256)) * 0.02).astype(jnp.bfloat16)
-    mesh = Mesh(np.asarray(jax.devices()), ("columns",))
-    placed = jax.make_array_from_callback(kernel.shape, NamedSharding(mesh, PartitionSpec(None, "columns")),
+    # Its depth named by an axis of one device, which leaves each column whole.
+    mesh = Mesh(np.asarray(jax.devices()).reshape(1, -1), ("depths", "columns"))
+    spec = PartitionSpec("depths", "columns")
+    placed = jax.make_array_from_callback(kernel.shape, NamedSharding(mesh, spec),
                                           lambda index: kernel[index])
     assert not placed.is_fully_addressable, "the pool's processes each hold their own columns"
     window = quantization.bf16_windows({"params": {"kernel": placed}}, sites=[""])[quantization.QUANTIZATION][
