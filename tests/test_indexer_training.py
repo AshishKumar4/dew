@@ -525,7 +525,8 @@ def test_a_preview_of_a_decoder_that_refuses_generation_is_refused_or_skipped(tm
                                                    log_every=1, eval_every=1, checkpoint_every=None,
                                                    checkpoint_final=False,
                                                    wandb=Wandb("dew", offline=True)))
-        loader = (Loader(lambda partition: token_batches(), lambda partition: held(), batch=8, records=None)
+        loader = (Loader(lambda partition: token_batches(), lambda partition: iter([next(token_batches())]),
+                         batch=8, records=None)
                   if validated == "implicit" else data())
         given = {"validation": validation(), "metrics": (Perplexity(),)} if validated == "given" else {}
         config.train(LMObjective(model, SEQ, samples=samples), loader, name=name, **given)
