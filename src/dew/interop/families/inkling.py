@@ -29,11 +29,9 @@ this yet: a checkpoint holding them loads its text decoder alone.
 
 from __future__ import annotations
 
-import re
-from collections.abc import Callable, Mapping
+from collections.abc import Mapping
 from types import MappingProxyType
 
-import jax
 import numpy as np
 
 from dew import _records
@@ -45,10 +43,16 @@ from dew.interop.decoder_parts import (
     SERIALIZED_TEXT_FIELDS,
     DecoderFamily,
     DecoderFields,
+    Inverted,
     KindFields,
     Leaves,
     MixtureFields,
     Packed,
+    Restacked,
+    Reversed,
+    Split,
+    Stacked,
+    Transposed,
     WrapperFields,
     context_lengths,
     record_float,
@@ -57,9 +61,7 @@ from dew.interop.decoder_parts import (
     spelled,
 )
 from dew.interop.layouts import Config, Renames, Route, Slot, Table
-from dew.interop.safetensors_io import LazyTensors, tensor_specs
 from dew.interop.towers.inkling import translate_inkling_projector_config, translate_inkling_vision_config
-from dew.interop.unread import Stored
 from dew.nn.activations import Situ
 from dew.nn.attention_residuals import AttentionResiduals
 from dew.nn.attention_terms import QKClip, RelativeBias
@@ -336,7 +338,7 @@ _LAYER_LEAVES: Leaves = {
 }
 """The tensors below a layer the shared decoder has no place for, as `_NAMES` spell them: its depth
 queries, convolutions, attention terms and cross-pass controllers, those the release stores otherwise as
-`_inkling2_prepare` reads them."""
+`_RESTACKED` reads them."""
 
 DRAFT = 'mtp.'
 """The prefix the draft's tensors (the release's `mtp.safetensors`) are read under
@@ -352,7 +354,7 @@ _DRAFT_LEAVES: Leaves = {
     'markov_head.rnn_context.weight': ('markov_head', 'rnn_context', 'kernel'),
     'markov_head.rnn_context.bias': ('markov_head', 'rnn_context', 'bias'),
 }
-"""The draft's tensors outside its layers, as `_inkling2_prepare` reads them (its `rnn_proj` split), onto
+"""The draft's tensors outside its layers, as `_RESTACKED` reads them (its `rnn_proj` split), onto
 the block drafter's leaves (`dew.nn.block_draft.BlockDrafter`)."""
 
 _DRAFT_LAYER_LEAVES: Leaves = {
@@ -410,332 +412,107 @@ _ROUTES = Table(
 tower."""
 
 
-def _query(value: Stored, name: str, width: int) -> Stored:
-    """A depth query `[width]` as the `[1, width]` projection its leaf reads (a kernel, `[out, in]`)."""
-    if value.shape != (width,):
-        raise ValueError(f"{name} holds {value.shape}, not a [{width}] query")
-    return value.reshape(1, width)
-
-
-def _inkling2_prepare(tensors: Mapping[str, Stored],
-                      config: Mapping[str, object] | None = None) -> Mapping[str, Stored]:
-    """The release's tensors as `_ROUTES` read them, in its own names (modeling_inkling2_loop.py, its
-    conversion in conversion_mapping.py and core_model_loading.py at transformers 3a96649):
-    - `attn_res.attn_queries.{i}` is layer `i + 1`'s attention query, a global layer's `[3, D]` its query,
-      key and value sites'; layer 0 reads none (its attention's input precedes every block), so its leaves,
-      which no read reaches, hold transformers' initial zeros; `mlp_queries.{i}` is layer `i`'s, and
-      `output_query` the final read's;
-    - `middle_cycle_cross_pass_queries` `[2L, D]` holds each loop layer's query and MLP message queries,
-      `middle_cycle_cross_pass_kv_queries` its key and value ones; each controller's `down_weight`
-      `[rank, 2D]` reads `[input; message]`, and its `forget_weight`, `gain_weight` `[D, rank]` are the
-      leaves' transposes;
-    - a global layer's dynamic convolution holds its static taps `static_w` `[K, C]` and the rows of its
-      taps' projection `weight_proj` `[heads * K, D]` by lag, the first the token itself, where Dew's run in
-      convolution order (`ShortConvSite`);
-    - each layer's experts are one `w13_weight` `[E, 2I, D]`, gate and up rows interleaved, and one
-      `w2_weight` `[E, D, I]`, read as each expert's projections."""
-    if config is None:
-        raise ValueError("Inkling 2's queries and loop messages are placed by the decoder's geometry")
-    width = _records.integer(config['emb_features'], 'emb_features')
-    prepared: dict[str, Stored] = {}
-    for name, value in tensors.items():
-        stem, _, leaf = name.rpartition('.')
-        if stem == 'model.llm.attn_res.attn_queries':
-            layer = f'model.llm.layers.{int(leaf) + 1}'
-            if value.ndim == 2 and value.shape[0] == 3:
-                for index, site in enumerate(('attn', 'k', 'v')):
-                    prepared[f'{layer}.{site}_query'] = _query(value[index], name, width)
-            else:
-                prepared[f'{layer}.attn_query'] = _query(value, name, width)
-        elif stem == 'model.llm.attn_res.mlp_queries':
-            prepared[f'model.llm.layers.{leaf}.mlp_query'] = _query(value, name, width)
-        elif name == 'model.llm.attn_res.output_query':
-            prepared['model.llm.output_query'] = _query(value, name, width)
-        elif name == 'model.llm.middle_cycle_cross_pass_queries':
-            prepared.update(_message_queries(value, tensors, config, width))
-        elif name == 'model.llm.middle_cycle_cross_pass_kv_queries':
-            continue
-        elif '.controllers.' in name and leaf == 'down_weight':
-            if value.shape[1] != 2 * width:
-                raise ValueError(f"{name} holds {value.shape}, not [rank, {2 * width}]")
-            prepared[f'{stem}.input_down'] = value[:, :width].T
-            prepared[f'{stem}.message_down'] = value[:, width:].T
-        elif '.controllers.' in name and leaf in ('forget_weight', 'gain_weight'):
-            prepared[f"{stem}.{leaf.removesuffix('_weight')}"] = value.T
-        elif name.endswith(('.k_sconv.static_w', '.v_sconv.static_w')):
-            if f'{stem}.weight_proj' not in tensors:
-                # A static convolution's taps are stored as the leaf holds them (`.weight`): `static_w` is
-                # a dynamic one's, beside its taps' projection, which `_inkling2_unprepare` writes back so.
-                raise ValueError(f"{name} holds a dynamic convolution's static taps beside no "
-                                 f"{stem}.weight_proj")
-            prepared[f'{stem}.weight'] = value[::-1].T[:, None, :]
-        elif name.endswith(('.k_sconv.weight_proj', '.v_sconv.weight_proj')):
-            static = tensors.get(f'{stem}.static_w')
-            if static is None:
-                raise ValueError(f"{name} projects a dynamic convolution's taps beside its static_w")
-            taps = static.shape[0]
-            heads = value.shape[0] // taps
-            prepared[name] = value.reshape(heads, taps, value.shape[1])[:, ::-1].reshape(heads * taps, -1)
-        elif name.endswith('.mlp.experts.w13_weight'):
-            for expert in range(value.shape[0]):
-                prepared[f'{stem}.{expert}.gate_proj.weight'] = value[expert, 0::2]
-                prepared[f'{stem}.{expert}.up_proj.weight'] = value[expert, 1::2]
-        elif name.endswith('.mlp.experts.w2_weight'):
-            for expert in range(value.shape[0]):
-                prepared[f'{stem}.{expert}.down_proj.weight'] = value[expert]
-        else:
-            prepared[name] = value
-    kinds = _records.record(config['kinds'], 'kinds')
-    first = _records.record(kinds[_records.strings(config['layer_types'], 'layer_types')[0]], 'kinds')
-    for site in ('attn', 'k', 'v') if first.get('depth_sites') else ('attn',):
-        prepared[f'model.llm.layers.0.{site}_query'] = np.zeros((1, width), np.float32)
-    return prepared
-
-
-def _message_queries(queries: Stored, tensors: Mapping[str, Stored], config: Mapping[str, object],
-                     width: int) -> dict[str, Stored]:
-    """Each loop layer's four message queries from the release's two `[2L, D]` stacks, layer-major:
-    `[query, mlp]` and `[key, value]` (core_model_loading.py `Inkling2LoopMergeMessageQueries`)."""
-    keys = tensors.get('model.llm.middle_cycle_cross_pass_kv_queries')
-    loop = config.get('loop')
-    if keys is None or not isinstance(loop, Mapping):
-        raise ValueError("middle_cycle_cross_pass_queries are a loop's, beside its kv_queries")
-    start, end = loop['layers']
-    count = 2 * (end - start)
-    for name, held in (('queries', queries), ('kv_queries', keys)):
-        if held.shape != (count, width):
-            raise ValueError(f"middle_cycle_cross_pass_{name} holds {held.shape}, not [{count}, {width}]")
-    placed: dict[str, Stored] = {}
-    for layer in range(end - start):
-        for stack, sites in ((queries, ('attn', 'mlp')), (keys, ('k', 'v'))):
-            for offset, site in enumerate(sites):
-                row = 2 * layer + offset
-                placed[f'model.llm.layers.{start + layer}.controllers.{site}.query'] = stack[row:row + 1]
-    return placed
-
-
-_QUERY = re.compile(r'model\.llm\.layers\.(\d+)\.(attn|k|v|mlp)_query')
-_MESSAGE = re.compile(r'model\.llm\.layers\.(\d+)\.controllers\.(attn|mlp|k|v)\.query')
-_CONTROLLER = re.compile(r'(.+\.controllers\.\w+)\.(input_down|message_down|forget|gain)')
-_TAPS = re.compile(r'(.+\.[kv]_sconv)\.(weight|weight_proj)')
-_EXPERT = re.compile(r'(.+\.mlp\.experts)\.(\d+)\.(gate_proj|up_proj|down_proj)\.weight')
-
-
-def _inkling2_unprepare(tensors: Mapping[str, Stored],
-                        config: Mapping[str, object] | None = None) -> LazyTensors:
-    """The release's tensors from `_inkling2_prepare`'s, its exact inverse (`DecoderFamily.unprepare`), each
-    built when it is read: each layer's queries stacked back into `attn_res`, the loop's message queries
-    into its two `[2L, D]` stacks, each controller's down projection joined and its forget and gain
-    transposed, the dynamic convolutions' taps reversed back and each layer's experts fused, the rest as they
-    are. A tensor `prepare` makes that is missing (one of a layer's query sites, a controller's half, an
-    expert) is refused, and layer 0's query, which `prepare` adds and no read reaches, must hold the zeros it
-    was given."""
-    specs = tensor_specs(tensors)
-    built: dict[str, tuple[jax.ShapeDtypeStruct, Callable[[], Stored]]] = {}
-    queries: dict[int, dict[str, str]] = {}
-    messages: dict[int, dict[str, str]] = {}
-    controllers: dict[str, dict[str, str]] = {}
-    experts: dict[str, dict[int, dict[str, str]]] = {}
-
-    def held(name: str) -> np.ndarray:
-        return np.asarray(tensors[name])
-
-    def emit(name: str, shape: tuple[int, ...], dtype, build: Callable[[], Stored]) -> None:
-        if name in built:
-            raise ValueError(f"two of Inkling 2's prepared tensors write back {name}")
-        built[name] = (jax.ShapeDtypeStruct(shape, dtype), build)
-
-    for name, spec in specs.items():
-        if match := _QUERY.fullmatch(name):
-            queries.setdefault(int(match[1]), {})[match[2]] = name
-        elif match := _MESSAGE.fullmatch(name):
-            messages.setdefault(int(match[1]), {})[match[2]] = name
-        elif match := _CONTROLLER.fullmatch(name):
-            controllers.setdefault(match[1], {})[match[2]] = name
-        elif match := _EXPERT.fullmatch(name):
-            experts.setdefault(match[1], {}).setdefault(int(match[2]), {})[match[3]] = name
-        elif (match := _TAPS.fullmatch(name)) and match[2] == 'weight' and f'{match[1]}.weight_proj' in specs:
-            # A dynamic convolution's static taps, which the release stores beside their projection as
-            # `static_w`; a static one's are stored as the leaf holds them and pass through.
-            channels, _, taps = spec.shape
-            emit(f'{match[1]}.static_w', (taps, channels), spec.dtype,
-                 lambda name=name: held(name)[:, 0, :].T[::-1])
-        elif (match := _TAPS.fullmatch(name)) and match[2] == 'weight_proj':
-            taps_of = specs.get(f'{match[1]}.weight')
-            if taps_of is None:
-                raise ValueError(f"{name} projects a dynamic convolution's taps beside its {match[1]}.weight")
-            taps = taps_of.shape[2]
-            heads = spec.shape[0] // taps
-            emit(name, spec.shape, spec.dtype, lambda name=name, taps=taps, heads=heads: held(name).reshape(
-                heads, taps, -1)[:, ::-1].reshape(heads * taps, -1))
-        elif name == 'model.llm.output_query':
-            emit('model.llm.attn_res.output_query', spec.shape[1:], spec.dtype,
-                 lambda name=name: held(name)[0])
-        else:
-            emit(name, spec.shape, spec.dtype, lambda name=name: tensors[name])
-    if config is None:
-        raise ValueError("Inkling 2's queries and loop messages are placed by the decoder's geometry")
-    _every_query(queries, messages, specs, config)
-    _every_part(controllers, specs, config)
-    for layer, sites in sorted(queries.items()):
-        _layer_queries(layer, sites, specs, held, emit)
-    _message_stacks(messages, specs, held, emit)
-    for stem, parts in controllers.items():
-        _controller(stem, parts, specs, held, emit)
-    stated = config.get('mixture')
-    mixture = None if stated is None else _records.record(stated, 'mixture')
-    count = None if mixture is None else _records.integer(mixture['experts'], 'experts')
-    routed = (set() if mixture is None else {f'model.llm.layers.{layer}.mlp.experts'
-                                              for layer in _records.integers(mixture['layers'], 'layers')})
-    if missing := routed - set(experts):
-        raise ValueError(f"Inkling 2's routed layers {sorted(missing)} hold no experts")
-    for stem, by_expert in experts.items():
-        _fused_experts(stem, by_expert, count, specs, held, emit)
-    return LazyTensors({name: spec for name, (spec, _) in built.items()}, lambda name: built[name][1]())
-
-
-def _every_query(queries: Mapping[int, Mapping[str, str]], messages: Mapping[int, Mapping[str, str]], specs,
-                 config: Mapping[str, object]) -> None:
-    """Refuse prepared tensors that miss a query `_inkling2_prepare` makes, by the decoder's geometry
-    (`config`, its record): every layer's MLP query and its attention's sites, a global layer's three and
-    a local one's one, the final read's query, and each loop layer's four message queries over the loop's
-    span exactly, so no stack is written short."""
-    kinds = _records.record(config['kinds'], 'kinds')
-    types = _records.strings(config['layer_types'], 'layer_types')
-    for layer, kind in enumerate(types):
-        sites = {'attn', 'k', 'v'} if _records.record(kinds[kind], 'kinds').get('depth_sites') else {'attn'}
-        if set(queries.get(layer, {})) != sites | {'mlp'}:
-            raise ValueError(f"Inkling 2's layer {layer} holds the queries {sorted(queries.get(layer, {}))}, "
-                             f"not {sorted(sites | {'mlp'})}")
-    if set(queries) != set(range(len(types))):
-        raise ValueError(f"Inkling 2's queries name the layers {sorted(queries)} of {len(types)}")
-    if 'model.llm.output_query' not in specs:
-        raise ValueError("Inkling 2's final read holds no model.llm.output_query")
-    loop = config.get('loop')
-    span = range(*loop['layers']) if isinstance(loop, Mapping) and loop.get('messages') is not None else ()
-    if set(messages) != set(span):
-        raise ValueError(f"Inkling 2's message queries name the layers {sorted(messages)}, not its loop's "
-                         f"{list(span)}")
-
-
-def _dynamic(record: Mapping[str, object]) -> bool:
-    """Whether a kind's record holds dynamic short convolutions (`ShortConvs.dynamic`), wherever it nests."""
+def _dynamic_taps(record: Mapping[str, object]) -> int | None:
+    """The taps of a kind's dynamic short convolutions (`ShortConvs.dynamic`), wherever its record nests
+    them, None where it holds none."""
     convs = record.get('short_convs')
     fields = convs.get('fields', convs) if isinstance(convs, Mapping) else None
     if fields is not None and _records.record(fields, 'short_convs').get('dynamic'):
-        return True
-    return any(_dynamic(value) for value in record.values() if isinstance(value, Mapping))
+        return _records.integer(fields['kernel'], 'short_convs.kernel')
+    return next((taps for value in record.values()
+                 if isinstance(value, Mapping) and (taps := _dynamic_taps(value)) is not None), None)
 
 
-def _every_part(controllers: Mapping[str, Mapping[str, str]], specs, config: Mapping[str, object]) -> None:
-    """Refuse prepared tensors that miss a group `_inkling2_prepare` makes, by the decoder's geometry: each
-    loop layer's four controllers (attention's, the MLP's, the keys' and the values'), and each layer of a
-    kind with dynamic short convolutions its keys' and values' taps' projections beside their static
-    taps."""
-    loop = config.get('loop')
-    span = range(*loop['layers']) if isinstance(loop, Mapping) else ()
-    stated = {f'model.llm.layers.{layer}.controllers.{site}'
-              for layer in span for site in ('attn', 'mlp', 'k', 'v')}
-    held = {stem for stem in controllers if stem.startswith('model.llm.layers.')}
-    if held != stated:
-        raise ValueError(f"Inkling 2's controllers {sorted(held ^ stated)} differ from its loop's")
+def _query(name: str, parts: tuple[str, ...]) -> Stacked:
+    """A depth query `[D]`, or a global layer's sites' `[3, D]`, as the `[1, D]` projection each leaf
+    reads (a kernel, `[out, in]`)."""
+    if len(parts) == 1:
+        return Stacked(name, parts, (Split(0),), grid=())
+    return Stacked(name, parts, (Split(1),))
+
+
+def _sites(kind: Mapping[str, object]) -> tuple[str, ...]:
+    """A layer's attention query sites: a global layer's query, key and value, a local one's one."""
+    return ('attn', 'k', 'v') if kind.get('depth_sites') else ('attn',)
+
+
+def _stacks(config: Mapping[str, object]) -> list[Stacked]:
+    """The release's tensors the decoder's record (`config`) reads otherwise than stored, each as its
+    `Stacked` view of those `_ROUTES` read, in its own names (modeling_inkling2_loop.py, its conversion in
+    conversion_mapping.py and core_model_loading.py at transformers 3a96649):
+    - `attn_res.attn_queries.{i}` is layer `i + 1`'s attention query, a global layer's `[3, D]` its query,
+      key and value sites'; layer 0 reads none (its attention's input precedes every block, `_unstored`);
+      `mlp_queries.{i}` is layer `i`'s, and `output_query` the final read's;
+    - `middle_cycle_cross_pass_queries` `[2L, D]` holds each loop layer's query and MLP message queries,
+      layer-major, `middle_cycle_cross_pass_kv_queries` its key and value ones
+      (`Inkling2LoopMergeMessageQueries`); each controller's `down_weight` `[rank, 2D]` reads
+      `[input; message]`, and its `forget_weight`, `gain_weight` `[D, rank]` are the leaves' transposes;
+    - a global layer's dynamic convolution holds its static taps `static_w` `[K, C]`, the `[C, 1, K]`
+      `weight` a static one stores reversed, and the rows of its taps' projection `weight_proj`
+      `[heads * K, D]` by lag, the first the token itself, where Dew's run in convolution order
+      (`ShortConvSite`);
+    - each routed layer's experts are one `w13_weight` `[E, 2I, D]`, gate and up rows interleaved, and one
+      `w2_weight` `[E, D, I]`, each expert's projections stacked."""
+    width = _records.integer(config['emb_features'], 'emb_features')
     kinds = _records.record(config['kinds'], 'kinds')
-    for layer, kind in enumerate(_records.strings(config['layer_types'], 'layer_types')):
-        if not _dynamic(_records.record(kinds[kind], 'kind')):
-            continue
-        for site in ('k', 'v'):
-            stem = f'model.llm.layers.{layer}.'
-            ending = f'.{site}_sconv.weight_proj'
-            if not any(name.startswith(stem) and name.endswith(ending) for name in specs):
-                raise ValueError(f"Inkling 2's layer {layer} holds no projection of its {site} convolution's "
-                                 "dynamic taps")
+    types = _records.strings(config['layer_types'], 'layer_types')
+    stated = config.get('mixture')
+    mixture = None if stated is None else _records.record(stated, 'mixture')
+    routed = () if mixture is None else _records.integers(mixture['layers'], 'layers')
+    experts = 0 if mixture is None else _records.integer(mixture['experts'], 'experts')
+    stacks = [_query('model.llm.attn_res.output_query', ('model.llm.output_query',))]
+    for layer, kind in enumerate(_records.record(kinds[kind], 'kinds') for kind in types):
+        stem = f'model.llm.layers.{layer}'
+        if layer:
+            stacks.append(_query(f'model.llm.attn_res.attn_queries.{layer - 1}',
+                                 tuple(f'{stem}.{site}_query' for site in _sites(kind))))
+        stacks.append(_query(f'model.llm.attn_res.mlp_queries.{layer}', (f'{stem}.mlp_query',)))
+        if (taps := _dynamic_taps(kind)) is not None:
+            for site in 'kv':
+                conv = f'{stem}.attn.{site}_sconv'
+                stacks += [Stacked(f'{conv}.static_w', (f'{conv}.weight',),
+                                   (Reversed(0), Transposed((1, 0)), Split(1)), grid=()),
+                           Stacked(f'{conv}.weight_proj', (f'{conv}.weight_proj',),
+                                   (Split(0, taps), Reversed(1), Inverted(Split(0, taps))), grid=())]
+        if layer in routed:
+            fused = f'{stem}.mlp.experts'
+            stacks += [Stacked(f'{fused}.w13_weight', tuple(f'{fused}.{expert}.{part}.weight'
+                                                           for expert in range(experts)
+                                                           for part in ('gate_proj', 'up_proj')),
+                               (Split(1, 2), Transposed((0, 2, 1, 3))), grid=(experts, 2)),
+                       Stacked(f'{fused}.w2_weight',
+                               tuple(f'{fused}.{expert}.down_proj.weight' for expert in range(experts)))]
+    loop = config.get('loop')
+    if not isinstance(loop, Mapping):
+        return stacks
+    span = range(*_records.integers(loop['layers'], 'loop.layers'))
+    for layer in span:
+        for site in ('attn', 'mlp', 'k', 'v'):
+            controller = f'model.llm.layers.{layer}.controllers.{site}'
+            stacks += [Stacked(f'{controller}.down_weight',
+                               (f'{controller}.input_down', f'{controller}.message_down'),
+                               (Transposed((1, 0)), Split(0, width))),
+                       *(Stacked(f'{controller}.{leaf}_weight', (f'{controller}.{leaf}',),
+                                 (Transposed((1, 0)),), grid=()) for leaf in ('forget', 'gain'))]
+    if loop.get('messages') is not None:
+        stacks += [Stacked(f'model.llm.middle_cycle_cross_pass_{stack}',
+                           tuple(f'model.llm.layers.{layer}.controllers.{site}.query'
+                                 for layer in span for site in sites), (Split(1),))
+                   for stack, sites in (('queries', ('attn', 'mlp')), ('kv_queries', ('k', 'v')))]
+    return stacks
 
 
-def _layer_queries(layer: int, sites: Mapping[str, str], specs, held, emit) -> None:
-    """Layer `layer`'s depth queries back into `attn_res` (`_inkling2_unprepare`): its MLP's, and its
-    attention's, a global layer's three sites stacked; layer 0's attention ones, which `prepare` added as
-    zeros, dropped once checked so."""
-    if 'mlp' in sites:
-        name = sites['mlp']
-        spec = specs[name]
-        emit(f'model.llm.attn_res.mlp_queries.{layer}', spec.shape[1:], spec.dtype, lambda: held(name)[0])
-    attention = {site: name for site, name in sites.items() if site != 'mlp'}
-    if not attention:
-        raise ValueError(f"Inkling 2's layer {layer} holds no attention query")
-    if set(attention) not in ({'attn'}, {'attn', 'k', 'v'}):
-        raise ValueError(f"Inkling 2's layer {layer} holds the query sites {sorted(attention)}, not 'attn' "
-                         "or 'attn', 'k' and 'v'")
-    if layer == 0:
-        nonzero = [name for name in attention.values() if np.any(held(name))]
-        if nonzero:
-            raise ValueError(f"{nonzero} hold values where no read reaches them: the release stores none")
-        return
-    spec = specs[attention['attn']]
-    if len(attention) == 1:
-        emit(f'model.llm.attn_res.attn_queries.{layer - 1}', spec.shape[1:], spec.dtype,
-             lambda: held(attention['attn'])[0])
-    else:
-        emit(f'model.llm.attn_res.attn_queries.{layer - 1}', (3, *spec.shape[1:]), spec.dtype,
-             lambda: np.concatenate([held(attention[site]) for site in ('attn', 'k', 'v')]))
+def _unstored(config: Mapping[str, object]) -> dict[str, np.ndarray]:
+    """Layer 0's attention queries, which the release stores none of: no read reaches them (its attention's
+    input precedes every block), so their leaves hold transformers' initial zeros."""
+    width = _records.integer(config['emb_features'], 'emb_features')
+    kinds = _records.record(config['kinds'], 'kinds')
+    first = _records.record(kinds[_records.strings(config['layer_types'], 'layer_types')[0]], 'kinds')
+    return {f'model.llm.layers.0.{site}_query': np.zeros((1, width), np.float32) for site in _sites(first)}
 
 
-def _message_stacks(messages: Mapping[int, Mapping[str, str]], specs, held, emit) -> None:
-    """The loop's message queries back into the release's two `[2L, D]` stacks, layer-major, `[query, mlp]`
-    and `[key, value]` (`_message_queries`'s inverse): every loop layer with its four, the layers
-    consecutive."""
-    if not messages:
-        return
-    layers = sorted(messages)
-    if layers != list(range(layers[0], layers[-1] + 1)):
-        raise ValueError(f"Inkling 2's loop message queries are on layers {layers}, not consecutive ones")
-    for layer in layers:
-        if set(messages[layer]) != {'attn', 'mlp', 'k', 'v'}:
-            raise ValueError(f"Inkling 2's loop layer {layer} holds the message queries "
-                             f"{sorted(messages[layer])}, not 'attn', 'mlp', 'k' and 'v'")
-    spec = specs[messages[layers[0]]['attn']]
-    for stack, sites in (('queries', ('attn', 'mlp')), ('kv_queries', ('k', 'v'))):
-        rows = [messages[layer][site] for layer in layers for site in sites]
-        emit(f'model.llm.middle_cycle_cross_pass_{stack}', (len(rows), spec.shape[1]), spec.dtype,
-             lambda rows=rows: np.concatenate([held(name) for name in rows]))
-
-
-def _controller(stem: str, parts: Mapping[str, str], specs, held, emit) -> None:
-    """A loop controller's tensors back as the release stores them: its down projection `[rank, 2D]` of its
-    input's and its message's halves, its forget and gain `[D, rank]` the leaves' transposes."""
-    if set(parts) != {'input_down', 'message_down', 'forget', 'gain'}:
-        raise ValueError(f"{stem} holds {sorted(parts)}, not a controller's input_down, message_down, forget "
-                         "and gain")
-    down = specs[parts['input_down']]
-    emit(f'{stem}.down_weight', (down.shape[1], 2 * down.shape[0]), down.dtype, lambda: np.concatenate(
-        [held(parts['input_down']).T, held(parts['message_down']).T], axis=1))
-    for leaf in ('forget', 'gain'):
-        spec = specs[parts[leaf]]
-        emit(f'{stem}.{leaf}_weight', spec.shape[::-1], spec.dtype, lambda leaf=leaf: held(parts[leaf]).T)
-
-
-def _fused_experts(stem: str, by_expert: Mapping[int, Mapping[str, str]], stated: int | None, specs, held,
-                   emit) -> None:
-    """A layer's experts back as the release fuses them: `w13_weight` `[E, 2I, D]`, each expert's gate and
-    up rows interleaved, and `w2_weight` `[E, D, I]`, every expert from 0 to the mixture's count (`stated`,
-    the decoder's record's) with its three projections."""
-    count = len(by_expert) if stated is None else stated
-    if sorted(by_expert) != list(range(count)):
-        raise ValueError(f"{stem} holds the experts {sorted(by_expert)}, not 0 to {count - 1}")
-    for expert, parts in by_expert.items():
-        if set(parts) != {'gate_proj', 'up_proj', 'down_proj'}:
-            raise ValueError(f"{stem}.{expert} holds {sorted(parts)}, not an expert's gate, up and down")
-    gate, down = specs[by_expert[0]['gate_proj']], specs[by_expert[0]['down_proj']]
-
-    def fused() -> np.ndarray:
-        stacked = np.empty((count, 2 * gate.shape[0], gate.shape[1]), gate.dtype)
-        for expert in range(count):
-            stacked[expert, 0::2] = held(by_expert[expert]['gate_proj'])
-            stacked[expert, 1::2] = held(by_expert[expert]['up_proj'])
-        return stacked
-
-    emit(f'{stem}.w13_weight', (count, 2 * gate.shape[0], gate.shape[1]), gate.dtype, fused)
-    emit(f'{stem}.w2_weight', (count, *down.shape), down.dtype,
-         lambda: np.stack([held(by_expert[expert]['down_proj']) for expert in range(count)]))
+_RESTACKED = Restacked(_stacks, _unstored)
+"""Inkling 2's release as `_ROUTES` read it and back, one declaration both ways."""
 
 
 def _inkling2_wrapper(hf_config: Mapping[str, object], used: set[str]) -> WrapperFields:
@@ -769,8 +546,8 @@ INKLING2 = DecoderFamily(
     'inkling2_loop',
     'Inkling2LoopForConditionalGeneration',
     routes=_ROUTES,
-    prepare=_inkling2_prepare,
-    unprepare=_inkling2_unprepare,
+    prepare=_RESTACKED.prepare,
+    unprepare=_RESTACKED.unprepare,
     holds_extensions=True,
     packed=_PACKED,
     sidecars=lambda config: {'mtp.safetensors': DRAFT} if config.get('mtp_config') else {},
