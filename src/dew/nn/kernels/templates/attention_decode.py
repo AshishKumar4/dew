@@ -36,7 +36,15 @@ from jax.extend import core as jaxpr_core
 from dew.algebra import means
 from dew.nn import programs
 from dew.nn.kernels import generation, tuning
-from dew.nn.kernels.templates import attention_algebra as algebra, attention_mosaic, cost, emission, merged
+from dew.nn.kernels.templates import (
+    attention_algebra as algebra,
+    attention_mosaic,
+    attention_mosaic_forward,
+    axes,
+    cost,
+    emission,
+    merged,
+)
 from dew.nn.kernels.templates.attention import (
     Hooks,
     Initial,
@@ -324,11 +332,10 @@ def _priced_slices(query, key, value, spans: KeySpans, hooks: Hooks | None, sing
                                                                                      issued=True)
     if alone is None:
         return None
-    if deferred:
-        # Its finish the merge's past the walk at one slice too (`planned`'s deferral: a resumed state, a hook
-        # its packed rows cannot read), a launch of its own.
-        alone += _merge_seconds(query, value, spans, single, 1, target=target, initial=initial,
-                                finished=finished)
+    # Its finish the merge's past the walk at one slice where `attend` defers it (`planned`'s deferral: a
+    # resumed state, a hook its packed rows cannot read), a launch of its own (`merge_branch`).
+    alone += _merge_seconds(query, value, spans, hooks, single, 1, scale=scale, target=target,
+                            initial=initial, finished=finished, deferred=deferred)
     prices = {(1, single): alone}
     for count in counts:
         sliced_op, sliced_ba = bound(splits=count)
@@ -340,8 +347,9 @@ def _priced_slices(query, key, value, spans: KeySpans, hooks: Hooks | None, sing
             walk = sliced_op.price_config(sliced_ba, tile, target, issued=True)
             if walk is None:
                 return None
-            prices[count, tile] = walk + _merge_seconds(query, value, spans, tile, count, target=target,
-                                                        initial=initial, finished=finished)
+            prices[count, tile] = walk + _merge_seconds(query, value, spans, hooks, tile, count, scale=scale,
+                                                        target=target, initial=initial, finished=finished,
+                                                        deferred=deferred)
     return least_plan(prices)
 
 
@@ -371,38 +379,67 @@ def launch_programs(rows: jax.Array, config: attention_mosaic.Tiles) -> int:
     return rows.shape[0] * rows.shape[2] * math.ceil(rows.shape[1] / (config.consumers * config.block_q))
 
 
-def _merge_seconds(query, value, spans: KeySpans, config: attention_mosaic.Tiles, slices: int, *,
-                   target: generation.GpuTarget, initial: Initial | None,
-                   finished: tuple[Hook, int] | None = None) -> float:
-    """The seconds of the merge of a split walk's `slices` as its launch's block choice prices it
-    (`merged.priced_launch`: its programs' waves): the walk's outputs as its launch writes them,
-    `[B, S, Qp, H, Dvp]` fp32 and their maxima and denominators `[2, B, H, S, Qp]`
-    (`attention_mosaic_forward.SplitOutput`), merged as the step's launch merges them: a finished step's
-    (`merged_finished`, `finished` its output hook and heads, the call's own, writing the query's dtype), or
-    an unfinished one's to its fp32 state (`merged_split`, `finished` None). Priced over the whole device at
-    once (`cost.seconds`), a B8 merge's 512 programs ran as one."""
-    output, out_heads = (NO_HOOK, None) if finished is None else finished
-    spec, padded, stacked, queries, width = merge_shapes(query, value, spans, config, slices, target=target)
-    return merged.priced_launch(spec, padded, stacked, queries, width, target,
-                                 has_initial=initial is not None,
-                                 normalized=initial is not None and initial.normalized, output=output,
-                                 out_dtype=None if finished is None else query.dtype, out_heads=out_heads)
+def _merge_seconds(query, value, spans: KeySpans, hooks: Hooks | None, config: attention_mosaic.Tiles,
+                   slices: int, *, scale: float | None, target: generation.GpuTarget, initial: Initial | None,
+                   finished: tuple[Hook, int] | None, deferred: bool) -> float:
+    """The seconds of a step's merge of its walk's `slices` (`merge_launch_for`: the launch `attend` runs, its
+    signature its own) as its block choice prices it (`merged.priced_launch`: its programs' waves); 0 where
+    the step launches none or a CUDA GPU merges it by the law's path in XLA (`MergeLaunch.native`), XLA's
+    work unpriced as `priced_step` leaves it."""
+    launch = merge_launch_for(query, value, spans, hooks, config, slices, scale=scale, target=target,
+                              initial=initial, finished=finished, deferred=deferred)
+    seconds = None if launch is None else merged.priced_launch(launch, target)
+    return 0.0 if seconds is None else seconds
 
 
-def merge_shapes(query, value, spans: KeySpans, config: attention_mosaic.Tiles, slices: int, *,
-                 target: generation.GpuTarget
-                 ) -> tuple[algebra.Forward, jax.ShapeDtypeStruct, jax.ShapeDtypeStruct, int, int]:
-    """A split walk's merge's operands as its launch lays them out (`_merge_seconds`): its walk's units
-    finished (`algebra.finished_form`), its slices' outputs `[B, S, Qp, H, Dvp]` and maxima and
-    denominators `[2, B, H, S, Qp]` fp32, its queries and its values' width."""
-    family = attention_mosaic.bundle_of(config, query.dtype, target=target)
-    rows = attention_mosaic._padded(query.shape[1], spans.keys, config)[0]
-    width = attention_mosaic._width(value.shape[-1], family, query.dtype)
-    batch, heads = query.shape[0], query.shape[2]
+def merge_branch(slices: int, *, finished: bool, deferred: bool) -> str:
+    """The merge a step of `slices` takes (`attend`'s `walked`): "none" where one slice finishes in its walk's
+    own launch, "state" where one slice's rows merge with the initial state by the law
+    (`algebra.merged_state`), "finished" where a merge launch finishes them (`merged.merged_finished`), and
+    "split" where it merges them to a state (`merged.merged_split`)."""
+    if slices == 1:
+        if finished and not deferred:
+            return "none"
+        return "finished" if finished else "state"
+    return "finished" if finished else "split"
+
+
+def merge_spec(query, spans: KeySpans, hooks: Hooks | None, *, scale: float | None) -> algebra.Forward:
+    """The walk a step's merge finishes (`merged.merge_launch`'s `spec`): its stateless walk's
+    (`attend`'s, its score hook and scale the call's own, no initial state or output hook), finished
+    (`algebra.finished_form`)."""
+    stateless = Hooks() if hooks is None else dataclasses.replace(hooks, initial=None, output=NO_HOOK)
+    return algebra.finished_form(_spec(query, spans, stateless, scale=scale))
+
+
+def merge_launch_for(query, value, spans: KeySpans, hooks: Hooks | None, config: attention_mosaic.Tiles,
+                     slices: int, *, scale: float | None, target: generation.GpuTarget,
+                     initial: Initial | None, finished: tuple[Hook, int] | None, deferred: bool
+                     ) -> merged.MergeLaunch | None:
+    """The merge launch (`merged.MergeLaunch`) a step of the packed `query` rows takes over its walk's
+    `slices` at `config` (`merge_branch`), as `attend` lays its operands out: one slice's outputs trimmed
+    `[B, 1, Q, H, Dv]` and rows `[B, H, 1, Q]`, a split walk's padded `[B, S, Qp, H, Dvp]` and
+    `[B, H, S, Qp]` (`attention_mosaic_forward.SplitOutput`), fp32; finished under `finished`'s output hook
+    over its heads writing the query's dtype, from `initial`. None where it launches none."""
+    branch = merge_branch(slices, finished=finished is not None, deferred=deferred)
+    if branch in ("none", "state"):
+        return None
+    batch, queries, heads = query.shape[0], query.shape[1], query.shape[2]
+    if slices == 1:
+        rows, width = queries, value.shape[-1]
+    else:
+        # As the launch pads its call (`padded_call`: its queries at its consumers' tiles) and its columns
+        # (`attention_mosaic._width`: `head_width`'s, then its family's column unit, `_columns`).
+        rows = axes.whole(max(queries, 1), attention_mosaic_forward.inference_query_block(config))
+        family = attention_mosaic.bundle_of(config, query.dtype, target=target)
+        width = attention_mosaic._width(value.shape[-1], family, query.dtype)
     padded = jax.ShapeDtypeStruct((batch, slices, rows, heads, width), jnp.float32)
     stacked = jax.ShapeDtypeStruct((2, batch, heads, slices, rows), jnp.float32)
-    spec = algebra.finished_form(_spec(query, spans, Hooks(), scale=None))
-    return spec, padded, stacked, query.shape[1], value.shape[-1]
+    output, out_heads = (NO_HOOK, None) if finished is None else finished
+    spec = merge_spec(query, spans, hooks, scale=scale)
+    return merged.merge_launch(spec, padded, stacked, queries=queries, width=value.shape[-1], initial=initial,
+                               out_dtype=None if finished is None else query.dtype, out_heads=out_heads,
+                               output=output)
 
 
 def _streamed(query, key, value, spans: KeySpans, hooks: Hooks | None, *, scale: float | None,
@@ -545,7 +582,9 @@ def _planned_step(query: jax.Array, key: jax.Array, value: jax.Array, spans: Key
         # resumed state's output, `Initial.normalized`).
         defer_merge = (initial is not None and initial.normalized) or (
             hooks.output.fn is not None and whole.output.fn is None)
-        if at.slices == 1 and finished and not defer_merge:
+        # The merge its plan priced (`merge_branch`, `merge_launch_for`).
+        branch = merge_branch(at.slices, finished=finished, deferred=defer_merge)
+        if branch == "none":
             # A row's walk from the initial state, finished in the query's dtype with any output hook fused
             # in-kernel, no merge past it (its fp32 rows and their merge took 45 of B128's 820 us at 4096
             # keys, ET-DECODE6-h100; row 5385).
@@ -553,33 +592,31 @@ def _planned_step(query: jax.Array, key: jax.Array, value: jax.Array, spans: Key
                 out = launch(rows, key, value, row_spans, whole, residuals=Kept.NONE, scaled=chosen.scaled,
                              bounded=chosen.bounded, masked=hooks.output.fn is None)
             return ungrouped_rows(out, heads)
-        stateless = dataclasses.replace(hooks, initial=None, output=NO_HOOK)
+        stateless = dataclasses.replace(whole, initial=None, output=NO_HOOK)
         with tuning.pinned({attention_mosaic.MosaicForward: at.config}):
             walked_out = launch(rows, key, value, row_spans, stateless, residuals=Kept.OUTPUT,
                                 out_dtype=jnp.float32, splits=at.slices, scaled=chosen.scaled,
                                 bounded=chosen.bounded, masked=True)
-        spec = _spec(rows, row_spans, stateless, scale=scale)
+        spec = merge_spec(rows, row_spans, whole, scale=scale)
         queries, width = rows.shape[1], value.shape[-1]
         if at.slices == 1:
             # One slice's outputs `[B, Q, KV, Dv]` and rows `[B, KV, Q]`, a slice axis of one.
             assert not isinstance(walked_out, attention_mosaic.SplitOutput)
             out, maximum, total = walked_out[:3]
-            out, maximum, total = out[:, None], maximum[:, :, None], total[:, :, None]
-            if finished and defer_merge:
-                return merged.merged_finished(
-                    spec, out, jnp.stack([maximum, total]), queries=queries, width=width,
-                    out_dtype=query.dtype, out_heads=heads, initial=initial, output=hooks.output)
-            state = algebra.merged_state(spec, out, maximum, total, initial)
+            padded, stacked = out[:, None], jnp.stack([maximum[:, :, None], total[:, :, None]])
         else:
-            # The slices merged where the launch wrote them (`merged_finished` / `merged_split`), fusing any
-            # output hook directly into the native merge store (row 5385).
+            # The slices where the launch wrote them, padded, any output hook fused into the merge's store
+            # (row 5385).
             assert isinstance(walked_out, attention_mosaic.SplitOutput)
-            if finished:
-                return merged.merged_finished(spec, walked_out.padded, walked_out.stacked, queries=queries,
-                                              width=width, out_dtype=query.dtype, out_heads=heads,
-                                              initial=initial, output=hooks.output)
-            state = merged.merged_split(spec, walked_out.padded, walked_out.stacked, queries=queries,
-                                        width=width, initial=initial)
+            padded, stacked = walked_out.padded, walked_out.stacked
+        if branch == "finished":
+            return merged.merged_finished(spec, padded, stacked, queries=queries, width=width,
+                                          out_dtype=query.dtype, out_heads=heads, initial=initial,
+                                          output=hooks.output)
+        if branch == "state":
+            state = algebra.merged_state(spec, padded, stacked[0], stacked[1], initial)
+        else:
+            state = merged.merged_split(spec, padded, stacked, queries=queries, width=width, initial=initial)
         if finished:
             return ungrouped_rows(algebra.finish(spec, state, initial=True, normalized=True)[0],
                                   heads).astype(query.dtype)
