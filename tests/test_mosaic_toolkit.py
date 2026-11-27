@@ -475,7 +475,7 @@ def test_shared_bytes_counts_a_programs_allocations_by_lifetime():
     largest of them, every barrier 8 bytes, a named CTA barrier none (the block's hardware barrier,
     `plgpu.CtaBarrier`, a packed decode's consumers' meet); a tile scoped after its walks beside the program's
     on a family whose walks share a scope (warpgroup MMA), the larger of it and the walks on one that scopes
-    each walk apart (mma.sync's emit_pipeline)."""
+    each walk apart (mma.sync's cp.async walk, `mosaic_sm80._streamed`)."""
     from dew.nn.kernels.templates import mosaic_sm90
 
     program = (plgpu.SMEM((100,), jnp.float32), plgpu.Barrier(num_barriers=3),
@@ -1936,12 +1936,12 @@ def test_a_launch_runs_a_flags_branch_and_its_negations_branch_each_alone(semant
 
 
 def test_an_mma_sync_walks_shared_memory_is_what_its_pipeline_scopes_for_its_copies():
-    """mma.sync's walk sizes its shared memory as `emit_pipeline` scopes it for the cp.async copies every
-    device the family runs on makes (`CpAsync.lifetimes`, read from JAX's own builder, row 6135): a slot of
+    """mma.sync's walk sizes its shared memory as its walk scopes it for the cp.async copies every device the
+    family runs on makes (`CpAsync.lifetimes`, the walk's own plan `mosaic_sm80._ring`, row 6135): a slot of
     each block a stage and no barrier, whatever GPU is assumed (an sm120, whose copies would be TMA's and
     take a barrier a stage, runs no mma.sync on cp.async: `bundles.legal`); a walk of fewer steps than stages
     as many slots as steps, also planned inside a jit's trace over a mesh of its own; two consumers running
-    it together, the two barriers they meet at, as the builder scopes them for its thread axis. That the plan
+    it together, the two barriers they meet at in turn. That the plan
     is the kernel's own allocation the compile gate checks of every launch (`kernel_compile.mosaic_failures`:
     its planned shared bytes against those the compiled kernel asks for)."""
     family = bundles.named("mma.sync", jnp.bfloat16, None)
