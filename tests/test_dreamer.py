@@ -899,8 +899,8 @@ def test_dreamer_filled_and_split_step_updates_as_the_real_windows_whole(dynamic
     microbatches through `Trainer` (with perturbed reward and value heads so imagined returns span well
     past unit scale) updates parameters and slow critic EMA as `split=1` on the 6 real windows does,
     held to the float64 update by check 1."""
-    from float64_replay import float64_replay
     from arm_arithmetic import summed_as_run
+    from float64_replay import float64_replay
     from rl_split_support import SplitAndWhole, nudged_tree
 
     from dew.averaging import ema_update
