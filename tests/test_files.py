@@ -1,8 +1,10 @@
 """A file written through dew._files is the old one or the new one, never part of one."""
 
 import concurrent.futures
+import inspect
 import os
 import stat
+import sys
 
 import pytest
 
@@ -311,6 +313,34 @@ def test_a_build_published_second_is_removed_whole_where_its_owner_cannot_search
     assert not published(built, directory)
     assert not built.exists()
     assert (directory / "who").read_text() == "first"
+
+
+def test_a_build_deeper_than_pythons_stack_is_removed_whole_when_published_second(tmp_path):
+    """A build that loses its publication to another writer, nested deeper than this process's call stack
+    allows (its recursion limit lowered to 150 frames past the test's own), is removed whole: its folders
+    are walked on a stack of descriptors, not Python's (theme 74's review: a recursive walk raised
+    RecursionError out of the cleanup)."""
+    directory = tmp_path / "published"
+    directory.mkdir()
+    (directory / "who").write_text("first")
+    built = tmp_path / "built"
+    built.mkdir()
+    folder = os.open(built, os.O_RDONLY)
+    try:
+        for _ in range(300):
+            os.mkdir("d", dir_fd=folder)
+            inner = os.open("d", os.O_RDONLY, dir_fd=folder)
+            os.close(folder)
+            folder = inner
+    finally:
+        os.close(folder)
+    limit = sys.getrecursionlimit()
+    sys.setrecursionlimit(len(inspect.stack()) + 150)
+    try:
+        assert not published(built, directory)
+    finally:
+        sys.setrecursionlimit(limit)
+    assert not built.exists()
 
 
 def test_a_release_takes_the_group_of_the_tree_it_replaces_as_the_lock_finds_it(tmp_path):

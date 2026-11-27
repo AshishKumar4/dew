@@ -1009,9 +1009,10 @@ def test_a_head_only_runs_frozen_layers_run_under_a_capture_of_every_method():
     head = freeze(base, lambda path: not any(key.startswith("layers_") for key in path))
     (site,) = model.stage_sites({"params": head["params"], FROZEN: head[FROZEN]}, 1)
     assert site.frozen
+    joined = {"params": merge(head["params"], head[FROZEN])}
     with held_by_stage((site,)):
-        _, captured = model.apply({"params": merge(head["params"], head[FROZEN])}, ids,
-                                  capture_intermediates=lambda module, method: True, mutable=["intermediates"])
+        _, captured = model.apply(joined, ids, capture_intermediates=lambda module, method: True,
+                                  mutable=["intermediates"])
     layers = sorted(captured["intermediates"])
     assert any(name.startswith("layers_") for name in layers), layers
 
@@ -1026,7 +1027,7 @@ def test_a_head_only_run_over_frozen_layers_read_where_they_lie_trains_as_one_ho
     model = decoder()
 
     def head(seed: int):
-        base = model.init(jax.random.key(seed), jnp.zeros((1, SEQ), jnp.int32))
+        base = nn.unbox(model.init(jax.random.key(seed), jnp.zeros((1, SEQ), jnp.int32)))
         return freeze(base, lambda path: not any(key.startswith("layers_") for key in path))
 
     initial = initials(model, LORA_OPTIMIZER, head)
