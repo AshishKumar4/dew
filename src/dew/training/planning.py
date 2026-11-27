@@ -1526,11 +1526,11 @@ class FitSearch[LossT, EffectsT]:
         where its miss was within what they hold by count, else, past every rung asked joined, in the
         climb's order before the search gives up (`Parting`). The place the start's schedule reads as fitting
         is asked second (`jumped`): where the start's first miss computes no split that fits, before the
-        start's finer splits (`started`), else past them. No rung is asked twice; every process asks the
+        start's finer splits (`start_walked`), else past them. No rung is asked twice; every process asks the
         same."""
         start = self.rung_now()
         after = functools.partial(self.after, candidates)
-        split, resumed = self.started(candidates, first)
+        split, resumed = self.start_walked(candidates, first)
         if split is not None:
             return split
         # The rungs walked already, all missed: none is asked again; and each as its record names it.
@@ -1624,7 +1624,7 @@ class FitSearch[LossT, EffectsT]:
         self.said(named)
         return split
 
-    def started(self, candidates: Sequence[int], first: int) -> tuple[int | None, int | None]:
+    def start_walked(self, candidates: Sequence[int], first: int) -> tuple[int | None, int | None]:
         """The split the start's rung fits at from `candidates[first]` (`walked`, `after`), or None and where
         its walk goes on: at its first miss that some process computes no split above it as fitting
         (`MemoryMiss.fits_at`), the walk stops there for the place the start's schedule reads as fitting
