@@ -279,7 +279,7 @@
 "tests/test_attention_mosaic.py::test_a_dropping_backward_is_on_par_over_every_call_interpreted[full-sm90]",
 "tests/test_attention_mosaic.py::test_a_forward_kernel_built_for_its_facts_runs_each_calls_own_interpreted[sm90]",
 "tests/test_attention_mosaic.py::test_a_gpu_no_one_measured_runs_the_tiles_its_facts_give[hopper-class]",
-"tests/test_attention_mosaic.py::test_a_hooked_backward_in_one_launch_holds_check_1_interpreted[sm90-('sinks', 'fused')]",
+"tests/test_attention_mosaic.py::test_a_hooked_backward_in_one_launch_holds_check_1_interpreted[sm90-('softcap', 'fused')]",
 "tests/test_attention_mosaic.py::test_a_hooks_streamed_parameters_hold_check_1_on_tcgen05s_chunks_interpreted[key-bias]",
 "tests/test_attention_mosaic.py::test_a_hooks_streamed_parameters_hold_check_1_through_the_rings_rotations_interpreted[tile-bias]",
 "tests/test_attention_mosaic.py::test_a_parameter_every_row_shares_takes_each_rows_gradient_interpreted[key-bias-sm90]",
@@ -766,16 +766,16 @@
 "tests/test_attention_triton.py::test_the_plain_forward_is_on_par_over_runs[runs-causal-Tiles(block_q=64, block_k=32, warps=4, stages=2)]"
 ],
 "tests/test_attention_triton_backward.py": [
-"tests/test_attention_triton_backward.py::test_the_backward_is_on_par_over_every_call_form[causal-window-Tiles(block_q=64, block_k=32, warps=4, stages=2)-default]",
-"tests/test_attention_triton_backward.py::test_the_backward_is_on_par_over_every_call_form[cross-causal-lengths-starts-Tiles(block_q=32, block_k=32, warps=4, stages=2)-default]",
+"tests/test_attention_triton_backward.py::test_the_backward_is_on_par_over_every_call_form[cross-causal-lengths-starts-Tiles(block_q=128, block_k=64, warps=4, stages=2)-accurate]",
+"tests/test_attention_triton_backward.py::test_the_backward_is_on_par_over_every_call_form[cross-causal-lengths-starts-Tiles(block_q=64, block_k=32, warps=4, stages=2)-accurate]",
 "tests/test_attention_triton_backward.py::test_the_backward_is_on_par_over_every_call_form[documents-Tiles(block_q=128, block_k=64, warps=4, stages=2)-default]",
-"tests/test_attention_triton_backward.py::test_the_backward_is_on_par_over_every_call_form[documents-Tiles(block_q=64, block_k=32, warps=4, stages=2)-accurate]",
-"tests/test_attention_triton_backward.py::test_the_backward_is_on_par_over_every_call_form[full-Tiles(block_q=32, block_k=32, warps=4, stages=2)-default]",
-"tests/test_attention_triton_backward.py::test_the_backward_is_on_par_over_every_call_form[two-sided-window-Tiles(block_q=32, block_k=32, warps=4, stages=2)-default]",
-"tests/test_attention_triton_backward.py::test_the_backward_is_on_par_over_the_core_s_other_call_forms[causal-chunk]",
-"tests/test_attention_triton_backward.py::test_the_backward_is_on_par_over_the_core_s_other_call_forms[causal-window-valid]",
-"tests/test_attention_triton_backward.py::test_the_backward_is_on_par_over_the_core_s_other_call_forms[cross-block-causal-window]",
-"tests/test_attention_triton_backward.py::test_the_backward_is_on_par_over_the_core_s_other_call_forms[cross-causal-window-valid]",
+"tests/test_attention_triton_backward.py::test_the_backward_is_on_par_over_every_call_form[documents-Tiles(block_q=64, block_k=32, warps=4, stages=2)-default]",
+"tests/test_attention_triton_backward.py::test_the_backward_is_on_par_over_every_call_form[full-Tiles(block_q=64, block_k=32, warps=4, stages=2)-default]",
+"tests/test_attention_triton_backward.py::test_the_backward_is_on_par_over_every_call_form[two-sided-window-Tiles(block_q=32, block_k=32, warps=4, stages=2)-accurate]",
+"tests/test_attention_triton_backward.py::test_the_backward_is_on_par_over_every_call_form[two-sided-window-Tiles(block_q=64, block_k=32, warps=4, stages=2)-default]",
+"tests/test_attention_triton_backward.py::test_the_backward_is_on_par_over_the_core_s_other_call_forms[causal-documents-window]",
+"tests/test_attention_triton_backward.py::test_the_backward_is_on_par_over_the_core_s_other_call_forms[causal]",
+"tests/test_attention_triton_backward.py::test_the_backward_is_on_par_over_the_core_s_other_call_forms[cross-causal-chunk]",
 "tests/test_attention_triton_backward.py::test_the_backward_is_on_par_over_the_core_s_other_call_forms[cross-causal]",
 "tests/test_attention_triton_backward.py::test_the_backward_is_on_par_over_the_core_s_other_call_forms[cross-window]",
 "tests/test_attention_triton_backward.py::test_the_backward_is_on_par_over_the_core_s_other_call_forms[documents-causal-chunk-places]",
@@ -820,12 +820,12 @@
 "tests/test_attention_witness.py::test_each_fault_is_refused_at_its_elements",
 "tests/test_attention_witness.py::test_each_gradient_of_the_backward_lies_in_its_enclosure[capped-accurate]",
 "tests/test_attention_witness.py::test_each_gradient_of_the_backward_lies_in_its_enclosure[causal-accurate]",
-"tests/test_attention_witness.py::test_each_gradient_of_the_backward_lies_in_its_enclosure[documents-accurate]",
-"tests/test_attention_witness.py::test_each_gradient_of_the_backward_lies_in_its_enclosure[full-accurate]",
+"tests/test_attention_witness.py::test_each_gradient_of_the_backward_lies_in_its_enclosure[documents-fast]",
 "tests/test_attention_witness.py::test_each_gradient_of_the_backward_lies_in_its_enclosure[window-accurate]",
-"tests/test_attention_witness.py::test_each_stored_state_and_the_output_lie_in_their_step_enclosures[0-capped]",
+"tests/test_attention_witness.py::test_each_gradient_of_the_two_launch_backward_lies_in_its_enclosure[capped]",
+"tests/test_attention_witness.py::test_each_gradient_of_the_two_launch_backward_lies_in_its_enclosure[full]",
 "tests/test_attention_witness.py::test_each_stored_state_and_the_output_lie_in_their_step_enclosures[0-full]",
-"tests/test_attention_witness.py::test_each_stored_state_and_the_output_lie_in_their_step_enclosures[1-documents]"
+"tests/test_attention_witness.py::test_the_certify_launch_writes_every_record_it_declares"
 ],
 "tests/test_autoencoder.py": [
 "tests/test_autoencoder.py::test_every_built_in_autoencoder_rebuilds_from_its_saved_record_alone[flux2]"
@@ -1385,9 +1385,6 @@
 "tests/test_decision_workflow.py::test_the_workflows_resumed_run_ends_on_its_uninterrupted_run_from_its_compiled_programs",
 "tests/test_decision_workflow.py::test_the_workflows_task_answers_from_its_compiled_programs"
 ],
-"tests/test_declared_cells_memory.py": [
-"tests/test_declared_cells_memory.py::test_a_gated_stacks_backward_holds_no_layers_outputs_past_its_layer[sm90-one device]"
-],
 "tests/test_decode_attention.py": [
 "tests/test_decode_attention.py::test_the_decode_kernel_applies_sinks_and_a_softcap_at_every_config[bfloat16-both-fold-16]",
 "tests/test_decode_attention.py::test_the_decode_kernel_applies_sinks_and_a_softcap_at_every_config[bfloat16-both-fold-4]",
@@ -1566,8 +1563,8 @@
 "tests/test_delayed_nvfp4_parts.py::test_a_reference_an_earlier_dew_saved_is_refused_and_one_this_dew_saved_resumes",
 "tests/test_delayed_nvfp4_parts.py::test_a_run_resumed_partway_through_a_held_update_rolls_what_its_taken_calls_recorded",
 "tests/test_delayed_nvfp4_parts.py::test_an_averaged_forward_reads_the_committed_histories",
-"tests/test_delayed_nvfp4_parts.py::test_an_optimizer_holding_updates_back_rolls_the_largest_of_every_call_it_held",
-"tests/test_delayed_nvfp4_parts.py::test_what_waits_rolls_once_an_update_applies_and_a_skipped_input_waits_for_none"
+"tests/test_delayed_nvfp4_parts.py::test_an_earlier_dews_checkpoint_resumes_where_an_update_applied_and_is_refused_partway",
+"tests/test_delayed_nvfp4_parts.py::test_an_optimizer_holding_updates_back_rolls_the_largest_of_every_call_it_held"
 ],
 "tests/test_delayed_nvfp4_training.py": [
 "tests/test_delayed_nvfp4_training.py::test_a_split_step_rolls_the_largest_its_microbatches_recorded_into_each_history_once_an_update"
@@ -1798,9 +1795,6 @@
 ],
 "tests/test_flight.py": [
 "tests/test_flight.py::test_a_step_pays_passes_ends_and_finishes_as_the_race_rules"
-],
-"tests/test_flow_cells.py": [
-"tests/test_flow_cells.py::test_the_model_widths_recurrence_cells_programs_fit_a_part_of_an_a100"
 ],
 "tests/test_flow_grpo.py": [
 "tests/test_flow_grpo.py::test_a_transitions_density_keeps_a_residual_whose_square_overflows",
@@ -2558,6 +2552,9 @@
 ],
 "tests/test_local_attention.py": [
 "tests/test_local_attention.py::test_chunks_count_tokens_from_the_place_a_caller_gives_their_first[banded-repeated-xla]"
+],
+"tests/test_log_linear.py": [
+"tests/test_log_linear.py::test_packed_levels_train_on_the_template_and_unpacked_ones_take_no_recurrence[sm120]"
 ],
 "tests/test_loop.py": [
 "tests/test_loop.py::test_a_count_of_passes_given_per_call_runs_as_a_loop_of_that_many[a block before its coda, gated, its last pass trained-2]",
@@ -3922,8 +3919,8 @@
 "tests/test_selective_template.py": [
 "tests/test_selective_template.py::test_a_forked_calls_training_step_compiles[sm90]",
 "tests/test_selective_template.py::test_a_routed_forked_training_step_compiles_spill_free[sm80]",
-"tests/test_selective_template.py::test_a_routed_forked_training_step_compiles_spill_free[sm90]",
-"tests/test_selective_template.py::test_the_backward_holds_its_registers_at_the_residency_it_launches[one sequence]"
+"tests/test_selective_template.py::test_a_spilled_backward_takes_its_models_next_plan[sm80]",
+"tests/test_selective_template.py::test_large_input_gates_with_normal_or_zero_steps_keep_dx_finite_interpreted[normal step]"
 ],
 "tests/test_sequence_parallel.py": [
 "tests/test_sequence_parallel.py::test_per_token_visibility_passes_through_either_exchange[gather runs-template]"
