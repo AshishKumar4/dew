@@ -152,7 +152,8 @@ def indexer_log_target(query, key, keep, scale: float, *, dtype=None):
     """The log of the indexer's teacher's unnormalized mass per key, `[B, S, T]` at least fp32 (float64 for
     float64 inputs): the main attention's softmaxes over the keys `keep` allows, summed over its heads,
     detached as the references detach it (arXiv 2512.02556 eq. 3; MSA's, arXiv 2606.13392 eq. 9); -inf at a
-    key `keep` hides and at every key of a row that allows none. `query` `[B, S, H, D]` and `key`
+    key `keep` hides, and over a row that allows none each head's softmax uniform over every key, as the
+    references' masked softmax gives it. `query` `[B, S, H, D]` and `key`
     `[B, T, H, D]` are the main heads, `scale` the kernel's logit scale. Each head's softmax is its logits
     less their log-sum-exp over the allowed keys alone, a hidden key no logit at all: given the least finite
     logit, it tied an allowed key at it and took its share (logits of the least finite twice and of 0 and
@@ -166,16 +167,17 @@ def indexer_log_target(query, key, keep, scale: float, *, dtype=None):
     batch, length, total = query.shape[0], query.shape[1], key.shape[1]
     keep = jnp.broadcast_to(keep, (batch, length, total))
     seen = jnp.any(keep, axis=-1, keepdims=True)
+    allowed = keep | ~seen
     query = jnp.moveaxis(jax.lax.stop_gradient(query).astype(wide) * scale, 2, 0)
     key = jnp.moveaxis(jax.lax.stop_gradient(key).astype(wide), 2, 0)
 
     def masses(q, k):
-        # A head's log-softmax over the allowed keys, -inf at the others and over a row that allows none.
-        logits = jnp.where(keep, float32_einsum('bsd,btd->bst', q, k), -jnp.inf)
+        # A head's log-softmax over the allowed keys, -inf at the others; over a row that allows none, uniform
+        # over every key, as MaxText's and the paper's masked softmax gives it (`allowed`).
+        logits = jnp.where(allowed, jnp.where(seen, float32_einsum('bsd,btd->bst', q, k), 0), -jnp.inf)
         peak = jnp.max(logits, axis=-1, keepdims=True)
-        peak = jnp.where(jnp.isfinite(peak), peak, 0)
         spread = jnp.log(jnp.sum(jnp.exp(logits - peak), axis=-1, keepdims=True))
-        return jnp.where(seen & keep, logits - peak - jnp.where(seen, spread, 0), -jnp.inf)
+        return logits - peak - spread
 
     def peak_of(peak, projections):
         return jnp.maximum(peak, masses(*projections)), None
@@ -192,12 +194,12 @@ def indexer_log_target(query, key, keep, scale: float, *, dtype=None):
     (high, low), _ = jax.lax.scan(head, (zeros, zeros), (query, key))
     # An allowed key's mass however its heads' logits gave it, a NaN's too (an invalid logit surfaces, never
     # read as a hidden key's none).
-    return jnp.where(keep & seen, held + jnp.log(high + low), -jnp.inf)
+    return jnp.where(allowed, held + jnp.log(high + low), -jnp.inf)
 
 
 def indexer_target(query, key, keep, scale: float, *, dtype=None):
     """The indexer's teacher's unnormalized mass per key, `[B, S, T]` (`indexer_log_target`'s, taken out of
-    its logarithm): 0 at a key `keep` hides and over a row that allows none."""
+    its logarithm): 0 at a key `keep` hides."""
     return jnp.exp(indexer_log_target(query, key, keep, scale, dtype=dtype))
 
 
@@ -220,10 +222,10 @@ def indexer_kl(scores, query, key, keep, scale: float):
     keep = jnp.broadcast_to(keep, summed.shape)
     target = summed / (compensated_sum(summed, (summed.ndim - 1,))[..., None] + INDEXER_EPS)
     # The indexer's softmax over the allowed keys alone, a hidden key no score at all (the least finite score
-    # tied an allowed key's there and took its share, train 1345's F1); a row that allows none takes zeros.
+    # tied an allowed key's there and took its share, train 1345's F1); a row that allows none uniform over
+    # every key, as the teacher's (`indexer_log_target`) and the reference's.
     seen = jnp.any(keep, axis=-1, keepdims=True)
-    indexer = jnp.where(seen, jax.nn.softmax(
-        jnp.where(seen, jnp.where(keep, scores.astype(wide), -jnp.inf), 0), axis=-1), 0)
+    indexer = jax.nn.softmax(jnp.where(seen, jnp.where(keep, scores.astype(wide), -jnp.inf), 0), axis=-1)
     divergence = target * (jnp.log(target + INDEXER_EPS) - jnp.log(indexer + INDEXER_EPS))
     return compensated_sum(divergence, (divergence.ndim - 1,))
 

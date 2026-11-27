@@ -435,7 +435,8 @@ def test_the_indexer_teacher_gives_a_hidden_key_no_share_of_a_heads_mass():
     over the keys its call allows alone. Two fp32 heads over two allowed keys and a hidden one, the first
     head's allowed logits fp32's least both, the second's 0 and -128: the heads' masses 1.5 and 0.5 within
     fp32's rounding, the hidden key none, where a hidden key given fp32's least logit tied the first head's
-    and took a third of it (4/3 and 1/3, train 1345's F1); a row that allows no key, none."""
+    and took a third of it (4/3 and 1/3, train 1345's F1); a row that allows no key, each head's uniform
+    over every key, the references' masked softmax's."""
     least = float(np.finfo(np.float32).min)
     query = jnp.ones((1, 2, 2, 1), jnp.float32)
     key = jnp.asarray([[[[least], [0.0]], [[least], [-128.0]], [[least], [0.0]]]], jnp.float32)
@@ -444,7 +445,8 @@ def test_the_indexer_teacher_gives_a_hidden_key_no_share_of_a_heads_mass():
     for found, exact in ((target[0, 0, 0], 1.5), (target[0, 0, 1], 0.5)):
         assert_fp32_reduction_bound(found, exact, exact, 8)
     np.testing.assert_array_equal(target[0, 0, 2], 0.0)
-    np.testing.assert_array_equal(target[0, 1], np.zeros(3, np.float32))
+    for found in target[0, 1]:
+        assert_fp32_reduction_bound(found, 2 / 3, 2 / 3, 8)
 
 
 def test_msas_selection_keeps_its_slots_and_forces_each_block_once_within_reach():
