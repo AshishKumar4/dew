@@ -334,7 +334,8 @@ def test_a_refused_config_a_build_would_hold_is_judged_under_every_build():
                 ("tile d", "cuda13"): "refused", ("tile d", "cuda12"): "refused",
                 ("tile f", "cuda13"): "failed: its machine code holds a finding",
                 ("tile f", "cuda12"): "refused",
-                ("tile g", "cuda13"): "qualified", ("tile h", "cuda13"): "refused"}
+                ("tile g", "cuda13"): "qualified", ("tile h", "cuda13"): "refused",
+                ("tile g", "cuda12"): "failed: over its cap", ("tile h", "cuda12"): "qualified"}
 
     def judge(build, name, ptx, binary, module):
         del name, binary, module
@@ -351,11 +352,17 @@ def test_a_refused_config_a_build_would_hold_is_judged_under_every_build():
                  _Certified("gh", {"k_g 0": "m_g", "k_h 0": "m_h"}, refused=True),
                  _Certified("t", {"k_t 0": "m_t"}, refused=True, kind="triton")]
     judged = kc.refused_across_builds(certified, printed, ("cuda13", "cuda12"), judge)
-    assert {entry["config"]: entry["builds"]["cuda13"] for entry in judged} == {
-        "'a'": "qualified", "'b'": "refused", "'c'": "unverified", "'d'": "refused",
-        "'f'": "failed: its machine code holds a finding", "'gh'": "refused"}
+    assert {entry["config"]: entry["builds"] for entry in judged} == {
+        "'a'": {"cuda13": "qualified", "cuda12": "refused"},
+        "'b'": {"cuda13": "refused", "cuda12": "refused"},
+        "'c'": {"cuda13": "unverified", "cuda12": "unverified"},
+        "'d'": {"cuda13": "refused", "cuda12": "refused"},
+        "'f'": {"cuda13": "failed: its machine code holds a finding", "cuda12": "refused"},
+        # Two kernels: one refused refuses the config; one failing, the other qualified, fails it.
+        "'gh'": {"cuda13": "refused", "cuda12": "failed: over its cap"}}
     failed = kc.refused_across_build_failures({"name": "a case", "refused_builds": judged})
-    assert len(failed) == 3 and all("'c'" in failure or "'f'" in failure for failure in failed)
+    assert len(failed) == 4 and all(any(f"'{config}'" in failure for config in ("c", "f", "gh"))
+                                    for failure in failed)
     # A later case certifying the same module, which Mosaic printed once: its PTX read by its module.
     again = kc.refused_across_builds([_Certified("a", {"k_a 0": "m_a"}, refused=True)], {}, ("cuda12",),
                                      judge)

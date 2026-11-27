@@ -410,10 +410,11 @@ def _compiled(case, generation: str, record: dict,
     estimating = _dumped(str(lowering)) if lowering is not None else contextlib.nullcontext()
     uncertified = report.uncertified()
     certifying = len(report.certifications())
-    # Each certification this case's lowering asks for, one an earlier case held among them (row 10766).
-    offering = len(report.offered())
+    # Each certification this case's lowering asks for, one an earlier case held among them (row 10766),
+    # collected before its compile-only device is set up, so a case failing there has none.
+    offers: list = []
     try:
-        with estimating, report.certifying(compile_only_gpus(generation)[0]):
+        with report.offered() as offers, estimating, report.certifying(compile_only_gpus(generation)[0]):
             lowered = lowered_for(fn, args, generation, expected)
     except Exception as error:  # A case that does not lower is its own failure.
         # One a block's shared memory does not hold asks its bytes, as XLA's refusal of a Triton kernel does.
@@ -429,9 +430,11 @@ def _compiled(case, generation: str, record: dict,
         record["certifications"] = _certified_since(certifying)
         if lowering is not None:
             # Every offer refused under the certifying build, each judged under the others too: one another
-            # build holds is a launch production there runs that no gate compiled (row 10766).
+            # build holds is a launch production there runs that no gate compiled (row 10766). Its estimates
+            # read first, the tensor memory each judgment holds it to.
+            _estimates((), dumps(str(lowering), ".resources.txt"))
             record["refused_builds"] = _judged_across_builds(
-                offering, printed_modules(dumps(str(lowering), ".ptx")), generation)
+                offers, printed_modules(dumps(str(lowering), ".ptx")), generation)
         return None
     # A launch the lowering could not certify (`report.certified`) is a failure of its own: its run would
     # find its spills only as its whole program compiles.
@@ -473,7 +476,7 @@ def _compiled(case, generation: str, record: dict,
         lowered_modules = printed_modules(dumps(str(lowering), ".ptx"))
         written({**lowered_modules, **printed_modules(dumps(str(compiling), ".ptx"))}, directory, modules)
         # Each config certification refused, judged under every build its generation's GPUs run (row 10766).
-        record["refused_builds"] = _judged_across_builds(offering, lowered_modules, generation)
+        record["refused_builds"] = _judged_across_builds(offers, lowered_modules, generation)
     if expected is not None:
         record["route"] = _route(lowered, executable, _device(generation, expected.axes))
     record["thunks"] = assembled.launched_thunks(executable)
@@ -618,12 +621,12 @@ def _judged_under(generation: str, build: str, name: str, ptx: str, certified: a
     return alternate_verdict(name, read, alternate, certified, estimate, ptx, generation)
 
 
-def _judged_across_builds(offering: int, printed: dict[str, str], generation: str) -> list[dict]:
-    """`refused_across_builds` of each certification the case asked for (`report.offered` past its first
-    `offering`, each once), their PTX as the case's lowering printed it (`printed`, `printed_modules`) or an
-    earlier case's (`PTX`)."""
+def _judged_across_builds(offers: list, printed: dict[str, str], generation: str) -> list[dict]:
+    """`refused_across_builds` of each certification the case asked for (`offers`, `report.offered`'s, each
+    once), their PTX as the case's lowering printed it (`printed`, `printed_modules`) or an earlier case's
+    (`PTX`)."""
     # Each once, by identity: a certification holds its kernels in a dict, no key.
-    asked = list({id(found): found for found in report.offered()[offering:]}.values())
+    asked = list({id(found): found for found in offers}.values())
     return refused_across_builds(asked, printed, judged_builds(generation),
                                  functools.partial(_judged_under, generation))
 
