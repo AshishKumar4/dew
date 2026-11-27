@@ -15,6 +15,7 @@ from generation_support import lowers
 from kernel_compile import compile_mosaic_kernels
 
 from dew import quantization
+from dew.nn import programs
 from dew.nn.dense import Dense
 from dew.nn.kernels import gemm, generation, grouped_matmul, tuning
 from dew.nn.kernels.formats import WINDOW_ESCAPES, Bf16Window
@@ -336,39 +337,29 @@ def test_gemm_over_a_window_sums_exactly_where_its_call_asks():
         jax.eval_shape(lambda x: gemm.gemm(x, window, None, out_dtype=jnp.float32, interpret_on_cpu=True),
                        rows)
     assert [call.arguments["exact_sums"] for _, call in seen.taken
-            if isinstance(call.op, grouped_matmul.MosaicGmm)] == [True]
+            if isinstance(call.op, grouped_matmul.MosaicGmm) and call.arguments["interpret"]] == [True]
 
 
 def _dot_precisions(fn, *args) -> list:
-    """The precision every dot of `fn`'s program states (its nested programs' too)."""
-    found = []
-
-    def walk(jaxpr):
-        for eqn in jaxpr.eqns:
-            if eqn.primitive.name == "dot_general":
-                found.append(eqn.params["precision"])
-            for value in eqn.params.values():
-                for program in value if isinstance(value, tuple) else (value,):
-                    if hasattr(program, "eqns"):
-                        walk(program)
-                    elif hasattr(program, "jaxpr") and hasattr(program.jaxpr, "eqns"):
-                        walk(program.jaxpr)
-
-    walk(jax.make_jaxpr(fn)(*args).jaxpr)
-    return found
+    """The precision every dot of `fn`'s program states, its nested programs' too (`programs.equations`)."""
+    return [eqn.params["precision"] for eqn in programs.equations(jax.make_jaxpr(fn)(*args).jaxpr)
+            if eqn.primitive is jax.lax.dot_general_p]
 
 
-@pytest.mark.parametrize(("stated", "algorithm"), [(None, jax.lax.DotAlgorithmPreset.F16_F16_F32),
-                                                   (jax.lax.Precision.DEFAULT, None)],
-                         ids=["omitted: the run's algorithm", "the default stated: no algorithm"])
-def test_gemm_over_a_window_states_the_algorithm_its_call_and_run_declare(stated, algorithm):
-    """`gemm.gemm` over a bfloat16 window of bf16 rows under a run's narrowing algorithm (`F16_F16_F32`)
-    states to XLA the algorithm the call declares (row 13686's review): the run's where the call states no
-    precision, none where it states the default (its level overriding the run's), on its decoded fallback
-    (the window's own dot reads the run's)."""
+@pytest.mark.parametrize(("run", "stated", "algorithm"),
+                         [("F16_F16_F32", None, jax.lax.DotAlgorithmPreset.F16_F16_F32),
+                          ("F16_F16_F32", jax.lax.Precision.DEFAULT, None),
+                          ("F32_F32_F32", jax.lax.Precision.DEFAULT, None)],
+                         ids=["omitted: the run's narrowing algorithm", "the default over a narrowing run",
+                              "the default over a whole run"])
+def test_gemm_over_a_window_states_the_algorithm_its_call_and_run_declare(run, stated, algorithm):
+    """`gemm.gemm` over a bfloat16 window of bf16 rows under a run's algorithm states to XLA the algorithm
+    the call declares (row 13686's review): the run's where the call states no precision, none where it
+    states the default (its level overriding the run's, a narrowing one's or a whole one a TPU does not
+    run), on its decoded fallback (the window's own dot reads the run's)."""
     kernel = jnp.zeros((128, 64), jnp.bfloat16).at[0, 0].set(1.0)
     x = jnp.full((2, 128), 2.0 ** -30, jnp.bfloat16)
-    with jax.default_matmul_precision("F16_F16_F32"):
+    with jax.default_matmul_precision(run):
         found = _dot_precisions(lambda x: gemm.gemm(x, Bf16Window.of(kernel).checked(), None,
                                                     out_dtype=jnp.float32, precision=stated), x)
     algorithms = {each for each in found
@@ -376,17 +367,16 @@ def test_gemm_over_a_window_states_the_algorithm_its_call_and_run_declare(stated
     assert found and algorithms == ({algorithm} if algorithm else set()), found
 
 
-@pytest.mark.parametrize("compute", [jnp.bfloat16, jnp.float32], ids=["window", "decoded"])
-def test_gemm_over_a_window_of_another_encoding_reads_nan_under_jit(compute):
-    """A window whose form is another encoder's, passed to `gemm.gemm` as a jitted argument (its form a
-    traced value no host check reads), gives NaN in every output, on the window's own product (bf16
-    compute) and on its decoded fallback (fp32 compute) alike (`Bf16Window.verified`), never a plausible
-    number read through the wrong decode (row 13686's review)."""
+def test_a_window_of_another_encoding_is_refused_however_it_is_made():
+    """A window whose form is another encoder's is refused where it is made, before any trace reads it
+    (row 13686's review): replaced into a window, or unflattened from a checkpoint's leaves, its words never
+    reach a product, jitted or not, on the window's own product or its decoded fallback."""
     kernel = jnp.asarray((np.arange(128 * 64).reshape(128, 64) % 7 - 3) / 4.0, jnp.bfloat16)
     window = Bf16Window.of(kernel)
     form = np.asarray(window.form).copy()
     form.reshape(-1)[0] ^= 1
-    other = dataclasses.replace(window, form=form)
-    out = jax.jit(lambda x, w: gemm.gemm(x, w, None, out_dtype=jnp.float32, compute=compute))(
-        jnp.ones((4, 128), jnp.float32), other)
-    assert np.isnan(np.asarray(out)).all()
+    with pytest.raises(ValueError):
+        dataclasses.replace(window, form=form)
+    leaves, structure = jax.tree.flatten(window)
+    with pytest.raises(ValueError):
+        jax.tree.unflatten(structure, [form if leaf is window.form else leaf for leaf in leaves])

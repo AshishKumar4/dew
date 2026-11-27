@@ -66,5 +66,5 @@ def window_product(lhs: jax.Array, window: Bf16Window, group_sizes: jax.Array | 
     else:
         product = xla_products.decoded_dot
         operands = (window.decoded(), group_sizes)
-    summed = window.verified(gemm._interpreted(product, interpret_on_cpu, rows, *operands))
+    summed = gemm._interpreted(product, interpret_on_cpu, rows, *operands)
     return summed.astype(lhs.dtype if out_dtype is None else out_dtype)

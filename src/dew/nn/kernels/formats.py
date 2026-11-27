@@ -656,6 +656,18 @@ class Bf16Window:
     words: jax.Array | np.ndarray
     meta: jax.Array | np.ndarray
     form: jax.Array | np.ndarray
+
+    def __post_init__(self):
+        # Admitted only of this Dew's encoder wherever its form is concrete, however it is made (`of`, a
+        # checkpoint's restore, `dataclasses.replace`, a pytree's unflatten): a window a jitted step takes
+        # was admitted so before its trace, whose form is traced, its shape still checked there (row 13686's
+        # review: words another encoder packed read wrong through this form's decode).
+        if isinstance(self.form, Tracer):
+            if math.prod(self.form.shape) != window_form_version().size:
+                raise ValueError(f"Bf16Window form of shape {self.form.shape}, where this Dew's digest is "
+                                 f"{window_form_version().size} bytes")
+        elif isinstance(self.form, np.ndarray | jax.Array):
+            self.checked()
     fmt: str = dataclasses.field(metadata={"static": True}, default="window")
 
     @classmethod
@@ -729,18 +741,6 @@ class Bf16Window:
         """Verify the stored `form` (every addressable shard) is this Dew's encoder's."""
         _checked_form(self.form, window_form_version(), "Bf16Window", "Bf16Window.of", form=form)
         return self
-
-    def verified(self, value: jax.Array) -> jax.Array:
-        """`value`, computed from this window, where its form is this Dew's encoder's: checked at once where
-        the form is concrete (`checked`, which refuses another's), else, the window a traced argument (a
-        jitted step's), NaN wherever it is not, so words another encoder packed, read through this form's
-        decode, give no plausible number (the one boundary every product of a window passes, row 13686)."""
-        if not isinstance(self.form, Tracer):
-            self.checked()
-            return value
-        expected = jnp.asarray(window_form_version())
-        ours = jnp.all(jnp.asarray(self.form).reshape(-1, expected.size) == expected)
-        return jnp.where(ours, value, jnp.asarray(jnp.nan, value.dtype))
 
     def decoded(self, dtype=jnp.bfloat16) -> jax.Array:
         """The matrix `[..., depth, width]` in `dtype`, each weight its stored bits again (a bit operation a

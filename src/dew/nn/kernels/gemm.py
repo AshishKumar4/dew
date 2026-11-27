@@ -365,15 +365,15 @@ def _gemm_refused(group_sizes, *, prologue, gather, scatter, compute, applied, l
 
 def _window_served(lhs, rhs, compute, precision, outputs: tuple):
     """`gemm`'s matrix: a `Bf16Window` whose product (`window_product`: bf16 rows' exact products, fp32 sums
-    none promoted, at the run's precision) is the call's (`templates.product.declared`'s of its `compute`
-    into its `outputs`, its algorithm the run's), else its decoded matrix, `Bf16Window.verified` (13686)."""
+    none promoted, its dot the run's) is the call's (`templates.product.declared`'s of its `compute` into
+    its `outputs`, neither the call nor the run stating an algorithm), else its decoded matrix (13686)."""
     if not isinstance(rhs, Bf16Window):
         return rhs
     computed = jnp.dtype(lhs.dtype if compute is None else compute)
     asked, run = (declared(computed, stated, outputs=outputs) for stated in (precision, None))
     taken = (computed == jnp.dtype(jnp.bfloat16) and not asked.promoted and asked.refusal is None
-             and run.refusal is None and stated_algorithm(precision) in (None, stated_algorithm(None)))
-    return rhs if taken else rhs.verified(rhs.decoded())
+             and run.refusal is None and stated_algorithm(precision) is stated_algorithm(None) is None)
+    return rhs if taken else rhs.decoded()
 
 
 def _packed_gemm(lhs, matrix: NvFp4 | TernaryWeights | Bf16Window, group_sizes, *, epilogue: Hook,
