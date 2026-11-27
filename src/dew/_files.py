@@ -453,9 +453,10 @@ def _keeps_folder_group(parent: Path) -> bool | None:
                 return None
             try:
                 os.chown(probe, -1, others[0])
-            except OSError:
+            except OSError as refused:
                 # A maker whose rights give no other group (root without CAP_CHOWN, or in a namespace
-                # mapping none): no answer read.
+                # mapping none): no answer read, which a commit refuses where it decides a group.
+                logging.getLogger(__name__).info("no group probe of %s: %s", parent, refused)
                 return None
         inner = probe / "inner"
         inner.mkdir()
