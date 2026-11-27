@@ -148,30 +148,55 @@ INDEXER_EPS = 1e-8
 logarithms of the KL."""
 
 
-def indexer_target(query, key, keep, scale: float, *, dtype=None):
-    """The indexer's teacher's unnormalized mass per key, `[B, S, T]` at least fp32 (float64 for float64
-    inputs): the main attention's softmaxes over the keys `keep` allows, summed over its heads, detached as
-    the references detach it (arXiv 2512.02556 eq. 3; MSA's, arXiv 2606.13392 eq. 9). `query` `[B, S, H, D]`
-    and `key` `[B, T, H, D]` are the main heads, `scale` the kernel's logit scale. Heads are summed one at a
-    time to keep the footprint at `[B, S, T]`, rounded once (`compensated_add`): plain sums biased the KL
-    upward, 1.67 times MaxText's error from float64, which sums its heads at once at H times this
-    footprint. It sums in `dtype` where given (at least fp32), its operands' otherwise."""
+def indexer_log_target(query, key, keep, scale: float, *, dtype=None):
+    """The log of the indexer's teacher's unnormalized mass per key, `[B, S, T]` at least fp32 (float64 for
+    float64 inputs): the main attention's softmaxes over the keys `keep` allows, summed over its heads,
+    detached as the references detach it (arXiv 2512.02556 eq. 3; MSA's, arXiv 2606.13392 eq. 9); -inf at a
+    key `keep` hides and at every key of a row that allows none. `query` `[B, S, H, D]` and `key`
+    `[B, T, H, D]` are the main heads, `scale` the kernel's logit scale. Each head's softmax is its logits
+    less their log-sum-exp over the allowed keys alone, a hidden key no logit at all: given the least finite
+    logit, it tied an allowed key at it and took its share (logits of the least finite twice and of 0 and
+    -128 over one hidden key summed to 0.8 and 0.2 where they are 0.75 and 0.25, train 1345's F1). The
+    heads' masses are summed at each key's largest, one head at a time to keep the footprint at `[B, S, T]`,
+    rounded once (`compensated_add`: plain sums biased the KL upward, 1.67 times MaxText's error from
+    float64), so a key whose every head weighs it below fp32's least normal keeps its mass in its logarithm
+    (a mass of e^-110 rounded to 0 before its product with a student's gap of 2^126, 1.44e-10, train
+    1345's F2). It sums in `dtype` where given (at least fp32), its operands' otherwise."""
     wide = at_least_fp32(jnp.result_type(query, key) if dtype is None else dtype)
-    masked = jnp.finfo(wide).min
     batch, length, total = query.shape[0], query.shape[1], key.shape[1]
     keep = jnp.broadcast_to(keep, (batch, length, total))
-    query = jax.lax.stop_gradient(query).astype(wide) * scale
-    key = jax.lax.stop_gradient(key).astype(wide)
+    seen = jnp.any(keep, axis=-1, keepdims=True)
+    query = jnp.moveaxis(jax.lax.stop_gradient(query).astype(wide) * scale, 2, 0)
+    key = jnp.moveaxis(jax.lax.stop_gradient(key).astype(wide), 2, 0)
+
+    def masses(q, k):
+        # A head's log-softmax over the allowed keys, -inf at the others and over a row that allows none.
+        logits = jnp.where(keep, float32_einsum('bsd,btd->bst', q, k), -jnp.inf)
+        peak = jnp.max(logits, axis=-1, keepdims=True)
+        peak = jnp.where(jnp.isfinite(peak), peak, 0)
+        spread = jnp.log(jnp.sum(jnp.exp(logits - peak), axis=-1, keepdims=True))
+        return jnp.where(seen & keep, logits - peak - jnp.where(seen, spread, 0), -jnp.inf)
+
+    def peak_of(peak, projections):
+        return jnp.maximum(peak, masses(*projections)), None
+
+    least = jnp.full((batch, length, total), -jnp.inf, wide)
+    peak, _ = jax.lax.scan(peak_of, least, (query, key))
+    held = jnp.where(jnp.isfinite(peak), peak, 0)
 
     def head(summed, projections):
-        q, k = projections
-        product = float32_einsum('bsd,btd->bst', q, k)
-        probabilities = jax.nn.softmax(jnp.where(keep, product, masked), axis=-1)
-        return compensated_add(summed, (probabilities, jnp.zeros_like(probabilities))), None
+        shared = jnp.exp(masses(*projections) - held)
+        return compensated_add(summed, (shared, jnp.zeros_like(shared))), None
 
     zeros = jnp.zeros((batch, length, total), wide)
-    (high, low), _ = jax.lax.scan(head, (zeros, zeros), (jnp.moveaxis(query, 2, 0), jnp.moveaxis(key, 2, 0)))
-    return high + low
+    (high, low), _ = jax.lax.scan(head, (zeros, zeros), (query, key))
+    return jnp.where(jnp.isfinite(peak), held + jnp.log(high + low), -jnp.inf)
+
+
+def indexer_target(query, key, keep, scale: float, *, dtype=None):
+    """The indexer's teacher's unnormalized mass per key, `[B, S, T]` (`indexer_log_target`'s, taken out of
+    its logarithm): 0 at a key `keep` hides and over a row that allows none."""
+    return jnp.exp(indexer_log_target(query, key, keep, scale, dtype=dtype))
 
 
 def indexer_kl(scores, query, key, keep, scale: float):
@@ -192,7 +217,11 @@ def indexer_kl(scores, query, key, keep, scale: float):
     summed = indexer_target(query, key, keep, scale, dtype=wide)
     keep = jnp.broadcast_to(keep, summed.shape)
     target = summed / (compensated_sum(summed, (summed.ndim - 1,))[..., None] + INDEXER_EPS)
-    indexer = jax.nn.softmax(jnp.where(keep, scores.astype(wide), jnp.finfo(wide).min), axis=-1)
+    # The indexer's softmax over the allowed keys alone, a hidden key no score at all (the least finite score
+    # tied an allowed key's there and took its share, train 1345's F1); a row that allows none takes zeros.
+    seen = jnp.any(keep, axis=-1, keepdims=True)
+    indexer = jnp.where(seen, jax.nn.softmax(
+        jnp.where(seen, jnp.where(keep, scores.astype(wide), -jnp.inf), 0), axis=-1), 0)
     divergence = target * (jnp.log(target + INDEXER_EPS) - jnp.log(indexer + INDEXER_EPS))
     return compensated_sum(divergence, (divergence.ndim - 1,))
 

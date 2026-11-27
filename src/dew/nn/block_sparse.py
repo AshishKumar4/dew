@@ -32,7 +32,7 @@ from dew.nn.inspection import INDEXER_COLLECTION, QK
 from dew.nn.kv_cache import cached_validity
 from dew.nn.mixer_base import MixerContext
 from dew.nn.mixers.attention import AttentionMixer, CausalSelfAttention
-from dew.nn.mla import SELECTIONS, indexer_target
+from dew.nn.mla import SELECTIONS, indexer_log_target
 from dew.nn.precision import at_least_fp32, compensated_sum, float32_einsum
 from dew.nn.residuals import Residual
 from dew.nn.sparse_selection import (
@@ -290,7 +290,7 @@ def msa_query_kls(index_scores: jax.Array, query: jax.Array, key: jax.Array, sel
                   block: int, scale: float) -> jax.Array:
     """MSA's indexer loss per query (arXiv 2606.13392 eqs. 9, 10), `[B, Q]`, as latent attention's indexer
     objective takes it (the objective's `IndexerTraining`): each group's KL of the index branch's softmax over
-    the query's selected tokens from its heads' detached attention there (`mla.indexer_target`: their
+    the query's selected tokens from its heads' detached attention there (`mla.indexer_log_target`: their
     softmaxes summed, normalized), averaged over the groups. Its logarithms are taken whole, no epsilon
     (MaxText's, `mla.indexer_kl`'s, caps a token the branch scores far below the attention's at -log(1e-8)
     and stills its gradient), over the selected tokens alone, a token the teacher gives no mass adding
@@ -303,12 +303,20 @@ def msa_query_kls(index_scores: jax.Array, query: jax.Array, key: jax.Array, sel
     def kl(group: int) -> jax.Array:
         keep = tokens[:, group]
         wide = at_least_fp32(jnp.result_type(index_scores, query, key))
-        summed = jnp.where(keep, indexer_target(query[:, :, group * per:(group + 1) * per],
-                                                jnp.repeat(key[:, :, group:group + 1], per, axis=2), keep,
-                                                scale, dtype=wide), 0)
-        total = compensated_sum(summed, (summed.ndim - 1,))[..., None]
-        target = jnp.where(total > 0, summed / jnp.where(total > 0, total, 1), 0)
-        taken = target > 0
+        # The teacher's mass in its logarithm (`mla.indexer_log_target`), normalized there: a key whose mass
+        # is below fp32's least normal keeps it for its product with the branch's gap below (a teacher of
+        # logits 0 and -110 against scores 0 and -2^126 weighs the second key's gap 1.44e-10, where its
+        # mass rounded to 0 first weighed it nothing, train 1345's F2).
+        logged = jnp.where(keep, indexer_log_target(query[:, :, group * per:(group + 1) * per],
+                                                    jnp.repeat(key[:, :, group:group + 1], per, axis=2), keep,
+                                                    scale, dtype=wide), -jnp.inf)
+        top = jnp.max(logged, axis=-1, keepdims=True)
+        top = jnp.where(jnp.isfinite(top), top, 0)
+        shares = jnp.exp(logged - top)
+        total = compensated_sum(shares, (shares.ndim - 1,))[..., None]
+        log_target = jnp.where(total > 0, logged - top - jnp.log(jnp.where(total > 0, total, 1)), -jnp.inf)
+        taken = jnp.isfinite(log_target)
+        target = jnp.exp(log_target)
         # KL = sum t log t + sum t (m - s) + log sum exp(s - m) over the selected keys alone, m their peak:
         # each gap m - s taken before its weight, none rounded away by a weighted mean, and one past fp32's
         # range weighted first (t m - t s: [fp32's max, its least] at a uniform teacher is fp32's max -
@@ -317,18 +325,19 @@ def msa_query_kls(index_scores: jax.Array, query: jax.Array, key: jax.Array, sel
         peak = jax.lax.stop_gradient(jnp.max(scores, axis=-1, keepdims=True))
         peak = jnp.where(jnp.isfinite(peak), peak, 0)
         spread = jnp.log(jnp.sum(jnp.where(keep, jnp.exp(scores - peak), 0), axis=-1))
-        # Each term at its share of the groups' mean, taken as its product and then divided where the product
-        # holds in fp32 (a teacher's least normal mass at its gap, divided first, went subnormal and flushed),
-        # its gap divided first where the product passes fp32's range, and its peak's and score's shares
-        # apart where the gap itself does: no group's own KL past fp32's range is rounded before the mean.
+        # Each term at its share of the groups' mean, its weight and its gap met in their logarithms where
+        # the gap is finite and positive (the product in range however small the weight, divided by the
+        # groups there), and its peak's and score's shares apart where the gap passes fp32's range: no group's
+        # own KL past fp32's range is rounded before the mean.
         held = jnp.where(taken, scores, 0)
         gap = peak - held
-        product = target * gap
-        gaps = jnp.where(taken, jnp.where(
-            jnp.isfinite(product), product / groups,
-            jnp.where(jnp.isfinite(gap), target * (gap / groups),
-                      target * (peak / groups) - target * (held / groups))), 0)
-        entropy = jnp.where(taken, target * jnp.log(jnp.where(taken, target, 1)) / groups, 0)
+        positive = taken & (gap > 0) & jnp.isfinite(gap)
+        logged_gap = jnp.log(jnp.where(positive, gap, 1))
+        # A gap of 0 (the peak's own key) its product, whose value is 0 and whose derivative is the weight's.
+        gaps = jnp.where(positive, jnp.exp(log_target + logged_gap - jnp.log(jnp.asarray(groups, wide))),
+                         jnp.where(taken & jnp.isfinite(gap), target * (gap / groups),
+                                   jnp.where(taken, target * (peak / groups) - target * (held / groups), 0)))
+        entropy = jnp.where(taken, target * jnp.where(taken, log_target, 0) / groups, 0)
         divergence = compensated_sum(gaps, (gaps.ndim - 1,)) + spread / groups + compensated_sum(
             entropy, (entropy.ndim - 1,))
         return jnp.where(jnp.any(keep, axis=-1), divergence, 0)
@@ -392,7 +401,8 @@ def infllm_attention(query: jax.Array, key: jax.Array, value: jax.Array, *, bloc
                      dense_below: int = INFLLM_DENSE_BELOW, implementation: AttentionImpl = "auto",
                      dtype=None, precision=None, force_fp32_for_softmax: bool = True,
                      wide_logits: bool = False, softcap: float | None = None,
-                     scale_logits: bool = False) -> jax.Array:
+                     scale_logits: bool = False, key_valid: jax.Array | None = None,
+                     sinks: jax.Array | None = None) -> jax.Array:
     """InfLLM-V2's attention (kernel-templates.md §A row 60): a call over fewer than `dense_below` keys the
     plain causal call; a longer one each query's selected blocks (`infllm_selection`: the `top_k` of its
     earlier blocks of `block` by its group's two-window pooled scores, the first `initial` and the `local`
@@ -401,17 +411,32 @@ def infllm_attention(query: jax.Array, key: jax.Array, value: jax.Array, *, bloc
     queries are its keys, its rows and heads whole: the call's arguments past them its numerics alone
     (`dtype`, `precision`, `force_fp32_for_softmax`, `wide_logits`, `softcap`, `scale_logits`), which both
     branches take alike; an operand laid by its rows, heads or places it takes none of, the selected
-    branch folding each group into the batch. The selection takes no gradient."""
+    branch folding each group into the batch. `key_valid` `[B, K]` marks a row's real keys (a right-padded
+    row's), which both branches read alone and whose count is the row's for the cut: a row of fewer real keys
+    than `dense_below` attends densely within a longer call, as its tokens unpadded do. `sinks` (`[H]`, or
+    `[B, Q, H]` a query's own) join both branches' softmaxes. The selection takes no gradient."""
     keys = key.shape[1]
     numerics = {"dtype": dtype, "precision": precision, "force_fp32_for_softmax": force_fp32_for_softmax,
-                "wide_logits": wide_logits, "softcap": softcap, "scale_logits": scale_logits}
-    if keys < dense_below:
+                "wide_logits": wide_logits, "softcap": softcap, "scale_logits": scale_logits, "sinks": sinks,
+                "key_valid": key_valid}
+
+    def dense():
         return scaled_dot_product_attention(query, key, value, causal=True, implementation=implementation,
                                             **numerics)
+
+    if keys < dense_below:
+        return dense()
     selected = infllm_selection(query, key, block=block, top_k=top_k, kernel=kernel, stride=stride,
                                 initial=initial, local=local)
-    return selected_attention(query, key, value, selected, block_runs(keys, block),
-                              implementation=implementation, **numerics)
+    sparse = selected_attention(query, key, value, selected, block_runs(keys, block),
+                                implementation=implementation, **numerics)
+    if key_valid is None:
+        return sparse
+    # A row of fewer real keys than the cut attends densely, its branch its real keys' (train 1345's F3);
+    # the dense call runs where some row is such alone.
+    short = jnp.sum(jnp.broadcast_to(key_valid, (key.shape[0], keys)), axis=-1) < dense_below
+    return jax.lax.cond(jnp.any(short), lambda: jnp.where(short[:, None, None, None], dense(), sparse),
+                        lambda: sparse)
 
 
 def masked_selection(mask: jax.Array, block_q: int, *, queries: int, most: int) -> jax.Array:
@@ -448,8 +473,9 @@ class BlockSparseSelfAttention(CausalSelfAttention):
         their documents and validity; a cached call's its cache's filled slots (`cached_validity`), its
         queries at the slots they were written to. The kernel reads the call's real keys alone, so a chunk
         whose run spans a key the call hides reads none of it. The gate's selection is sown (`SELECTIONS`)
-        for a caller that opens the collection: its scores, the windows each query may take, its budget."""
-        del positions, sinks, train
+        for a caller that opens the collection: its scores, the windows each query may take, its budget.
+        `sinks` (a head's, or a query's own projected) join each query's softmax over its selection."""
+        del positions, train
         query, key, value = masking.query, masking.key, masking.value
         rows, keys = key.shape[:2]
         groups = masking.groups
@@ -463,7 +489,7 @@ class BlockSparseSelfAttention(CausalSelfAttention):
             raise ValueError(f"{self.name}: QK-Clip's logit maxima are a dense call's, which block-selected "
                              "attention forms none of")
         if self.selection == "infllm":
-            return checkpoint_name(self._infllm(query, key, value, masking, append), Residual.CONTEXT)
+            return checkpoint_name(self._infllm(query, key, value, masking, append, sinks), Residual.CONTEXT)
         if self.selection == "msa":
             return checkpoint_name(self._msa(query, key, value, masking, append, hidden), Residual.CONTEXT)
         if append is None:
@@ -486,7 +512,7 @@ class BlockSparseSelfAttention(CausalSelfAttention):
         selected = moba_selection(gate, keep, self.top_k)
         return checkpoint_name(selected_attention(
             query, key, value, selected, window_runs(chunks.windows), own=chunks.own, slots=slots,
-            key_valid=valid, dtype=self.ctx.dtype,
+            key_valid=valid, sinks=sinks, dtype=self.ctx.dtype,
             precision=self.ctx.precision, force_fp32_for_softmax=self.ctx.force_fp32_for_softmax,
             wide_logits=self.ctx.wide_logits, softcap=self.ctx.attn_logit_softcap), Residual.CONTEXT)
 
@@ -497,16 +523,19 @@ class BlockSparseSelfAttention(CausalSelfAttention):
         # the same real tokens unpadded.
         return self.selection != "infllm" and super()._causal_implies_right_padding(metadata, causal)
 
-    def _infllm(self, query, key, value, masking, append):
+    def _infllm(self, query, key, value, masking, append, sinks):
         """InfLLM-V2's attention over the call's own tokens (`infllm_attention`: dense below its cut, its
-        selected blocks of `block`, `top_k` of them, past it), a row one document of every token real: a
-        packed row's documents, a row's hidden tokens (trailing padding among them, which would move its
-        dense cut, `_causal_implies_right_padding`) or a cache's slots it refuses."""
-        if append is not None or masking.documents is not None or masking.valid is not None:
-            raise ValueError(f"{self.name}: InfLLM-V2's selection reads a row of one document's real tokens, "
-                             "its own: no cache, packed documents or hidden token")
+        selected blocks of `block`, `top_k` of them, past it), a row one document: its hidden tokens (a
+        right-padded row's, `_causal_implies_right_padding`) it reads as such, its cut taken at its real
+        keys' count; a packed row's documents or a cache's slots it refuses. `sinks` join both branches."""
+        if append is not None or masking.documents is not None:
+            raise ValueError(f"{self.name}: InfLLM-V2's selection reads a row of one document's tokens, its "
+                             "own: no cache or packed documents")
+        valid = (None if masking.valid is None
+                 else jnp.broadcast_to(jnp.asarray(masking.valid, bool), key.shape[:2]))
         return infllm_attention(query, key, value, block=self.block, top_k=self.top_k,
-                                dense_below=self.dense_below, dtype=self.ctx.dtype,
+                                dense_below=self.dense_below, key_valid=valid, sinks=sinks,
+                                dtype=self.ctx.dtype,
                                 precision=self.ctx.precision,
                                 force_fp32_for_softmax=self.ctx.force_fp32_for_softmax,
                                 wide_logits=self.ctx.wide_logits, softcap=self.ctx.attn_logit_softcap)
@@ -597,17 +626,19 @@ class BlockSparseAttentionMixer(AttentionMixer):
         if self.selection == "msa" and ctx.attn_logit_softcap is not None:
             raise ValueError("MSA's indexer loss takes its heads' plain softmax as its target, which a logit "
                              "softcap would part from the attention it trains toward")
+        if self.selection == "msa" and (ctx.attention_sinks or self.projected_sinks):
+            raise ValueError("MSA's indexer loss takes its heads' plain softmax as its target, which sinks "
+                             "would part from the attention it trains toward")
         if self.block < 1 or self.top_k < 1:
             raise ValueError(f"block_sparse_attention takes a positive block and top_k, got {self.block} and "
                              f"{self.top_k}")
         if self.alibi or self.bidirectional_images or self.bidirectional_blocks:
             raise ValueError("block_sparse_attention adds no ALiBi bias and reads no image or block whole")
         ctx.refuse("block_sparse_attention", {
-            "attention_sinks": ctx.attention_sinks, "attention_dropout_rate": ctx.attention_dropout_rate,
+            "attention_dropout_rate": ctx.attention_dropout_rate,
             "sliding_window": ctx.sliding_window, "attention_chunk": ctx.attention_chunk,
             "kv_shared": ctx.kv_shared,
-        }, "each query head's selection is a row of its call, whose sinks and dropout are a head's "
-           "across rows, and it reads its document's blocks from their start, no window, chunk or other "
-           "layer's keys")
+        }, "each query head's selection is a row of its call, whose dropout draws a head's across rows, "
+           "and it reads its document's blocks from their start, no window, chunk or other layer's keys")
         kind = {field.name: getattr(self, field.name) for field in dataclasses.fields(self)}
         return functools.partial(BlockSparseSelfAttention, ctx=ctx, **kind)

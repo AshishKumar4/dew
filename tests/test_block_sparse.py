@@ -23,7 +23,7 @@ from dew.batch import coordinates
 from dew.nn import block_sparse, sparse_selection
 from dew.nn.attention import scaled_dot_product_attention
 from dew.nn.inspection import INDEXER_COLLECTION
-from dew.nn.mla import SELECTIONS
+from dew.nn.mla import SELECTIONS, indexer_target
 from dew.registry import mixers
 
 SEEDS = 8
@@ -408,9 +408,35 @@ def test_msas_indexer_loss_holds_a_token_its_branch_scores_far_below_the_attenti
     mass = np.exp(-87.0) / (1 + np.exp(-87.0))
     terms = np.asarray([(1 - mass) * np.log1p(-mass), mass * np.log(mass), mass * 2.0**126]) / 2
     assert_fp32_reduction_bound(np.asarray(found)[0, 1], terms.sum(), np.abs(terms).sum(), len(terms) + 2)
+    # A teacher's mass of e^-110, below fp32's least subnormal, at the same gap: its term 1.44e-10, a normal
+    # fp32, met with the gap in their logarithms, where the mass rounded to 0 first held nothing (train 1345's
+    # F2).
+    farther = jnp.zeros((1, 2, 2, 1), jnp.float32).at[0, 1, 0, 0].set(-110.0)
+    found = block_sparse.msa_query_kls(gapped, rare, farther, jnp.zeros((1, 2, 2, 1), jnp.int32), block=2,
+                                       scale=1.0)
+    mass = np.exp(-110.0) / (1 + np.exp(-110.0))
+    terms = np.asarray([(1 - mass) * np.log1p(-mass), mass * np.log(mass), mass * 2.0**126]) / 2
+    assert_fp32_reduction_bound(np.asarray(found)[0, 1], terms.sum(), np.abs(terms).sum(), len(terms) + 2)
     # The first query selects its own token alone (the second is past it), scored fp32's least.
     hidden = jnp.asarray([[[[-largest, 0.0], [0.0, 0.0]]]], jnp.float32)
     assert np.asarray(loss(hidden))[0, 0] == 0.0
+
+
+def test_the_indexer_teacher_gives_a_hidden_key_no_share_of_a_heads_mass():
+    """The indexer's teacher (`mla.indexer_target`, MSA's and the lightning indexers'): each head's softmax
+    over the keys its call allows alone. Two fp32 heads over two allowed keys and a hidden one, the first
+    head's allowed logits fp32's least both, the second's 0 and -128: the heads' masses 1.5 and 0.5 within
+    fp32's rounding, the hidden key none, where a hidden key given fp32's least logit tied the first head's
+    and took a third of it (4/3 and 1/3, train 1345's F1); a row that allows no key, none."""
+    least = float(np.finfo(np.float32).min)
+    query = jnp.ones((1, 2, 2, 1), jnp.float32)
+    key = jnp.asarray([[[[least], [0.0]], [[least], [-128.0]], [[least], [0.0]]]], jnp.float32)
+    keep = jnp.asarray([[[True, True, False], [False, False, False]]])
+    target = np.asarray(indexer_target(query, key, keep, 1.0))
+    for found, exact in ((target[0, 0, 0], 1.5), (target[0, 0, 1], 0.5)):
+        assert_fp32_reduction_bound(found, exact, exact, 8)
+    np.testing.assert_array_equal(target[0, 0, 2], 0.0)
+    np.testing.assert_array_equal(target[0, 1], np.zeros(3, np.float32))
 
 
 def test_msas_selection_keeps_its_slots_and_forces_each_block_once_within_reach():
@@ -443,7 +469,7 @@ def test_infllm_attention_past_its_cut_over_every_block_is_on_par_with_the_dense
     """InfLLM-V2's attention past its dense cut whose selection takes every block a query sees (its top as
     many as the blocks) reads every key the dense causal call reads: its output and gradients are on par
     with that call's (check 1), the two branches one function at the cut. An operand laid by the call's
-    heads, rows or places (a sink, query slots, key runs) is no argument of either branch."""
+    places (query slots, key runs) is no argument of either branch."""
     rows, queries, heads, groups, width = 1, 128, 8, 2, 32
     shape = {"block": 16, "top_k": queries // 16, "kernel": 8, "stride": 4}
     draw = _drawn(rows, queries, heads, groups, width)
@@ -457,12 +483,67 @@ def test_infllm_attention_past_its_cut_over_every_block_is_on_par_with_the_dense
     assert_as_exact(jax.jit(with_gradients(selected)), jax.jit(with_gradients(dense)), draw,
                     "InfLLM-V2's attention over every block", seeds=SEEDS)
     query, key, value, _ = draw(0)
-    laid = {"sinks": jnp.zeros((heads,)), "query_slots": jnp.zeros((rows, queries), jnp.int32),
+    laid = {"query_slots": jnp.zeros((rows, queries), jnp.int32),
             "key_runs": jnp.zeros((rows, queries, 1, 2), jnp.int32)}
     for dense_below, (name, operand) in itertools.product((queries + 1, queries), laid.items()):
         with pytest.raises(TypeError):
             block_sparse.infllm_attention(query, key, value, dense_below=dense_below, **{name: operand},
                                           **shape)
+
+
+def test_infllm_attention_takes_each_rows_cut_at_its_real_keys():
+    """InfLLM-V2's attention over right-padded rows (`key_valid`) past its cut by the call's 80 keys: a row of
+    60 real keys, below the cut of 64, attends densely as its 60 tokens do alone, and a row of 80 by its
+    selection as its tokens do unpadded, its output and gradients on par with theirs (check 1), each row's
+    real queries; a head's sinks join both branches (train 1345's F3 and F4)."""
+    rows, queries, heads, groups, width = 2, 80, 4, 2, 32
+    shape = {"block": 16, "top_k": 1, "kernel": 8, "stride": 4, "dense_below": 64}
+    real = 60
+    valid = jnp.arange(queries)[None, :] < jnp.asarray([[real], [queries]])
+    sinks = jnp.asarray([0.5, -1.0, 2.0, 0.0], jnp.float32)
+    draw = _drawn(rows, queries, heads, groups, width)
+
+    def ours(query, key, value):
+        out = block_sparse.infllm_attention(query, key, value, key_valid=valid, sinks=sinks, **shape)
+        return out[0, :real], out[1]
+
+    def alone(query, key, value):
+        short = block_sparse.infllm_attention(query[:1, :real], key[:1, :real], value[:1, :real], sinks=sinks,
+                                              implementation="xla", **shape)
+        long = block_sparse.infllm_attention(query[1:], key[1:], value[1:], sinks=sinks,
+                                             implementation="xla", **shape)
+        return short[0], long[0]
+
+    assert_as_exact(jax.jit(with_gradients(ours)), jax.jit(with_gradients(alone)), draw,
+                    "InfLLM-V2's cut at each row's real keys", seeds=SEEDS)
+
+
+@pytest.mark.parametrize("selection", ["moba", "infllm"])
+@pytest.mark.parametrize("sinks", ["attention_sinks", "projected_sinks"])
+def test_a_block_sparse_decoders_sinks_reach_its_softmax(selection, sinks):
+    """A decoder of block-selected attention with sinks (a head's learned, or a query's own projected from
+    its input) reads them in its softmax: its logits move with them (train 1345's F4: they were dropped)."""
+    options = {"projected_sinks": True} if sinks == "projected_sinks" else {}
+    mixer = mixers.build("block_sparse_attention", selection=selection, block=16, top_k=1, dense_below=16,
+                         **options)
+    model = tiny(mixer=mixer, dtype="float32", **({"attention_sinks": True} if not options else {}))
+    tokens = jax.random.randint(jax.random.key(0), (1, 32), 0, VOCAB)
+    params = model.init(jax.random.key(1), tokens)
+    moved = jax.tree_util.tree_map_with_path(
+        lambda path, leaf: leaf + 3.0 if "sink" in jax.tree_util.keystr(path) else leaf, params)
+    assert not np.array_equal(np.asarray(model.apply(params, tokens)), np.asarray(model.apply(moved, tokens)))
+
+
+@pytest.mark.parametrize("sinks", ["attention_sinks", "projected_sinks"])
+def test_an_msa_decoder_refuses_sinks(sinks):
+    """An MSA decoder with sinks is refused at build: its indexer's loss targets its heads' plain softmax
+    (`msa_query_kls`), which the sinks' would part from."""
+    options = {"projected_sinks": True} if sinks == "projected_sinks" else {}
+    mixer = mixers.build("block_sparse_attention", selection="msa", block=4, top_k=1, index_width=8,
+                         **options)
+    with pytest.raises(ValueError):
+        tiny(mixer=mixer, **({"attention_sinks": True} if not options else {})).init(
+            jax.random.key(1), jnp.zeros((1, 16), jnp.int32))
 
 
 def test_nsa_attention_holds_check_1_against_its_branches_written_out():
@@ -523,8 +604,9 @@ def test_an_infllm_decoder_below_its_cut_is_the_dense_decoder():
     `selection="infllm"`) over a row shorter than the selection's dense cut (8192 keys) attends densely:
     its logits are the same model's under causal attention's mixer, its parameters the same, bit for bit
     (`infllm_attention`'s dense branch is the plain causal call). Past its cut the mixer runs its selected
-    branch, which reads fewer keys than the dense decoder; a block no 16 places divide it refuses, and a
-    right-padded row, whose padding would move its dense cut."""
+    branch, which reads fewer keys than the dense decoder; a block no 16 places divide it refuses. A
+    right-padded row (`training.md`'s) it takes, its real queries' logits bitwise as they were whatever token
+    its padding holds (train 1345's F3: it was refused)."""
     infllm = tiny(mixer=mixers.build("block_sparse_attention", selection="infllm", block=16, top_k=2),
                   dtype="float32")
     dense = tiny(mixer=mixers.build("attention"), dtype="float32")
@@ -542,8 +624,10 @@ def test_an_infllm_decoder_below_its_cut_is_the_dense_decoder():
         tiny(mixer=mixers.build("block_sparse_attention", selection="infllm", block=4)).init(
             jax.random.key(1), tokens)
     padded = jnp.ones(tokens.shape, bool).at[:, -1].set(False)
-    with pytest.raises(ValueError):
-        sparse.apply(params, tokens, coordinates=coordinates(valid=padded, right_padded=True))
+    forward = jax.jit(lambda row: sparse.apply(params, row, coordinates=coordinates(valid=padded,
+                                                                                    right_padded=True)))
+    changed = tokens.at[:, -1].set((tokens[:, -1] + 5) % VOCAB)
+    np.testing.assert_array_equal(np.asarray(forward(tokens))[:, :-1], np.asarray(forward(changed))[:, :-1])
 
 
 def test_an_msa_decoder_selects_by_its_index_branch_and_trains_it_by_its_own_loss_alone():
