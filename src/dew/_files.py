@@ -251,8 +251,9 @@ def swapped(directory: Path, foreign: Callable[[Entries, Entries, Path], set[Pat
     # A new tree's mode read before anything is written: a probe once the write is done could find no
     # inode left.
     made = _made_mode(directory.parent)
-    # The parent as the staging is made in it, whose group policy the staging's own group follows.
-    parent_before = directory.parent.stat()
+    # Whether the folder the staging's entries take their group from as they are made (the tree it
+    # replaces, or its parent) is setgid as it is made.
+    setgid_before = (before or directory.parent.stat()).st_mode & stat.S_ISGID
     staging = _beside(directory, ".staging")
     os.mkdir(staging, 0o700)
     try:
@@ -278,7 +279,7 @@ def swapped(directory: Path, foreign: Callable[[Entries, Entries, Path], set[Pat
             # The groups and access the published tree takes, bound under the lock to what the destination
             # is now (audit 2026-11-27 P05: a publisher that began before another's commit, or against no
             # tree, chose them from another view), while the staging is still private.
-            mode = _granted(staging, directory, held_at, before is not None, made, parent_before, written,
+            mode = _granted(staging, directory, held_at, before is not None, made, setgid_before, written,
                             replaces(written, held))
             if held_at is None:
                 staging.chmod(mode)
@@ -347,7 +348,7 @@ def _removed_in(folder: int, name: str, log: logging.Logger) -> None:
 
 
 def _granted(staging: Path, directory: Path, held_at: os.stat_result | None, held_before: bool, made: int,
-             parent_before: os.stat_result, written: Entries, replacements: Replacements) -> int:
+             setgid_before: int, written: Entries, replacements: Replacements) -> int:
     """Give each entry of `staging` the group and access the tree published from it takes at `directory`,
     as the destination is now, and return the mode its root takes, which its caller sets last.
 
@@ -381,18 +382,18 @@ def _granted(staging: Path, directory: Path, held_at: os.stat_result | None, hel
             # refused rather than published in the group of a tree no longer there (theme 72's review).
             raise FileExistsError(f"{directory} was removed while this save was written, whose files took "
                                   "its group: save again")
-        if parent_before.st_mode & stat.S_ISGID and not setgid:
-            # The staging took the setgid parent's group, which a folder made there now takes no longer,
-            # and which group it does take (the publisher's, or the parent's on a `grpid` mount) no stat
-            # says: refused rather than published in a group the parent no longer gives (theme 72's
-            # review).
-            raise PermissionError(f"{directory.parent} cleared its setgid bit while {directory.name} was "
-                                  "written, whose files took its group: save again")
         # A setgid parent's group; else the one the kernel gave the staging made there (the parent's on a
         # `grpid` mount, this process's otherwise), kept (train 1423's review).
         root = (parent.st_gid if setgid else None, (made & ~stat.S_ISGID) | setgid)
     else:
         root = (held_at.st_gid, stat.S_IMODE(held_at.st_mode))
+    if setgid_before and not root[1] & stat.S_ISGID:
+        # The staging's entries took a setgid folder's group as they were made, which the folder they
+        # publish into gives no longer, and which group its new entries take instead (the publisher's, or
+        # the folder's on a `grpid` mount) no stat says: refused rather than published in a group no
+        # longer given (theme 72's review).
+        raise PermissionError(f"{directory} or its parent cleared its setgid bit while this save was "
+                              "written, whose files took its group: save again")
     _grouped(staging, root[0])
     # Each folder's group and setgid bit as published, its entries following it (a folder before them).
     placed = {Path(): (staging.lstat().st_gid, root[1] & stat.S_ISGID)}
