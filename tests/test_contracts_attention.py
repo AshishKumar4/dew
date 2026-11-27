@@ -84,7 +84,7 @@ order sets, none held per case."""
 
 
 @pytest.mark.parametrize(("implementation", "edge", "taken"),
-                         list(itertools.product(("template", "tpu"), EDGES, ORDER_SETS)))
+                         list(itertools.product(FUSED, EDGES, ORDER_SETS)))
 def test_a_fused_attention_kernel_holds_every_order(implementation, edge, taken):
     """The template's route (`attention_route._attend`) and splash (`splash._attention`, interpreted off a
     TPU), each differentiated at every order (`generation.linear_tangent`, row 2654): every order runs
