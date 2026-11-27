@@ -136,6 +136,9 @@ class Lane:
     clamped: bool = False
     """Whether its log decays are clamped at its floor before their prefix is summed (`mainloop.Call.clamped`,
     `recurrence_witness.Exponents.of`)."""
+    tanh_reach: int = 0
+    """`tanh`'s reach: the most steps of the fp32 grid its result lies from its correctly rounded value
+    (`tanh_reach`), a capped score's (Gemma 2's cap, `template.Capped`)."""
     tf32: Literal["plain", "rna", "read"] = "read"
     """How a one-part fp32 operand reaches its product (`operand`), the issuer's: 'plain', as itself (an
     interpreted product, a plain fp32 dot: mosaic_sm80.py's and mosaic_sm90.py's interpreted branches);
@@ -286,6 +289,42 @@ def exp2(x: Iv, lane: Lane) -> Iv:
     for _ in range(lane.reach):
         lo, hi = stepped(lo, FLOAT32, -np.inf), stepped(hi, FLOAT32, np.inf)
     return Iv(np.where(lo < 2.0 ** FLOAT32.emin, 0.0, lo), hi)
+
+
+def tanh_rounding(x) -> tuple[np.ndarray, np.ndarray]:
+    """The fp32 values tanh of each fp32 `x` rounds to nearest within: tanh in float64 (libm's, within a few
+    of its last bits) widened by 2^-40 of itself, far past those bits and far inside fp32's, and taken to
+    the fp32 grid below and above, so the correctly rounded fp32 tanh is one of the two."""
+    exact = np.tanh(np.asarray(x, np.float64))
+    slack = np.abs(exact) * 2.0 ** -40 + 2.0 ** -1074
+    return below(exact - slack, FLOAT32), above(exact + slack, FLOAT32)
+
+
+def tanh(x: Iv, lane: Lane) -> Iv:
+    """`tanh` of an fp32 value within `x`: within `lane.tanh_reach` steps of the fp32 grid of its correctly
+    rounded value (`tanh_rounding`), at the least and greatest fp32 operands within `x` (tanh and rounding to
+    nearest are monotone), never past ±1."""
+    lo = tanh_rounding(above(x.lo, FLOAT32))[0]
+    hi = tanh_rounding(below(x.hi, FLOAT32))[1]
+    for _ in range(lane.tanh_reach):
+        lo, hi = stepped(lo, FLOAT32, -np.inf), stepped(hi, FLOAT32, np.inf)
+    return Iv(np.maximum(lo, -1.0), np.minimum(hi, 1.0))
+
+
+def tanh_reach(native, low: float = -12.0, high: float = 12.0) -> int:
+    """The most steps of the fp32 grid `native(x)`, an fp32 `tanh` of fp32 operands, lies from tanh(x)
+    correctly rounded (`tanh_rounding`'s nearer end), over (`low`, `high`), the operands a capped score
+    takes (its products times scale over the cap) and past where tanh is ±1 in fp32: 2^17 of them, densely
+    and drawn, zero among them. In a GPU tier's prepare, whose arms compute nothing (`exp2_reach`'s), none."""
+    rng = np.random.default_rng(1402)
+    x = np.concatenate([np.linspace(low, high, 1 << 16, dtype=np.float32), np.zeros(1, np.float32),
+                        rng.uniform(low, high, (1 << 16) - 1).astype(np.float32)])
+    found = np.asarray(native(x), np.float64)
+    if tier_wire.preparing():
+        return 0
+    lower, upper = tanh_rounding(x)
+    below_by, above_by = grid_index(lower) - grid_index(found), grid_index(found) - grid_index(upper)
+    return int(np.max(np.maximum(np.maximum(below_by, above_by), 0)))
 
 
 def operand(iv: Iv, lane: Lane, parts: int = 1) -> Iv:

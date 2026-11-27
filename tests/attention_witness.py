@@ -24,11 +24,27 @@ enclosure grows across the walk; a bias below one step's enclosure is not visibl
 A query row's tiles past its last kept key are walked with nothing kept, which leaves its state bit for bit;
 the witness holds a row's states up to the last tile it keeps a key of, and its output from there."""
 
+import dataclasses
 import functools
 
 import attention_oracle
 import numpy as np
-from interval_certificates import Iv, Lane, add, cast, dot, exp2, exp2_reach, fp32, hull, mul, point, within
+from interval_certificates import (
+    Iv,
+    Lane,
+    add,
+    cast,
+    dot,
+    exp2,
+    exp2_reach,
+    fp32,
+    hull,
+    mul,
+    point,
+    tanh,
+    tanh_reach,
+    within,
+)
 from op_certificates import BFLOAT16, FLOAT32, nearest, stepped
 
 from dew.nn.kernels.templates import attention as template, attention_mosaic
@@ -50,7 +66,7 @@ def attention_lane() -> Lane:
     from certified import lane
 
     reach = exp2_reach(lambda x: jax.jit(jnp.exp2)(jnp.asarray(x)), low=-126.0, high=0.0)
-    return Lane(reach, lane().flushes, 0)
+    return Lane(reach, lane().flushes, 0, tanh_reach=tanh_reach(lambda x: jax.jit(jnp.tanh)(jnp.asarray(x))))
 
 
 def summed(p: Iv, lane: Lane) -> Iv:
@@ -64,18 +80,27 @@ def summed(p: Iv, lane: Lane) -> Iv:
     return fp32(Iv(p.lo.sum(-1) - slack, p.hi.sum(-1) + slack), lane)
 
 
-def step(m_before, l_before, acc_before, q, keys, values, kept, factor: float, m_after, lane: Lane) -> dict:
+def step(m_before, l_before, acc_before, q, keys, values, kept, factor: float, m_after, lane: Lane,
+         capped: tuple[float, float] | None = None) -> dict:
     """One plain step's enclosures of a query block's rows over a key tile: `m`, `l` and `acc` after it, from
     the stored state before it (`m_before` -inf on a first tile) and the stored maximum after it, which the
-    weights and the factor read (each state is held from the stored ones)."""
+    weights and the factor read (each state is held from the stored ones). Under a cap (`capped`, its two
+    folded constants, `capped_constants`), the logits are the products times the first rounded, their tanh,
+    times the second (`attention_algebra.logits_of`'s base-2 cap), and the tile's maximum is theirs."""
     products = dot(point(q), point(keys.T), lane)
-    products = Iv(np.where(kept, products.lo, -np.inf), np.where(kept, products.hi, -np.inf))
-    peak = fp32(mul(Iv(products.lo.max(-1), products.hi.max(-1)), point(factor)), lane)
+    if capped is None:
+        products = Iv(np.where(kept, products.lo, -np.inf), np.where(kept, products.hi, -np.inf))
+        peak = fp32(mul(Iv(products.lo.max(-1), products.hi.max(-1)), point(factor)), lane)
+        logits = mul(products, point(factor))
+    else:
+        inner, outer = capped
+        logits = mul(tanh(fp32(mul(products, point(inner)), lane), lane), point(outer))
+        logits = Iv(np.where(kept, logits.lo, -np.inf), np.where(kept, logits.hi, -np.inf))
+        peak = fp32(Iv(logits.lo.max(-1), logits.hi.max(-1)), lane)
     maximum = Iv(np.maximum(m_before, peak.lo), np.maximum(m_before, peak.hi))
     first = np.isneginf(m_before)
     alpha = exp2(fp32(point(np.where(first, 0.0, m_before - m_after)), lane), lane)
     alpha = Iv(np.where(first, 0.0, alpha.lo), np.where(first, 0.0, alpha.hi))
-    logits = mul(products, point(factor))
     # The multiply and the subtraction: one FMA, or the product rounded first.
     exponents = hull(fp32(add(logits, point(-m_after[:, None])), lane),
                      fp32(add(fp32(logits, lane), point(-m_after[:, None])), lane))
@@ -99,16 +124,17 @@ def finished(acc, total, fmt) -> Iv:
     return cast(Iv(np.where(quotient == 0, 0.0, lo), np.where(quotient == 0, 0.0, hi)), fmt)
 
 
-def witnessed(query, key, value, kept, records: dict, *,
-              lane: Lane | None = None) -> dict[str, tuple[np.ndarray, ...]]:
+def witnessed(query, key, value, kept, records: dict, *, lane: Lane | None = None,
+              capped: tuple[float, float] | None = None) -> dict[str, tuple[np.ndarray, ...]]:
     """Each stored state and the output of a certify launch's `records` (`launched`) over `query`, `key` and
     `value` (`[B, S, H, D]`, bf16), held to their enclosures under the mask `kept` (`[B or 1, 1, Q, K]`,
-    `attention_oracle.kept`'s): for each record, the entries held and those inside."""
+    `attention_oracle.kept`'s), under a cap's constants where `capped` (`capped_constants`): for each record,
+    the entries held and those inside."""
     lane = attention_lane() if lane is None else lane
     q, k, v = (np.asarray(np.asarray(x, np.float32), np.float64) for x in (query, key, value))
     count, width = records["m"].shape[2], records["tile"]
     factor = walk_factor(q.shape[3])
-    lane = Lane(lane.reach, lane.flushes, width)
+    lane = dataclasses.replace(lane, block=width)
     held = {name: [] for name in ("m", "l", "acc", "out")}
     for b in range(q.shape[0]):
         keeps = np.broadcast_to(kept, (q.shape[0], 1, *kept.shape[2:]))[b, 0]
@@ -125,7 +151,7 @@ def witnessed(query, key, value, kept, records: dict, *,
                 kv = h * k.shape[2] // q.shape[2]
                 m_after = records["m"][b, h, j]
                 found = step(m_before, l_before, acc_before, q[b, :, h], k[b, at, kv], v[b, at, kv],
-                             tile_kept, factor, m_after, lane)
+                             tile_kept, factor, m_after, lane, capped)
                 for name in ("m", "l", "acc"):
                     stored = records[name][b, h, j]
                     rows = walked if name != "acc" else walked[:, None] & np.ones(stored.shape, bool)
@@ -140,13 +166,13 @@ def witnessed(query, key, value, kept, records: dict, *,
                    np.concatenate([inside.ravel() for _, inside in found])) for name, found in held.items()}
 
 
-def certified(query, key, value, spans):
+def certified(query, key, value, spans, hooks=None):
     """The interpreted certify launch's tiles and records (`attention_mosaic.certified`) at a Hopper's tiles,
     the target an interpreted launch derives its config for (`generation.assumed`)."""
     from dew.nn.kernels import generation
 
     with generation.assumed("sm90"):
-        return attention_mosaic.certified(query, key, value, spans, interpret=True)
+        return attention_mosaic.certified(query, key, value, spans, hooks, interpret=True)
 
 
 SHAPE = (1, 512, 2, 64)
@@ -156,10 +182,33 @@ this length, so a fault in the rescale has a second step to break."""
 FORMS = {"full": {}, "causal": {"causal": True},
          "window": {"causal": True, "sliding_window": 192},
          "documents": {"causal": True,
-                       "segment_ids": np.repeat(np.arange(1, 4, dtype=np.int32), (160, 224, 128))[None]}}
+                       "segment_ids": np.repeat(np.arange(1, 4, dtype=np.int32), (160, 224, 128))[None]},
+         "capped": {"causal": True}}
 """Each witnessed form, its mask as `template.spans` and `attention_oracle.kept` both take it: full, causal, a
-causal window of 192 keys (each query's tiles partly walked), and three causal documents packed into the
-call, their bounds off the key tiles."""
+causal window of 192 keys (each query's tiles partly walked), three causal documents packed into the call,
+their bounds off the key tiles, and a causal call under a cap (`CAPS`)."""
+
+CAPS = {"capped": 2.0}
+"""A form's logit cap (Gemma 2's, `template.Capped`), low enough that the witnessed draws' scaled logits
+(their keys doubled) reach its bend."""
+
+
+def hooks_of(form: str):
+    """The witnessed call's hooks under `form`: its cap as a score hook where it has one (`CAPS`)."""
+    from dew.nn.kernels.templates.hooks import Hook
+
+    return None if form not in CAPS else template.Hooks(score=Hook(template.Capped(CAPS[form])))
+
+
+def capped_constants(form: str, width: int) -> tuple[float, float] | None:
+    """The two fp32 constants a base-2 walk folds a cap into (`attention_algebra.logits_of`): the logit
+    scale over the cap, `fp32(scale * fp32(1 / cap))`, before the tanh, and `fp32(cap) * fp32(log2(e))` after
+    it; None for an uncapped form."""
+    if form not in CAPS:
+        return None
+    capped = template.Capped(CAPS[form])
+    inner = float(np.float32(attention_mosaic.logit_scale(width, None) * capped.reciprocal))
+    return inner, float(np.float32(capped.softcap) * np.float32(LOG2E))
 
 
 def mask_of(form: str):
@@ -201,12 +250,13 @@ def _certified_native(query, key, value, *, form: str, site: str):
 
     abstract_spans = jax.eval_shape(lambda: spans_of(form, query.shape[0]))
     declined = attention_mosaic.forward_declined(
-        *(jax.ShapeDtypeStruct(x.shape, x.dtype) for x in (query, key, value)), abstract_spans)
+        *(jax.ShapeDtypeStruct(x.shape, x.dtype) for x in (query, key, value)), abstract_spans,
+        hooks_of(form))
     if declined is not None:
         pytest.skip(f"the Mosaic mainloop declines the witnessed call here: {declined}")
 
     def program(q, k, v):
-        tiles, result = attention_mosaic.certified(q, k, v, spans_of(form, q.shape[0]))
+        tiles, result = attention_mosaic.certified(q, k, v, spans_of(form, q.shape[0]), hooks_of(form))
         return jnp.asarray(tiles.block_k, jnp.int32), result
 
     shapes = ", ".join(f"{np.dtype(x.dtype).name}{list(np.shape(x))}" for x in (query, key, value))
@@ -221,7 +271,8 @@ def launched(query, key, value, form: str, *, interpret: bool, site: str = "witn
     if not interpret:
         block_k, (out, rows, sums) = _certified_native(query, key, value, form=form, site=site)
     else:
-        tiles, (out, rows, sums) = certified(query, key, value, spans_of(form, query.shape[0]))
+        spans = spans_of(form, query.shape[0])
+        tiles, (out, rows, sums) = certified(query, key, value, spans, hooks_of(form))
         block_k = tiles.block_k
     return {"out": np.asarray(out, np.float64), "m": np.asarray(rows[0], np.float64),
             "l": np.asarray(rows[1], np.float64), "acc": np.asarray(sums, np.float64), "tile": block_k}
@@ -242,7 +293,7 @@ def assert_witnessed(seed: int, form: str, *, interpret: bool, lane: Lane | None
     records = launched(q, k, v, form, interpret=interpret)
     if not interpret and tier_wire.preparing():
         return
-    found = witnessed(q, k, v, mask_of(form), records, lane=lane)
+    found = witnessed(q, k, v, mask_of(form), records, lane=lane, capped=capped_constants(form, SHAPE[3]))
     for name, (rows, inside) in found.items():
         assert rows.any(), name
         assert inside[rows].all(), f"{name}: {refused(found, name)} of {int(rows.sum())} held entries outside"
@@ -251,7 +302,8 @@ def assert_witnessed(seed: int, form: str, *, interpret: bool, lane: Lane | None
 def assert_faults_refused(*, interpret: bool, lane: Lane | None = None) -> None:
     """Each fault the witness exists for, refused at its elements: a dropped rescale, a maximum from the
     wrong tile, sums rounded to bf16 where the walk holds fp32, a causal launch's records held under a mask
-    one key short of its own, and a window's and the documents' records held as one undivided causal call's.
+    one key short of its own, a window's and the documents' records held as one undivided causal call's, and a
+    capped call's records held as an uncapped one's, and the reverse.
     Every native program launches before any check so GPU-tier prepare compiles them all (row 9546)."""
     import tier_wire
 
@@ -261,6 +313,7 @@ def assert_faults_refused(*, interpret: bool, lane: Lane | None = None) -> None:
     claimed = launched(q, k, v, "causal", interpret=interpret, site="faults")
     bounded = {form: launched(q, k, v, form, interpret=interpret, site="faults")
                for form in ("window", "documents")}
+    capped = launched(q, k, v, "capped", interpret=interpret, site="faults")
     if not interpret and tier_wire.preparing():
         return
     m, acc = truth["m"], truth["acc"]
@@ -279,3 +332,8 @@ def assert_faults_refused(*, interpret: bool, lane: Lane | None = None) -> None:
         # A window's or the documents' launch held as one undivided causal call: its bounds read.
         held = witnessed(q, k, v, causal, records, lane=lane)
         assert sum(refused(held, name) for name in ("m", "l", "acc")), form
+    # A capped launch held as an uncapped call's, and an uncapped one as a capped call's: its cap read.
+    assert sum(refused(witnessed(q, k, v, causal, capped, lane=lane), name) for name in ("m", "l", "acc"))
+    constants = capped_constants("capped", SHAPE[3])
+    assert sum(refused(witnessed(q, k, v, causal, claimed, lane=lane, capped=constants), name)
+               for name in ("m", "l", "acc"))
