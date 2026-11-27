@@ -223,6 +223,8 @@ def test_a_compiles_residuals_are_read_by_its_backward_where_it_holds_them():
     assert residuals
     for buffer in residuals:
         assert buffer.until is not None and buffer.start < buffer.until <= buffer.end, buffer
-    # Its forward's reads decoded off the assignment: some residual is held past its own placing.
-    assert any(buffer.until is not None and buffer.until > buffer.start + 1 for buffer in residuals)
+    # Its forward's reads decoded off the assignment and placed: some residual is held past its own placing
+    # and released before its end.
+    assert any(buffer.until is not None and buffer.start + 1 < buffer.until < buffer.end
+               for buffer in residuals)
 

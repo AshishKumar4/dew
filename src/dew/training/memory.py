@@ -998,7 +998,10 @@ class LiveProfile:
         def until(interval: LiveInterval) -> int:
             # Held through its forward's last read of it; to its end where a read is placed nowhere. A value
             # made before the backward began is read by its forward before then: a read at or past the
-            # backward's start is the backward's, whatever op name its fusion took.
+            # backward's start is taken as the backward's, whatever op name its fusion took. An estimate, the
+            # compile its judge: a forward branch XLA schedules after another's backward is read so too, and
+            # charging every such read prices the miss-driven decoder's save_dot_except_mlp at 41 MB freed
+            # where XLA frees 210 MB, this rule at 209 MB (tests/test_miss_driven_rungs.py).
             uses = within(interval)
             if any(position == UNPLACED for position, _ in uses):
                 return interval.end
