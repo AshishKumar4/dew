@@ -1471,6 +1471,23 @@ def test_an_a100_decode_plan_prices_the_count_of_slices_filling_one_wave():
     assert {13, 27, 2, 4, 8, 16, 32} <= set(counts) and max(counts) <= 54 and min(counts) >= 2, counts
 
 
+@pytest.mark.parametrize(("batch", "keys", "width", "fastest"), [(1, 32768, 128, 13), (8, 4096, 64, 3)],
+                         ids=["B1-K32768-d128", "B8-K4096-d64"])
+def test_an_a100_decode_plan_takes_the_slices_its_merge_runs_fastest_at(batch, keys, width, fastest):
+    """An A100-SXM4-40GB's bf16 decode step, 32/8 heads: the slices its plan takes are the ones whose walk and
+    merge ran fastest (M-NA-50b-a100: B1 over 32768 keys at width 128, 13 slices' walk and merge 136 us where
+    27's took 162; B8 over 4096 at 64, 3's 88 where 5's took 109), its merge priced a slot at a time
+    (`merged._triton_span`) over its programs' waves (`merged.launch_seconds`), where priced a chunk at a
+    time over the whole device at once it took 27 and 5."""
+    target = generation.gpu_target("NVIDIA A100-SXM4-40GB")
+    query = jnp.zeros((batch, 1, 32, width), jnp.bfloat16)
+    key = jax.ShapeDtypeStruct((batch, keys, 8, width), jnp.bfloat16)
+    with generation.assumed(target):
+        plans = attention_decode.planned(query, key, key, template.spans(1, keys, batch, causal=False),
+                                         template.Hooks())[0]
+    assert plans["plain"].slices == fastest, plans
+
+
 def test_a_decode_plan_takes_the_larger_key_tile_among_plans_priced_alike():
     """Row 5274: among plans priced alike, a decode step takes the fewer slices, then the larger key tile
     (`attention_decode.least_plan`), and a cheaper plan whatever its tile: a GH200's B8 over 4096 keys at

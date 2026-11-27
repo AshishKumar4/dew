@@ -36,7 +36,7 @@ from jax.extend import core as jaxpr_core
 from dew.algebra import means
 from dew.nn import programs
 from dew.nn.kernels import generation, tuning
-from dew.nn.kernels.templates import attention_algebra as algebra, attention_mosaic, cost, emission, merged
+from dew.nn.kernels.templates import attention_algebra as algebra, attention_mosaic, emission, merged
 from dew.nn.kernels.templates.attention import (
     Hooks,
     Initial,
@@ -300,7 +300,7 @@ def _priced_slices(query, key, value, spans: KeySpans, hooks: Hooks | None, sing
     """The slice count of `counts` (one beside them, at the derived `single` tile as `single_launch`'s hooks
     and written dtype run it, the plan's one-slice launch) and key tile whose step
     the cost model prices least over `spans`: its walk (`MosaicForward.price_config`, its programs' warps
-    hiding each other's issue intervals) and, past one slice, the merge of its slices (`merged.launch_work`,
+    hiding each other's issue intervals) and, past one slice, the merge of its slices (`_merge_seconds`,
     its passes' waited loads: the state form's merge, a proxy of a finished step's, its cast, its heads'
     layout and its output hook aside). Each further count prices the tiles its derived config's walk may
     stream at (`MosaicForward.streamings`), uncertified here; the caller certifies the chosen one at its own
@@ -367,9 +367,11 @@ def launch_programs(rows: jax.Array, config: attention_mosaic.Tiles) -> int:
 
 def _merge_seconds(query, value, spans: KeySpans, config: attention_mosaic.Tiles, slices: int, *,
                    target: generation.GpuTarget, initial: Initial | None) -> float:
-    """The seconds of the merge of a split walk's `slices` (`merged.launch_work`): the walk's outputs as its
-    launch writes them, `[B, S, Qp, H, Dvp]` fp32 and their maxima and denominators `[2, B, H, S, Qp]`
-    (`attention_mosaic_forward.SplitOutput`)."""
+    """The seconds of the merge of a split walk's `slices` as its launch's block choice prices it
+    (`merged.launch_seconds`: its programs' waves): the walk's outputs as its launch writes them,
+    `[B, S, Qp, H, Dvp]` fp32 and their maxima and denominators `[2, B, H, S, Qp]`
+    (`attention_mosaic_forward.SplitOutput`). Priced over the whole device at once (`cost.seconds`), a B8
+    merge's 512 programs ran as one."""
     family = attention_mosaic.bundle_of(config, query.dtype, target=target)
     rows = attention_mosaic._padded(query.shape[1], spans.keys, config)[0]
     width = attention_mosaic._width(value.shape[-1], family, query.dtype)
@@ -377,10 +379,9 @@ def _merge_seconds(query, value, spans: KeySpans, config: attention_mosaic.Tiles
     padded = jax.ShapeDtypeStruct((batch, slices, rows, heads, width), jnp.float32)
     stacked = jax.ShapeDtypeStruct((2, batch, heads, slices, rows), jnp.float32)
     spec = algebra.finished_form(_spec(query, spans, Hooks(), scale=None))
-    work = merged.launch_work(spec, padded, stacked, query.shape[1], value.shape[-1], target,
-                              has_initial=initial is not None,
-                              normalized=initial is not None and initial.normalized)
-    return cost.seconds(work, target)
+    return merged.launch_seconds(spec, padded, stacked, query.shape[1], value.shape[-1], target,
+                                 has_initial=initial is not None,
+                                 normalized=initial is not None and initial.normalized)
 
 
 def _streamed(query, key, value, spans: KeySpans, hooks: Hooks | None, *, scale: float | None,
