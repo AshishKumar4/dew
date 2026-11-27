@@ -175,6 +175,26 @@ equation is written as a term by it (`_term`, `spoken_as`) and a term's operatio
 (`operations_written`: a rule's left side's head, a stored term's parameters)."""
 
 
+def _written_index() -> dict[tuple[str, str | None], tuple[Operation, ...]]:
+    """Each operation of the language (`OPERATIONS`, every one declared above) under the term it is written
+    as (`WRITTEN`): by the term's constructor and the name it holds (the operation's symbol, its reduction's
+    monoid, or None where its kind's terms hold none), an operation two primitives declare (an add and JAX's
+    tangent sum) once."""
+    index: dict[tuple[str, str | None], dict[Operation, None]] = {}
+    for operation in OPERATIONS.values():
+        written = WRITTEN[operation.kind]
+        named = None if written.names is None else (
+            operation.symbol if written.names == "symbol" else operation.monoid)
+        index.setdefault((written.constructor, named), {})[operation] = None
+    return {key: tuple(held) for key, held in index.items()}
+
+
+_WRITTEN_BY = _written_index()
+"""The operations a term writes, by its constructor and the name it holds (`operations_written`)."""
+_HOLDS_NAME = {written.constructor: written.names is not None for written in WRITTEN.values()}
+"""Whether a term of each operation's constructor holds a name (its second argument)."""
+
+
 def _symbols(chosen: Callable[[Operation], bool]) -> frozenset[str]:
     """The symbols of the language's operations `chosen` holds of."""
     return frozenset(operation.symbol for operation in OPERATIONS.values() if chosen(operation))
@@ -1882,15 +1902,11 @@ def operations_written(constructor: str, named: str | None = None) -> tuple[Oper
     a stored term's parameters, `dew.algebra.stored`): of its kind, the one whose symbol it holds where its
     kind's terms hold their symbol, the reduction over the monoid it holds, each of its kind where its terms
     hold no name (`named` read past); none where it holds a name no operation has (a variable's, None); None
-    for a constructor that writes no operation (a leaf, a literal, a state)."""
-    kind = next((kind for kind, written in WRITTEN.items() if written.constructor == constructor), None)
-    if kind is None:
+    for a constructor that writes no operation (a leaf, a literal, a state). Read from one index
+    (`_WRITTEN_BY`)."""
+    if constructor not in _HOLDS_NAME:
         return None
-    names = WRITTEN[kind].names
-    # An operation two primitives declare (an add and JAX's tangent sum) once.
-    return tuple(dict.fromkeys(
-        operation for operation in OPERATIONS.values() if operation.kind == kind and (
-            names is None or named == (operation.symbol if names == "symbol" else operation.monoid))))
+    return _WRITTEN_BY.get((constructor, named if _HOLDS_NAME[constructor] else None), ())
 
 
 def written_as(constructor: str, named: str | None = None) -> str | None:
