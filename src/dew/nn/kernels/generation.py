@@ -120,10 +120,6 @@ class Choice(enum.StrEnum):
     GATED_DELTA_RULE = 'gated_delta_rule'
     GEMM_EPILOGUE = 'gemm_epilogue'
     GEMM_PROLOGUE = 'gemm_prologue'
-    GENERATED = 'generated'
-    """Whether a component the algebra generated and checked runs in place of its written body, decided
-    without a selector (`dew.algebra.generated.body`): "written", the default, or "generated" where a call's
-    case is declared (docs/design/algebra.md §6.11, rows 3272 and 6109)."""
     GROUPED_MATMUL = 'grouped_matmul'
     LAYER_SCAN = 'layer_scan'
     """How a decoder's stack compiles, decided without a selector (`dew.nn.backbones.decoder_stages.scanned`):
@@ -154,7 +150,6 @@ CHOICES = frozenset(choice.value for choice in Choice)
 """The choices' names (`Choice`), those `chosen` may name (`dew.kernels.choices`)."""
 
 SITE_KERNELS: dict[Choice, frozenset[str]] = {Choice.NARROW_COPIES: frozenset({'on', 'off'}),
-                                               Choice.GENERATED: frozenset({'written', 'generated'}),
                                                Choice.LAYER_SCAN: frozenset({'plain', 'scanned'}),
                                                Choice.MERGE: frozenset({'mosaic', 'triton'})}
 """The kernels of each choice a site decides without a selector (`chosen_kernel`), which `chosen` names

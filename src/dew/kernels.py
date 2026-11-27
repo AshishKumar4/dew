@@ -50,12 +50,11 @@ class Kernels:
     gated_mlp: Literal['apart', 'fused', 'wide'] | None = None
     gemm_epilogue: Literal['fused', 'xla'] | None = None
     gemm_prologue: Literal['fused', 'xla'] | None = None
-    # Keyword-only: a positional call of the fields before it keeps naming the ones it named.
-    generated: Literal['generated', 'written'] | None = dataclasses.field(default=None, kw_only=True)
     grouped_matmul: Literal['apart', 'cutlass', 'mosaic', 'triton', 'xla'] | None = None
     layer_scan: Literal['plain', 'scanned'] | None = None
     linear_ce: Literal['mosaic', 'xla'] | None = None
     low_rank: Literal['fused', 'xla'] | None = None
+    # Keyword-only: a positional call of the fields before it keeps naming the ones it named.
     merge: Literal['mosaic', 'triton'] | None = dataclasses.field(default=None, kw_only=True)
     mxfp8: Literal['mosaic', 'xla'] | None = None
     narrow_copies: Literal['off', 'on'] | None = None

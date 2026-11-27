@@ -54,12 +54,6 @@ def found(forms: Forms, operands: Sequence, policy: str, target: str) -> Callabl
     return forms.cases.get((policy, target, case_of(operands)))
 
 
-def entry(form: Callable[..., tuple], *, single: bool) -> Callable:
-    """A checked form as its declaration's function returns, for a caller that runs it later: its one value
-    where `single`."""
-    return (lambda *operands: form(*operands)[0]) if single else form
-
-
 def call(forms: Forms, operands: tuple, policy: str, target: str):
     """Run only the checked form for the exact policy, target, shape and dtype key, as its function
     returns."""
