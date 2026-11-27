@@ -1474,10 +1474,10 @@ the written trace and independent truth. Sharing and case selection add no run-t
   (M-AL-5: 62 cases, dispatch-dominated, no device-time claim), and an opt-in seam that ran them where a
   call's exact case was declared reached, in the portable Mamba selective scan
   (`dew.nn.mixers.mamba.selective_scan`), one site at a case no declaration held (M-AL-6: its decay's step
-  operand at 2x64x1536), running no generated body: an exact-case table holds only the sizes declared, and a
-  table keyed by pattern would run a body checked at other sizes, for no measured gain. The seam was removed
-  (rows 3272, 6109). A template's trace-time derivation at its fixed tiles remains a cold process's first-
-  step cost (9 s of a 26 s cold attention step), which these twins do not remove.
+  operand at (2, 64, 1536, 1)), running no generated body: an exact-case table holds only the sizes
+  declared, and a table keyed by pattern would run a body checked at other sizes, for no measured gain. The
+  seam was removed (rows 3272, 6109). A template's trace-time derivation at its fixed tiles remains a cold
+  process's first- step cost (9 s of a 26 s cold attention step), which these twins do not remove.
 
 - `python -m dew.algebra.generate [--check]` traces every declared case. For a stable form it
   saturates with the dev-time sets, measures error against the declaration at float64 and selects
