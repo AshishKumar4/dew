@@ -1721,7 +1721,6 @@ def test_a_b200s_port_cell_overrides_only_the_extent_its_receipt_timed(rows, tok
 @pytest.mark.parametrize(('rows', 'tokens', 'packed', 'heads', 'width', 'chunk_size', 'keys', 'output',
                           'declared'), [
     (1, 4096, False, 96, 80, 256, jnp.bfloat16, jnp.float32, True),
-    (1, 4096, False, 64, 64, 128, jnp.bfloat16, jnp.float32, False),
     (1, 4096, False, 96, 80, 256, jnp.bfloat16, jnp.bfloat16, False),
     (1, 4096, False, 64, 64, 128, jnp.bfloat16, jnp.bfloat16, False),
     (1, 4096, False, 96, 80, 256, jnp.float32, jnp.float32, False),
@@ -1731,7 +1730,7 @@ def test_a_b200s_port_cell_overrides_only_the_extent_its_receipt_timed(rows, tok
     (1, 4096, False, 96, 96, 256, jnp.bfloat16, jnp.float32, False),
     (1, 4096, False, 32, 64, 128, jnp.bfloat16, jnp.float32, False),
     (1, 4096, False, 64, 64, 256, jnp.bfloat16, jnp.float32, False)],
-    ids=['4B', '30B', '4B of a bf16 output', '30B of a bf16 output', '4B of float32 keys', '4B of two rows',
+    ids=['4B', '4B of a bf16 output', '30B of a bf16 output', '4B of float32 keys', '4B of two rows',
          '4B shorter', '4B packed', 'heads padded to 4B\'s', 'another head count', 'another chunk'])
 def test_an_a100s_ssd_port_cells_override_only_the_geometries_their_receipt_timed(rows, tokens, packed, heads,
                                                                                 width, chunk_size, keys,
@@ -1739,11 +1738,11 @@ def test_an_a100s_ssd_port_cells_override_only_the_geometries_their_receipt_time
     """An SSD's bf16 training on an A100, whose receipt timed mamba_ssm's port faster than the template on
     Nemotron-H 4B's (96 heads of 80, chunks of 256, eight groups of 128-wide states) at one unpacked row of
     4096 tokens (`recurrence_chunk.SCAN_CELLS`; 30B's, 64 heads of 64 at chunks of 128, the template's since
-    M-JS-271b-a100 timed it the faster): the rated scan's selector runs the port by that receipt on those
-    calls alone, and on another row count, length, chunk or head count, packed documents, heads only padded
-    to the port's width as 4B's are (96 wide), float32 keys, whose call the scan launches in float32, or an
-    output in the operands' bf16, which the receipt timed none of (`ScanCell.wide`, row 11812), no receipt
-    overrides its kernels' order, where every mma.sync training geometry took the port (row 8991)."""
+    M-JS-271b-a100 timed it the faster, tests/test_recurrence_cells.py's to hold): the rated scan's selector
+    runs the port by that receipt on those calls alone, and on another row count, length, chunk or head
+    count, packed documents, heads only padded to the port's width as 4B's are (96 wide), float32 keys, whose
+    call the scan launches in float32, or an output in the operands' bf16, which the receipt timed none of
+    (`ScanCell.wide`, row 11812), no receipt overrides its kernels' order (row 8991)."""
     def loss(x, B, C, dt, A, D, *starts):
         operands = Chunk(C, B, x, beta=dt, rate=A, skip=D, starts=starts[0] if starts else None)
         out, _ = chunk(FORMED[4], operands, chunk_size=chunk_size, dtype=output)
