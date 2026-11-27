@@ -34,7 +34,6 @@ Receipts:
 """
 
 import functools
-from collections.abc import Callable
 
 import jax.numpy as jnp
 import numpy as np
@@ -249,59 +248,59 @@ def _rounded_tangent_0(x1, x2, x3):
     return (x2,)
 
 
-_decode_e4m3_forms: dict[tuple, Callable[..., tuple]] = {
+_decode_e4m3_forms = _generated.Forms(True, {
     ('default', 'sm90', (((32, 8), 'uint8'),)):
         _decode_e4m3_0,
     ('default', 'sm90', (((64, 8), 'uint8'),)):
         _decode_e4m3_0,
-}
+})
 
 
 def decode_e4m3(*operands, policy: str = 'default', target: str = 'sm90'):
     """decode_e4m3's generated form for `policy` and `target` at its operands' case."""
-    return _generated.call(_decode_e4m3_forms, operands, policy, target, single=True)
+    return _generated.call(_decode_e4m3_forms, operands, policy, target)
 
 
-_decode_e5m2_forms: dict[tuple, Callable[..., tuple]] = {
+_decode_e5m2_forms = _generated.Forms(True, {
     ('default', 'sm90', (((32, 8), 'uint8'),)):
         _decode_e5m2_0,
     ('default', 'sm90', (((64, 8), 'uint8'),)):
         _decode_e5m2_0,
-}
+})
 
 
 def decode_e5m2(*operands, policy: str = 'default', target: str = 'sm90'):
     """decode_e5m2's generated form for `policy` and `target` at its operands' case."""
-    return _generated.call(_decode_e5m2_forms, operands, policy, target, single=True)
+    return _generated.call(_decode_e5m2_forms, operands, policy, target)
 
 
-_e8m0_decode_forms: dict[tuple, Callable[..., tuple]] = {
+_e8m0_decode_forms = _generated.Forms(True, {
     ('default', 'sm90', (((32, 8), 'uint8'),)):
         _e8m0_decode_0,
     ('default', 'sm90', (((64, 8), 'uint8'),)):
         _e8m0_decode_0,
-}
+})
 
 
 def e8m0_decode(*operands, policy: str = 'default', target: str = 'sm90'):
     """e8m0_decode's generated form for `policy` and `target` at its operands' case."""
-    return _generated.call(_e8m0_decode_forms, operands, policy, target, single=True)
+    return _generated.call(_e8m0_decode_forms, operands, policy, target)
 
 
-_e8m0_exponents_forms: dict[tuple, Callable[..., tuple]] = {
+_e8m0_exponents_forms = _generated.Forms(False, {
     ('default', 'sm90', (((32, 8), 'uint8'),)):
         _e8m0_exponents_0,
     ('default', 'sm90', (((64, 8), 'uint8'),)):
         _e8m0_exponents_0,
-}
+})
 
 
 def e8m0_exponents(*operands, policy: str = 'default', target: str = 'sm90'):
     """e8m0_exponents's generated form for `policy` and `target` at its operands' case."""
-    return _generated.call(_e8m0_exponents_forms, operands, policy, target, single=False)
+    return _generated.call(_e8m0_exponents_forms, operands, policy, target)
 
 
-_encode_e2m1_forms: dict[tuple, Callable[..., tuple]] = {
+_encode_e2m1_forms = _generated.Forms(True, {
     ('default', 'sm90', (((16, 128), 'uint32'),)):
         functools.partial(
         shared_component_4, p0=lax.shift_right_logical_p, p2=31, p3=jnp.dtype('uint32'), p4=2147483647,
@@ -312,15 +311,15 @@ _encode_e2m1_forms: dict[tuple, Callable[..., tuple]] = {
         shared_component_4, p0=lax.shift_right_logical_p, p2=31, p3=jnp.dtype('uint32'), p4=2147483647,
         p6=(32, 128), p7=(), p8=0, p12=1086324736, p16=2139095040, p22=23, p26=4294967170,
         p31=jnp.dtype('int32'), p32=lax.shift_left_p, p34=23, p36=22, p47=32, p53=7, p62=3),
-}
+})
 
 
 def encode_e2m1(*operands, policy: str = 'default', target: str = 'sm90'):
     """encode_e2m1's generated form for `policy` and `target` at its operands' case."""
-    return _generated.call(_encode_e2m1_forms, operands, policy, target, single=True)
+    return _generated.call(_encode_e2m1_forms, operands, policy, target)
 
 
-_encode_e4m3_forms: dict[tuple, Callable[..., tuple]] = {
+_encode_e4m3_forms = _generated.Forms(True, {
     ('default', 'sm90', (((16, 128), 'uint32'),)):
         functools.partial(
         shared_component_4, p0=lax.shift_right_logical_p, p2=31, p3=jnp.dtype('uint32'), p4=2147483647,
@@ -331,15 +330,15 @@ _encode_e4m3_forms: dict[tuple, Callable[..., tuple]] = {
         shared_component_4, p0=lax.shift_right_logical_p, p2=31, p3=jnp.dtype('uint32'), p4=2147483647,
         p6=(32, 128), p7=(), p8=0, p12=1138753536, p16=2139095040, p22=23, p26=4294967176,
         p31=jnp.dtype('int32'), p32=lax.shift_left_p, p34=21, p36=20, p47=32, p53=127, p62=7),
-}
+})
 
 
 def encode_e4m3(*operands, policy: str = 'default', target: str = 'sm90'):
     """encode_e4m3's generated form for `policy` and `target` at its operands' case."""
-    return _generated.call(_encode_e4m3_forms, operands, policy, target, single=True)
+    return _generated.call(_encode_e4m3_forms, operands, policy, target)
 
 
-_encode_e5m2_forms: dict[tuple, Callable[..., tuple]] = {
+_encode_e5m2_forms = _generated.Forms(True, {
     ('default', 'sm90', (((16, 128), 'uint32'),)):
         functools.partial(
         shared_component_4, p0=lax.shift_right_logical_p, p2=31, p3=jnp.dtype('uint32'), p4=2147483647,
@@ -350,67 +349,67 @@ _encode_e5m2_forms: dict[tuple, Callable[..., tuple]] = {
         shared_component_4, p0=lax.shift_right_logical_p, p2=31, p3=jnp.dtype('uint32'), p4=2147483647,
         p6=(32, 128), p7=(), p8=0, p12=1197473792, p16=2139095040, p22=23, p26=4294967184,
         p31=jnp.dtype('int32'), p32=lax.shift_left_p, p34=22, p36=21, p47=32, p53=127, p62=7),
-}
+})
 
 
 def encode_e5m2(*operands, policy: str = 'default', target: str = 'sm90'):
     """encode_e5m2's generated form for `policy` and `target` at its operands' case."""
-    return _generated.call(_encode_e5m2_forms, operands, policy, target, single=True)
+    return _generated.call(_encode_e5m2_forms, operands, policy, target)
 
 
-_fp8_epilogue_forms: dict[tuple, Callable[..., tuple]] = {
+_fp8_epilogue_forms = _generated.Forms(False, {
     ('default', 'sm90', (((32, 128), 'float32'),)):
         _fp8_epilogue_0,
     ('default', 'sm90', (((64, 256), 'float32'),)):
         _fp8_epilogue_1,
-}
+})
 
 
 def fp8_epilogue(*operands, policy: str = 'default', target: str = 'sm90'):
     """fp8_epilogue's generated form for `policy` and `target` at its operands' case."""
-    return _generated.call(_fp8_epilogue_forms, operands, policy, target, single=False)
+    return _generated.call(_fp8_epilogue_forms, operands, policy, target)
 
 
-_gemm_partial_scale_forms: dict[tuple, Callable[..., tuple]] = {
+_gemm_partial_scale_forms = _generated.Forms(True, {
     ('default', 'sm90', (((32, 128), 'float32'), ((32,), 'float32'), ((128,), 'float32'))):
         _gemm_partial_scale_0,
     ('default', 'sm90', (((64, 128), 'float32'), ((64,), 'float32'), ((128,), 'float32'))):
         _gemm_partial_scale_0,
-}
+})
 
 
 def gemm_partial_scale(*operands, policy: str = 'default', target: str = 'sm90'):
     """gemm_partial_scale's generated form for `policy` and `target` at its operands' case."""
-    return _generated.call(_gemm_partial_scale_forms, operands, policy, target, single=True)
+    return _generated.call(_gemm_partial_scale_forms, operands, policy, target)
 
 
-_mxfp8_block_decode_forms: dict[tuple, Callable[..., tuple]] = {
+_mxfp8_block_decode_forms = _generated.Forms(True, {
     ('default', 'sm90', (((32, 256), 'uint8'), ((32, 8), 'uint8'))):
         _mxfp8_block_decode_0,
     ('default', 'sm90', (((64, 128), 'uint8'), ((64, 4), 'uint8'))):
         _mxfp8_block_decode_1,
-}
+})
 
 
 def mxfp8_block_decode(*operands, policy: str = 'default', target: str = 'sm90'):
     """mxfp8_block_decode's generated form for `policy` and `target` at its operands' case."""
-    return _generated.call(_mxfp8_block_decode_forms, operands, policy, target, single=True)
+    return _generated.call(_mxfp8_block_decode_forms, operands, policy, target)
 
 
-_mxfp8_block_decode_bf16_forms: dict[tuple, Callable[..., tuple]] = {
+_mxfp8_block_decode_bf16_forms = _generated.Forms(True, {
     ('default', 'sm90', (((32, 256), 'uint8'), ((32, 8), 'uint8'))):
         _mxfp8_block_decode_bf16_0,
     ('default', 'sm90', (((64, 128), 'uint8'), ((64, 4), 'uint8'))):
         _mxfp8_block_decode_bf16_1,
-}
+})
 
 
 def mxfp8_block_decode_bf16(*operands, policy: str = 'default', target: str = 'sm90'):
     """mxfp8_block_decode_bf16's generated form for `policy` and `target` at its operands' case."""
-    return _generated.call(_mxfp8_block_decode_bf16_forms, operands, policy, target, single=True)
+    return _generated.call(_mxfp8_block_decode_bf16_forms, operands, policy, target)
 
 
-_mxfp8_epilogue_forms: dict[tuple, Callable[..., tuple]] = {
+_mxfp8_epilogue_forms = _generated.Forms(False, {
     ('default', 'sm90', (((32, 128), 'float32'),)):
         functools.partial(
         shared_component_23, p1=(32, 4, 32), p2=(2,), p3=(32, 4, 32), p4=(0, 1), p5=(32, 128),
@@ -423,28 +422,28 @@ _mxfp8_epilogue_forms: dict[tuple, Callable[..., tuple]] = {
         p6=jnp.dtype('uint32'), p7=lax.shift_right_logical_p, p10=jnp.dtype('int32'), p15=(64, 128), p16=(),
         p17=127, p20=lax.shift_left_p, p21=23, p23=jnp.dtype('float32'), p43=jnp.dtype('uint8'),
         p44=jnp.dtype('float8_e4m3fn'), p46=jnp.dtype('float8_e8m0fnu')),
-}
+})
 
 
 def mxfp8_epilogue(*operands, policy: str = 'default', target: str = 'sm90'):
     """mxfp8_epilogue's generated form for `policy` and `target` at its operands' case."""
-    return _generated.call(_mxfp8_epilogue_forms, operands, policy, target, single=False)
+    return _generated.call(_mxfp8_epilogue_forms, operands, policy, target)
 
 
-_mxfp8_scale_forms: dict[tuple, Callable[..., tuple]] = {
+_mxfp8_scale_forms = _generated.Forms(False, {
     ('default', 'sm90', (((32, 8), 'uint32'),)):
         _mxfp8_scale_0,
     ('default', 'sm90', (((64, 8), 'uint32'),)):
         _mxfp8_scale_0,
-}
+})
 
 
 def mxfp8_scale(*operands, policy: str = 'default', target: str = 'sm90'):
     """mxfp8_scale's generated form for `policy` and `target` at its operands' case."""
-    return _generated.call(_mxfp8_scale_forms, operands, policy, target, single=False)
+    return _generated.call(_mxfp8_scale_forms, operands, policy, target)
 
 
-_nvfp4_block_decode_forms: dict[tuple, Callable[..., tuple]] = {
+_nvfp4_block_decode_forms = _generated.Forms(True, {
     ('default', 'sm90', (((64, 64), 'uint32'), ((4, 64), 'uint8'))):
         functools.partial(
         shared_component_30, p1=(1, 0), p2=(64, 8, 8), p3=jnp.dtype('uint32'), p4=(8,), p6=(1, 1, 8), p7=(2,),
@@ -458,15 +457,15 @@ _nvfp4_block_decode_forms: dict[tuple, Callable[..., tuple]] = {
         p14=jnp.dtype('float8_e4m3fn'), p16=lax.shift_right_logical_p, p23=jnp.dtype('uint16'), p24=(32, 128),
         p26=jnp.dtype('float32'), p27=jnp.dtype('int32'), p43=(8, 16, 32), p44=(0, 2), p45=(128, 32),
         p46=jnp.dtype('bfloat16')),
-}
+})
 
 
 def nvfp4_block_decode(*operands, policy: str = 'default', target: str = 'sm90'):
     """nvfp4_block_decode's generated form for `policy` and `target` at its operands' case."""
-    return _generated.call(_nvfp4_block_decode_forms, operands, policy, target, single=True)
+    return _generated.call(_nvfp4_block_decode_forms, operands, policy, target)
 
 
-_nvfp4_payload_forms: dict[tuple, Callable[..., tuple]] = {
+_nvfp4_payload_forms = _generated.Forms(True, {
     ('default', 'sm90', (((16, 32), 'uint32'),)):
         functools.partial(
         shared_component_46, p1=(1, 0), p2=(32, 2, 8), p3=jnp.dtype('uint32'), p4=(8,), p6=(1, 1, 8), p7=(2,),
@@ -477,41 +476,41 @@ _nvfp4_payload_forms: dict[tuple, Callable[..., tuple]] = {
         shared_component_46, p1=(1, 0), p2=(64, 4, 8), p3=jnp.dtype('uint32'), p4=(8,), p6=(1, 1, 8), p7=(2,),
         p8=lax.shift_left_p, p10=(64, 4), p11=(), p12=jnp.dtype('uint8'), p14=lax.shift_right_logical_p,
         p21=jnp.dtype('uint16'), p22=(64, 32), p24=jnp.dtype('float32'), p25=jnp.dtype('int32')),
-}
+})
 
 
 def nvfp4_payload(*operands, policy: str = 'default', target: str = 'sm90'):
     """nvfp4_payload's generated form for `policy` and `target` at its operands' case."""
-    return _generated.call(_nvfp4_payload_forms, operands, policy, target, single=True)
+    return _generated.call(_nvfp4_payload_forms, operands, policy, target)
 
 
-_nvfp4_scale_forms: dict[tuple, Callable[..., tuple]] = {
+_nvfp4_scale_forms = _generated.Forms(True, {
     ('default', 'sm90', (((32, 8), 'uint8'),)):
         _nvfp4_scale_0,
     ('default', 'sm90', (((64, 8), 'uint8'),)):
         _nvfp4_scale_0,
-}
+})
 
 
 def nvfp4_scale(*operands, policy: str = 'default', target: str = 'sm90'):
     """nvfp4_scale's generated form for `policy` and `target` at its operands' case."""
-    return _generated.call(_nvfp4_scale_forms, operands, policy, target, single=True)
+    return _generated.call(_nvfp4_scale_forms, operands, policy, target)
 
 
-_quantized_ste_forms: dict[tuple, Callable[..., tuple]] = {
+_quantized_ste_forms = _generated.Forms(True, {
     ('default', 'sm90', (((16, 32), 'float32'), ((16, 32), 'bfloat16'))):
         _quantized_ste_0,
     ('default', 'sm90', (((8, 64), 'float32'), ((8, 64), 'bfloat16'))):
         _quantized_ste_0,
-}
+})
 
 
 def quantized_ste(*operands, policy: str = 'default', target: str = 'sm90'):
     """quantized_ste's generated form for `policy` and `target` at its operands' case."""
-    return _generated.call(_quantized_ste_forms, operands, policy, target, single=True)
+    return _generated.call(_quantized_ste_forms, operands, policy, target)
 
 
-_quantized_ste_tangent_forms: dict[tuple, Callable[..., tuple]] = {
+_quantized_ste_tangent_forms = _generated.Forms(True, {
     ('default', 'sm90', (
         ((16, 32), 'float32'), ((16, 32), 'bfloat16'), ((16, 32), 'float32'), ((16, 32), 'bfloat16'),
         ((16, 32), 'float32'))):
@@ -520,61 +519,61 @@ _quantized_ste_tangent_forms: dict[tuple, Callable[..., tuple]] = {
         ((8, 64), 'float32'), ((8, 64), 'bfloat16'), ((8, 64), 'float32'), ((8, 64), 'bfloat16'),
         ((8, 64), 'float32'))):
         _quantized_ste_tangent_0,
-}
+})
 
 
 def quantized_ste_tangent(*operands, policy: str = 'default', target: str = 'sm90'):
     """quantized_ste_tangent's generated form for `policy` and `target` at its operands' case."""
-    return _generated.call(_quantized_ste_tangent_forms, operands, policy, target, single=True)
+    return _generated.call(_quantized_ste_tangent_forms, operands, policy, target)
 
 
-_rounded_forms: dict[tuple, Callable[..., tuple]] = {
+_rounded_forms = _generated.Forms(True, {
     ('default', 'sm90', (((16, 32), 'float32'),)):
         functools.partial(shared_component_47, p1=jnp.dtype('bfloat16'), p2=jnp.dtype('float32')),
     ('default', 'sm90', (((8, 64), 'float32'),)):
         functools.partial(shared_component_47, p1=jnp.dtype('bfloat16'), p2=jnp.dtype('float32')),
-}
+})
 
 
 def rounded(*operands, policy: str = 'default', target: str = 'sm90'):
     """rounded's generated form for `policy` and `target` at its operands' case."""
-    return _generated.call(_rounded_forms, operands, policy, target, single=True)
+    return _generated.call(_rounded_forms, operands, policy, target)
 
 
-_rounded_fp16_forms: dict[tuple, Callable[..., tuple]] = {
+_rounded_fp16_forms = _generated.Forms(True, {
     ('default', 'sm90', (((16, 32), 'float32'),)):
         functools.partial(shared_component_47, p1=jnp.dtype('float16'), p2=jnp.dtype('float32')),
     ('default', 'sm90', (((8, 64), 'float32'),)):
         functools.partial(shared_component_47, p1=jnp.dtype('float16'), p2=jnp.dtype('float32')),
-}
+})
 
 
 def rounded_fp16(*operands, policy: str = 'default', target: str = 'sm90'):
     """rounded_fp16's generated form for `policy` and `target` at its operands' case."""
-    return _generated.call(_rounded_fp16_forms, operands, policy, target, single=True)
+    return _generated.call(_rounded_fp16_forms, operands, policy, target)
 
 
-_rounded_fp16_tangent_forms: dict[tuple, Callable[..., tuple]] = {
+_rounded_fp16_tangent_forms = _generated.Forms(True, {
     ('default', 'sm90', (*(((16, 32), 'float32'),) * 3,)):
         _rounded_fp16_tangent_0,
     ('default', 'sm90', (*(((8, 64), 'float32'),) * 3,)):
         _rounded_fp16_tangent_0,
-}
+})
 
 
 def rounded_fp16_tangent(*operands, policy: str = 'default', target: str = 'sm90'):
     """rounded_fp16_tangent's generated form for `policy` and `target` at its operands' case."""
-    return _generated.call(_rounded_fp16_tangent_forms, operands, policy, target, single=True)
+    return _generated.call(_rounded_fp16_tangent_forms, operands, policy, target)
 
 
-_rounded_tangent_forms: dict[tuple, Callable[..., tuple]] = {
+_rounded_tangent_forms = _generated.Forms(True, {
     ('default', 'sm90', (*(((16, 32), 'float32'),) * 3,)):
         _rounded_tangent_0,
     ('default', 'sm90', (*(((8, 64), 'float32'),) * 3,)):
         _rounded_tangent_0,
-}
+})
 
 
 def rounded_tangent(*operands, policy: str = 'default', target: str = 'sm90'):
     """rounded_tangent's generated form for `policy` and `target` at its operands' case."""
-    return _generated.call(_rounded_tangent_forms, operands, policy, target, single=True)
+    return _generated.call(_rounded_tangent_forms, operands, policy, target)

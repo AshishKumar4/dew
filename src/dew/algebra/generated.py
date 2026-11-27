@@ -75,13 +75,14 @@ def body(qualified: str, operands: Sequence, *, when: bool = True) -> Callable |
     module, name = qualified.rsplit(".", 1)
     derived = _derived(module)
     policy = "accurate" if generation.numerics().forms == "accurate" else "default"
+    # One key and one lookup, the operands admitted above: the form found is the one the call runs.
     key = (policy, generation.device_generation(), _generated.case_of(tuple(operands)))
-    if key not in _generated.table(derived, name):
+    forms = _generated.table(derived, name)
+    if (form := forms.cases.get(key)) is None:
         _counted(qualified, f"no declared case {key}")
         return None
     _counted(qualified, GENERATED)
-    function = getattr(derived, name)
-    return lambda *values: function(*values, policy=key[0], target=key[1])
+    return _generated.entry(form, single=forms.single)
 
 
 def _derived(module: str) -> ModuleType:

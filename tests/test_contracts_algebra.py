@@ -30,7 +30,7 @@ class _Recorded:
                 self.taken.append(name)
                 return form(*operands)
             return run
-        return {key: recorded(form) for key, form in held.items()}
+        return _generated.Forms(held.single, {key: recorded(form) for key, form in held.cases.items()})
 
 
 def _recorded(module):
@@ -251,8 +251,10 @@ def test_a_surrogate_case_keys_its_static_arguments_exactly():
     key = ("default", "sm90", _generated.case_of((jnp.zeros((4,), jnp.float32),)))
     tangent_key = ("default", "sm90", _generated.case_of((jnp.zeros((4,), jnp.float32),) * 3))
     emitted = _Recorded(None, {
-        _generated.table_name(name): {key: lambda x: (x + 1,)} for name in ("plus", "member", "named")} | {
-        _generated.table_name(f"{name}_tangent"): {tangent_key: lambda x, dx, value: (dx,)}
+        _generated.table_name(name): _generated.Forms(True, {key: lambda x: (x + 1,)})
+        for name in ("plus", "member", "named")} | {
+        _generated.table_name(f"{name}_tangent"):
+            _generated.Forms(True, {tangent_key: lambda x, dx, value: (dx,)})
         for name in ("plus", "member", "named")})
     composed = surrogate.assembled(emitted)
     x = jnp.zeros((4,), jnp.float32)
@@ -321,8 +323,9 @@ def test_a_generated_module_whose_tables_are_not_its_declarations_is_refused():
         tables = {}
         for _, case in format_cases.ROUNDED.cases:
             for name in (case.name, *map(case.tangent_name, case.tangents)):
-                tables[_generated.table_name(name)] = dict(_generated.table(format_cases_derived, name))
-        rows = tables[_generated.table_name("rounded")]
+                held = _generated.table(format_cases_derived, name)
+                tables[_generated.table_name(name)] = _generated.Forms(held.single, dict(held.cases))
+        rows = tables[_generated.table_name("rounded")].cases
         if change == "missing":
             rows.pop(next(iter(rows)))
         else:

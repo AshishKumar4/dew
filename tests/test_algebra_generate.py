@@ -469,7 +469,7 @@ def test_a_partial_symbolic_zero_uses_its_generated_tangent_and_the_original_val
                 return loaded(*values)
             rows |= {(policy, target, _generated.case_of(operands)): form
                      for policy in component.cases.policies for target in component.cases.targets}
-        tables[_generated.table_name(name)] = rows
+        tables[_generated.table_name(name)] = _generated.Forms(False, rows)
 
     composed = declared.assembled(types.SimpleNamespace(**tables))
     x = np.arange(8, dtype=np.float32)
@@ -653,3 +653,21 @@ def test_a_name_declared_twice_is_refused_and_keeps_its_first_form():
     with pytest.raises(ValueError):
         generate.declare(__name__, "gain", second)
     assert generate.DECLARATIONS[f"{__name__}.gain"] is first
+
+
+def test_a_surrogate_whose_tangent_name_is_taken_registers_nothing():
+    """A surrogate's bodies are registered together or not at all (`SurrogateBodies.declared`): where its
+    tangent's name is another form's, its forward is not left registered alone."""
+    operand = jax.ShapeDtypeStruct((8,), jnp.float32)
+    form = generate.ComponentForm(lambda x: x, lambda x: x,
+                                  generate.Cases(((operand,),), lambda seed, operands: operands, 1))
+    tangent = generate.ComponentForm(lambda x, dx, value: dx, lambda x, dx, value: dx,
+                                     generate.Cases(((operand,) * 3,), lambda seed, operands: operands, 1))
+    generate.declare(__name__, "lone_tangent", generate.ComponentForm(lambda x: 2 * x, lambda x: 2 * x,
+                                                                      form.cases))
+    case = generate.SurrogateCase("lone", form, {(): tangent}, output_tree=(jax.tree.structure(0),))
+    before = dict(generate.DECLARATIONS)
+    with pytest.raises(ValueError):
+        generate.SurrogateBodies(lambda x: x, lambda *values: values[1][0], (), symbolic_zeros=False,
+                                 cases=(((), case),)).declared(__name__)
+    assert generate.DECLARATIONS == before
