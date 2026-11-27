@@ -206,10 +206,9 @@ class Assignment:
                 if step.kind == kinds["FREE"]:
                     spans.append((step.buffer_id, opened.pop(step.buffer_id), position))
                     continue
-                shared = step.share_with_canonical_id
+                shared: int = int(step.share_with_canonical_id)
                 sharing = step.kind == kinds["SHARE_WITH"]
-                storages[step.buffer_id] = (int(storages.get(shared, shared)) if sharing
-                                            else int(step.buffer_id))
+                storages[step.buffer_id] = storages.get(shared, shared) if sharing else int(step.buffer_id)
                 opened[step.buffer_id] = position
             spans += [(buffer, start, len(simulated.events)) for buffer, start in opened.items()]
             allocation = simulated.buffer_allocation_index
@@ -282,7 +281,8 @@ def _charged(events, assigned: dict[int, int], kinds: dict[str, int]) -> set[int
             if instances[shared] == 1 and assigned[step.buffer_id] > 0:
                 charged.add(step.buffer_id)
         else:
-            freed = int(canonical.get(step.buffer_id, step.buffer_id))
+            owned: int = int(step.buffer_id)
+            freed = canonical.get(owned, owned)
             instances[freed] = instances.get(freed, 0) - 1
     return charged
 

@@ -22,6 +22,7 @@ from pathlib import Path
 
 import jax
 import jax.numpy as jnp
+import pytest
 from jax import ad_checkpoint
 from live_buffers_support import (
     counted,
@@ -179,6 +180,17 @@ def test_a_tuple_makers_name_is_its_result_alone_not_its_workspace():
         ((2,), "jit(f)/pair", (), "")]
 
 
+def _saved_hidden(step) -> list:
+    """The buffers live at the peak of `step`'s weight gradient, checkpointed saving the "hidden" residual
+    alone, over 2048 rows of 256."""
+    saved = jax.checkpoint(step, policy=jax.checkpoint_policies.save_only_these_names("hidden"))
+    rows = jax.ShapeDtypeStruct((2048, 256), jnp.float32)
+    weight = jax.ShapeDtypeStruct((256, 256), jnp.float32)
+    live = peak_live(jax.jit(jax.grad(saved, argnums=1)).lower(rows, weight).compile())
+    assert live is not None
+    return live
+
+
 def test_a_residual_a_policy_saves_is_named_by_its_checkpoint_name():
     """sin(tanh(x @ w))'s gradient in w under a policy saving the residual named "hidden" alone: the
     backward reads the saved tanh beside the cotangent it forms from it, the rows' widest buffers, so at its
@@ -188,11 +200,7 @@ def test_a_residual_a_policy_saves_is_named_by_its_checkpoint_name():
         hidden = ad_checkpoint.checkpoint_name(jnp.tanh(x @ w), "hidden")
         return jnp.sum(jnp.sin(hidden))
 
-    saved = jax.checkpoint(step, policy=jax.checkpoint_policies.save_only_these_names("hidden"))
-    rows = jax.ShapeDtypeStruct((2048, 256), jnp.float32)
-    weight = jax.ShapeDtypeStruct((256, 256), jnp.float32)
-    live = peak_live(jax.jit(jax.grad(saved, argnums=1)).lower(rows, weight).compile())
-    assert live is not None
+    live = _saved_hidden(step)
     assert {buffer.names for buffer in live if buffer.names} == {("hidden",)}
     assert sorted(buffer.parameter for buffer in live if buffer.kind == "parameter") == [0, 1]
 
@@ -249,11 +257,7 @@ def test_a_residual_named_through_reshapes_names_the_buffer_they_bitcast():
         hidden = jnp.tanh(x @ w).reshape(2048, 16, 16).reshape(2048 * 16, 16)
         return jnp.sum(jnp.sin(ad_checkpoint.checkpoint_name(hidden, "hidden")))
 
-    saved = jax.checkpoint(step, policy=jax.checkpoint_policies.save_only_these_names("hidden"))
-    rows = jax.ShapeDtypeStruct((2048, 256), jnp.float32)
-    weight = jax.ShapeDtypeStruct((256, 256), jnp.float32)
-    live = peak_live(jax.jit(jax.grad(saved, argnums=1)).lower(rows, weight).compile())
-    assert live is not None
+    live = _saved_hidden(step)
     assert {buffer.names for buffer in live if buffer.names} == {("hidden",)}
 
 
@@ -372,8 +376,8 @@ def test_a_while_loop_carries_what_its_body_adds_to_a_fixed_point():
     assert found["n"] == (both, both)
 
 
-def test_a_fusion_reads_its_operands_through_its_body():
-    found = descended("""
+@pytest.mark.parametrize(("text", "name", "dims"), [
+    ("""
       HloModule m
       fused {
         a = f32[8,4] parameter(0)
@@ -382,12 +386,8 @@ def test_a_fusion_reads_its_operands_through_its_body():
       ENTRY e {
         x = f32[8,4] parameter(0)
         ROOT f = f32[4,8] fusion(x), kind=kLoop, calls=fused
-      }""")
-    assert found["f"] == (of((0, 1)), of((0, 0)))
-
-
-def test_a_gather_takes_its_batch_from_its_indices_and_its_offsets_from_its_operand():
-    found = descended("""
+      }""", "f", ((0, 1), (0, 0))),
+    ("""
       HloModule m
       ENTRY e {
         table = f32[100,32] parameter(0)
@@ -395,8 +395,11 @@ def test_a_gather_takes_its_batch_from_its_indices_and_its_offsets_from_its_oper
         ROOT rows = f32[16,32] gather(table, ids), offset_dims={1},
             collapsed_slice_dims={0}, start_index_map={0}, index_vector_dim=1,
             slice_sizes={1,32}
-      }""")
-    assert found["rows"] == (of((1, 0)), of((0, 1)))
+      }""", "rows", ((1, 0), (0, 1)))], ids=["fusion", "gather"])
+def test_a_fusion_and_a_gather_read_their_operands_dimensions(text, name, dims):
+    """A fusion reads its operands' dimensions through its body; a gather takes its batch from its indices
+    and its offsets from its operand."""
+    assert descended(text)[name] == tuple(of(dim) for dim in dims)
 
 
 def test_a_custom_call_states_its_dimensions_or_they_are_unknown():
