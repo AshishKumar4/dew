@@ -120,17 +120,19 @@ class _TaggedKernels(Kernels):
 
 @pytest.mark.parametrize("tagged", [False, True], ids=["plain", "tagged"])
 @pytest.mark.parametrize("generated", [None, "generated", "written"])
-def test_a_run_saved_with_a_retired_kernel_choice_reads_as_the_run_it_trained(generated, tagged):
+def test_a_run_saved_with_a_retired_kernel_choice_reads_as_the_run_it_trained(tmp_path, generated, tagged):
     """The published run as a Dew of rows 3272/6109's opt-in seam saved it, its kernel choices stating the
     retired `generated` (written None where unset, as a record of its kernels writes each), in a plain
-    record or a subclass's tagged one, reads as today's run of the written math, the choice left out
-    (`earlier_retired_kernels`), its other choices and its class kept."""
+    record or a subclass's tagged one, loads as today's run of the written math, the choice left out
+    (`_records.saved_fields`), its other choices and its class kept."""
     held = json.loads(PUBLISHED.read_text())
     choices = {**held["fields"]["diagnostics"]["kernels"], "generated": generated, "attention": "xla"}
     name = f"{_TaggedKernels.__module__}:{_TaggedKernels.__qualname__}"
     kernels = {"class": name, "fields": choices} if tagged else choices
     diagnostics = {**held["fields"]["diagnostics"], "kernels": kernels}
-    run = RunConfig.read(earlier_run({**held, "fields": {**held["fields"], "diagnostics": diagnostics}}))
+    (tmp_path / "run.json").write_text(json.dumps({**held, "fields": {**held["fields"],
+                                                                      "diagnostics": diagnostics}}))
+    run = RunConfig.load(str(tmp_path))
     assert run.diagnostics.kernels == (_TaggedKernels if tagged else Kernels)(attention="xla")
     assert type(run.diagnostics.kernels) is (_TaggedKernels if tagged else Kernels)
 
@@ -205,13 +207,37 @@ def test_a_kernels_subclass_that_declares_the_retired_name_keeps_it(tmp_path):
     assert RunConfig.load(run.save(str(tmp_path))) == run
 
 
-def test_a_run_of_before_its_diagnostics_loses_the_retired_choice_it_moves():
-    """A run's `kernels` of before its diagnostics held them, naming the retired choice, read as today's
-    run's diagnostics' kernel choices without it (`earlier_run`)."""
+def test_a_kernels_subclass_field_of_the_retired_name_runs_no_choice():
+    """A run whose kernel choices are a subclass declaring `generated` as its own field traces with the
+    choices `Kernels` declares alone (`Kernels.named`): its own field is no kernel choice."""
+    from dew import _cache
+
+    run = RunConfig(diagnostics=dataclasses.replace(
+        RunConfig().diagnostics, kernels=_GeneratedKernels(attention="xla", generated="kept")))
+    with run.traced():
+        choices = dict(_cache.KERNEL_CHOICES.value)
+    assert choices.get("attention") == "xla" and "generated" not in choices
+
+
+def test_a_run_of_before_its_diagnostics_loses_the_retired_choice_it_moves(tmp_path):
+    """A saved run's `kernels` of before its diagnostics held them, naming the retired choice, loads as
+    today's run's diagnostics' kernel choices without it (`earlier_run`)."""
     held = json.loads(PUBLISHED.read_text())
     fields = {key: value for key, value in held["fields"].items() if key != "diagnostics"}
     record = {**held, "fields": {**fields, "kernels": {"attention": "xla", "generated": "generated"}}}
-    assert RunConfig.read(earlier_run(record)).diagnostics.kernels == Kernels(attention="xla")
+    (tmp_path / "run.json").write_text(json.dumps(record))
+    assert RunConfig.load(str(tmp_path)).diagnostics.kernels == Kernels(attention="xla")
+
+
+def test_a_live_run_record_naming_the_retired_choice_is_refused():
+    """A run record read live (`RunConfig.read`: a recipe's, as `dew train recipe.py` rebuilds it) holds
+    each of its fields: one naming the retired choice is refused, as only a saved run's load reads it
+    without (`RunConfig.load`)."""
+    held = json.loads(PUBLISHED.read_text())
+    diagnostics = {**held["fields"]["diagnostics"], "kernels": {"attention": "xla", "generated": "generated"}}
+    record = {**held, "fields": {**held["fields"], "diagnostics": diagnostics}}
+    with pytest.raises(ValueError):
+        RunConfig.read(earlier_run(record))
 
 
 @dataclasses.dataclass(frozen=True)

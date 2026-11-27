@@ -73,8 +73,9 @@ class Kernels:
     # End of the kernel choices.
 
     def named(self) -> dict[str, str]:
-        """The ops it names and the kernel each runs, those it leaves to their picks omitted."""
-        return {field.name: kernel for field in dataclasses.fields(self)
+        """The ops it names and the kernel each runs, those it leaves to their picks omitted: the choices
+        `Kernels` declares, a subclass's own fields (a retired choice it keeps among them) none of them."""
+        return {field.name: kernel for field in dataclasses.fields(Kernels)
                 if (kernel := vars(self)[field.name]) is not None}
 
 

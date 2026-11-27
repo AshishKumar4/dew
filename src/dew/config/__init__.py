@@ -1057,12 +1057,22 @@ class RunConfig:
         # A field its record left to its checkpoints (`earlier_checkpointed`) is read where the run resumes
         # (`resumed`, `check_resumed`), its process prepared: `dew train run.json` reads the run first, before
         # a pool of processes is joined, which no device opened before may be (train 589's review).
-        return cls.read(earlier_run(record), trust=trust)
+        # A saved run: a field a class it holds lost since is read without (`_from_saved`).
+        run_class, fields = cls._named(earlier_run(record), trust)
+        return run_class._from_saved(fields)
 
     @classmethod
     def read(cls, record: Mapping[str, object], *, trust: Sequence[str] = ()) -> Self:
         """The run a class record (`record`) names, as its class, which must be
-        this one or derive from it."""
+        this one or derive from it: a live record, each of whose fields its class
+        holds (a saved run's is read by `load`)."""
+        run_class, fields = cls._named(record, trust)
+        return run_class.from_dict(fields)
+
+    @classmethod
+    def _named(cls, record: Mapping[str, object],
+               trust: Sequence[str]) -> tuple[type[Self], Mapping[str, object]]:
+        """The class a run record names, this one or one deriving from it, and its fields."""
         if record.get("rebuildable") is False:
             reasons = record.get("reasons", [])
             stated = "".join(f"; {reason}" for reason in reasons) if isinstance(reasons, list) else ""
@@ -1079,11 +1089,11 @@ class RunConfig:
         run_class = registry.runs[named[0]]
         if not (isinstance(run_class, type) and issubclass(run_class, cls)):
             raise ValueError(f"the record names {named[0]}, which is no {cls.__name__}")
-        return run_class._from_saved(named[1])
+        return run_class, named[1]
 
     @classmethod
     def _from_saved(cls, fields: Mapping[str, object]) -> Self:
-        """The run a saved record's `fields` state, as every reader of a saved run reads them (`read`,
+        """The run a saved record's `fields` state, as every reader of a saved run reads them (`load`,
         `_saved_as`): a field a class it holds lost since, at any depth, read without
         (`_records.reading_saved`, `_records.DECODED_REMOVED`)."""
         with _records.reading_saved():
