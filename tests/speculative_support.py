@@ -10,6 +10,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from arm_forms import dew_path
+from jax.experimental import checkify
 from reference_error import as_given, assert_as_exact, widened
 
 from dew.nn.inputs import ModelInputs
@@ -59,8 +60,7 @@ def _arms(model, params, *, mask_on_host: bool):
     whole."""
     ops = decode_ops(model, params, 0, 0)
 
-    @jax.jit
-    def replayed(prompts, greedy, counts, fed):
+    def settled_draft(prompts, greedy, counts, fed):
         rows, width = prompts.shape
         block = greedy.shape[1] - 2
         # The drafted candidates the walk's own, but where a row's count stops it: there a token the walk's
@@ -82,6 +82,14 @@ def _arms(model, params, *, mask_on_host: bool):
         first = jnp.take_along_axis(greedy, counts[:, None], axis=1)[:, 0]
         return {**_draft(ops, settled.state, first, fed),
                 "emitted": jnp.where(settled.kept, settled.tokens, -1)}
+
+    # A block's device checks discharged as a decode loop's are (`text._generate`), raised here.
+    checked = jax.jit(checkify.checkify(settled_draft, errors=checkify.user_checks))
+
+    def replayed(prompts, greedy, counts, fed):
+        error, leaves = checked(prompts, greedy, counts, fed)
+        error.throw()
+        return leaves
 
     def history(prompts, greedy, counts):
         """Each row's history, the prompt and its kept tokens, left-padded to one width, its real ones, and
