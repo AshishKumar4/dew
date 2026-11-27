@@ -606,8 +606,9 @@ def test_gemm_quantized_nvfp4_block_matches_bits_nvfp4_coded_and_lowers(gpu: str
 def test_ternary_weights_checkpoint_restore_verifies_form_and_scale(tmp_path):
     """Checkpoint restore (`formats.restored`) restores a matching `TernaryWeights` bank, its words and scale,
     beside a concrete bank the checkpoint holds none of, kept as supplied; and refuses one stored under
-    another form version, read into this Dew's template (the digest it read refused, not its template's), or
-    one of an invalid scale shape (row 12161)."""
+    another form version, read into this Dew's template (the digest it read refused, not its template's), one
+    of an invalid scale shape (row 12161), and a supplied concrete bank of another form or an invalid scale
+    shape, which the restore checks as it checks a read one (train 1390's review)."""
     from dew.checkpoints import Checkpoints
 
     where = jax.sharding.SingleDeviceSharding(jax.devices()[0])
@@ -629,6 +630,9 @@ def test_ternary_weights_checkpoint_restore_verifies_form_and_scale(tmp_path):
     np.testing.assert_array_equal(np.asarray(held["supplied"].words), np.asarray(supplied.words))
     bad_form, bad_scale = (dataclasses.replace(good, form=bytes(8)),
                            dataclasses.replace(good, scale=jnp.ones((3,), jnp.float32)))
+    for foreign in (bad_form, bad_scale):
+        with pytest.raises(ValueError):
+            Checkpoints(str(tmp_path / "ok")).restore({**template({"w": good}), "supplied": foreign})
     for tag, bad, into in (("form", bad_form, good), ("scale", bad_scale, bad_scale)):
         bad_ckpt = Checkpoints(str(tmp_path / tag))
         bad_ckpt.save(1, {"w": bad})

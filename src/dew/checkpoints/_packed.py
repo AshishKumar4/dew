@@ -25,7 +25,7 @@ def _record(node) -> bool:
     """Whether `node` is a packed matrix's checkpoint record (`formats.RECORDS`)."""
     from dew.nn.kernels.formats import RECORDS
 
-    return isinstance(node, tuple(RECORDS.values()))
+    return isinstance(node, tuple(record.type for record in RECORDS.values()))
 
 
 def _held_apart(node) -> bool:
@@ -89,14 +89,15 @@ def _stored_template(tree, stored):
 def _unstored(tree, template):
     """`tree` (a restore's whole read, as `_stored_template` asked it) with each record in it rebuilt into the
     packed matrix `template` holds at its path (`formats.restored`, each process checking the digest rows it
-    holds), the pool agreeing on the outcome first, so every process refuses alike, by its path, a digest
-    that is not this Dew's form."""
+    holds), and each packed matrix the template supplied that the checkpoint held none of checked as it is
+    (`checked`: its form and its scales' shape), the pool agreeing on the outcome first, so every process
+    refuses alike, by its path, a matrix that is not this Dew's form."""
     from dew._coordination import agreed
     from dew.nn.kernels.formats import restored
 
     flat = jax.tree_util.tree_flatten_with_path
     typed = {path: node for path, node in flat(template, is_leaf=_packed)[0] if _packed(node)}
-    read = [(path, node) for path, node in flat(tree, is_leaf=_record)[0] if _record(node)]
+    read = [(path, node) for path, node in flat(tree, is_leaf=_held_apart)[0] if _held_apart(node)]
     if not read:
         return tree
 
@@ -104,11 +105,11 @@ def _unstored(tree, template):
         matrices = {}
         for path, node in read:
             try:
-                matrices[path] = restored(typed[path], node)
+                matrices[path] = restored(typed[path], node) if _record(node) else node.checked()
             except ValueError as error:
                 raise ValueError(f"{jax.tree_util.keystr(path)}: {error}") from error
         return matrices
 
     matrices = agreed("packed forms", rebuilt)
-    return jax.tree_util.tree_map_with_path(lambda path, node: matrices[path] if _record(node) else node,
-                                            tree, is_leaf=_record)
+    return jax.tree_util.tree_map_with_path(lambda path, node: matrices.get(path, node), tree,
+                                            is_leaf=_held_apart)

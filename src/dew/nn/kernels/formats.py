@@ -832,32 +832,42 @@ a checkpoint holding it as its record (`stored`), the digest beside its words th
 (`restored`)."""
 
 
-def _record_type(cls) -> type:
-    """The record a checkpoint holds of a packed matrix of `cls` (`stored`): its data fields' leaves, then its
-    digest `form` a leaf, its other static fields its structure, keyed and ordered as `cls` registered them
-    while its digest was a leaf (before row 13700): every checkpoint, an earlier Dew's too, holds the same
-    leaves at the same paths, and a collection's integrity digest reads the same."""
-    fields = dataclasses.fields(cls)
-    leaves = [(field.name, object) for field in fields if not field.metadata.get("static")]
-    static = [(field.name, object, dataclasses.field(metadata={"static": True})) for field in fields
-              if field.metadata.get("static") and field.name != "form"]
-    record = dataclasses.make_dataclass(f"Stored{cls.__name__}", [*leaves, ("form", object), *static],
-                                        frozen=True)
-    return jax.tree_util.register_dataclass(record)
+@dataclasses.dataclass(frozen=True)
+class _Record:
+    """A packed matrix type's checkpoint record (`stored`) and the one split of its fields both directions
+    read: its data fields (`leaves`, the matrix's array leaves) and its static ones but its digest
+    (`static`). The record type holds the leaves, then the digest `form` a leaf, then the static fields as
+    its structure, keyed and ordered as the matrix type registered them while its digest was a leaf (before
+    row 13700): every checkpoint, an earlier Dew's too, holds the same leaves at the same paths, and a
+    collection's integrity digest reads the same."""
+
+    type: type
+    leaves: tuple[str, ...]
+    static: tuple[str, ...]
+
+    @classmethod
+    def of(cls, matrix_type) -> "_Record":
+        fields = dataclasses.fields(matrix_type)
+        leaves = tuple(field.name for field in fields if not field.metadata.get("static"))
+        static = tuple(field.name for field in fields
+                       if field.metadata.get("static") and field.name != "form")
+        record = dataclasses.make_dataclass(
+            f"Stored{matrix_type.__name__}",
+            [*((name, object) for name in leaves), ("form", object),
+             *((name, object, dataclasses.field(metadata={"static": True})) for name in static)], frozen=True)
+        return cls(jax.tree_util.register_dataclass(record), leaves, static)
 
 
-RECORDS = {cls: _record_type(cls) for cls in PACKED_FORMATS}
-"""Each packed matrix type's checkpoint record (`_record_type`), by the type."""
+RECORDS = {cls: _Record.of(cls) for cls in PACKED_FORMATS}
+"""Each packed matrix type's checkpoint record (`_Record`), by the type."""
 
 
 def record_of(matrix, form):
     """Packed `matrix`'s record (`RECORDS`) holding `form` as its digest leaf (an array, or a restore's asked
     one), `matrix`'s other leaves and static fields its own (`matrix` a restore's template too)."""
-    fields = dataclasses.fields(matrix)
-    leaves = {field.name: getattr(matrix, field.name) for field in fields if not field.metadata.get("static")}
-    static = {field.name: getattr(matrix, field.name) for field in fields
-              if field.metadata.get("static") and field.name != "form"}
-    return RECORDS[type(matrix)](**leaves, form=form, **static)
+    record = RECORDS[type(matrix)]
+    held = {name: getattr(matrix, name) for name in (*record.leaves, *record.static)}
+    return record.type(**held, form=form)
 
 
 def digest_placement(words) -> jax.sharding.Sharding | None:
@@ -896,6 +906,5 @@ def restored(template, record):
     name = type(template).__name__
     if found := _digests(record.form, len(template.form)):
         _checked_form(found, template.FORM_OF, name, template.FACTORY)
-    leaves = {field.name: getattr(record, field.name) for field in dataclasses.fields(record)
-              if field.name != "form" and not field.metadata.get("static")}
+    leaves = {name: getattr(record, name) for name in RECORDS[type(template)].leaves}
     return dataclasses.replace(template, **leaves).checked()

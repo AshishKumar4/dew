@@ -198,10 +198,10 @@ def prepared_as(hook: Callable) -> Prepared:
 
 
 def encoded(value: object) -> JSON:
-    """`value`, an op's field, a launch's argument or a config, as JSON `decoded` rebuilds equal: a
-    scalar, None or string as itself, a list element by element, and every other kind its `_KINDS` entry
-    writes, by its parts: a shape and dtype, a dtype, an enum member, a class and a module-level function (a
-    template's hook) by its module and name, a dataclass, a tuple and a mapping. Anything else, a lambda, a
+    """`value`, an op's field, a launch's argument or a config, as JSON `decoded` rebuilds equal: a scalar,
+    None or string as itself, a list element by element, and every other kind its `_KINDS` entry writes, by
+    its parts: a shape and dtype, a dtype, bytes (as hex), an enum member, a class and a module-level function
+    (a template's hook) by its module and name, a dataclass, a tuple and a mapping. Anything else, a lambda, a
     closure or a local function among them, has no JSON form here, and raises: a measured pick for a launch
     with a hook needs a module-level hook."""
     if value is None or isinstance(value, (bool, int, float, str)):
@@ -291,6 +291,16 @@ def _field[T](reader: Callable[[_records.JSON, str], T], value: _records.JSON, k
         raise Unreadable(str(error)) from error
 
 
+def _bytes(stored: dict) -> bytes:
+    """The bytes a `bytes` kind's hex names (a packed matrix's form digest, a static field of a launch's
+    matrix, row 13700); `Unreadable` where it is no hex."""
+    written = _field(_records.text, stored.get("bytes"), "bytes")
+    try:
+        return bytes.fromhex(written)
+    except ValueError as error:
+        raise Unreadable(f"stored bytes are no hex: {written!r}") from error
+
+
 def _dtype(name: str) -> np.dtype:
     """The dtype `name` names; `Unreadable` where this checkout's NumPy and JAX know none."""
     try:
@@ -363,6 +373,7 @@ _KINDS = (
          beside=lambda value: {"dtype": str(value.dtype)}),
     _Kind("dtype", lambda value: isinstance(value, np.dtype), str,
          lambda stored: _dtype(_field(_records.text, stored.get("dtype"), "dtype"))),
+    _Kind("bytes", lambda value: isinstance(value, bytes), bytes.hex, _bytes),
     _Kind("enum", lambda value: isinstance(value, enum.Enum), lambda value: _named(type(value)), _enum_member,
          beside=lambda value: {"name": value.name}),
     _Kind("class", lambda value: isinstance(value, type), _named,
