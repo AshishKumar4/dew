@@ -17,7 +17,7 @@ import pytest
 from reference_error import assert_as_exact
 
 from dew import algebra
-from dew.algebra import acceptance, component_cases, error, generate, printed
+from dew.algebra import acceptance, component_cases, error, format_cases, generate, printed
 from dew.sampling import guidance_cases
 
 FORMS = [(name, policy) for name, form in generate.DECLARATIONS.items() for policy in form.cases.policies]
@@ -79,14 +79,17 @@ def test_each_generated_form_is_on_par_with_its_declaration(name, policy):
                                   "encode_e4m3", "encode_e5m2", "encode_e2m1", "e8m0_decode",
                                   "decode_e4m3", "decode_e5m2", "selective_read", "e8m0_exponents",
                                   "mxfp8_block_decode", "mxfp8_block_decode_bf16", "selective_token",
-                                  "selective_dx_scale", "selective_state_tangent",
+                                  "selective_dx_scale", "selective_state_tangent", "nvfp4_block_decode",
+                                  "skipped_back",
                                   f"{guidance_cases.__name__}.guided",
                                   f"{guidance_cases.__name__}.guided_tangent"])
 @pytest.mark.parametrize("arm", ["written", "generated"])
 def test_new_template_components_certify_every_primitive_on_the_cpu(name, arm, on_its_platform):
     from certified import assert_certified
 
-    qualified = name if "." in name else f"{component_cases.__name__}.{name}"
+    qualified = name if "." in name else next(
+        f"{module.__name__}.{name}" for module in (component_cases, format_cases)
+        if f"{module.__name__}.{name}" in generate.DECLARATIONS)
     declaration = generate.DECLARATIONS[qualified]
     for policy in declaration.cases.policies:
         function = (declaration.function if arm == "written" else
@@ -117,11 +120,11 @@ def test_shared_component_preserves_layouts_constants_and_live_results():
         fn = functools.partial(tile, axis=axis, keep_product=keep_product, bias=bias)
         separate[name] = printed.formed(jax.make_jaxpr(fn)(*arguments[name]), borrow_shapes=True)[0]
     # An existing emitted body and a public wrapper can both occupy the helper's preferred name.
-    occupied = "_shared_component_0"
+    occupied = "shared_component_0"
     arguments[occupied] = (jax.ShapeDtypeStruct((7,), jnp.bfloat16),)
     separate[occupied] = printed.formed(jax.make_jaxpr(lambda x: (x * x,))(*arguments[occupied]),
                                         borrow_shapes=True)[0]
-    reserved = "_shared_component_1"
+    reserved = "shared_component_1"
     shared = _component_sharing.shared(separate, reserved=(reserved,))
     assert len(shared) == len(separate) + 1 and reserved not in shared
     for name, operands in arguments.items():
@@ -165,7 +168,7 @@ def test_shared_component_preserves_two_ordered_spans_in_one_body():
 
 @pytest.mark.parametrize("kind", ["placed", "duplicate"])
 def test_component_dispatch_refuses_cases_its_flat_key_cannot_distinguish(kind):
-    form = component_cases.ROUNDED.cases[jnp.bfloat16,].forward
+    form = format_cases.ROUNDED.cases[jnp.bfloat16,].forward
     (example,) = form.cases.operands[0]
     if kind == "placed":
         mesh = jax.make_mesh((1,), ("data",), devices=jax.devices()[:1])
@@ -353,7 +356,7 @@ def test_an_unhashable_static_surrogate_case_uses_the_written_primal_and_jvp():
     def tangent(spec, primals, directions, value):
         return precision._rounded_tangent(dtype_of(spec), primals, directions, value)
 
-    paired = dataclasses.replace(component_cases.ROUNDED, forward=forward, tangent=tangent)
+    paired = dataclasses.replace(format_cases.ROUNDED, forward=forward, tangent=tangent)
     composed = paired.assembled(lambda name: getattr(emitted, name))
     options = {"dtype": jnp.bfloat16}
     x = jnp.full((16, 32), 1.003, jnp.float32)

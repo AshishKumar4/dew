@@ -22,12 +22,14 @@ import importlib.metadata
 import importlib.util
 import itertools
 import logging
+import re
 import sys
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from pathlib import Path
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from jax.core import ShapedArray
 from jax.extend import core as jcore
 
@@ -48,7 +50,8 @@ TESTS = "tests/test_algebra_generate.py"
 """The suite every generated module is held by: its forms on par with their declarations (check 1) and the
 written module what generation writes (`--check`)."""
 
-DECLARING = ("dew.algebra.acceptance", "dew.algebra.component_cases", "dew.sampling.guidance_cases")
+DECLARING = ("dew.algebra.acceptance", "dew.algebra.component_cases", "dew.algebra.format_cases",
+             "dew.sampling.guidance_cases")
 """Modules that declare generated functions, imported before generation reads `DECLARATIONS`."""
 
 
@@ -83,6 +86,20 @@ class ComponentForm:
     function: Callable
     truth: Callable
     cases: Cases
+
+def normal_operands(seed: int, operands: tuple[jax.ShapeDtypeStruct, ...]) -> tuple[np.ndarray, ...]:
+    """A case's draw of standard normal operands, each at its shape and dtype: a component's ordinary
+    family."""
+    rng = np.random.default_rng(seed)
+    return tuple(np.asarray(rng.standard_normal(a.shape), dtype=a.dtype) for a in operands)
+
+
+def float32_cases(*shapes: tuple[tuple[int, ...], ...]) -> Cases:
+    """A component's float32 cases, operands at each of `shapes`' cells drawn normal (`normal_operands`) over
+    eight seeds under default numerics."""
+    return Cases(tuple(tuple(jax.ShapeDtypeStruct(shape, jnp.float32) for shape in cell) for cell in shapes),
+                 normal_operands, seeds=8, policies=("default",))
+
 
 _Tree = tuple[jax.tree_util.PyTreeDef]
 
@@ -370,45 +387,96 @@ def _bodies(chosen: Sequence[_Chosen]):
     return bodies, active
 
 
-def _shared_cases(bodies: dict[str, str | printed.Body], active: dict[_Chosen, str], declared: list[str]):
-    # Stable forms containing compensated bindings do not participate in component sharing.
-    if any(isinstance(body, str) for body in bodies.values()):
-        return bodies, {}
-    components = {name: body for name, body in bodies.items() if isinstance(body, printed.Body)}
-    emitted = _component_sharing.shared(components, reserved=declared)
-    shared_names = emitted.keys() - components.keys()
-    shared_bodies = {name: emitted[name] for name in shared_names}
-    bound = {}
-    for found, name in active.items():
-        args = _component_sharing.bound_call(emitted[name], shared_bodies,
-                                             tuple(arg.shape for arg in found.operands))
-        if args is not None:
-            bound[found] = args
-    needed = {name for found, name in active.items() if found not in bound}
-    retained: dict[str, str | printed.Body] = {
-        name: body for name, body in emitted.items() if name in shared_names or name in needed}
-    return retained, bound
+SHARED = "dew.algebra.shared_derived"
+"""The generated module of the component helpers every generated module shares (`_component_sharing`): one
+helper wherever a span recurs, in one declaring module or across several, so a module splits along its own
+seams without writing a helper twice."""
 
 
-def _written(module: str, chosen: Sequence[_Chosen], names: Sequence[str]) -> str:
-    """The generated module's text: its header, each chosen form printed (`printed.source`), and each
-    declaration's function, which picks its form by policy, target and its operands' shapes and dtypes."""
+@dataclasses.dataclass(frozen=True)
+class _Emitted:
+    """A declaring module's generated bodies (`_bodies`) once shared: each body it keeps, and each case a
+    shared helper's call alone answers, bound in its table (`_component_sharing.bound_call`)."""
+
+    bodies: dict[str, str | printed.Body]
+    named: dict[_Chosen, str]
+    bound: dict[_Chosen, printed.Call]
+
+
+def _emitted(by_module: Mapping[str, Sequence[_Chosen]]
+             ) -> tuple[dict[str, _Emitted], dict[str, printed.Body]]:
+    """Each module's bodies with the spans its components share with any other's factored into helpers
+    (`_component_sharing.shared`, over every sharing module at once), and those helpers. A module holding a
+    stable form's compensated text (a body of no bindings to share) keeps its bodies as they are."""
+    per = {module: _bodies(chosen) for module, chosen in by_module.items()}
+    names = [name for bodies, _ in per.values() for name in bodies]
+    if len(set(names)) != len(names):
+        raise ValueError("two declaring modules emit a body of one name; name their declarations apart")
+    sharing = [module for module, (bodies, _) in per.items()
+               if not any(isinstance(body, str) for body in bodies.values())]
+    components = {name: body for module in sharing for name, body in per[module][0].items()
+                  if isinstance(body, printed.Body)}
+    declared = sorted({found.name for chosen in by_module.values() for found in chosen})
+    shared = _component_sharing.shared(components, reserved=declared) if components else {}
+    helpers = {name: body for name, body in shared.items() if name not in components}
+    made = {}
+    for module, (bodies, named) in per.items():
+        if module not in sharing:
+            made[module] = _Emitted(bodies, named, {})
+            continue
+        bound = {}
+        for found, name in named.items():
+            call = _component_sharing.bound_call(shared[name], helpers,
+                                                 tuple(arg.shape for arg in found.operands))
+            if call is not None:
+                bound[found] = call
+        needed = {name for found, name in named.items() if found not in bound}
+        made[module] = _Emitted({name: shared[name] for name in bodies if name in needed}, named, bound)
+    return made, helpers
+
+
+def _header(first: str, names: Sequence[str]) -> list[str]:
     sets = rules.admitted(accurate=False, dev=True)
-    lines = [f'"""Generated by `python -m dew.algebra.generate` from {module}; do not edit.', "",
-             f"Declarations: {', '.join(names)}.",
-             f"Rule sets: {', '.join(found.name for found in sets)}.",
-             f"egglog {importlib.metadata.version('egglog')}; measured on {jax.default_backend()}.",
-             "", "Receipts:"]
+    lines = [f'"""Generated by `python -m dew.algebra.generate` {first}; do not edit.', ""]
+    if names:
+        lines.append(f"Declarations: {', '.join(names)}.")
+    lines += [f"Rule sets: {', '.join(found.name for found in sets)}.",
+              f"egglog {importlib.metadata.version('egglog')}; measured on {jax.default_backend()}.",
+              "", "Receipts:"]
     lines += [f"- {found.name}: {found.receipt}" for found in sets]
-    lines = [*_flowed(lines), '"""', ""]
+    return [*_flowed(lines), '"""', ""]
+
+
+def _rendered(sources: Mapping[str, str | printed.Body]) -> list[str]:
     body: list[str] = []
-    bodies, named = _bodies(chosen)
-    declared = sorted({found.name for found in chosen})
-    emitted, bound = _shared_cases(bodies, named, declared)
-    for name, source in emitted.items():
+    for name, source in sources.items():
         text = source.render(name) if isinstance(source, printed.Body) else source.replace(
             "def form(", f"def {name}(", 1)
         body += ["", "", *text.splitlines()]
+    return body
+
+
+def _helpers_written(helpers: Mapping[str, printed.Body]) -> str:
+    """The shared helpers' module: its header and each helper printed."""
+    body = _rendered(helpers)
+    return "\n".join([*_header("for every generated module's shared spans", ()),
+                      *printed.imports("\n".join(body)), *body]) + "\n"
+
+
+def _helper_reads(body: Sequence[str], helpers: Mapping[str, printed.Body]) -> list[str]:
+    """The shared helpers `body`'s lines call, in their module's order."""
+    text = "\n".join(body)
+    return [name for name in helpers if re.search(rf"(?<![\w.]){name}\b", text)]
+
+
+def _written(module: str, chosen: Sequence[_Chosen], names: Sequence[str], emitted: _Emitted,
+             helpers: Mapping[str, printed.Body]) -> tuple[str, str]:
+    """The generated module's text: its header, each chosen form printed (`printed.source`), the shared
+    helpers it calls imported (`SHARED`), and each declaration's function, which picks its form by policy,
+    target and its operands' shapes and dtypes; and the same module with those helpers written in place of
+    their import, which admission loads before the helpers' module is written (`_admit_components`)."""
+    body = _rendered(emitted.bodies)
+    declared = sorted({found.name for found in chosen})
     for name in declared:
         own = [found for found in chosen if found.name == name]
         single = own[0].single
@@ -419,9 +487,9 @@ def _written(module: str, chosen: Sequence[_Chosen], names: Sequence[str]) -> st
             operands = _runs(repr(operand) for operand in case_of(found.operands))
             body += printed.wrapped(f"    ({found.policy!r}, {found.target!r}, (", operands,
                                     ",)):" if len(operands) == 1 else ")):")
-            binding = bound.get(found)
+            binding = emitted.bound.get(found)
             if binding is None:
-                body.append(f"        {named[found]},")
+                body.append(f"        {emitted.named[found]},")
             elif not binding.keywords:
                 body.append(f"        {binding.callee},")
             else:
@@ -431,7 +499,32 @@ def _written(module: str, chosen: Sequence[_Chosen], names: Sequence[str]) -> st
         body += ["}", "", "", f"def {name}(*operands, policy: str = {policy!r}, target: str = {target!r}):",
                  f'    """{name}\'s generated form for `policy` and `target` at its operands\' case."""',
                  f"    return _generated.call({table}, operands, policy, target, single={single})"]
-    return "\n".join([*lines, *printed.imports("\n".join(body)), *body]) + "\n"
+    header = _header(f"from {module}", names)
+    reads = _helper_reads(body, helpers)
+    imports = printed.imports("\n".join(body))
+    if reads:
+        one = f"from {SHARED} import {', '.join(reads)}"
+        lines = [one] if len(one) <= printed.WIDTH else [
+            f"from {SHARED} import (", *(f"    {name}," for name in reads), ")"]
+        # Within Dew's section, in module order: after `dew.algebra`'s own, before `dew.nn`'s.
+        at = next((index for index, line in enumerate(imports) if line.startswith("from dew.nn")),
+                  len(imports))
+        imports[at:at] = lines
+    text = "\n".join([*header, *imports, *body]) + "\n"
+    inlined = _rendered({name: helpers[name] for name in _closure(reads, helpers)})
+    admitted = "\n".join([*header, *printed.imports("\n".join([*inlined, *body])), *inlined, *body]) + "\n"
+    return text, admitted
+
+
+def _closure(names: Sequence[str], helpers: Mapping[str, printed.Body]) -> list[str]:
+    """`names` and every helper they call in turn, in the helpers' module order."""
+    held, pending = set(), list(names)
+    while pending:
+        if (name := pending.pop()) in held:
+            continue
+        held.add(name)
+        pending += _helper_reads(_rendered({name: helpers[name]}), helpers)
+    return [name for name in helpers if name in held]
 
 
 def _runs(keys: Iterable[str]) -> list[str]:
@@ -491,15 +584,22 @@ def generate(names: Sequence[str] | None = None, *, check: bool = False) -> tupl
     by_module: dict[str, list[str]] = {}
     for qualified in chosen:
         by_module.setdefault(qualified.rsplit(".", 1)[0], []).append(qualified)
-    made, stale = [], []
+    if names is not None and set(chosen) != set(DECLARATIONS):
+        raise ValueError("every declaration generates together: their components share one helper module "
+                         f"({SHARED})")
     sets = tuple(found.name for found in rules.admitted(accurate=False, dev=True))
-    for module, declared in by_module.items():
-        if names is not None and set(declared) != {name for name in DECLARATIONS
-                                                  if name.rsplit(".", 1)[0] == module}:
-            raise ValueError(f"{module}'s module holds every declaration of it: generate them together")
-        found = [one for qualified in declared for one in _chosen(qualified, DECLARATIONS[qualified])]
-        text, path = _written(module, found, declared), _path(module)
-        _admit_components(module, found, text)
+    found = {module: [one for qualified in declared for one in _chosen(qualified, DECLARATIONS[qualified])]
+             for module, declared in by_module.items()}
+    emitted, helpers = _emitted(found)
+    texts = {module: _written(module, found[module], by_module[module], emitted[module], helpers)
+             for module in by_module}
+    for module, (_, admitted) in texts.items():
+        _admit_components(module, found[module], admitted)
+    made, stale = [], []
+    writes = [(_path(module), text, tuple(by_module[module])) for module, (text, _) in texts.items()]
+    package = Path(str(importlib.util.find_spec("dew.algebra").origin))
+    writes.append((package.with_name(f"{SHARED.rsplit('.', 1)[1]}.py"), _helpers_written(helpers), ()))
+    for path, text, declared in writes:
         if check:
             written = path.read_text() if path.exists() else ""
             if written != text:
@@ -507,7 +607,7 @@ def generate(names: Sequence[str] | None = None, *, check: bool = False) -> tupl
                     written.splitlines(), text.splitlines(), "written", "generated", lineterm=""), 40)]))
         else:
             path.write_text(text)
-        made.append(Generated(tuple(declared), str(path), TESTS, sets, importlib.metadata.version("egglog")))
+        made.append(Generated(declared, str(path), TESTS, sets, importlib.metadata.version("egglog")))
     if stale:
         raise ValueError("generated modules differ from what generation writes; run `python -m "
                          "dew.algebra.generate`:\n" + "\n".join(stale))

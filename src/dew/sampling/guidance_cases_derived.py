@@ -29,10 +29,11 @@ import numpy as np
 from jax import lax
 
 from dew.algebra import _generated
+from dew.algebra.shared_derived import shared_component_32
 
 
 def _guided_0(x1, x2, x3):
-    v13, = _shared_component_0(x1, x2, (x1.shape[0], x1.shape[1]), (), jnp.dtype('float32'))
+    v13, = shared_component_32(x1, x2, (x1.shape[0], x1.shape[1]), (), jnp.dtype('float32'))
     v14 = lax.mul_p.bind(v13, x2, out_dtype=None)
     v15 = lax.mul_p.bind(v13, x1, out_dtype=None)
     v16 = lax.mul_p.bind(v13, x2, out_dtype=None)
@@ -63,7 +64,7 @@ def _guided_tangent_0(x1, x2, x3, x4, x5, x6, x7):
     v16 = lax.broadcast_in_dim_p.bind(
         v8, shape=(x1.shape[0], x1.shape[1]), broadcast_dimensions=(0, 1), sharding=None)
     v17 = lax.select_n_p.bind(v16, v15, v12)
-    v27, = _shared_component_0(x1, x2, (x1.shape[0], x1.shape[1]), (), jnp.dtype('float32'))
+    v27, = shared_component_32(x1, x2, (x1.shape[0], x1.shape[1]), (), jnp.dtype('float32'))
     v28 = lax.mul_p.bind(v27, x1, out_dtype=None)
     v29 = lax.mul_p.bind(v27, x2, out_dtype=None)
     v30 = lax.sub_p.bind(v28, v29)
@@ -71,20 +72,6 @@ def _guided_tangent_0(x1, x2, x3, x4, x5, x6, x7):
     v32 = lax.div_p.bind(v31, v27)
     v33 = lax.add_p.bind(v17, v32)
     return (v33,)
-
-
-def _shared_component_0(p0, p1, p2, p3, p4):
-    v0 = lax.abs_p.bind(p0)
-    v1 = lax.abs_p.bind(p1)
-    v2 = lax.max_p.bind(v0, v1)
-    v3 = lax.gt_p.bind(v2, np.array(float.fromhex('0x1.fffffe0000000p+126'), dtype=jnp.dtype('float32')))
-    v4 = np.array(float.fromhex('0x1.0000000000000p-1'), dtype=jnp.dtype('float32'))
-    v5 = np.array(float.fromhex('0x1.0000000000000p+0'), dtype=jnp.dtype('float32'))
-    v6 = lax.broadcast_in_dim_p.bind(v4, shape=p2, broadcast_dimensions=p3, sharding=None)
-    v7 = lax.broadcast_in_dim_p.bind(v5, shape=p2, broadcast_dimensions=p3, sharding=None)
-    v8 = lax.select_n_p.bind(v3, v7, v6)
-    v9 = lax.convert_element_type_p.bind(v8, new_dtype=p4, weak_type=False, sharding=None)
-    return (v9,)
 
 
 _guided_forms: dict[tuple, Callable[..., tuple]] = {

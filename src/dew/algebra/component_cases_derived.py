@@ -2,28 +2,18 @@
 
 Declarations: dew.algebra.component_cases.chunk_carry, dew.algebra.component_cases.chunk_inverse_pullback,
   dew.algebra.component_cases.chunk_pullback, dew.algebra.component_cases.chunk_solve_level,
-  dew.algebra.component_cases.chunk_weighted, dew.algebra.component_cases.decode_e4m3,
-  dew.algebra.component_cases.decode_e5m2, dew.algebra.component_cases.e8m0_decode,
-  dew.algebra.component_cases.e8m0_exponents, dew.algebra.component_cases.encode_e2m1,
-  dew.algebra.component_cases.encode_e4m3, dew.algebra.component_cases.encode_e5m2,
-  dew.algebra.component_cases.fp8_epilogue, dew.algebra.component_cases.gdn_value_pullback,
-  dew.algebra.component_cases.gemm_partial_scale, dew.algebra.component_cases.kda_strict_band,
-  dew.algebra.component_cases.key_dropped_cotangents, dew.algebra.component_cases.key_memory_decay,
-  dew.algebra.component_cases.key_walk_factors, dew.algebra.component_cases.key_weights,
-  dew.algebra.component_cases.keys_cotangent, dew.algebra.component_cases.mxfp8_block_decode,
-  dew.algebra.component_cases.mxfp8_block_decode_bf16, dew.algebra.component_cases.mxfp8_epilogue,
-  dew.algebra.component_cases.mxfp8_scale, dew.algebra.component_cases.nvfp4_payload,
-  dew.algebra.component_cases.nvfp4_scale, dew.algebra.component_cases.online_softmax_step,
-  dew.algebra.component_cases.prefix_difference, dew.algebra.component_cases.quantized_ste,
-  dew.algebra.component_cases.quantized_ste_tangent, dew.algebra.component_cases.queries_cotangent,
-  dew.algebra.component_cases.query_dropped_cotangents, dew.algebra.component_cases.query_walk_factors,
-  dew.algebra.component_cases.query_weights, dew.algebra.component_cases.rounded,
-  dew.algebra.component_cases.rounded_fp16, dew.algebra.component_cases.rounded_fp16_tangent,
-  dew.algebra.component_cases.rounded_tangent, dew.algebra.component_cases.scores,
-  dew.algebra.component_cases.selective_adjoint, dew.algebra.component_cases.selective_decay,
-  dew.algebra.component_cases.selective_dx_scale, dew.algebra.component_cases.selective_read,
-  dew.algebra.component_cases.selective_state_tangent, dew.algebra.component_cases.selective_token,
-  dew.algebra.component_cases.sink_state, dew.algebra.component_cases.sliding_visibility,
+  dew.algebra.component_cases.chunk_weighted, dew.algebra.component_cases.gdn_value_pullback,
+  dew.algebra.component_cases.kda_strict_band, dew.algebra.component_cases.key_dropped_cotangents,
+  dew.algebra.component_cases.key_memory_decay, dew.algebra.component_cases.key_walk_factors,
+  dew.algebra.component_cases.key_weights, dew.algebra.component_cases.keys_cotangent,
+  dew.algebra.component_cases.online_softmax_step, dew.algebra.component_cases.prefix_difference,
+  dew.algebra.component_cases.queries_cotangent, dew.algebra.component_cases.query_dropped_cotangents,
+  dew.algebra.component_cases.query_walk_factors, dew.algebra.component_cases.query_weights,
+  dew.algebra.component_cases.scores, dew.algebra.component_cases.selective_adjoint,
+  dew.algebra.component_cases.selective_decay, dew.algebra.component_cases.selective_dx_scale,
+  dew.algebra.component_cases.selective_read, dew.algebra.component_cases.selective_state_tangent,
+  dew.algebra.component_cases.selective_token, dew.algebra.component_cases.sink_state,
+  dew.algebra.component_cases.skipped_back, dew.algebra.component_cases.sliding_visibility,
   dew.algebra.component_cases.softcap_tile, dew.algebra.component_cases.split_kv_merge,
   dew.algebra.component_cases.ssd_chunk_forward, dew.algebra.component_cases.ssd_chunk_pullback,
   dew.algebra.component_cases.values_gradient, dew.algebra.component_cases.walk_output.
@@ -56,6 +46,24 @@ import numpy as np
 from jax import lax
 
 from dew.algebra import _generated
+from dew.algebra.shared_derived import (
+    shared_component_10,
+    shared_component_11,
+    shared_component_14,
+    shared_component_15,
+    shared_component_16,
+    shared_component_21,
+    shared_component_22,
+    shared_component_24,
+    shared_component_33,
+    shared_component_36,
+    shared_component_37,
+    shared_component_38,
+    shared_component_39,
+    shared_component_41,
+    shared_component_42,
+    shared_component_45,
+)
 
 
 def _chunk_carry_0(x1, x2, x3, x4, x5):
@@ -171,146 +179,12 @@ def _chunk_weighted_0(x1, x2, x3):
     return (v7,)
 
 
-def _decode_e4m3_0(x1):
-    v2 = lax.convert_element_type_p.bind(x1, new_dtype=jnp.dtype('uint32'), weak_type=False, sharding=None)
-    v3 = lax.shift_right_logical_p.bind(v2, np.array(3, dtype=jnp.dtype('uint32')))
-    v4 = lax.and_p.bind(v3, np.array(15, dtype=jnp.dtype('uint32')))
-    v5 = lax.and_p.bind(v2, np.array(7, dtype=jnp.dtype('uint32')))
-    v7, v13, v14 = _shared_component_30(
-        v2, v4, v5, lax.shift_right_logical_p, 7, jnp.dtype('uint32'), lax.shift_left_p, 31, 120, 23, 20,
-        jnp.dtype('float32'))
-    v15 = lax.mul_p.bind(
-        v14, np.array(float.fromhex('0x1.0000000000000p-9'), dtype=jnp.dtype('float32')), out_dtype=None)
-    v20, v21 = _shared_component_36(v4, v7, v15, v13, v2, 0, jnp.dtype('uint32'), 127)
-    v22 = lax.gt_p.bind(v21, np.array(126, dtype=jnp.dtype('uint32')))
-    v23 = lax.ne_p.bind(v7, np.array(0, dtype=jnp.dtype('uint32')))
-    v29, = _shared_component_23(
-        v23, v22, v20, jnp.dtype('uint32'), lax.shift_left_p, 31, 2143289344, jnp.dtype('float32'))
-    return (v29,)
-
-
-def _decode_e5m2_0(x1):
-    v2 = lax.convert_element_type_p.bind(x1, new_dtype=jnp.dtype('uint32'), weak_type=False, sharding=None)
-    v3 = lax.shift_right_logical_p.bind(v2, np.array(2, dtype=jnp.dtype('uint32')))
-    v4 = lax.and_p.bind(v3, np.array(31, dtype=jnp.dtype('uint32')))
-    v5 = lax.and_p.bind(v2, np.array(3, dtype=jnp.dtype('uint32')))
-    v7, v13, v14 = _shared_component_30(
-        v2, v4, v5, lax.shift_right_logical_p, 7, jnp.dtype('uint32'), lax.shift_left_p, 31, 112, 23, 21,
-        jnp.dtype('float32'))
-    v15 = lax.mul_p.bind(
-        v14, np.array(float.fromhex('0x1.0000000000000p-16'), dtype=jnp.dtype('float32')), out_dtype=None)
-    v20, v21 = _shared_component_36(v4, v7, v15, v13, v2, 0, jnp.dtype('uint32'), 127)
-    v22 = lax.or_p.bind(v7, np.array(2139095040, dtype=jnp.dtype('uint32')))
-    v23 = lax.bitcast_convert_type_p.bind(v22, new_dtype=jnp.dtype('float32'))
-    v24 = lax.eq_p.bind(v21, np.array(124, dtype=jnp.dtype('uint32')))
-    v25 = lax.select_n_p.bind(v24, v20, v23)
-    v26 = lax.gt_p.bind(v21, np.array(124, dtype=jnp.dtype('uint32')))
-    v27 = lax.ne_p.bind(v7, np.array(0, dtype=jnp.dtype('uint32')))
-    v33, = _shared_component_23(
-        v27, v26, v25, jnp.dtype('uint32'), lax.shift_left_p, 31, 2143289344, jnp.dtype('float32'))
-    return (v33,)
-
-
-def _e8m0_decode_0(x1):
-    v2 = lax.convert_element_type_p.bind(x1, new_dtype=jnp.dtype('uint32'), weak_type=False, sharding=None)
-    v3 = lax.and_p.bind(v2, np.array(255, dtype=jnp.dtype('uint32')))
-    v4 = lax.shift_left_p.bind(v3, np.array(23, dtype=jnp.dtype('uint32')))
-    v5 = lax.add_p.bind(np.array(0, dtype=jnp.dtype('uint32')), v3)
-    v6 = lax.add_p.bind(np.array(1, dtype=jnp.dtype('uint32')), v5)
-    v7 = lax.and_p.bind(v6, np.array(254, dtype=jnp.dtype('uint32')))
-    v8 = lax.broadcast_in_dim_p.bind(
-        np.array(1, dtype=jnp.dtype('uint32')), shape=(x1.shape[0], x1.shape[1]), broadcast_dimensions=(),
-        sharding=None)
-    v9 = lax.min_p.bind(v7, v8)
-    v10 = lax.shift_left_p.bind(v9, np.array(22, dtype=jnp.dtype('uint32')))
-    v11 = lax.broadcast_in_dim_p.bind(
-        np.array(4194304, dtype=jnp.dtype('uint32')), shape=(x1.shape[0], x1.shape[1]),
-        broadcast_dimensions=(), sharding=None)
-    v12 = lax.broadcast_in_dim_p.bind(
-        np.array(0, dtype=jnp.dtype('uint32')), shape=(x1.shape[0], x1.shape[1]), broadcast_dimensions=(),
-        sharding=None)
-    v13 = lax.not_p.bind(v4)
-    v14 = lax.not_p.bind(v10)
-    v15 = lax.and_p.bind(v13, v14)
-    v33, = _shared_component_25(v15, v11, v12, v10, v4)
-    v34 = lax.bitcast_convert_type_p.bind(v33, new_dtype=jnp.dtype('float32'))
-    v35 = lax.bitcast_convert_type_p.bind(v34, new_dtype=jnp.dtype('uint32'))
-    return (v35,)
-
-
-def _e8m0_exponents_0(x1):
-    v2 = lax.bitcast_convert_type_p.bind(x1, new_dtype=jnp.dtype('float8_e8m0fnu'))
-    v3 = lax.bitcast_convert_type_p.bind(v2, new_dtype=jnp.dtype('uint8'))
-    v4 = lax.convert_element_type_p.bind(v3, new_dtype=jnp.dtype('int32'), weak_type=False, sharding=None)
-    v5 = lax.sub_p.bind(v4, np.array(127, dtype=jnp.dtype('int32')))
-    v6 = lax.eq_p.bind(v4, np.array(255, dtype=jnp.dtype('int32')))
-    return (v5, v6)
-
-
-def _fp8_epilogue_0(x1):
-    v2, v23, v215 = _shared_component_12(
-        x1, jnp.dtype('bfloat16'), jnp.dtype('float32'), (32, 1, 128), (2,), (x1.shape[0], 1, x1.shape[1]),
-        (0, 1), (32, 128), jnp.dtype('uint32'), lax.shift_right_logical_p, 23, 255, 8388607,
-        jnp.dtype('int32'), 127, 0, (x1.shape[0], x1.shape[1]), (), lax.shift_left_p, 254, 2147483648,
-        jnp.dtype('uint8'), jnp.dtype('float8_e4m3fn'))
-    return (v2, v215, v23)
-
-
-def _fp8_epilogue_1(x1):
-    v2, v23, v215 = _shared_component_12(
-        x1, jnp.dtype('bfloat16'), jnp.dtype('float32'), (64, 2, 128), (2,), (x1.shape[0], 2, 128), (0, 1),
-        (64, 256), jnp.dtype('uint32'), lax.shift_right_logical_p, 23, 255, 8388607, jnp.dtype('int32'), 127,
-        0, (x1.shape[0], x1.shape[1]), (), lax.shift_left_p, 254, 2147483648, jnp.dtype('uint8'),
-        jnp.dtype('float8_e4m3fn'))
-    return (v2, v215, v23)
-
-
 def _gdn_value_pullback_0(x1, x2, x3):
     v4 = lax.broadcast_in_dim_p.bind(x3, shape=(x1.shape[0], 1), broadcast_dimensions=(0,), sharding=None)
     v5 = lax.mul_p.bind(x1, v4, out_dtype=None)
     v6 = lax.mul_p.bind(x1, x2, out_dtype=None)
     v7 = lax.reduce_sum_p.bind(v6, axes=(1,), out_sharding=None)
     return (v5, v7)
-
-
-def _gemm_partial_scale_0(x1, x2, x3):
-    v4 = lax.broadcast_in_dim_p.bind(x2, shape=(x1.shape[0], 1), broadcast_dimensions=(0,), sharding=None)
-    v5 = lax.broadcast_in_dim_p.bind(x3, shape=(1, x1.shape[1]), broadcast_dimensions=(1,), sharding=None)
-    v6 = lax.mul_p.bind(x1, v4, out_dtype=None)
-    v7 = lax.abs_p.bind(v6)
-    v8 = lax.lt_p.bind(v7, np.array(float('inf'), dtype=jnp.dtype('float32')))
-    v9 = lax.ge_p.bind(v7, np.array(float.fromhex('0x1.0000000000000p-126'), dtype=jnp.dtype('float32')))
-    v10 = lax.and_p.bind(v8, v9)
-    v11 = lax.eq_p.bind(x1, np.array(float.fromhex('0x0.0p+0'), dtype=jnp.dtype('float32')))
-    v12 = lax.or_p.bind(v10, v11)
-    v13 = lax.broadcast_in_dim_p.bind(
-        v4, shape=(x1.shape[0], x1.shape[1]), broadcast_dimensions=(0, 1), sharding=None)
-    v14 = lax.broadcast_in_dim_p.bind(
-        v5, shape=(x1.shape[0], x1.shape[1]), broadcast_dimensions=(0, 1), sharding=None)
-    v15 = lax.select_n_p.bind(v12, v14, v13)
-    v16 = lax.mul_p.bind(x1, v15, out_dtype=None)
-    v17 = lax.mul_p.bind(v4, v5, out_dtype=None)
-    v18 = lax.abs_p.bind(v16)
-    v19 = lax.lt_p.bind(v18, np.array(float('inf'), dtype=jnp.dtype('float32')))
-    v20 = lax.ge_p.bind(v18, np.array(float.fromhex('0x1.0000000000000p-126'), dtype=jnp.dtype('float32')))
-    v21 = lax.and_p.bind(v19, v20)
-    v22 = lax.not_p.bind(v21)
-    v23 = lax.ne_p.bind(x1, np.array(float.fromhex('0x0.0p+0'), dtype=jnp.dtype('float32')))
-    v24 = lax.and_p.bind(v22, v23)
-    v25 = lax.abs_p.bind(v17)
-    v26 = lax.lt_p.bind(v25, np.array(float('inf'), dtype=jnp.dtype('float32')))
-    v27 = lax.ge_p.bind(v25, np.array(float.fromhex('0x1.0000000000000p-126'), dtype=jnp.dtype('float32')))
-    v28 = lax.and_p.bind(v26, v27)
-    v29 = lax.and_p.bind(v24, v28)
-    v30 = lax.select_n_p.bind(v29, v16, x1)
-    v31 = lax.broadcast_in_dim_p.bind(
-        v5, shape=(x1.shape[0], x1.shape[1]), broadcast_dimensions=(0, 1), sharding=None)
-    v32 = lax.broadcast_in_dim_p.bind(
-        v4, shape=(x1.shape[0], x1.shape[1]), broadcast_dimensions=(0, 1), sharding=None)
-    v33 = lax.select_n_p.bind(v12, v32, v31)
-    v34 = lax.select_n_p.bind(v29, v33, v17)
-    v35 = lax.mul_p.bind(v30, v34, out_dtype=None)
-    return (v35,)
 
 
 def _kda_strict_band_0(x1):
@@ -341,7 +215,7 @@ def _kda_strict_band_0(x1):
 
 
 def _key_dropped_cotangents_0(x1, x2, x3, x4, x5, x6, x7, x8, x9):
-    v15, v21, v46 = _shared_component_15(
+    v15, v21, v46 = shared_component_16(
         x3, x1, x4, x2, x7, x5, x9, x6, x8, (x1.shape[1],), (), (x1.shape[0], x1.shape[1]), (1,),
         (1, x1.shape[1]))
     return (v15, v21, v46)
@@ -361,7 +235,7 @@ def _key_memory_decay_1(x1, x2):
 
 
 def _key_weights_0(x1, x2, x3):
-    v9, _, v15 = _shared_component_21(
+    v9, _, v15 = shared_component_24(
         x2, x1, x3, (x1.shape[1],), (), (x1.shape[0], x1.shape[1]), (1,), (1, x1.shape[1]))
     return (v9, v15)
 
@@ -377,70 +251,6 @@ def _keys_cotangent_0(x1, x2, x3, x4, x5):
     v11 = lax.mul_p.bind(x1, v10, out_dtype=None)
     v12 = lax.select_n_p.bind(x5, v6, v11)
     return (v12,)
-
-
-def _mxfp8_block_decode_0(x1, x2):
-    v130, = _shared_component_40(
-        x2, x1, jnp.dtype('float8_e8m0fnu'), jnp.dtype('uint8'), jnp.dtype('int32'),
-        (x1.shape[0], x2.shape[1], x1.shape[0]), (0, 1), (32, 256), jnp.dtype('float8_e4m3fn'),
-        jnp.dtype('float32'), jnp.dtype('uint32'), lax.shift_right_logical_p, lax.shift_left_p,
-        (x1.shape[0], x1.shape[1]), ())
-    return (v130,)
-
-
-def _mxfp8_block_decode_1(x1, x2):
-    v130, = _shared_component_40(
-        x2, x1, jnp.dtype('float8_e8m0fnu'), jnp.dtype('uint8'), jnp.dtype('int32'),
-        (x1.shape[0], x2.shape[1], 32), (0, 1), (64, 128), jnp.dtype('float8_e4m3fn'), jnp.dtype('float32'),
-        jnp.dtype('uint32'), lax.shift_right_logical_p, lax.shift_left_p, (x1.shape[0], x1.shape[1]), ())
-    return (v130,)
-
-
-def _mxfp8_block_decode_bf16_0(x1, x2):
-    v132, = _shared_component_39(
-        x2, x1, jnp.dtype('float8_e8m0fnu'), jnp.dtype('uint8'), jnp.dtype('int32'),
-        (x1.shape[0], x2.shape[1], x1.shape[0]), (0, 1), (32, 256), jnp.dtype('float8_e4m3fn'),
-        jnp.dtype('float32'), jnp.dtype('uint32'), lax.shift_right_logical_p, lax.shift_left_p,
-        (x1.shape[0], x1.shape[1]), (), 16, jnp.dtype('uint16'), jnp.dtype('bfloat16'))
-    return (v132,)
-
-
-def _mxfp8_block_decode_bf16_1(x1, x2):
-    v132, = _shared_component_39(
-        x2, x1, jnp.dtype('float8_e8m0fnu'), jnp.dtype('uint8'), jnp.dtype('int32'),
-        (x1.shape[0], x2.shape[1], 32), (0, 1), (64, 128), jnp.dtype('float8_e4m3fn'), jnp.dtype('float32'),
-        jnp.dtype('uint32'), lax.shift_right_logical_p, lax.shift_left_p, (x1.shape[0], x1.shape[1]), (), 16,
-        jnp.dtype('uint16'), jnp.dtype('bfloat16'))
-    return (v132,)
-
-
-def _mxfp8_scale_0(x1):
-    v2 = lax.bitcast_convert_type_p.bind(x1, new_dtype=jnp.dtype('float32'))
-    v19, v25 = _shared_component_17(
-        v2, jnp.dtype('uint32'), lax.shift_right_logical_p, 23, 255, jnp.dtype('int32'), 127, 8, 0,
-        (x1.shape[0], x1.shape[1]), ())
-    return (v19, v25)
-
-
-def _nvfp4_scale_0(x1):
-    v2 = lax.convert_element_type_p.bind(x1, new_dtype=jnp.dtype('uint32'), weak_type=False, sharding=None)
-    v3 = lax.shift_right_logical_p.bind(v2, np.array(3, dtype=jnp.dtype('uint32')))
-    v4 = lax.shift_left_p.bind(v2, np.array(20, dtype=jnp.dtype('uint32')))
-    v5 = lax.shift_left_p.bind(v3, np.array(27, dtype=jnp.dtype('uint32')))
-    v6 = lax.xor_p.bind(v4, v5)
-    v7 = lax.and_p.bind(v6, np.array(2280652800, dtype=jnp.dtype('uint32')))
-    v8, v14, v15, v16, v34, v44, v52 = _shared_component_28(
-        v7, jnp.dtype('float32'), jnp.dtype('uint32'), lax.shift_right_logical_p, jnp.dtype('int32'),
-        lax.shift_left_p, 120, 127, 23)
-    v62, = _shared_component_14(
-        v14, v52, v34, v44, v15, v16, v8, -126, jnp.dtype('int32'), 255, 0, jnp.dtype('float32'))
-    v63 = lax.and_p.bind(v2, np.array(127, dtype=jnp.dtype('uint32')))
-    v64 = lax.eq_p.bind(v63, np.array(127, dtype=jnp.dtype('uint32')))
-    v65 = lax.and_p.bind(v2, np.array(128, dtype=jnp.dtype('uint32')))
-    v66 = lax.ne_p.bind(v65, np.array(0, dtype=jnp.dtype('uint32')))
-    v72, = _shared_component_23(
-        v66, v64, v62, jnp.dtype('uint32'), lax.shift_left_p, 31, 2143289344, jnp.dtype('float32'))
-    return (v72,)
 
 
 def _online_softmax_step_0(x1, x2, x3, x4, x5):
@@ -476,48 +286,31 @@ def _prefix_difference_0(x1, x2, x3, x4):
     return (v11,)
 
 
-def _quantized_ste_0(x1, x2):
-    v3 = lax.convert_element_type_p.bind(x2, new_dtype=jnp.dtype('float32'), weak_type=False, sharding=None)
-    return (v3,)
-
-
-def _quantized_ste_tangent_0(x1, x2, x3, x4, x5):
-    return (x3,)
-
-
 def _queries_cotangent_0(x1, x2, x3, x4, x5, x6, x7, x8):
     v9 = lax.broadcast_in_dim_p.bind(
         x3, shape=(x1.shape[0], x1.shape[1]), broadcast_dimensions=(0,), sharding=None)
     v10 = lax.sub_p.bind(x1, v9)
     v11 = lax.min_p.bind(v10, np.array(float.fromhex('0x0.0p+0'), dtype=jnp.dtype('float32')))
-    v12, v17, v18 = _shared_component_34(v11, x4, (x1.shape[0],), (), (x1.shape[0], 1), (0,))
+    v12, v17, v18 = shared_component_38(v11, x4, (x1.shape[0],), (), (x1.shape[0], 1), (0,))
     v19 = lax.broadcast_in_dim_p.bind(
         np.array(float.fromhex('0x0.0p+0'), dtype=jnp.dtype('float32')), shape=(x1.shape[0], x1.shape[1]),
         broadcast_dimensions=(), sharding=None)
-    v26, = _shared_component_33(x5, x2, x8, v19, x6, v17, v12, (x1.shape[0], 1), (0,))
+    v26, = shared_component_37(x5, x2, x8, v19, x6, v17, v12, (x1.shape[0], 1), (0,))
     v27 = lax.select_n_p.bind(x7, v19, v26)
     return (v12, v18, v27)
 
 
 def _query_dropped_cotangents_0(x1, x2, x3, x4, x5, x6, x7, x8, x9):
-    v15, v21, v46 = _shared_component_15(
+    v15, v21, v46 = shared_component_16(
         x3, x1, x4, x2, x7, x5, x9, x6, x8, (x1.shape[0],), (), (x1.shape[0], x1.shape[1]), (0,),
         (x1.shape[0], 1))
     return (v15, v21, v46)
 
 
 def _query_weights_0(x1, x2, x3):
-    v9, _, v15 = _shared_component_21(
+    v9, _, v15 = shared_component_24(
         x2, x1, x3, (x1.shape[0],), (), (x1.shape[0], x1.shape[1]), (0,), (x1.shape[0], 1))
     return (v9, v15)
-
-
-def _rounded_fp16_tangent_0(x1, x2, x3):
-    return (x2,)
-
-
-def _rounded_tangent_0(x1, x2, x3):
-    return (x2,)
 
 
 def _scores_0(x1, x2, x3):
@@ -538,7 +331,7 @@ def _scores_0(x1, x2, x3):
 
 
 def _selective_adjoint_0(x1, x2, x3, x4, x5, x6, x7, x8, x9):
-    v11, v13, v16 = _shared_component_35(x1, x2, x3, x7, x5, x6, x9)
+    v11, v13, v16 = shared_component_39(x1, x2, x3, x7, x5, x6, x9)
     v17 = lax.mul_p.bind(x1, x5, out_dtype=None)
     v18 = lax.mul_p.bind(v17, x6, out_dtype=None)
     v19 = lax.mul_p.bind(x3, x2, out_dtype=None)
@@ -577,12 +370,12 @@ def _selective_dx_scale_0(x1, x2, x3):
     v12 = lax.broadcast_in_dim_p.bind(v10, shape=(x2.shape[0],), broadcast_dimensions=(), sharding=None)
     v13 = lax.broadcast_in_dim_p.bind(v11, shape=(x2.shape[0],), broadcast_dimensions=(), sharding=None)
     v14 = lax.select_n_p.bind(v9, v13, v12)
-    v67, = _shared_component_29(
-        v4, v14, jnp.dtype('uint32'), lax.shift_right_logical_p, jnp.dtype('int32'), lax.shift_left_p, 127,
-        23, jnp.dtype('float32'))
-    v120, = _shared_component_29(
-        x3, v14, jnp.dtype('uint32'), lax.shift_right_logical_p, jnp.dtype('int32'), lax.shift_left_p, 127,
-        23, jnp.dtype('float32'))
+    v67, = shared_component_15(
+        v4, v14, jnp.dtype('uint32'), 2147483648, lax.shift_right_logical_p, 23, 255, 8388607,
+        jnp.dtype('int32'), 31, 0, lax.shift_left_p, 127, -126, jnp.dtype('float32'))
+    v120, = shared_component_15(
+        x3, v14, jnp.dtype('uint32'), 2147483648, lax.shift_right_logical_p, 23, 255, 8388607,
+        jnp.dtype('int32'), 31, 0, lax.shift_left_p, 127, -126, jnp.dtype('float32'))
     v121 = np.array(float.fromhex('0x1.0000000000000p-64'), dtype=jnp.dtype('float32'))
     v122 = np.array(float.fromhex('0x1.0000000000000p+0'), dtype=jnp.dtype('float32'))
     v123 = lax.broadcast_in_dim_p.bind(v121, shape=(x2.shape[0],), broadcast_dimensions=(), sharding=None)
@@ -594,15 +387,15 @@ def _selective_dx_scale_0(x1, x2, x3):
 def _selective_read_0(
         x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x12, x13, x14, x15, x16, x17, x18, x19, x20, x21, x22,
         x23, x24, x25, x26, x27, x28, x29, x30, x31, x32, x33, x34):
-    v35, v36, v37, v38, v39, v40, v41, v42 = _shared_component_13(
+    v35, v36, v37, v38, v39, v40, v41, v42 = shared_component_14(
         x17, x1, x18, x2, x19, x3, x20, x4, x21, x5, x22, x6, x23, x7, x24, x8)
-    v43, v44, v45, v46, v47, v48, v49, v50 = _shared_component_13(
+    v43, v44, v45, v46, v47, v48, v49, v50 = shared_component_14(
         x25, x9, x26, x10, x27, x11, x28, x12, x29, x13, x30, x14, x31, x15, x32, x16)
-    v51, v52, v53, v54, v55, v56 = _shared_component_19(
+    v51, v52, v53, v54, v55, v56 = shared_component_22(
         v35, v36, v37, v38, v39, v40, v41, v42, v43, v44, v45, v46)
     v57 = lax.add_p.bind(v47, v48)
     v58 = lax.add_p.bind(v49, v50)
-    v67, = _shared_component_31(v51, v52, v53, v54, v55, v56, v57, v58, x33, x34)
+    v67, = shared_component_33(v51, v52, v53, v54, v55, v56, v57, v58, x33, x34)
     return (v67,)
 
 
@@ -611,39 +404,39 @@ def _selective_read_1(
         x23, x24, x25, x26, x27, x28, x29, x30, x31, x32, x33, x34, x35, x36, x37, x38, x39, x40, x41, x42,
         x43, x44, x45, x46, x47, x48, x49, x50, x51, x52, x53, x54, x55, x56, x57, x58, x59, x60, x61, x62,
         x63, x64, x65, x66):
-    v67, v68, v69, v70, v71, v72, v73, v74 = _shared_component_13(
+    v67, v68, v69, v70, v71, v72, v73, v74 = shared_component_14(
         x33, x1, x34, x2, x35, x3, x36, x4, x37, x5, x38, x6, x39, x7, x40, x8)
-    v75, v76, v77, v78, v79, v80, v81, v82 = _shared_component_13(
+    v75, v76, v77, v78, v79, v80, v81, v82 = shared_component_14(
         x41, x9, x42, x10, x43, x11, x44, x12, x45, x13, x46, x14, x47, x15, x48, x16)
-    v83, v84, v85, v86, v87, v88, v89, v90 = _shared_component_13(
+    v83, v84, v85, v86, v87, v88, v89, v90 = shared_component_14(
         x49, x17, x50, x18, x51, x19, x52, x20, x53, x21, x54, x22, x55, x23, x56, x24)
-    v91, v92, v93, v94, v95, v96, v97, v98 = _shared_component_13(
+    v91, v92, v93, v94, v95, v96, v97, v98 = shared_component_14(
         x57, x25, x58, x26, x59, x27, x60, x28, x61, x29, x62, x30, x63, x31, x64, x32)
-    v99, v100, v101, v102, v103, v104 = _shared_component_19(
+    v99, v100, v101, v102, v103, v104 = shared_component_22(
         v67, v68, v69, v70, v71, v72, v73, v74, v75, v76, v77, v78)
-    v105, v106, v107, v108, v109, v110 = _shared_component_19(
+    v105, v106, v107, v108, v109, v110 = shared_component_22(
         v79, v80, v81, v82, v83, v84, v85, v86, v87, v88, v89, v90)
-    v111, v112, v113, v114, v115, v116 = _shared_component_19(
+    v111, v112, v113, v114, v115, v116 = shared_component_22(
         v91, v92, v93, v94, v95, v96, v97, v98, v99, v100, v101, v102)
-    v117, v118, v119, v120, v121, v122 = _shared_component_19(
+    v117, v118, v119, v120, v121, v122 = shared_component_22(
         v103, v104, v105, v106, v107, v108, v109, v110, v111, v112, v113, v114)
-    v131, = _shared_component_31(v115, v116, v117, v118, v119, v120, v121, v122, x65, x66)
+    v131, = shared_component_33(v115, v116, v117, v118, v119, v120, v121, v122, x65, x66)
     return (v131,)
 
 
 def _selective_state_tangent_0(x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x12):
-    _, v16, v19 = _shared_component_35(x3, x4, x5, x9, x12, x8, x11)
+    _, v16, v19 = shared_component_39(x3, x4, x5, x9, x12, x8, x11)
     v20 = lax.add_p.bind(x1, v16)
     v21 = lax.add_p.bind(x2, v19)
     return (v20, v21)
 
 
 def _selective_token_0(x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x12, x13, x14):
-    v17, v20 = _shared_component_37(x13, x5, x6)
-    v23, v26 = _shared_component_37(x13, x7, x8)
+    v17, v20 = shared_component_41(x13, x5, x6)
+    v23, v26 = shared_component_41(x13, x7, x8)
     v27 = lax.mul_p.bind(x13, x14, out_dtype=None)
-    v30, v33 = _shared_component_10(v17, x1, v27, x9, v20, x2, x10)
-    v36, v39 = _shared_component_10(v23, x3, v27, x11, v26, x4, x12)
+    v30, v33 = shared_component_11(v17, x1, v27, x9, v20, x2, x10)
+    v36, v39 = shared_component_11(v23, x3, v27, x11, v26, x4, x12)
     return (v30, v33, v36, v39)
 
 
@@ -651,24 +444,33 @@ def _selective_token_1(
         x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x12, x13, x14, x15, x16, x17, x18, x19, x20, x21, x22,
         x23, x24, x25, x26, x27, x28, x29, x30, x31, x32, x33, x34, x35, x36, x37, x38, x39, x40, x41, x42,
         x43, x44, x45, x46, x47, x48, x49, x50, x51):
-    v55, v59 = _shared_component_9(x49, x17, x51, x18)
-    v63, v67 = _shared_component_9(x49, x19, x51, x20)
-    v71, v75 = _shared_component_9(x49, x21, x51, x22)
-    v79, v83 = _shared_component_9(x49, x23, x51, x24)
-    v87, v91 = _shared_component_9(x49, x25, x51, x26)
-    v95, v99 = _shared_component_9(x49, x27, x51, x28)
-    v103, v107 = _shared_component_9(x49, x29, x51, x30)
-    v111, v115 = _shared_component_9(x49, x31, x51, x32)
+    v55, v59 = shared_component_10(x49, x17, x51, x18)
+    v63, v67 = shared_component_10(x49, x19, x51, x20)
+    v71, v75 = shared_component_10(x49, x21, x51, x22)
+    v79, v83 = shared_component_10(x49, x23, x51, x24)
+    v87, v91 = shared_component_10(x49, x25, x51, x26)
+    v95, v99 = shared_component_10(x49, x27, x51, x28)
+    v103, v107 = shared_component_10(x49, x29, x51, x30)
+    v111, v115 = shared_component_10(x49, x31, x51, x32)
     v116 = lax.mul_p.bind(x49, x50, out_dtype=None)
-    v119, v122 = _shared_component_10(v55, x1, v116, x33, v59, x2, x34)
-    v125, v128 = _shared_component_10(v63, x3, v116, x35, v67, x4, x36)
-    v131, v134 = _shared_component_10(v71, x5, v116, x37, v75, x6, x38)
-    v137, v140 = _shared_component_10(v79, x7, v116, x39, v83, x8, x40)
-    v143, v146 = _shared_component_10(v87, x9, v116, x41, v91, x10, x42)
-    v149, v152 = _shared_component_10(v95, x11, v116, x43, v99, x12, x44)
-    v155, v158 = _shared_component_10(v103, x13, v116, x45, v107, x14, x46)
-    v161, v164 = _shared_component_10(v111, x15, v116, x47, v115, x16, x48)
+    v119, v122 = shared_component_11(v55, x1, v116, x33, v59, x2, x34)
+    v125, v128 = shared_component_11(v63, x3, v116, x35, v67, x4, x36)
+    v131, v134 = shared_component_11(v71, x5, v116, x37, v75, x6, x38)
+    v137, v140 = shared_component_11(v79, x7, v116, x39, v83, x8, x40)
+    v143, v146 = shared_component_11(v87, x9, v116, x41, v91, x10, x42)
+    v149, v152 = shared_component_11(v95, x11, v116, x43, v99, x12, x44)
+    v155, v158 = shared_component_11(v103, x13, v116, x45, v107, x14, x46)
+    v161, v164 = shared_component_11(v111, x15, v116, x47, v115, x16, x48)
     return (v119, v122, v125, v128, v131, v134, v137, v140, v143, v146, v149, v152, v155, v158, v161, v164)
+
+
+def _skipped_back_0(x1, x2, x3):
+    v4 = lax.broadcast_in_dim_p.bind(
+        x3, shape=(1, x1.shape[1], 1), broadcast_dimensions=(1, 2), sharding=None)
+    v5 = lax.mul_p.bind(v4, x1, out_dtype=None)
+    v6 = lax.mul_p.bind(x1, x2, out_dtype=None)
+    v7 = lax.reduce_sum_p.bind(v6, axes=(2,), out_sharding=None)
+    return (v5, v7)
 
 
 def _sliding_visibility_0(x1, x2, x3, x4, x5):
@@ -738,7 +540,7 @@ def _split_kv_merge_0(x1, x2, x3, x4, x5, x6):
 
 
 def _ssd_chunk_forward_0(x1, x2, x3, x4, x5):
-    _, _, v22, v24, v32, v34, v36 = _shared_component_18(
+    _, _, v22, v24, v32, v34, v36 = shared_component_21(
         x4, x2, x3, jnp.dtype('int32'), (x1.shape[0], x1.shape[0]), (1, x1.shape[0]), (1,),
         jnp.dtype('float32'), (0, 1), (), 63, (0,), (1, 0))
     v37 = lax.mul_p.bind(v36, v22, out_dtype=None)
@@ -767,7 +569,7 @@ def _ssd_chunk_forward_0(x1, x2, x3, x4, x5):
 
 
 def _ssd_chunk_pullback_0(x1, x2, x3, x4, x5, x6, x7):
-    v10, v11, v24, v26, v34, v36, v38 = _shared_component_18(
+    v10, v11, v24, v26, v34, v36, v38 = shared_component_21(
         x4, x2, x3, jnp.dtype('int32'), (x1.shape[0], x1.shape[0]), (1, x1.shape[0]), (1,),
         jnp.dtype('float32'), (0, 1), (), 63, (0,), (1, 0))
     v39 = lax.transpose_p.bind(x1, permutation=(1, 0))
@@ -835,7 +637,7 @@ def _ssd_chunk_pullback_0(x1, x2, x3, x4, x5, x6, x7):
     v76 = lax.iota_p.bind(
         dtype=jnp.dtype('int32'), shape=(x1.shape[0], x1.shape[0]), dimension=0, sharding=None)
     v77 = lax.eq_p.bind(v76, np.array(63, dtype=jnp.dtype('int32')))
-    v83, = _shared_component_38(
+    v83, = shared_component_42(
         v69, v77, (1, x1.shape[0]), (1,), jnp.dtype('float32'), (x1.shape[0], x1.shape[0]), (0, 1), ())
     v84 = lax.add_p.bind(v75, v83)
     v85 = lax.convert_element_type_p.bind(v11, new_dtype=jnp.dtype('float32'), weak_type=False, sharding=None)
@@ -901,799 +703,6 @@ def _walk_output_0(x1, x2, x3):
     v7 = lax.broadcast_in_dim_p.bind(v6, shape=(x1.shape[0], 1), broadcast_dimensions=(0,), sharding=None)
     v8 = lax.div_p.bind(x1, v7)
     return (v8,)
-
-
-def _shared_component_0(p4, p5, p0, p1, p2, p3):
-    v0 = lax.broadcast_in_dim_p.bind(np.array(p0, dtype=p1), shape=p2, broadcast_dimensions=p3, sharding=None)
-    v1 = lax.broadcast_in_dim_p.bind(np.array(p0, dtype=p1), shape=p2, broadcast_dimensions=p3, sharding=None)
-    v2 = lax.not_p.bind(p4)
-    v3 = lax.and_p.bind(v2, p5)
-    v4 = lax.not_p.bind(v0)
-    v5 = lax.and_p.bind(v3, v4)
-    v6 = lax.or_p.bind(v1, v5)
-    v7 = lax.not_p.bind(p4)
-    v8 = lax.and_p.bind(v7, p5)
-    v26, = _shared_component_25(v8, v0, v6, p5, p4)
-    return (v26,)
-
-
-def _shared_component_1(p0, p7, p1, p2, p3, p4, p5, p6):
-    v0 = lax.and_p.bind(p0, np.array(p1, dtype=p2))
-    v1 = lax.population_count_p.bind(v0)
-    v2 = lax.convert_element_type_p.bind(v1, new_dtype=p3, weak_type=False, sharding=None)
-    v3 = lax.convert_element_type_p.bind(v2, new_dtype=p2, weak_type=False, sharding=None)
-    v4 = lax.and_p.bind(v3, np.array(p4, dtype=p2))
-    v5 = p5.bind(v4, np.array(p6, dtype=p2))
-    v6 = lax.or_p.bind(p7, v5)
-    return (v6,)
-
-
-def _shared_component_2(
-        p0, p1, p6, p8, p9, p20, p21, p3, p4, p5, p7, p10, p11, p12, p13, p14, p15, p16, p17, p18, p19, p22):
-    v0, = _shared_component_0(p0, p1, 0, p3, p4, p5)
-    v1 = lax.ne_p.bind(p6, np.array(p7, dtype=p3))
-    v2 = lax.select_n_p.bind(v1, p8, v0)
-    v3 = lax.sub_p.bind(np.array(p7, dtype=p3), p9)
-    v4 = lax.add_p.bind(np.array(p7, dtype=p3), v3)
-    v5 = lax.add_p.bind(np.array(p10, dtype=p3), v4)
-    v6 = lax.broadcast_in_dim_p.bind(
-        np.array(p11, dtype=p3), shape=p4, broadcast_dimensions=p5, sharding=None)
-    v7 = lax.convert_element_type_p.bind(v5, new_dtype=p12, weak_type=False, sharding=None)
-    v8 = lax.convert_element_type_p.bind(v6, new_dtype=p12, weak_type=False, sharding=None)
-    v9 = lax.min_p.bind(v7, v8)
-    v10 = lax.convert_element_type_p.bind(v9, new_dtype=p3, weak_type=False, sharding=None)
-    v11 = lax.add_p.bind(np.array(p13, dtype=p3), np.array(p7, dtype=p3))
-    v12 = lax.ne_p.bind(p6, np.array(p7, dtype=p3))
-    v13 = lax.broadcast_in_dim_p.bind(v11, shape=p4, broadcast_dimensions=p5, sharding=None)
-    v14 = lax.select_n_p.bind(v12, v10, v13)
-    v15 = lax.add_p.bind(np.array(p7, dtype=p3), v14)
-    v16 = lax.add_p.bind(np.array(p14, dtype=p3), v15)
-    v17 = lax.add_p.bind(np.array(p15, dtype=p3), np.array(p7, dtype=p3))
-    v23, = _shared_component_27(v16, p11, p3, p16, v17, p17, p7, p4, p5)
-    v24 = lax.add_p.bind(np.array(p7, dtype=p3), v23)
-    v25 = lax.add_p.bind(v24, v2)
-    v26 = lax.add_p.bind(np.array(p14, dtype=p3), v25)
-    v32, = _shared_component_27(v14, p11, p3, p18, v2, p17, p7, p4, p5)
-    v41, = _shared_component_24(p15, p3, p4, p5, p7, v32)
-    v42 = lax.add_p.bind(np.array(p7, dtype=p3), v26)
-    v43 = lax.add_p.bind(v42, v41)
-    v44 = lax.add_p.bind(np.array(p7, dtype=p3), v43)
-    v50, = _shared_component_27(v14, p11, p3, p18, v44, p17, p7, p4, p5)
-    v51 = lax.add_p.bind(np.array(p19, dtype=p3), np.array(p7, dtype=p3))
-    v52 = lax.ne_p.bind(p20, np.array(p7, dtype=p3))
-    v53 = lax.broadcast_in_dim_p.bind(v51, shape=p4, broadcast_dimensions=p5, sharding=None)
-    v54 = lax.select_n_p.bind(v52, v50, v53)
-    v55 = p16.bind(p21, np.array(p22, dtype=p3))
-    v56, = _shared_component_0(v54, v55, 0, p3, p4, p5)
-    return (v56,)
-
-
-def _shared_component_3(
-        p1, p0, p2, p3, p4, p5, p6, p7, p8, p9, p10, p11, p12, p13, p14, p15, p18, p20, p24, p25):
-    v0 = p0.bind(p1, np.array(p2, dtype=p3))
-    v9, = _shared_component_24(p4, p3, p5, p6, p7, p1)
-    v10 = lax.broadcast_in_dim_p.bind(
-        np.array(p8, dtype=p3), shape=p5, broadcast_dimensions=p6, sharding=None)
-    v11 = lax.min_p.bind(v9, v10)
-    v12 = lax.broadcast_in_dim_p.bind(
-        np.array(p9, dtype=p3), shape=p5, broadcast_dimensions=p6, sharding=None)
-    v13 = lax.gt_p.bind(v9, v12)
-    v14 = lax.convert_element_type_p.bind(v13, new_dtype=p3, weak_type=False, sharding=None)
-    v15 = p0.bind(v11, np.array(p10, dtype=p3))
-    v16 = lax.add_p.bind(np.array(p7, dtype=p3), v15)
-    v17 = lax.add_p.bind(np.array(p11, dtype=p3), v16)
-    v26, = _shared_component_24(p12, p3, p5, p6, p7, v11)
-    v27 = lax.broadcast_in_dim_p.bind(
-        np.array(p13, dtype=p3), shape=p5, broadcast_dimensions=p6, sharding=None)
-    v28 = lax.convert_element_type_p.bind(v17, new_dtype=p14, weak_type=False, sharding=None)
-    v29 = lax.convert_element_type_p.bind(v27, new_dtype=p14, weak_type=False, sharding=None)
-    v30 = lax.ge_p.bind(v28, v29)
-    v31 = lax.convert_element_type_p.bind(v30, new_dtype=p3, weak_type=False, sharding=None)
-    v32 = lax.broadcast_in_dim_p.bind(
-        np.array(p13, dtype=p3), shape=p5, broadcast_dimensions=p6, sharding=None)
-    v33 = lax.min_p.bind(v15, v32)
-    v34 = p15.bind(v33, np.array(p10, dtype=p3))
-    v35, = _shared_component_0(v34, v26, 0, p3, p5, p6)
-    v36 = lax.ne_p.bind(v31, np.array(p7, dtype=p3))
-    v37 = lax.select_n_p.bind(v36, v35, v26)
-    v38 = p15.bind(v17, np.array(p10, dtype=p3))
-    v39, = _shared_component_2(
-        v38, v26, v31, v37, v17, v14, v0, p3, p5, p6, 0, p18, 31, p14, p20, 4294967295, 1, p15, 32, p0, p24,
-        p25)
-    return (v39,)
-
-
-def _shared_component_4(p3, p0, p1, p2):
-    v0 = np.array(p0, dtype=p1)
-    v1 = np.array(p2, dtype=p1)
-    v2 = lax.convert_element_type_p.bind(v0, new_dtype=p1, weak_type=False, sharding=None)
-    v3 = lax.max_p.bind(v2, p3)
-    v4 = lax.convert_element_type_p.bind(v1, new_dtype=p1, weak_type=False, sharding=None)
-    v5 = lax.min_p.bind(v4, v3)
-    return (v5,)
-
-
-def _shared_component_5(
-        p0, p3, p15, p1, p2, p6, p10, p11, p14, p16, p17, p18, p19, p20, p21, p22, p23, p24, p27, p28):
-    v0 = lax.sub_p.bind(p0, np.array(p1, dtype=p2))
-    v1, = _shared_component_4(p3, -65536, p2, 65536)
-    v2, = _shared_component_4(v0, p6, p2, 65536)
-    v3 = lax.sub_p.bind(v2, v1)
-    v4, = _shared_component_4(v3, 1, p2, 31)
-    v5 = lax.convert_element_type_p.bind(v4, new_dtype=p10, weak_type=False, sharding=None)
-    v6 = lax.le_p.bind(v3, np.array(p11, dtype=p2))
-    v7 = lax.neg_p.bind(v3)
-    v8, = _shared_component_4(v7, 0, p2, 31)
-    v9 = lax.convert_element_type_p.bind(v8, new_dtype=p10, weak_type=False, sharding=None)
-    v10 = p14.bind(p15, v9)
-    v11 = lax.le_p.bind(v3, np.array(p16, dtype=p2))
-    v12 = p17.bind(p15, v5)
-    v13 = np.array(p11, dtype=p10)
-    v14 = lax.broadcast_in_dim_p.bind(v13, shape=p18, broadcast_dimensions=p19, sharding=None)
-    v15 = lax.select_n_p.bind(v11, v14, v12)
-    v16 = lax.select_n_p.bind(v6, v15, v10)
-    v17 = p14.bind(np.array(p20, dtype=p10), v5)
-    v18 = lax.sub_p.bind(v17, np.array(p20, dtype=p10))
-    v19 = lax.and_p.bind(p15, v18)
-    v20 = lax.sub_p.bind(v5, np.array(p20, dtype=p10))
-    v21 = p14.bind(np.array(p20, dtype=p10), v20)
-    v22 = lax.and_p.bind(v16, np.array(p20, dtype=p10))
-    v23 = lax.eq_p.bind(v22, np.array(p20, dtype=p10))
-    v24 = lax.and_p.bind(np.array(np.True_, dtype=jnp.dtype('bool')), v23)
-    v25 = lax.or_p.bind(np.array(np.False_, dtype=jnp.dtype('bool')), v24)
-    v26 = lax.ge_p.bind(v3, np.array(p20, dtype=p2))
-    v27 = lax.le_p.bind(v3, np.array(p16, dtype=p2))
-    v28 = lax.and_p.bind(v26, v27)
-    v29 = lax.gt_p.bind(v19, v21)
-    v30 = lax.eq_p.bind(v19, v21)
-    v31 = lax.and_p.bind(v30, v25)
-    v32 = lax.or_p.bind(v29, v31)
-    v33 = lax.and_p.bind(v28, v32)
-    v34 = lax.eq_p.bind(v3, np.array(p21, dtype=p2))
-    v35 = lax.gt_p.bind(p15, np.array(p22, dtype=p10))
-    v36 = lax.eq_p.bind(p15, np.array(p22, dtype=p10))
-    v37 = lax.and_p.bind(v36, np.array(np.False_, dtype=jnp.dtype('bool')))
-    v38 = lax.or_p.bind(v35, v37)
-    v39 = lax.and_p.bind(v34, v38)
-    v40 = lax.or_p.bind(v33, v39)
-    v41 = lax.convert_element_type_p.bind(v40, new_dtype=p10, weak_type=False, sharding=None)
-    v42 = lax.add_p.bind(v16, v41)
-    v43 = lax.add_p.bind(v2, np.array(p23, dtype=p2))
-    v44 = lax.add_p.bind(v43, np.array(p1, dtype=p2))
-    v45 = lax.ge_p.bind(v44, np.array(p24, dtype=p2))
-    v46, = _shared_component_4(v44, 1, p2, 254)
-    v47 = lax.convert_element_type_p.bind(v46, new_dtype=p10, weak_type=False, sharding=None)
-    v48 = p14.bind(v47, np.array(p1, dtype=p10))
-    v49 = lax.add_p.bind(v48, v42)
-    v50 = lax.sub_p.bind(v49, np.array(p27, dtype=p10))
-    v51 = np.array(p28, dtype=p10)
-    v52 = lax.broadcast_in_dim_p.bind(v51, shape=p18, broadcast_dimensions=p19, sharding=None)
-    v53 = lax.select_n_p.bind(v45, v50, v52)
-    return (v53,)
-
-
-def _shared_component_6(p0, p1, p2, p3, p4, p5, p6, p7, p8, p11, p12, p13, p14):
-    v0 = lax.bitcast_convert_type_p.bind(p0, new_dtype=p1)
-    v1 = lax.and_p.bind(v0, np.array(p2, dtype=p1))
-    v2 = p3.bind(v0, np.array(p4, dtype=p1))
-    v3 = lax.and_p.bind(v2, np.array(p5, dtype=p1))
-    v4 = lax.and_p.bind(v0, np.array(p6, dtype=p1))
-    v5 = lax.bitcast_convert_type_p.bind(v1, new_dtype=p7)
-    v6 = lax.bitcast_convert_type_p.bind(v3, new_dtype=p7)
-    v7 = lax.bitcast_convert_type_p.bind(v4, new_dtype=p7)
-    v8 = lax.clz_p.bind(v7)
-    v9 = lax.sub_p.bind(np.array(p8, dtype=p7), v8)
-    v10 = lax.sub_p.bind(np.array(p4, dtype=p7), v9)
-    v11, = _shared_component_4(v10, 0, p7, 23)
-    v12 = lax.gt_p.bind(v6, np.array(p11, dtype=p7))
-    v13 = p12.bind(v7, v11)
-    v14 = lax.and_p.bind(v13, np.array(p6, dtype=p7))
-    v15 = lax.select_n_p.bind(v12, v14, v7)
-    v16 = lax.gt_p.bind(v6, np.array(p11, dtype=p7))
-    v17 = lax.sub_p.bind(v6, np.array(p13, dtype=p7))
-    v18 = lax.sub_p.bind(np.array(p14, dtype=p7), v11)
-    v19 = lax.select_n_p.bind(v16, v18, v17)
-    return (v5, v6, v7, v15, v19)
-
-
-def _shared_component_7(
-        p0, p9, p1, p2, p3, p4, p5, p6, p7, p8, p10, p11, p12, p13, p14, p15, p16, p17, p18, p19, p20, p21,
-        p23, p25, p26, p32, p33):
-    v0 = lax.bitcast_convert_type_p.bind(p0, new_dtype=p1)
-    v1 = lax.bitcast_convert_type_p.bind(v0, new_dtype=p2)
-    v2 = lax.convert_element_type_p.bind(v1, new_dtype=p3, weak_type=False, sharding=None)
-    v3 = lax.sub_p.bind(v2, np.array(p4, dtype=p3))
-    v4 = lax.eq_p.bind(v2, np.array(p5, dtype=p3))
-    v5 = lax.broadcast_in_dim_p.bind(v3, shape=p6, broadcast_dimensions=p7, sharding=None)
-    v6 = lax.reshape_p.bind(v5, new_sizes=p8, dimensions=None, sharding=None)
-    v7 = lax.broadcast_in_dim_p.bind(v4, shape=p6, broadcast_dimensions=p7, sharding=None)
-    v8 = lax.reshape_p.bind(v7, new_sizes=p8, dimensions=None, sharding=None)
-    v9 = lax.bitcast_convert_type_p.bind(p9, new_dtype=p10)
-    v10 = lax.convert_element_type_p.bind(v9, new_dtype=p11, weak_type=False, sharding=None)
-    v11 = lax.bitcast_convert_type_p.bind(v10, new_dtype=p12)
-    v12 = lax.and_p.bind(v11, np.array(p13, dtype=p12))
-    v13 = p14.bind(v11, np.array(p15, dtype=p12))
-    v14 = lax.and_p.bind(v13, np.array(p5, dtype=p12))
-    v15 = lax.and_p.bind(v11, np.array(p16, dtype=p12))
-    v16 = lax.ne_p.bind(v14, np.array(p17, dtype=p12))
-    v17 = lax.or_p.bind(v15, np.array(p18, dtype=p12))
-    v18 = lax.select_n_p.bind(v16, v15, v17)
-    v19 = lax.convert_element_type_p.bind(v14, new_dtype=p3, weak_type=False, sharding=None)
-    v20 = lax.sub_p.bind(v19, np.array(p19, dtype=p3))
-    v21 = lax.add_p.bind(v20, v6)
-    v22 = lax.add_p.bind(v21, np.array(p15, dtype=p3))
-    v23, = _shared_component_5(
-        v22, v21, v18, p20, p3, p21, p12, 0, p23, 31, p14, p25, p26, 1, 32, 2147483648, 127, 255, p32, p33)
-    return (v8, v9, v12, v18, v23)
-
-
-def _shared_component_8(
-        p1, p4, p5, p0, p2, p3, p7, p97, p98, p99, p100, p101, p102, p103, p104, p105, p106, p111, p116, p117,
-        p120):
-    v0 = p0.bind(p1, np.array(p2, dtype=p3))
-    v1 = lax.or_p.bind(p4, v0)
-    v7, = _shared_component_20(
-        p5, v1, p3, p7, p0, 67372033, 2, 41943168, 3, 16777216, 4, 33554432, 5, 67108864, 6, 134217730, 7)
-    v13, = _shared_component_20(
-        p5, v7, p3, p7, p0, 67371009, 8, 536872968, 9, 67174400, 10, 134348802, 11, 67108865, 12, 134217728,
-        13)
-    v19, = _shared_component_20(
-        p5, v13, p3, p7, p0, 67371013, 14, 536870920, 15, 1073745920, 16, 2147491872, 17, 1077952528, 18,
-        537395208, 19)
-    v25, = _shared_component_20(
-        p5, v19, p3, p7, p0, 268435456, 20, 536870912, 21, 1073741824, 22, 2147483680, 23, 1077936144, 24,
-        33587328, 25)
-    v31, = _shared_component_20(
-        p5, v25, p3, p7, p0, 1074790400, 26, 2149580832, 27, 1073741840, 28, 2147483648, 29, 1077936208, 30,
-        33554560, 31)
-    v32 = lax.transpose_p.bind(v31, permutation=p97)
-    v33 = lax.transpose_p.bind(v32, permutation=p97)
-    v34 = p98.bind(v33, np.array(p99, dtype=p3))
-    v35 = p0.bind(v33, np.array(p100, dtype=p3))
-    v36 = lax.or_p.bind(v34, v35)
-    v37 = p0.bind(v33, np.array(p101, dtype=p3))
-    v38 = p0.bind(v33, np.array(p99, dtype=p3))
-    v39 = p0.bind(v36, np.array(p101, dtype=p3))
-    v40 = lax.xor_p.bind(v33, v36)
-    v41 = lax.and_p.bind(v40, np.array(p102, dtype=p3))
-    v42 = lax.xor_p.bind(v33, v38)
-    v43 = lax.and_p.bind(v42, np.array(p102, dtype=p3))
-    v44 = lax.xor_p.bind(v33, v39)
-    v45 = lax.and_p.bind(v44, np.array(p102, dtype=p3))
-    v46 = lax.and_p.bind(v37, np.array(p102, dtype=p3))
-    v47 = lax.stack_p.bind(v41, v43, v45, v46, axis=2)
-    v48 = lax.bitcast_convert_type_p.bind(v47, new_dtype=p103)
-    v49 = lax.reshape_p.bind(v48, new_sizes=p104, dimensions=None, sharding=None)
-    v50 = lax.transpose_p.bind(v49, permutation=p97)
-    v51 = lax.convert_element_type_p.bind(v50, new_dtype=p3, weak_type=False, sharding=None)
-    v52 = p0.bind(v51, np.array(p105, dtype=p3))
-    v53, v54, v55, v56, v59, v64, v67 = _shared_component_28(v52, p106, p3, p98, p111, p0, p116, p117, p120)
-    return (v53, v54, v55, v56, v59, v64, v67)
-
-
-def _shared_component_9(p0, p1, p2, p3):
-    v0 = lax.mul_p.bind(p0, p1, out_dtype=None)
-    v1 = lax.mul_p.bind(
-        v0, np.array(float.fromhex('0x1.7154760000000p+0'), dtype=jnp.dtype('float32')), out_dtype=None)
-    v2 = lax.exp2_p.bind(v1, accuracy=None)
-    v3 = lax.mul_p.bind(v2, p2, out_dtype=None)
-    v4 = lax.mul_p.bind(p0, p3, out_dtype=None)
-    v5 = lax.mul_p.bind(
-        v4, np.array(float.fromhex('0x1.7154760000000p+0'), dtype=jnp.dtype('float32')), out_dtype=None)
-    v6 = lax.exp2_p.bind(v5, accuracy=None)
-    v7 = lax.mul_p.bind(v6, p2, out_dtype=None)
-    return (v3, v7)
-
-
-def _shared_component_10(p0, p1, p2, p3, p4, p5, p6):
-    v0 = lax.mul_p.bind(p0, p1, out_dtype=None)
-    v1 = lax.mul_p.bind(p2, p3, out_dtype=None)
-    v2 = lax.add_p.bind(v0, v1)
-    v3 = lax.mul_p.bind(p4, p5, out_dtype=None)
-    v4 = lax.mul_p.bind(p2, p6, out_dtype=None)
-    v5 = lax.add_p.bind(v3, v4)
-    return (v2, v5)
-
-
-def _shared_component_11(p0, p2, p6, p1, p3, p4, p5, p7, p8, p9, p10):
-    v0 = lax.bitcast_convert_type_p.bind(p0, new_dtype=p1)
-    v1 = lax.bitcast_convert_type_p.bind(p2, new_dtype=p3)
-    v2 = lax.and_p.bind(v1, np.array(p4, dtype=p3))
-    v3 = lax.eq_p.bind(v2, np.array(p4, dtype=p3))
-    v4 = lax.eq_p.bind(v1, np.array(p5, dtype=p3))
-    v5 = lax.not_p.bind(p6)
-    v6 = lax.and_p.bind(v4, v5)
-    v7 = lax.or_p.bind(v3, p6)
-    v13, = _shared_component_23(v6, v7, v0, p7, p8, p9, p10, p1)
-    return (v13,)
-
-
-def _shared_component_12(
-        p0, p1, p2, p3, p4, p5, p6, p7, p8, p9, p10, p11, p12, p13, p14, p15, p16, p17, p18, p19, p20, p34,
-        p35):
-    v0 = lax.convert_element_type_p.bind(p0, new_dtype=p1, weak_type=False, sharding=None)
-    v1 = lax.convert_element_type_p.bind(v0, new_dtype=p2, weak_type=False, sharding=None)
-    v2 = lax.abs_p.bind(v1)
-    v3 = lax.reshape_p.bind(v2, new_sizes=p3, dimensions=None, sharding=None)
-    v4 = lax.reduce_max_p.bind(v3, axes=p4, out_sharding=None)
-    v5 = lax.broadcast_in_dim_p.bind(v4, shape=p5, broadcast_dimensions=p6, sharding=None)
-    v6 = lax.reshape_p.bind(v5, new_sizes=p7, dimensions=None, sharding=None)
-    v7 = lax.max_p.bind(v6, np.array(float.fromhex('0x1.a36e2e0000000p-14'), dtype=jnp.dtype('float32')))
-    v8 = lax.mul_p.bind(
-        v7, np.array(float.fromhex('0x1.24924a0000000p-9'), dtype=jnp.dtype('float32')), out_dtype=None)
-    v9 = lax.bitcast_convert_type_p.bind(v8, new_dtype=p8)
-    v10 = p9.bind(v9, np.array(p10, dtype=p8))
-    v11 = lax.and_p.bind(v10, np.array(p11, dtype=p8))
-    v12 = lax.and_p.bind(v9, np.array(p12, dtype=p8))
-    v13 = lax.convert_element_type_p.bind(v11, new_dtype=p13, weak_type=False, sharding=None)
-    v14 = lax.sub_p.bind(v13, np.array(p14, dtype=p13))
-    v15 = lax.ne_p.bind(v12, np.array(p15, dtype=p8))
-    v16 = lax.convert_element_type_p.bind(v15, new_dtype=p13, weak_type=False, sharding=None)
-    v17 = lax.add_p.bind(v14, v16)
-    v18 = lax.add_p.bind(v17, np.array(p14, dtype=p13))
-    v19 = lax.broadcast_in_dim_p.bind(
-        np.array(p10, dtype=p13), shape=p16, broadcast_dimensions=p17, sharding=None)
-    v20 = p18.bind(v18, v19)
-    v21 = lax.bitcast_convert_type_p.bind(v20, new_dtype=p2)
-    v22 = lax.bitcast_convert_type_p.bind(v21, new_dtype=p8)
-    v23 = p9.bind(v22, np.array(p10, dtype=p8))
-    v24 = lax.and_p.bind(v23, np.array(p11, dtype=p8))
-    v25 = lax.sub_p.bind(np.array(p19, dtype=p8), v24)
-    v26 = p18.bind(v25, np.array(p10, dtype=p8))
-    v27 = lax.bitcast_convert_type_p.bind(v26, new_dtype=p2)
-    v28 = lax.eq_p.bind(v24, np.array(p11, dtype=p8))
-    v29 = lax.eq_p.bind(v22, np.array(p20, dtype=p8))
-    v30 = np.array(float('-inf'), dtype=jnp.dtype('float32'))
-    v31 = lax.broadcast_in_dim_p.bind(v30, shape=p16, broadcast_dimensions=p17, sharding=None)
-    v32 = lax.select_n_p.bind(v29, v27, v31)
-    v33 = np.array(float.fromhex('0x0.0p+0'), dtype=jnp.dtype('float32'))
-    v34 = lax.broadcast_in_dim_p.bind(v33, shape=p16, broadcast_dimensions=p17, sharding=None)
-    v35 = lax.select_n_p.bind(v28, v32, v34)
-    v36 = lax.mul_p.bind(v1, v35, out_dtype=None)
-    v37 = lax.bitcast_convert_type_p.bind(v36, new_dtype=p8)
-    v38, = _shared_component_3(
-        v37, p9, 31, p8, 2147483647, p16, p17, 0, 1138753536, 2139095040, 23, 4294967176, 8388607, 1, p13,
-        p18, 21, 20, 127, 7)
-    v39 = lax.convert_element_type_p.bind(v38, new_dtype=p34, weak_type=False, sharding=None)
-    v40 = lax.bitcast_convert_type_p.bind(v39, new_dtype=p35)
-    return (v0, v21, v40)
-
-
-def _shared_component_13(p0, p1, p2, p3, p4, p5, p6, p7, p8, p9, p10, p11, p12, p13, p14, p15):
-    v0 = lax.mul_p.bind(p0, p1, out_dtype=None)
-    v1 = lax.mul_p.bind(p2, p3, out_dtype=None)
-    v2 = lax.mul_p.bind(p4, p5, out_dtype=None)
-    v3 = lax.mul_p.bind(p6, p7, out_dtype=None)
-    v4 = lax.mul_p.bind(p8, p9, out_dtype=None)
-    v5 = lax.mul_p.bind(p10, p11, out_dtype=None)
-    v6 = lax.mul_p.bind(p12, p13, out_dtype=None)
-    v7 = lax.mul_p.bind(p14, p15, out_dtype=None)
-    return (v0, v1, v2, v3, v4, v5, v6, v7)
-
-
-def _shared_component_14(p0, p1, p2, p5, p6, p9, p11, p3, p4, p7, p8, p10):
-    v0 = lax.or_p.bind(p0, p1)
-    v1 = lax.ge_p.bind(p2, np.array(p3, dtype=p4))
-    v2 = lax.select_n_p.bind(v1, v0, p5)
-    v3 = lax.eq_p.bind(p6, np.array(p7, dtype=p4))
-    v4 = lax.eq_p.bind(p6, np.array(p8, dtype=p4))
-    v5 = lax.eq_p.bind(p9, np.array(p8, dtype=p4))
-    v6 = lax.and_p.bind(v4, v5)
-    v7 = lax.or_p.bind(v3, v6)
-    v8 = lax.bitcast_convert_type_p.bind(v2, new_dtype=p10)
-    v9 = lax.select_n_p.bind(v7, v8, p11)
-    return (v9,)
-
-
-def _shared_component_15(p0, p5, p6, p8, p9, p10, p11, p12, p13, p1, p2, p3, p4, p7):
-    v5, v10, v11 = _shared_component_21(p0, p5, p6, p1, p2, p3, p4, p7)
-    v12 = lax.broadcast_in_dim_p.bind(
-        np.array(float.fromhex('0x0.0p+0'), dtype=jnp.dtype('float32')), shape=p3, broadcast_dimensions=p2,
-        sharding=None)
-    v13 = lax.mul_p.bind(p8, p9, out_dtype=None)
-    v14, = lax.optimization_barrier_p.bind(v13)
-    v21, = _shared_component_33(p10, v14, p11, v12, p12, v10, v5, p7, p4)
-    v22 = lax.abs_p.bind(v21)
-    v23 = lax.lt_p.bind(v22, np.array(float('inf'), dtype=jnp.dtype('float32')))
-    v24 = lax.mul_p.bind(
-        v14, np.array(float.fromhex('0x1.0000000000000p-2'), dtype=jnp.dtype('float32')), out_dtype=None)
-    v25 = lax.mul_p.bind(
-        p10, np.array(float.fromhex('0x1.0000000000000p-2'), dtype=jnp.dtype('float32')), out_dtype=None)
-    v26 = lax.broadcast_in_dim_p.bind(v25, shape=p7, broadcast_dimensions=p4, sharding=None)
-    v27 = lax.sub_p.bind(v24, v26)
-    v28 = lax.select_n_p.bind(p11, v27, v12)
-    v29 = lax.mul_p.bind(
-        p12, np.array(float.fromhex('0x1.0000000000000p-2'), dtype=jnp.dtype('float32')), out_dtype=None)
-    v30 = lax.broadcast_in_dim_p.bind(v29, shape=p7, broadcast_dimensions=p4, sharding=None)
-    v31 = lax.sub_p.bind(v28, v30)
-    v32 = lax.mul_p.bind(v31, v10, out_dtype=None)
-    v33 = lax.mul_p.bind(v5, v32, out_dtype=None)
-    v34 = lax.mul_p.bind(
-        v33, np.array(float.fromhex('0x1.0000000000000p+2'), dtype=jnp.dtype('float32')), out_dtype=None)
-    v35 = lax.select_n_p.bind(v23, v34, v21)
-    v36 = lax.select_n_p.bind(p13, v12, v35)
-    return (v5, v11, v36)
-
-
-def _shared_component_16(p0, p5, p6, p1, p2, p3, p4, p7, p8):
-    v0 = lax.eq_p.bind(p0, np.array(p1, dtype=p2))
-    v1 = np.array(p1, dtype=p2)
-    v2 = lax.broadcast_in_dim_p.bind(v1, shape=p3, broadcast_dimensions=p4, sharding=None)
-    v3 = lax.select_n_p.bind(v0, p5, v2)
-    v4 = lax.or_p.bind(p6, v3)
-    v5 = lax.or_p.bind(p6, np.array(p7, dtype=p2))
-    v6 = np.array(np.False_, dtype=jnp.dtype('bool'))
-    v7 = lax.select_n_p.bind(v6, v4, v5)
-    v8 = np.array(np.False_, dtype=jnp.dtype('bool'))
-    v9 = np.array(p8, dtype=p2)
-    v10 = lax.broadcast_in_dim_p.bind(v9, shape=p3, broadcast_dimensions=p4, sharding=None)
-    v11 = lax.select_n_p.bind(v8, v7, v10)
-    return (v11,)
-
-
-def _shared_component_17(p0, p1, p2, p3, p4, p5, p6, p7, p10, p11, p12):
-    v0 = lax.bitcast_convert_type_p.bind(p0, new_dtype=p1)
-    v1 = p2.bind(v0, np.array(p3, dtype=p1))
-    v2 = lax.and_p.bind(v1, np.array(p4, dtype=p1))
-    v3 = lax.convert_element_type_p.bind(v2, new_dtype=p5, weak_type=False, sharding=None)
-    v4 = lax.ne_p.bind(v3, np.array(p4, dtype=p5))
-    v5 = lax.sub_p.bind(v3, np.array(p6, dtype=p5))
-    v6 = lax.sub_p.bind(v5, np.array(p7, dtype=p5))
-    v7, = _shared_component_4(v6, -127, p5, 127)
-    v8 = np.array(p10, dtype=p5)
-    v9 = lax.convert_element_type_p.bind(v8, new_dtype=p5, weak_type=False, sharding=None)
-    v10 = lax.broadcast_in_dim_p.bind(v9, shape=p11, broadcast_dimensions=p12, sharding=None)
-    v11 = lax.select_n_p.bind(v4, v10, v7)
-    v12 = lax.add_p.bind(v11, np.array(p6, dtype=p5))
-    v13 = np.array(p4, dtype=p5)
-    v14 = lax.convert_element_type_p.bind(v13, new_dtype=p5, weak_type=False, sharding=None)
-    v15 = lax.broadcast_in_dim_p.bind(v14, shape=p11, broadcast_dimensions=p12, sharding=None)
-    v16 = lax.select_n_p.bind(v4, v15, v12)
-    v17 = lax.convert_element_type_p.bind(v16, new_dtype=p1, weak_type=False, sharding=None)
-    return (v11, v17)
-
-
-def _shared_component_18(p2, p10, p12, p0, p1, p3, p4, p5, p6, p7, p8, p9, p11):
-    v0 = lax.iota_p.bind(dtype=p0, shape=p1, dimension=0, sharding=None)
-    v1 = lax.iota_p.bind(dtype=p0, shape=p1, dimension=1, sharding=None)
-    v2 = lax.ge_p.bind(v0, v1)
-    v3 = lax.gt_p.bind(v0, v1)
-    v9, = _shared_component_38(p2, v2, p3, p4, p5, p1, p6, p7)
-    v10 = lax.convert_element_type_p.bind(v3, new_dtype=p5, weak_type=False, sharding=None)
-    v11 = lax.dot_general_p.bind(
-        v9, v10, dimension_numbers=(((1,), (0,)), ((), ())),
-        precision=(lax.Precision.HIGHEST, lax.Precision.HIGHEST), preferred_element_type=None,
-        out_sharding=None)
-    v12 = lax.exp_p.bind(v11, accuracy=None)
-    v13 = np.array(float.fromhex('0x0.0p+0'), dtype=jnp.dtype('float32'))
-    v14 = lax.convert_element_type_p.bind(v13, new_dtype=p5, weak_type=False, sharding=None)
-    v15 = lax.broadcast_in_dim_p.bind(v14, shape=p1, broadcast_dimensions=p7, sharding=None)
-    v16 = lax.select_n_p.bind(v2, v15, v12)
-    v17 = lax.reduce_sum_p.bind(v9, axes=p4, out_sharding=None)
-    v18 = lax.exp_p.bind(v17, accuracy=None)
-    v19 = lax.iota_p.bind(dtype=p0, shape=p1, dimension=0, sharding=None)
-    v20 = lax.eq_p.bind(v19, np.array(p8, dtype=p0))
-    v21 = np.array(float.fromhex('0x0.0p+0'), dtype=jnp.dtype('float32'))
-    v22 = lax.convert_element_type_p.bind(v21, new_dtype=p5, weak_type=False, sharding=None)
-    v23 = lax.broadcast_in_dim_p.bind(v22, shape=p1, broadcast_dimensions=p7, sharding=None)
-    v24 = lax.select_n_p.bind(v20, v23, v11)
-    v25 = lax.reduce_sum_p.bind(v24, axes=p9, out_sharding=None)
-    v26 = lax.exp_p.bind(v25, accuracy=None)
-    v27 = lax.reduce_sum_p.bind(p2, axes=p9, out_sharding=None)
-    v28 = lax.exp_p.bind(v27, accuracy=None)
-    v29 = lax.transpose_p.bind(p10, permutation=p11)
-    v30 = lax.dot_general_p.bind(
-        p12, v29, dimension_numbers=(((1,), (0,)), ((), ())),
-        precision=(lax.Precision.HIGHEST, lax.Precision.HIGHEST), preferred_element_type=p5,
-        out_sharding=None)
-    return (v2, v3, v16, v18, v26, v28, v30)
-
-
-def _shared_component_19(p0, p1, p2, p3, p4, p5, p6, p7, p8, p9, p10, p11):
-    v0 = lax.add_p.bind(p0, p1)
-    v1 = lax.add_p.bind(p2, p3)
-    v2 = lax.add_p.bind(p4, p5)
-    v3 = lax.add_p.bind(p6, p7)
-    v4 = lax.add_p.bind(p8, p9)
-    v5 = lax.add_p.bind(p10, p11)
-    return (v0, v1, v2, v3, v4, v5)
-
-
-def _shared_component_20(p0, p1, p3, p4, p6, p2, p7, p8, p10, p11, p13, p14, p16, p17, p19, p20, p22):
-    v0, = _shared_component_1(p0, p1, p2, p3, p4, 1, p6, p7)
-    v1, = _shared_component_1(p0, v0, p8, p3, p4, 1, p6, p10)
-    v2, = _shared_component_1(p0, v1, p11, p3, p4, 1, p6, p13)
-    v3, = _shared_component_1(p0, v2, p14, p3, p4, 1, p6, p16)
-    v4, = _shared_component_1(p0, v3, p17, p3, p4, 1, p6, p19)
-    v5, = _shared_component_1(p0, v4, p20, p3, p4, 1, p6, p22)
-    return (v5,)
-
-
-def _shared_component_21(p0, p5, p6, p1, p2, p3, p4, p7):
-    v0 = lax.eq_p.bind(p0, np.array(float('-inf'), dtype=jnp.dtype('float32')))
-    v1 = lax.broadcast_in_dim_p.bind(
-        np.array(float('inf'), dtype=jnp.dtype('float32')), shape=p1, broadcast_dimensions=p2, sharding=None)
-    v2 = lax.select_n_p.bind(v0, p0, v1)
-    v3 = lax.broadcast_in_dim_p.bind(v2, shape=p3, broadcast_dimensions=p4, sharding=None)
-    v4 = lax.sub_p.bind(p5, v3)
-    v5, v10, v11 = _shared_component_34(v4, p6, p1, p2, p7, p4)
-    return (v5, v10, v11)
-
-
-def _shared_component_22(p0, p1, p2, p3, p4, p5, p6, p7, p10, p14, p15, p16, p17, p18, p19, p33, p34, p35):
-    v0 = lax.abs_p.bind(p0)
-    v1 = lax.reshape_p.bind(v0, new_sizes=p1, dimensions=None, sharding=None)
-    v2 = lax.reduce_max_p.bind(v1, axes=p2, out_sharding=None)
-    v3 = lax.broadcast_in_dim_p.bind(v2, shape=p3, broadcast_dimensions=p4, sharding=None)
-    v4 = lax.reshape_p.bind(v3, new_sizes=p5, dimensions=None, sharding=None)
-    v5, v6 = _shared_component_17(v4, p6, p7, 23, 255, p10, 127, 8, 0, p14, p15)
-    v7 = lax.sub_p.bind(np.array(p16, dtype=p10), v5)
-    v8 = lax.convert_element_type_p.bind(v7, new_dtype=p6, weak_type=False, sharding=None)
-    v9 = p17.bind(v8, np.array(p18, dtype=p6))
-    v10 = lax.bitcast_convert_type_p.bind(v9, new_dtype=p19)
-    v11 = lax.mul_p.bind(p0, v10, out_dtype=None)
-    v12 = lax.bitcast_convert_type_p.bind(v11, new_dtype=p6)
-    v13, = _shared_component_3(
-        v12, p7, 31, p6, 2147483647, p14, p15, 0, 1138753536, 2139095040, 23, 4294967176, 8388607, 1, p10,
-        p17, 21, 20, 127, 7)
-    v14 = lax.convert_element_type_p.bind(v13, new_dtype=p33, weak_type=False, sharding=None)
-    v15 = lax.bitcast_convert_type_p.bind(v14, new_dtype=p34)
-    v16 = lax.convert_element_type_p.bind(v6, new_dtype=p33, weak_type=False, sharding=None)
-    v17 = lax.bitcast_convert_type_p.bind(v16, new_dtype=p35)
-    v18 = lax.bitcast_convert_type_p.bind(v15, new_dtype=p33)
-    v19 = lax.bitcast_convert_type_p.bind(v17, new_dtype=p33)
-    return (v18, v19)
-
-
-def _shared_component_23(p0, p6, p7, p1, p2, p3, p4, p5):
-    v0 = lax.convert_element_type_p.bind(p0, new_dtype=p1, weak_type=False, sharding=None)
-    v1 = p2.bind(v0, np.array(p3, dtype=p1))
-    v2 = lax.or_p.bind(np.array(p4, dtype=p1), v1)
-    v3 = lax.bitcast_convert_type_p.bind(v2, new_dtype=p5)
-    v4 = lax.select_n_p.bind(p6, p7, v3)
-    v5 = lax.bitcast_convert_type_p.bind(v4, new_dtype=p1)
-    return (v5,)
-
-
-def _shared_component_24(p0, p1, p2, p3, p4, p5):
-    v0 = lax.broadcast_in_dim_p.bind(np.array(p0, dtype=p1), shape=p2, broadcast_dimensions=p3, sharding=None)
-    v1 = lax.broadcast_in_dim_p.bind(np.array(p4, dtype=p1), shape=p2, broadcast_dimensions=p3, sharding=None)
-    v2 = lax.and_p.bind(p5, v0)
-    v3 = lax.not_p.bind(v0)
-    v4 = lax.and_p.bind(v2, v3)
-    v5 = lax.or_p.bind(v1, v4)
-    v6 = lax.and_p.bind(p5, v0)
-    v7 = lax.and_p.bind(v6, v0)
-    v8 = lax.or_p.bind(v5, v7)
-    return (v8,)
-
-
-def _shared_component_25(p0, p1, p2, p3, p4):
-    v0 = lax.and_p.bind(p0, p1)
-    v1 = lax.or_p.bind(p2, v0)
-    v2 = lax.not_p.bind(p3)
-    v3 = lax.and_p.bind(p4, v2)
-    v4 = lax.not_p.bind(p1)
-    v5 = lax.and_p.bind(v3, v4)
-    v6 = lax.or_p.bind(v1, v5)
-    v7 = lax.not_p.bind(p3)
-    v8 = lax.and_p.bind(p4, v7)
-    v9 = lax.and_p.bind(v8, p1)
-    v10 = lax.or_p.bind(v6, v9)
-    v11 = lax.and_p.bind(p4, p3)
-    v12 = lax.not_p.bind(p1)
-    v13 = lax.and_p.bind(v11, v12)
-    v14 = lax.or_p.bind(v10, v13)
-    v15 = lax.and_p.bind(p4, p3)
-    v16 = lax.and_p.bind(v15, p1)
-    v17 = lax.or_p.bind(v14, v16)
-    return (v17,)
-
-
-def _shared_component_26(
-        p0, p1, p2, p3, p4, p5, p6, p7, p8, p9, p10, p11, p13, p16, p17, p19, p24, p25, p27, p28):
-    v0 = lax.transpose_p.bind(p0, permutation=p1)
-    v1 = lax.reshape_p.bind(v0, new_sizes=p2, dimensions=None, sharding=None)
-    v2 = lax.iota_p.bind(dtype=p3, shape=p4, dimension=0, sharding=None)
-    v3 = lax.mul_p.bind(v2, np.array(p5, dtype=p3), out_dtype=None)
-    v4 = lax.broadcast_in_dim_p.bind(v3, shape=p6, broadcast_dimensions=p7, sharding=None)
-    v5 = p8.bind(v1, v4)
-    v6 = lax.reduce_sum_p.bind(v5, axes=p7, out_sharding=None)
-    v7 = lax.broadcast_in_dim_p.bind(
-        np.array(p9, dtype=p3), shape=p10, broadcast_dimensions=p11, sharding=None)
-    v8, = _shared_component_1(v6, v7, 67109120, p3, p13, 1, p8, 0)
-    v9 = lax.and_p.bind(v6, np.array(p16, dtype=p3))
-    v10 = lax.population_count_p.bind(v9)
-    v11 = lax.convert_element_type_p.bind(v10, new_dtype=p13, weak_type=False, sharding=None)
-    v12 = lax.convert_element_type_p.bind(v11, new_dtype=p3, weak_type=False, sharding=None)
-    v13 = lax.and_p.bind(v12, np.array(p17, dtype=p3))
-    v14, v15, v16, v17, v18, v19, v20 = _shared_component_8(
-        v13, v8, v6, p8, 1, p3, p13, p1, p19, 6, 26, 2, 2176876992, p24, p25, 16, p27, p28, 126, 127, 23)
-    v21, = _shared_component_14(v15, v20, v18, v19, v16, v17, v14, -126, p28, 255, 0, p27)
-    return (v21,)
-
-
-def _shared_component_27(p0, p1, p2, p3, p4, p5, p6, p7, p8):
-    v0 = lax.min_p.bind(p0, np.array(p1, dtype=p2))
-    v1 = p3.bind(p4, v0)
-    v2 = lax.lt_p.bind(p0, np.array(p5, dtype=p2))
-    v3 = np.array(p6, dtype=p2)
-    v4 = lax.broadcast_in_dim_p.bind(v3, shape=p7, broadcast_dimensions=p8, sharding=None)
-    v5 = lax.select_n_p.bind(v2, v4, v1)
-    return (v5,)
-
-
-def _shared_component_28(p0, p1, p2, p4, p8, p11, p14, p15, p18):
-    v0 = lax.bitcast_convert_type_p.bind(p0, new_dtype=p1)
-    v1, v2, v3, v4, v5 = _shared_component_6(
-        v0, p2, 2147483648, p4, 23, 255, 8388607, p8, 31, 0, p11, 127, -126)
-    v6 = lax.add_p.bind(v5, np.array(p14, dtype=p8))
-    v7 = lax.add_p.bind(v6, np.array(p15, dtype=p8))
-    v8, = _shared_component_4(v7, 1, p8, 254)
-    v9 = p11.bind(v8, np.array(p18, dtype=p8))
-    v10 = lax.or_p.bind(v1, v9)
-    v11 = lax.or_p.bind(v10, v4)
-    v12 = np.array(p14, dtype=p8)
-    v13, = _shared_component_4(v12, 0, p8, 31)
-    v14 = p11.bind(v3, v13)
-    return (v0, v1, v2, v3, v6, v11, v14)
-
-
-def _shared_component_29(p0, p13, p1, p3, p7, p10, p14, p17, p23):
-    v0, v1, v2, v3, v4 = _shared_component_6(
-        p0, p1, 2147483648, p3, 23, 255, 8388607, p7, 31, 0, p10, 127, -126)
-    v5 = lax.add_p.bind(v4, p13)
-    v6 = lax.add_p.bind(v5, np.array(p14, dtype=p7))
-    v7, = _shared_component_4(v6, 1, p7, 254)
-    v8 = p10.bind(v7, np.array(p17, dtype=p7))
-    v9 = lax.or_p.bind(v0, v8)
-    v10 = lax.or_p.bind(v9, v3)
-    v11, = _shared_component_4(p13, 0, p7, 31)
-    v12 = p10.bind(v2, v11)
-    v13, = _shared_component_14(v0, v12, v5, v10, v1, v2, p0, -126, p7, 255, 0, p23)
-    return (v13,)
-
-
-def _shared_component_30(p1, p6, p9, p0, p2, p3, p4, p5, p7, p8, p10, p11):
-    v0 = p0.bind(p1, np.array(p2, dtype=p3))
-    v1 = p4.bind(v0, np.array(p5, dtype=p3))
-    v2 = lax.add_p.bind(p6, np.array(p7, dtype=p3))
-    v3 = p4.bind(v2, np.array(p8, dtype=p3))
-    v4 = lax.or_p.bind(v1, v3)
-    v5 = p4.bind(p9, np.array(p10, dtype=p3))
-    v6 = lax.or_p.bind(v4, v5)
-    v7 = lax.bitcast_convert_type_p.bind(v6, new_dtype=p11)
-    v8 = lax.convert_element_type_p.bind(p9, new_dtype=p11, weak_type=False, sharding=None)
-    return (v1, v7, v8)
-
-
-def _shared_component_31(p0, p1, p2, p3, p4, p5, p6, p7, p8, p9):
-    v0 = lax.add_p.bind(p0, p1)
-    v1 = lax.add_p.bind(p2, p3)
-    v2 = lax.add_p.bind(p4, p5)
-    v3 = lax.add_p.bind(p6, p7)
-    v4 = lax.add_p.bind(v0, v1)
-    v5 = lax.add_p.bind(v2, v3)
-    v6 = lax.add_p.bind(v4, v5)
-    v7 = lax.mul_p.bind(p8, p9, out_dtype=None)
-    v8 = lax.add_p.bind(v6, v7)
-    return (v8,)
-
-
-def _shared_component_32(p0, p2, p1, p3, p4):
-    v0 = lax.reduce_max_p.bind(p0, axes=p1, out_sharding=None)
-    v1 = lax.max_p.bind(p2, v0)
-    v2 = lax.sub_p.bind(p2, v1)
-    v3 = lax.exp2_p.bind(v2, accuracy=None)
-    v4 = lax.broadcast_in_dim_p.bind(v1, shape=p3, broadcast_dimensions=p4, sharding=None)
-    v5 = lax.sub_p.bind(p0, v4)
-    v6 = lax.exp2_p.bind(v5, accuracy=None)
-    return (v1, v3, v6)
-
-
-def _shared_component_33(p0, p3, p4, p5, p6, p7, p8, p1, p2):
-    v0 = lax.broadcast_in_dim_p.bind(p0, shape=p1, broadcast_dimensions=p2, sharding=None)
-    v1 = lax.sub_p.bind(p3, v0)
-    v2 = lax.select_n_p.bind(p4, v1, p5)
-    v3 = lax.broadcast_in_dim_p.bind(p6, shape=p1, broadcast_dimensions=p2, sharding=None)
-    v4 = lax.sub_p.bind(v2, v3)
-    v5 = lax.mul_p.bind(v4, p7, out_dtype=None)
-    v6 = lax.mul_p.bind(p8, v5, out_dtype=None)
-    return (v6,)
-
-
-def _shared_component_34(p0, p1, p2, p3, p4, p5):
-    v0 = lax.exp_p.bind(p0, accuracy=None)
-    v1 = lax.eq_p.bind(p1, np.array(float.fromhex('0x0.0p+0'), dtype=jnp.dtype('float32')))
-    v2 = lax.broadcast_in_dim_p.bind(
-        np.array(float.fromhex('0x1.0000000000000p+0'), dtype=jnp.dtype('float32')), shape=p2,
-        broadcast_dimensions=p3, sharding=None)
-    v3 = lax.select_n_p.bind(v1, p1, v2)
-    v4 = lax.div_p.bind(np.array(float.fromhex('0x1.0000000000000p+0'), dtype=jnp.dtype('float32')), v3)
-    v5 = lax.broadcast_in_dim_p.bind(v4, shape=p4, broadcast_dimensions=p5, sharding=None)
-    v6 = lax.mul_p.bind(v0, v5, out_dtype=None)
-    return (v0, v5, v6)
-
-
-def _shared_component_35(p0, p1, p2, p3, p4, p5, p6):
-    v0 = lax.mul_p.bind(p0, p1, out_dtype=None)
-    v1 = lax.mul_p.bind(v0, p2, out_dtype=None)
-    v2 = lax.mul_p.bind(p0, p3, out_dtype=None)
-    v3 = lax.mul_p.bind(v2, p4, out_dtype=None)
-    v4 = lax.mul_p.bind(v2, p5, out_dtype=None)
-    v5 = lax.mul_p.bind(v1, p6, out_dtype=None)
-    v6 = lax.add_p.bind(v4, v5)
-    return (v1, v3, v6)
-
-
-def _shared_component_36(p0, p3, p4, p5, p6, p1, p2, p7):
-    v0 = lax.eq_p.bind(p0, np.array(p1, dtype=p2))
-    v1 = lax.ne_p.bind(p3, np.array(p1, dtype=p2))
-    v2 = lax.neg_p.bind(p4)
-    v3 = lax.select_n_p.bind(v1, p4, v2)
-    v4 = lax.select_n_p.bind(v0, p5, v3)
-    v5 = lax.and_p.bind(p6, np.array(p7, dtype=p2))
-    return (v4, v5)
-
-
-def _shared_component_37(p0, p1, p2):
-    v0 = lax.mul_p.bind(p0, p1, out_dtype=None)
-    v1 = lax.mul_p.bind(
-        v0, np.array(float.fromhex('0x1.7154760000000p+0'), dtype=jnp.dtype('float32')), out_dtype=None)
-    v2 = lax.exp2_p.bind(v1, accuracy=None)
-    v3 = lax.mul_p.bind(p0, p2, out_dtype=None)
-    v4 = lax.mul_p.bind(
-        v3, np.array(float.fromhex('0x1.7154760000000p+0'), dtype=jnp.dtype('float32')), out_dtype=None)
-    v5 = lax.exp2_p.bind(v4, accuracy=None)
-    return (v2, v5)
-
-
-def _shared_component_38(p0, p7, p1, p2, p3, p4, p5, p6):
-    v0 = lax.broadcast_in_dim_p.bind(p0, shape=p1, broadcast_dimensions=p2, sharding=None)
-    v1 = np.array(float.fromhex('0x0.0p+0'), dtype=jnp.dtype('float32'))
-    v2 = lax.convert_element_type_p.bind(v1, new_dtype=p3, weak_type=False, sharding=None)
-    v3 = lax.broadcast_in_dim_p.bind(v0, shape=p4, broadcast_dimensions=p5, sharding=None)
-    v4 = lax.broadcast_in_dim_p.bind(v2, shape=p4, broadcast_dimensions=p6, sharding=None)
-    v5 = lax.select_n_p.bind(p7, v4, v3)
-    return (v5,)
-
-
-def _shared_component_39(p0, p1, p2, p3, p4, p7, p8, p9, p10, p11, p12, p14, p22, p23, p24, p27, p31, p32):
-    v0, v1, v2, v3, v4 = _shared_component_7(
-        p0, p1, p2, p3, p4, 127, 255, p7, p8, p9, p10, p11, p12, 2147483648, p14, 23, 8388607, 0, 8388608,
-        150, 7, -133, p22, p23, p24, 128, 32640)
-    v5 = p14.bind(v2, np.array(p27, dtype=p12))
-    v6, = _shared_component_16(v3, v4, v5, 0, p12, p23, p24, 32640, 32704)
-    v7 = lax.convert_element_type_p.bind(v6, new_dtype=p31, weak_type=False, sharding=None)
-    v8, = _shared_component_11(v7, v1, v0, p32, p3, 127, 255, p31, p22, 15, 32704)
-    return (v8,)
-
-
-def _shared_component_40(p0, p1, p2, p3, p4, p7, p8, p9, p10, p11, p12, p14, p22, p23, p24):
-    v0, v1, v2, v3, v4 = _shared_component_7(
-        p0, p1, p2, p3, p4, 127, 255, p7, p8, p9, p10, p11, p12, 2147483648, p14, 23, 8388607, 0, 8388608,
-        150, 23, -149, p22, p23, p24, 8388608, 2139095040)
-    v5, = _shared_component_16(v3, v4, v2, 0, p12, p23, p24, 2139095040, 2143289344)
-    v6, = _shared_component_11(v5, v1, v0, p11, p3, 127, 255, p12, p22, 31, 2143289344)
-    return (v6,)
-
-
-def _shared_component_41(p0, p1, p2):
-    v0 = lax.convert_element_type_p.bind(p0, new_dtype=p1, weak_type=False, sharding=None)
-    v1, = lax.optimization_barrier_p.bind(v0)
-    v2 = lax.convert_element_type_p.bind(v1, new_dtype=p2, weak_type=False, sharding=None)
-    return (v2,)
-
-
-def _shared_component_42(p0, p1, p2, p3, p4):
-    v0 = lax.transpose_p.bind(p0, permutation=p1)
-    v1 = lax.broadcast_in_dim_p.bind(
-        np.array(float.fromhex('0x1.0000000000000p+0'), dtype=jnp.dtype('float32')), shape=p2,
-        broadcast_dimensions=p3, sharding=None)
-    v2 = lax.broadcast_in_dim_p.bind(
-        np.array(float.fromhex('0x0.0p+0'), dtype=jnp.dtype('float32')), shape=p4, broadcast_dimensions=p3,
-        sharding=None)
-    return (v0, v1, v2)
 
 
 _chunk_carry_forms: dict[tuple, Callable[..., tuple]] = {
@@ -1771,128 +780,6 @@ def chunk_weighted(*operands, policy: str = 'default', target: str = 'sm90'):
     return _generated.call(_chunk_weighted_forms, operands, policy, target, single=True)
 
 
-_decode_e4m3_forms: dict[tuple, Callable[..., tuple]] = {
-    ('default', 'sm90', (((32, 8), 'uint8'),)):
-        _decode_e4m3_0,
-    ('default', 'sm90', (((64, 8), 'uint8'),)):
-        _decode_e4m3_0,
-}
-
-
-def decode_e4m3(*operands, policy: str = 'default', target: str = 'sm90'):
-    """decode_e4m3's generated form for `policy` and `target` at its operands' case."""
-    return _generated.call(_decode_e4m3_forms, operands, policy, target, single=True)
-
-
-_decode_e5m2_forms: dict[tuple, Callable[..., tuple]] = {
-    ('default', 'sm90', (((32, 8), 'uint8'),)):
-        _decode_e5m2_0,
-    ('default', 'sm90', (((64, 8), 'uint8'),)):
-        _decode_e5m2_0,
-}
-
-
-def decode_e5m2(*operands, policy: str = 'default', target: str = 'sm90'):
-    """decode_e5m2's generated form for `policy` and `target` at its operands' case."""
-    return _generated.call(_decode_e5m2_forms, operands, policy, target, single=True)
-
-
-_e8m0_decode_forms: dict[tuple, Callable[..., tuple]] = {
-    ('default', 'sm90', (((32, 8), 'uint8'),)):
-        _e8m0_decode_0,
-    ('default', 'sm90', (((64, 8), 'uint8'),)):
-        _e8m0_decode_0,
-}
-
-
-def e8m0_decode(*operands, policy: str = 'default', target: str = 'sm90'):
-    """e8m0_decode's generated form for `policy` and `target` at its operands' case."""
-    return _generated.call(_e8m0_decode_forms, operands, policy, target, single=True)
-
-
-_e8m0_exponents_forms: dict[tuple, Callable[..., tuple]] = {
-    ('default', 'sm90', (((32, 8), 'uint8'),)):
-        _e8m0_exponents_0,
-    ('default', 'sm90', (((64, 8), 'uint8'),)):
-        _e8m0_exponents_0,
-}
-
-
-def e8m0_exponents(*operands, policy: str = 'default', target: str = 'sm90'):
-    """e8m0_exponents's generated form for `policy` and `target` at its operands' case."""
-    return _generated.call(_e8m0_exponents_forms, operands, policy, target, single=False)
-
-
-_encode_e2m1_forms: dict[tuple, Callable[..., tuple]] = {
-    ('default', 'sm90', (((16, 128), 'uint32'),)):
-        functools.partial(
-        _shared_component_3, p0=lax.shift_right_logical_p, p2=31, p3=jnp.dtype('uint32'), p4=2147483647,
-        p5=(16, 128), p6=(), p7=0, p8=1086324736, p9=2139095040, p10=23, p11=4294967170, p12=8388607, p13=1,
-        p14=jnp.dtype('int32'), p15=lax.shift_left_p, p18=23, p20=22, p24=7, p25=3),
-    ('default', 'sm90', (((32, 128), 'uint32'),)):
-        functools.partial(
-        _shared_component_3, p0=lax.shift_right_logical_p, p2=31, p3=jnp.dtype('uint32'), p4=2147483647,
-        p5=(32, 128), p6=(), p7=0, p8=1086324736, p9=2139095040, p10=23, p11=4294967170, p12=8388607, p13=1,
-        p14=jnp.dtype('int32'), p15=lax.shift_left_p, p18=23, p20=22, p24=7, p25=3),
-}
-
-
-def encode_e2m1(*operands, policy: str = 'default', target: str = 'sm90'):
-    """encode_e2m1's generated form for `policy` and `target` at its operands' case."""
-    return _generated.call(_encode_e2m1_forms, operands, policy, target, single=True)
-
-
-_encode_e4m3_forms: dict[tuple, Callable[..., tuple]] = {
-    ('default', 'sm90', (((16, 128), 'uint32'),)):
-        functools.partial(
-        _shared_component_3, p0=lax.shift_right_logical_p, p2=31, p3=jnp.dtype('uint32'), p4=2147483647,
-        p5=(16, 128), p6=(), p7=0, p8=1138753536, p9=2139095040, p10=23, p11=4294967176, p12=8388607, p13=1,
-        p14=jnp.dtype('int32'), p15=lax.shift_left_p, p18=21, p20=20, p24=127, p25=7),
-    ('default', 'sm90', (((32, 128), 'uint32'),)):
-        functools.partial(
-        _shared_component_3, p0=lax.shift_right_logical_p, p2=31, p3=jnp.dtype('uint32'), p4=2147483647,
-        p5=(32, 128), p6=(), p7=0, p8=1138753536, p9=2139095040, p10=23, p11=4294967176, p12=8388607, p13=1,
-        p14=jnp.dtype('int32'), p15=lax.shift_left_p, p18=21, p20=20, p24=127, p25=7),
-}
-
-
-def encode_e4m3(*operands, policy: str = 'default', target: str = 'sm90'):
-    """encode_e4m3's generated form for `policy` and `target` at its operands' case."""
-    return _generated.call(_encode_e4m3_forms, operands, policy, target, single=True)
-
-
-_encode_e5m2_forms: dict[tuple, Callable[..., tuple]] = {
-    ('default', 'sm90', (((16, 128), 'uint32'),)):
-        functools.partial(
-        _shared_component_3, p0=lax.shift_right_logical_p, p2=31, p3=jnp.dtype('uint32'), p4=2147483647,
-        p5=(16, 128), p6=(), p7=0, p8=1197473792, p9=2139095040, p10=23, p11=4294967184, p12=8388607, p13=1,
-        p14=jnp.dtype('int32'), p15=lax.shift_left_p, p18=22, p20=21, p24=127, p25=7),
-    ('default', 'sm90', (((32, 128), 'uint32'),)):
-        functools.partial(
-        _shared_component_3, p0=lax.shift_right_logical_p, p2=31, p3=jnp.dtype('uint32'), p4=2147483647,
-        p5=(32, 128), p6=(), p7=0, p8=1197473792, p9=2139095040, p10=23, p11=4294967184, p12=8388607, p13=1,
-        p14=jnp.dtype('int32'), p15=lax.shift_left_p, p18=22, p20=21, p24=127, p25=7),
-}
-
-
-def encode_e5m2(*operands, policy: str = 'default', target: str = 'sm90'):
-    """encode_e5m2's generated form for `policy` and `target` at its operands' case."""
-    return _generated.call(_encode_e5m2_forms, operands, policy, target, single=True)
-
-
-_fp8_epilogue_forms: dict[tuple, Callable[..., tuple]] = {
-    ('default', 'sm90', (((32, 128), 'float32'),)):
-        _fp8_epilogue_0,
-    ('default', 'sm90', (((64, 256), 'float32'),)):
-        _fp8_epilogue_1,
-}
-
-
-def fp8_epilogue(*operands, policy: str = 'default', target: str = 'sm90'):
-    """fp8_epilogue's generated form for `policy` and `target` at its operands' case."""
-    return _generated.call(_fp8_epilogue_forms, operands, policy, target, single=False)
-
-
 _gdn_value_pullback_forms: dict[tuple, Callable[..., tuple]] = {
     ('default', 'sm90', (*(((32, 64), 'float32'),) * 2, ((32,), 'float32'))):
         _gdn_value_pullback_0,
@@ -1904,19 +791,6 @@ _gdn_value_pullback_forms: dict[tuple, Callable[..., tuple]] = {
 def gdn_value_pullback(*operands, policy: str = 'default', target: str = 'sm90'):
     """gdn_value_pullback's generated form for `policy` and `target` at its operands' case."""
     return _generated.call(_gdn_value_pullback_forms, operands, policy, target, single=False)
-
-
-_gemm_partial_scale_forms: dict[tuple, Callable[..., tuple]] = {
-    ('default', 'sm90', (((32, 128), 'float32'), ((32,), 'float32'), ((128,), 'float32'))):
-        _gemm_partial_scale_0,
-    ('default', 'sm90', (((64, 128), 'float32'), ((64,), 'float32'), ((128,), 'float32'))):
-        _gemm_partial_scale_0,
-}
-
-
-def gemm_partial_scale(*operands, policy: str = 'default', target: str = 'sm90'):
-    """gemm_partial_scale's generated form for `policy` and `target` at its operands' case."""
-    return _generated.call(_gemm_partial_scale_forms, operands, policy, target, single=True)
 
 
 _kda_strict_band_forms: dict[tuple, Callable[..., tuple]] = {
@@ -1964,9 +838,9 @@ def key_memory_decay(*operands, policy: str = 'default', target: str = 'sm90'):
 
 _key_walk_factors_forms: dict[tuple, Callable[..., tuple]] = {
     ('default', 'sm90', (((64, 32), 'float32'), ((32,), 'float32'))):
-        functools.partial(_shared_component_32, p1=(0,), p3=(1, 32), p4=(1,)),
+        functools.partial(shared_component_36, p1=(0,), p3=(1, 32), p4=(1,)),
     ('default', 'sm90', (((128, 64), 'float32'), ((64,), 'float32'))):
-        functools.partial(_shared_component_32, p1=(0,), p3=(1, 64), p4=(1,)),
+        functools.partial(shared_component_36, p1=(0,), p3=(1, 64), p4=(1,)),
 }
 
 
@@ -1999,100 +873,6 @@ def keys_cotangent(*operands, policy: str = 'default', target: str = 'sm90'):
     return _generated.call(_keys_cotangent_forms, operands, policy, target, single=True)
 
 
-_mxfp8_block_decode_forms: dict[tuple, Callable[..., tuple]] = {
-    ('default', 'sm90', (((32, 256), 'uint8'), ((32, 8), 'uint8'))):
-        _mxfp8_block_decode_0,
-    ('default', 'sm90', (((64, 128), 'uint8'), ((64, 4), 'uint8'))):
-        _mxfp8_block_decode_1,
-}
-
-
-def mxfp8_block_decode(*operands, policy: str = 'default', target: str = 'sm90'):
-    """mxfp8_block_decode's generated form for `policy` and `target` at its operands' case."""
-    return _generated.call(_mxfp8_block_decode_forms, operands, policy, target, single=True)
-
-
-_mxfp8_block_decode_bf16_forms: dict[tuple, Callable[..., tuple]] = {
-    ('default', 'sm90', (((32, 256), 'uint8'), ((32, 8), 'uint8'))):
-        _mxfp8_block_decode_bf16_0,
-    ('default', 'sm90', (((64, 128), 'uint8'), ((64, 4), 'uint8'))):
-        _mxfp8_block_decode_bf16_1,
-}
-
-
-def mxfp8_block_decode_bf16(*operands, policy: str = 'default', target: str = 'sm90'):
-    """mxfp8_block_decode_bf16's generated form for `policy` and `target` at its operands' case."""
-    return _generated.call(_mxfp8_block_decode_bf16_forms, operands, policy, target, single=True)
-
-
-_mxfp8_epilogue_forms: dict[tuple, Callable[..., tuple]] = {
-    ('default', 'sm90', (((32, 128), 'float32'),)):
-        functools.partial(
-        _shared_component_22, p1=(32, 4, 32), p2=(2,), p3=(32, 4, 32), p4=(0, 1), p5=(32, 128),
-        p6=jnp.dtype('uint32'), p7=lax.shift_right_logical_p, p10=jnp.dtype('int32'), p14=(32, 128), p15=(),
-        p16=127, p17=lax.shift_left_p, p18=23, p19=jnp.dtype('float32'), p33=jnp.dtype('uint8'),
-        p34=jnp.dtype('float8_e4m3fn'), p35=jnp.dtype('float8_e8m0fnu')),
-    ('default', 'sm90', (((64, 128), 'float32'),)):
-        functools.partial(
-        _shared_component_22, p1=(64, 4, 32), p2=(2,), p3=(64, 4, 32), p4=(0, 1), p5=(64, 128),
-        p6=jnp.dtype('uint32'), p7=lax.shift_right_logical_p, p10=jnp.dtype('int32'), p14=(64, 128), p15=(),
-        p16=127, p17=lax.shift_left_p, p18=23, p19=jnp.dtype('float32'), p33=jnp.dtype('uint8'),
-        p34=jnp.dtype('float8_e4m3fn'), p35=jnp.dtype('float8_e8m0fnu')),
-}
-
-
-def mxfp8_epilogue(*operands, policy: str = 'default', target: str = 'sm90'):
-    """mxfp8_epilogue's generated form for `policy` and `target` at its operands' case."""
-    return _generated.call(_mxfp8_epilogue_forms, operands, policy, target, single=False)
-
-
-_mxfp8_scale_forms: dict[tuple, Callable[..., tuple]] = {
-    ('default', 'sm90', (((32, 8), 'uint32'),)):
-        _mxfp8_scale_0,
-    ('default', 'sm90', (((64, 8), 'uint32'),)):
-        _mxfp8_scale_0,
-}
-
-
-def mxfp8_scale(*operands, policy: str = 'default', target: str = 'sm90'):
-    """mxfp8_scale's generated form for `policy` and `target` at its operands' case."""
-    return _generated.call(_mxfp8_scale_forms, operands, policy, target, single=False)
-
-
-_nvfp4_payload_forms: dict[tuple, Callable[..., tuple]] = {
-    ('default', 'sm90', (((16, 32), 'uint32'),)):
-        functools.partial(
-        _shared_component_26, p1=(1, 0), p2=(32, 2, 8), p3=jnp.dtype('uint32'), p4=(8,), p5=4, p6=(1, 1, 8),
-        p7=(2,), p8=lax.shift_left_p, p9=0, p10=(32, 2), p11=(), p13=jnp.dtype('uint8'), p16=134218242, p17=1,
-        p19=lax.shift_right_logical_p, p24=jnp.dtype('uint16'), p25=(32, 16), p27=jnp.dtype('float32'),
-        p28=jnp.dtype('int32')),
-    ('default', 'sm90', (((32, 64), 'uint32'),)):
-        functools.partial(
-        _shared_component_26, p1=(1, 0), p2=(64, 4, 8), p3=jnp.dtype('uint32'), p4=(8,), p5=4, p6=(1, 1, 8),
-        p7=(2,), p8=lax.shift_left_p, p9=0, p10=(64, 4), p11=(), p13=jnp.dtype('uint8'), p16=134218242, p17=1,
-        p19=lax.shift_right_logical_p, p24=jnp.dtype('uint16'), p25=(64, 32), p27=jnp.dtype('float32'),
-        p28=jnp.dtype('int32')),
-}
-
-
-def nvfp4_payload(*operands, policy: str = 'default', target: str = 'sm90'):
-    """nvfp4_payload's generated form for `policy` and `target` at its operands' case."""
-    return _generated.call(_nvfp4_payload_forms, operands, policy, target, single=True)
-
-
-_nvfp4_scale_forms: dict[tuple, Callable[..., tuple]] = {
-    ('default', 'sm90', (((32, 8), 'uint8'),)):
-        _nvfp4_scale_0,
-    ('default', 'sm90', (((64, 8), 'uint8'),)):
-        _nvfp4_scale_0,
-}
-
-
-def nvfp4_scale(*operands, policy: str = 'default', target: str = 'sm90'):
-    """nvfp4_scale's generated form for `policy` and `target` at its operands' case."""
-    return _generated.call(_nvfp4_scale_forms, operands, policy, target, single=True)
-
-
 _online_softmax_step_forms: dict[tuple, Callable[..., tuple]] = {
     ('default', 'sm90', (
         ((32, 64), 'float32'), *(((32,), 'float32'),) * 2, ((32, 64), 'float32'), ((64, 64), 'float32'))):
@@ -2117,36 +897,6 @@ _prefix_difference_forms: dict[tuple, Callable[..., tuple]] = {
 def prefix_difference(*operands, policy: str = 'default', target: str = 'sm90'):
     """prefix_difference's generated form for `policy` and `target` at its operands' case."""
     return _generated.call(_prefix_difference_forms, operands, policy, target, single=True)
-
-
-_quantized_ste_forms: dict[tuple, Callable[..., tuple]] = {
-    ('default', 'sm90', (((16, 32), 'float32'), ((16, 32), 'bfloat16'))):
-        _quantized_ste_0,
-    ('default', 'sm90', (((8, 64), 'float32'), ((8, 64), 'bfloat16'))):
-        _quantized_ste_0,
-}
-
-
-def quantized_ste(*operands, policy: str = 'default', target: str = 'sm90'):
-    """quantized_ste's generated form for `policy` and `target` at its operands' case."""
-    return _generated.call(_quantized_ste_forms, operands, policy, target, single=True)
-
-
-_quantized_ste_tangent_forms: dict[tuple, Callable[..., tuple]] = {
-    ('default', 'sm90', (
-        ((16, 32), 'float32'), ((16, 32), 'bfloat16'), ((16, 32), 'float32'), ((16, 32), 'bfloat16'),
-        ((16, 32), 'float32'))):
-        _quantized_ste_tangent_0,
-    ('default', 'sm90', (
-        ((8, 64), 'float32'), ((8, 64), 'bfloat16'), ((8, 64), 'float32'), ((8, 64), 'bfloat16'),
-        ((8, 64), 'float32'))):
-        _quantized_ste_tangent_0,
-}
-
-
-def quantized_ste_tangent(*operands, policy: str = 'default', target: str = 'sm90'):
-    """quantized_ste_tangent's generated form for `policy` and `target` at its operands' case."""
-    return _generated.call(_quantized_ste_tangent_forms, operands, policy, target, single=True)
 
 
 _queries_cotangent_forms: dict[tuple, Callable[..., tuple]] = {
@@ -2180,9 +930,9 @@ def query_dropped_cotangents(*operands, policy: str = 'default', target: str = '
 
 _query_walk_factors_forms: dict[tuple, Callable[..., tuple]] = {
     ('default', 'sm90', (((32, 64), 'float32'), ((32,), 'float32'))):
-        functools.partial(_shared_component_32, p1=(1,), p3=(32, 1), p4=(0,)),
+        functools.partial(shared_component_36, p1=(1,), p3=(32, 1), p4=(0,)),
     ('default', 'sm90', (((64, 128), 'float32'), ((64,), 'float32'))):
-        functools.partial(_shared_component_32, p1=(1,), p3=(64, 1), p4=(0,)),
+        functools.partial(shared_component_36, p1=(1,), p3=(64, 1), p4=(0,)),
 }
 
 
@@ -2202,58 +952,6 @@ _query_weights_forms: dict[tuple, Callable[..., tuple]] = {
 def query_weights(*operands, policy: str = 'default', target: str = 'sm90'):
     """query_weights's generated form for `policy` and `target` at its operands' case."""
     return _generated.call(_query_weights_forms, operands, policy, target, single=False)
-
-
-_rounded_forms: dict[tuple, Callable[..., tuple]] = {
-    ('default', 'sm90', (((16, 32), 'float32'),)):
-        functools.partial(_shared_component_41, p1=jnp.dtype('bfloat16'), p2=jnp.dtype('float32')),
-    ('default', 'sm90', (((8, 64), 'float32'),)):
-        functools.partial(_shared_component_41, p1=jnp.dtype('bfloat16'), p2=jnp.dtype('float32')),
-}
-
-
-def rounded(*operands, policy: str = 'default', target: str = 'sm90'):
-    """rounded's generated form for `policy` and `target` at its operands' case."""
-    return _generated.call(_rounded_forms, operands, policy, target, single=True)
-
-
-_rounded_fp16_forms: dict[tuple, Callable[..., tuple]] = {
-    ('default', 'sm90', (((16, 32), 'float32'),)):
-        functools.partial(_shared_component_41, p1=jnp.dtype('float16'), p2=jnp.dtype('float32')),
-    ('default', 'sm90', (((8, 64), 'float32'),)):
-        functools.partial(_shared_component_41, p1=jnp.dtype('float16'), p2=jnp.dtype('float32')),
-}
-
-
-def rounded_fp16(*operands, policy: str = 'default', target: str = 'sm90'):
-    """rounded_fp16's generated form for `policy` and `target` at its operands' case."""
-    return _generated.call(_rounded_fp16_forms, operands, policy, target, single=True)
-
-
-_rounded_fp16_tangent_forms: dict[tuple, Callable[..., tuple]] = {
-    ('default', 'sm90', (*(((16, 32), 'float32'),) * 3,)):
-        _rounded_fp16_tangent_0,
-    ('default', 'sm90', (*(((8, 64), 'float32'),) * 3,)):
-        _rounded_fp16_tangent_0,
-}
-
-
-def rounded_fp16_tangent(*operands, policy: str = 'default', target: str = 'sm90'):
-    """rounded_fp16_tangent's generated form for `policy` and `target` at its operands' case."""
-    return _generated.call(_rounded_fp16_tangent_forms, operands, policy, target, single=True)
-
-
-_rounded_tangent_forms: dict[tuple, Callable[..., tuple]] = {
-    ('default', 'sm90', (*(((16, 32), 'float32'),) * 3,)):
-        _rounded_tangent_0,
-    ('default', 'sm90', (*(((8, 64), 'float32'),) * 3,)):
-        _rounded_tangent_0,
-}
-
-
-def rounded_tangent(*operands, policy: str = 'default', target: str = 'sm90'):
-    """rounded_tangent's generated form for `policy` and `target` at its operands' case."""
-    return _generated.call(_rounded_tangent_forms, operands, policy, target, single=True)
 
 
 _scores_forms: dict[tuple, Callable[..., tuple]] = {
@@ -2355,15 +1053,28 @@ def selective_token(*operands, policy: str = 'default', target: str = 'sm90'):
 
 _sink_state_forms: dict[tuple, Callable[..., tuple]] = {
     ('default', 'sm90', (((1, 32, 8), 'float32'),)):
-        functools.partial(_shared_component_42, p1=(0, 2, 1), p2=(1, 8, 32), p3=(), p4=(1, 8, 32, 64)),
+        functools.partial(shared_component_45, p1=(0, 2, 1), p2=(1, 8, 32), p3=(), p4=(1, 8, 32, 64)),
     ('default', 'sm90', (((2, 64, 16), 'float32'),)):
-        functools.partial(_shared_component_42, p1=(0, 2, 1), p2=(2, 16, 64), p3=(), p4=(2, 16, 64, 64)),
+        functools.partial(shared_component_45, p1=(0, 2, 1), p2=(2, 16, 64), p3=(), p4=(2, 16, 64, 64)),
 }
 
 
 def sink_state(*operands, policy: str = 'default', target: str = 'sm90'):
     """sink_state's generated form for `policy` and `target` at its operands' case."""
     return _generated.call(_sink_state_forms, operands, policy, target, single=False)
+
+
+_skipped_back_forms: dict[tuple, Callable[..., tuple]] = {
+    ('default', 'sm90', (*(((8, 4, 32), 'float32'),) * 2, ((4, 1), 'float32'))):
+        _skipped_back_0,
+    ('default', 'sm90', (*(((16, 8, 64), 'float32'),) * 2, ((8, 1), 'float32'))):
+        _skipped_back_0,
+}
+
+
+def skipped_back(*operands, policy: str = 'default', target: str = 'sm90'):
+    """skipped_back's generated form for `policy` and `target` at its operands' case."""
+    return _generated.call(_skipped_back_forms, operands, policy, target, single=False)
 
 
 _sliding_visibility_forms: dict[tuple, Callable[..., tuple]] = {

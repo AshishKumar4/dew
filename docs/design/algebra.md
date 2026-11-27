@@ -1397,7 +1397,8 @@ byte's exponent, and the MXFP8 block decode's portable scale application lands a
 scale bytes in each draw in FP32 and BF16 with one rounding, subnormals and signed NaNs included. The
 selective scan's token stage composes its per-state decay and update as the template steps it; its
 backward's subnormal-step lift and one state's turn of the tangent sums are checked as the block's loop
-takes them. Both written and generated components check their primitives on the CPU; an FP8 code's exact
+takes them. NVFP4's block decode lands all codes and all finite E4M3 scale bytes of each draw in BF16, and
+the recurrence skip's pullback is checked beside the gated values'. Both written and generated components check their primitives on the CPU; an FP8 code's exact
 widening to FP32 is the one FP8 conversion check 2 admits.
 Production still uses the written bodies (row 3272).
 
@@ -1431,8 +1432,11 @@ def generate(names: Sequence[str] | None = None, *, check: bool = False) -> tupl
 
 **Template and surrogate generation (rows 3272, 6109).** A `ComponentForm` names one flat function,
 its independent reference and its cases. The registry emits its traced arithmetic. Matching contiguous
-typed primitive bindings share a helper before source is rendered. Geometry, integer literals and
-logical shift direction are static arguments; callers keep their own layout and live results. The
+primitive bindings share a helper before source is rendered, across every declaring module at once, the
+helpers one generated module of their own (`dew.algebra.shared_derived`), so a declaring module splits
+along its seams without writing a helper twice; every declaration therefore generates together. Geometry,
+integer literals and their dtypes, and logical shift direction are static arguments; callers keep their
+own layout and live results. The
 generator admits the final emitted entrypoint, including its case dispatch and shared helpers, against
 the written trace and independent truth. Sharing and case selection add no run-time branch to the program.
 
@@ -1476,8 +1480,8 @@ the written trace and independent truth. Sharing and case selection add no run-t
 - The output is ordinary Python (`dew.algebra.printed`): each equation its primitive bound at its own
   parameters (`lax.<name>_p.bind`), so it computes bit for bit what the chosen candidate computed when it was
   measured, with a compensated form's sums through `dew.nn.precision`. Its only Algebra-package
-  dependency is `dew.algebra._generated`, which selects the checked case by shape, dtype, policy and
-  target without importing the registry, rules or extractor. Generated modules are linted and typed
+  dependencies are `dew.algebra._generated`, which selects the checked case by shape, dtype, policy and
+  target without importing the registry, rules or extractor, and the generated shared helpers. Generated modules are linted and typed
   as usual; their headers name the declarations, rule sets, receipts and egglog version. The writer
   refuses equations it cannot print as plain calls, such as a call with a custom derivative rule.
 - `--check` regenerates in memory and fails where the checked-in output differs; it runs as a test

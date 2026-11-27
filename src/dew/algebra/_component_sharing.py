@@ -268,7 +268,7 @@ def shared(source: dict[str, Body], *, reserved: Collection[str] = ()) -> dict[s
         suffixes = [_live(forms[found.name], found.first + width) for found in copies]
         kept = [i for i in range(len(first.written))
                 if any(found.written[i] in reads for found, reads in zip(copies, suffixes, strict=True))]
-        while (name := f"_shared_component_{next(numbers)}") in occupied:
+        while (name := f"shared_component_{next(numbers)}") in occupied:
             pass
         occupied.add(name)
         # Give every helper the dynamic-array prefix the case table can pass directly.

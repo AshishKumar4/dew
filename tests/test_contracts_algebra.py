@@ -13,10 +13,10 @@ from dew.algebra import means, scan, windows
 
 @pytest.mark.parametrize("dtype", [jnp.bfloat16, jnp.float16])
 def test_generated_rounded_bodies_keep_the_written_surrogate_law(dtype):
-    from dew.algebra import component_cases, component_cases_derived as emitted
+    from dew.algebra import format_cases, format_cases_derived as emitted
     from dew.nn import precision
 
-    composed = component_cases.ROUNDED.assembled(lambda name: getattr(emitted, name))
+    composed = format_cases.ROUNDED.assembled(lambda name: getattr(emitted, name))
 
     def rounded(value):
         return composed(value, dtype=dtype)
@@ -36,10 +36,10 @@ def test_generated_rounded_bodies_keep_the_written_surrogate_law(dtype):
 
 
 def test_generated_quantized_straight_through_holds_signed_zero_and_higher_orders():
-    from dew.algebra import component_cases, component_cases_derived as emitted
+    from dew.algebra import format_cases, format_cases_derived as emitted
     from dew.nn import fake_quant
 
-    composed = component_cases.QUANTIZED_STE.assembled(lambda name: getattr(emitted, name))
+    composed = format_cases.QUANTIZED_STE.assembled(lambda name: getattr(emitted, name))
     x = jnp.full((16, 32), 7.0, jnp.float32)
     stored = jnp.full(x.shape, -0.0, jnp.bfloat16)
     tangent = jnp.full_like(x, 3)

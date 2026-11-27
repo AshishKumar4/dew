@@ -7,6 +7,9 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
 
 ## Unreleased
 
+- Generated components share one helper module across declaring modules, so the numeric formats'
+  components are declared on their own (`dew.algebra.format_cases`). Add checked NVFP4 block decode and
+  the recurrence skip's pullback; production dispatch is unchanged.
 - Add checked portable E4M3/E5M2 decoding and the selective scan readout; keep production dispatch
   unchanged. Split the slowest moment derivative checks by the derivative and draw they already held.
 
