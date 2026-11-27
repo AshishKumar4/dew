@@ -84,30 +84,48 @@ def test_what_waits_rolls_once_an_update_applies_and_a_skipped_input_waits_for_n
     assert all(float(value) == -1.0 for value in jax.tree.leaves(after))
 
 
+def _held_partway(directory) -> Trainer:
+    """A run of three steps checkpointed at each, its last partway through its second held update."""
+    from dew.checkpoints import Checkpoints
+
+    run = delayed_lm(1, Checkpoints(str(directory)), optimizer=_every_second())
+    run.fit(data(), steps=3, checkpoint_every=1)
+    return run
+
+
 def test_a_run_resumed_partway_through_a_held_update_rolls_what_its_taken_calls_recorded(tmp_path):
     """A run whose optimizer holds updates back, resumed from a checkpoint written partway through one,
     restores what its taken call recorded (`NVFP4_PENDING`) and rolls the histories the uninterrupted run
-    rolls; a checkpoint an earlier Dew wrote, which holds none, resumes where an update applied, nothing
-    waiting, and is refused partway through one, whose records it lost (row 12994's review)."""
+    rolls (row 12994's review). Its earlier Dew's checkpoints are the next test's: each cell's fits apart
+    (row 13117: five fits in one cell took 256 s)."""
     from dew.checkpoints import Checkpoints
-    from dew.nn.dense import NVFP4_PENDING
 
     with generation.run_precision(DELAYED):
         whole = delayed_lm(1, optimizer=_every_second()).fit(data(), steps=4)
-        delayed_lm(1, Checkpoints(str(tmp_path / "held")), optimizer=_every_second()).fit(
-            data(), steps=3, checkpoint_every=1)
+        _held_partway(tmp_path / "held")
         # Step 3's checkpoint, partway through the second update, read again below as it was written.
         shutil.copytree(tmp_path / "held", tmp_path / "run")
         resumed = delayed_lm(1, Checkpoints(str(tmp_path / "run")), optimizer=_every_second()).fit(
             data(), steps=4, checkpoint_every=1)
         for one, other in zip(histories(resumed), histories(whole), strict=True):
             np.testing.assert_array_equal(one, other)
+
+
+def test_an_earlier_dews_checkpoint_resumes_where_an_update_applied_and_is_refused_partway(tmp_path):
+    """A checkpoint an earlier Dew wrote, which holds nothing waiting to roll (`NVFP4_PENDING`), resumes
+    where an update applied, nothing waiting, and is refused partway through one, whose records it lost;
+    one this Dew wrote partway through resumes as written (row 12994's review)."""
+    from dew.checkpoints import Checkpoints
+    from dew.nn.dense import NVFP4_PENDING
+
+    with generation.run_precision(DELAYED):
+        _held_partway(tmp_path / "held")
         # A run's checkpoint where its update applied (step 2): one keeps its latest step alone.
         delayed_lm(1, Checkpoints(str(tmp_path / "applied")), optimizer=_every_second()).fit(
             data(), steps=2, checkpoint_every=2)
 
         def resaved(step: int, name: str, waiting) -> Trainer:
-            """The run's checkpoint at `step` (step 2's run's, else the resumed one's step 3) written again at
+            """The run's checkpoint at `step` (step 2's run's, else the held one's step 3) written again at
             `name` with `waiting` as what waits to roll (`NVFP4_PENDING`): None, as an earlier Dew wrote it,
             holds none."""
             source = delayed_lm(1, Checkpoints(str(tmp_path / ("applied" if step == 2 else "held"))),
