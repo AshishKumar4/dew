@@ -1264,6 +1264,10 @@ class FitSearch[LossT, EffectsT]:
         return self.lower(split, self.narrow, self.ns_group)
 
     def after(self, candidates: Sequence[int], index: int) -> int | None:
+        """The split `forecast` asks after `candidates[index]` missed."""
+        return self.forecast(candidates, index)[0]
+
+    def forecast(self, candidates: Sequence[int], index: int) -> tuple[int | None, bool]:
         """The index into `candidates` of the split asked after the compile of `candidates[index]` at the
         objective's rung missed: the first above it that compile computes fits (`MemoryMiss.fits_at`), the
         latest any process computes so every process asks the same; the next above it where the compile
@@ -1272,14 +1276,16 @@ class FitSearch[LossT, EffectsT]:
         finest before the rung is left: the figures take every temporary as scaled by a microbatch's rows,
         and a split's temporaries can fall faster than its rows (`walked`), so they rule no split out; None
         past the last. Every process gathers at every miss, whatever its own compile read, so their rounds
-        stay in step."""
+        stay in step; beside it, whether every process's compile computes a split above it as fitting, read
+        in the same round."""
         if index + 1 >= len(candidates):
-            return None
+            return None, False
         miss = self.misses.get((self.rung(), candidates[index]))
         above = range(index + 1, len(candidates))
-        computed = index + 1 if miss is None else next(
-            (at for at in above if miss.fits_at(candidates[at])), len(candidates) - 1)
-        return max(self.gather(computed))
+        found = None if miss is None else next((at for at in above if miss.fits_at(candidates[at])), None)
+        computed = index + 1 if miss is None else len(candidates) - 1 if found is None else found
+        read = self.gather([computed, found is not None])
+        return max(each[0] for each in read), all(each[1] for each in read)
 
     def current(self) -> dict[str, JSON]:
         return rung_record(self.objective, self.xla_defaults, narrow=self.narrow, ns_group=self.ns_group)
@@ -1572,16 +1578,16 @@ class FitSearch[LossT, EffectsT]:
 
         # The place the start's whole schedule reads as fitting, at the split it read, asked second (the
         # owner's 2026-11-26 ruling: the fitting place in the second compile), before the start's stacks
-        # parted by their count alone; the climb on past it where it misses, its coarser splits unasked
-        # left for the search's end (`coarser`), and the start's finer splits its first miss left.
-        coarser: list[tuple[Rung, int]] = []
+        # parted by their count alone; the climb on past it where it misses, its splits left untried
+        # asked at the search's end (`untried`), and the start's finer splits its first miss left.
+        jumped: list[Rung] = []
         if (jump := self.jumped(start, narrow, group, candidates, named[0])) is not None:
             split = ask(jump[0], "the step does not fit the devices; compiling it again at the place its "
                         "schedule reads as fitting, %s", jump[1]) or parted(jump[0])
             if split is not None:
                 self.said(named)
                 return split
-            coarser.append(jump)
+            jumped.append(jump[0])
         if resumed is not None:
             # On from where the start's walk stopped: its next split, down past a fit to the one after its
             # miss, as its walk would have gone on.
@@ -1628,7 +1634,7 @@ class FitSearch[LossT, EffectsT]:
             if split is not None:
                 self.said(named)
                 return split
-        split = self.coarser_asked(candidates, coarser)
+        split = self.untried(candidates, jumped, self.fits_here)
         self.said(named)
         return split
 
@@ -1645,27 +1651,25 @@ class FitSearch[LossT, EffectsT]:
         resumed: list[tuple[int, int]] = []
 
         def after(index: int) -> int | None:
-            following = self.after(candidates, index)
-            miss = self.misses.get((self.rung(), candidates[index]))
-            computed = miss is not None and any(miss.fits_at(split) for split in candidates[index + 1:])
-            if following is not None and not resumed and not all(self.gather(computed)):
+            following, predicted = self.forecast(candidates, index)
+            if following is not None and not resumed and not predicted:
                 resumed.append((following, index))
                 return None
             return following
 
         return walked(candidates, first, self.fits_here, after), next(iter(resumed), None)
 
-    def coarser_asked(self, candidates: Sequence[int], jumped: Sequence[tuple[Rung, int]]) -> int | None:
-        """The split a place the jump asked from a finer split than the batch whole fits at among the
-        coarser splits its walk left unasked (`walked` asks a coarser one past a fit alone), the objective
-        left at it; None where none fits: XLA schedules each split anew, so a prediction rules none out."""
-        for rung, index in jumped:
-            if index == 0:
-                continue
+    def untried(self, candidates: Sequence[int], jumped: Sequence[Rung], fits: Callable[[int], bool]
+                ) -> int | None:
+        """The split a place the jump asked fits at among the legal splits its walk left untried (`lowered`
+        keeps each split a rung was measured at), coarsest first, the objective left at it; None where none
+        fits: XLA schedules each split anew, so a prediction rules none out, and a jump's walk can pass over
+        a split that fits (a forecast from a finer split's miss)."""
+        for rung in jumped:
             self.at(rung)
-            fewer = candidates[:index]
-            if (split := walked(fewer, 0, self.fits_here, functools.partial(self.after, fewer))) is not None:
-                return split
+            for split in candidates:
+                if (split, self.rung()) not in self.lowered and fits(split):
+                    return split
         return None
 
     def without_copies(self, start: Rung, named: list[str], ask: Callable[[Rung, str], int | None],

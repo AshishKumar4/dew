@@ -143,3 +143,64 @@ def test_every_process_defers_a_place_any_predicts_short_and_asks_it_after_the_r
     assert search.past_copies([first, second], second, named, ask, lambda rung: None) == 2
     assert search.asked == [second, first]
 
+
+def scripted_search(gather):
+    """A fit search over a tiny decoder on one device, its rounds `gather`'s, its rung the plain one."""
+    from dew.training.planning import FitSearch, Rung
+
+    model = models.build("causal_transformer", vocab_size=32, emb_features=16, num_layers=1, num_heads=2,
+                         mlp_features=32, max_seq_len=8)
+    search = FitSearch(lower=None, options=lambda candidate: None, objective=LMObjective(model, seq_len=8),
+                       mesh=MeshSpec().build(jax.devices()[:1]), xla_defaults=False, narrow=False,
+                       ns_group=None, base=None, resumed=None, gather=gather)
+    return search, Rung((), None, fused=False, xla_defaults=False, narrow=False)
+
+
+def test_a_jumped_rung_is_asked_at_every_legal_split_its_walk_passed_over_before_refusing():
+    """A jumped rung whose walk compiled splits 2, 8 and 1 and missed at each, its forecast passing over
+    4: the search asks 4, the one left untried, before it refuses, and it fits there (train 1387's P0)."""
+    search, rung = scripted_search(lambda mine: [mine])
+    search.at(rung)
+    for split in (2, 8, 1):
+        search.lowered[(split, search.rung())] = None
+    asked: list[int] = []
+
+    def fits(split: int) -> bool:
+        asked.append(split)
+        return split == 4
+
+    assert search.untried([1, 2, 4, 8], [rung], fits) == 4
+    assert asked == [4]
+
+
+def test_a_miss_reads_its_next_split_and_whether_it_fits_in_one_round():
+    """After a miss, the split asked next and whether every process computes it fitting come of one scan
+    and one agreement (`forecast`): another process computing none fitting, the next split is the latest
+    any computes, and no process reads it as fitting (train 1387's P1)."""
+    from dew.training.memory import MemoryMiss
+
+    rounds: list[object] = []
+
+    def gather(mine):
+        rounds.append(mine)
+        return [mine, [2, False]]
+
+    search, rung = scripted_search(gather)
+    search.at(rung)
+    search.misses[(search.rung(), 1)] = MemoryMiss(1, scaled=100, shortfall=40, factor=1)
+    assert search.forecast([1, 2, 4, 8], 0) == (2, False)
+    assert len(rounds) == 1
+
+
+def test_a_looped_decoder_whose_loss_reads_its_passes_apart_fuses_no_head():
+    """A looped decoder whose passes the loss weighs apart takes each pass's per-token terms through the
+    unfused head, so its objective states no fused head (`fuses_head`), as its loss decides it; the plain
+    decoder's fuses it (train 1387's P2)."""
+    from dew.nn.backbones.causal_transformer import CausalTransformer
+    from dew.nn.backbones.decoder_stack import Loop
+
+    looped = CausalTransformer(vocab_size=256, emb_features=32, num_layers=3, num_heads=2, mlp_features=48,
+                               max_seq_len=128, loop=Loop(4, layers=(1, 2)))
+    assert not LMObjective(looped, 16, pass_weights="mean").fuses_head()
+    assert LMObjective(looped, 16).fuses_head()
+
