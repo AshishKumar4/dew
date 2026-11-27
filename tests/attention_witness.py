@@ -188,9 +188,9 @@ FORMS = {"full": {}, "causal": {"causal": True},
 causal window of 192 keys (each query's tiles partly walked), three causal documents packed into the call,
 their bounds off the key tiles, and a causal call under a cap (`CAPS`)."""
 
-CAPS = {"capped": 2.0}
+CAPS = {"capped": 3.0}
 """A form's logit cap (Gemma 2's, `template.Capped`), low enough that the witnessed draws' scaled logits
-(their keys doubled) reach its bend."""
+(their keys doubled) reach its bend, its reciprocal inexact in fp32 so each constant's rounding is read."""
 
 
 def hooks_of(form: str):
@@ -201,13 +201,17 @@ def hooks_of(form: str):
 
 
 def capped_constants(form: str, width: int) -> tuple[float, float] | None:
-    """The two fp32 constants a base-2 walk folds a cap into (`attention_algebra.logits_of`): the logit
-    scale over the cap, `fp32(scale * fp32(1 / cap))`, before the tanh, and `fp32(cap) * fp32(log2(e))` after
-    it; None for an uncapped form."""
+    """The two fp32 constants a base-2 walk folds a cap into (`attention_algebra.logits_of`), as the witness's
+    unscaled products take them: the walk's scale over the cap, `fp32(scale * Capped.reciprocal)` of the
+    scale left after the queries' power of two (`template.prescale`, which scales the products exactly), times
+    that power, before the tanh; and `fp32(cap) * fp32(log2(e))` after it. None for an uncapped form."""
+    import jax.numpy as jnp
+
     if form not in CAPS:
         return None
     capped = template.Capped(CAPS[form])
-    inner = float(np.float32(attention_mosaic.logit_scale(width, None) * capped.reciprocal))
+    power, left = template.prescale(jnp.bfloat16, width, None)
+    inner = power * float(np.float32(left * capped.reciprocal))
     return inner, float(np.float32(capped.softcap) * np.float32(LOG2E))
 
 
