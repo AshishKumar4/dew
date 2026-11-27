@@ -250,10 +250,10 @@ def test_a_primitive_its_name_does_not_identify_keys_nothing():
     def branched(function):
         return jax.make_jaxpr(lambda p, x: jax.lax.cond(p, function, jax.lax.neg, x))(taken, operand)
 
-    assert stored.key(jax.make_jaxpr(own.bind)(operand), (), ()) is None
-    assert stored.key(branched(own.bind), (), ()) is None
-    assert stored.key(jax.make_jaxpr(jax.lax.exp)(operand), (), ()) is not None
-    assert stored.key(branched(jax.lax.exp), (), ()) is not None
+    assert _keyed(jax.make_jaxpr(own.bind)(operand), ()) is None
+    assert _keyed(branched(own.bind), ()) is None
+    assert _keyed(jax.make_jaxpr(jax.lax.exp)(operand), ()) is not None
+    assert _keyed(branched(jax.lax.exp), ()) is not None
 
 
 def test_a_program_capturing_an_outer_traces_value_has_no_key():
@@ -261,7 +261,7 @@ def test_a_program_capturing_an_outer_traces_value_has_no_key():
     no error): its derivation is not stored."""
     def outer(scale):
         closed = jax.make_jaxpr(lambda x: x * scale)(np.ones(4, np.float32))
-        assert stored.key(closed, (), ()) is None
+        assert _keyed(closed, ()) is None
         return scale
 
     jax.jit(outer)(np.float32(2))
@@ -286,7 +286,7 @@ def test_an_entry_keys_on_its_programs_captured_constants():
     def program(constant):
         return jax.make_jaxpr(lambda x: x * constant)(np.ones(4, np.float32))
 
-    named = [stored.key(program(np.full(4, value, np.float32)), (), ()) for value in (1.0, 2.0)]
+    named = [_keyed(program(np.full(4, value, np.float32)), ()) for value in (1.0, 2.0)]
     assert None not in named and named[0] != named[1]
 
 
@@ -397,3 +397,189 @@ def test_a_fused_multiply_adds_terms_read_as_the_operations_they_bind():
     assert terms.key(decoded(at, sides=())) == terms.key(form)
     with pytest.raises(ValueError):
         stored._decoded(table, leaves=1, literals=0, primitives=[jax.lax.add_p, jax.lax.add_p], states=0)
+
+
+@pytest.fixture
+def shipped(tmp_path, monkeypatch):
+    """A read-only store of the test's own in the package's place (`DEW_DERIVATIONS`), not made yet."""
+    monkeypatch.setenv("DEW_DERIVATIONS", str(tmp_path / "shipped"))
+    return tmp_path / "shipped"
+
+
+def _ship(shipped):
+    """The store's entries moved into the read-only one, the store left empty: a fresh install's."""
+    shipped.mkdir(exist_ok=True)
+    for entry in Path(stored.directory()).glob("*.json"):
+        entry.rename(shipped / entry.name)
+
+
+def test_a_shipped_derivation_reads_into_an_empty_store_and_writes_nothing(storing, shipped):
+    fresh = _derived("walk")
+    _ship(shipped)
+    read = _derived("walk")
+    assert storing.stored == {"miss": 1, "hit": 1}
+    assert _terms(read) == _terms(fresh)
+    assert not list(Path(stored.directory()).glob("*.json"))
+
+
+def test_the_store_is_read_before_the_shipped_entries(storing, shipped):
+    """Where both hold an entry, Dew's cache's is read: the shipped one, here no entry at all, is not."""
+    fresh = _derived("walk")
+    entry, _ = _entry()
+    shipped.mkdir()
+    (shipped / entry.name).write_text("no entry")
+    read = _derived("walk")
+    assert storing.stored == {"miss": 1, "hit": 1}
+    assert _terms(read) == _terms(fresh)
+
+
+def test_shipped_entries_another_build_derived_are_derived_afresh_past(storing, shipped):
+    """Shipped entries keyed otherwise (another derivation's, or another build's code, egglog or JAX) are
+    none of a derivation's: it is derived afresh and written to Dew's cache. One shipped under its name but
+    not its own (another's text) is counted invalid and derived afresh past."""
+    _derived("weights")
+    _ship(shipped)
+    (other,) = shipped.glob("*.json")
+    fresh = _derived("walk")
+    assert storing.stored == {"miss": 2}
+    entry, _ = _entry()
+    entry.unlink()
+    (shipped / entry.name).write_text(other.read_text())
+    again = _derived("walk")
+    assert storing.stored == {"miss": 3, "invalid": 1}
+    assert _terms(again) == _terms(fresh)
+    assert [path.name for path in Path(stored.directory()).glob("*.json")] == [entry.name]
+
+
+def _manual(sizes, names=("data",)):
+    """An abstract mesh of `sizes` over manual axes `names`, a sharded step's kernels' as they trace."""
+    return jax.sharding.use_abstract_mesh(jax.sharding.AbstractMesh(
+        sizes, names, axis_types=(jax.sharding.AxisType.Manual,) * len(names)))
+
+
+def test_a_derivation_stored_on_one_device_is_read_on_eight(storing):
+    """A walk derived on a manual mesh of one device is read on one of eight: a key states a mesh by its
+    axes' names and types, which a derivation reads, and none of their sizes, which it does not."""
+    with _manual((1,)):
+        fresh = _derived("walk")
+    with _manual((8,)):
+        read = _derived("walk")
+    assert storing.stored == {"miss": 1, "hit": 1}
+    assert _terms(read) == _terms(fresh)
+
+
+def test_a_derivation_on_a_manual_mesh_is_none_of_one_on_no_mesh(storing):
+    """Whether a mesh's axes are manual is read by a derivation (a tangent sum, an fp32-exact product and a
+    cast's round trip are each treated by it, `terms.unplaced_equation`): one stored on a manual mesh is
+    derived afresh on none."""
+    with _manual((8,)):
+        _derived("walk")
+    _derived("walk")
+    assert storing.stored == {"miss": 2}
+
+
+def test_a_mesh_axis_named_as_an_address_keys_its_derivations(storing):
+    """A mesh axis whose name reads as an object's address is a name like any other: the derivations on it
+    are stored and read back."""
+    with _manual((2,), names=("data at 0x1",)):
+        _derived("walk")
+        _derived("walk")
+    assert storing.stored == {"miss": 1, "hit": 1}
+
+
+def _keyed(closed, parts=()):
+    """The store's key of `closed`'s derivation over its region (`terms.region`), with no rule sets."""
+    return stored.key(closed, terms.region(closed), [], parts)
+
+
+def _mesh(sizes):
+    return jax.sharding.AbstractMesh(sizes, ("a", "b"), axis_types=(jax.sharding.AxisType.Explicit,) * 2)
+
+
+def _broadcasts(sizes, moved=None, to=(2, 1)):
+    """Three broadcasts of one value, summed, traced on an Explicit mesh of `sizes`, each placing its result
+    on it; the `moved`th's parameters placed on a mesh of the same axes of sizes `to` instead."""
+    mesh = _mesh(sizes)
+    where = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec())
+
+    def program(x):
+        return sum(jax.lax.broadcast_in_dim(x, (2, 4), (1,), out_sharding=where) for _ in range(3))
+
+    with jax.sharding.use_abstract_mesh(mesh):
+        closed = jax.make_jaxpr(program)(jax.ShapeDtypeStruct((4,), jnp.float32))
+    if moved is None:
+        return closed
+    broadcasts = [at for at, equation in enumerate(closed.jaxpr.eqns)
+                  if equation.primitive is jax.lax.broadcast_in_dim_p]
+    elsewhere = jax.sharding.NamedSharding(_mesh(to), jax.sharding.PartitionSpec())
+    equations = [equation.replace(params={**equation.params, "sharding": elsewhere})
+                 if at == broadcasts[moved] else equation for at, equation in enumerate(closed.jaxpr.eqns)]
+    return closed.replace(jaxpr=closed.jaxpr.replace(eqns=equations))
+
+
+def test_a_key_states_a_mesh_by_name_and_how_its_parameters_intern():
+    """A stored derivation's key states the meshes its program reads by their axes' names and types, not
+    their sizes, beside how its region interns its parameters (`Region.interned`): a program traced on a
+    mesh of one device and of four keys alike, its parameters' placements among them; two whose
+    parameters are one but for their meshes' sizes and intern apart (a broadcast placed on another mesh
+    of those axes, the second or the third) key apart."""
+    assert _keyed(_broadcasts((1, 1), None), ()) == _keyed(_broadcasts((2, 2), None), ())
+    second, third = (_keyed(_broadcasts((1, 2), at), ()) for at in (1, 2))
+    assert None not in (second, third) and second != third
+
+
+def _composed(order):
+    """A scalar broadcast to (1,) and on to (2, 4) along each axis, broadcast to (3,), and broadcast to (2, 4)
+    directly: the three (2, 4) broadcasts placed on the meshes of `order`'s sizes in turn (one axis's apart),
+    which a region interns after the composed broadcasts' dimensions are replaced by the direct one's."""
+    def program(x):
+        one = jax.lax.broadcast_in_dim(x, (1,), ())
+        return (jax.lax.broadcast_in_dim(one, (2, 4), (0,)), jax.lax.broadcast_in_dim(one, (2, 4), (1,)),
+                jax.lax.broadcast_in_dim(x, (3,), ()), jax.lax.broadcast_in_dim(x, (2, 4), ()))
+
+    closed = jax.make_jaxpr(program)(jax.ShapeDtypeStruct((), jnp.float32))
+    placed = iter(jax.sharding.NamedSharding(_mesh(sizes), jax.sharding.PartitionSpec()) for sizes in order)
+    equations = [equation.replace(params={**equation.params, "sharding": next(placed)})
+                 if equation.params["shape"] == (2, 4) else equation for equation in closed.jaxpr.eqns]
+    return closed.replace(jaxpr=closed.jaxpr.replace(eqns=equations))
+
+
+@pytest.mark.parametrize("other", [((1, 1), (1, 1), (2, 1)), ((1, 1), (2, 1), (2, 1))],
+                         ids=["slots apart", "outputs apart"])
+def test_a_key_states_the_parameters_its_region_interns(other):
+    """A key states how the region interns its parameters, after it normalizes them, and which output reads
+    which: two programs one but for which (2, 4) broadcast is placed on the mesh of another size key apart,
+    whether their regions' parameter slots differ or only which output reads a slot (head reviews' cases)."""
+    first, second = _keyed(_composed(((1, 1), (2, 1), (1, 1)))), _keyed(_composed(other))
+    assert None not in (first, second) and first != second
+
+
+def test_a_part_of_objects_keys_nothing():
+    """A part whose value is held by identity, an array of objects among them (its bytes their addresses),
+    keys no derivation."""
+    assert _keyed(_broadcasts((1, 1)), (np.array([object()], dtype=object),)) is None
+
+
+@pytest.mark.parametrize("linked", [False, True], ids=["named", "linked"])
+def test_a_read_only_store_that_is_dews_cache_is_never_written(storing, tmp_path, monkeypatch, linked):
+    """A read-only store (`DEW_DERIVATIONS`) that resolves to Dew's cache, named or through a link, is never
+    written: a derivation there is derived and counted unstorable, the store left empty."""
+    Path(stored.directory()).mkdir(parents=True, exist_ok=True)
+    alias = tmp_path / "alias"
+    if linked:
+        alias.symlink_to(stored.directory())
+    monkeypatch.setenv("DEW_DERIVATIONS", str(alias if linked else stored.directory()))
+    _derived("walk")
+    assert storing.stored == {"unstorable": 1}
+    assert not list(Path(stored.directory()).glob("*.json"))
+
+
+def test_an_entry_is_a_stores_own_file_not_its_name(storing, tmp_path):
+    """A file named as an entry is one only where its text is its own (`stored.entry`), as the catalogue's
+    output is replaced only where it holds entries alone."""
+    _derived("walk")
+    entry, _ = _entry()
+    assert stored.entry(entry)
+    named = tmp_path / entry.name
+    named.write_text('{"format": 5}')
+    assert not stored.entry(named) and not stored.entry(tmp_path / "missing.json")

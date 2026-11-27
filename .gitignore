@@ -36,6 +36,8 @@ samples/
 build/
 # recorded fixtures over 1 MiB, fetched by tools/fetched_fixtures.py from their pins (*.fetched.json)
 /tests/fixtures/fetched/
+# the derivations a built package ships, written as it is built (tools/derived_catalogue.py)
+/src/dew/algebra/derived/
 
 # run logs a test runner writes where it is started, never part of the tree
 /*.log

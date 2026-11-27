@@ -479,7 +479,8 @@ concurrency = ["thread", "multiprocessing"]
 version = {attr = "dew._version.__version__"}
 
 [tool.setuptools.package-data]
-dew = ["py.typed", "telemetry/xla_protos.binpb"]
+# algebra/derived: the derivations a built package ships (tools/derived_catalogue.py), none in the tree.
+dew = ["py.typed", "telemetry/xla_protos.binpb", "algebra/derived/*.json"]
 
 [tool.setuptools.packages.find]
 where = ["src"]

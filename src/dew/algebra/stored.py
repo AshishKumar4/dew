@@ -1,5 +1,7 @@
 """A template's trace-time derivations (`derive._derived`'s forms at one tile) stored across processes in
-Dew's cache, so a process traces a fixed tile's forms from what an earlier one derived
+Dew's cache, so a process traces a fixed tile's forms from what an earlier one derived, and read from a
+store no run writes (`shipped`: a built package's, the derivations its declared steps' templates request,
+derived as it was built by `tools/derived_catalogue.py`, or one a site built), after Dew's cache's
 (docs/design/algebra.md §6.5).
 
 A derivation is a pure function of what it reads: its declaration's traced program (its structural digest,
@@ -7,21 +9,29 @@ A derivation is a pure function of what it reads: its declaration's traced progr
 its numerics' class and limits, the context its forms are priced and traced in (`derive.context`), the rule
 sets it saturates with (by name, each as the source registers it, immutable, `rules.sourced`; a set
 registered at run time stores nothing), the algebra's code (`dew._code.code_digest`) and egglog's and JAX's
-versions. The program's digest states each primitive by its name, so a program is keyed only where each
-of its primitives, at every depth, is the one JAX binds to that name (`_bound`): a region tells primitives
-apart by identity (`terms.OPERATIONS`), and a user's primitive of a JAX name is not keyed.
-An entry is keyed by all of them (`key`, each part in a canonical form: an unordered collection sorted, a
-structure by its fields), written whole (`dew._files.write_atomically`) and read back exactly: each chosen
-term through the Term language's constructors (`CONSTRUCTORS`, `get_callable_args`), its arguments as their
+versions, each its exact build's (egglog `14.0.0.post1` where Dew pins its patched build, `14.0.0` where it
+pins upstream's): an entry is read only by the egglog that derived it, so a shipped one is read where the
+package's build was derived and derived afresh elsewhere, never an entry another build could saturate or
+extract otherwise. The program's digest states each primitive by its name, so a program is keyed only where
+each of its primitives, at every depth, is the one JAX binds to that name (`_bound`): a region tells
+primitives apart by identity (`terms.OPERATIONS`), and a user's primitive of a JAX name is not keyed.
+An entry is keyed by all of them (`key`, each part by the algebra's structural key, `terms.plain_key`: an
+unordered collection sorted, a structure by its fields, a part held by identity keying nothing), every mesh by
+its axes' names and types and none of their sizes (`terms.unsized`), beside its region in order (`_inventory`:
+each output, opaque input and shaped term, its parameter slots normalized): a derivation reads whether an axis
+is explicit or manual (`terms.unplaced_equation`, a tangent sum's add), never its size, so a run on one device
+and one on eight read one entry (its forms in a process, which hold their mesh's avals, are kept per mesh,
+`derive.context`). Written whole (`dew._files.write_atomically`) and read back exactly: each chosen term
+through the Term language's constructors (`CONSTRUCTORS`, `get_callable_args`), its arguments as their
 literals, a vector as written (egglog writes it typed or not, each a term of its own), each term once in a
-table its forms index (`_Writer`: a term its forms share is written once); the parameters, literals and
-shapes the derivation appended to its region past its trace by their primitive's name and their values'
-types, in their order (the shapes it appended, its appended literals' own, `_appended`), the region itself
-traced afresh. No value is pickled or evaluated. An entry's text
-is digested with its name (`_summed`), and one whose digest is not its own is not decoded; an entry is
-checked against the region it extends as it decodes (each value of its kind, each term's leaf, literal,
-parameter and state in range, each state of a side its form reads, each count and part of its forms the
-region's) before any of it is taken, and the region extended once all of it has read.
+table its forms index (`_Writer`: a term its forms share is written once); the parameters, literals and shapes
+the derivation appended to its region past its trace by their primitive's name and their values' types, in
+their order (the shapes it appended, its appended literals' own, `_appended`), the region itself traced
+afresh. No value is pickled or evaluated. An entry's text is digested with its name (`_summed`), and one whose
+digest is not its own is not decoded; an entry is checked against the region it extends as it decodes (each
+value of its kind, each term's leaf, literal, parameter and state in range, each state of a side its form
+reads, each count and part of its forms the region's) before any of it is taken, and the region extended once
+all of it has read.
 
 A derivation a key cannot state (a value held by identity, an outer trace's or a device's) or a value the
 codec cannot state is derived afresh and not stored, as is one whose entry cannot be written; an entry that
@@ -38,6 +48,7 @@ import importlib.metadata
 import json
 import logging
 import os
+import re
 from collections.abc import Callable, Mapping, Sequence
 from typing import TYPE_CHECKING
 
@@ -45,7 +56,7 @@ import jax
 import numpy as np
 from egglog import ConvertError, String, Vec, f64, get_callable_args, i64
 from jax.core import ShapedArray
-from jax.extend.core import Jaxpr, Primitive, primitives
+from jax.extend.core import Jaxpr, JaxprEqn, Primitive, primitives
 
 from dew import _code, _files
 from dew._builds import dew_cache_dir
@@ -58,8 +69,8 @@ if TYPE_CHECKING:
 
 _log = logging.getLogger(__name__)
 
-FORMAT = 4
-"""The entries' layout, in every key: an entry of another is never read."""
+FORMAT = 5
+"""The entries' layout and key, in every key: an entry of another is never read."""
 
 CONSTRUCTORS: Mapping[str, Callable] = {
     **{written.constructor: getattr(Term, written.constructor) for written in terms.WRITTEN.values()},
@@ -71,36 +82,47 @@ class Unstated(Exception):
     """A value the store's key or codec does not state: its derivation is not stored."""
 
 
+SHIPPED = os.path.join(os.path.dirname(os.path.abspath(__file__)), "derived")
+"""The entries a built package ships (`tools/derived_catalogue.py`, its package data): none in a checkout
+of the source, whose tree holds none (`.gitignore`)."""
+
+
 def directory() -> str:
-    """Where the entries are, in Dew's cache."""
+    """Where the entries a process writes are, in Dew's cache, read before the read-only ones (`shipped`)."""
     return os.path.join(dew_cache_dir(), "algebra", "derived")
 
 
-def key(closed, sets: Sequence[str], parts: Sequence[object]) -> str | None:
+def shipped() -> str:
+    """Where the read-only entries are, read after Dew's cache's and never written: `DEW_DERIVATIONS` where
+    it is set (a store `tools/derived_catalogue.py` built for a site's own GPUs and meshes, every run of it
+    reading it), else the package's (`SHIPPED`)."""
+    return os.environ.get("DEW_DERIVATIONS") or SHIPPED
+
+
+def key(closed, region: terms.Region, sets: Sequence[str], parts: Sequence[object]) -> str | None:
     """The entry's name of a derivation of the traced `closed` saturated with the source's rule sets named
-    `sets` (`rules.sourced`), in their order, beside `parts` (everything else it reads, `derive._derived`'s);
-    None where its program (a primitive its name does not identify, `_bound`), a captured constant (an
-    outer trace's value, or one on a device) or a part is no value a key states by its contents."""
-    if not _bound(closed):
+    `sets` (`rules.sourced`), in their order, beside `parts` (everything else it reads, `derive._derived`'s),
+    each by the algebra's structural key (`terms.plain_key`), every mesh among them by its axes' names and
+    types (`terms.unsized`); None where its program (a primitive its name does not identify, `_bound`), a
+    captured constant (an outer trace's value, or one on a device) or a part is held by identity."""
+    equations = _equations(closed)
+    if equations is None or not _bound(equations):
         _log.info("a derivation not keyed: a primitive its name does not identify")
         return None
-    digest, opaques = terms.jaxpr_digest(closed, in_process=False)
-    if opaques or not all(isinstance(const, (np.ndarray, np.generic, bool, int, float))
-                          for const in closed.consts):
-        _log.info("a derivation not keyed: a program or constant held by identity")
+    if not all(isinstance(const, (np.ndarray, np.generic, bool, int, float)) for const in closed.consts):
+        _log.info("a derivation not keyed: a constant on a device")
         return None
-    try:
-        text = repr((FORMAT, digest, [_encoded_value(np.asarray(const)) for const in closed.consts],
-                     list(sets), _canonical(tuple(parts)), importlib.metadata.version("egglog"),
-                     jax.__version__,
-                     _code.code_digest("dew.algebra.derive")))
-    except Unstated as unstated:
-        _log.info("a derivation not keyed: %s", unstated)
+    with terms.unsized():
+        digest, opaques = terms.jaxpr_digest(closed, in_process=False)
+        interned = _inventory(region)
+        stated = None if interned is None else terms.plain_key((list(closed.consts), interned, list(sets),
+                                                                tuple(parts),
+                                  importlib.metadata.version("egglog"), jax.__version__,
+                                  _code.code_digest("dew.algebra.derive")))
+    if opaques or stated is None:
+        _log.info("a derivation not keyed: a program or part held by identity")
         return None
-    if " at 0x" in text:
-        _log.info("a derivation not keyed: a part held by identity")
-        return None
-    return hashlib.blake2b(text.encode(), digest_size=20).hexdigest()
+    return hashlib.blake2b(repr((FORMAT, digest, stated)).encode(), digest_size=20).hexdigest()
 
 
 def loaded(name: str, region: terms.Region, assembled: Callable[..., _Forms], *,
@@ -109,16 +131,21 @@ def loaded(name: str, region: terms.Region, assembled: Callable[..., _Forms], *,
     shapes replayed once the whole entry reads (`assembled(record, decoded=..., ...)` its forms, each decoded
     term checked against the region, `_Decoded`, a rescale reading an exponential of `rescaled`, those its
     declaration's own rescale reads, `_operated`); None where none is stored, or where the entry fails to
-    open, is not its own (`_summed`) or fails to decode (counted `invalid`, derived afresh past)."""
-    path = os.path.join(directory(), f"{name}.json")
-    try:
-        with open(path, "rb") as file:
-            text = file.read()
-    except FileNotFoundError:
-        _log.debug("no stored derivation %s: derived afresh", path)
-        return None
-    except OSError as unreadable:
-        _invalid(path, unreadable)
+    open, is not its own (`_summed`) or fails to decode (counted `invalid`, derived afresh past). Read from
+    Dew's cache where it holds the entry, else from the read-only ones (`shipped`)."""
+    for held in (directory(), shipped()):
+        path = os.path.join(held, f"{name}.json")
+        try:
+            with open(path, "rb") as file:
+                text = file.read()
+            break
+        except FileNotFoundError:
+            continue
+        except OSError as unreadable:
+            _invalid(path, unreadable)
+            return None
+    else:
+        _log.debug("no stored derivation %s: derived afresh", name)
         return None
     try:
         summed, _, body = text.decode().partition("\n")
@@ -154,6 +181,40 @@ def loaded(name: str, region: terms.Region, assembled: Callable[..., _Forms], *,
     return made
 
 
+def _inventory(region: terms.Region) -> list | None:
+    """`region` (the traced program's, `key`'s) as a derivation reads it, in order, each term by its index in
+    one table of the store's codec (`_Writer`: a term once, its slots' and literals' indices within it): each
+    output by its position (None a literal's), each opaque equation's inputs by theirs, each shaped term and
+    its extent in the region's order, and the parameter table its terms index, normalized as the region
+    interns it (`terms.Region.interned`): an entry's forms and indices then bind alike in every region of
+    one key. None where a term is of no stored kind."""
+    writer = _Writer()
+    try:
+        outputs = [writer.maybe(term) for term in region.outputs]
+        opaque = [[writer.maybe(term) for term in held.inputs] for held in region.opaque]
+        shaped = [[writer.term(term), list(extent)] for term, extent in region.shapes]
+    except Unstated as unstated:
+        _log.info("a derivation not keyed: its region holds %s", unstated)
+        return None
+    return [writer.table, outputs, opaque, shaped,
+            [(primitive.name, params) for primitive, params in region.params]]
+
+
+def entry(path: str | os.PathLike) -> bool:
+    """Whether the file at `path` is a store's entry: named by a key, its text this format's and its own
+    (`_summed`), as `loaded` reads one."""
+    name = os.path.basename(path).removesuffix(".json")
+    if not re.fullmatch(r"[0-9a-f]{40}", name) or not os.path.isfile(path):
+        return False
+    try:
+        with open(path, "rb") as file:
+            summed, _, body = file.read().decode().partition("\n")
+        record = json.loads(body)
+    except (OSError, UnicodeDecodeError, ValueError):
+        return False
+    return summed == _summed(name, body) and isinstance(record, dict) and record.get("format") == FORMAT
+
+
 def _summed(name: str, body: str) -> str:
     """The digest an entry `name` of text `body` is written under: an entry is read only where it is its
     own."""
@@ -185,6 +246,8 @@ def stored(name: str, region: terms.Region, params_from: int, literals_from: int
                                for value in region.literals[literals_from:]],
                   **forms, "terms": writer.table}
         body = json.dumps(record, sort_keys=True)
+        if os.path.realpath(directory()) == os.path.realpath(shipped()):
+            raise Unstated("Dew's cache is the read-only store (`DEW_DERIVATIONS`), never written")
         os.makedirs(directory(), exist_ok=True)
         _files.write_atomically(os.path.join(directory(), f"{name}.json"), f"{_summed(name, body)}\n{body}")
     except (Unstated, OSError) as unstated:
@@ -202,23 +265,6 @@ def _appended(region: terms.Region, literals_from: int, shapes_from: int) -> Non
     if held != [(terms.key(Term.literal(i64(index))), np.shape(region.literals[index]))
                 for index in range(literals_from, len(region.literals))]:
         raise Unstated("a derivation's appended shapes are not its appended literals'")
-
-
-def _canonical(value):
-    """`value` as a key states it, the same in every process: a structure by its class and fields, a mapping
-    or an unordered collection sorted by its entries' canonical text, a sequence in its order, anything else
-    by its text."""
-    if dataclasses.is_dataclass(value) and not isinstance(value, type):
-        return (type(value).__qualname__, tuple((field.name, _canonical(getattr(value, field.name)))
-                                                for field in dataclasses.fields(value)))
-    if isinstance(value, Mapping):
-        entries = ((_canonical(k), _canonical(v)) for k, v in value.items())
-        return ("mapping", tuple(sorted(entries, key=repr)))
-    if isinstance(value, (set, frozenset)):
-        return ("set", tuple(sorted((_canonical(member) for member in value), key=repr)))
-    if isinstance(value, (tuple, list)):
-        return tuple(_canonical(part) for part in value)
-    return repr(value)
 
 
 def _called(term) -> tuple[str, tuple]:
@@ -434,12 +480,12 @@ _PLAIN = (type(None), bool, int, float, complex, str, bytes, np.dtype, np.generi
 """The parameter values that hold no program: what `_bound` reads past without descending."""
 
 
-def _bound(closed: Jaxpr) -> bool:
-    """Whether each primitive of `closed`, and of every program its parameters hold at any depth, is the
-    one JAX binds to its name (`_primitives`): its parameters read through sequences and mappings (their
-    keys and values), each once, to programs and plain values (`_PLAIN`); a parameter of any other kind,
-    which may hold a program out of this walk's sight, is none it binds."""
-    bound = _primitives()
+def _equations(closed: Jaxpr) -> list[JaxprEqn] | None:
+    """Each equation of `closed` and of every program its parameters hold, at any depth, in one order: its
+    parameters read through sequences and mappings (their keys and values), each once, to programs and plain
+    values (`_PLAIN`); None where a parameter of any other kind, which may hold a program out of this walk's
+    sight, is met."""
+    found: list[JaxprEqn] = []
     pending: list = [closed]
     seen: set[int] = set()
     while pending:
@@ -449,16 +495,21 @@ def _bound(closed: Jaxpr) -> bool:
         seen.add(id(value))
         if isinstance(value, Jaxpr):
             for equation in value.jaxpr.eqns:
-                if bound.get(equation.primitive.name) is not equation.primitive:
-                    return False
+                found.append(equation)
                 pending.extend(equation.params.values())
         elif isinstance(value, (tuple, list, set, frozenset)):
             pending.extend(value)
         elif isinstance(value, Mapping):
             pending.extend((*value.keys(), *value.values()))
         else:
-            return False
-    return True
+            return None
+    return found
+
+
+def _bound(equations: Sequence[JaxprEqn]) -> bool:
+    """Whether each primitive of `equations` is the one JAX binds to its name (`_primitives`)."""
+    bound = _primitives()
+    return all(bound.get(equation.primitive.name) is equation.primitive for equation in equations)
 
 
 def _primitive_name(primitive) -> str:
