@@ -788,6 +788,29 @@ def test_a_stage_stacked_packed_leaf_reads_as_its_stored_layers_rows():
     assert np.shape(np.asarray(first[True])) == (1, 2, 256, 64)
 
 
+def test_a_packed_bank_split_by_stage_over_an_explicit_axis_reads_its_rows():
+    """A packed bank a stage-local store places on two devices, its leading (stage) axis split over an
+    Explicit mesh axis as `StageLocal` places it, read for an export a row at a time: each row sliced where
+    it lies, placed as the bank's own spec past the stage, and decoded to the bank's own row (#4560's train
+    review: the row's slice, a gather of an Explicit dimension, was refused for want of its placement)."""
+    from jax.sharding import AxisType, NamedSharding, PartitionSpec
+
+    from dew.nn.backbones.layer_names import array_rows
+    from dew.nn.kernels.formats import NvFp4
+
+    stacked = np.random.default_rng(4560).standard_normal((2, 256, 64)).astype(np.float32)
+    bank = NvFp4.quantized(jnp.asarray(stacked))
+    whole = np.asarray(quantization.packed_values(bank))
+    mesh = jax.make_mesh((2,), ("stage",), axis_types=(AxisType.Explicit,), devices=jax.devices()[:2])
+    split = jax.tree.map(lambda plane: jax.device_put(plane, NamedSharding(mesh, PartitionSpec(
+        *(("stage",) if np.ndim(plane) and np.shape(plane)[0] == 2 else ())))), bank)
+    assert any(np.ndim(plane) and plane.sharding.spec[:1] == ("stage",) for plane in jax.tree.leaves(split))
+    tree = quantization.deferred_packed({quantization.QUANTIZATION: {"stages": {"kernel": split}}})
+    for index, row in enumerate(array_rows(("params", "stages", "kernel"), tree["params"]["stages"]["kernel"],
+                                           (2,))):
+        np.testing.assert_array_equal(np.asarray(row), whole[index])
+
+
 WINDOW_WITHOUT_CPU = """
 import jax, jax.numpy as jnp, numpy as np
 from dew import quantization

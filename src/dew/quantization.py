@@ -97,7 +97,7 @@ from dew.nn.precision import (
     twice_scaled,
     uncontracted,
 )
-from dew.nn.sharding import abstract
+from dew.nn.sharding import abstract, explicit_spec
 
 if TYPE_CHECKING:
     from qwix import QArray, QtProvider, QuantizationProvider
@@ -864,7 +864,7 @@ class PackedDecode:
         self.memo.clear()
         # The row sliced from each plane where it lives, then read home on this host, a pool's shards
         # read together: only that row's planes leave their devices, and only its decode is made.
-        home = jax.tree.map(lambda plane: read_home(plane[rows] if rows else plane), self.leaf)
+        home = jax.tree.map(lambda plane: read_home(_row_of(plane, rows)), self.leaf)
         with _decoding():
             decoded = np.asarray(packed_values(home) if isinstance(home, NvFp4)
                                  else home.admitted().decoded())
@@ -881,6 +881,20 @@ class PackedDecode:
 
     def __jax_array__(self) -> jax.Array:
         return jnp.asarray(np.asarray(self))
+
+
+def _row_of(plane, rows: tuple[int, ...]):
+    """`plane`'s row at `rows`, the indices of its leading stacked axes, sliced where the plane lies: placed
+    as the plane's own spec past those axes where an Explicit axis splits it (a stage-local store's bank on
+    its `stage` axis, `dew.training.stages.StageLocal`), whose gather JAX places only as it is told
+    (`out_sharding`; #4560's train review: the row's slice was refused)."""
+    if not rows:
+        return plane
+    placed = explicit_spec(plane) if isinstance(plane, jax.Array) else None
+    if placed is None:
+        return plane[rows]
+    past = jax.sharding.PartitionSpec(*tuple(placed.spec)[len(rows):])
+    return plane.at[rows].get(out_sharding=jax.sharding.NamedSharding(placed.mesh, past))
 
 
 def _decoding() -> contextlib.AbstractContextManager[None]:
