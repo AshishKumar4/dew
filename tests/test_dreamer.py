@@ -925,7 +925,9 @@ def test_dreamer_filled_and_split_step_updates_as_the_real_windows_whole(dynamic
     def draw(seed: int):
         base_params = init_fn(jax.random.key(seed))["params"]
         variables = {"params": nudged_tree(base_params, seed + 1000, scale=0.2), "returns": seeded_returns}
-        ema = {"params": {"value": jax.tree.map(lambda x: x * 0.8, variables["params"]["value"])}}
+        # The slow critic a tenth of the critic: its step, a tenth of the critic's moved, resolved on its
+        # grid as the critic's on its own (audit PT02).
+        ema = {"params": {"value": jax.tree.map(lambda x: x * 0.1, variables["params"]["value"])}}
         return variables, ema, dreamer_windows(6, seed, obs_size=obs_size, action_size=action_size)
 
     def whole_update(variables, ema, real_batch):
