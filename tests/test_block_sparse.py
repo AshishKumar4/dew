@@ -503,9 +503,9 @@ def test_infllm_v2s_selection_spends_no_pick_on_a_block_of_hidden_keys():
 
 def test_msas_teacher_takes_the_attentions_precision_not_the_ambient_one():
     """MSA's indexer loss (`msa_query_kls`) at the layer's precision, `highest`, under an ambient bf16
-    product preset (`BF16_BF16_F32`, whose operands Dew rounds to bf16 on any backend): its teacher's logits 4096 and 4097 (a query of 1 against keys 4096 and 4097) stay apart, so a
-    uniform student's KL is the float64 run's, where the ambient preset rounded both to 4096 and gave 0
-    (row 13706); and a layer stating that preset under the run's accurate numerics, whose attention forms
+    product preset (`BF16_BF16_F32`, whose operands Dew rounds to bf16 on any backend): its teacher's
+    logits 4096 and 4097 (a query of 1 against keys 4096 and 4097) stay apart, so a uniform student's KL
+    is the float64 run's, where the ambient preset rounded both to 4096 and gave 0 (row 13706); and a layer stating that preset under the run's accurate numerics, whose attention forms
     IEEE fp32 logits, alike."""
     query = jnp.ones((1, 2, 1, 1), jnp.float32)
     key = jnp.asarray([[[[4096.0]], [[4097.0]]]], jnp.float32)
