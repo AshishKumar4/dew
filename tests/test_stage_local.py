@@ -23,7 +23,7 @@ from model_support import TINY_DECODER, stacked
 from reference_error import as_given, assert_as_exact, assert_fp32_reduction_bound, widened
 from token_support import token_rows
 
-from dew.batch import FROZEN, merge
+from dew.batch import FROZEN, freeze, merge
 from dew.checkpoints import Checkpoints
 from dew.data.dataset import Loader
 from dew.decision.layout import SegmentLayout
@@ -934,6 +934,19 @@ def test_a_one_stage_scan_reads_a_frozen_base_where_it_lies():
     assert rows_temporaries < stacked_temporaries, (rows_temporaries, stacked_temporaries)
 
 
+def one_stage_temp(model, variables, *, scan: bool, mesh: MeshSpec | None = None, devices: int = 1) -> int:
+    """The temporaries of a stage-local run's step over `variables` on one stage of `devices` devices (`mesh`,
+    one device's by default), its layers scanned or not."""
+    mesh = MeshSpec() if mesh is None else mesh
+    with stacked(scan):
+        run = trainer(model, LORA_OPTIMIZER, mesh, devices, variables=variables)
+        run.validate(steps=1)
+        state, _, _ = run.place()
+        batch = shard_batch(mesh.build(jax.devices()[:devices]), token_rows(VOCAB, BATCH, SEQ + 1))
+        run.compile(state, batch)
+        return run.executable.memory_analysis().temp_size_in_bytes
+
+
 @pytest.mark.mesh(devices=8)
 def test_a_frozen_base_read_where_it_lies_holds_no_more_than_the_layers_unscanned():
     """A LoRA run whose decoder computes in bf16 over float32 parameters and names no rung, its layers
@@ -941,18 +954,42 @@ def test_a_frozen_base_read_where_it_lies_holds_no_more_than_the_layers_unscanne
     more temporaries for its step than the same run over the layers unscanned: the backward reads each
     layer's rows again from the iteration's index, so no value made of them alone (a row cast to bf16)
     stacks among the scan's residuals (row 4751)."""
+    model = decoder(dtype="bfloat16")
+    base = model.init(jax.random.key(0), jnp.zeros((1, SEQ), jnp.int32))
+    adapter = LoRA(rank=2, modules=("q_proj", "v_proj")).apply(model, base, key=1)
+    held = {scan: one_stage_temp(adapter.model, adapter.variables, scan=scan, mesh=MeshSpec(fsdp=2),
+                                 devices=8)
+            for scan in (True, False)}
+    assert held[True] <= held[False], held
+
+
+@pytest.mark.mesh(devices=1)
+def test_a_frozen_base_under_a_saving_rung_holds_no_more_than_naming_none():
+    """A LoRA run over a frozen base read where it lies, its eight layers scanned on one stage, holds no more
+    temporaries for its step under the saving rung `minimal` than naming none: its blocks' own remat drops
+    the CSE barriers a scanned body's separate loops make needless (`decoder_block.scanned_remat`), where it
+    held one more of every value it saved (row 4751: 12.97 MB against 12.58 MB here)."""
     held = {}
-    for scan in (True, False):
-        with stacked(scan):
-            model = decoder(dtype="bfloat16")
-            base = model.init(jax.random.key(0), jnp.zeros((1, SEQ), jnp.int32))
-            adapter = LoRA(rank=2, modules=("q_proj", "v_proj")).apply(model, base, key=1)
-            run = trainer(adapter.model, LORA_OPTIMIZER, MeshSpec(fsdp=2), 8, variables=adapter.variables)
-            run.validate(steps=1)
-            state, _, _ = run.place()
-            batch = shard_batch(MeshSpec(fsdp=2).build(jax.devices()), token_rows(VOCAB, BATCH, SEQ + 1))
-            run.compile(state, batch)
-            held[scan] = run.executable.memory_analysis().temp_size_in_bytes
+    for remat in (None, "minimal"):
+        model = decoder(dtype="bfloat16", num_layers=8, emb_features=256, mlp_features=1024, num_heads=4,
+                        num_kv_heads=4, remat=remat)
+        base = model.init(jax.random.key(0), jnp.zeros((1, SEQ), jnp.int32))
+        adapter = LoRA(rank=4, modules=("q_proj", "v_proj")).apply(model, base, key=1)
+        held[remat] = one_stage_temp(adapter.model, adapter.variables, scan=True)
+    assert held["minimal"] <= held[None], held
+
+
+@pytest.mark.mesh(devices=1)
+def test_a_head_only_run_reads_its_frozen_layers_where_they_lie():
+    """A head-only run whose decoder layers are all frozen (`dew.batch.freeze`), its layers scanned on one
+    stage under a stage-local state, reads its frozen layers a row an iteration where they lie
+    (`decoder_stack.LAYER_ROWS`, `DecoderBank.frozen`) and holds no more temporaries for its step than the
+    same run over the layers unscanned: without trainable layer leaves `StageLocal` writes no `stages` entry
+    into `params`, where the scan fell back to stacking every frozen layer each step (row 4751)."""
+    model = decoder(dtype="bfloat16")
+    base = model.init(jax.random.key(0), jnp.zeros((1, SEQ), jnp.int32))
+    head = freeze(base, lambda path: not any(k.startswith("layers_") for k in path))
+    held = {scan: one_stage_temp(model, head, scan=scan) for scan in (True, False)}
     assert held[True] <= held[False], held
 
 

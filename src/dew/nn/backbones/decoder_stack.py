@@ -31,7 +31,7 @@ from jax.sharding import PartitionSpec as P
 from dew._cache import INTERCEPTED, QUANTIZED_TRACE
 from dew.batch import Variables, merge, part, sows_appended
 from dew.mesh import STAGE_AXIS, LayoutRefused, row_axes
-from dew.nn.dense import NVFP4_AMAX
+from dew.nn.dense import NVFP4_AMAX, QUANTIZATION
 from dew.nn.inspection import INDEXER_COLLECTION, QK
 from dew.nn.protocols import StagedStacks, fixed_remat
 from dew.quantization import held_scales, holds_quantized
@@ -188,8 +188,9 @@ def _rows_joined(variables: Mapping[str, Mapping], index: jax.Array) -> dict:
     """A run's variables at an iteration: its rows (`LAYER_ROWS`) read at `index` (`_rows_read`) and joined
     into the collections they belong to, beside those collections' own slices."""
     read = _rows_read(variables[LAYER_ROWS], index)
-    return {name: merge(dict(tree), read[name]) if name in read else tree
-            for name, tree in variables.items() if name != LAYER_ROWS}
+    return {name: merge(dict(variables[name]), read[name]) if name in variables and name in read
+            else read[name] if name in read else variables[name]
+            for name in dict.fromkeys((*variables, *read)) if name != LAYER_ROWS}
 
 
 @dataclasses.dataclass(frozen=True)
@@ -629,9 +630,10 @@ def _scanned_run(run: nn.Module, x, step: Callable, store, inputs, *, count: int
             return layered(layer, carry), None
 
         def read(layer, carry, index):
-            return nn.map_variables(layered, (LAYER_ROWS, *rows), init=False, mutable=False,
-                                    trans_in_fn=functools.partial(_rows_joined, index=index))(
-                layer, carry)
+            with scanned_remat():
+                return nn.map_variables(layered, (LAYER_ROWS, *rows), init=False, mutable=False,
+                                        trans_in_fn=functools.partial(_rows_joined, index=index))(
+                    layer, carry)
         # Under no scope of its own: the rows' policy keeps what a rung keeps by its names, every
         # product besides under none or one recomputing named residuals (`_rows_recomputed`), each
         # value a rung's to keep or drop as a block's; the rows it read it never keeps.
@@ -1322,14 +1324,16 @@ class StackView:
             if collection in self.banked:
                 inside[collection] = tree
                 continue
-            if self.stages == 1 and collection in self.staged:
+            if self.stages == 1 and (collection in self.staged
+                                     or (self.staged and collection == QUANTIZATION)):
                 # A stage-local state on one stage holds each run as the scan reads it, under the one
                 # stage's index (`staged_shape`), its run's name beside the layers outside it: read in
                 # place, the index a reshape.
                 runs = {name: with_unstacked_axes(jax.tree.map(_one_stage, run), 1)
-                        for name, run in tree['stages'].items()}
+                        for name, run in tree.get('stages', {}).items()}
                 # The layers it keeps on their stored layers beside its runs (a frozen base the objective
-                # joins into its parameters) are read a row an iteration where they lie (`_rows_read`).
+                # joins into its parameters, and packed frozen weights in `QUANTIZATION` such as
+                # `FROZEN_FP8`) are read a row an iteration where they lie (`_rows_read`).
                 outside, rows = self._rowed_runs(collection, {name: value for name, value in tree.items()
                                                               if name != 'stages'})
                 inside[collection] = {**outside, **runs}
@@ -1362,8 +1366,9 @@ class StackView:
             if self.stages == 1 and collection in self.staged:
                 held = {name: with_stacked_axes(jax.tree.map(lambda leaf: leaf[None], value), 1)
                         for name, value in tree.items() if name in runs}
-                outside[collection] = {**{name: value for name, value in tree.items() if name not in runs},
-                                       'stages': held}
+                outside[collection] = {name: value for name, value in tree.items() if name not in runs}
+                if held:
+                    outside[collection]['stages'] = held
                 continue
             if collection == LAYER_ROWS:
                 continue
@@ -1568,6 +1573,10 @@ class DecoderBank:
     A nested model that trains nothing holds its variables under a collection of the run's, a
     distillation's frozen teacher under `teacher`, and a host layout banks its stacks there
     (`dew.training.execution.frozen_trees`)."""
+    frozen: bool = False
+    """Whether `params` holds none of this site's stacked runs on one stage (`CausalTransformer.stage_sites`):
+    every layer of the stack lies outside `params` (in `FROZEN` or `QUANTIZATION`), so `StageLocal` writes
+    no `stages` entry into `params` and the one-stage scan reads the stored layers in place (`LAYER_ROWS`)."""
 
 
 def _on_stage_axis(leaf):

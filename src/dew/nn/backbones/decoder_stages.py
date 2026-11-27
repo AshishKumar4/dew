@@ -12,11 +12,11 @@ from flax import linen as nn
 
 from dew.mesh import LayoutRefused
 
-from ..dense import captures_any_method
+from ..dense import QUANTIZATION, captures_any_method
 from ..host_memory import on_host
 from ..hyper_connections import Carried
 from ..precision import at_least_fp32
-from ..sharding import pipeline_stages
+from ..sharding import pipeline_stages, stage_sites
 from .decoder_stack import (
     PipelineStage,
     StackView,
@@ -43,6 +43,22 @@ def scanned() -> bool:
     from dew.nn.kernels.generation import Choice, chosen_kernel
 
     return chosen_kernel(Choice.LAYER_SCAN, "scanned") == "scanned"
+
+
+def _frozen_staged(decoder: CausalTransformer) -> tuple[str, ...]:
+    """The collections a one-stage stage-local run whose layers are all frozen (`DecoderBank.frozen`)
+    keeps on their stored layers to read in place (`LAYER_ROWS`), empty otherwise."""
+    sites = [site for site in stage_sites() if site.frozen]
+    if not sites:
+        return ()
+    view = stage_view(decoder, 1)
+    path = decoder.path
+    if not any(site.view == view and len(site.namespace) >= len(path)
+               and (not path or site.namespace[-len(path):] == path)
+               for site in sites):
+        return ()
+    return tuple(name for name in ('params', QUANTIZATION)
+                 if name in decoder.variables and view.holds(decoder.variables[name]))
 
 
 def stack(decoder: CausalTransformer, x, *, train: bool, decode: bool, per_layer_input,
@@ -111,6 +127,8 @@ def stack(decoder: CausalTransformer, x, *, train: bool, decode: bool, per_layer
         # (`decoder_cache._banked_runs`), each run's layers' under the run's name, as the run's scan
         # carries it; a cache handed in a layer at a time goes back so.
         banked = (*banked, 'cache')
+    if stages == 1 and not staged and not banked and span is None:
+        staged = _frozen_staged(decoder)
     if stages == 1 and staged:
         if span is not None:
             raise LayoutRefused(f"a loop over layers {span} runs part of the stack, and a stage-local "
