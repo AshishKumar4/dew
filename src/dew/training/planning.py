@@ -539,10 +539,10 @@ def kept_at(rung: Rung, start: Rung) -> tuple[Callable[[Held], bool], Callable[[
     return (lambda buffer: not (gone(buffer) or recomputed(buffer))), recomputed
 
 
-Tiled = Callable[[tuple[int, int], tuple[int, int], bool], int | None]
+Tiled = Callable[[tuple[int, int], tuple[int, int], bool, int], int | None]
 """The bytes of logits a head tiled at a tile, fused or not, holds at once, given the shape of the whole
-logits a device held (`dew.objectives.lm.head.HeadedObjective.tiled_logits`); None where it does not
-price that move."""
+logits a device held and their bytes each (`dew.objectives.lm.head.HeadedObjective.tiled_logits`); None
+where it does not price that move."""
 
 
 def priced(rung: Rung, start: Rung, profile: LiveProfile, bank: int, tiled: Tiled | None,
@@ -568,7 +568,8 @@ def priced(rung: Rung, start: Rung, profile: LiveProfile, bank: int, tiled: Tile
             return None
         for call in calls:
             tokens, columns = call.shape
-            held = tiled((-(-tokens // ratio), columns), rung.tile, rung.fused)
+            itemsize = call.bytes // (tokens * columns)
+            held = tiled((-(-tokens // ratio), columns), rung.tile, rung.fused, itemsize)
             if held is None:
                 return None
             added.append(Held(held, call.op_name, (), scaled=False, residual=False, trace=call.trace,
@@ -1726,6 +1727,16 @@ class FitSearch[LossT, EffectsT]:
         return next((split for rung in deferred if rung not in self.asked
                      if (split := tried(rung)) is not None), None)
 
+    @staticmethod
+    def placed(start: Rung, rungs: Sequence[Rung]) -> list[Rung]:
+        """The places past `start` in the order a search reads them, the jump's (`jumped`) and the frontier's
+        (`below`) alike: the start's copy-only release where it reads narrow copies, then each of `rungs`
+        and, where it reads them, its form without them (train 1409: a frontier ordering fewer places than
+        the jump admits read a copy-free plan as none of its own)."""
+        return [*([dataclasses.replace(start, narrow=False)] if start.narrow else []),
+                *(place for rung in rungs for place in
+                  ((rung, dataclasses.replace(rung, narrow=False)) if rung.narrow else (rung,)))]
+
     def below(self, candidates: Sequence[int], origin: Rung, plan: Rung) -> tuple[Probe, ...]:
         """Each rung the ladder reads before the plan's from `origin`, the rung the run was configured at,
         cheapest first, that no search asked (`asked`; a plan taken from its record asked none), at the
@@ -1748,10 +1759,8 @@ class FitSearch[LossT, EffectsT]:
         # Every process reads the same places: the count gathered, as the search gathers it.
         groups = (None, 1) if origin.ns_group is None and self.stacks_count() else (plan.ns_group,)
         start = dataclasses.replace(origin, ns_group=groups[0])
-        copies = start.narrow and any(candidate.copies for candidate in self.lowered.values())
-        places = [*([dataclasses.replace(start, narrow=False)] if copies else []),
-                  *(rung for places in self.ladder(start, start.narrow, start.ns_group, remat_set=explicit,
-                                                   defaults=(False, True)) for rung in places)]
+        ladder = self.ladder(start, start.narrow, start.ns_group, remat_set=explicit, defaults=(False, True))
+        places = self.placed(start, [rung for places in ladder for rung in places])
         order = [*(dataclasses.replace(start, ns_group=group) for group in groups[1:]),
                  *(dataclasses.replace(place, ns_group=group) for place in places for group in groups)]
         if plan not in order:
@@ -1840,11 +1849,8 @@ class FitSearch[LossT, EffectsT]:
         later remat's whole head at another). None where some process prices none, none is common, or the
         common one was asked; why is recorded (`jump`). Its compile is the judge (XLA schedules each place
         anew and recomputes what it drops), the climb going on past a miss."""
-        rungs = [rung for places in self.ladder(start, narrow, ns_group, remat_set=self.remat_set,
-                                                defaults=self.own_defaults()) for rung in places]
-        places = [*([dataclasses.replace(start, narrow=False)] if start.narrow else []),
-                  *(place for rung in rungs for place in
-                    ((rung, dataclasses.replace(rung, narrow=False)) if rung.narrow else (rung,)))]
+        ladder = self.ladder(start, narrow, ns_group, remat_set=self.remat_set, defaults=self.own_defaults())
+        places = self.placed(start, [rung for places in ladder for rung in places])
         profiles = {split: live.profile for (rung, split), live in self.live.items()
                     if rung == begun and live.profile is not None}
         tiled = self.objective.tiled_logits if isinstance(self.objective, HeadedObjective) else None

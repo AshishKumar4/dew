@@ -254,7 +254,9 @@ class Assignment:
     def used(self, buffer_id: int, ran: Mapping[tuple[str, str], int]) -> tuple[tuple[int, str], ...]:
         """Where in a trace (`ran`: each instruction's position in it) the instructions reading logical
         buffer `buffer_id`'s value run, with their `op_name`s: its defining instruction's readers, a tuple
-        element's through the getter of its index; a reader the trace states no event of is none of them."""
+        element's through the getter of its index; a reader the trace states no event of is none of them. A
+        fusion of no op_name of its own reads as each op its computation names (`_read_as`), and as "" where
+        it names none, a read no phase is told of."""
         readers = self.readers
         if readers is None:
             # Each instruction's readers, built where an interval is read alone.
@@ -278,11 +280,12 @@ class Assignment:
                 continue
             key = (self.computation_of[reader.id], reader.name)
             if key in ran:
-                found.append((ran[key], reader.metadata.op_name))
-            elif readers.get(reader.id):
+                found += [(ran[key], op_name)
+                          for op_name in _read_as(reader, self.computations)]
+            elif followers := readers.get(reader.id):
                 # A reader the trace places no buffer for (a view of its operand, a bitcast): its readers read
                 # the value through it.
-                reading += [(next_, ()) for next_ in readers.get(reader.id, ())]
+                reading += [(next_, ()) for next_ in followers]
             else:
                 # Read where the trace states no position (`UNPLACED`).
                 found.append((UNPLACED, reader.metadata.op_name))
@@ -355,6 +358,25 @@ def _charged(events, assigned: dict[int, int], kinds: dict[str, int]) -> set[int
             freed = canonical.get(owned, owned)
             instances[freed] = instances.get(freed, 0) - 1
     return charged
+
+
+def _read_as(reader, computations) -> tuple[str, ...]:
+    """The op names `reader` reads a value as: its own, or a fusion's of none (XLA:GPU's own fusions carry
+    none, `_maker`) each op name its fused computation's instructions carry, through any fusion of none
+    within it, which ops of a forward and of a backward both may be (train 1406); ("",) where none carries
+    one."""
+    if reader.metadata.op_name or reader.opcode != "fusion":
+        return (reader.metadata.op_name,)
+    named: set[str] = set()
+    inside = [computations[reader.called_computation_ids[0]]]
+    while inside:
+        for each in inside.pop().instructions:
+            if each.metadata.op_name:
+                named.add(each.metadata.op_name)
+            elif each.opcode == "fusion":
+                # A fusion within it of no name of its own (XLA's nested GEMM fusions): the ops it fuses.
+                inside.append(computations[each.called_computation_ids[0]])
+    return tuple(sorted(named)) or ("",)
 
 
 def _maker(instruction, index: tuple[int, ...], instructions,

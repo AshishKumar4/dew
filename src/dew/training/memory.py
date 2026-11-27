@@ -768,11 +768,11 @@ def resident_on(*trees: TrainState | Batch) -> dict[Hashable, int]:
 
 
 def limit_exited(executable: jax.stages.Compiled | None) -> bool:
-    """Whether `executable` is a compile XLA stopped at its buffer assignment, past the limit it compiled
-    under (`LIMIT_EXIT`), as it states (`CompiledMemory.stopped`): its memory stated as a whole compile's,
-    it runs nowhere and is no plan's nor any held step's. A whole binary (one held, compiled ahead or read
-    from the persistent cache, which keys no limit) runs whatever limit a later compile asks, and is judged
-    by its memory alone."""
+    """Whether `executable` is a compile XLA stopped past the limit it compiled under (`LIMIT_EXIT`), as it
+    states (`CompiledMemory.stopped`): after its buffer assignment, its memory stated as a whole compile's,
+    or before optimizing where its arguments alone are over, those alone stated; it runs nowhere and is no
+    plan's nor any held step's. A whole binary (one held, compiled ahead or read from the persistent cache,
+    which keys no limit) runs whatever limit a later compile asks, and is judged by its memory alone."""
     memory = None if executable is None else compiled_memory(executable)
     return memory is not None and memory.stopped
 
@@ -1003,7 +1003,10 @@ class LiveProfile:
             # charging every such read prices the miss-driven decoder's save_dot_except_mlp at 41 MB freed
             # where XLA frees 210 MB, this rule at 209 MB (tests/test_miss_driven_rungs.py).
             uses = within(interval)
-            if any(position == UNPLACED for position, _ in uses):
+            # A read placed nowhere, or of no op name to tell its phase by (a fusion naming none), holds it
+            # to its end: which phase read it is not known, and freeing it earlier would credit a release
+            # the compile may not make (train 1406).
+            if any(position == UNPLACED or not op_name for position, op_name in uses):
                 return interval.end
             ends = backward if backward is not None and interval.start < backward else interval.end + 1
             read = [position for position, op_name in uses if forward_made(op_name) and position < ends]

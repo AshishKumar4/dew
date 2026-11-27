@@ -1132,9 +1132,10 @@ class CompiledMemory(NamedTuple):
     allocation its temporaries are packed into, that packing's room included. None where the backend states
     none (a TPU's, an older plugin's), never zero."""
     stopped: bool = False
-    """Whether its compile stopped after buffer assignment, past the memory limit it compiled under
-    (`stopped_at_memory_limit`, `dew.training.memory.LIMIT_EXIT`): an executable that states its memory and
-    runs nowhere, loaded or compiled ahead alike."""
+    """Whether its compile stopped past the memory limit it compiled under (`stopped_at_memory_limit`,
+    `dew.training.memory.LIMIT_EXIT`): after buffer assignment, its memory stated whole, or before optimizing
+    where its arguments alone are over the limit, its arguments alone stated; an executable that runs
+    nowhere, loaded or compiled ahead alike."""
 
     @property
     def summed(self) -> int:
