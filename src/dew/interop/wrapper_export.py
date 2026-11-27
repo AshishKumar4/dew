@@ -71,7 +71,7 @@ def wrapper_layouts(tensors, record, variables, language: Sequence[decoder_parts
     return tuple(bindings), retained
 
 
-def bundle_media_sections(config: Mapping[str, object]) -> dict[str, object]:
+def bundle_media_sections(config: Mapping[str, object]) -> Mapping[str, object]:
     """A media bundle's config sections its language model's config leaves out (`bundle_text_config`): its
     towers' and its folders', which a load of its language model alone retains unread. A deep copy, so a
     snapshot taken at load stays as loaded while its config's nested sections are edited in place."""
@@ -101,7 +101,8 @@ def unprepared_export(unprepare: decoder_parts.WeightPreparer, record: Mapping[s
     if isinstance(model, MediaWrapper):
         refuse_lossy_wrapper(model, config)
     else:
-        decoders.refuse_lossy_export(model, config)
+        # A bundle's language model alone reads back its language model's config, as its load read it.
+        decoders.refuse_lossy_export(model, config if media is None else decoders.bundle_text_config(config))
     if media is not None and (published := bundle_media_sections(config)) != media:
         changed = sorted(name for name in {*published, *media} if published.get(name) != media.get(name))
         raise ExportRefused(f"{changed} of the config differ from the towers' its language model was loaded "
