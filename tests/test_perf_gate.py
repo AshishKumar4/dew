@@ -43,14 +43,7 @@ def test_a_base_whose_probe_failed_owes_its_comparison_and_fails_the_report(gate
     from types import SimpleNamespace
 
     row = gate.Row("gated", "ms", "")
-    assert gate.verdict(row, ["failed: exited 1"] * 6, samples(10.0), samples(10.0))[0] == "base failed"
     assert gate.verdict(row, ["not run: no lock"] * 6, samples(10.0), [None] * 6)[0] == "not compared"
-    results = {"base": "main", "head": "head", "alone": "main~aa", "rows": [row.__dict__], "rounds": 6,
-               "samples": {"base": [{"gated": "failed: exited 1"}] * 6, "alone": [{"gated": 10.0}] * 6,
-                           "head": [{"gated": 10.0}] * 6}}
-    (tmp_path / "gate.json").write_text(json.dumps(results))
-    monkeypatch.setattr(sys, "argv", ["perf_gate.py", "report", str(tmp_path / "gate.json")])
-    assert gate.main() == 1
     standing_in(gate, monkeypatch, passed=True)
     stood_in = gate.subprocess.run
     probe = next(probe for probe in gate.PROBES if probe.tool == "benchmark_step.py")
@@ -64,7 +57,20 @@ def test_a_base_whose_probe_failed_owes_its_comparison_and_fails_the_report(gate
     args = SimpleNamespace(only=[probe.rows[0].name], claim=False, model="unused", flowers="unused",
                            torch_python="torch", out=tmp_path / "run.json")
     sample = gate.measure(ROOT, Path(sys.executable), args, ROOT / "tools", is_head=False)
-    assert all(sample[row.name].startswith(f"failed: {probe.tool} exited 3") for row in probe.rows)
+    # The receipt a base whose probe exited so writes, reported: each of its rows "base failed", the report
+    # failing on them.
+    measured = {row.name: 10.0 for row in probe.rows}
+    receipt = {"base": "main", "head": "head", "alone": "main~aa",
+               "rows": [row.__dict__ for row in probe.rows], "rounds": 6,
+               "samples": {"base": [sample] * 6, "alone": [measured] * 6, "head": [measured] * 6}}
+    (tmp_path / "failed.json").write_text(json.dumps(receipt))
+    monkeypatch.setattr(sys, "argv", ["perf_gate.py", "report", str(tmp_path / "failed.json"),
+                                      "--verdicts", str(tmp_path / "verdicts.json")])
+    assert gate.main() == 1
+    verdicts = json.loads((tmp_path / "verdicts.json").read_text())
+    assert {name: row["state"] for name, row in verdicts["rows"].items()} == {
+        row.name: "base failed" for row in probe.rows}
+    assert verdicts["failed"] == [f"{row.name} (base failed)" for row in probe.rows]
 
 
 def test_a_selection_of_no_row_is_refused_before_setup_and_an_empty_receipt_fails(

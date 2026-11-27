@@ -13,7 +13,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Set as AbstractSet
 from pathlib import Path
 
 PREPARE = "prepare-"
@@ -292,6 +292,23 @@ def unprepared_in(truths: Path, records: tuple[str, ...],
     return found
 
 
+Cell = tuple[str, str, str | None]
+"""An unprepared cell as a row and its baseline keep it (`unprepared_cells`): its test, where in it, and its
+label or None, each a field, so no node id reading like a where or a label (" @ ", " [") is parsed for one."""
+
+
+def cell_of(record: Mapping) -> Cell:
+    """`record`'s cell (`Cell`), its where "?" where it names none, as `identity` names it."""
+    return (record["test"], record.get("where") or "?", record.get("cell"))
+
+
+def record_of(cell: Cell) -> dict:
+    """The record of cell `cell` (`Cell`), as `unprepared_in` gives one, its `identity` beside it."""
+    test, where, label = cell
+    record = {"test": test, "where": where, **({"cell": label} if label else {})}
+    return {**record, "identity": identity(record)}
+
+
 def identity(record: Mapping) -> str:
     """What a dry prepare's unprepared cell names (`graded`): its test, where in it, and a deferred cell's
     label, so one deferred cell of a test is no mask for a sibling deferred beside it, at one line or
@@ -337,7 +354,8 @@ def as_ran(row: dict, stale: str) -> dict:
             else row)
 
 
-def graded(rows: list[dict], unprepared: Mapping[str, list[dict]], before: set[str] | str, generation: str,
+def graded(rows: list[dict], unprepared: Mapping[str, list[dict]], before: AbstractSet[Cell | str] | str,
+           generation: str,
            file_of: Callable[[str], str], stale: str, capped_at: str) -> list[dict]:
     """A dry prepare's `rows` (`file_of` a row's name its test file), each keeping the cells it left
     unprepared (`identity`) as its `unprepared`: a row this run prepared, its file's records (`unprepared`,
@@ -356,7 +374,10 @@ def graded(rows: list[dict], unprepared: Mapping[str, list[dict]], before: set[s
     judged = []
     for found in rows:
         own = unprepared.get(file_of(found["name"]), [])
-        held = ([{"identity": cell} for cell in found["unprepared"]] if "unprepared" in found
+        # A reused row's cells by their fields where its record keeps them (`unprepared_cells`), else by its
+        # identities.
+        held = ([record_of(tuple(cell)) for cell in found["unprepared_cells"]] if "unprepared_cells" in found
+                else [{"identity": cell} for cell in found["unprepared"]] if "unprepared" in found
                 else [{**record, "identity": identity(record)} for record in own])
         cells = sorted(record["identity"] for record in held)
         capped = sorted(found.get("capped", []) if "unprepared" in found
@@ -365,15 +386,27 @@ def graded(rows: list[dict], unprepared: Mapping[str, list[dict]], before: set[s
         # Said once: a reused row's output holds its banner (`capped_banner`) already.
         if capped and (found.get("output") or "").startswith(head := capped_banner(capped)):
             found = {**found, "output": found["output"][len(head):].lstrip("\n")}
-        if isinstance(before, set):
+        if not isinstance(before, str):
             # Main's decision_laya prepare capped its five tests, which a run that reached them failed
-            # alike at main's commit (2026-11-25): no run of main's says how they go.
+            # alike at main's commit (2026-11-25): no run of main's says how they go. A baseline keeping its
+            # cells by their fields gives main's capped ones so; an older one's identities are read back.
+            # Kept apart: main's cells by their fields, compared and read for its caps by field alone, and an
+            # older baseline's identities, parsed for its caps as they always were.
+            fields = {cell for cell in before if isinstance(cell, tuple)}
+            legacy = {cell for cell in before if isinstance(cell, str)}
+            untried = {test for test, where, label in fields if where == capped_at and label is None}
+            untried_cells = {(test, label) for test, where, label in fields
+                             if where == capped_at and label is not None}
             whole = f" @ {capped_at}"
-            untried = {cell[:-len(whole)] for cell in before if cell.endswith(whole)}
+            untried |= {cell[:-len(whole)] for cell in legacy if cell.endswith(whole)}
             labeled = f" @ {capped_at} ["
-            untried_cells = {(cell[:cell.rfind(labeled)], cell[cell.rfind(labeled) + len(labeled):-1])
-                             for cell in before if labeled in cell and cell.endswith("]")}
-            new = [record for record in judged_ if record["identity"] not in before
+            untried_cells |= {(cell[:cell.rfind(labeled)], cell[cell.rfind(labeled) + len(labeled):-1])
+                              for cell in legacy if labeled in cell and cell.endswith("]")}
+            # A record main left so: by its fields where it has them, else (a reused row's identity) rendered.
+            rendered = legacy | {identity(record_of(cell)) for cell in fields}
+            new = [record for record in judged_
+                   if not (cell_of(record) in fields or record["identity"] in legacy if "test" in record
+                           else record["identity"] in rendered)
                    and not skipped_whole(record, untried) and not capped_alike(record, untried_cells)]
             said = [f"unprepared in its {generation} prepare, which main's did not leave so: "
                     f"{record['identity']}" + (f": {record['error']}" if record.get("error") else "")
@@ -388,7 +421,11 @@ def graded(rows: list[dict], unprepared: Mapping[str, list[dict]], before: set[s
             red = {}
         said = ({"capped": capped, "output": "\n".join([capped_banner(capped), red.get(
             "output", found.get("output") or "")])} if capped else {})
-        judged.append(as_ran({**found, "unprepared": cells, **red, **said}, stale))
+        # Its unprepared cells by their fields too, its baseline's (`cells_of`), where each has them.
+        fields = ({"unprepared_cells": sorted((cell_of(record) for record in held),
+                                   key=lambda cell: (cell[0], cell[1], cell[2] or ""))}
+                  if all("test" in record for record in held) else {})
+        judged.append(as_ran({**found, "unprepared": cells, **fields, **red, **said}, stale))
     return judged
 
 
@@ -478,12 +515,21 @@ def bounded_get(store, key: str, until: float, failures: tuple[type[BaseExceptio
     return found
 
 
-def cells_of(record: dict | None) -> set[str] | None:
-    """The cells a commit's baseline record (`baseline_key`, a green prepare's alone) keeps unprepared, None
-    where there is no record; `Unread` where the record is no object of a list of cells (`identity`'s
-    strings)."""
+def cells_of(record: dict | None) -> set[Cell] | set[str] | None:
+    """The cells a commit's baseline record (`baseline_key`, a green prepare's alone) keeps unprepared: by
+    their fields (`Cell`) where it keeps them so (`unprepared_cells`), an older record's by their identities
+    (`identity`'s strings); None where there is no record; `Unread` where the record keeps neither as a list
+    of cells."""
     if record is None:
         return None
+    if "unprepared_cells" in record:
+        kept = record["unprepared_cells"]
+        if not (isinstance(kept, list) and all(
+                isinstance(cell, list) and len(cell) == 3 and isinstance(cell[0], str)
+                and isinstance(cell[1], str) and (cell[2] is None or isinstance(cell[2], str))
+                for cell in kept)):
+            raise Unread("a baseline's cells are no list of cells")
+        return {(test, where, label) for test, where, label in kept}
     kept = record.get("unprepared")
     if not (isinstance(kept, list) and all(isinstance(cell, str) for cell in kept)):
         raise Unread("a baseline's unprepared cells are no list of cells")
@@ -507,7 +553,7 @@ def listed_cuts(store, prefix: str, row_variant: str, until: float) -> dict[str,
     return cuts
 
 
-def before(ci, python: str, name: str, group: str, until: float) -> set[str] | str:
+def before(ci, python: str, name: str, group: str, until: float) -> set[Cell | str] | str:
     """The cells main's own runs of file `name`'s prepare for `group`'s generation and process left unprepared
     (`identity`), whatever cut main's plan made of it: each of its rows' baselines main's commit keeps (this
     checkout's `mainline`, ci.py's `baseline_key`, listed under the file's place once; a green run's alone,
@@ -526,7 +572,7 @@ def before(ci, python: str, name: str, group: str, until: float) -> set[str] | s
     return BOOTSTRAP if found == PARTIAL else found
 
 
-def _before(ci, python: str, name: str, group: str, until: float) -> set[str] | str:
+def _before(ci, python: str, name: str, group: str, until: float) -> set[Cell | str] | str:
     """`before`'s read of main's baselines, whatever commit this checkout is: `PARTIAL` where they were read
     and are not whole (a run named with no baseline, or no cut every group of which is listed), `UNREAD`
     where they could not be read."""
@@ -556,7 +602,7 @@ def _before(ci, python: str, name: str, group: str, until: float) -> set[str] | 
             if count != "whole" and len(held_cuts) != int(count):
                 continue
             whole = True
-            found: set[str] = set()
+            found: set[Cell | str] = set()
             for cut in held_cuts:
                 held_row = ci.row(python, name, ci.varied("" if cut == "whole" else cut.replace("-of-", "/"),
                                                           row_variant))
@@ -566,6 +612,7 @@ def _before(ci, python: str, name: str, group: str, until: float) -> set[str] | 
                     break
                 found |= kept
             else:
+                # Cuts kept by fields and by identities alike stay apart (`graded`).
                 return found
     except (Unread, *failures, ValueError) as failure:
         print(f"dry prepare: main's runs of {name} not read whole ({type(failure).__name__}: {failure}); its "

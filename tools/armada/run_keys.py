@@ -239,8 +239,11 @@ def baselined(python: str, place: str, held: str, token: str, ran: Mapping,
     stale (`unbaselined`)."""
     if (commit := head_commit()) is None or not due(ran):
         return True
-    return written(baseline_key(commit, python, place, held), token,
-                   json.dumps({"unprepared": ran["unprepared"]}).encode(), tries=1, until=until)
+    # Its cells by their fields too where the row keeps them (`prepares.cells_of` reads them so).
+    kept = {"unprepared": ran["unprepared"],
+            **({"unprepared_cells": ran["unprepared_cells"]} if "unprepared_cells" in ran else {})}
+    return written(baseline_key(commit, python, place, held), token, json.dumps(kept).encode(), tries=1,
+                   until=until)
 
 
 def named_at_commit(python: str, place: str, held: str, key: str, token: str,
