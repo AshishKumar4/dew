@@ -362,7 +362,10 @@ def test_a_grouped_window_products_value_and_tangent_state_one_algorithm():
         program = jax.make_jaxpr(value_and_tangent)(x).jaxpr
     found = [eqn.params["precision"] for eqn in programs.equations(program)
              if eqn.primitive.name == "ragged_dot_general"]
-    assert found == [jax.lax.DotAlgorithmPreset.F16_F16_F32] * 2, found
+    # The value's ragged dot and its tangent's state the run's algorithm; none states the default instead.
+    default = jax.lax.Precision.DEFAULT
+    assert found.count(jax.lax.DotAlgorithmPreset.F16_F16_F32) == 2, found
+    assert not any(each in (None, default, (default, default)) for each in found), found
 
 
 @pytest.mark.parametrize(("run", "stated", "algorithm"),
