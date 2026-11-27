@@ -28,7 +28,7 @@ test-types	sh tools/base_history.sh && "$PYTHON" -m tools.test_types "$BASE"
 fixtures	"$PYTHON" tools/fetched_fixtures.py check
 complexity	"$PYTHON" tools/complexity.py src/dew tools/lint_slop.py tools/lint_scopes.py examples recipes > complexity.json
 # A tutorial pinned to a commit is checked against that commit's API, which a shallow checkout fetches first.
-api-pages	sh tools/base_history.sh && uv run --no-project --with-requirements site/scripts/requirements.txt python site/scripts/gen_api.py --check
+api-pages	sh tools/base_history.sh && PYTHONPATH=. uv run --no-project --with-requirements site/scripts/requirements.txt python site/scripts/gen_api.py --check
 api-tests	uv run --no-project --with-requirements site/scripts/requirements.txt --with pytest python -m pytest -q --noconftest tests/test_gen_api.py
 # The committed public surface is what tools/api_report.py reads from the checkout: a change to a public signature
 # regenerates docs/api/report.txtar in the same commit, so a stale report fails a head's precheck, never its train.
