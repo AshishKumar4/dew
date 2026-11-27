@@ -321,44 +321,66 @@ class _Binary:
     kind: str
 
 
-def test_a_refused_config_a_build_would_hold_is_held_to_the_gate_under_it():
+def test_a_refused_config_a_build_would_hold_is_judged_under_every_build():
     """Row 10766: each Mosaic GPU config certification refused is judged under every build its generation's
-    GPUs run (`kernel_compile.refused_across_builds`): one a build's assembler refuses too (spilling or
-    serializing) passes, production there stepping past it; one a build holds, which production on that
-    build certifies and runs, is held to the gate's kernel checks under it, qualified where it notes no
-    loss and failing the gate where it does (its setmaxnreg ignored); one no build judged here (no PTX
-    printed of a kernel of it) fails; an accepted config, and a Triton launch's (no print of its PTX),
-    are not judged. A kernel's PTX is the module printed as it certified, or, by its module, an earlier
-    case's print, its verdict read from the store or not."""
-    spilling = kc.Assembled(255, 24, ())
-    serialized = kc.Assembled(168, 0, (next(iter(assembled.SERIALIZED)),))
-    clean = kc.Assembled(168, 0, ())
-    ignored = kc.Assembled(168, 0, (assembled.IGNORED_RAISE,))
-    verdicts = {("tile a", "cuda13"): clean, ("tile a", "cuda12"): spilling,
-                ("tile b", "cuda13"): spilling, ("tile b", "cuda12"): serialized,
-                ("tile d", "cuda13"): spilling, ("tile d", "cuda12"): spilling,
-                ("tile f", "cuda13"): ignored, ("tile f", "cuda12"): spilling}
+    GPUs run (`kernel_compile.refused_across_builds`), by each kernel's verdict under that build: refused
+    where any kernel is, failed where any fails the gate's checks, else qualified; one no build judged here
+    (no PTX printed of a kernel of it) is unverified; an accepted config, and a Triton launch's (no print
+    of its PTX), are not judged; and a gate failure is each build's verdict but refused and qualified. A
+    kernel's PTX is the module printed as it certified, or, by its module, an earlier case's print, its
+    verdict read from the store or not."""
+    verdicts = {("tile a", "cuda13"): "qualified", ("tile a", "cuda12"): "refused",
+                ("tile b", "cuda13"): "refused", ("tile b", "cuda12"): "refused",
+                ("tile d", "cuda13"): "refused", ("tile d", "cuda12"): "refused",
+                ("tile f", "cuda13"): "failed: its machine code holds a finding",
+                ("tile f", "cuda12"): "refused",
+                ("tile g", "cuda13"): "qualified", ("tile h", "cuda13"): "refused"}
 
-    def read(ptx: str, build: str) -> kc.Assembled:
+    def judge(build, name, ptx, binary, module):
+        del name, binary, module
         return verdicts[ptx, build]
 
-    printed = {"k_a 0": "tile a", "k_b 0": "tile b", "k_d 0": "tile d", "k_f 0": "tile f", "k_t 0": "tile t"}
+    printed = {"k_a 0": "tile a", "k_b 0": "tile b", "k_d 0": "tile d", "k_f 0": "tile f", "k_g 0": "tile g",
+               "k_h 0": "tile h", "k_t 0": "tile t"}
     certified = [_Certified("a", {"k_a 0": "m_a"}, refused=True),
                  _Certified("b", {"k_b 0": "m_b"}, refused=True),
                  _Certified("c", {"k_c 0": "m_c"}, refused=True),
                  _Certified("d", {"k_d 0": "m_d"}, refused=True, stored=True),
                  _Certified("e", {"k_e 0": "m_e"}, refused=False),
                  _Certified("f", {"k_f 0": "m_f"}, refused=True),
+                 _Certified("gh", {"k_g 0": "m_g", "k_h 0": "m_h"}, refused=True),
                  _Certified("t", {"k_t 0": "m_t"}, refused=True, kind="triton")]
-    judged = kc.refused_across_builds(certified, printed, ("cuda13", "cuda12"), read)
-    assert {entry["config"]: entry["builds"] for entry in judged} == {
-        "'a'": {"cuda13": "qualified", "cuda12": "refused"},
-        "'b'": {"cuda13": "refused", "cuda12": "refused"},
-        "'c'": {"cuda13": "unverified", "cuda12": "unverified"},
-        "'d'": {"cuda13": "refused", "cuda12": "refused"},
-        "'f'": {"cuda13": f"failed: {assembled.IGNORED_RAISE}", "cuda12": "refused"}}
+    judged = kc.refused_across_builds(certified, printed, ("cuda13", "cuda12"), judge)
+    assert {entry["config"]: entry["builds"]["cuda13"] for entry in judged} == {
+        "'a'": "qualified", "'b'": "refused", "'c'": "unverified", "'d'": "refused",
+        "'f'": "failed: its machine code holds a finding", "'gh'": "refused"}
     failed = kc.refused_across_build_failures({"name": "a case", "refused_builds": judged})
     assert len(failed) == 3 and all("'c'" in failure or "'f'" in failure for failure in failed)
     # A later case certifying the same module, which Mosaic printed once: its PTX read by its module.
-    again = kc.refused_across_builds([_Certified("a", {"k_a 0": "m_a"}, refused=True)], {}, ("cuda12",), read)
+    again = kc.refused_across_builds([_Certified("a", {"k_a 0": "m_a"}, refused=True)], {}, ("cuda12",),
+                                     judge)
     assert again[0]["builds"] == {"cuda12": "refused"}
+
+
+def test_a_config_another_build_holds_is_held_to_the_gates_kernel_checks():
+    """A refused config's kernel as another build assembles it (`kernel_compile.alternate_verdict`): refused
+    where that build spills or serializes it too; else held to the gate's own checks of a settled kernel
+    (`Report.failure`), its launch's shared bytes its certifying compile's, its tensor memory its estimate's
+    and its registers, machine code, threads and raise that build's: qualified within them, failed over its
+    launch's register cap, on a machine code finding, or with no cubin of it to read."""
+    name = assembled.launch_name("k", "0")
+    estimate = "Resources(smem_scratch_bytes=1024, tmem_scratch_cols=0, tmem_collective_scratch_cols=0)"
+    certified = assembled.Binary("k", "0", 168, 0, "mosaic_gpu", shared=1024)
+
+    def cubin(**fields) -> assembled.Binary:
+        return assembled.Binary("k", "0", fields.pop("registers", 160), 0, "mosaic_gpu",
+                                **{"sass": (), "threads": 384, **fields})
+
+    def verdict(read, alternate):
+        return kc.alternate_verdict(name, read, alternate, certified, estimate, "", "sm90")
+
+    assert verdict(kc.Assembled(255, 24, ()), cubin()) == "refused"
+    assert verdict(kc.Assembled(160, 0, ()), cubin()) == "qualified"
+    assert "above its launch's" in verdict(kc.Assembled(200, 0, ()), cubin())
+    assert "machine code holds" in verdict(kc.Assembled(160, 0, ()), cubin(sass=("a finding",)))
+    assert "state no binary" in verdict(kc.Assembled(160, 0, ()), None)

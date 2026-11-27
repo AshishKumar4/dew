@@ -410,6 +410,8 @@ def _compiled(case, generation: str, record: dict,
     estimating = _dumped(str(lowering)) if lowering is not None else contextlib.nullcontext()
     uncertified = report.uncertified()
     certifying = len(report.certifications())
+    # Each certification this case's lowering asks for, one an earlier case held among them (row 10766).
+    offering = len(report.offered())
     try:
         with estimating, report.certifying(compile_only_gpus(generation)[0]):
             lowered = lowered_for(fn, args, generation, expected)
@@ -429,7 +431,7 @@ def _compiled(case, generation: str, record: dict,
             # Every offer refused under the certifying build, each judged under the others too: one another
             # build holds is a launch production there runs that no gate compiled (row 10766).
             record["refused_builds"] = _judged_across_builds(
-                certifying, printed_modules(dumps(str(lowering), ".ptx")), generation)
+                offering, printed_modules(dumps(str(lowering), ".ptx")), generation)
         return None
     # A launch the lowering could not certify (`report.certified`) is a failure of its own: its run would
     # find its spills only as its whole program compiles.
@@ -471,7 +473,7 @@ def _compiled(case, generation: str, record: dict,
         lowered_modules = printed_modules(dumps(str(lowering), ".ptx"))
         written({**lowered_modules, **printed_modules(dumps(str(compiling), ".ptx"))}, directory, modules)
         # Each config certification refused, judged under every build its generation's GPUs run (row 10766).
-        record["refused_builds"] = _judged_across_builds(certifying, lowered_modules, generation)
+        record["refused_builds"] = _judged_across_builds(offering, lowered_modules, generation)
     if expected is not None:
         record["route"] = _route(lowered, executable, _device(generation, expected.axes))
     record["thunks"] = assembled.launched_thunks(executable)
@@ -536,18 +538,17 @@ def printed_modules(printed: str) -> dict[str, str]:
 
 
 def refused_across_builds(certifications, printed: dict[str, str], builds: Sequence[str],
-                          read: Callable[[str, str], Assembled]) -> list[dict]:
+                          judge: Callable[[str, str, str, assembled.Binary, str], str]) -> list[dict]:
     """Each Mosaic GPU launch config certification refused (`report.Certification.refused`) judged under every
-    build of `builds` a GPU of its generation runs (row 10766): `refused` where that build's assembler
-    refuses a kernel of it too (`read`, its ptxas's report of a kernel's PTX under a build: a spill or a
-    serialization, `assembled.refuses`), production there stepping past it as the gate did; else production
-    on that build certifies it, a launch the gate's settled kernels are not, held here to the gate's own
-    kernel checks under that build: `qualified` where no kernel of it notes a loss the gate fails
-    (`LOSSES`), else `failed` and the codes. Each kernel's PTX is the module Mosaic GPU printed as it
-    certified (`printed`, `printed_modules`, by name and launch; else by its module where an earlier case
-    printed it, `PTX`): a config whose kernel printed none here (its module compiled before the gate) is
-    `unverified`. A Triton launch's config is not judged here: no print of its PTX is read (its certifying
-    build's verdict alone). Each `{op, config, builds}`."""
+    build of `builds` a GPU of its generation runs (row 10766), by `judge(build, kernel, ptx, its certified
+    binary, its module)` of each kernel (`_judged_under`): `refused` where the build's assembler refuses a
+    kernel of it too, production there stepping past it as the gate did; else production on that build
+    certifies it, a launch the gate's settled kernels are not, so it is held to the gate's own kernel checks
+    under that build (`Report.failure`): `qualified` where every kernel holds them, else `failed` and why.
+    Each kernel's PTX is the module Mosaic GPU printed as it certified (`printed`, `printed_modules`, by name
+    and launch; else by its module where an earlier case printed it, `PTX`): a config whose kernel printed
+    none here (its module compiled before the gate) is `unverified`. A Triton launch's config is not judged
+    here: no print of its PTX is read (its certifying build's verdict alone). Each `{op, config, builds}`."""
     judged = []
     for found in certifications:
         triton = any(binary.kind != "mosaic_gpu" for _, binary in found.kernels.values())
@@ -563,21 +564,68 @@ def refused_across_builds(certifications, printed: dict[str, str], builds: Seque
             if None in sources.values():
                 verdicts[build] = "unverified"
                 continue
-            reads = [read(ptx, build) for ptx in sources.values()]
-            losses = sorted({code for each in reads for code in each.losses if code in LOSSES})
-            if any(assembled.refuses(each.spilled, each.losses) for each in reads):
-                verdicts[build] = "refused"
-            else:
-                verdicts[build] = f"failed: {', '.join(losses)}" if losses else "qualified"
+            each = [judge(build, name, sources[name], binary, module)
+                    for name, (module, binary) in found.kernels.items()]
+            failed = [verdict for verdict in each if verdict.startswith("failed")]
+            verdicts[build] = ("refused" if "refused" in each else "; ".join(failed) if failed
+                               else "qualified")
         judged.append({"op": found.op, "config": repr(found.config), "builds": verdicts})
     return judged
 
 
-def _judged_across_builds(certifying: int, printed: dict[str, str], generation: str) -> list[dict]:
-    """`refused_across_builds` of the certifications since the first `certifying`, their PTX as the case's
-    lowering printed it (`printed`, `printed_modules`)."""
-    return refused_across_builds(report.certifications()[certifying:], printed, judged_builds(generation),
-                                 functools.partial(_assembled_under, generation))
+def alternate_verdict(name: str, read: Assembled, alternate: assembled.Binary | None,
+                      certified: assembled.Binary, estimate: str, ptx: str, generation: str) -> str:
+    """A refused config's kernel `name` as a build other than its certifying one assembles it (`read`, its
+    ptxas's report; `alternate`, its cubin, None where it made none): `refused` where that assembler refuses
+    it (`assembled.refuses`), else held to the gate's own checks (`Report.failure`) of its launch's shared
+    bytes (`certified`'s, its certifying compile's launch), its tensor memory (`estimate`, Pallas's printed
+    `Resources`), and that build's registers, spills, losses, machine code, threads and register cap (as
+    `mosaic_kernels` caps a settled kernel's, from its PTX's programs): `qualified`, or `failed: ` and why."""
+    if assembled.refuses(read.spilled, read.losses):
+        return "refused"
+    tmem = TENSOR_MEMORY.search(estimate)
+    unread = tuple(field for field, known in (
+        ("shared bytes", certified.shared is not None), ("tensor memory columns", tmem),
+        ("binary", alternate), ("machine code", alternate is not None and alternate.sass is not None))
+        if not known)
+    programs = int(held.group(1)) if (held := PROGRAMS.search(ptx)) else 1
+    threads = alternate.threads if alternate is not None else None
+    raised = alternate.raised if alternate is not None else None
+    with assumed(gpu_target(generation)):
+        shared_cap = None if threads is None else resources.thread_share(threads, programs)
+    cap = raised if raised is not None else shared_cap
+    kernel, launch, _ = assembled.kernel_of(name)
+    report = Report(kernel, certified.shared, sum(map(int, tmem.groups())) if tmem else None, read.registers,
+                    read.spilled, unread, None, launch, losses=read.losses,
+                    sass=tuple(alternate.sass or ()) if alternate is not None else (), threads=threads,
+                    decreased=alternate.decreased if alternate is not None else None, raised=raised, cap=cap)
+    target = gpu_target(generation)
+    failure = report.failure(target.shared_limit or 0, target.tmem_columns or 0)
+    return "qualified" if failure is None else f"failed: {failure}"
+
+
+def _judged_under(generation: str, build: str, name: str, ptx: str, certified: assembled.Binary,
+                  module: str) -> str:
+    """`alternate_verdict` of the kernel `name`'s `ptx` assembled by JAX's CUDA `build`'s ptxas for
+    `generation` as the GPU compiles it (`RELOCATABLE`), its cubin decoded (`assembled.binary_of`), its
+    estimate its module's (`ESTIMATES`)."""
+    text, cubin = _ptxas_cubin(ptx, generation, RELOCATABLE, ptxas_of(build))
+    read = ptxas_read(text)
+    entry = PTX_ENTRY.search(ptx)
+    alternate = (assembled.binary_of(entry.group(1), cubin, decoded=True, spilled=read.spilled)
+                 if cubin is not None and entry is not None else None)
+    estimate = ESTIMATES.get(module[:16], "")
+    return alternate_verdict(name, read, alternate, certified, estimate, ptx, generation)
+
+
+def _judged_across_builds(offering: int, printed: dict[str, str], generation: str) -> list[dict]:
+    """`refused_across_builds` of each certification the case asked for (`report.offered` past its first
+    `offering`, each once), their PTX as the case's lowering printed it (`printed`, `printed_modules`) or an
+    earlier case's (`PTX`)."""
+    # Each once, by identity: a certification holds its kernels in a dict, no key.
+    asked = list({id(found): found for found in report.offered()[offering:]}.values())
+    return refused_across_builds(asked, printed, judged_builds(generation),
+                                 functools.partial(_judged_under, generation))
 
 
 def refused_across_build_failures(record: dict) -> list[str]:
@@ -940,10 +988,11 @@ the PTX as the GPU does: a container without nvJitLink compiles Mosaic's whole-p
 GPU ignores."""
 
 
-def _ptxas_text(ptx: str, generation: str, relocatable: bool, ptxas: Path | None = None) -> tuple[str, bool]:
+def _ptxas_text(ptx: str, generation: str, relocatable: bool, ptxas: Path | None = None, *,
+                output: Path | None = None) -> tuple[str, bool]:
     """ptxas's own report (`-v`) on the kernel `ptx` for the CUDA `generation`, compiled relocatably or
-    whole-program (`relocatable`, `RELOCATABLE`) by `ptxas` (`assemblers`' first by default), and whether it
-    took the kernel."""
+    whole-program (`relocatable`, `RELOCATABLE`) by `ptxas` (`assemblers`' first by default) into `output`
+    (nowhere by default), and whether it took the kernel."""
     major, minor = capability(generation) or (0, 0)
     arch = f"sm_{major}{minor}{'a' if major >= 9 else ''}"
     with tempfile.NamedTemporaryFile("w", suffix=".ptx") as source:
@@ -951,7 +1000,8 @@ def _ptxas_text(ptx: str, generation: str, relocatable: bool, ptxas: Path | None
         source.flush()
         relocating = ("--compile-only",) if relocatable else ()
         ran = subprocess.run([str(ptxas or assemblers(generation)[0]), f"-arch={arch}", "-v", *relocating,
-                              source.name, "-o", os.devnull], capture_output=True, text=True, check=False)
+                              source.name, "-o", str(output or os.devnull)], capture_output=True, text=True,
+                             check=False)
     return ran.stdout + ran.stderr, ran.returncode == 0
 
 
@@ -960,6 +1010,15 @@ def ptxas_notes(ptx: str, generation: str) -> str:
     and the notes it makes of the code, a warpgroup MMA's serialization among them ("wgmma.mma_async
     instructions are serialized"), which the gate's registers and spills do not state."""
     return _ptxas_text(ptx, generation, RELOCATABLE)[0]
+
+
+def _ptxas_cubin(ptx: str, generation: str, relocatable: bool, ptxas: Path) -> tuple[str, bytes | None]:
+    """`_ptxas_text`'s report of the kernel `ptx`, and the cubin ptxas made of it (None where it took
+    none)."""
+    with tempfile.TemporaryDirectory(prefix="dew-ptxas-") as directory:
+        target = Path(directory, "kernel.cubin")
+        text, took = _ptxas_text(ptx, generation, relocatable, ptxas, output=target)
+        return text, target.read_bytes() if took and target.exists() else None
 
 
 def _assembled_under(generation: str, ptx: str, build: str) -> Assembled:

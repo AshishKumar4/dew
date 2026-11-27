@@ -642,6 +642,10 @@ class Certification:
 _CERTIFIED: dict[tuple, Certification] = {}
 """Each launch certified (`certified`), by its identity, config, device and product."""
 
+_OFFERED: list[Certification] = []
+"""Each certification a launch's derivation asked for (`certified`), in order, a certification held in this
+process again each time it is asked for (`offered`)."""
+
 _UNCERTIFIED: dict[tuple, str] = {}
 """Each launch certification could not compile alone (`certified`), by its identity, config, device and
 product: why."""
@@ -957,6 +961,8 @@ def certified(op, arguments: tokamax.BoundArguments, config: Hashable) -> tuple[
         if held is None and key in _UNCERTIFIED:
             return None
     if held is not None:
+        with _GUARD:
+            _OFFERED.append(held)
         if not held.refused:
             _progressed(key)
         return held.refused
@@ -1036,6 +1042,7 @@ def _kept_certification(key: tuple, op, config: Hashable, reverse: bool, kernels
     found = Certification(type(op).__name__, config, reverse, kernels, read, device)
     with _GUARD:
         _CERTIFIED[key] = found
+        _OFFERED.append(found)
     if not found.refused:
         _progressed(key)
     return found
@@ -1136,6 +1143,14 @@ def certifications() -> tuple[Certification, ...]:
     """Each launch certified in this process (`certified`)."""
     with _GUARD:
         return tuple(_CERTIFIED.values())
+
+
+def offered() -> tuple[Certification, ...]:
+    """Each certification a launch's derivation asked for in this process (`certified`), in order: one held
+    here already again each time (a compile gate's case reads its own offers past where it began, those an
+    earlier case certified among them)."""
+    with _GUARD:
+        return tuple(_OFFERED)
 
 
 def uncertified() -> dict[tuple, str]:
