@@ -329,26 +329,27 @@ def msa_query_kls(index_scores: jax.Array, query: jax.Array, key: jax.Array, sel
         # Each term at its share of the groups' mean, taken as its product and then divided where the
         # product holds in fp32, its gap divided first where the product passes fp32's range, and its peak's
         # and score's shares apart where the gap itself does: no group's own KL past fp32's range is rounded
-        # before the mean. A weight below fp32's least normal meets them in their logarithms instead, so a
-        # term its rounded weight would flush keeps its value (a teacher of logits 0 and -110 against scores 0
-        # and -2^126: 1.44e-10, train 1345's F2).
+        # before the mean. A weight below fp32's least normal meets them in its halves instead (`scaled`),
+        # so a term its rounded weight would flush keeps its value (a teacher of logits 0 and -110 against
+        # scores 0 and -2^126: 1.44e-10, train 1345's F2).
         held = jnp.where(taken, scores, 0)
         gap = peak - held
         tiny = log_target < jnp.log(jnp.finfo(wide).tiny)
-        share = jnp.log(jnp.asarray(groups, wide))
 
         def scaled(x):
-            # `target * x / groups` of a weight below fp32's least normal, met in their logarithms.
-            nonzero = x != 0
-            return jnp.where(nonzero, jnp.sign(x) * jnp.exp(
-                log_target + jnp.log(jnp.where(nonzero, jnp.abs(x), 1)) - share), 0)
+            # `target * x / groups` of a weight below fp32's least normal: its weight's halves each a normal
+            # number (e^(L/2), exact halving of its logarithm L), the product formed between them, so neither
+            # rounds to 0 first and each takes one rounding.
+            half = jnp.exp(log_target / 2)
+            # An infinite `x` (a selected score of -inf) at any positive weight is its own sign's infinity.
+            return jnp.where(jnp.isinf(x), x, (half * x) * (half / groups))
 
         product = target * gap
         direct = jnp.where(jnp.isfinite(gap),
                            jnp.where(jnp.isfinite(product), product / groups, target * (gap / groups)),
                            target * (peak / groups) - target * (held / groups))
-        logged_terms = jnp.where(jnp.isfinite(gap), scaled(gap), scaled(peak) - scaled(held))
-        gaps = jnp.where(taken, jnp.where(tiny, logged_terms, direct), 0)
+        halved = jnp.where(jnp.isfinite(gap), scaled(gap), scaled(peak) - scaled(held))
+        gaps = jnp.where(taken, jnp.where(tiny, halved, direct), 0)
         entropy = jnp.where(taken, target * jnp.where(taken, log_target, 0) / groups, 0)
         divergence = compensated_sum(gaps, (gaps.ndim - 1,)) + spread / groups + compensated_sum(
             entropy, (entropy.ndim - 1,))
