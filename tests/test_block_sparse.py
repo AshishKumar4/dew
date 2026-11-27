@@ -636,7 +636,7 @@ def test_a_block_sparse_decoders_sinks_reach_its_softmax(selection, sinks):
     """A decoder of block-selected attention with sinks (a head's learned, or a query's own projected from
     its input) reads them in its softmax: its logits move with them (train 1345's F4: they were dropped)."""
     options = {"projected_sinks": True} if sinks == "projected_sinks" else {}
-    mixer = mixers.build("block_sparse_attention", selection=selection, block=16, top_k=1, dense_below=16,
+    mixer = mixers.build("block_sparse_attention", selection=selection, block=16, top_k=3, dense_below=16,
                          **options)
     model = tiny(mixer=mixer, dtype="float32", **({"attention_sinks": True} if not options else {}))
     tokens = jax.random.randint(jax.random.key(0), (1, 32), 0, VOCAB)
