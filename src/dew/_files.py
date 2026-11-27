@@ -327,29 +327,30 @@ def _removed(tree: Path) -> None:
         # empty one is removed all the same, while its name still names it.
         log.warning("could not read %s of a save's discarded tree: %s", tree, unopened)
         root = None
-    if root is not None:
-        try:
+    try:
+        if root is not None:
             if not os.path.samestat(named, os.fstat(root)):
                 log.warning("left %s: another entry took its name as it was opened", tree)
                 return
             _emptied(root, log)
-        finally:
-            os.close(root)
-    try:
+        # Its name removed while the folder it named is held open, so no other folder takes its inode.
         if not os.path.samestat(os.lstat(tree), named):
             raise FileExistsError(errno.EEXIST, "another entry took its name while it was removed", str(tree))
         os.rmdir(tree)
     except OSError as left:
         # A save's own leftover, named for whoever clears it; the save's outcome is its own.
         log.warning("could not remove a save's discarded tree %s: %s", tree, left)
+    finally:
+        if root is not None:
+            os.close(root)
 
 
 def _emptied(root: int, log: logging.Logger) -> None:
     """Every entry of the folder the descriptor `root` holds removed through descriptors (`_removed`), a
     link not followed, depth first on a stack of open folders rather than Python's: each folder given its
     owner's read, write and search (`_opened`) before its entries are read; a folder in it opened, held to
-    the entry its name was read as, emptied, closed and its name removed while it still names that folder.
-    Every folder it opened is closed, a failure logged, not raised."""
+    the entry its name was read as, emptied, and its name removed while it still names that folder, held
+    open until then. Every folder it opened is closed, a failure logged, not raised."""
     _opened(root, log)
     # Each open folder: its descriptor, its entries left to remove, and its own name and entry in the folder
     # below it on the stack (None for the root, its caller's).
@@ -362,8 +363,11 @@ def _emptied(root: int, log: logging.Logger) -> None:
             if name is None:
                 stack.pop()
                 if own is not None:
-                    os.close(folder)
-                    _rmdir_held(stack[-1][0], *own, log)
+                    # Its name removed while it is held open, so no other folder takes its inode meanwhile.
+                    try:
+                        _rmdir_held(stack[-1][0], *own, log)
+                    finally:
+                        os.close(folder)
                 continue
             try:
                 found = os.stat(name, dir_fd=folder, follow_symlinks=False)
@@ -402,8 +406,9 @@ def _listed(folder: int, log: logging.Logger) -> Iterator[str]:
 
 
 def _rmdir_held(folder: int, name: str, held: os.stat_result, log: logging.Logger) -> None:
-    """The folder `name` of the folder the descriptor `folder` holds removed while it is still the entry
-    `held` (`_emptied`); a failure logged, not raised."""
+    """The folder `name` of the folder the descriptor `folder` holds removed where it is still the entry
+    `held`, which its caller holds open (`_emptied`), a stat and a removal apart, not one call; a failure
+    logged, not raised."""
     try:
         if not os.path.samestat(os.stat(name, dir_fd=folder, follow_symlinks=False), held):
             raise FileExistsError(errno.EEXIST, "another entry took its name while it was removed", name)
