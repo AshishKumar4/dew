@@ -3,6 +3,8 @@ next (row 12463): the remat rung whose dropped values cover what the step was sh
 decision step on 2 x H100 climbed one rung at a time. Compiled for compile-only H100s on the CPU, never
 run; each search read by the probes its plan or refusal records."""
 
+from types import SimpleNamespace
+
 import jax
 import numpy as np
 import pytest
@@ -170,8 +172,9 @@ def test_a_jumped_rung_fitting_at_a_split_its_walk_passed_over_is_admitted_there
         place: str | None = None
 
         def fits_here(self, split: int) -> bool:
+            # The split measured at the rung, its candidate one that joins no stacks and reads no copies.
             rung = self.rung()
-            self.lowered[(split, rung)] = None
+            self.lowered[(split, rung)] = SimpleNamespace(copies=False, joined=0, lowered=None)
             if rung == self.place and split == 4:
                 return True
             self.misses[(rung, split)] = MemoryMiss(split, scaled=0, shortfall=10, factor=1)
