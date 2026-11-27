@@ -158,9 +158,13 @@ jobs:
         ARMADA_URL: ${{ secrets.ARMADA_URL }}
         ARMADA_TOKEN: ${{ secrets.ARMADA_TOKEN }}
       run: |
+        # armada's map exits 1 where an item's command does, 2 where one could not run; each generation's row is
+        # read as well, so a generation that did not derive ships nothing in its place, whatever armada's exit.
         printf '%s\n' sm80 sm90 sm100 | armada map --commit=${{ github.sha }} --items=- --size=large \
           --label="derived-$GITHUB_REF_NAME" --artifacts="$RUNNER_TEMP/derived" --json -- \
           sh -c 'sh tools/ci/derived.sh "$1" "$2/derived"' sh '{item}' '{artifacts}' > "$RUNNER_TEMP/derived.jsonl"
+        jq -se '[.[] | select(has("index"))] | length == 3 and all(.kind == "ok" and .exitCode == 0)' \
+          "$RUNNER_TEMP/derived.jsonl" > /dev/null || { cat "$RUNNER_TEMP/derived.jsonl"; exit 1; }
     - uses: actions/upload-artifact@v4
       with:
         name: derived
