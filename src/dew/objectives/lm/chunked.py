@@ -41,6 +41,7 @@ from typing import NamedTuple, overload
 
 import jax
 import jax.numpy as jnp
+from jax.ad_checkpoint import checkpoint_name
 from jax.custom_derivatives import zero_from_primal
 from jax.sharding import PartitionSpec as P
 
@@ -76,6 +77,7 @@ from dew.nn.precision import (
 )
 from dew.nn.protocols import (
     HEAD_SCOPE,
+    WHOLE_LOGITS,
     AffineHead,
     HiddenStates,
     Lacks,
@@ -717,10 +719,12 @@ def _whole_head_terms(hidden, table, targets, excluded, softcap, precision, pred
     operands = _operand_dtype(precision, at_least_fp32(hidden.dtype))
     flat = hidden.reshape(-1, table.shape[1]).astype(operands)
     labels = targets.reshape(-1)
-    # The whole logits under the whole head's name (`HEAD_SCOPE`): what a tiled head holds a tile of alone,
-    # where its per-token results and its gradients are its own as much as this head's.
+    # The whole logits under the whole head's name (`HEAD_SCOPE`), the product itself named too
+    # (`WHOLE_LOGITS`): what a tiled head holds a tile of alone, where the table's cast, its per-token
+    # results and its gradients are its own as much as this head's.
+    table = table.astype(operands)
     with jax.named_scope(HEAD_SCOPE):
-        raw = _whole_logits(flat, table.astype(operands), precision)
+        raw = checkpoint_name(_whole_logits(flat, table, precision), WHOLE_LOGITS)
         logits = _without(capped_logits(columns.logits(_widened(raw)), softcap, temperature), 0, excluded)
     log_z, top, normalizer = _row_terms(logits, predict, labels)
     # The vocabulary-split head shifts each shard's targets by its first row
@@ -1087,16 +1091,6 @@ def fused_tokens(tokens: int, vocab: int, tile: tuple[int, int] | None = None) -
     `tile`'s tokens and every token."""
     fitting = 1 << max(FUSED_LOGIT_BYTES // (4 * vocab), 1).bit_length() - 1
     return min(tokens, fitting, tokens if tile is None else tile[0])
-
-
-def tile_logits(tokens: int, vocab: int, tile: tuple[int, int], fused: bool) -> int:
-    """The bytes of fp32 logits a tiled head over `tokens` tokens and `vocab` columns holds at once: a fused
-    head's chunk of tokens over the whole vocabulary (`fused_tokens`), an unfused head's `tile` of tokens
-    and columns (`_bounded_head_bwd`), what a fit search prices a head's move from its whole logits by
-    (`dew.training.planning.FitSearch.jumped`)."""
-    if fused:
-        return 4 * fused_tokens(tokens, vocab, tile) * vocab
-    return 4 * min(tile[0], tokens) * min(tile[1], vocab)
 
 
 def fused_head_loss(hidden, head: OutputTable, targets, weights, *, z_loss: float = 0.0,

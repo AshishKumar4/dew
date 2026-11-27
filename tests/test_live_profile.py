@@ -2,8 +2,7 @@
 the buffers a rung would keep, as the heap simulation counts the memory it occupies, and what a place of
 the fit ladder frees of it (`dew.training.planning.priced`)."""
 
-from dew.nn.protocols import COPIES_SCOPE, HEAD_SCOPE, RecomputeStatement
-from dew.objectives.lm.chunked import tile_logits
+from dew.nn.protocols import COPIES_SCOPE, HEAD_SCOPE, WHOLE_LOGITS, RecomputeStatement
 from dew.training.live_buffers import LiveInterval
 from dew.training.memory import Held, LiveProfile, LiveSet
 from dew.training.planning import Rung, priced
@@ -73,12 +72,13 @@ def test_a_rung_frees_what_its_peak_falls_by_wherever_the_peak_then_stands():
 
 def test_a_residual_is_a_forward_value_live_into_the_backward():
     """Read off a compile's intervals, a forward's value freed before the backward makes its first buffer
-    is its own scratch, which a rung recomputing the forward makes again, and frees none of the peak;
-    one live past it is a residual the rung drops."""
+    is its own scratch, which a rung recomputing the forward makes again, and frees none of the peak; one
+    made before it and live past it is a residual the rung drops; a forward replayed after the backward
+    began (a resident transaction's) makes scratch a rung makes again too."""
     profile = LiveProfile.of((interval(30, 0, 3, 0), interval(20, 1, 6, 1),
-                              interval(25, 4, 6, 2, op_name=BACKWARD)), frozenset())
+                              interval(25, 4, 6, 2, op_name=BACKWARD), interval(5, 5, 7, 3)), frozenset())
     assert profile is not None
-    assert [buffer.residual for buffer in profile.held] == [False, True, False]
+    assert [buffer.residual for buffer in profile.held] == [False, True, False, False]
     assert profile.most == 50
     assert profile.frees(lambda op_name, names: True) == 50 - 30
 
@@ -106,18 +106,22 @@ def rung(modules=(), tile=None, *, fused=False, narrow=True) -> Rung:
 START = rung()
 
 
-def test_a_whole_heads_tile_frees_its_logits_less_the_tile_it_holds_fused_or_not():
-    """A place tiling a head the start held whole drops the whole logits (`HEAD_SCOPE`) and holds a tile of
-    them in their place, a fused head's chunk of tokens over every column or an unfused head's tile; a tile
-    or fusion change of a head already tiled is priced by no name."""
-    tokens, vocab = 4096, 65536
-    logits = 4 * tokens * vocab
-    profile = LiveProfile((held(logits, 0, 4, 0, op_name=HEAD, shape=(tokens, vocab)),
-                           held(1 << 20, 0, 4, 1)))
-    for fused in (False, True):
-        tiled = rung(tile=(1024, 8192), fused=fused)
-        assert priced(tiled, START, profile, 0) == logits - tile_logits(tokens, vocab, (1024, 8192), fused)
-    assert priced(rung(tile=(1024, 8192)), rung(tile=(1024, 8192), fused=True), profile, 0) is None
+def tiled(held: int):
+    """A head policy whose tile holds `held` bytes whatever the logits and tile."""
+    return lambda whole, tile, fused: held
+
+
+def test_a_whole_heads_tile_frees_its_logits_and_holds_its_tile_where_they_were():
+    """A place tiling a head the start held whole drops the whole head's buffers (`HEAD_SCOPE`) and holds
+    its tile over the positions they held: where the head's phase is the peak (100) and the layers' is
+    apart (80), a 10-byte tile frees 20, the peak then the layers'; a tile or fusion change of a head
+    already tiled, or a head policy that prices no tile, is priced by none."""
+    profile = LiveProfile((held(100, 0, 3, 0, op_name=HEAD, names=(WHOLE_LOGITS,), shape=(64, 512)),
+                           held(80, 3, 6, 1)))
+    assert priced(rung(tile=(16, 128), fused=True), START, profile, 0, tiled(10)) == 20
+    assert priced(rung(tile=(16, 128)), START, profile, 0, tiled(90)) == 10
+    assert priced(rung(tile=(16, 128)), START, profile, 0, lambda whole, tile, fused: None) is None
+    assert priced(rung(tile=(16, 128)), rung(tile=(16, 128), fused=True), profile, 0, tiled(10)) is None
 
 
 def test_a_place_frees_each_buffer_once_and_the_copies_bank_where_it_drops_them():
@@ -127,5 +131,27 @@ def test_a_place_frees_each_buffer_once_and_the_copies_bank_where_it_drops_them(
     casts = f"jit(step)/{COPIES_SCOPE}/convert"
     profile = LiveProfile((held(64, 0, 6, 0, residual=True), held(16, 1, 6, 1, op_name=casts, residual=True),
                            held(8, 4, 6, 2, op_name=BACKWARD)))
-    assert priced(rung((Remat(),), narrow=False), START, profile, bank=32) == 88 - 8 + 32
-    assert priced(START, rung(narrow=False), profile, 0) is None
+    assert priced(rung((Remat(),), narrow=False), START, profile, 32, None) == 88 - 8 + 32
+    assert priced(START, rung(narrow=False), profile, 0, None) is None
+
+
+def test_a_finer_split_frees_its_rows_share_beside_what_the_place_drops():
+    """Priced at twice the microbatches its profile read, a place frees half of each buffer a microbatch's
+    rows scale too."""
+    profile = LiveProfile((held(64, 0, 6, 0, residual=True), held(40, 0, 6, 1, scaled=True)))
+    assert priced(rung((Remat(),)), START, profile, 0, None, ratio=2) == 104 - 20
+
+
+def test_a_heads_tile_holds_what_its_route_holds():
+    """A head tiled unfused holds a tile of its tokens by its columns' width over its chunks; fused, a chunk
+    of its tokens over the whole vocabulary, gathered whole where the whole head's columns were a split of
+    it: 4 bytes a logit."""
+    from dew.nn.backbones.causal_transformer import CausalTransformer
+    from dew.objectives.lm import LMObjective
+
+    model = CausalTransformer(vocab_size=65536, emb_features=8, num_layers=1, num_heads=1, mlp_features=16,
+                              max_seq_len=8)
+    objective = LMObjective(model, seq_len=8, head_chunks=16)
+    assert objective.tiled_logits((4096, 65536), (1024, 8192), fused=False) == 4 * 1024 * 4096
+    assert objective.tiled_logits((4096, 32768), (1024, 8192), fused=False) == 4 * 1024 * 2048
+    assert objective.tiled_logits((4096, 32768), (1024, 8192), fused=True) == 4 * 1024 * 65536

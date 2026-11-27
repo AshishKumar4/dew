@@ -965,10 +965,11 @@ class LiveProfile:
     def of(intervals: Sequence[LiveInterval], rows: frozenset[tuple[int, int]]) -> LiveProfile | None:
         """The profile of a compile's `intervals` (`dew.training.live_buffers.live_intervals`), `rows` the
         (argument, axis) pairs of the batch's rows: its buffers not an argument's over the whole module's
-        simulation, each a residual where the forward made it and it lives past the first buffer the backward
-        makes. None where no interval is of a whole module's simulation (a CPU states none), or where they
-        lie on more than one timeline (`LiveInterval.timeline`): heaps XLA simulates apart, whose positions
-        no common clock orders, so no peak of them together is read."""
+        simulation, each a residual where the forward made it before the first buffer the backward makes and
+        it lives past that one (a forward replayed after a backward began, a resident transaction's, makes
+        scratch a rung recomputing it makes again). None where no interval is of a whole module's simulation
+        (a CPU states none), or where they lie on more than one timeline (`LiveInterval.timeline`): heaps XLA
+        simulates apart, whose positions no common clock orders, so no peak of them together is read."""
         whole = [interval for interval in intervals if interval.whole and interval.kind != "parameter"]
         if not whole or len({interval.timeline for interval in whole}) > 1:
             return None
@@ -978,8 +979,8 @@ class LiveProfile:
             Held(interval.bytes, interval.op_name, tuple(interval.names),
                  any(dimension is not None and dimension & rows for dimension in interval.dims),
                  interval.role != "workspace" and forward_made(interval.op_name) and backward is not None
-                 and interval.end > backward, interval.trace, interval.start, interval.end, interval.buffer,
-                 interval.storage, interval.shape)
+                 and interval.start < backward < interval.end, interval.trace, interval.start,
+                 interval.end, interval.buffer, interval.storage, interval.shape)
             for interval in whole))
 
     @functools.cached_property
@@ -994,19 +995,24 @@ class LiveProfile:
         """Its peak, every buffer kept (`peak`)."""
         return self.peak()
 
-    def peak(self, kept: Callable[[Held], bool] = lambda buffer: True, split: int = 1) -> int:
-        """The most bytes the schedule holds at any position, of the buffers `kept` keeps: each storage of
-        each trace once, at the most bytes of the buffers kept in it that are live there, a buffer a
-        microbatch's rows scale at its share of `split` (rounded up), as the heap simulation counts the
-        memory it occupies (a storage reused after it was freed held again where a buffer reusing it is
-        live)."""
-        keeps = [kept(buffer) for buffer in self.held]
+    def peak(self, kept: Callable[[Held], bool] = lambda buffer: True, split: int = 1,
+             added: Sequence[Held] = ()) -> int:
+        """The most bytes the schedule holds at any position, of the buffers `kept` keeps and those `added`
+        in their place (a tiled head's tile over the positions its whole logits held): each storage of each
+        trace once, at the most bytes of the buffers kept in it that are live there, a buffer a microbatch's
+        rows scale at its share of `split` (rounded up), as the heap simulation counts the memory it occupies
+        (a storage reused after it was freed held again where a buffer reusing it is live)."""
+        held = self.held + tuple(added)
+        keeps = [kept(buffer) for buffer in self.held] + [True] * len(added)
+        events = self._events if not added else sorted(
+            [*self._events, *(event for at, buffer in enumerate(added, len(self.held))
+                              for event in ((buffer.start, 1, at), (buffer.end, 0, at)))])
         covering: dict[tuple[int, int], collections.Counter[int]] = {}
         live = most = 0
-        for _, starts, index in self._events:
+        for _, starts, index in events:
             if not keeps[index]:
                 continue
-            buffer = self.held[index]
+            buffer = held[index]
             size = -(-buffer.bytes // split) if buffer.scaled else buffer.bytes
             sizes = covering.setdefault((buffer.trace, buffer.storage), collections.Counter())
             before = max(sizes, default=0)

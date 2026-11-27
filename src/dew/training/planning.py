@@ -47,9 +47,9 @@ from dew.nn.kernels.options import (
     shapes_of,
 )
 from dew.nn.kernels.templates import report
-from dew.nn.protocols import COPIES_SCOPE, HEAD_SCOPE, RecomputeStatement, StatesRecompute
+from dew.nn.protocols import COPIES_SCOPE, HEAD_SCOPE, WHOLE_LOGITS, RecomputeStatement, StatesRecompute
 from dew.objectives.base import RECORD, Objective, Pooled, head_fused_of, head_tile_of
-from dew.objectives.lm.chunked import tile_logits
+from dew.objectives.lm.head import HeadedObjective
 from dew.state import TrainState, apart, together
 from dew.telemetry.compiles import Ledger
 from dew.telemetry.instrumentation import compiled_memory
@@ -456,10 +456,12 @@ class PlanRefused(RuntimeError):
 
     def __init__(self, probes: Sequence[Probe], allocators: Sequence[Mapping[str, int]] = (),
                  candidates: Sequence[int] = (), variants: bool = True,
-                 asked: Sequence[Mapping[str, JSON]] = ()):
+                 asked: Sequence[Mapping[str, JSON]] = (), jump: Mapping[str, JSON] | None = None):
         self.probes, self.allocators = tuple(probes), tuple(allocators)
         # Each rung the search asked past its start, in order, with what it found there (`FitSearch.said`).
         self.asked = tuple(asked)
+        # What its jump read off the start's schedule, or why it read none (`FitSearch.jump`).
+        self.jump = dict(jump or {})
         # The splits the search asked of each rung, and whether a rung it measured has a lighter form it did
         # not (its Newton-Schulz stacks parted, its narrow copies dropped), which a search on more room may
         # reach (`FitSearch.unmeasured_lighter`, `dew.training.compiler.StepCompiler.refuse_unplaced`).
@@ -533,26 +535,41 @@ def kept_at(rung: Rung, start: Rung) -> Callable[[Held], bool] | None:
     return kept
 
 
-def priced(rung: Rung, start: Rung, profile: LiveProfile, bank: int) -> int | None:
+Tiled = Callable[[tuple[int, int], tuple[int, int], bool], int | None]
+"""The bytes of logits a head tiled at a tile, fused or not, holds at once, given the shape of the whole
+logits a device held (`dew.objectives.lm.head.HeadedObjective.tiled_logits`); None where it does not
+price that move."""
+
+
+def priced(rung: Rung, start: Rung, profile: LiveProfile, bank: int, tiled: Tiled | None,
+           ratio: int = 1) -> int | None:
     """What the step at `rung` frees of the peak it held at `start`, priced over `start`'s whole schedule
-    (`profile`): its peak less the peak of the buffers `rung` keeps (`kept_at`), less the logits a head
-    `rung` tiles holds a tile of at once (`tile_logits`, over the shape of the whole logits the start held,
-    its head scope's largest buffer), plus the narrow copies' `bank` (their bytes among the step's arguments
-    on a device) where `rung` drops them. None where `kept_at` reads none, or where `rung` tiles a head of
-    whose whole logits the schedule names no buffer."""
+    (`profile`), at `ratio` times the microbatches the profile's compile read (a microbatch's rows' buffers
+    at their share, `LiveProfile.peak`): its peak less the peak of the buffers `rung` keeps (`kept_at`)
+    with the logits a head `rung` tiles holds at once (`tiled`, from the shape of the start's whole logits,
+    `WHOLE_LOGITS`) charged over the positions its whole head held (`HEAD_SCOPE`'s), plus the narrow copies'
+    `bank` (their bytes among the step's arguments on a device, in the units the shortfall reads) where
+    `rung` drops them. None where `kept_at` reads none, or where `rung` tiles a head whose whole logits
+    the schedule names no buffer of or whose tile `tiled` does not price."""
     kept = kept_at(rung, start)
     if kept is None:
         return None
-    held = 0
+    added: list[Held] = []
     if start.tile is None and rung.tile is not None:
-        whole = max((buffer for buffer in profile.held
-                     if HEAD_SCOPE in buffer.op_name and len(buffer.shape) == 2),
-                    key=lambda buffer: buffer.bytes, default=None)
-        if whole is None:
+        logits = next((buffer for buffer in profile.held
+                       if WHOLE_LOGITS in buffer.names and len(buffer.shape) == 2), None)
+        head = [buffer for buffer in profile.held if HEAD_SCOPE in buffer.op_name]
+        if logits is None or tiled is None:
             return None
-        held = tile_logits(*whole.shape, rung.tile, rung.fused)
+        tokens, columns = logits.shape
+        held = tiled((-(-tokens // ratio), columns), rung.tile, rung.fused)
+        if held is None:
+            return None
+        added.append(Held(held, HEAD_SCOPE, (), scaled=False, residual=False, trace=logits.trace,
+                          start=min(buffer.start for buffer in head), end=max(buffer.end for buffer in head),
+                          buffer=-1, storage=-1))
     released = bank if start.narrow and not rung.narrow else 0
-    return profile.most - profile.peak(kept) - held + released
+    return profile.most - profile.peak(kept, ratio, added) + released
 
 
 def predicted_short(rung: Rung, measured: Sequence[tuple[Rung, int]], start: Rung) -> int | None:
@@ -1176,7 +1193,7 @@ class FitSearch[LossT, EffectsT]:
         if split is None:
             allocators = [device_memory(device) for device in local_devices(self.mesh)]
             raise PlanRefused(self.probes, allocators, candidates, self.unmeasured_lighter(),
-                              self.outcomes) from (self.refusals[-1] if self.refusals else None)
+                              self.outcomes, self.jump) from (self.refusals[-1] if self.refusals else None)
         return self.found(split), tuple(self.probes)
 
     def above(self, candidates: Sequence[int], split: int) -> tuple[Probe, ...]:
@@ -1507,11 +1524,13 @@ class FitSearch[LossT, EffectsT]:
         (`Candidate.joined`), each of those rungs that misses is asked again joining them one at a time, its
         copies released (up to 11.3 GB at a 4B step's peak for 82 ms a step, row 5669; row 5889): at once
         where its miss was within what they hold by count, else, past every rung asked joined, in the
-        climb's order before the search gives up (`Parting`). No rung is asked twice; every process asks the
+        climb's order before the search gives up (`Parting`). The place the start's schedule reads as fitting
+        is asked second (`jumped`): where the start's first miss computes no split that fits, before the
+        start's finer splits (`started`), else past them. No rung is asked twice; every process asks the
         same."""
         start = self.rung_now()
         after = functools.partial(self.after, candidates)
-        split = walked(candidates, first, self.fits_here, after)
+        split, resumed = self.started(candidates, first)
         if split is not None:
             return split
         # The rungs walked already, all missed: none is asked again; and each as its record names it.
@@ -1527,8 +1546,6 @@ class FitSearch[LossT, EffectsT]:
             return walked(candidates, first, self.fits_here, after, coarsest=0)
 
         narrow, group = self.narrow, self.ns_group
-        # The least the start fell short by, and its live set: what each remat rung would free of it.
-        missed = self.short(named[0])
         # What its joined Newton-Schulz stacks hold by count, every process's the same (0: it joins none, or
         # its run states their group): what orders each rung's parted variant (`Parting`).
         parting = self.parting = Parting(self.stacks_count() if group is None else 0, self.gather)
@@ -1550,12 +1567,22 @@ class FitSearch[LossT, EffectsT]:
 
         # The place the start's whole schedule reads as fitting, at the split it read, asked second (the
         # owner's 2026-11-26 ruling: the fitting place in the second compile), before the start's stacks
-        # parted by their count alone; the climb on past it where it misses.
-        if (jump := self.jumped(start, narrow, group, candidates, named[0])) is not None and (split := ask(
-                jump[0], "the step does not fit the devices; compiling it again at the place its schedule "
-                "reads as fitting, %s", jump[1]) or parted(jump[0])) is not None:
-            self.said(named)
-            return split
+        # parted by their count alone; the climb on past it where it misses, its coarser splits unasked
+        # left for the search's end (`coarser`), and the start's finer splits its first miss left.
+        coarser: list[tuple[Rung, int]] = []
+        if (jump := self.jumped(start, narrow, group, candidates, named[0])) is not None:
+            split = ask(jump[0], "the step does not fit the devices; compiling it again at the place its "
+                        "schedule reads as fitting, %s", jump[1]) or parted(jump[0])
+            if split is not None:
+                self.said(named)
+                return split
+            coarser.append(jump)
+        if resumed is not None:
+            self.at(start)
+            if (split := walked(candidates, resumed, self.fits_here, after)) is not None:
+                self.said(named)
+                return split
+        missed = self.short(named[0])
         if (split := parted(start)) is not None:
             self.said(named)
             return split
@@ -1572,23 +1599,7 @@ class FitSearch[LossT, EffectsT]:
                 self.said(named)
                 return split
         if narrow and any(candidate.copies for candidate in self.lowered.values()):
-            # The narrow copies, two bytes a parameter held all run for 1-2% of a step, dropped at the start's
-            # rung where no recomputation fits with them.
-            dropped = dataclasses.replace(start, narrow=False)
-            # Asked once: the jump may have asked it already (`jumped`'s copy-only release).
-            split = None if dropped in self.asked else ask(
-                dropped, "the step does not fit the devices with its narrow copies; compiling it again "
-                "without them (%s)")
-            if split is None:
-                narrow = not self.freed(named[0], named[self.asked.index(dropped)])
-                if narrow:
-                    # Dropped, the step fell no less short at the split both missed at: on a GPU the step
-                    # casts its weights whole either way (a GH200: 68.352 MB without its copies, 68.344 MB
-                    # with them), so the copies come back, their 1-2% of a step kept, and the ladder climbs
-                    # with them.
-                    _log.warning("the step's narrow copies free nothing it needs: it keeps them and climbs "
-                                 "on")
-                split = parted(dropped)
+            split, narrow = self.without_copies(start, named, ask, parted)
             if split is not None:
                 self.said(named)
                 return split
@@ -1609,8 +1620,61 @@ class FitSearch[LossT, EffectsT]:
             if split is not None:
                 self.said(named)
                 return split
+        split = self.coarser_asked(candidates, coarser)
         self.said(named)
+        return split
+
+    def started(self, candidates: Sequence[int], first: int) -> tuple[int | None, int | None]:
+        """The split the start's rung fits at from `candidates[first]` (`walked`, `after`), or None and where
+        its walk goes on: at its first miss that some process computes no split above it as fitting
+        (`MemoryMiss.fits_at`), the walk stops there for the place the start's schedule reads as fitting
+        (`jumped`), its next split (`after`'s) left to ask past that place's miss; None where it walked every
+        split it reaches."""
+        resumed: list[int] = []
+
+        def after(index: int) -> int | None:
+            following = self.after(candidates, index)
+            miss = self.misses.get((self.rung(), candidates[index]))
+            computed = miss is not None and any(miss.fits_at(split) for split in candidates[index + 1:])
+            if following is not None and not resumed and not all(self.gather(computed)):
+                resumed.append(following)
+                return None
+            return following
+
+        return walked(candidates, first, self.fits_here, after), next(iter(resumed), None)
+
+    def coarser_asked(self, candidates: Sequence[int], jumped: Sequence[tuple[Rung, int]]) -> int | None:
+        """The split a place the jump asked from a finer split than the batch whole fits at among the
+        coarser splits its walk left unasked (`walked` asks a coarser one past a fit alone), the objective
+        left at it; None where none fits: XLA schedules each split anew, so a prediction rules none out."""
+        for rung, index in jumped:
+            if index == 0:
+                continue
+            self.at(rung)
+            fewer = candidates[:index]
+            if (split := walked(fewer, 0, self.fits_here, functools.partial(self.after, fewer))) is not None:
+                return split
         return None
+
+    def without_copies(self, start: Rung, named: list[str], ask: Callable[[Rung, str], int | None],
+                       parted: Callable[[Rung], int | None]) -> tuple[int | None, bool]:
+        """The split the start's rung fits at without its narrow copies, two bytes a parameter held all run
+        for 1-2% of a step, where no recomputation fits with them, and whether the climb past it reads them:
+        asked once (the jump may have asked it already, `jumped`'s copy-only release), then parted
+        (`parted`); `named` names each rung asked (`asked`), `ask` asks one."""
+        dropped = dataclasses.replace(start, narrow=False)
+        split = None if dropped in self.asked else ask(
+            dropped, "the step does not fit the devices with its narrow copies; compiling it again without "
+            "them (%s)")
+        if split is not None:
+            return split, True
+        narrow = not self.freed(named[0], named[self.asked.index(dropped)])
+        if narrow:
+            # Dropped, the step fell no less short at the split both missed at: on a GPU the step casts its
+            # weights whole either way (a GH200: 68.352 MB without its copies, 68.344 MB with them), so the
+            # copies come back, their 1-2% of a step kept, and the ladder climbs with them.
+            _log.warning("the step's narrow copies free nothing it needs: it keeps them and climbs on")
+        return parted(dropped), narrow
 
     def past_copies(self, rungs: list[Rung], start: Rung, named: list[str],
                     ask: Callable[[Rung, str], int | None],
@@ -1742,9 +1806,10 @@ class FitSearch[LossT, EffectsT]:
         """The first place of the ladder past `start`, and the split, that every process reads as fitting
         off the start's whole schedules: each split the start (named `begun`) missed at whose compile states
         its schedule (`LiveSet.profile`, read for the start's misses alone: `fits_here`) prices each place
-        by what it frees there (`priced`: each buffer dropped at most once, whichever of the remat, the
-        head's tile and the copies' drop drops it), the place fitting there where that covers what the start
-        fell short by at that split. The places are the start's copy-only release, then the ladder's
+        at that split and each finer one (`priced`: each buffer dropped at most once, whichever of the
+        remat, the head's tile and the copies' drop drops it, a microbatch's rows' buffers at their share),
+        the place fitting at a split where what it frees covers what the start fell short by at the
+        profile's. The places are the start's copy-only release, then the ladder's
         (`ladder`, its speed order: least recomputation first, each place reading the narrow copies `narrow`
         keeps before it drops them). Every process states each place and split it reads as fitting
         (`gather`), and the jump is the first, by the places' order then the coarsest split, that every one
@@ -1759,18 +1824,23 @@ class FitSearch[LossT, EffectsT]:
                     ((rung, dataclasses.replace(rung, narrow=False)) if rung.narrow else (rung,)))]
         profiles = {split: live.profile for (rung, split), live in self.live.items()
                     if rung == begun and live.profile is not None}
-        fitting: list[list[int]] = []
+        tiled = self.objective.tiled_logits if isinstance(self.objective, HeadedObjective) else None
         freed: dict[tuple[int, int], int] = {}
         for split, profile in profiles.items():
             short = self.shortfall_at(begun, split)
             candidate = self.lowered.get((split, begun))
+            # The copies' bank is no temporary, which the shortfall's units scale (`MemoryMiss.shortfall`).
             bank = (0 if candidate is None or candidate.prepared.compute is None
-                    else placed_bytes(candidate.prepared.compute))
+                    else placed_bytes(candidate.prepared.compute) // self.factor)
+            # Each split as fine as the profile's or finer, by the whole times as many microbatches.
+            finer = [(index, finer // split) for index, finer in enumerate(candidates)
+                     if finer >= split and finer % split == 0]
             for at, place in enumerate(places):
-                frees = priced(place, start, profile, bank)
-                if short is not None and frees is not None and frees >= short:
-                    fitting.append([at, candidates.index(split)])
-                    freed[(at, candidates.index(split))] = frees
+                for index, ratio in finer:
+                    frees = priced(place, start, profile, bank, tiled, ratio)
+                    if short is not None and frees is not None and frees >= short:
+                        freed[(at, index)] = max(frees, freed.get((at, index), frees))
+        fitting = sorted([at, index] for at, index in freed)
         read = self.gather(sorted(fitting) if profiles else None)
         if any(verdict is None for verdict in read):
             self.jump = {"jumped": False, "why": "a process's start states no schedule"}

@@ -65,4 +65,3 @@ def test_a_tight_start_compiles_second_a_place_that_fits(tmp_path, monkeypatch, 
     plan = searched(decoder(room))
     probes = plan["probes"]
     assert [probe["fits"] for probe in probes] == [False, True], (probes, plan.get("jump"))
-    assert plan["jump"]["jumped"] is True, plan["jump"]

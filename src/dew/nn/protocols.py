@@ -958,6 +958,11 @@ buffers a tiled head makes none of, its per-token results and gradients its own 
 search reads off a compile's live intervals by the `op_name` of the op that made each
 (`dew.training.planning.priced`)."""
 
+WHOLE_LOGITS = "dew_whole_logits"
+"""The checkpoint name of a language model head's whole logits (`chunked._whole_head_terms`), `[tokens,
+columns]` on a device: the buffer whose shape a fit search prices a tile of them by
+(`dew.training.planning.priced`)."""
+
 COPIES_SCOPE = "dew_narrow_copies"
 """The name scope of a step's narrow copies of its parameters (`dew.training.narrow.narrowed`): the buffers a
 step reading none of them makes none of, read off a compile's live intervals as `HEAD_SCOPE`'s are."""
