@@ -32,11 +32,14 @@ import uuid
 from collections.abc import Callable, Hashable, Iterable, Iterator, Mapping, Sequence
 from fractions import Fraction
 from pathlib import Path
-from typing import ClassVar, NamedTuple
+from typing import TYPE_CHECKING, ClassVar, NamedTuple
 
 import jax
 import jax.numpy as jnp
 import numpy as np
+
+if TYPE_CHECKING:
+    from dew.telemetry import hlo
 
 
 @dataclasses.dataclass(frozen=True)
@@ -415,8 +418,9 @@ def tpu_ops(directory: str | Path, devices: Iterable[int], module: str, *, annot
     runs one program at a time, so the ops inside a run's span are its own: a v5e's XProf names a run's
     program in its name alone and its ops state none (M-FS-90); a run stating its program by stat takes the
     ops stating it, no host transfer. Where its ops state none, each is read as the instruction of the
-    call's module it names (`instructions`, each instruction's opcode by name; an op's name the
-    instruction's, or its HLO text, `%name = ...`, `_opcode_of`): one no instruction of the module names is
+    call's module it names (`instructions`, each instruction's opcode by name as it runs, `_opcodes`: a
+    generic async op's its wrapped op's; an op's name the instruction's, or its HLO text, `%name = ...`,
+    `_opcode_of`): one no instruction of the module names is
     another's, refused (`AmbiguousCapture`), and a run of ops that move data alone (`trace.moves_only`:
     copies, infeeds, outfeeds and collectives that reduce nothing, async or not) times no kernel of the
     call's (`NoKernels`), never scored as its kernels' time. A capture whose runs name no program, or not
@@ -593,7 +597,37 @@ def _module_of(program: jax.stages.Compiled) -> tuple[str, dict[str, str]]:
     module = hlo_module(program)
     if module is None:
         raise AmbiguousCapture(f"{program} holds no module")
-    return module.name, {instruction.name: instruction.opcode for instruction in hlo.instructions(module)}
+    return module.name, _opcodes(list(hlo.instructions(module)))
+
+
+def _opcodes(instructions: Sequence[hlo.Instruction]) -> dict[str, str]:
+    """Each instruction's opcode by its name as it runs: a generic async op's (`async-start`, `async-update`
+    or `async-done`, over a computation holding the op itself, as XLA wraps some collectives,
+    `trace.COLLECTIVES`) its wrapped op's, as `<op>-start` or `<op>-done`: the root of the computation it
+    calls, as XLA reads it first (a done taking a loop-carried handle from a tuple names it so), else, an
+    update's or a done's that names none, the op of the async instruction it reads; so a run of a generic
+    async all-to-all is the transfer it is (`trace.moves_only`). Every other its own."""
+    roots = {each.computation: each.opcode for each in instructions if each.root}
+    named = {each.name: each for each in instructions}
+
+    def wrapped(each: hlo.Instruction) -> str | None:
+        if each.opcode not in _ASYNC:
+            return None
+        if (own := next((roots[called] for called in each.called if called in roots), None)) is not None:
+            return own
+        producer = named.get(each.operands[0]) if each.opcode != "async-start" and each.operands else None
+        return None if producer is None else wrapped(producer)
+
+    found = {}
+    for each in instructions:
+        op = wrapped(each)
+        found[each.name] = (each.opcode if op is None
+                            else f"{op}-start" if each.opcode == "async-start" else f"{op}-done")
+    return found
+
+
+_ASYNC = ("async-start", "async-update", "async-done")
+"""XLA's generic async ops, each over a computation holding the op it runs (`_opcodes`)."""
 
 
 @contextlib.contextmanager

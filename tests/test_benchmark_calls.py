@@ -602,6 +602,48 @@ def test_a_tpu_call_is_timed_by_its_own_programs_run_on_its_own_devices(tmp_path
         tpu_ops(carried, {0}, "jit_run", annotation=READ, instructions=OPCODES)
 
 
+def test_a_tpu_run_of_a_generic_async_collective_is_read_as_the_op_it_wraps(tmp_path):
+    """A TPU call's run whose ops are a generic async collective's start and done alone (`async-start` over
+    a computation holding the op itself, as XLA wraps some collectives, `trace.COLLECTIVES`), each the
+    instruction its name is, its opcode as it runs read from its module's typed instructions
+    (`benchmark._opcodes`: the start as the op its computation's root is, the done by the start it reads):
+    an all-to-all's moves data alone and times no kernel of the call's (`NoKernels`), an all-reduce's
+    reduces as it moves and is timed (Train 1431's review: its start read as no op, an all-to-all's run was
+    timed as kernels); a done reading a loop-carried handle from a tuple is its own computation's op, and a
+    fusion calling a computation is a fusion."""
+    from dew.telemetry import benchmark, hlo
+    from dew.telemetry.benchmark import NoKernels, tpu_ops
+
+    def instruction(computation, name, opcode, operands=(), called=(), *, root=False):
+        return hlo.Instruction(computation, name, opcode, None, tuple(operands), tuple(called), root,
+                               computation == "main", None)
+
+    opcodes = benchmark._opcodes([
+        instruction("wrapped_all_to_all", "p", "parameter"),
+        instruction("wrapped_all_to_all", "a2a", "all-to-all", ["p"], root=True),
+        instruction("wrapped_all_reduce", "q", "parameter"),
+        instruction("wrapped_all_reduce", "ar", "all-reduce", ["q"], root=True),
+        instruction("main", "x", "parameter"),
+        instruction("main", "async-start", "async-start", ["x"], ["wrapped_all_to_all"]),
+        instruction("main", "async-done", "async-done", ["async-start"]),
+        instruction("main", "async-start.1", "async-start", ["x"], ["wrapped_all_reduce"]),
+        instruction("main", "async-done.1", "async-done", ["async-start.1"]),
+        # A loop-carried handle: the done reads it from a tuple and names the computation itself.
+        instruction("main", "carried", "tuple", ["async-start", "x"]),
+        instruction("main", "handle", "get-tuple-element", ["carried"]),
+        instruction("main", "async-done.2", "async-done", ["handle"], ["wrapped_all_to_all"]),
+        instruction("main", "fusion", "fusion", ["x"], ["wrapped_all_reduce"], root=True)])
+    assert (opcodes["async-done.2"], opcodes["fusion"]) == ("all-to-all-done", "fusion")
+    runs = [(0, "jit_run(7)", 0.0, 1.0, None)]
+    transfer, reduction = tmp_path / "transfer", tmp_path / "reduction"
+    _tpu_capture(transfer, [(0, "async-start", 0.25, 0.5, None), (0, "async-done", 0.5, 0.75, None)], runs)
+    _tpu_capture(reduction, [(0, "async-start.1", 0.25, 0.5, None), (0, "async-done.1", 0.5, 0.75, None)],
+                 runs)
+    with pytest.raises(NoKernels):
+        tpu_ops(transfer, {0}, "jit_run", annotation=READ, instructions=opcodes)
+    assert [op.name for op in tpu_ops(reduction, {0}, "jit_run", annotation=READ, instructions=opcodes)] == [
+        "async-start.1", "async-done.1"]
+
 def test_a_tpu_call_is_timed_by_the_ops_inside_its_run_as_a_v5e_records_them(tmp_path):
     """A v5e's XProf (M-FS-90's capture of a bf16 8192x4096 by 4096x4096 GEMM, its three ops' spans as
     recorded, their HLO text shortened): its run on the `XLA Modules` line names its program in its name,
