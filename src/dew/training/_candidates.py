@@ -512,6 +512,6 @@ def lowered_for[LossT, EffectsT](stepping: Stepping[LossT, EffectsT], objective:
         placement, replicated = batch_shardings(mesh, batch), NamedSharding(mesh, P())
         candidate = candidate_for(stepping, state, batch, schedule, placement, replicated, split, narrow,
                                   mesh=mesh, platforms=('cuda',))
-        gathered = layer_gathers(objective, state.variables, mesh.devices.size)
+        gathered = layer_gathers(objective, state.variables, mesh.size)
         return candidate.lowered, unlimited(step_options(objective, candidate.micro,
                                                          candidate.prepared.variables, mesh, gathered))
