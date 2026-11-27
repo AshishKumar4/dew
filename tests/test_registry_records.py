@@ -546,6 +546,7 @@ def test_a_bound_member_reads_back_as_its_annotation_admits():
     record = to_record(bound, functools.partial[JepaPredictor])
     for annotation in (functools.partial[Any], functools.partial, functools.partial[JepaPredictor]):
         again = from_record(annotation, record)
+        assert isinstance(again, functools.partial)
         assert (again.func, again.keywords) == (JepaPredictor, {"num_layers": 1, "predictor_features": 8})
     other = functools.partial(JepaEncoder, num_layers=1)
     for given in (other, to_record(other, functools.partial)):
@@ -558,7 +559,8 @@ def test_a_bound_member_reads_back_as_its_annotation_admits():
 
     made = functools.partial(decoder, kind="attention")
     for given in (made, to_record(made, functools.partial)):
-        assert from_record(functools.partial[CausalTransformer], given).func is decoder
+        read = from_record(functools.partial[CausalTransformer], given)
+        assert isinstance(read, functools.partial) and read.func is decoder
 
 
 USER_ENVS = """
@@ -631,4 +633,5 @@ def test_a_bound_member_reads_back_through_its_alias():
 
     bound = functools.partial(JepaPredictor, num_layers=4)
     again = from_record(_Predictor, to_record(bound, _Predictor))
+    assert isinstance(again, functools.partial)
     assert (again.func, again.keywords) == (JepaPredictor, {"num_layers": 4})

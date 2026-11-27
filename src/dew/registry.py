@@ -2079,12 +2079,10 @@ class Bound[Member](ABC):
         beside `defaults`. A recorded kind's as held (`argument_records`, at construction); another's each
         recorded as given, read against nothing until its member is built (a world model's views named
         alone, which its environment widens)."""
-        if self._recorded:
-            return dict(self.fields)
         with recording():
             # Each written as held, against no parameter's annotation, as the record held them before
-            # (`JsonDict`): a world model's views named alone, which its environment widens, are no value
-            # of the parameter they become.
+            # (`JsonDict`): a recorded kind's records again as they are, and a world model's views named
+            # alone, which its environment widens, no value of the parameter they become.
             return {name: to_record(value, None) for name, value in self.fields.items()}
 
     def record(self) -> dict[str, JSON]:
@@ -2102,13 +2100,16 @@ class Bound[Member](ABC):
         own = {field.name for field in dataclasses.fields(cls)} - {"bound"}
         unknown = sorted(set(record) - own - {"name", "fields"})
         default = next(field for field in dataclasses.fields(cls) if field.name == "bound").default_factory
-        if unknown or ("name" not in record and default is dataclasses.MISSING):
+        if "name" in record:
+            member = cls._member(text(record["name"], f"{cls.__name__}.name"))
+        elif default is not dataclasses.MISSING:
+            # A record naming no member is the kind's default one's, as a record of an earlier Dew's was.
+            member = default().func
+        else:
+            raise ValueError(f"{cls.__name__}'s record names no member, and the kind has no default one")
+        if unknown:
             raise ValueError(f"{cls.__name__} is the record {{'name': ..., 'fields': {{...}}, 'defaults': "
-                             f"{{...}}}}; unknown fields {unknown}" + ("" if "name" in record else
-                                                                       ", and it names no member"))
-        # A record naming no member is the kind's default one's, as a record of an earlier Dew's was.
-        member = (cls._member(text(record["name"], f"{cls.__name__}.name")) if "name" in record
-                  else default().func)
+                             f"{{...}}}}; unknown fields {unknown}")
         fields = _records.record(record.get("fields") or {}, f"{cls.__name__}.fields")
         settings: dict[str, Any] = {name: _rebuilt(declared_type(cls, name), value, dtypes=dtypes, name=name)
                                     for name, value in record.items() if name in own}
