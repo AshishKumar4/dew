@@ -187,13 +187,13 @@ def refused_exports(run, destination: Path, restoring, model, variables, extensi
     # failure the reader's, none left waiting in the export's later rounds (train 1406's review).
     import tempfile
 
-    from dew.interop.saved_sources import pooled_export
+    from dew.interop.saved_sources import export_run
 
     temporary = tempfile.tempdir
     if rank == 1:
         tempfile.tempdir = str(destination.parent / "no such folder")
     try:
-        pooled_export(run, destination.parent / "shared")
+        export_run(run, destination.parent / "shared")
         report["scratch"] = None
     except (OSError, PeerFailure) as failure:
         report["scratch"] = type(failure).__name__

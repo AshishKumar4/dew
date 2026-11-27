@@ -32,7 +32,7 @@ import numpy as np
 from etils import epath
 
 from dew._coordination import agreed_reading, writes_weights
-from dew._files import Entries, is_uri, swapped, write_atomically
+from dew._files import Entries, is_uri, same_entries, swapped, write_atomically
 from dew.interop.release_record import RELEASE_FILE, Release
 from dew.interop.safetensors_io import (
     CONFIG_FILE,
@@ -70,32 +70,52 @@ def published_release(directory: str | Path, write: Callable[[Path], None], *, f
     root = Path(directory)
     in_place = fresh or is_uri(str(directory)) or not writes_weights()
     with contextlib.ExitStack() as staged:
-        target = agreed_reading(
-            lambda: root if in_place else staged.enter_context(swapped(root, foreign_entries)))
+        target = agreed_reading(lambda: root if in_place else staged.enter_context(
+            swapped(root, foreign_entries, replaces=replaced_entries)))
         agreed_reading(lambda: write(target))
         agreed_reading(staged.close)
 
 
 @contextlib.contextmanager
-def pooled_destination(destination: Path, *, publishes: bool,
+def pooled_destination(destination: str | Path, *, publishes: bool, shared: bool = True,
                        stage: Callable[[Path], contextlib.AbstractContextManager[Path]] | None = None
-                       ) -> Iterator[Path]:
+                       ) -> Iterator[str | Path]:
     """The directory this process writes a pool's release into, inside its reading scope
     (`dew._coordination.reading_home`), every process taking the same rounds: made in one the pool agrees
     (`agreed_reading`), the publisher's `destination` (or the staging `stage` makes of it), another
-    process's a scratch directory discarded, so none touches the live one; and committed in another as the
+    process's a scratch directory discarded where the pool shares `destination`, so none touches the live
+    one, and its own `destination` where it does not (`shared`); and committed in another as the
     block ends, the staging published and the scratch removed, its removal failing nothing. A process that
     fails making its directory, writing, or committing is heard by the others at that boundary, none left
     waiting in a round alone (train 1406's review). One lifecycle for every pooled release: a saved run's
-    (`saved_sources.pooled_export`) and a rollout's weights (`inference.rollouts.SafetensorsReload`)."""
+    (`saved_sources.export_run`) and a rollout's weights (`inference.rollouts.SafetensorsReload`). A
+    location with a scheme is the publisher's as named, no stage made of it."""
     with contextlib.ExitStack() as held:
-        def made() -> Path:
-            if not publishes:
+        def made() -> str | Path:
+            if not publishes and shared:
                 return Path(held.enter_context(tempfile.TemporaryDirectory(ignore_cleanup_errors=True)))
-            return destination if stage is None else held.enter_context(stage(destination))
+            if not publishes:
+                return destination
+            return destination if stage is None else held.enter_context(stage(Path(destination)))
 
         yield agreed_reading(made)
         agreed_reading(held.close)
+
+
+def replaced_entries(written: Entries, held: Entries) -> dict[Path, set[Path]]:
+    """Each file and folder a release writes, with the earlier entries it replaces (`swapped`'s
+    `replaces`): the same entry; and a shard of its weights, every shard of that stem the earlier tree held
+    in its folder, however the two shard them, so a resharded release keeps the access its earlier weights
+    allowed (train 1407's review: `model.safetensors` replaced by `model-00001-of-00002.safetensors`)."""
+    earlier: dict[tuple[Path, str], set[Path]] = {}
+    for entry, kind in held.items():
+        if kind == "file" and (stem := weight_stem(entry.name)) is not None:
+            earlier.setdefault((entry.parent, stem), set()).add(entry)
+    replaced = same_entries(written, held)
+    for entry, kind in written.items():
+        if kind == "file" and (stem := weight_stem(entry.name)) is not None:
+            replaced[entry] = replaced.get(entry, set()) | earlier.get((entry.parent, stem), set())
+    return replaced
 
 
 def foreign_entries(written: Entries, held: Entries, directory: Path) -> set[Path]:
@@ -222,10 +242,11 @@ class ReleasePlan:
         `directory` holding files or folders no export writes or owns (`foreign_entries`), at any depth, is
         refused, those entries named. A pool's process that reads its share and publishes none
         (`writes_weights`) writes the release's small files in place, to a destination of its own
-        (`pooled_export` discards one the pool shares), every process agreeing its setup, its writes and
-        the publisher's replacement in turn; a location with a scheme, which has no rename, is written file
-        by file; and a `fresh` directory, one its caller made empty and private for this write alone, which
-        it publishes itself (a cache release's staging, `pooled_export`), is written in place."""
+        (`saved_sources.export_run` discards one the pool shares), every process agreeing its setup, its
+        writes and the publisher's replacement in turn; a location with a scheme, which has no rename, is
+        written file by file; and a `fresh` directory, one its caller made empty and private for this write
+        alone, which it publishes itself (a cache release's staging, `saved_sources.export_run`), is written
+        in place."""
         published_release(directory, lambda target: self._write(target, max_shard_size), fresh=fresh)
 
     def _write(self, root: Path, max_shard_size: int | str) -> None:

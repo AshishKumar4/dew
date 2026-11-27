@@ -60,20 +60,40 @@ if TYPE_CHECKING:
 
 def export_run(run: SavedRun, destination: str | Path, *, ema: bool | None = None,
                mesh: MeshSpec | Mesh | None = None, layout: Layout | None = None,
-               publishes: bool = True, fresh: bool = False) -> None:
+               publishes: bool | None = None, staging: bool = False) -> None:
     """Write `run`'s pinned checkpoint (`SavedRun.pinned`) to `destination` as its release (`run_plan`),
-    its EMA weights where `ema`. Its weights restore where `mesh` and `layout` place them, so no device
-    holds more of them than a load does, and the writer reads them home a tensor at a time as it writes
-    them, one shard of the release at a time (`save_sharded`). On a pool every process runs this same
-    writer, reading each tensor that spans the pool's processes home together (`reading_home`), so each
-    host holds a shard of the release, not the model (ledger 2874). One that does not `publish` reads
-    every tensor as the one that does and writes no weights to `destination`, only the release's small
-    files. A `fresh` destination, one its caller made empty and private for this export alone and publishes
-    itself, is written in place (`ReleasePlan.write`)."""
+    its EMA weights where `ema`: the one entry of a saved run's export, from one process or every process
+    of a pool. Its weights restore where `mesh` and `layout` place them, so no device holds more of them
+    than a load does, and the writer reads them home a tensor at a time as it writes them, one shard of
+    the release at a time (`save_sharded`). On a pool every process runs this same writer, reading each
+    tensor that spans the pool's processes home together (`reading_home`), so each host holds a shard of
+    the release, not the model (ledger 2874). The process that `publishes` writes the release; another
+    reads every tensor as it does and writes only the release's small files, to a destination of its own
+    (`releases.pooled_destination`). Where `publishes` is None, a pool that shares the destination, every
+    process naming the one and seeing one directory, publishes it from its first process, the others'
+    small files written to a directory discarded, and elsewhere each process publishes its own. A
+    `staging` export publishes through `staged`, which keeps a release written already, and states the
+    saved run it holds (`HELD_FILE`); another replaces the release in one call (`ReleasePlan.write`).
+    Every process returns once the release is published, the pool agreeing its commit (ledgers 2874,
+    2992)."""
+    from dew.interop.releases import pooled_destination
+
+    named, shared = Path(destination), False
+    if publishes is None:
+        shared = (jax.process_count() > 1 and len(set(from_every_process(named.name))) == 1
+                  and all(seen_by_every_process(str(named.parent))))
+        publishes = not shared or jax.process_index() == 0
     # Restored before the writer reads its tensors home, each as the writer reaches it.
     plan = run_plan(run, ema=ema, mesh=mesh, layout=layout)
-    with reading_home("saved run export", writes=publishes):
-        plan.write(destination, fresh=fresh)
+    with (reading_home("saved run export", writes=publishes),
+          pooled_destination(destination, publishes=publishes, shared=shared,
+                             stage=staged if staging else None) as target):
+        # A staging's one publication is `staged`'s: the export writes it in place.
+        plan.write(target, fresh=staging and publishes)
+        if staging:
+            # A cache release states the saved run it holds, which a run that reads it carries, in a round
+            # the pool agrees as its others.
+            agreed_reading(lambda: _write_held(Path(target), run, ema) if publishes else None)
 
 
 def run_plan(run: SavedRun, *, ema: bool | None = None, mesh: MeshSpec | Mesh | None = None,
@@ -323,7 +343,7 @@ def released_run(name_or_dir: str | Path, *, step: int | str | None = None, ema:
     # One that holds the release already keeps it (`staged`). A key reads each host's own checkpoint
     # files (`_fingerprint`), which copies of one checkpoint on several hosts may stamp apart, so a pool
     # shares a release only where every process asks for the one.
-    pooled_export(run, release, ema=ema, mesh=mesh, layout=layout, staging=True)
+    export_run(run, release, ema=ema, mesh=mesh, layout=layout, staging=True)
     return release
 
 
@@ -432,34 +452,6 @@ def releases_here(record: Mapping[str, object], *, mesh: MeshSpec | Mesh | None 
 
     return {**{key: mapped_strings(field, here_named) for key, field in fields.items()},
             RELEASE_SOURCES: sources}
-
-
-def pooled_export(run: SavedRun, destination: Path, *, ema: bool | None = None,
-                  mesh: MeshSpec | Mesh | None = None, layout: Layout | None = None,
-                  staging: bool = False) -> None:
-    """Write `run`'s release to `destination` from every process of a pool, or from one (`export_run`):
-    every process restores and writes, the pool reading its tensors home together. Where the pool shares
-    the destination, every process naming the one and seeing one directory, the first publishes it and
-    the others read every tensor as it does, writing only the release's small files, to a directory
-    discarded; elsewhere each publishes its own. A `staging` export publishes through `staged`, which
-    keeps a release written already; another writes in place, as `dew export` does. Every process
-    returns once the release is published (ledgers 2874, 2992)."""
-    from dew.interop.releases import pooled_destination
-
-    shared = (jax.process_count() > 1 and len(set(from_every_process(destination.name))) == 1
-              and all(seen_by_every_process(str(destination.parent))))
-    publishes = not shared or jax.process_index() == 0
-    # Restored before the writer reads its tensors home, each as the writer reaches it.
-    plan = run_plan(run, ema=ema, mesh=mesh, layout=layout)
-    with (reading_home("saved run export", writes=publishes),
-          pooled_destination(destination, publishes=publishes, stage=staged if staging else None) as target):
-        # A staging's one publication is `staged`'s: the export writes it in place.
-        plan.write(target, fresh=staging and publishes)
-        if staging:
-            # A cache release states the saved run it holds, which a run that reads it carries, in a round
-            # the pool agrees as its others.
-            agreed_reading(lambda: _write_held(target, run, ema) if publishes else None)
-    from_every_process(None)  # every process reads the release once it is published
 
 
 def native_release(source: str | Path) -> bool:

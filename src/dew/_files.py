@@ -18,12 +18,14 @@ import contextlib
 import ctypes
 import errno
 import fcntl
+import functools
 import hashlib
+import operator
 import os
 import secrets
 import shutil
 import stat
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, Collection, Iterator, Mapping
 from pathlib import Path
 
 from etils import epath
@@ -121,7 +123,7 @@ def staged(directory: Path) -> Iterator[Path]:
         staging.chmod(mode)
         published(staging, directory)
     finally:
-        shutil.rmtree(staging, ignore_errors=True)
+        _removed(staging)
 
 
 def published(built: Path, directory: Path) -> bool:
@@ -133,7 +135,7 @@ def published(built: Path, directory: Path) -> bool:
     except OSError:
         if not directory.is_dir():
             raise
-        shutil.rmtree(built, ignore_errors=True)
+        _removed(built)
         return False
     return True
 
@@ -162,9 +164,18 @@ Entries = Mapping[Path, str]
 regular file), `"folder"`, `"link"` or `"special"` (a FIFO, a socket, a device)."""
 
 
+def same_entries(written: Entries, held: Entries) -> dict[Path, set[Path]]:
+    """Each file and folder `written` where `held` holds the same entry, of the same kind: the earlier entry
+    it replaces (`swapped`'s `replaces`)."""
+    return {entry: {entry} for entry, kind in written.items()
+            if kind in ("file", "folder") and held.get(entry) == kind}
+
+
 @contextlib.contextmanager
 def swapped(directory: Path, foreign: Callable[[Entries, Entries, Path], set[Path]], *,
-            exchange: Callable[[Path, Path], None] = exchange_directories) -> Iterator[Path]:
+            exchange: Callable[[Path, Path], None] = exchange_directories,
+            replaces: Callable[[Entries, Entries], Mapping[Path, Collection[Path]]] = same_entries
+            ) -> Iterator[Path]:
     """A sibling directory to write the whole of `directory` into, which replaces it when the block ends
     in one call, so a write that fails at any file leaves the one `directory` held whole and the one
     that succeeds is put in place whole; removed if the block raises, or if its own setup fails.
@@ -237,12 +248,15 @@ def swapped(directory: Path, foreign: Callable[[Entries, Entries, Path], set[Pat
                 raise FileExistsError(f"{directory} holds {sorted(map(str, refused))}, which the export "
                                       "would not write: export into an empty directory, or one holding only "
                                       "an export")
-            # Each entry the new tree writes where the earlier one held the same kind takes its access as
-            # held, a private file kept private, a new one its umask's (train 1406's review), while the
-            # staging is still private; its own mode last, just before it is put in place.
-            for entry, kind in written.items():
-                if kind in ("file", "folder") and held.get(entry) == kind:
-                    (staging / entry).chmod(stat.S_IMODE((directory / entry).lstat().st_mode))
+            # Each entry the new tree writes in place of earlier ones (`replaces`: the same entry, or a
+            # release's reshard of its weights) takes the access every one of them allowed, a private file
+            # kept private, a new one its umask's (trains 1406 and 1407's reviews), while the staging is
+            # still private; its own mode last, just before it is put in place.
+            for entry, earlier in replaces(written, held).items():
+                if earlier:
+                    modes = (stat.S_IMODE((directory / each).lstat().st_mode) for each in earlier)
+                    allowed = functools.reduce(operator.and_, modes)
+                    (staging / entry).chmod(allowed)
             staging.chmod(stat.S_IMODE(held_at.st_mode))
             if held:
                 exchange(staging, directory)
@@ -250,7 +264,19 @@ def swapped(directory: Path, foreign: Callable[[Entries, Entries, Path], set[Pat
                 # An empty directory is replaced by a rename, which every filesystem makes in one step.
                 os.rename(staging, directory)
     finally:
-        shutil.rmtree(staging, ignore_errors=True)
+        _removed(staging)
+
+
+def _removed(tree: Path) -> None:
+    """Remove `tree`, a tree of this process's own (a staging, the earlier tree an exchange put there, or a
+    build another writer published before), every folder in it first made writable, as one whose mode an
+    earlier tree's restored read-only is not: no folder of a save left behind (train 1407's review). The
+    live tree is never walked."""
+    if not os.path.lexists(tree) or os.path.islink(tree):
+        return
+    for here, _, _ in os.walk(tree, followlinks=False):
+        Path(here).chmod(0o700)
+    shutil.rmtree(tree, ignore_errors=True)
 
 
 def _made_mode(parent: Path) -> int:

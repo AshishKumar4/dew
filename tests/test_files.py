@@ -274,3 +274,21 @@ def test_a_lock_that_is_no_regular_file_is_refused_without_waiting(tmp_path):
     with pytest.raises(FileExistsError), swapped(release, _nothing_foreign) as staging:
         (staging / "model.safetensors").write_text("new")
     assert not release.exists()
+
+
+def test_a_read_only_folder_replaced_leaves_no_tree_behind(tmp_path):
+    """A release whose folder was read-only (`0555`), replaced by one that writes that folder: the new
+    folder takes its mode and the earlier tree, put aside by the exchange, is removed whole, every folder
+    made writable first (train 1407's review: the earlier tree was left as a `.staging` sibling)."""
+    release = tmp_path / "release"
+    (release / "text_encoder").mkdir(parents=True)
+    (release / "text_encoder" / "model.safetensors").write_text("old")
+    (release / "text_encoder").chmod(0o555)
+    with swapped(release, _nothing_foreign) as staging:
+        (staging / "text_encoder").mkdir()
+        (staging / "text_encoder" / "model.safetensors").write_text("new")
+    assert stat.S_IMODE((release / "text_encoder").stat().st_mode) == 0o555
+    assert (release / "text_encoder" / "model.safetensors").read_text() == "new"
+    # The release and its publication lock alone: nothing of the earlier tree or the staging.
+    left = sorted(path.name for path in tmp_path.iterdir() if not path.name.startswith(".dew-lock-"))
+    assert left == ["release"], left

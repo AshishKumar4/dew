@@ -575,3 +575,23 @@ def test_taps_past_the_targets_visits_are_refused(taps):
     built(RELEASE['mtp_config']['target_layer_ids'])
     with pytest.raises(ValueError):
         built(taps)
+
+
+def test_a_resharded_release_keeps_its_weights_private(tmp_path):
+    """A release whose weights a user made private (`0600`), re-exported in shards: each shard takes the
+    access the weights it replaces allowed, the earlier single file's (train 1407's review: the shards
+    took the umask's, readable by others)."""
+    import stat
+
+    from dew.interop.releases import Placed, ReleasePlan
+
+    weight = np.arange(4096, dtype=np.float32).reshape(64, 64)
+    plan = ReleasePlan(Placed({'': ({'model_type': 'tiny'}, {'model.a': weight, 'model.b': weight + 1})}))
+    target = tmp_path / 'release'
+    plan.write(target)
+    (target / 'model.safetensors').chmod(0o600)
+    plan.write(target, max_shard_size=20000)
+    shards = sorted(target.glob('model-*.safetensors'))
+    assert len(shards) > 1
+    for shard in shards:
+        assert stat.S_IMODE(shard.stat().st_mode) == 0o600, shard
