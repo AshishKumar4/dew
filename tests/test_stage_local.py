@@ -995,6 +995,43 @@ def test_a_head_only_run_reads_its_frozen_layers_where_they_lie():
 
 @pytest.mark.usefixtures("scanned_stacks")
 @pytest.mark.mesh(devices=1)
+def test_a_stage_local_runs_layers_write_back_what_they_calibrate():
+    """A stage-local state on one stage, its layers scanned, under a call that updates its `quantization`
+    collection (a calibration scale each layer's query projection writes from its input) gives each layer
+    its own write back, as the same call over the layers unstaged does: a collection the call updates stays
+    on the scan's own path, never among the rows read where they lie, which are bound immutable (train
+    1443's review: Flax refused the write)."""
+    from flax import traverse_util
+
+    from dew.nn.sharding import held_by_stage
+
+    model = decoder()
+    ids = jnp.asarray(np.random.default_rng(1443).integers(0, VOCAB, (2, SEQ)), jnp.int32)
+    params = nn.unbox(model.init(jax.random.key(0), ids))["params"]
+    sites = {path[:path.index("q_proj") + 1] for path in traverse_util.flatten_dict(params)
+             if "q_proj" in path}
+    calibration = traverse_util.unflatten_dict({(*site, "calibration"): jnp.zeros((), jnp.float32)
+                                                for site in sites})
+
+    def calibrating(next_fun, args, kwargs, context):
+        if context.method_name == "__call__" and context.module.name == "q_proj":
+            context.module.put_variable("quantization", "calibration", jnp.max(jnp.abs(args[0])))
+        return next_fun(*args, **kwargs)
+
+    (site,) = model.stage_sites({"params": params}, 1)
+    staged = site.view.stage_form("params", params, stacked_rows)
+    with nn.intercept_methods(calibrating):
+        with held_by_stage((site,)):
+            _, written = model.apply({"params": staged, "quantization": calibration}, ids,
+                                     mutable=["quantization"])
+        _, unstaged = model.apply({"params": params, "quantization": calibration}, ids,
+                                  mutable=["quantization"])
+    assert jax.tree.structure(written) == jax.tree.structure(unstaged)
+    assert all(float(leaf) > 0 for leaf in jax.tree.leaves(written)), written
+
+
+@pytest.mark.usefixtures("scanned_stacks")
+@pytest.mark.mesh(devices=1)
 def test_a_head_only_runs_frozen_layers_run_under_a_capture_of_every_method():
     """A head-only stage-local decoder whose every layer is frozen, under a caller's capture of every method
     (`capture_intermediates=lambda module, method: True`, a method returning no array among them), runs its

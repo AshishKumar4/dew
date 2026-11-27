@@ -343,6 +343,21 @@ def test_a_build_deeper_than_pythons_stack_is_removed_whole_when_published_secon
     assert not built.exists()
 
 
+def test_a_build_published_second_is_removed_whole_with_an_empty_folder_no_one_may_open(tmp_path):
+    """A build that loses its publication to another writer, holding an empty folder of mode `0000` that
+    no right of its owner opens, is removed whole: the folder is removed by its name, as the entry it was
+    read as, without being walked (train 1443's review: the walk skipped it and left the build)."""
+    directory = tmp_path / "published"
+    directory.mkdir()
+    (directory / "who").write_text("first")
+    built = tmp_path / "built"
+    (built / "sealed").mkdir(parents=True)
+    (built / "who").write_text("second")
+    (built / "sealed").chmod(0)
+    assert not published(built, directory)
+    assert not built.exists()
+
+
 def test_a_release_takes_the_group_of_the_tree_it_replaces_as_the_lock_finds_it(tmp_path):
     """A publisher that began against no tree, which another published while it wrote, publishes in the
     group and setgid inheritance of the tree it replaces as its publication lock finds it, every entry of

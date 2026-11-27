@@ -56,8 +56,19 @@ def _frozen_staged(decoder: CausalTransformer, view: StackView) -> tuple[str, ..
                and (not path or site.namespace[-len(path):] == path)
                for site in sites):
         return ()
-    return tuple(name for name in ('params', QUANTIZATION)
-                 if name in decoder.variables and view.holds(decoder.variables[name]))
+    held = decoder.variables.get('params')
+    return (*(('params',) if held is not None and view.holds(held) else ()), *_packed_rows(decoder, view))
+
+
+def _packed_rows(decoder: CausalTransformer, view: StackView) -> tuple[str, ...]:
+    """`QUANTIZATION`, where a one-stage scan reads it a row an iteration where it lies (`LAYER_ROWS`) beside
+    a stage-local state's runs: where it holds the view's layers (packed frozen weights, `FROZEN_FP8`) and the
+    call updates none of it. A collection the call updates (a layer's calibration scale) stays on the scan's
+    own path, which carries what its layers write (train 1443's review: the rows read in place are bound
+    immutable, and a layer's write there was refused)."""
+    held = decoder.variables.get(QUANTIZATION)
+    return ((QUANTIZATION,) if held is not None and not decoder.is_mutable_collection(QUANTIZATION)
+            and view.holds(held) else ())
 
 
 def _one_stage(decoder: CausalTransformer, staged: tuple[str, ...], banked: tuple[str, ...], first: int,
@@ -70,8 +81,11 @@ def _one_stage(decoder: CausalTransformer, staged: tuple[str, ...], banked: tupl
         if span is not None:
             raise LayoutRefused(f"a loop over layers {span} runs part of the stack, and a stage-local "
                                 f"state holds whole runs; {list(staged)} arrived stacked")
-        # A stage-local state on one stage holds each run as the scan reads it (`stage_view`).
-        return dataclasses.replace(stage_view(decoder, 1), staged=staged), whole
+        # A stage-local state on one stage holds each run as the scan reads it (`stage_view`), its packed
+        # frozen weights read where they lie beside it (`_packed_rows`).
+        view = stage_view(decoder, 1)
+        packed = () if QUANTIZATION in staged else _packed_rows(decoder, view)
+        return dataclasses.replace(view, staged=(*staged, *packed)), whole
     groups, periods = one_stage_runs(decoder, first, end, banked=bool(banked))
     if span is not None and banked and not set(groups).issubset(decoder.groups):
         raise LayoutRefused(f"a loop over layers {span} runs part of the stack, and a store banked "

@@ -31,7 +31,7 @@ from jax.sharding import PartitionSpec as P
 from dew._cache import INTERCEPTED, QUANTIZED_TRACE
 from dew.batch import Variables, merge, part, sows_appended
 from dew.mesh import STAGE_AXIS, LayoutRefused, row_axes
-from dew.nn.dense import NVFP4_AMAX, QUANTIZATION
+from dew.nn.dense import NVFP4_AMAX
 from dew.nn.inspection import INDEXER_COLLECTION, QK
 from dew.nn.protocols import StagedStacks, fixed_remat
 from dew.quantization import held_scales, holds_quantized
@@ -1324,8 +1324,7 @@ class StackView:
             if collection in self.banked:
                 inside[collection] = tree
                 continue
-            if self.stages == 1 and (collection in self.staged
-                                     or (self.staged and collection == QUANTIZATION)):
+            if self.stages == 1 and collection in self.staged:
                 # A stage-local state on one stage holds each run as the scan reads it, under the one
                 # stage's index (`staged_shape`), its run's name beside the layers outside it: read in
                 # place, the index a reshape.

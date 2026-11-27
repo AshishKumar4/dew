@@ -254,9 +254,15 @@ def swapped(directory: Path, foreign: Callable[[Entries, Entries, Path], set[Pat
     # Whether this filesystem gives an entry its folder's group where the folder is not setgid (`grpid`),
     # read before anything is written, as the mode is.
     grpid = _keeps_folder_group(directory.parent)
+    # Where no probe read it, an inode held for the folder the commit may make under the lock to read the
+    # group one takes then (`_granted`, `_made_in`), released just before: a write that takes the
+    # filesystem's last inode leaves the commit its own (train 1443's review).
+    held_inode = None if grpid is not None else _beside(directory.parent / "probe", ".held")
     staging = _beside(directory, ".staging")
     os.mkdir(staging, 0o700)
     try:
+        if held_inode is not None:
+            held_inode.mkdir(0o700)
         if before is not None:
             # The group and setgid inheritance of the tree it replaces, before anything is written in it.
             if staging.stat().st_gid != before.st_gid:
@@ -279,6 +285,9 @@ def swapped(directory: Path, foreign: Callable[[Entries, Entries, Path], set[Pat
             # The groups and access the published tree takes, bound under the lock to what the destination
             # is now (audit 2026-11-27 P05: a publisher that began before another's commit, or against no
             # tree, chose them from another view), while the staging is still private.
+            if held_inode is not None:
+                held_inode.rmdir()
+                held_inode = None
             mode = _granted(staging, directory, held_at, made, grpid, written, replaces(written, held))
             if held_at is None:
                 staging.chmod(mode)
@@ -292,6 +301,8 @@ def swapped(directory: Path, foreign: Callable[[Entries, Entries, Path], set[Pat
                 os.rename(staging, directory)
     finally:
         _removed(staging)
+        if held_inode is not None:
+            _removed(held_inode)
 
 
 _FOLDER = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
@@ -374,9 +385,15 @@ def _emptied(root: int, log: logging.Logger) -> None:
                 if not stat.S_ISDIR(found.st_mode):
                     os.unlink(name, dir_fd=folder)
                     continue
-                inner = os.open(name, _FOLDER, dir_fd=folder)
             except OSError as left:
                 log.warning("could not remove %s from a save's discarded tree: %s", name, left)
+                continue
+            try:
+                inner = os.open(name, _FOLDER, dir_fd=folder)
+            except OSError:
+                # A folder no right of this process opens (a `0000` one): removed where it is empty, while
+                # its name names the entry it was read as, never walked (train 1443's review).
+                _rmdir_held(folder, name, found, log)
                 continue
             try:
                 held = os.fstat(inner)
