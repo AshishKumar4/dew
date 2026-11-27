@@ -2,6 +2,9 @@
 the buffers a rung would keep, as the heap simulation counts the memory it occupies, and what a place of
 the fit ladder frees of it (`dew.training.planning.priced`)."""
 
+import jax
+import jax.numpy as jnp
+
 from dew.nn.protocols import COPIES_SCOPE, HEAD_SCOPE, WHOLE_LOGITS, RecomputeStatement
 from dew.training.live_buffers import LiveInterval
 from dew.training.memory import Held, LiveProfile, LiveSet
@@ -174,3 +177,29 @@ def test_a_heads_tile_holds_what_its_route_holds():
     assert objective.tiled_logits((4096, 32768), (1024, 8192), fused=False) == 4 * 1024 * 2048
     assert objective.tiled_logits((4096, 65536), (1024, 8192), fused=True) == 4 * 1024 * 65536
     assert objective.tiled_logits((4096, 32768), (1024, 8192), fused=True) is None
+
+
+def test_a_compiles_residuals_are_read_by_its_backward_where_it_holds_them():
+    """Off a compile-only H100's buffer assignment, a tanh chain's gradient: some forward value is a
+    residual, its backward reading it; each of its reads is placed in its trace within its interval, its
+    forward's last before its backward's, so a rung recomputing it holds it through that read alone."""
+    from test_compile_ahead import gpus
+
+    from dew.training.live_buffers import live_intervals
+
+    def step(x, w):
+        for _ in range(3):
+            x = jnp.tanh(x @ w)
+        return x.sum()
+
+    device = gpus("sm90")[0]
+    placed = jax.sharding.SingleDeviceSharding(device)
+    tile = jax.ShapeDtypeStruct((256, 256), jnp.float32, sharding=placed)
+    compiled = jax.jit(jax.grad(step, argnums=(0, 1))).lower(tile, tile).compile()
+    profile = LiveProfile.of(live_intervals(compiled), frozenset())
+    assert profile is not None
+    residuals = [buffer for buffer in profile.held if buffer.residual]
+    assert residuals
+    for buffer in residuals:
+        assert buffer.until is not None and buffer.start < buffer.until <= buffer.end, buffer
+

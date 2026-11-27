@@ -42,7 +42,7 @@ from dew.nn.protocols import OffloadsResiduals, Recomputing, TritonGemm
 from dew.objectives.base import Objective, head_fused_of, head_tile_of
 from dew.state import TrainState
 from dew.telemetry.instrumentation import CompiledMemory, compiled_memory
-from dew.training.live_buffers import LiveInterval, assignment_of
+from dew.training.live_buffers import UNPLACED, LiveInterval, assignment_of
 
 _log = logging.getLogger(__name__)
 
@@ -970,16 +970,20 @@ class LiveProfile:
     def of(intervals: Sequence[LiveInterval], rows: frozenset[tuple[int, int]]) -> LiveProfile | None:
         """The profile of a compile's `intervals` (`dew.training.live_buffers.live_intervals`), `rows` the
         (argument, axis) pairs of the batch's rows: its buffers not an argument's over the whole module's
-        simulation, each a residual where the forward made it before the first buffer the backward makes and
-        it lives past that one (a forward replayed after a backward began, a resident transaction's, makes
-        scratch a rung recomputing it makes again). None where no interval is of a whole module's simulation
-        (a CPU states none), or where they lie on more than one timeline (`LiveInterval.timeline`): heaps XLA
-        simulates apart, whose positions no common clock orders, so no peak of them together is read."""
+        simulation, each a residual where the forward made it and a backward reads it (`LiveInterval.uses`: a
+        replayed forward's value its own pullback reads after an earlier backward's among them), every read of
+        it placed in the trace; a value read where no position is stated stays charged whole. None where no
+        interval is of a whole module's simulation (a CPU states none), or where they lie on more than one
+        timeline (`LiveInterval.timeline`): heaps XLA simulates apart, whose positions no common clock orders,
+        so no peak of them together is read."""
         whole = [interval for interval in intervals if interval.whole and interval.kind != "parameter"]
         if not whole or len({interval.timeline for interval in whole}) > 1:
             return None
-        backward = min((interval.start for interval in whole if backward_made(interval.op_name)),
-                       default=None)
+        def residual(interval: LiveInterval) -> bool:
+            # A forward value its own backward reads; one with a read placed nowhere stays charged whole.
+            return (interval.role != "workspace" and forward_made(interval.op_name)
+                    and any(backward_made(op_name) for _, op_name in interval.uses)
+                    and all(position != UNPLACED for position, _ in interval.uses))
 
         def until(interval: LiveInterval) -> int:
             read = [position for position, op_name in interval.uses if forward_made(op_name)]
@@ -988,9 +992,8 @@ class LiveProfile:
         return LiveProfile(tuple(
             Held(interval.bytes, interval.op_name, tuple(interval.names),
                  any(dimension is not None and dimension & rows for dimension in interval.dims),
-                 interval.role != "workspace" and forward_made(interval.op_name) and backward is not None
-                 and interval.start < backward < interval.end, interval.trace, interval.start,
-                 interval.end, interval.buffer, interval.storage, interval.shape, until(interval))
+                 residual(interval), interval.trace, interval.start, interval.end, interval.buffer,
+                 interval.storage, interval.shape, until(interval))
             for interval in whole))
 
     @functools.cached_property
