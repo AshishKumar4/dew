@@ -16,8 +16,9 @@ store between them held inside its launch step's enclosure on the native records
 (`recurrence_witness`), its faults a dropped carry, a state rounded to bf16 where fp32 is held, the decay from
 rounded cumulative sums and an off-by-one chunk boundary. Link 4: the attention template's Mosaic forward,
 each online-softmax state its certify launch stores after a key tile and its output held inside one plain
-step's enclosure on the state before it (`attention_witness`), its faults a dropped rescale, a maximum from
-the wrong tile, sums rounded to bf16 and a mask off by one key."""
+step's enclosure on the state before it (`attention_witness`), full, causal, windowed and over packed
+documents, its faults a dropped rescale, a maximum from the wrong tile, sums rounded to bf16, a mask off by
+one key and a window's or the documents' records held as one undivided call's."""
 
 import collections
 import functools
@@ -30,7 +31,7 @@ import numpy as np
 import pytest
 import recurrence_witness as rw
 import tier_wire
-from attention_witness import assert_faults_refused, assert_witnessed
+from attention_witness import FORMS, assert_faults_refused, assert_witnessed
 from gpu_flow import RUNNING, Cell, in_parts, run_cells
 from interval_certificates import Lane, exp2_reach
 from jax.experimental import pallas as pl
@@ -730,18 +731,19 @@ def the_recurrence_witness_holds_a_decay_a_key_dimension_natively(generation_nam
         rw.assert_key_decays_witnessed(mosaic_lane(), heads=2, width=width)
 
 
-def the_attention_templates_states_certify_natively_a_step_at_a_time(generation_name, mask):
+def the_attention_templates_states_certify_natively_a_step_at_a_time(generation_name, form):
     """Every online-softmax state the attention template's certify launch stores after a key tile, and its
-    output, lies inside its step's enclosure on the state before it, under a causal or a full `mask`
-    (`attention_witness.assert_witnessed`), at this GPU's `ex2` (PTX's reach)."""
+    output, lies inside its step's enclosure on the state before it, under `form`: full, causal, windowed or
+    over packed documents (`attention_witness.assert_witnessed`), at this GPU's `ex2` (PTX's reach)."""
     with generation.assumed(generation_name):
-        assert_witnessed(0, mask == "causal", interpret=False, lane=mosaic_lane())
+        assert_witnessed(0, form, interpret=False, lane=mosaic_lane())
 
 
 def the_attention_witness_refuses_its_faults_natively(generation_name):
     """The attention step witness's faults, each refused where it lands natively
     (`attention_witness.assert_faults_refused`): a dropped rescale, a maximum from the wrong tile, sums
-    rounded to bf16 and a mask off by one key."""
+    rounded to bf16, a mask off by one key, and a window's or the documents' records held as one undivided
+    call's."""
     with generation.assumed(generation_name):
         assert_faults_refused(interpret=False, lane=mosaic_lane())
 
@@ -802,8 +804,8 @@ FLOWS = {
         *(cell(the_recurrence_witness_holds_a_decay_a_key_dimensions_fast_backward_natively, g, heads)
           for g in GENERATIONS for heads in (1, 2))],
     "attention": lambda: [
-        *(cell(the_attention_templates_states_certify_natively_a_step_at_a_time, g, mask)
-          for g in GENERATIONS for mask in ("causal", "full")),
+        *(cell(the_attention_templates_states_certify_natively_a_step_at_a_time, g, form)
+          for g in GENERATIONS for form in FORMS),
         *(cell(the_attention_witness_refuses_its_faults_natively, g)
           for g in GENERATIONS)],
 }
