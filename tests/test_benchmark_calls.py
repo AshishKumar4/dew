@@ -434,33 +434,66 @@ def test_a_projection_benchmark_names_a_grouped_matmul_kernel_and_runs_it(monkey
         assert {route.kernel for route in routes if route.choice == "grouped_matmul"} == {"xla"}
 
 
-def _tpu_capture(directory, ops, runs):
+READ = "dew.tpu_read.0"
+"""The read's annotation a fixture's host enqueues its runs within (`_tpu_capture`, `TpuTime`'s)."""
+
+
+def _tpu_capture(directory, ops, runs, read=None):
     """A capture under `directory` as JAX writes a TPU's (plugins/profile/<run>/<host>.xplane.pb): `ops`, each
     (device, name, start ms, end ms, program id), on each TPU's `XLA Ops` line, and `runs`, each (device,
     module name, start ms, end ms, program id), on its `XLA Modules` line, an event of a program id carrying
     it as XLA's program_id stat and one of None no stat, as a v5e's XProf writes both (M-FS-90: a run's
-    program the id its name carries, its ops none)."""
+    program the id its name carries, its ops none); the i-th run's run id i + 1 (its `run_id` stat), and on
+    the host's plane the read's annotation (`READ`) over the PJRT C API's execute linkage, the runtime
+    thread's execute the linkage flows to holding a `DoEnqueueProgram` of each run `read` names by run id
+    (every run where None), and another thread's enqueue of each other run within the annotation's span, as
+    a v5e's XProf ties a call to its runs (M-FS-104)."""
     from jax.profiler import ProfileData
 
     names = sorted({name for _, name, *_ in [*ops, *runs]})
+    stated = ("program_id", "run_id", "device_ordinal", "_pt", "_p", "_ct", "_c")
 
-    def events(listed, device):
-        return "".join(
-            f"events {{ metadata_id: {names.index(name) + 1} offset_ps: {round(start * 1e9)} "
-            f"duration_ps: {round((end - start) * 1e9)}"
-            + ("" if program is None else f" stats {{ metadata_id: 1 int64_value: {program} }}") + " } "
-            for each, name, start, end, program in listed if each == device)
+    def event(name, start, end, **stats):
+        held = "".join(f" stats {{ metadata_id: {stated.index(key) + 1} int64_value: {value} }}"
+                       for key, value in stats.items() if value is not None)
+        return (f"events {{ metadata_id: {name} offset_ps: {round(start * 1e9)} "
+                f"duration_ps: {round((end - start) * 1e9)}{held} }} ")
 
+    statted = "".join(f'stat_metadata {{ key: {index} value {{ id: {index} name: "{key}" }} }} '
+                      for index, key in enumerate(stated, 1))
     metadata = "".join(f'event_metadata {{ key: {index} value {{ id: {index} name: "{name}" }} }} '
                        for index, name in enumerate(names, 1))
     planes = [f'planes {{ id: {plane} name: "/device:TPU:{device}" '
-              f'lines {{ id: 1 name: "XLA Ops" timestamp_ns: 0 {events(ops, device)}}} '
-              f'lines {{ id: 2 name: "XLA Modules" timestamp_ns: 0 {events(runs, device)}}} {metadata}'
-              'stat_metadata { key: 1 value { id: 1 name: "program_id" } } }'
+              'lines { id: 1 name: "XLA Ops" timestamp_ns: 0 '
+              + "".join(event(names.index(name) + 1, start, end, program_id=program)
+                        for each, name, start, end, program in ops if each == device) + '} '
+              'lines { id: 2 name: "XLA Modules" timestamp_ns: 0 '
+              + "".join(event(names.index(name) + 1, start, end, program_id=program, run_id=index)
+                        for index, (each, name, start, end, program) in enumerate(runs, 1) if each == device)
+              + f'}} {metadata}{statted}}}'
               for plane, device in enumerate(sorted({device for device, *_ in [*ops, *runs]}), 1)]
+    ours = range(1, len(runs) + 1) if read is None else read
+
+    def enqueues(*, mine: bool) -> str:
+        return "".join(event(2, 1.0 + 0.01 * index, 1.001 + 0.01 * index, run_id=index,
+                             device_ordinal=runs[index - 1][0])
+                       for index in range(1, len(runs) + 1) if (index in ours) == mine)
+
+    host = ('planes { id: 99 name: "/host:CPU" '
+            'lines { id: 1 name: "python3" timestamp_ns: 0 ' + event(1, 0.0, 10.0)
+            + event(3, 0.5, 0.6, _pt=14, _p=5) + '} '
+            'lines { id: 2 name: "main" timestamp_ns: 0 ' + event(4, 0.7, 9.0, _ct=14, _c=5)
+            + enqueues(mine=True) + '} lines { id: 3 name: "foreign" timestamp_ns: 0 '
+            + enqueues(mine=False) + '} '
+            f'event_metadata {{ key: 1 value {{ id: 1 name: "{READ}" }} }} '
+            'event_metadata { key: 2 value { id: 2 name: "DoEnqueueProgram" } } '
+            'event_metadata { key: 3 value { id: 3 name: "PJRT_LoadedExecutable_Execute linkage" } } '
+            'event_metadata { key: 4 value { id: 4 name: "PJRT_LoadedExecutable_Execute" } } '
+            + statted + '}')
     run = directory / "plugins" / "profile" / "run"
     run.mkdir(parents=True)
-    (run / "host.xplane.pb").write_bytes(ProfileData.text_proto_to_serialized_xspace(" ".join(planes)))
+    space = ProfileData.text_proto_to_serialized_xspace(" ".join([*planes, host]))
+    (run / "host.xplane.pb").write_bytes(space)
 
 
 def test_a_tpu_call_is_timed_by_its_own_programs_run_on_its_own_devices(tmp_path):
@@ -469,8 +502,8 @@ def test_a_tpu_call_is_timed_by_its_own_programs_run_on_its_own_devices(tmp_path
     transfer and another device's left out; a call on two devices, each one's. A capture where the call's
     program did not run on one of its devices, or ran there without an op (a host transfer its only one), is
     refused, though another program ran there (`NoKernels`), and one where it ran twice on a device, whose
-    runs name no program, two, or another than an earlier read found, or where another program's run
-    overlaps the call's, is refused as ambiguous (`AmbiguousCapture`)."""
+    runs name no program or two, or where another program's run overlaps the call's, is refused as ambiguous
+    (`AmbiguousCapture`); a same-named executable's run the call did not enqueue is no run of the call's."""
     from dew.telemetry.benchmark import AmbiguousCapture, NoKernels, tpu_ops
 
     ops = [(0, "fusion.1", 0.0, 0.25, 7), (0, "custom-call.2", 0.25, 1.0, 7), (0, "transfer", 1.0, 1.5, None),
@@ -478,45 +511,47 @@ def test_a_tpu_call_is_timed_by_its_own_programs_run_on_its_own_devices(tmp_path
     runs = [(0, "jit_run(7)", 0.0, 1.0, 7), (0, "jit_other(9)", 2.0, 3.0, 9), (1, "jit_run(7)", 0.0, 4.0, 7)]
     one = tmp_path / "one"
     _tpu_capture(one, ops, runs)
-    assert [(op.name, op.milliseconds) for op in tpu_ops(one, {0}, "jit_run").ops] == [
+    assert [(op.name, op.milliseconds) for op in tpu_ops(one, {0}, "jit_run", annotation=READ)] == [
         ("fusion.1", 0.25), ("custom-call.2", 0.75)]
-    assert [op.name for op in tpu_ops(one, {0, 1}, "jit_run", program="7").ops] == [
+    assert [op.name for op in tpu_ops(one, {0, 1}, "jit_run", annotation=READ)] == [
         "fusion.1", "custom-call.2", "fusion.9"]
-    # A read pinned to the program an earlier read of its executable found (`TpuTime`): a run of the same
-    # name naming another, its executable another, refused.
-    with pytest.raises(AmbiguousCapture):
-        tpu_ops(one, {0, 1}, "jit_run", program="9")
+    # A same-named executable's run the read's call did not enqueue (another thread's, within the read's
+    # annotation): no run of the call's, though its name is the call's module's.
+    foreign = tmp_path / "foreign"
+    _tpu_capture(foreign, ops, runs, read=(3,))
+    with pytest.raises(NoKernels):
+        tpu_ops(foreign, {0}, "jit_run", annotation=READ)
     for devices in ({2}, set()):
         with pytest.raises(NoKernels):
-            tpu_ops(one, devices, "jit_run")
+            tpu_ops(one, devices, "jit_run", annotation=READ)
     with pytest.raises(NoKernels):
-        tpu_ops(one, {0}, "jit_idle")
+        tpu_ops(one, {0}, "jit_idle", annotation=READ)
     # A call on TPUs 0 and 1 whose capture holds its run on TPU 0 alone, another program's on TPU 1; or its
     # run on TPU 1 with no op of its own: part of the call, refused.
     half = tmp_path / "half"
     _tpu_capture(half, ops, [runs[0], (1, "jit_other(9)", 0.0, 4.0, 9)])
     with pytest.raises(NoKernels):
-        tpu_ops(half, {0, 1}, "jit_run")
+        tpu_ops(half, {0, 1}, "jit_run", annotation=READ)
     idle = tmp_path / "idle"
     _tpu_capture(idle, ops[:4], runs)
     with pytest.raises(NoKernels):
-        tpu_ops(idle, {0, 1}, "jit_run")
+        tpu_ops(idle, {0, 1}, "jit_run", annotation=READ)
     twice = tmp_path / "twice"
     _tpu_capture(twice, ops, [*runs, (0, "jit_run(7)", 1.5, 1.8, 7)])
     with pytest.raises(AmbiguousCapture):
-        tpu_ops(twice, {0}, "jit_run")
+        tpu_ops(twice, {0}, "jit_run", annotation=READ)
     # Another program's run overlapping the call's on its core: the ops within it not told apart, refused.
     overlapped = tmp_path / "overlapped"
     _tpu_capture(overlapped, ops, [*runs, (0, "jit_other(9)", 0.4, 0.8, 9)])
     with pytest.raises(AmbiguousCapture):
-        tpu_ops(overlapped, {0}, "jit_run")
+        tpu_ops(overlapped, {0}, "jit_run", annotation=READ)
     # An op inside the call's run stating another program, or one where the run states none: refused.
     for listed, ran in (([*ops, (0, "fusion.5", 0.5, 0.75, 9)], runs),
                         (ops, [(0, "jit_run", 0.0, 1.0, None)])):
         stray = tmp_path / f"stray{len(listed)}"
         _tpu_capture(stray, listed, ran)
         with pytest.raises(AmbiguousCapture):
-            tpu_ops(stray, {0}, "jit_run")
+            tpu_ops(stray, {0}, "jit_run", annotation=READ)
     # Runs naming two programs on the call's two devices, or a run naming none, its ops stating none (a v5e's
     # layout): not one call's, refused. A host transfer the only op inside a run stating its program by stat:
     # no op of the call's.
@@ -525,11 +560,11 @@ def test_a_tpu_call_is_timed_by_its_own_programs_run_on_its_own_devices(tmp_path
         unnamed = tmp_path / name
         _tpu_capture(unnamed, [(0, "fusion.1", 0.0, 0.25, None), (1, "fusion.9", 0.0, 4.0, None)], ran)
         with pytest.raises(AmbiguousCapture):
-            tpu_ops(unnamed, {0, 1}, "jit_run")
+            tpu_ops(unnamed, {0, 1}, "jit_run", annotation=READ)
     carried = tmp_path / "carried"
     _tpu_capture(carried, [(0, "transfer", 0.25, 0.5, None)], runs[:1])
     with pytest.raises(NoKernels):
-        tpu_ops(carried, {0}, "jit_run")
+        tpu_ops(carried, {0}, "jit_run", annotation=READ)
 
 
 def test_a_tpu_call_is_timed_by_the_ops_inside_its_run_as_a_v5e_records_them(tmp_path):
@@ -552,11 +587,10 @@ def test_a_tpu_call_is_timed_by_the_ops_inside_its_run_as_a_v5e_records_them(tmp
             (0, gemm, 7.198516, 8.624395, None)]
     v5e = tmp_path / "v5e"
     _tpu_capture(v5e, ops, runs)
-    read = tpu_ops(v5e, {0}, "jit_fs90_profiled_gemm")
+    read = tpu_ops(v5e, {0}, "jit_fs90_profiled_gemm", annotation=READ)
     # Each op's milliseconds its own picoseconds, as the capture states them.
-    assert [(op.name, round(op.milliseconds * 1e9)) for op in read.ops] == [
+    assert [(op.name, round(op.milliseconds * 1e9)) for op in read] == [
         (started, 13000), (done, 2000), (fused, 1425826000)]
-    assert read.program == "370734272565018276"
 
 
 def test_a_tpu_call_is_timed_as_the_compiled_program_its_module_names_and_any_other_call_refused():

@@ -71,15 +71,15 @@ def device_events(directory: str | Path, tpu_line: str = "XLA Ops"
     plane runs its HLO ops on one `XLA Ops` line, named after the HLO
     instruction (`fusion.12`, `convolution.3`); `tpu_line` reads another of its
     lines instead (`XLA Modules`, a program's runs, each named after its module)."""
-    from jax.profiler import ProfileData
+    return planes_of(newest(directory), tpu_line)
 
-    traces = sorted(Path(directory).rglob("*.xplane.pb"), key=os.path.getmtime)
-    if not traces:
-        raise FileNotFoundError(f"no xplane.pb under {directory}")
+
+def planes_of(capture, tpu_line: str = "XLA Ops") -> tuple[dict[str, list[Kernel]], list[str]]:
+    """`device_events`' events and lines of one read capture (`newest`'s), so several views of one capture
+    are read from it alone."""
     planes: dict[str, list[Kernel]] = {}
     lines = set()
-    # The trace's planes, lines and events are views into `capture`, which lives to the loop's end.
-    capture = ProfileData.from_file(str(traces[-1]))
+    # The trace's planes, lines and events are views into `capture`, which outlives the loop.
     for plane in capture.planes:
         match = re.match(r"/device:(GPU|TPU):\d+", plane.name)
         if match is None:
@@ -92,6 +92,60 @@ def device_events(directory: str | Path, tpu_line: str = "XLA Ops"
                     Kernel(event.name, event.start_ns, event.end_ns, event.duration_ns, tuple(event.stats))
                     for event in line.events)
     return planes, sorted(lines)
+
+
+def newest(directory: str | Path):
+    """The newest JAX trace under `directory`, read (`jax.profiler.ProfileData`)."""
+    from jax.profiler import ProfileData
+
+    traces = sorted(Path(directory).rglob("*.xplane.pb"), key=os.path.getmtime)
+    if not traces:
+        raise FileNotFoundError(f"no xplane.pb under {directory}")
+    return ProfileData.from_file(str(traces[-1]))
+
+
+EXECUTE = "PJRT_LoadedExecutable_Execute"
+"""The PJRT C API's execute as a host's XProf names it: its caller's thread's linkage event (`EXECUTE
+linkage`) the flow's producer, the runtime thread's execute its consumer (`enqueued`)."""
+
+
+def enqueued(capture, annotation: str) -> dict[int, set[int]]:
+    """The TPU programs a host call enqueued within its event `annotation` (a `jax.profiler.TraceAnnotation`)
+    in `capture` (`newest`'s), by device ordinal: each run id its `DoEnqueueProgram`s state, which the
+    device's run of it on `XLA Modules` states too. A v5e's XProf (M-FS-104) links the call to them: the
+    annotation's thread holds the PJRT C API's execute linkage (its `_pt`/`_p` flow), the runtime's thread
+    the execute that consumes the flow (its `_ct`/`_c`), and within that execute's span on its thread the
+    enqueue of each device's run; no other thread's enqueue is the call's. The host's clock is not the
+    device's, so the host's events alone are read by time."""
+    hosts = [list(line.events) for plane in capture.planes if plane.name.startswith("/host:")
+             for line in plane.lines]
+
+    def within(event, outer) -> bool:
+        return outer.start_ns <= event.start_ns and event.start_ns + event.duration_ns <= (
+            outer.start_ns + outer.duration_ns)
+
+    flows = {(stats.get("_pt"), stats["_p"]) for events in hosts for outer in events
+             if outer.name == annotation for event in events
+             if event.name == f"{EXECUTE} linkage" and within(event, outer)
+             and "_p" in (stats := dict(event.stats))}
+    found: dict[int, set[int]] = {}
+    for events in hosts:
+        for execute in events:
+            stats = dict(execute.stats)
+            if execute.name != EXECUTE or (stats.get("_ct"), stats.get("_c")) not in flows:
+                continue
+            for event in events:
+                held = dict(event.stats)
+                device, run = held.get("device_ordinal"), held.get("run_id")
+                if (event.name == "DoEnqueueProgram" and within(event, execute) and isinstance(device, int)
+                        and isinstance(run, int)):
+                    found.setdefault(device, set()).add(run)
+    return found
+
+
+def run_of(event: Kernel) -> int | None:
+    """The run a TPU program's `XLA Modules` event is, by its `run_id` stat (`enqueued`'s)."""
+    return next((value for name, value in event.stats if name == "run_id" and isinstance(value, int)), None)
 
 
 def program_of(event: Kernel) -> str | None:

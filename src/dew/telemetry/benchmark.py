@@ -28,6 +28,7 @@ import select
 import statistics
 import threading
 import time
+import uuid
 from collections.abc import Callable, Hashable, Iterable, Iterator, Mapping, Sequence
 from fractions import Fraction
 from pathlib import Path
@@ -403,36 +404,32 @@ class AmbiguousCapture(NoKernels):
     does (`NoKernels`)."""
 
 
-class TpuCall(NamedTuple):
-    """A TPU call's read (`tpu_ops`): the program its runs name (XProf's id) and its ops."""
-
-    program: str
-    ops: tuple[KernelTime, ...]
-
-
-def tpu_ops(directory: str | Path, devices: Iterable[int], module: str, *, program: str | None = None
-            ) -> TpuCall:
+def tpu_ops(directory: str | Path, devices: Iterable[int], module: str, *, annotation: str
+            ) -> tuple[KernelTime, ...]:
     """The ops one call of the program `module` names ran on the TPU `devices` (their ids), as the newest
     capture under `directory` holds them (`dew.telemetry.trace.device_events`): its one run on each device
-    (an `XLA Modules` event of its name, `jit_run` or `jit_run(7)`, a TPU's run naming its program so), and
+    (an `XLA Modules` event of its name, `jit_run` or `jit_run(7)`, a TPU's run naming its program so), the
+    one the host enqueued within the call's `annotation` (`trace.enqueued`: its run id, which no identity of
+    an executable JAX states gives, M-FS-102, and a same-named executable's run does not carry), and
     every op within that run's span on the device's `XLA Ops` line, each its device milliseconds. A TPU core
     runs one program at a time, so the ops inside a run's span are its own: a v5e's XProf names a run's
     program in its name alone and its ops state none (M-FS-90); a run stating its program by stat takes the
     ops stating it, no host transfer. A capture whose runs name no program, or not one program on every
     device, or where another program's run overlaps the call's on a device, or an op inside it states
-    another program, is refused (`AmbiguousCapture`), as is one whose runs name another than `program`, the
-    one an earlier read of the call's executable found: no identity JAX states of an executable is XProf's
-    id (M-FS-102, a v5e: neither its PJRT fingerprint nor its modules' ids), so a reader pins the first
-    read's. A call of one program always
-    runs its module (`_module_of`), so a run of another executable of the same name beside it is a second
-    run, refused with the rest of a capture where it ran twice on one device (`AmbiguousCapture`). The call
+    another program, is refused (`AmbiguousCapture`). A run its call did not enqueue is no run of the call's,
+    whatever its name, so none stands in for one the capture lacks; two runs the call enqueued on one
+    device, or another run overlapping the call's, are ambiguous (`AmbiguousCapture`). The call
     ran on every one of `devices`, so a capture holding no run of it, or no op of its run, on any one of
     them holds part of the call and is refused (`NoKernels`), never read as the whole."""
     from dew.telemetry import trace
 
-    modules, _ = trace.device_events(directory, tpu_line="XLA Modules")
+    # One read of the capture: its runs, its ops and the host's enqueues, each a view of it.
+    capture = trace.newest(directory)
+    modules, _ = trace.planes_of(capture, "XLA Modules")
     own = re.compile(re.escape(module) + r"(\.\d+)?(\((\d+)\))?")
-    runs = {device: [run for run in modules.get(f"/device:TPU:{device}", []) if own.fullmatch(run.name)]
+    launched = trace.enqueued(capture, annotation)
+    runs = {device: [run for run in modules.get(f"/device:TPU:{device}", [])
+                     if own.fullmatch(run.name) and trace.run_of(run) in launched.get(device, ())]
             for device in sorted(set(devices))}
     if not runs:
         raise NoKernels(f"a call of {module} names no TPU its run is read on")
@@ -444,11 +441,10 @@ def tpu_ops(directory: str | Path, devices: Iterable[int], module: str, *, progr
                                f"of TPU {sorted(runs)}, which no one call's own are told apart from")
     programs = {device: trace.program_of(run) or (found[3] if (found := own.fullmatch(run.name)) else None)
                 for device, (run,) in runs.items()}
-    if None in programs.values() or len(set(programs.values())) > 1 or (
-            program is not None and set(programs.values()) != {program}):
+    if None in programs.values() or len(set(programs.values())) > 1:
         raise AmbiguousCapture(f"{module}'s runs under {directory} name programs {programs}, not the one "
-                               f"program one call runs on each of its devices ({program or 'any'})")
-    planes, _ = trace.device_events(directory)
+                               "program one call runs on each of its devices")
+    planes, _ = trace.planes_of(capture)
     timed = []
     for device, (run,) in runs.items():
         plane = f"/device:TPU:{device}"
@@ -469,8 +465,7 @@ def tpu_ops(directory: str | Path, devices: Iterable[int], module: str, *, progr
             raise NoKernels(f"{module}'s run under {directory} holds no op on TPU {device} of the call's "
                             f"{sorted(runs)}")
         timed += [KernelTime(op.name, op.duration_ns / 1e6) for op in inside]
-    (named,) = set(programs.values())
-    return TpuCall(named, tuple(timed))
+    return tuple(timed)
 
 
 class TpuTime:
@@ -480,14 +475,13 @@ class TpuTime:
     dispatch enters. The call runs once untimed before it, warm as CUPTI reads a GPU's; a capture starts and
     stops a call, a second or so a read. A TPU's call runs unevicted (`eviction`). A call is a compiled
     program called with its dynamic operands (`_program_of`), whose module names its runs, read once for a
-    program read again in turn (the tuner's repeats of one config), the id its first read's runs name
-    required of every later read (`tpu_ops`' `program`); a call of another kind, or whose devices its arrays
-    do not name, is refused (`AmbiguousCapture`)."""
+    program read again in turn (the tuner's repeats of one config), its run the one its call enqueued
+    within an annotation of its own (`tpu_ops`' `annotation`); a call of another kind, or whose devices its
+    arrays do not name, is refused (`AmbiguousCapture`)."""
 
     def __init__(self):
-        # The last program read, its module's name and the id its first read's runs named (`tpu_ops`'
-        # `program`): no earlier program held past its reads.
-        self._named: tuple[jax.stages.Compiled, str, str | None] | None = None
+        # The last program read and its module's name: no earlier program held past its reads.
+        self._named: tuple[jax.stages.Compiled, str] | None = None
 
     def kernels(self, fn: Callable, *args, evicted: bool = False) -> tuple[KernelTime, ...]:
         """The ops one call of `fn(*args)` ran (`tpu_ops`); `evicted` is a GPU's (`DeviceTime.kernels`), whose
@@ -515,8 +509,8 @@ class TpuTime:
 
         program = _program_of(fn)
         if self._named is None or self._named[0] is not program:
-            self._named = (program, _module_of(program), None)
-        _, module, named = self._named
+            self._named = (program, _module_of(program))
+        module = self._named[1]
         warm = jax.block_until_ready(program(*args))
         devices = (_devices_of(warm) or _devices_of(args))
         if not devices:
@@ -531,14 +525,15 @@ class TpuTime:
                 profiler.start()
             except RuntimeError as error:
                 raise CaptureHeld(str(error)) from error
+            # The call's enqueue named apart from any other's in the capture (`tpu_ops`' `annotation`).
+            annotation = f"dew.tpu_read.{uuid.uuid4().hex}"
             try:
-                jax.block_until_ready(program(*args))
+                with jax.profiler.TraceAnnotation(annotation):
+                    jax.block_until_ready(program(*args))
             finally:
                 profiler.stop()
             (capture,) = profiler.captures
-            found = tpu_ops(capture, devices, module, program=named)
-            self._named = (program, module, found.program)
-            return found.ops
+            return tpu_ops(capture, devices, module, annotation=annotation)
 
 
 def _devices_of(tree) -> set[int]:
