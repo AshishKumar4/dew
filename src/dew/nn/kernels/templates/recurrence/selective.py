@@ -26,6 +26,7 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
 from dew._devices import deterministic_ops_requested
+from dew.algebra import generated
 from dew.nn import derivatives
 from dew.nn.kernels import generation, launches, recurrence_algebra as algebra, tuning
 from dew.nn.kernels.chunked_launch import Forked, zero_padded
@@ -274,7 +275,15 @@ def forward(x, dt, b, c, parameters, state, resets, scan: Scan, table: tuple = (
                         step_ = dts[t, :].astype(jnp.float32)
                         value = xs[t, :].astype(jnp.float32)
                         kept = None if resets is None else 1.0 - resets[t, 0].astype(jnp.float32)
-                        h = algebra.selective_token(
+                        token = None
+                        if generated.enabled():
+                            # The algebra's generated token stage where the run asks for it and the case is
+                            # declared (`generated.body`), the written stage otherwise.
+                            b = [bs[t, n].astype(jnp.float32) for n in range(states)]
+                            operands = (*h, *rates, *b, step_, value, *(() if kept is None else (kept,)))
+                            body = generated.body("dew.algebra.component_cases.selective_token", operands)
+                            token = None if body is None else list(body(*operands))
+                        h = token if token is not None else algebra.selective_token(
                             h, [algebra.selective_decay(step_, rates[n], kept) for n in range(states)],
                             step_ * value, [bs[t, n].astype(jnp.float32) for n in range(states)])
                         c = [cs[t, n].astype(jnp.float32) for n in range(states)]

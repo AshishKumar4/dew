@@ -1477,8 +1477,9 @@ the written trace and independent truth. Sharing and case selection add no run-t
   "generated" a call whose case (policy, target, operand shapes and dtypes) its generated module declares
   runs the checked body, and any other call its written math; every answer is counted by its outcome
   (`generated.taken`), so a measurement tells a generated body that ran from a written one that stood in.
-  The selective scan's decay and readout and the derived split-KV merge (`attention_algebra._derived_merge`,
-  every walk's and split decode's) are its first sites. A component's default changes only on its native
+  The selective scan's decay, token stage, readout and backward step lift, the recurrence skip's pullback,
+  and the derived split-KV merge (`attention_algebra._derived_merge`, every walk's and split decode's) are
+  its sites. A component's default changes only on its native
   receipts (M-AL-5).
 
 - `python -m dew.algebra.generate [names] [--check]` traces each declared case. For a stable form it

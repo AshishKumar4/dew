@@ -96,3 +96,22 @@ def test_the_generated_merge_takes_an_empty_slice_as_its_identity():
         np.testing.assert_array_equal(merged.total, state.total)
     assert np.all(np.isfinite(merges[2].acc)) and not np.any(merges[2].acc)
     assert not np.any(merges[2].total)
+
+
+def test_the_backward_skip_and_step_lift_run_their_generated_bodies_where_declared():
+    """The selective scan's subnormal-step lift and the recurrence skip's pullback, at their declared cases,
+    run the generated bodies bit for bit, each counted."""
+    rng = np.random.default_rng(2)
+    skip, dy, step = (np.float32(rng.standard_normal()), rng.standard_normal(64).astype(np.float32),
+                      np.abs(rng.standard_normal(64)).astype(np.float32) * np.float32(2.0 ** -110))
+    out_grad, values = (rng.standard_normal((8, 4, 32)).astype(np.float32) for _ in range(2))
+    scale = rng.standard_normal((4, 1)).astype(np.float32)
+    with generation.chosen(generated="generated"), generation.assumed("sm90"), generated.taken() as counts:
+        lifted = recurrence_algebra.selective_dx_scale(skip, dy, step)
+        skipped = recurrence_algebra.skipped_back(out_grad, values, scale)
+    assert counts == {("dew.algebra.component_cases.selective_dx_scale", generated.GENERATED): 1,
+                      ("dew.algebra.component_cases.skipped_back", generated.GENERATED): 1}
+    for found, expected in zip((*lifted, *skipped),
+                               (*component_cases_derived.selective_dx_scale(skip, dy, step),
+                                *component_cases_derived.skipped_back(out_grad, values, scale)), strict=True):
+        np.testing.assert_array_equal(found, expected)

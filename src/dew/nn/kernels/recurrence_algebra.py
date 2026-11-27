@@ -1520,6 +1520,8 @@ def selective_dx_scale(skip, dy, step):
     and `step` by `2^64` via `float_bits.raised_exactly` (bit-safe on flush-to-zero backends, row 9089) and
     return `inv_scale = 2^-64`; otherwise return `(skip * dy, step, 1.0)` (row 8722, base reviews da734bf54
     F3, b65e3cab4 F8, b0601005b F6)."""
+    if (generated := _generated_body("selective_dx_scale", (skip, dy, step))) is not None:
+        return generated(skip, dy, step)
     base = skip * dy
     scaled = ((jnp.abs(step) < jnp.float32(_SELECTIVE_SUBNORMAL_STEP))
               & (jnp.abs(base) < jnp.float32(2.0 ** 60)))
@@ -1553,6 +1555,8 @@ def skipped_back(out_grad, values, skip) -> tuple[jax.Array, jax.Array]:
     """The skip `y += D v`'s gradient on values from the output's gradient `out_grad` `[..., V]`, fp32: the
     values' own, `D do` (`skip` broadcasting), and the skip's own rows `[...]`, `sum(v do)` over the last
     axis's columns."""
+    if (generated := _generated_body("skipped_back", (out_grad, values, skip))) is not None:
+        return generated(out_grad, values, skip)
     return skip * out_grad, jnp.sum(out_grad * values, axis=-1)
 
 
