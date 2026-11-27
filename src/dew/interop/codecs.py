@@ -1960,23 +1960,34 @@ def _decode_inkling2(tensors: Mapping[str, Stored], name: str) -> Stored:
     return values.reshape(*codes.shape[:-1], 2 * codes.shape[-1])
 
 
-def _encode_inkling2(name: str, weight: np.ndarray, *, grid: Mapping[str, Stored] | None
-                     ) -> dict[str, np.ndarray]:
+def _encode_inkling2(name: str, weight: np.ndarray, *, grid: Mapping[str, Stored] | None,
+                     loaded: Mapping[str, str | None]) -> dict[str, np.ndarray]:
     """One expert bank `[experts, rows, columns]` written back as its release stored it, against the scales
     its source shipped (`grid`, as ModelOpt's encoder writes against its own, `_modelopt_encode`). A value
-    the stored code decodes to bit for bit (`_decode_inkling2`'s arithmetic) keeps that code, so a bank its
-    training left as loaded writes its codes back bit for bit, whatever its scales round (a zero scale, an
-    expert factor a group scale's product underflows); any other value over its group's scale and its
-    expert's factor, taken in float64, rounds to the nearest code, saturating at E2M1's +-6 (NVFP4) or
-    E4M3's +-448 (MXFP8). A value no code of a zero scale holds is refused."""
-    # Each value compared as it is held, in the dtype the load kept it in (its `param_dtype`): a stored code
-    # whose decode that dtype rounds to the held value is the code it was loaded from.
+    equal to its stored code's decode as the load kept it (`_decode_inkling2`'s arithmetic, rounded to the
+    dtype the load decoded the bank into, `loaded`) keeps that code, whatever dtype the export hands the
+    value in (a bfloat16 load's tree, or that tree widened to float32), so a bank its training left as
+    loaded writes its codes back bit for bit, whatever its scales round (a zero scale, an expert factor a
+    group scale's product underflows, a decode the load's dtype rounds to zero); any other value, as it is
+    given, over its group's scale and its expert's factor, taken in float64, rounds to the nearest code,
+    saturating at E2M1's +-6 (NVFP4) or E4M3's +-448 (MXFP8). A value no code of a zero scale holds is
+    refused, as is a bank the load recorded no dtype of."""
+    if name not in loaded:
+        raise ValueError(f"{name}: its load recorded no dtype it decoded the bank into, which a value left "
+                         "as loaded is told apart in")
     given = np.asarray(weight)
-    unsigned = np.dtype(f"uint{8 * given.dtype.itemsize}")
-    held = given.astype(np.float32)
+    # A bank served packed (None) reaches the export decoded exactly in float32
+    # (`quantization.packed_values`).
+    kept_as = np.dtype(np.float32 if loaded[name] is None else loaded[name])
+    # Both sides held exactly in one dtype: float64 where either is, else float32, which holds bfloat16's,
+    # float16's and float32's values alike (NumPy joins no two 16-bit floats); no copy where they match.
+    common = np.dtype(np.float64 if np.float64 in (kept_as, given.dtype) else np.float32)
 
     def unchanged(decoded) -> np.ndarray:
-        return np.asarray(decoded, np.float32).astype(given.dtype).view(unsigned) == given.view(unsigned)
+        # Each value as given against its code's decode as the load kept it, its sign a zero's among it.
+        as_loaded = np.asarray(decoded, np.float32).astype(kept_as, copy=False).astype(common, copy=False)
+        held = given.astype(common, copy=False)
+        return (as_loaded == held) & (np.signbit(as_loaded) == np.signbit(held))
 
     if grid is not None and name + "_amax" in grid:
         scale, amax, denominator, original = _gridded(
@@ -1988,11 +1999,16 @@ def _encode_inkling2(name: str, weight: np.ndarray, *, grid: Mapping[str, Stored
         if not kept.all():
             factor = (np.asarray(amax, np.float32) / np.asarray(denominator, np.float32)).astype(np.float64)
             effective = (np.repeat(np.asarray(scale).astype(np.float64), 16, axis=-1)
-                         * factor.reshape(-1, *(1,) * (held.ndim - 1)))
-            if np.any((effective == 0) & ~kept):
+                         * factor.reshape(-1, *(1,) * (given.ndim - 1)))
+            wide = given.astype(np.float64)
+            # Under a zero scale every code decodes to a zero, of the code's sign times the scale's: a
+            # changed zero takes the code of its own sign so; any other changed value none holds.
+            zeroed = (effective == 0) & ~kept
+            if np.any(zeroed & (wide != 0)):
                 raise ValueError(f"{name} has a zero NVFP4 scale and trained values outside its grid")
-            quotients = np.divide(held.astype(np.float64), effective, out=np.zeros_like(effective),
-                                  where=effective != 0)
+            # A zero scale's quotient a zero of the value's sign over the scale's, which the encoder packs.
+            signed = np.where(zeroed & (np.signbit(wide) ^ np.signbit(effective)), -0.0, 0.0)
+            quotients = np.divide(wide, effective, out=signed, where=effective != 0)
             fresh = encode_e2m1(quotients, ties='even')
             # Each byte's half the stored code keeps from the stored byte, the other from the fresh one.
             low = np.where(kept[..., 0::2], stored & 0x0f, fresh & 0x0f)
@@ -2002,18 +2018,24 @@ def _encode_inkling2(name: str, weight: np.ndarray, *, grid: Mapping[str, Stored
                 name + "_amax": np.asarray(amax), name + "_outer_scale_denominator": np.asarray(denominator)}
     exponents, original = _gridded(grid, name, (name + "_scale", name))
     kept = unchanged(_decode_inkling2({name: original, name + "_scale": exponents}, name))
-    powers = np.repeat(e8m0_scales(np.asarray(exponents)).astype(np.float64), 32, axis=-1)
-    fresh = np.clip(held.astype(np.float64) / powers, -E4M3_MAX, E4M3_MAX).astype(ml_dtypes.float8_e4m3fn)
-    codes = np.where(kept, np.asarray(original).view(np.uint8), fresh.view(np.uint8))
+    codes = np.asarray(original).view(np.uint8)
+    if not kept.all():
+        # The fresh codes of a bank its training changed alone: each group of 32 over its own power.
+        powers = e8m0_scales(np.asarray(exponents)).astype(np.float64)[..., None]
+        grouped = given.astype(np.float64).reshape(*powers.shape[:-1], 32)
+        fresh = np.clip(grouped / powers, -E4M3_MAX, E4M3_MAX).astype(ml_dtypes.float8_e4m3fn)
+        codes = np.where(kept, codes, fresh.view(np.uint8).reshape(codes.shape))
     return {name: codes.view(ml_dtypes.float8_e4m3fn), name + "_scale": np.asarray(exponents)}
 
 
-def inkling2_experts(grid: Mapping[str, Stored] | None = None) -> SourceQuantization:
+def inkling2_experts(grid: Mapping[str, Stored] | None = None,
+                     loaded: Mapping[str, str | None] | None = None) -> SourceQuantization:
     """Inkling 2's NVFP4 and MXFP8 expert banks (the section above), read as transformers dequantizes them
-    and written back against the scales the source shipped (`grid`, `_encode_inkling2`)."""
+    and written back against the scales the source shipped (`grid`), each bank's values told apart from
+    its load's in the dtype the load decoded it into (`loaded`, `_encode_inkling2`)."""
     return SourceQuantization(
         _inkling2_names, lambda name: tuple(name + part for part in _INKLING2_PARTS), _decode_inkling2,
-        partial(_encode_inkling2, grid=grid),
+        partial(_encode_inkling2, grid=grid, loaded={} if loaded is None else loaded),
         grid=lambda name: (name, *(name + part for part in _INKLING2_PARTS)))
 
 
@@ -2031,15 +2053,18 @@ def quantization_record(config: Mapping[str, object]) -> Mapping[str, object] | 
 
 
 def source_quantization(config: Mapping[str, object], *, scale_dtype: str | None = None,
-                        grid: Mapping[str, Stored] | None = None) -> SourceQuantization | None:
+                        grid: Mapping[str, Stored] | None = None,
+                        loaded: Mapping[str, str | None] | None = None) -> SourceQuantization | None:
     """Return the format a config's `quantization_config` declares, or None.
 
     A wrapper may declare it on its text_config alone (`quantization_record`).
     An fp8 config that declares `expert_dtype`, in quantization_config or
     beside it, is DeepSeek-V4's `.scale` storage; `scale_dtype` is the dtype
-    the source stored those scales in, which the codec writes back, and
+    the source stored those scales in, which the codec writes back,
     `grid` the scales and zeros an integer format encodes against
-    (`SourceQuantization.grid`).
+    (`SourceQuantization.grid`), and `loaded` the dtype a load decoded each
+    quantized weight into (`Pretrained.quantized_dtypes`), against which a
+    format whose writer keeps a value left as loaded tells it apart.
     """
     _refuse_mlx(config)
     quantization = quantization_record(config)
@@ -2096,7 +2121,7 @@ def source_quantization(config: Mapping[str, object], *, scale_dtype: str | None
         if quantization.get("quant_algo") != "NVFP4":
             raise ValueError(f"Inkling 2's release states quant_algo 'NVFP4' over its experts, got "
                              f"{quantization.get('quant_algo')!r}")
-        return inkling2_experts(grid)
+        return inkling2_experts(grid, loaded)
     if method == "modelopt":
         return modelopt_nvfp4(config, quantization, grid)
     raise ValueError(
