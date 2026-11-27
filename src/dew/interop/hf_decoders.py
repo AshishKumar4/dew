@@ -1590,10 +1590,6 @@ def _bundled(model_type: str) -> DecoderFamily | None:
 _BUNDLE_MEDIA = ("vision_config", "audio_config")
 """The sections a media bundle's config names its towers in (`bundles`)."""
 
-_BUNDLE_PLACEHOLDERS = ("image_token_id", "video_token_id", "audio_token_id")
-"""The ids a media bundle's config marks its towers' places in a prompt by, which its language model alone
-reads none of (Inkling 2's `image_token_id`, beside its `text_config`)."""
-
 
 def sidecars(config: Mapping[str, object]) -> Mapping[str, str]:
     """The files beside a source's weights holding more of its registered family's tensors, each by the
@@ -1655,11 +1651,13 @@ def bundle_media(config: Mapping[str, object], names: Collection[str]) -> frozen
 
 def bundle_text_config(config: Mapping[str, object]) -> Mapping[str, object]:
     """A media bundle's config as its family's text checkpoint states it: the same record without its
-    towers' sections (`_BUNDLE_MEDIA`), their placeholders' ids (`_BUNDLE_PLACEHOLDERS`) and its folders'
-    configs (`DecoderFamily.wrapper_folders`), which its decoder family reads as text alone."""
+    towers' sections (`_BUNDLE_MEDIA`), the keys its towers alone read (`DecoderFamily.wrapper_placeholders`)
+    and its folders' configs (`DecoderFamily.wrapper_folders`), which its decoder family reads as text
+    alone."""
     family = _bundled(_records.text(config["model_type"], "model_type"))
-    folders = () if family is None else tuple(folder_config(folder) for folder in family.wrapper_folders)
-    left_out = (*_BUNDLE_MEDIA, *_BUNDLE_PLACEHOLDERS, *folders)
+    own = () if family is None else (*family.wrapper_placeholders,
+                                     *(folder_config(folder) for folder in family.wrapper_folders))
+    left_out = (*_BUNDLE_MEDIA, *own)
     return {name: value for name, value in config.items() if name not in left_out}
 
 

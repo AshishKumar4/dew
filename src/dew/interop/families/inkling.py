@@ -776,7 +776,7 @@ INKLING2 = DecoderFamily(
     sidecars=lambda config: {'mtp.safetensors': DRAFT} if config.get('mtp_config') else {},
     whole_drafter=_draft_kept,
     preserve_source_layout=True,
-    wrapper=_inkling2_wrapper,
+    wrapper=_inkling2_wrapper, wrapper_placeholders=('image_token_id',),
 )
 """Inkling 2 (`inkling2_loop`): the release's text decoder, its wrapper's or alone, and the wrapper's
 vision tower and merger (`_inkling2_wrapper`)."""

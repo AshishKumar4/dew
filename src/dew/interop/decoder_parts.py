@@ -2026,6 +2026,10 @@ class DecoderFamily:
     """Reads a media bundle released under the family's own model_type, which
     keeps the decoder's tensors unprefixed and `wrapper_projector_names` beside them."""
     wrapper_projector_names: tuple[str, ...] = ()
+    wrapper_placeholders: tuple[str, ...] = ()
+    """A media bundle's config keys its towers alone read, which its language model's config leaves out
+    (`hf_decoders.bundle_text_config`): Inkling 2's `image_token_id`, beside its `text_config`. Kimi K2.5's
+    text decoder reads its own placeholder ids (its `embedding_zero_ids`), so they stay."""
     wrapper_folders: tuple[str, ...] = ()
     """Folders of a bundle that each hold a media component of its own, its config.json and its weights,
     which the release's code loads beside the model (MiMo-V2.6's `audio_tokenizer`): a load reads each
