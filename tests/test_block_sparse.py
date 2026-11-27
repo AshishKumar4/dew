@@ -23,7 +23,7 @@ from test_text_rollout_contract import assert_generation_scores_as_full_forwards
 
 from dew.batch import coordinates
 from dew.nn import block_sparse, sparse_selection
-from dew.nn.attention import scaled_dot_product_attention
+from dew.nn.attention import reference_scores, scaled_dot_product_attention
 from dew.nn.inspection import INDEXER_COLLECTION
 from dew.nn.mla import SELECTIONS, indexer_target
 from dew.registry import mixers
@@ -526,12 +526,13 @@ def test_infllm_v2s_selection_spends_no_pick_on_a_block_of_hidden_keys():
 ], ids=["bf16-preset", "layer-highest-under-ambient-bf16", "wide-logits"])
 def test_msas_teacher_is_the_weights_its_attention_gives(dtype, precision, wide_logits, ambient):
     """MSA's teacher (`msa_query_kls` with the mixer's `msa_scores`) over two keys against a uniform student:
-    its KL the float64 KL of the very weights MSA's attention gives (the reference path of
-    `scaled_dot_product_attention` at the layer's dtype, precision and logit width, read out as its output
-    over one-hot values), a query `[1, 0]` and keys `[0, 0]` and `[1, 0]` at width 2, whose scaled query a
-    narrowing preset rounds to bf16 (0.70703125), the attention's and so the teacher's; and keys 4096 and
-    4097 at a layer's `highest` under an ambient bf16 preset (row 13706): the teacher's logits never
-    another order or precision than the attention's (train 1359's F1)."""
+    its KL the float64 KL of the softmax of the logits MSA's attention forms (`attention.reference_scores`,
+    the reference path's own operand scaling, product and scale after, which `reference_attention`
+    composes) at the layer's dtype, precision and logit width: a query `[1, 0]` and keys `[0, 0]` and
+    `[1, 0]` at width 2, whose scaled query a narrowing preset rounds to bf16 (0.70703125), the attention's
+    and so the teacher's; and keys 4096 and 4097 at a layer's `highest` under an ambient bf16 preset (row
+    13706): the teacher's logits never another order or precision than the attention's (train 1359's
+    F1). Read through the attention's output, its weights would round to its dtype first."""
     query = jnp.asarray([[[[1.0, 0.0]]] * 2], dtype)
     key = jnp.asarray([[[[0.0, 0.0]], [[1.0, 0.0]]]], dtype)
     if ambient is not None:
@@ -539,14 +540,13 @@ def test_msas_teacher_is_the_weights_its_attention_gives(dtype, precision, wide_
     selected = jnp.zeros((1, 1, 2, 1), jnp.int32)
     uniform = jnp.zeros((1, 1, 2, 2), jnp.float32)
     teacher = block_sparse.msa_scores(dtype, precision, wide_logits=wide_logits)
-    one_hot = jnp.eye(2, dtype=dtype)[None, :, None, :]
     with jax.default_matmul_precision(ambient) if ambient is not None else contextlib.nullcontext():
         found = np.asarray(block_sparse.msa_query_kls(uniform, query, key, selected, block=2,
                                                       scale=2 ** -0.5, teacher=teacher))[0, 1]
-        weights = scaled_dot_product_attention(query, key, one_hot, causal=True, implementation="reference",
-                                               dtype=dtype, precision=precision, wide_logits=wide_logits,
-                                               force_fp32_for_softmax=True)
-    attended = np.asarray(weights, np.float64)[0, 1, 0]
+        logits = reference_scores(query[:, :, 0], key[:, :, 0], 'bsd,btd->bst', precision=precision,
+                                  wide_logits=wide_logits)
+    row = np.asarray(logits, np.float64)[0, 1]
+    attended = np.exp(row - row.max()) / np.exp(row - row.max()).sum()
     expected = float(np.sum(attended * np.log(attended)) + np.log(2.0))
     assert_fp32_reduction_bound(found, expected, 2 * np.log(2.0) + 2 * np.finfo(np.float32).eps, 6)
 
