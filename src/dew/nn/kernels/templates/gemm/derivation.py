@@ -32,7 +32,7 @@ def derived(layouts: tuple, *, rows: int, depth: int | None, width: int, dtype, 
             candidate, launch_of, grouped: bool, depths: tuple[int, ...] | None = None, ragged: bool = False,
             units: tuple[int, int, int] = (1, 1, 1), dense: bool = False,
             programs: int | None = None, outputs: tuple = (), hooked: bool = False,
-            operands: Callable | None = None) -> Tiles | None:
+            operands: Callable | None = None, walked_rows: int | None = None) -> Tiles | None:
     """The one tile a GEMM mainloop runs on an instruction family's `layouts` (`bundles.layouts`, its bundles
     in preference order, which share its facts but their loaders and registers) for a call whose output has
     `rows` rows (a group's, on average, where `grouped`: a product's rows split among its groups) and `width`
@@ -49,7 +49,9 @@ def derived(layouts: tuple, *, rows: int, depth: int | None, width: int, dtype, 
     `outputs`, the dtypes its tiles store, where the derivation states their staging (`_ring_staged`);
     `hooked`, whether a column-local epilogue's hook computes them, its tile read out a chunk at a time
     (`hooks.ColumnLocal`: its side tiles and outputs a chunk's beside the ring); `operands(tile)`, the
-    launch's operands' bytes and decoded forms its tiles are priced by (`_tile_cost`), else `dtype`'s.
+    launch's operands' bytes and decoded forms its tiles are priced by (`_tile_cost`), else `dtype`'s;
+    `walked_rows`, the rows its launch walks where they are fewer than the `rows` its tiles are searched at
+    (a call whose rows are aligned up to its family's unit for the search, `linear_ce`), which its band reads.
 
     - Layout: at each shape and step, the first layout whose planner holds it (`resources.placed`): a
       producer's where its consumers' registers hold the tile, else one whose first consumer issues the
@@ -112,7 +114,8 @@ def derived(layouts: tuple, *, rows: int, depth: int | None, width: int, dtype, 
         most_rows = max(role, rows // 2 // role * role if grouped else axes.whole(rows, role))
         padded = grouped and not dense
         shaped = functools.partial(_shaped, consumers=consumers, programs=programs, rows=rows, width=width,
-                                   multiprocessors=multiprocessors, grouped=padded)
+                                   multiprocessors=multiprocessors, grouped=padded,
+                                   walked=rows if walked_rows is None else walked_rows)
         price_of = functools.partial(_tile_cost, family=family, target=target, dtype=dtype, rows=rows,
                                      width=width, padded=padded, operands=operands)
         held_tile = functools.partial(_held_tile, role=role, steps=steps, shaped=shaped,
@@ -404,7 +407,7 @@ def _padded_side(layouts: tuple, consumers: int, role: int, most_rows: int, colu
 
 
 def _shaped(layout, block_m: int, block_n: int, step: int, *, consumers: int, programs: int, rows: int,
-            width: int, multiprocessors: int, grouped: bool) -> Tiles:
+            width: int, multiprocessors: int, grouped: bool, walked: int) -> Tiles:
     """`derived`'s tile of a shape and step on `layout`: a pair of multiprocessors a cluster runs two row
     tiles of one group where its layout's loads multicast and the call's rows (a group's on average, a
     kernel gradient's output rows) hold a tile's, which then read the block they share once (a product's
@@ -413,7 +416,10 @@ def _shaped(layout, block_m: int, block_n: int, step: int, *, consumers: int, pr
     2-SM MMA) runs every tile on its pair."""
     multicast = consumers > 1 and rows >= block_m
     cluster = layout.cluster if layout.pairs_product or multicast else 1
-    band = resources.band(multiprocessors * programs, block_m, block_n, width // block_n,
-                          row_tiles=-(-rows // (block_m * cluster)), grouped=grouped, cluster=cluster)
+    # The columns a cluster's tile holds (`pricing.tile_columns`: a pair's products both CTAs'), and the row
+    # tiles of the rows the launch walks (`walked`), which its band reads.
+    columns = block_n * (cluster if layout.pairs_product else 1)
+    band = resources.band(multiprocessors * programs, block_m, columns, width // columns,
+                          row_tiles=-(-walked // (block_m * cluster)), grouped=grouped, cluster=cluster)
     return Tiles(block_m, block_n, step, 2, band, warpgroups=consumers, cluster=cluster, family=layout.name,
                  programs=programs)
