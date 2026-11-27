@@ -238,15 +238,16 @@ def test_the_autoencoder_walks_in_chunks_and_holds_one_chunk(loaded):
 
 
 PUBLISHED_SEEDS = 8
-"""The published VAE's declared seeds for check 1, as the published FLUX.2 VAE's (test_flux2_source.py's
-`PIPELINE_SEEDS`)."""
+"""The published VAE's declared seeds for check 1, sized on its own draws by a qualification run on the
+network lane (`check1_wire.QUALIFY`; run IG-13335-WANSIZE, an A100)."""
 
 
 @pytest.mark.network
 def test_the_published_vae_matches_the_source():
     """`Wan-AI/Wan2.1-T2V-1.3B-Diffusers`'s VAE, downloaded, over drawn smooth nine-frame 128x192 clips:
-    its posterior mean, and the decode of the source's mean, on par with diffusers' `AutoencoderKLWan` in
-    float32 from its float64 twin (check 1)."""
+    its posterior mean of a clip, and its decode of the latent the source's float32 encoder makes of it,
+    the same latent each arm decodes, so the decoder is held apart from the encoder; each on par with
+    diffusers' `AutoencoderKLWan` in float32 from its float64 twin (check 1)."""
     import diffusers
     import torch
     from huggingface_hub import snapshot_download
@@ -257,36 +258,40 @@ def test_the_published_vae_matches_the_source():
     t, y, x = np.mgrid[0:9, 0:128, 0:192] / np.array([4.0, 32.0, 32.0])[:, None, None, None]
     smooth = 0.8 * np.stack([np.sin(x + y + t), np.cos(2 * x - y - 0.5 * t),
                              np.sin(3 * y + t) * np.cos(x)])[None]
-
-    def draw(seed):
-        noise = np.random.default_rng([37, seed]).standard_normal(smooth.shape)
-        return ((smooth + 0.05 * noise).astype(np.float32),)
-
     source = diffusers.AutoencoderKLWan.from_pretrained(path, subfolder="vae").eval()
     wide = float64_twin(source)
 
-    def source_walk(model, dtype, video):
+    def draw(seed):
+        """A clip, and the latent the source's float32 encoder makes of it, which every arm decodes."""
+        noise = np.random.default_rng([37, seed]).standard_normal(smooth.shape)
+        video = (smooth + 0.05 * noise).astype(np.float32)
+        with torch.no_grad():
+            latent = source.encode(torch.from_numpy(video)).latent_dist.mean.numpy()
+        return video, latent
+
+    def source_walk(model, dtype, video, latent):
         with torch.no_grad():
             mean = model.encode(torch.from_numpy(video).to(dtype)).latent_dist.mean
-            return {"mean": channels_last(mean.numpy()),
-                    "pixels": channels_last(model.decode(mean).sample.numpy())}
+            pixels = model.decode(torch.from_numpy(latent).to(dtype)).sample
+            return {"mean": channels_last(mean.numpy()), "pixels": channels_last(pixels.numpy())}
 
     autoencoder, params, _, _ = load_wan_vae(path, jnp.float32)
     model = autoencoder.model
 
     @jax.jit
-    def walk(video):
-        mean = model.apply({"params": params}, video, method=model.encode)
-        return {"mean": mean, "pixels": model.apply({"params": params}, mean, method=model.decode)}
+    def walk(video, latent):
+        return {"mean": model.apply({"params": params}, video, method=model.encode),
+                "pixels": model.apply({"params": params}, latent, method=model.decode)}
 
     @as_given
-    def truth(video):
+    def truth(video, latent):
         with float64():
-            return source_walk(wide, torch.float64, video)
+            return source_walk(wide, torch.float64, video, latent)
 
-    assert walk(channels_last(draw(0)[0]))["mean"].shape == (1, 3, 16, 24, 16)
-    assert_as_exact(as_given(lambda video: walk(channels_last(video))),
-                    as_given(lambda video: source_walk(source, torch.float32, video)), draw,
+    first = draw(0)
+    assert walk(*(channels_last(value) for value in first))["mean"].shape == (1, 3, 16, 24, 16)
+    assert_as_exact(as_given(lambda video, latent: walk(channels_last(video), channels_last(latent))),
+                    as_given(lambda video, latent: source_walk(source, torch.float32, video, latent)), draw,
                     "published Wan VAE", seeds=PUBLISHED_SEEDS, truth_fn=truth)
 
 
