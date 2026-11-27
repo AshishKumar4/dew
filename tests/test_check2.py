@@ -652,12 +652,12 @@ def test_moves_keep_their_bits_and_integer_operations_wrap():
         assert ct.certified(fn, ints)[1] == [], fn
 
 
+@pytest.mark.parametrize("dtype", [ml_dtypes.float8_e4m3fn, ml_dtypes.float8_e8m0fnu])
 @pytest.mark.parametrize("raw", [False, True], ids=["fp8-first", "bytes-first"])
-def test_fp8_storage_bitcasts_preserve_every_code_without_admitting_arithmetic(raw):
+def test_fp8_storage_bitcasts_preserve_every_code_without_admitting_arithmetic(raw, dtype):
     codes = np.arange(256, dtype=np.uint8)
-    stored = codes.view(ml_dtypes.float8_e4m3fn)
-    start, middle, returned = ((codes, jnp.float8_e4m3fn, jnp.uint8) if raw
-                               else (stored, jnp.uint8, jnp.float8_e4m3fn))
+    stored = codes.view(dtype)
+    start, middle, returned = (codes, dtype, jnp.uint8) if raw else (stored, jnp.uint8, dtype)
 
     def viewed(value):
         other = jax.lax.bitcast_convert_type(value, middle)
@@ -668,7 +668,67 @@ def test_fp8_storage_bitcasts_preserve_every_code_without_admitting_arithmetic(r
     np.testing.assert_array_equal(np.asarray(other).view(np.uint8), codes)
     np.testing.assert_array_equal(np.asarray(repeat).view(np.uint8), codes)
     _, findings = ct.certified(lambda value: value.astype(jnp.float32), stored)
-    assert findings and all("no format for float8_e4m3fn" in finding for finding in findings)
+    assert findings and all(f"no format for {np.dtype(dtype)}" in finding for finding in findings)
+
+
+@pytest.mark.parametrize("operands", [
+    np.arange(256, dtype=np.uint8), np.arange(256, dtype=np.uint8).view(np.int8),
+    np.asarray([-2 ** 31, -1, 0, 1, 2 ** 31 - 1], np.int32),
+], ids=["u8", "s8", "s32"])
+def test_population_count_counts_the_words_at_their_own_width(operands):
+    mask = (1 << (operands.dtype.itemsize * 8)) - 1
+    expected = [(int(value) & mask).bit_count() for value in operands]
+    result, findings = ct.certified(jax.lax.population_count, operands)
+    assert not findings, findings
+    np.testing.assert_array_equal(result, expected)
+
+
+def test_half_widening_and_barrier_keep_all_codes_at_their_conversion_boundary():
+    codes = np.arange(65536, dtype=np.uint16)
+    half = codes.view(np.float16)
+    nan = np.isnan(half)
+    with np.errstate(invalid="ignore"):
+        expected = half.astype(np.float32).view(np.uint32)
+    bits = codes[nan].astype(np.uint32)
+    # The bind widens every payload bit; compiled CPU execution quiets signaling NaNs.
+    expected[nan] = ((bits & 0x8000) << 16) | 0x7f800000 | ((bits & 0x3ff) << 13)
+
+    def widen(value):
+        return jax.lax.convert_element_type(value, jnp.float32)
+
+    value, findings = ct.certified(widen, half)
+    assert not findings, findings
+    np.testing.assert_array_equal(np.asarray(widen(half)).view(np.uint32), expected)
+    expected[nan] |= np.uint32(0x400000)
+    np.testing.assert_array_equal(np.asarray(value).view(np.uint32), expected)
+    np.testing.assert_array_equal(np.asarray(jax.jit(widen)(half)).view(np.uint32), expected)
+    stored, findings = ct.certified(jax.lax.optimization_barrier, half)
+    assert not findings, findings
+    np.testing.assert_array_equal(np.asarray(stored).view(np.uint16), codes)
+
+
+def test_half_narrowing_holds_midpoints_and_both_fp32_neighbours():
+    low = np.arange(0x7c00, dtype=np.uint16)
+    high = low + np.uint16(1)
+    a = low.view(np.float16).astype(np.float32)
+    b = high[:-1].view(np.float16).astype(np.float32)
+    ties = np.concatenate(((a[:-1] + b) * np.float32(0.5), np.float32([65520])))
+    below = np.nextafter(ties, np.float32(-np.inf))
+    above = np.nextafter(ties, np.float32(np.inf))
+    values = np.concatenate((below, ties, above))
+    expected = np.concatenate((low, np.where(low & 1, high, low), high))
+    values = np.concatenate((values, -values))
+    expected = np.concatenate((expected, expected | np.uint16(0x8000)))
+    result, findings = ct.certified(lambda value: value.astype(jnp.float16), values)
+    assert not findings, findings
+    np.testing.assert_array_equal(np.asarray(result).view(np.uint16), expected)
+
+
+@pytest.mark.parametrize("operation", [jax.lax.add, jax.lax.mul])
+def test_a_half_cast_and_storage_certificate_does_not_admit_half_arithmetic(operation):
+    half = np.float16([1.5, -2.25])
+    _, findings = ct.certified(operation, half, half)
+    assert findings and all("no format for float16" in finding for finding in findings)
 
 
 def test_an_integer_division_is_held_at_every_64_bit_magnitude():

@@ -15,6 +15,7 @@ from jax.extend.core import primitives
 from op_certificates import (
     DTYPES,
     EXP_RANGE,
+    FLOAT16,
     FORMATS,
     Format,
     exact_sum,
@@ -959,6 +960,11 @@ def _exact_integer(values) -> tuple[np.ndarray, np.ndarray]:
     return hi, lo
 
 
+_HALF = np.dtype(np.float16)
+_FLOAT = np.dtype(np.float32)
+_HALF_CONVERSIONS = frozenset({(_HALF, _FLOAT), (_FLOAT, _HALF)})
+
+
 def _converted(params, operands, result, fmt):
     """A cast, as XLA's CPU lowering casts: between float formats correctly rounded, subnormals kept
     (bit manipulation); to a float from an integer or boolean correctly rounded from the exact integer;
@@ -967,6 +973,9 @@ def _converted(params, operands, result, fmt):
     (value,) = operands
     value, result = np.asarray(value), np.asarray(result)
     source = _format(value.dtype)
+    if (value.dtype, result.dtype) in _HALF_CONVERSIONS:
+        source = FLOAT16 if value.dtype == _HALF else source
+        fmt = FLOAT16 if result.dtype == _HALF else fmt
     if fmt is not None:
         exact = _exact_integer(value) if source is None else (value.astype(np.float64), np.zeros(value.shape))
         return _same(result, rounded(*exact, fmt))
@@ -2049,6 +2058,7 @@ CONTRACTS = {
     jax.lax.shift_right_logical_p: _moved(_logical_shift(1)),
     jax.lax.shift_left_p: _moved(_logical_shift(-1)),
     jax.lax.bitcast_convert_type_p: _moved(_bitcast),
+    jax.lax.population_count_p: _moved(lambda params, value: np.bitwise_count(_bits(value))),
     jax.lax.reduce_and_p: _moved(lambda params, a: np.all(a, axis=tuple(params["axes"]))),
     jax.lax.reduce_or_p: _moved(lambda params, a: np.any(a, axis=tuple(params["axes"]))),
     jax.lax.reduce_max_p: _extremum(_signed_max, _integral_extremum(np.max, "max")),
@@ -2196,8 +2206,12 @@ def observing():
         del _OBSERVING[next(index for index, observer in enumerate(_OBSERVING) if observer is seen)]
 
 
-_RAW_BITCAST_PAIRS = frozenset({(np.dtype(np.uint8), np.dtype(jax.numpy.float8_e4m3fn)),
-                               (np.dtype(jax.numpy.float8_e4m3fn), np.dtype(np.uint8))})
+_RAW_BITCAST_PAIRS = frozenset({
+    (np.dtype(np.uint8), np.dtype(jax.numpy.float8_e4m3fn)),
+    (np.dtype(jax.numpy.float8_e4m3fn), np.dtype(np.uint8)),
+    (np.dtype(np.uint8), np.dtype(jax.numpy.float8_e8m0fnu)),
+    (np.dtype(jax.numpy.float8_e8m0fnu), np.dtype(np.uint8)),
+})
 """Explicit integer/FP8 storage views the exact bitcast contract can check without a float format."""
 
 
@@ -2214,8 +2228,13 @@ def _held(eqn, operands, results, findings, at) -> None:
     hosted_results = [_host(result) for result in results]
     raw_bitcast = (primitive is jax.lax.bitcast_convert_type_p
                    and (hosted[0].dtype, hosted_results[0].dtype) in _RAW_BITCAST_PAIRS)
+    half_storage = (primitive is jax.lax.optimization_barrier_p
+                    or (primitive is jax.lax.convert_element_type_p
+                        and (hosted[0].dtype, hosted_results[0].dtype) in _HALF_CONVERSIONS))
     for value in () if raw_bitcast else (*hosted, *hosted_results):
         dtype = getattr(value, "dtype", None)
+        if dtype == _HALF and half_storage:
+            continue
         keyed = dtype is not None and jax.dtypes.issubdtype(dtype, jax.dtypes.prng_key)
         if dtype is not None and not keyed and _inexact(dtype) and _format(dtype) is None:
             findings.append(f"{at}: uncertifiable, no format for {dtype}")
@@ -2223,7 +2242,7 @@ def _held(eqn, operands, results, findings, at) -> None:
     if primitive is jax.lax.reduce_p:
         # A variadic reduction's results are held together, by the reduction its combine is.
         try:
-            held = _reduced(eqn, hosted, [_host(result) for result in results])
+            held = _reduced(eqn, hosted, hosted_results)
         except TypeError:
             findings.append(f"{at}: uncertifiable, no contract for this reduce's combine")
             return
@@ -2231,20 +2250,19 @@ def _held(eqn, operands, results, findings, at) -> None:
             if not np.all(ok):
                 findings.append(f"{at}: {int(ok.size - ok.sum())} of {ok.size} elements break the contract")
         return
-    for index, result in enumerate(results):
-        fmt = _format(getattr(_host(result), "dtype", np.float32))
+    for index, hosted_result in enumerate(hosted_results):
+        fmt = _format(getattr(hosted_result, "dtype", np.float32))
         # A result of its own position reads its own part of the operands alone (a barrier's, a split's).
         given = (RESULT_OPERANDS[primitive](eqn.params, hosted, index) if primitive in RESULT_OPERANDS
                  else hosted)
         try:
-            ok = np.asarray(CONTRACTS[primitive](eqn.params, given, _host(result), fmt))
+            ok = np.asarray(CONTRACTS[primitive](eqn.params, given, hosted_result, fmt))
         except TypeError:
             findings.append(f"{at}: uncertifiable, {name} of these operands has no contract")
             return
         if not np.all(ok):
-            hosted_result = _host(result)
             keyed = not isinstance(hosted_result, np.ndarray)
-            shown = np.asarray(jax.random.key_data(result)) if keyed else hosted_result
+            shown = np.asarray(jax.random.key_data(hosted_result)) if keyed else hosted_result
             first = np.unravel_index(int(np.argmin(ok.ravel())), ok.shape) if ok.ndim else ()
             findings.append(f"{at}: {int(ok.size - ok.sum())} of {ok.size} elements break the contract, "
                             f"first at {first}: {shown[first]!r}")

@@ -1,95 +1,112 @@
-"""Share straight-line fragments of printed component bodies without changing their primitive order."""
+"""Factor ordered primitive bindings before rendering any generated Python."""
 
-import ast
-import copy
 import dataclasses
 import itertools
 from collections import defaultdict
-from collections.abc import Collection
+from collections.abc import Collection, Iterator
 
-from dew.algebra import printed
+import numpy as np
+from jax import lax
+
+from dew.algebra.printed import (
+    Binding,
+    Body,
+    Call,
+    Extent,
+    Layout,
+    Literal,
+    Operand,
+    Primitive,
+    Ref,
+    StaticTuple,
+)
 
 _MIN_SHARED = 6
-"""Smaller fragments would add a call and arguments for little source reduction."""
+_MIN_WHOLE = 3
 _MAX_SHARED = 64
-"""Long repeats can share several readable helpers rather than one oversized body."""
+_GEOMETRY = frozenset({"shape", "broadcast_dimensions", "new_sizes"})
+_SHIFTS = (lax.shift_left_p, lax.shift_right_logical_p)
 
 
-class _Fragment(ast.NodeTransformer):
-    """Alpha-rename a fragment without changing its caller's geometry or logical shift direction."""
+class _Fragment:
+    """Canonicalize SSA names and bind only explicit static inputs at the call site."""
 
-    def __init__(self, scope: set[str]):
-        self.scope = scope
-        self.inputs: dict[str, str] = {}
-        self.bound: dict[str, str] = {}
+    def __init__(self):
+        self.inputs: dict[Operand, Ref] = {}
+        self.bound: dict[str, Ref] = {}
 
-    def _input(self, value: str) -> ast.Name:
-        slot = self.inputs.setdefault(value, f"p{len(self.inputs)}")
-        return ast.Name(id=slot, ctx=ast.Load())
+    def input(self, value: Operand) -> Ref:
+        if value not in self.inputs:
+            self.inputs[value] = Ref(f"p{len(self.inputs)}")
+        return self.inputs[value]
 
-    def visit_Name(self, node: ast.Name) -> ast.Name:
-        if node.id == "_" or node.id not in self.scope:
-            return node
-        if isinstance(node.ctx, ast.Store):
-            self.bound[node.id] = f"v{len(self.bound)}"
-        if node.id in self.bound:
-            return ast.Name(id=self.bound[node.id], ctx=node.ctx)
-        return self._input(node.id)
+    def operand(self, value: Operand) -> Operand:
+        if isinstance(value, Ref):
+            return self.bound.get(value.name) or self.input(value)
+        if isinstance(value, Extent):
+            if value.operand.name not in self.bound:
+                return self.input(value)
+            return Extent(self.bound[value.operand.name], value.axis)
+        if isinstance(value, Layout):
+            if all(name not in self.bound for name in _reads(value)):
+                return self.input(value)
+            return Layout(tuple(n if isinstance(n, int) else self.dimension(n) for n in value.dimensions))
+        if isinstance(value, StaticTuple) and all(type(n) is int for n in value.values):
+            return self.input(value)
+        if isinstance(value, Literal) and value.integer is not None:
+            original = value.integer
+            integer = self.operand(original) if isinstance(original, Ref) else self.input(original)
+            assert isinstance(integer, Ref)
+            return dataclasses.replace(value, integer=integer, data=b"")
+        if isinstance(value, Primitive) and value.value in _SHIFTS:
+            return self.input(value)
+        return value
 
-    def visit_Attribute(self, node: ast.Attribute) -> ast.AST:
-        # Both logical shifts have the same bind interface. The caller passes the original primitive.
-        if (node.attr in ("shift_left_p", "shift_right_logical_p")
-                and isinstance(node.value, ast.Name) and node.value.id == "lax"):
-            return self._input(ast.unparse(node))
-        return self.generic_visit(node)
+    def dimension(self, value: Extent) -> Extent:
+        operand = self.operand(value.operand)
+        assert isinstance(operand, Ref)
+        return Extent(operand, value.axis)
 
-    def visit_keyword(self, node: ast.keyword) -> ast.AST:
-        if node.arg in ("shape", "broadcast_dimensions", "new_sizes") and _extent(node.value, self.bound):
-            return ast.keyword(arg=node.arg, value=self._input(ast.unparse(node.value)))
-        return self.generic_visit(node)
+    def binding(self, statement: Binding) -> Binding:
+        raw = statement.value
+        if isinstance(raw, Call):
+            callee = self.operand(raw.callee) if not isinstance(raw.callee, str) else raw.callee
+            assert isinstance(callee, str | Ref | Primitive)
+            arguments = tuple(map(self.operand, raw.operands))
+            keywords = tuple((name, self.input(value) if _static_parameter(name, value)
+                              else self.operand(value)) for name, value in raw.keywords)
+            raw = Call(callee, arguments, keywords)
+        else:
+            raw = self.operand(raw)
+        targets = []
+        for target in statement.targets:
+            if target == "_":
+                targets.append(target)
+            else:
+                name = f"v{len(self.bound)}"
+                self.bound[target] = Ref(name)
+                targets.append(name)
+        return Binding(tuple(targets), raw, statement.unpack)
 
 
-def _extent(node: ast.expr, bound: dict[str, str]) -> bool:
-    """A static expression the printer takes from array inputs, not from a value made in the fragment."""
-    if isinstance(node, ast.Tuple):
-        return all(_extent(part, bound) for part in node.elts)
-    if isinstance(node, ast.Constant):
-        return type(node.value) is int
-    return (isinstance(node, ast.Subscript) and isinstance(node.value, ast.Attribute)
-            and node.value.attr == "shape" and isinstance(node.value.value, ast.Name)
-            and node.value.value.id not in bound and isinstance(node.slice, ast.Constant)
-            and type(node.slice.value) is int)
+def _static_parameter(name: str, value: Operand) -> bool:
+    return ((name == "new_dtype" and isinstance(value, np.dtype))
+            or (name in _GEOMETRY and isinstance(value, StaticTuple)
+                and all(type(n) is int for n in value.values)))
+
+
+def _eligible(node: Binding | str) -> bool:
+    return isinstance(node, Binding) and (isinstance(node.value, Call)
+                                          or (isinstance(node.value, Literal) and not node.constant))
 
 
 @dataclasses.dataclass(frozen=True)
-class _Assignment:
-    target: str
-    call: str
-    arguments: tuple[str, ...]
-
-    def printed(self) -> list[str]:
-        return printed.wrapped(f"    {self.target} = {self.call}(", list(self.arguments), ")")
-
-
-@dataclasses.dataclass
 class _Copy:
     name: str
     first: int
-    statements: tuple[_Assignment, ...]
-    arguments: tuple[str, ...]
+    statements: tuple[Binding, ...]
+    arguments: tuple[Operand, ...]
     written: tuple[str, ...]
-
-
-def _assigns(node: ast.stmt, fragments: set[str]) -> bool:
-    if not isinstance(node, ast.Assign) or not isinstance(node.value, ast.Call):
-        return False
-    call = node.value.func
-    if isinstance(call, ast.Name):
-        return call.id in fragments
-    if not isinstance(call, ast.Attribute):
-        return False
-    return call.attr == "bind" or (call.attr == "array" and isinstance(call.value, ast.Name)
-                                   and call.value.id == "np")
 
 
 @dataclasses.dataclass
@@ -97,12 +114,15 @@ class _Span:
     name: str
     first: int
     available: int
-    normal: _Fragment
-    statements: list[_Assignment] = dataclasses.field(default_factory=list)
+    whole: bool
+    normal: _Fragment = dataclasses.field(default_factory=_Fragment)
+    statements: list[Binding] = dataclasses.field(default_factory=list)
 
-    def extend(self, nodes: list[ast.stmt], width: int) -> tuple[_Assignment, ...]:
+    def extend(self, nodes: tuple[Binding | str, ...], width: int) -> tuple[Binding, ...]:
         for index in range(self.first + len(self.statements), self.first + width):
-            self.statements.append(_assignment(nodes[index], self.normal))
+            node = nodes[index]
+            assert isinstance(node, Binding)
+            self.statements.append(self.normal.binding(node))
         return tuple(self.statements)
 
     def snapshot(self) -> _Copy:
@@ -110,117 +130,129 @@ class _Span:
                      tuple(self.normal.bound))
 
 
-def _assignment(node: ast.stmt, normal: _Fragment) -> _Assignment:
-    # Visit the operands before allocating the SSA result names.
-    assert isinstance(node, ast.Assign) and isinstance(node.value, ast.Call)
-    call = normal.visit(copy.deepcopy(node.value))
-    assert isinstance(call, ast.Call)
-    (target,) = node.targets
-    target = ast.unparse(normal.visit(copy.deepcopy(target)))
-    args = tuple(ast.unparse(arg) for arg in (*call.args, *call.keywords))
-    return _Assignment(target, ast.unparse(call.func), args)
-
-
-@dataclasses.dataclass(frozen=True)
-class _Body:
-    statements: list[ast.stmt]
-    scope: set[str]
-
-
-def _bodies(source: dict[str, str]) -> dict[str, _Body]:
-    bodies = {}
-    for name, text in source.items():
-        (function,) = ast.parse(text).body
-        assert isinstance(function, ast.FunctionDef)
-        scope = {node.arg for node in ast.walk(function.args) if isinstance(node, ast.arg)}
-        scope.update(node.id for node in ast.walk(function)
-                     if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store))
-        bodies[name] = _Body(function.body, scope)
-    return bodies
-
-
-def _largest(bodies: dict[str, _Body], fragments: set[str]) -> tuple[_Copy, ...]:
-    """Find the shared region which saves the most source, including earlier emitted fragments."""
+def _spans(bodies: dict[str, Body]) -> list[_Span]:
     candidates = []
     for name, body in bodies.items():
-        eligible = (_assigns(node, fragments) for node in body.statements)
-        runs = itertools.groupby(enumerate(eligible), key=lambda pair: pair[1])
-        for accepted, group in runs:
-            if accepted:
-                indices = [index for index, _ in group]
-                candidates.extend(_Span(name, first, indices[-1] + 1 - first, _Fragment(body.scope))
-                                  for first in indices[:len(indices) - _MIN_SHARED + 1])
+        runs = itertools.groupby(enumerate(body.statements), key=lambda numbered: _eligible(numbered[1]))
+        for eligible, group in runs:
+            if not eligible:
+                continue
+            starts = [index for index, _ in group]
+            end = starts[-1] + 1
+            whole = starts[0] == 0 and end == len(body.statements)
+            minimum = _MIN_WHOLE if whole else _MIN_SHARED
+            candidates.extend(_Span(name, start, end - start, whole and start == 0)
+                              for start in starts[:len(starts) - minimum + 1])
+    return candidates
+
+
+def _disjoint(entries: list[_Span], width: int) -> list[_Span]:
+    stops: dict[str, int] = {}
+    chosen = []
+    for span in entries:
+        if span.first >= stops.get(span.name, 0):
+            chosen.append(span)
+            stops[span.name] = span.first + width
+    return chosen
+
+
+def _largest(bodies: dict[str, Body]) -> tuple[_Copy, ...]:
+    candidates = _spans(bodies)
     best: tuple[_Copy, ...] = ()
     saved = 0
-    for width in range(_MIN_SHARED, _MAX_SHARED + 1):
-        by_body: dict[tuple[_Assignment, ...], list[_Span]] = defaultdict(list)
+    for width in range(_MIN_WHOLE, _MAX_SHARED + 1):
+        by_body: dict[tuple[Binding, ...], list[_Span]] = defaultdict(list)
         for span in candidates:
             if span.available >= width:
-                signature = span.extend(bodies[span.name].statements, width)
-                by_body[signature].append(span)
+                by_body[span.extend(bodies[span.name].statements, width)].append(span)
         candidates = []
         for entries in by_body.values():
-            # Every group's starts remain in source order. Earliest disjoint spans leave the
-            # most room for the next one of the same width in the same function.
-            stops: dict[str, int] = {}
-            copies = []
-            for span in entries:
-                if span.first >= stops.get(span.name, 0):
-                    copies.append(span)
-                    stops[span.name] = span.first + width
+            copies = _disjoint(entries, width)
             if len(copies) < 2:
                 continue
             candidates.extend(entries)
+            if width < _MIN_SHARED:
+                copies = [span for span in copies if span.whole and span.available == width]
             avoided = width * (len(copies) - 1)
             if avoided > saved:
                 best, saved = tuple(span.snapshot() for span in copies), avoided
         if not candidates:
-            return best
+            break
     return best
 
 
-def _reads(statements: list[ast.stmt]) -> set[str]:
-    return {node.id for statement in statements for node in ast.walk(statement)
-            if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load)}
+def _reads(value: Operand) -> Iterator[str]:
+    if isinstance(value, Ref):
+        yield value.name
+    elif isinstance(value, Extent):
+        yield value.operand.name
+    elif isinstance(value, Layout):
+        for dimension in value.dimensions:
+            yield from _reads(dimension)
+    elif isinstance(value, Literal) and isinstance(value.integer, Ref):
+        yield value.integer.name
+    elif isinstance(value, Call):
+        if isinstance(value.callee, Ref):
+            yield value.callee.name
+        for operand in value.operands:
+            yield from _reads(operand)
+        for _, operand in value.keywords:
+            yield from _reads(operand)
 
 
-def shared(source: dict[str, str], *, reserved: Collection[str] = ()) -> dict[str, str]:
-    """Emit private helpers for equivalent contiguous binds. Calls pass static axes and the original
-    preceding values. They return only values used after at least one copy's span. No tracing decision
-    moves into a run-time test, and each call executes the original primitive sequence in order."""
+def _live(body: Body, start: int) -> set[str]:
+    live = {name for statement in body.statements[start:] if isinstance(statement, Binding)
+            for name in _reads(statement.value)}
+    live.update(name for operand in body.outputs for name in _reads(operand))
+    return live
+
+
+def shared(source: dict[str, Body], *, reserved: Collection[str] = ()) -> dict[str, Body]:
+    """Factor disjoint spans with the same typed operations and preserve their ordered live outputs."""
     forms = dict(source)
     occupied = set(source).union(reserved)
     numbers = itertools.count()
-    fragments: set[str] = set()
-    while True:
-        bodies = _bodies(forms)
-        copies = _largest(bodies, fragments)
-        if not copies:
-            return forms
+    while copies := _largest(forms):
         first = copies[0]
         width = len(first.statements)
-        suffixes = [_reads(bodies[found.name].statements[found.first + width:]) for found in copies]
-        kept = [index for index in range(len(first.written))
-                if any(found.written[index] in reads for found, reads in zip(copies, suffixes, strict=True))]
+        suffixes = [_live(forms[found.name], found.first + width) for found in copies]
+        kept = [i for i in range(len(first.written))
+                if any(found.written[i] in reads for found, reads in zip(copies, suffixes, strict=True))]
         while (name := f"_shared_component_{next(numbers)}") in occupied:
             pass
         occupied.add(name)
-        fragments.add(name)
-        fragment_lines = printed.wrapped(f"def {name}(", [f"p{i}" for i in range(len(first.arguments))], "):")
-        fragment_lines += [line for statement in first.statements for line in statement.printed()]
-        if kept:
-            tail = ",)" if len(kept) == 1 else ")"
-            fragment_lines += printed.wrapped("    return (", [f"v{i}" for i in kept], tail)
-        forms[name] = "\n".join(fragment_lines)
-        # Later replacements cannot slide an earlier source range in the same function.
+        forms[name] = Body(tuple(f"p{i}" for i in range(len(first.arguments))), first.statements,
+                           tuple(Ref(f"v{i}") for i in kept))
         for found, reads in reversed(tuple(zip(copies, suffixes, strict=True))):
-            nodes = bodies[found.name].statements
-            begin, end = nodes[found.first].lineno - 1, nodes[found.first + width - 1].end_lineno
-            outputs = ", ".join(found.written[index] if found.written[index] in reads else "_"
-                                for index in kept)
-            if len(kept) == 1:
-                outputs += ","
-            assigned = f"{outputs} = " if outputs else ""
-            call = printed.wrapped(f"    {assigned}{name}(", list(found.arguments), ")")
-            lines = forms[found.name].splitlines()
-            forms[found.name] = "\n".join([*lines[:begin], *call, *lines[end:]])
+            body = forms[found.name]
+            outputs = tuple(found.written[i] if found.written[i] in reads else "_" for i in kept)
+            invoke = Binding(outputs, Call(name, found.arguments), unpack=True)
+            statements = (*body.statements[:found.first], invoke, *body.statements[found.first + width:])
+            forms[found.name] = dataclasses.replace(body, statements=statements)
+    return forms
+
+
+def bound_call(body: Body, shared_names: set[str], shapes: tuple[tuple[int, ...], ...]) -> Call | None:
+    """Bind a tail call's known case arguments directly in the case table."""
+    if len(body.statements) != 1 or not isinstance(binding := body.statements[0], Binding):
+        return None
+    if not isinstance(call := binding.value, Call) or not isinstance(call.callee, str):
+        return None
+    if (call.callee not in shared_names or not binding.unpack
+            or body.outputs != tuple(map(Ref, binding.targets))):
+        return None
+    count = len(body.inputs)
+    if call.keywords or call.operands[:count] != tuple(map(Ref, body.inputs)):
+        return None
+    sizes = dict(zip(body.inputs, shapes, strict=True))
+    fixed = []
+    for position, value in enumerate(call.operands[count:], count):
+        if any(name not in sizes for name in _reads(value)) or isinstance(value, Ref | Literal | Call):
+            return None
+        if isinstance(value, Layout):
+            value = StaticTuple(tuple(sizes[dim.operand.name][dim.axis] if isinstance(dim, Extent) else dim
+                                      for dim in value.dimensions))
+        elif isinstance(value, Extent):
+            value = sizes[value.operand.name][value.axis]
+        fixed.append((f"p{position}", value))
+    return Call(call.callee, (), tuple(fixed))

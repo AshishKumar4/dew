@@ -4,11 +4,35 @@ finite."""
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 import pytest
 from contract_support import EDGES, ORDER_SETS, assert_contract, normal_draw
 
 from dew.algebra import means, scan, windows
 
+
+@pytest.mark.parametrize("dtype", [jnp.bfloat16, jnp.float16])
+def test_generated_rounded_bodies_keep_the_written_surrogate_law(dtype):
+    from dew.algebra import component_cases, component_cases_derived as emitted
+    from dew.nn import precision
+
+    composed = component_cases.ROUNDED.assembled(lambda name: getattr(emitted, name))
+
+    def rounded(value):
+        return composed(value, dtype=dtype)
+
+    gradient = jax.grad(lambda x: jnp.sum(rounded(x) ** 2))
+
+    for shape in ((16, 32), (3, 5)):  # generated geometry and the written fallback
+        x = np.full(shape, 1.003, np.float32)
+        dx = np.full_like(x, 1.007)
+        primal, direction = jax.jit(lambda x, dx: jax.jvp(rounded, (x,), (dx,)))(x, dx)
+        np.testing.assert_array_equal(primal, precision.rounded_operand(x, dtype))
+        np.testing.assert_array_equal(direction, dx)
+        _, pullback = jax.vjp(rounded, jnp.asarray(x))
+        np.testing.assert_array_equal(pullback(jnp.asarray(dx))[0], dx)
+        _, higher = jax.jit(lambda x, dx: jax.jvp(gradient, (x,), (dx,)))(x, dx)
+        np.testing.assert_array_equal(higher, 2 * dx)
 
 def _plain(outputs, totals, anchors):
     """The convex mean as written: each state's mass at the joined anchor, its outputs weighed by it."""

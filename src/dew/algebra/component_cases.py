@@ -9,9 +9,10 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from dew.algebra.generate import Cases, ComponentForm, declare
+from dew.algebra import bits
+from dew.algebra.generate import Cases, ComponentForm, SurrogateBodies, SurrogateCase, declare
 from dew.nn import precision
-from dew.nn.kernels import recurrence_algebra, ssd
+from dew.nn.kernels import formats, recurrence_algebra, ssd
 from dew.nn.kernels.recurrence_algebra import apart, derived_tile
 from dew.nn.kernels.templates import attention, attention_algebra, attention_gradient
 from dew.nn.kernels.templates.attention_backward_algebra import (
@@ -105,20 +106,29 @@ def _backward_cases(shapes, *, mask_count, total_at=None, accurate=False):
     return Cases((operands,), draw, seeds=8, policies=("accurate" if accurate else "default",))
 
 
-def _rounded(x):
-    return precision._rounded(x, jnp.bfloat16)
+def _rounded(x, *, dtype):
+    return precision._rounded(x, dtype)
 
 
-def _rounded_truth(x):
-    return x.astype(jnp.bfloat16).astype(x.dtype)
+def _rounded_truth(x, *, dtype):
+    return x.astype(dtype).astype(x.dtype)
 
 
-def _tangent(x, dx, value):
-    return precision._rounded_tangent(jnp.bfloat16, (x,), (dx,), value)
+def _tangent(x, dx, value, *, dtype):
+    return precision._rounded_tangent(dtype, (x,), (dx,), value)
 
 
 def _tangent_truth(x, dx, value):
     return dx
+
+
+def _rounding_case(name, dtype):
+    return SurrogateCase(name, ComponentForm(
+        functools.partial(_rounded, dtype=dtype), functools.partial(_rounded_truth, dtype=dtype),
+        _cases(((16, 32),), ((8, 64),))), {(): ComponentForm(
+            functools.partial(_tangent, dtype=dtype), _tangent_truth,
+            _cases(*[((m, n),) * 3 for m, n in ((16, 32), (8, 64))]))},
+                         output_tree=(jax.tree.structure(0),))
 
 
 def _online_step(acc, peak, total, logits, values):
@@ -466,10 +476,10 @@ def _recompute_form(function, truth, *, keys_first, dropped):
 
 SCORES = declare(__name__, "scores", ComponentForm(
     _scores, _scores_truth, _cases(*[((n, n), (n, n), (n,)) for n in (16, 32, 64)])))
-ROUNDED = declare(__name__, "rounded", ComponentForm(
-    _rounded, _rounded_truth, _cases(((16, 32),), ((8, 64),))))
-TANGENT = declare(__name__, "rounded_tangent", ComponentForm(
-    _tangent, _tangent_truth, _cases(*[((m, n),) * 3 for m, n in ((16, 32), (8, 64))])))
+ROUNDED = SurrogateBodies(precision._rounded, precision._rounded_tangent, (1,), symbolic_zeros=False, cases={
+    (jnp.bfloat16,): _rounding_case("rounded", jnp.bfloat16),
+    (jnp.float16,): _rounding_case("rounded_fp16", jnp.float16),
+}).declared(__name__)
 PREFIX_DIFFERENCE = declare(__name__, "prefix_difference", ComponentForm(
     apart, _apart_truth,
     dataclasses.replace(_cases(((32,), (32,), (64,), (64,))), draw=_apart_draw)))
@@ -740,3 +750,98 @@ GEMM_PARTIAL_SCALE = declare(__name__, "gemm_partial_scale", ComponentForm(
 FP8_EPILOGUE = declare(__name__, "fp8_epilogue", ComponentForm(
     quantized.blockwise_fp8_epilogue(), _fp8_epilogue_truth,
     dataclasses.replace(_cases(((32, 128),), ((64, 256),)), draw=_fp8_epilogue_draw)))
+
+
+def _mxfp8_scale(raw):
+    return formats.mxfp8_scale_bytes(jax.lax.bitcast_convert_type(raw, jnp.float32))
+
+
+def _mx_scale_truth(value):
+    _, e = jnp.frexp(value)
+    exponent = jnp.clip(jnp.where(value == 0, -127, e - 9), -127, 127)
+    finite = jnp.isfinite(value)
+    return jnp.where(finite, exponent, 0), jnp.where(finite, exponent + 127, 255).astype(jnp.uint32)
+
+
+def _mxfp8_scale_truth(raw):
+    return _mx_scale_truth(jax.lax.bitcast_convert_type(raw, jnp.float32).astype(jnp.float64))
+
+
+def _mx_scale_draw(seed, operands):
+    rng = np.random.default_rng(seed)
+    raw = rng.integers(0, 2 ** 31, operands[0].shape, dtype=np.uint32)
+    raw.flat[:11] = [0, 1, 0x007fffff, 0x00800000, 0x047fffff, 0x04800000,
+                     0x3f7fffff, 0x3f800000, 0x7f7fffff, 0x7f800000, 0x7fc00001]
+    return (raw,)
+
+
+def _mxfp8_epilogue(acc):
+    codes, scales = quantized.quantize_mxfp8_epilogue()(acc)
+    return jax.lax.bitcast_convert_type(codes, jnp.uint8), jax.lax.bitcast_convert_type(scales, jnp.uint8)
+
+
+def _mxfp8_epilogue_truth(acc):
+    blocks = acc.reshape(acc.shape[0], -1, 32)
+    exponent, scale = _mx_scale_truth(jnp.max(jnp.abs(blocks), axis=-1, keepdims=True))
+    narrowed = jnp.clip(jnp.ldexp(blocks, -exponent), -448, 448).astype(jnp.float8_e4m3fn)
+    codes = jax.lax.bitcast_convert_type(narrowed, jnp.uint8)
+    scale_codes = jnp.broadcast_to(scale, blocks.shape).astype(jnp.uint8)
+    return codes.reshape(acc.shape), scale_codes.reshape(acc.shape)
+
+
+def _mxfp8_draw(seed, operands):
+    (acc,) = _arrays(seed, operands)
+    acc *= np.float32(2.0 ** (seed * 20 - 80))
+    acc[0, :32] = 0
+    acc[1, :8] = [448, -448, 224, -224, 256, -256, 1, -0.0]
+    return (acc,)
+
+
+def _nvfp4_scale(codes):
+    return jax.lax.bitcast_convert_type(bits.scales_decoded(codes), jnp.uint32)
+
+
+def _nvfp4_scale_truth(codes):
+    magnitude = codes.astype(jnp.uint32) & 127
+    field, fraction = magnitude >> 3, magnitude & 7
+    significand = fraction.astype(jnp.float64) * 0.125 + (field > 0)
+    exact = jnp.ldexp(significand, jnp.maximum(field, 1).astype(jnp.int32) - 7)
+    rounded = jax.lax.bitcast_convert_type(exact.astype(jnp.float32), jnp.uint32)
+    return jnp.where(magnitude == 127, jnp.uint32(0x7fc00000), rounded) | (
+        (codes.astype(jnp.uint32) & 0x80) << 24)
+
+
+def _nvfp4_scale_draw(seed, operands):
+    rows, columns = operands[0].shape
+    codes = np.arange(rows * columns, dtype=np.uint32).astype(np.uint8)
+    return (np.roll(codes, seed).reshape(rows, columns),)
+
+
+def _nvfp4_payload(codes):
+    return bits.nvfp4_codes(bits.packed(codes.T, bits.E2M1).T)
+
+
+def _nvfp4_payload_truth(codes):
+    values = jnp.asarray([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0], jnp.float64)[codes & 7]
+    return jnp.where(codes & 8 != 0, -values, values)
+
+
+def _nvfp4_payload_draw(seed, operands):
+    rng = np.random.default_rng(seed)
+    (value,) = operands
+    codes = rng.integers(0, 16, value.shape, dtype=np.uint32)
+    codes[0, :16] = np.arange(16, dtype=np.uint32)
+    return (codes,)
+
+
+MXFP8_SCALE = declare(__name__, "mxfp8_scale", ComponentForm(_mxfp8_scale, _mxfp8_scale_truth, Cases(
+    tuple((jax.ShapeDtypeStruct(shape, jnp.uint32),) for shape in ((32, 8), (64, 8))),
+    _mx_scale_draw, seeds=8, policies=("default",))))
+MXFP8_EPILOGUE = declare(__name__, "mxfp8_epilogue", ComponentForm(_mxfp8_epilogue, _mxfp8_epilogue_truth,
+    dataclasses.replace(_cases(((32, 128),), ((64, 128),)), draw=_mxfp8_draw)))
+NVFP4_SCALE = declare(__name__, "nvfp4_scale", ComponentForm(_nvfp4_scale, _nvfp4_scale_truth, Cases(
+    tuple((jax.ShapeDtypeStruct(shape, jnp.uint8),) for shape in ((32, 8), (64, 8))),
+    _nvfp4_scale_draw, seeds=8, policies=("default",))))
+NVFP4_PAYLOAD = declare(__name__, "nvfp4_payload", ComponentForm(_nvfp4_payload, _nvfp4_payload_truth, Cases(
+    tuple((jax.ShapeDtypeStruct(shape, jnp.uint32),) for shape in ((16, 32), (32, 64))),
+    _nvfp4_payload_draw, seeds=8, policies=("default",))))
