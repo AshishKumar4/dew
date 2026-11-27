@@ -351,20 +351,20 @@ def test_a_bf16_levels_read_whose_decay_keeps_no_finite_value_reads_zero(length,
     assert all(np.isfinite(np.asarray(x, np.float32)).all() for x in pull(jnp.ones_like(out)))
 
 
-@pytest.mark.parametrize(("query", "key", "cotangent", "decay"), [
-    (1.0, 2.0 ** 127, 2.0 ** 127, -90.0), (1.0, 1.0, 2.0 ** 120, -120.0),
-    (2.0 ** -60, 2.0 ** -60, 2.0 ** 120, -10.0), (1.0, 2.0 ** -120, 2.0 ** 100, -25.0),
-    (1.0, 2.0 ** 127, 2.0 ** 127, -200.0)])
-def test_a_bf16_levels_decay_gradient_is_in_its_binade(query, key, cotangent, decay):
+@pytest.mark.parametrize(("query", "key", "cotangent", "decay", "kept"), [
+    (1.0, 2.0 ** 127, 2.0 ** 127, -90.0, True), (1.0, 2.0 ** 127, 2.0 ** 127, -150.0, True),
+    (1.0, 1.0, 2.0 ** 120, -120.0, False), (1.0, 2.0 ** -120, 2.0 ** 100, -25.0, False),
+    (1.0, 2.0 ** 127, 2.0 ** 127, -200.0, False)])
+def test_a_bf16_levels_decay_gradient_is_the_cotangent_times_its_decayed_read(query, key, cotangent, decay,
+                                                                              kept):
     """A bf16 level-7 read (67 tokens) at token 66 of token 0's key against a value of 1, decayed by `decay`
     over tokens 64 to 66 (a third each, every one live), under `cotangent` there: each of those decays'
-    gradients `cotangent * query * key * exp(decay)`, in float64's binade, the decay's derivative the
-    cotangent and the read decayed together (`scan.scaled_exp`'s declared transpose): `2^254 e^-90`
-    (2.4e37), where autodiff through the decay's factors overflowed (train 1379's review K-F2); `2^120
-    e^-120` (1.0e-16) and `2^-20 e^-25` (1.3e-17, a key of 2^-120 under 2^100), where the cotangent times the
-    decayed read read zero, that read underflowed (train 1383's reviews); `e^-10` of 2^-120 under 2^120; and
-    `2^254 e^-200` (4.0e-11) of a finite read of 2^127 its decay rounds to zero, which a mask of every read
-    under a decay no finite fp32 survives zeroed (train 1398's review of 9b6609de0)."""
+    gradients the cotangent times the decayed read (`scan.scaled_exp`'s declared transpose, as the plain
+    formula's; Main's ruling on row 13750, 11-28). Where the decay keeps the read normal (`kept`),
+    `cotangent * query * key * exp(decay)` in float64's binade: `2^254 e^-90` (2.4e37) and `2^254 e^-150`,
+    where autodiff through the decay's factors overflowed (train 1379's review K-F2); where it underflows
+    (`1 e^-120` by 2^120, a key of 2^-120 under `e^-25` by 2^100, `2^127 e^-200` by 2^127), zero, as the
+    plain formula's, and every output finite."""
     weights = jnp.zeros((1, 67, 1, levels(67)), jnp.float32).at[0, 66, 0, 7].set(1.0)
     g = jnp.zeros((1, 67, 1), jnp.float32).at[0, 64:67].set(decay / 3)
 
@@ -377,8 +377,12 @@ def test_a_bf16_levels_decay_gradient_is_in_its_binade(query, key, cotangent, de
     found = np.asarray(dg, np.float64)[0, 64:67, 0]
     whole = 3 * float(np.float32(decay / 3))
     assert np.isfinite(np.asarray(out, np.float32)).all(), out
-    assert np.isfinite(found).all() and (found != 0).all(), dg
-    assert (np.frexp(found)[1] == np.frexp(cotangent * query * key * np.exp(whole))[1]).all(), (found, dg)
+    assert np.isfinite(found).all(), dg
+    if kept:
+        assert (found != 0).all(), dg
+        assert (np.frexp(found)[1] == np.frexp(cotangent * query * key * np.exp(whole))[1]).all(), (found, dg)
+    else:
+        np.testing.assert_array_equal(found, np.zeros(3))
 
 
 def test_a_bf16_calls_levels_take_the_recurrence_its_kernel_choice_names():

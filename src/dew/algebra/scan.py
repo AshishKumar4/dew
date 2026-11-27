@@ -1711,11 +1711,8 @@ def scaled_exp(value, exponent):
     product falls monotonically to the value's decayed one and keeps it where that is normal (row 9660: a
     decay of `e^-120` takes 2^100 to `e^-51`, which one exponential's underflow zeroed); an exponent of -inf
     zeroes a finite value and keeps a NaN or an infinite one NaN. Its derivatives are declared
-    (`_scaled_exp_tangent`): the value's tangent and cotangent decayed alike, and the exponent's the value,
-    the direction and the decay together, balanced so no partial product leaves fp32's range where the
-    whole is in it (`_decayed`): autodiff through the factors overflowed (`2^127 * 2^127 e^-87`
-    where `2^254 e^-90` is finite), and the direction times the decayed value read zero where that value
-    underflowed (`2^120` times `1 e^-120`, its derivative 1.0e-16)."""
+    (`_scaled_exp_tangent`): the value's tangent and cotangent decayed alike, and the exponent's the
+    direction or the cotangent times the decayed value, as the plain formula's."""
     return _scaled_exp(value, exponent)
 
 
@@ -1728,34 +1725,54 @@ def _scaled_exp_value(value, exponent):
 
 def _scaled_exp_tangent(primals, tangents):
     """`scaled_exp`'s value and tangent, a linear map of the moving tangents with its transpose declared
-    (`generation.linear_map`): the value's tangent and cotangent decayed by the same factors, and the
-    exponent's each the value, the direction and the decay together (`_decayed`, one rounding over the three
-    as a scaled value's), never the decayed value rounded first nor a factor's partial product. The
-    exponent's cotangent times the decayed value read zero where that value underflowed (1 decayed by
-    `e^-120` under a cotangent of 2^120, its derivative 1.0e-16; train 1383's reviews), and autodiff through
-    the factors overflowed (2^127 by 2^127 under `e^-90`, its derivative 2.4e37; train 1379's review K-F2).
-    A symbolic zero tangent moves nothing (an overflowed value's zero tangent times it NaN)."""
+    (`generation.linear_map`): the value's tangent and cotangent decayed by the same factors (the declared
+    function again), and the exponent's the direction or the cotangent times the decayed value
+    (`_times_decayed`), as the plain formula's `value * exp(exponent)` (Main's ruling on row 13750, 11-28:
+    row 5426's envelope, `tests/contract_support.assert_contract`, finite wherever the plain formula is). A
+    value the decay keeps normal holds the product in range (2^127 by 2^127 under `e^-90` or `e^-150`); one
+    it underflows reads zero (1 under `e^-120` by 2^120). The range-exact product of the three, each term
+    decayed as a scaled value's, took a GH200's log-linear bf16 training step 8.6 to 15.3 ms against this
+    form's 4.4 (M-JS-307, 310, 312c, 314b). A symbolic zero tangent moves nothing (an overflowed value's zero
+    tangent times it NaN)."""
     value, exponent = primals
     # The declared function again, so a derivative of this one meets this rule, no factor's product.
     out = _scaled_exp(value, exponent)
 
     def moved(held, index, direction):
         value, exponent = held
-        return _scaled_exp(direction, exponent) if index == 0 else _decayed(exponent, value, direction)
+        return _scaled_exp(direction, exponent) if index == 0 else _times_decayed(exponent, value, direction)
 
     def pulled(held, index, cotangent):
         value, exponent = held
         return (_summed_to(_scaled_exp(cotangent, exponent), value) if index == 0
-                else _summed_to(_decayed(exponent, value, cotangent), exponent))
+                else _summed_to(_times_decayed(exponent, value, cotangent), exponent))
 
     return out, _linear_tangent(primals, tangents, out, moved, pulled)
 
 
-def _linear_tangent(primals, tangents, out, moved, pulled):
+def _times_decayed_value(exponent, value, *factors):
+    """`value` decayed by `exp(exponent)` (`scaled_exp`), then times each of `factors` in turn: the decay
+    applied before any factor meets the value."""
+    return functools.reduce(jnp.multiply, factors, _scaled_exp(value, exponent))
+
+
+def _times_decayed_tangent(primals, tangents):
+    """`_times_decayed`'s value and tangent: its derivatives, `scaled_exp`'s second ones, which no training
+    step takes, the range-exact product's (`_decayed_terms` of its one term: every order a sum of products
+    decayed and landed once as a scaled value's), so no grouping of two directions and a factor, nor a sum of
+    terms, leaves the range where the whole is in it (a cotangent and a direction of 2^100 met before
+    `e^-60`, `2^200`; a value of 2^100 and a direction of 2^100 before a cotangent of `2^-100`, in either
+    order of differentiation; head reviews)."""
+    exponent, value, *factors = primals
+    out = _times_decayed(exponent, value, *factors)
+    return out, _decayed_terms_linear((tuple(range(1 + len(factors))),), primals, tangents, out)
+
+
+def _linear_tangent(primals, tangents, out, moved, pulled, joined=None):
     """The tangent of a declared rule whose tangent is a sum of linear maps, one each moving tangent:
     `moved(primals, index, direction)` the map of tangent `index`, `pulled(primals, index, cotangent)` its
     transpose (`generation.linear_map`), a symbolic zero tangent none (`out`'s symbolic zero where every
-    tangent is one)."""
+    tangent is one); `joined(primals, live, directions)`, where given, the maps' sum at once."""
     from dew.nn.kernels import generation
 
     live = tuple(index for index, part in enumerate(tangents) if not isinstance(part, SymbolicZero))
@@ -1763,6 +1780,8 @@ def _linear_tangent(primals, tangents, out, moved, pulled):
         return SymbolicZero(jax.typeof(out).to_tangent_aval())
 
     def applied(held, directions):
+        if joined is not None:
+            return joined(held, live, directions).astype(out.dtype)
         parts = [moved(held, index, direction) for index, direction in zip(live, directions, strict=True)]
         return functools.reduce(jnp.add, parts).astype(out.dtype)
 
@@ -1780,85 +1799,138 @@ def _linear_tangent(primals, tangents, out, moved, pulled):
     return generation.linear_map(applied, transposed, primals, moving)
 
 
-def _decayed_value(exponent, *factors):
-    """`factors`' product times `exp(exponent)` (`exponent` at most 0, every array broadcast together) with
-    one rounding into the format, a scaled value's (`dew.algebra.scaled`): each factor exact as a
-    significand and a power of two, the decay a power of two and the exponential of its remainder
-    (`scaled.base2`), their product's significands and exponents formed apart, landed once. No partial
-    product leaves the format's range where the whole is in it: 2^127 by 2^127 under `e^-90`, 2^120 by 1
-    under `e^-120`, 2^100 by 2^-120 under `e^-25`. An exponent past the cutoff, -inf or fp32's most negative
-    among them, decays a finite product to zero (a non-finite one to NaN, no product of the factors formed:
-    2^127 by 2^127 at -inf is zero)."""
-    dtype = jnp.result_type(exponent, *factors)
+def _decayed_terms_value(terms, exponent, *operands):
+    """The sum over `terms` (each a tuple of indices into `operands`) of its operands' product, times
+    `exp(exponent)` (`exponent` at most 0, every array broadcast together), with one rounding into the
+    format, a scaled value's (`dew.algebra.scaled`): each operand exact as a significand and a power of two,
+    the decay a power of two and the exponential of its remainder (`scaled.base2`), each term's product with
+    the decay formed apart, the terms summed as scaled values (`scaled.add`), landed once. No partial
+    product or sum leaves the format's range where the whole is in it: 2^127 by 2^127 under `e^-90`, 2^120
+    by 1 under `e^-120`, 2^100 by 2^-120 under `e^-25`, a term past the range beside one it cancels. An
+    exponent past the cutoff, -inf or fp32's most negative among them, decays a finite sum to zero (a
+    non-finite one to NaN, no product of the operands formed: 2^127 by 2^127 at -inf is zero)."""
+    used = sorted({index for term in terms for index in term})
+    dtype = jnp.result_type(exponent, *operands)
     # The decomposition in at least fp32, each operand widened exactly (a 16-bit subnormal a normal fp32),
-    # the product narrowed once at the end: in fp16 the decay's base-two split doubled -10 and its
+    # the sum narrowed once at the end: in fp16 the decay's base-two split doubled -10 and its
     # two-product splitter (4097) overflowed, NaN (train 1398's review of 9b6609de0).
     work = jnp.promote_types(dtype, jnp.float32)
     exponent = jnp.asarray(exponent).astype(work)
-    factors = [jnp.asarray(factor).astype(work) for factor in factors]
+    operands = [jnp.asarray(operand).astype(work) for operand in operands]
+    exponent, *operands = _placed_alike([exponent, *operands])
     form = scaled.format_of(work)
-    # The least power of two the decay holds: beneath it every product of `factors` in the format (each
-    # below `2^(largest + 1)`) decays below the format's least subnormal (`2^-reach`).
-    cutoff = len(factors) * (form.largest + 1) + form.reach + 1
-    # A decay past the cutoff (-inf among them) decays every finite product to zero, detected in natural
-    # units before the base-two conversion, whose head overflowed at fp32's most negative exponent (its
-    # remainder then -inf less -inf, NaN).
+    # The least power of two the decay holds: beneath it every sum of `terms` in the format (each product
+    # below `2^(n (largest + 1))`, `n` its factors, the sum below the count of them) decays below the
+    # format's least subnormal (`2^-reach`).
+    cutoff = (max(map(len, terms)) * (form.largest + 1) + (len(terms) - 1).bit_length()) + form.reach + 1
+    # A decay past the cutoff (-inf among them) decays every finite sum to zero, detected in natural units
+    # before the base-two conversion, whose head overflowed at fp32's most negative exponent (its remainder
+    # then -inf less -inf, NaN).
     gone = exponent < -(cutoff + 2) * math.log(2.0)
     high, low = scaled.base2(jnp.where(gone, 0.0, exponent))
     whole = jnp.round(high)
     # The remainder's exponential in [2^-1/2, 2^1/2], its power of two apart.
     remainder = accurate_exp(((high - whole) + low) * np.asarray(math.log(2.0), work))
     decay = scaled.normalized(remainder, jnp.clip(whole, -cutoff, 0).astype(jnp.int32), cutoff + 1)
-    parts = [scaled.scaled(factor) for factor in factors]
-    found = scaled.landed(functools.reduce(scaled.mul, parts, decay))
-    unbounded = functools.reduce(jnp.logical_or, [~jnp.isfinite(factor) for factor in factors])
+    parts = {index: scaled.scaled(operands[index]) for index in used}
+    products = [functools.reduce(scaled.mul, [parts[index] for index in term], decay) for term in terms]
+    found = scaled.landed(functools.reduce(scaled.add, products))
+    unbounded = functools.reduce(jnp.logical_or, [~jnp.isfinite(operands[index]) for index in used])
     return jnp.where(gone, jnp.where(unbounded, np.asarray(np.nan, work), 0), found).astype(dtype)
 
 
-def _decayed_tangent(primals, tangents):
-    """`_decayed`'s value and tangent, linear maps of the moving tangents (`_linear_tangent`): a factor's
-    tangent in its place, and the exponent's beside the factors, each another `_decayed`, so every order
-    meets this rule again and no order forms a partial product."""
-    exponent, *factors = primals
-    out = _decayed(exponent, *factors)
+def _placed_alike(arrays) -> list:
+    """`arrays` broadcast together and placed alike where an Explicit axis splits one (as they are where none
+    does): each as the first split one is, so the terms' scaled products and their sums (`scaled.add`'s
+    selects and maxima) meet one placement, where a split product beside a replicated one of its shape was
+    refused (train 1430's review)."""
+    from dew.nn import sharding
 
-    def moved(held, index, direction):
-        exponent, *factors = held
-        if index == 0:
-            return _decayed(exponent, direction, *factors)
-        return _decayed(exponent, *factors[:index - 1], direction, *factors[index:])
+    split = next(filter(None, map(sharding.explicit_spec, arrays)), None)
+    if split is None:
+        # No Explicit split: the operands broadcast where they meet, a decay's split and exponential on
+        # its own shape (formed at the values' was most of a GH200's log-linear step, M-JS-310).
+        return list(arrays)
+    shape = jnp.broadcast_shapes(*(jnp.shape(x) for x in arrays))
+    arrays = [jnp.broadcast_to(x, shape) for x in arrays]
+    placed = next(filter(None, map(sharding.explicit_spec, arrays)))
+    return [jax.sharding.reshard(x, placed) for x in arrays]
+
+
+def _replaced(terms, operand: int, by: int) -> tuple:
+    """`terms`' derivative by operand `operand`, written with operand `by` (its direction or cotangent):
+    each term holding it once for each place it does, that place `by`."""
+    return tuple((*term[:place], by, *term[place + 1:])
+                 for term in terms for place, index in enumerate(term) if index == operand)
+
+
+def _decayed_terms_tangent(terms, primals, tangents):
+    """`_decayed_terms`'s value and tangent (`_decayed_terms_linear`)."""
+    out = _decayed_terms(terms, *primals)
+    return out, _decayed_terms_linear(terms, primals, tangents, out)
+
+
+def _decayed_terms_linear(terms, primals, tangents, out):
+    """The tangent of a sum of `terms`' products decayed by `exp(exponent)` at `primals`, its value `out`
+    (the caller's, staged once), linear maps of the moving tangents (`_linear_tangent`), each the form again
+    over the operands and the direction or cotangent, so every order meets `_decayed_terms`' rule again and
+    no order forms a partial product or sum: an operand's tangent each term's in its place, and the
+    exponent's beside each term's operands; the tangent's terms joined in one such sum, as the plain
+    product's chain sums them before its last factors, where summed after them one term past fp32's
+    largest overflowed (`2^0.5` times a decayed product of `-3.2e38` where float64's tangent is
+    `-1.6e38`), and over `out`'s shape and placement (`_broadcast_to`): the derived terms alone lost a
+    dimension a term without a moving operand gave (a scalar `c`'s tangent in `(a b + c) e^0` over `a` and
+    `b` of two; a head review)."""
+
+    def derivative(index, by):
+        return tuple((*term, by) for term in terms) if index == 0 else _replaced(terms, index - 1, by)
+
+    # An operand no term holds moves nothing: its derivative's terms none, a zero.
+    def joined(held, live, directions):
+        exponent, *operands = held
+        extra = [*operands, *directions]
+        derived = tuple(term for place, index in enumerate(live)
+                        for term in derivative(index, len(operands) + place))
+        if not derived:
+            return jnp.zeros_like(out)
+        return _broadcast_to(_decayed_terms(derived, exponent, *extra), out)
 
     def pulled(held, index, cotangent):
-        exponent, *factors = held
-        if index == 0:
-            return _summed_to(_decayed(exponent, cotangent, *factors), exponent)
-        others = (*factors[:index - 1], *factors[index:])
-        return _summed_to(_decayed(exponent, cotangent, *others), factors[index - 1])
+        exponent, *operands = held
+        like = exponent if index == 0 else operands[index - 1]
+        derived = derivative(index, len(operands))
+        if not derived:
+            return jnp.zeros_like(like, dtype=jnp.promote_types(like.dtype, jnp.float32))
+        return _summed_to(_decayed_terms(derived, exponent, *operands, cotangent), like)
 
-    return out, _linear_tangent(primals, tangents, out, moved, pulled)
+    return _linear_tangent(primals, tangents, out, None, pulled, joined)
+
+
+def _broadcast_to(tangent, like):
+    """`tangent` over `like`'s shape, varying over the manual mesh axes `like` varies over
+    (`sharding.varying_like`), and placed as `like` is where an Explicit axis places it: a tangent formed
+    from fewer operands than its primal, `_summed_to`'s dual."""
+    from dew.nn import sharding
+
+    tangent = sharding.varying_like(jnp.broadcast_to(tangent, like.shape), like)
+    placed = sharding.explicit_placement(jax.typeof(like))
+    return tangent if placed is None else jax.sharding.reshard(tangent, placed)
 
 
 def _summed_to(cotangent, like):
-    """`cotangent` summed over the axes `like` broadcast across and over each manual mesh axis it varies over
-    that `like` does not (`sharding.summed_to`: a replicated exponent's cotangent each shard's partial of a
-    value split across them, which JAX's accumulator refuses unsummed), in `like`'s shape and in the
-    cotangent's dtype promoted with `like`'s and fp32, never narrowed, so every sum is taken wide (the dtype
-    `_linear_tangent`'s map works in); and placed as `like` is where an Explicit axis places it, as
-    `templates.gemm.factored` places its rows' (a replicated value's cotangent split as a split exponent's
-    was; train 1398's review)."""
+    """`cotangent` as `like`'s cotangent, every sum taken wide (`sharding.summed_like`)."""
     from dew.nn import sharding
 
-    summing = jnp.promote_types(jnp.promote_types(cotangent.dtype, like.dtype), jnp.float32)
-    extra = cotangent.ndim - like.ndim
-    axes = (*range(extra), *(extra + axis for axis, size in enumerate(like.shape)
-                              if size == 1 and cotangent.shape[extra + axis] != 1))
-    total = sharding.summed_to(jnp.sum(cotangent.astype(summing), axis=axes).reshape(like.shape), like)
-    placed = sharding.explicit_placement(jax.typeof(like))
-    return total if placed is None else jax.sharding.reshard(total, placed)
+    return sharding.summed_like(cotangent, like)
 
 
-_decayed = contracted("test_a_decayed_product_holds_every_order")(
-    declared_tangent(Protected(), _decayed_value, _decayed_tangent, symbolic_zeros=True))
+_decayed_terms = contracted("test_a_decayed_sum_of_products_holds_every_order")(
+    declared_tangent(Protected(), _decayed_terms_value, _decayed_terms_tangent, nondiff_argnums=(0,),
+                     symbolic_zeros=True))
+
+
+_times_decayed = contracted("test_a_decayed_value_times_factors_holds_every_order")(
+    declared_tangent(Protected(), _times_decayed_value, _times_decayed_tangent, symbolic_zeros=True))
 
 
 _scaled_exp = contracted("test_scaled_exp_holds_every_order")(
