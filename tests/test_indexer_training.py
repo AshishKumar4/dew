@@ -516,20 +516,28 @@ def test_a_preview_of_a_decoder_that_refuses_generation_is_refused_or_skipped(tm
     assert not any(isinstance(artifact, FitStarted) for _, artifact in tracker.artifacts)
     assert not tracker.scalars
 
-    def recorded(model, name: str) -> dict:
+    def recorded(model, name: str, *, validated: str) -> dict:
+        """The summary a tracked run records, validating its split by `validation=` ("given"), as its data's
+        own `val` split ("implicit"), or none ("none")."""
         run = TrackedRun()
         monkeypatch.setattr(wandb, "init", lambda **_: run)
         config = LMRunConfig(trainer=TrainerConfig(name=name, steps=1, checkpoint_dir=str(tmp_path),
                                                    log_every=1, eval_every=1, checkpoint_every=None,
                                                    checkpoint_final=False,
                                                    wandb=Wandb("dew", offline=True)))
-        config.train(LMObjective(model, SEQ, samples=samples), data(), name=name, validation=validation(),
-                     metrics=(Perplexity(),))
-        assert any("val/perplexity" in logged for logged in run.history)
+        loader = (Loader(lambda partition: token_batches(), lambda partition: held(), batch=8, records=None)
+                  if validated == "implicit" else data())
+        given = {"validation": validation(), "metrics": (Perplexity(),)} if validated == "given" else {}
+        config.train(LMObjective(model, SEQ, samples=samples), loader, name=name, **given)
+        assert any(any(name.startswith("val/") for name in logged) for logged in run.history) == (
+            validated != "none")
         return run.configuration["run_record"]["summary"]
 
-    assert "skipped" in recorded(refusing, "refusing")["preview"]
-    assert "preview" not in recorded(tiny(dtype="float32", max_seq_len=SEQ, vocab_size=VOCAB), "sampling")
+    for validated in ("given", "implicit"):
+        assert "skipped" in recorded(refusing, f"refusing-{validated}", validated=validated)["preview"]
+    assert "preview" not in recorded(refusing, "refusing-unvalidated", validated="none")
+    sampling = tiny(dtype="float32", max_seq_len=SEQ, vocab_size=VOCAB)
+    assert "preview" not in recorded(sampling, "sampling", validated="given")
 
 
 @pytest.mark.parametrize("phase, topk", [("warmup", None), ("sparse", 4)])
