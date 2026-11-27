@@ -1905,6 +1905,20 @@ def test_a_step_the_fit_check_admits_is_within_the_limit_its_compile_stops_at():
     assert compile_limit(devices, held + batch, built) == compile_limit(devices, held, built) - batch
 
 
+def test_a_step_whose_arguments_alone_pass_its_compiles_limit_is_refused_uncompiled():
+    """A step whose arguments, as some device holds them, take more than its compile's limit alone fits on
+    no compile, its outputs and temporaries XLA sums beside them never negative (`arguments_past`): refused
+    before its compile, its optimization and autotuning spent on nothing; one whose arguments reach the
+    limit exactly, or that compiles under no limit, is its compile's to judge."""
+    from dew.training.memory import LIMIT_EXIT, ArgumentsPastLimit, arguments_past
+
+    limited = {LIMIT_EXIT: 1000}
+    assert isinstance(arguments_past({"gpu:0": 400, "gpu:1": 1001}, limited), ArgumentsPastLimit)
+    assert arguments_past({"gpu:0": 1000, "gpu:1": 999}, limited) is None
+    assert arguments_past({"gpu:0": 10**12}, None) is None
+    assert arguments_past({}, limited) is None
+
+
 def test_a_step_that_fails_on_its_first_run_states_the_room_outside_xla_s_pool():
     """A newly compiled step whose first run fails on its devices is raised as the step's, from the
     devices' own error, which its message states, so a reader of the message alone tells an out-of-memory

@@ -717,6 +717,30 @@ executable stating its memory and its live set and refusing to run; within it, i
 attempt of a plan is one compile, whole where the step can fit and stopped where it cannot."""
 
 
+class ArgumentsPastLimit(ValueError):
+    """A step whose arguments alone, as its devices hold them, take more than its compile's limit
+    (`LIMIT_EXIT`), so no compile of it fits: refused before it is compiled (`arguments_past`)."""
+
+
+def arguments_past(arguments: Mapping[Hashable, int], options: jax.stages.CompilerOptions | None
+                   ) -> ArgumentsPastLimit | None:
+    """The refusal of a step whose arguments' shards alone, on some device (`arguments`, the bytes each of
+    this process's devices' own memory holds of them, `Candidate.arguments`), pass the compile's limit in
+    `options` (`LIMIT_EXIT`): XLA sums a step's arguments, its outputs less those written over an argument,
+    and its temporaries against that limit, each argument whole whatever it aliases or donates and a host
+    memory's none of it, so the arguments a device holds bound that sum from below and a step past it stops
+    at its buffer assignment, its optimization and autotuning paid for nothing (row 12465). None where no
+    device's arguments pass it, or no limit is given; whether such a step fits is its compile's to say."""
+    limit = (options or {}).get(LIMIT_EXIT)
+    if limit is None or not arguments:
+        return None
+    device, held = max(arguments.items(), key=lambda item: item[1])
+    if held <= int(limit):
+        return None
+    return ArgumentsPastLimit(f"the step's arguments take {held} bytes of {device} alone, past the "
+                              f"{int(limit)} bytes its compile is limited to: no compile of it fits")
+
+
 def compile_limit(devices: Sequence, held: int, built: int,
                   resident: Mapping[Hashable, int] | None = None) -> int | None:
     """The bytes past which no step fits `devices` (`LIMIT_EXIT`), as XLA sums a step (its arguments, its

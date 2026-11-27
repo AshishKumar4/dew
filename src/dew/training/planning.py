@@ -58,10 +58,12 @@ from dew.training.distributed import batch_divisor
 from dew.training.interval import latest
 from dew.training.memory import (
     LIMIT_EXIT,
+    ArgumentsPastLimit,
     CodeBounded,
     LiveSet,
     MemoryMiss,
     admitted_or_missed,
+    arguments_past,
     code_bytes,
     compile_limit,
     compiled_if_it_fits,
@@ -1281,13 +1283,21 @@ class FitSearch[LossT, EffectsT]:
                 # lowered and compiled for a step that fits alone (below), where each missed rung lowered,
                 # traced and compiled it for nothing (rows 8411, 10960: half an inspecting climb's time).
                 missed = any(not probe.fits for probe in self.probes)
-                early = None if candidate.sampled is None or missed else candidate.sampled()
-                firsts = report.attempts([(candidate.lowered, options)]
-                                         + ([] if early is None else [(early, options)]))
-                relowered = Relowered(lambda: self.relowering(split))
-                executable = compiled_if_it_fits(candidate.lowered, options, self.refusals, relower=relowered,
-                                                 first=firsts[0])
-                candidate = relowered.candidate(candidate)
+                # A step whose arguments alone pass its compile's limit on some process's device fits on no
+                # compile: refused on every process before any compiles it (`arguments_past`, row 12465).
+                past = arguments_past(candidate.arguments, options)
+                if any(self.gather(past is not None)):
+                    self.refusals.append(past or ArgumentsPastLimit("another process's arguments pass its "
+                                                                    "compile's limit"))
+                    executable = None
+                else:
+                    early = None if candidate.sampled is None or missed else candidate.sampled()
+                    firsts = report.attempts([(candidate.lowered, options)]
+                                             + ([] if early is None else [(early, options)]))
+                    relowered = Relowered(lambda: self.relowering(split))
+                    executable = compiled_if_it_fits(candidate.lowered, options, self.refusals,
+                                                     relower=relowered, first=firsts[0])
+                    candidate = relowered.candidate(candidate)
             fit, headroom, admitted = self.fitting(executable, candidate, options)
             judged = executable
             # Its lowering's own key, derived again only where a spill relowered it.
