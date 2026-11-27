@@ -1,0 +1,17 @@
+HloModule m, entry_computation_layout={(f32[2]{0})->(f32[2]{0}, f32[2]{0})}
+
+body {
+  p = f32[2]{0} parameter(0)
+  n = f32[2]{0} negate(p), metadata={op_name="jit(f)/neg"}
+  x = f32[2]{0} exponential(p), metadata={op_name="jit(f)/exp"}
+  pair = (f32[2]{0}, f32[2]{0}) tuple(n, x)
+  kept = f32[2]{0} get-tuple-element(pair), index=1, frontend_attributes={checkpoint_name="kept"}
+  other = f32[2]{0} get-tuple-element(pair), index=0
+  ROOT t = (f32[2]{0}, f32[2]{0}) tuple(other, kept)
+}
+
+ENTRY e {
+  a = f32[2]{0} parameter(0)
+  f = (f32[2]{0}, f32[2]{0}) fusion(a), kind=kLoop, calls=body
+  ROOT r = (f32[2]{0}, f32[2]{0}) tuple(f, f)
+}

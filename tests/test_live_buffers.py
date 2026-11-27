@@ -1,3 +1,19 @@
+# Copyright 2026 The JAX Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# Modified by Dew: ported from tests/peak_live_test.py, read as Dew's own
+# (the JAX fork's audit of 2026-11-26, its C01/C02).
 """A compile's buffers read from its buffer assignment (`dew.training.live_buffers`): those live at each
 allocation's peak and each over its heap simulation, each by what made it, the `checkpoint_name` its value
 carries and its dimensions' provenance among the call's arguments; on every backend whose compile states an
@@ -112,6 +128,27 @@ def test_a_fusions_output_is_named_by_what_makes_it_where_it_has_no_name():
         peak.logical_buffer_ids.append(buffer_id)
     assert [(each.op_name, each.names) for each in read(assignment, module).live()] == [
         ("jit(f)/neg", ()), ("jit(f)/exp", ("grown",)), ("jit(f)/own", ())]
+
+
+GOTTEN = (FIXTURES / "gotten.hlo").read_text()
+
+
+def test_a_fusion_output_a_named_getter_selects_keeps_the_getters_name():
+    """A fusion's output its root selects through a get-tuple-element named by a checkpoint is named by that
+    getter, though the unnamed tuple it reads is what makes it; its sibling, through an unnamed getter, takes
+    no name, and each keeps the op_name of the instruction making it."""
+    module = module_bytes(GOTTEN)
+    defined = instruction_ids(module, "e")
+    assignment = empty_assignment()
+    assignment.buffer_allocations.add(index=0, size=16)
+    peak = assignment.peak_buffers.add(index=0)
+    for buffer_id, index in enumerate(([0], [1])):
+        buffer = assignment.logical_buffers.add(id=buffer_id, size=8)
+        buffer.defined_at.instruction_id = defined["f"].id
+        buffer.defined_at.shape_index.extend(index)
+        peak.logical_buffer_ids.append(buffer_id)
+    assert [(each.op_name, each.names) for each in read(assignment, module).live()] == [
+        ("jit(f)/neg", ()), ("jit(f)/exp", ("kept",))]
 
 
 TUPLED = (FIXTURES / "tupled.hlo").read_text()

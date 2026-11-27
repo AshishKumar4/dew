@@ -1,3 +1,19 @@
+# Copyright 2026 The JAX Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# Modified by Dew: ported from jax/_src/peak_live.py, read as Dew's own
+# (the JAX fork's audit of 2026-11-26, its C01/C02).
 """The buffers a compile holds: those live at the peak of each of its allocations (`peak_live`), and each over
 the part of a heap simulation's schedule it lives in (`live_intervals`), each with what made it, the
 `checkpoint_name` its value carries and its dimensions' provenance among the call's arguments.
@@ -226,7 +242,9 @@ class Assignment:
                                                      self.computations)
         if written is not None:
             named = written.frontend_attributes.map.get("checkpoint_name")
-        made, within = _maker(instruction, index, self.instructions, self.computations)
+        made, within, getter = _maker(instruction, index, self.instructions, self.computations)
+        if not named and getter is not None:
+            named = getter.frontend_attributes.map.get("checkpoint_name")
         if not named and _names_output(made, within):
             named = made.frontend_attributes.map.get("checkpoint_name")
         op_name = (metadata.op_name or (written.metadata.op_name if written is not None else "")
@@ -276,17 +294,22 @@ def _maker(instruction, index: tuple[int, ...], instructions,
     fuse does: a gemm's fusion, its cuBLAS call and the workspace it holds; a dynamic-slice fusion's root,
     `tuple(updated, get-tuple-element(cublas_call, workspace))`, XLA's
     `dynamic_slice_fusion_rewriter_v2.cc` `CreateFusionBody`); `instruction` itself at `index` for any
-    other."""
+    other. Beside them, the nearest get-tuple-element the walk passed that names the value it selects whole
+    (a `checkpoint_name` on it, its result the output itself), whose name is that value's own where its
+    maker's names its tuple (`_names_output`), or None."""
     if instruction.opcode != "fusion":
-        return instruction, index
+        return instruction, index, None
     made = instructions[computations[instruction.called_computation_ids[0]].root_id]
+    getter = None
     while True:
         if made.opcode == "tuple" and index:
             made, index = instructions[made.operand_ids[index[0]]], index[1:]
         elif made.opcode == "get-tuple-element":
+            if getter is None and not index and made.frontend_attributes.map.get("checkpoint_name"):
+                getter = made
             made, index = instructions[made.operand_ids[0]], (made.tuple_index, *index)
         else:
-            return made, index
+            return made, index, getter
 
 
 def _cublas(maker) -> bool:
