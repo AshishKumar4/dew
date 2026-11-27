@@ -16,7 +16,13 @@ import pytest
 from fla_gdn_support import KernelCase
 from generation_support import COMPILES_FOR_TPU, COMPILES_ON_CPU, INTERPRETS, lowers
 from jax.sharding import AbstractDevice, AbstractMesh, AxisType, Mesh
-from kernel_compile import compile_mosaic_kernels, gate_generations, lowered_for, mosaic_failures
+from kernel_compile import (
+    compile_mosaic_kernels,
+    gate_generations,
+    lowered_for,
+    mosaic_failures,
+    refused_across_build_failures,
+)
 from test_attention_mosaic import (
     BACKWARD_HOOKS,
     CALLS,
@@ -684,6 +690,8 @@ def _check_backward_case(generation_name: str, width: int, accurate: bool, hooks
     assert not record.get("uncertified"), record
     assert offered and all(any(refused for _, _, refused in cert["kernels"].values())
                            for cert in offered), "\n".join(failed)
+    # Every offer refused under every build its GPUs run, none taken ungated where another build holds it.
+    assert not refused_across_build_failures(record), "\n".join(refused_across_build_failures(record))
 
 
 @COMPILES_ON_CPU

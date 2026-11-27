@@ -1,5 +1,7 @@
 """The compile gate's reading of ptxas's notes: a kernel whose assembly ptxas notes a performance loss of
 fails it."""
+import dataclasses
+
 import jax
 import jax.numpy as jnp
 import kernel_compile as kc
@@ -298,3 +300,65 @@ def test_report_binaries_distinguishes_sm100_tmem_mosaic_cubins_from_non_tmem_tr
     triton_raw = [b for b in assembled.binaries(exe_t, decoded=False) if b.kind == "triton"]
     assert triton_decoded and all(b.uses_tmem is False for b in triton_decoded), triton_decoded
     assert triton_raw and all(b.uses_tmem is None for b in triton_raw), triton_raw
+
+
+class _Certified:
+    """A config certification as `refused_across_builds` reads one (`report.Certification`): its op and
+    config, each kernel's module and binary (only its kind read) by its name and launch, whether it was
+    refused, and whether its verdict was read back from the store."""
+
+    def __init__(self, config, kernels: dict[str, str], *, refused: bool, stored: bool = False,
+                 kind: str = "mosaic_gpu"):
+        self.op, self.config, self.stored = "MosaicGmm", config, stored
+        self.kernels = {name: (module, _Binary(kind)) for name, module in kernels.items()}
+        self.refused = (None,) if refused else ()
+
+
+@dataclasses.dataclass(frozen=True)
+class _Binary:
+    """A kernel's binary as `refused_across_builds` reads it: its kind, Mosaic GPU's or Triton's."""
+
+    kind: str
+
+
+def test_a_refused_config_a_build_would_hold_is_held_to_the_gate_under_it():
+    """Row 10766: each Mosaic GPU config certification refused is judged under every build its generation's
+    GPUs run (`kernel_compile.refused_across_builds`): one a build's assembler refuses too (spilling or
+    serializing) passes, production there stepping past it; one a build holds, which production on that
+    build certifies and runs, is held to the gate's kernel checks under it, qualified where it notes no
+    loss and failing the gate where it does (its setmaxnreg ignored); one no build judged here (no PTX
+    printed of a kernel of it) fails; an accepted config, and a Triton launch's (no print of its PTX),
+    are not judged. A kernel's PTX is the module printed as it certified, or, by its module, an earlier
+    case's print, its verdict read from the store or not."""
+    spilling = kc.Assembled(255, 24, ())
+    serialized = kc.Assembled(168, 0, (next(iter(assembled.SERIALIZED)),))
+    clean = kc.Assembled(168, 0, ())
+    ignored = kc.Assembled(168, 0, (assembled.IGNORED_RAISE,))
+    verdicts = {("tile a", "cuda13"): clean, ("tile a", "cuda12"): spilling,
+                ("tile b", "cuda13"): spilling, ("tile b", "cuda12"): serialized,
+                ("tile d", "cuda13"): spilling, ("tile d", "cuda12"): spilling,
+                ("tile f", "cuda13"): ignored, ("tile f", "cuda12"): spilling}
+
+    def read(ptx: str, build: str) -> kc.Assembled:
+        return verdicts[ptx, build]
+
+    printed = {"k_a 0": "tile a", "k_b 0": "tile b", "k_d 0": "tile d", "k_f 0": "tile f", "k_t 0": "tile t"}
+    certified = [_Certified("a", {"k_a 0": "m_a"}, refused=True),
+                 _Certified("b", {"k_b 0": "m_b"}, refused=True),
+                 _Certified("c", {"k_c 0": "m_c"}, refused=True),
+                 _Certified("d", {"k_d 0": "m_d"}, refused=True, stored=True),
+                 _Certified("e", {"k_e 0": "m_e"}, refused=False),
+                 _Certified("f", {"k_f 0": "m_f"}, refused=True),
+                 _Certified("t", {"k_t 0": "m_t"}, refused=True, kind="triton")]
+    judged = kc.refused_across_builds(certified, printed, ("cuda13", "cuda12"), read)
+    assert {entry["config"]: entry["builds"] for entry in judged} == {
+        "'a'": {"cuda13": "qualified", "cuda12": "refused"},
+        "'b'": {"cuda13": "refused", "cuda12": "refused"},
+        "'c'": {"cuda13": "unverified", "cuda12": "unverified"},
+        "'d'": {"cuda13": "refused", "cuda12": "refused"},
+        "'f'": {"cuda13": f"failed: {assembled.IGNORED_RAISE}", "cuda12": "refused"}}
+    failed = kc.refused_across_build_failures({"name": "a case", "refused_builds": judged})
+    assert len(failed) == 3 and all("'c'" in failure or "'f'" in failure for failure in failed)
+    # A later case certifying the same module, which Mosaic printed once: its PTX read by its module.
+    again = kc.refused_across_builds([_Certified("a", {"k_a 0": "m_a"}, refused=True)], {}, ("cuda12",), read)
+    assert again[0]["builds"] == {"cuda12": "refused"}

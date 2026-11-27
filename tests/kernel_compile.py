@@ -23,7 +23,7 @@ import sys
 import tempfile
 import threading
 from collections import Counter
-from collections.abc import Callable, Collection, Mapping
+from collections.abc import Callable, Collection, Mapping, Sequence
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any, NamedTuple
@@ -40,7 +40,7 @@ from sharded import collective_axes
 from dew import _cache
 from dew._builds import generation_builds
 from dew._devices import cuda_builds, nvidia_gpus
-from dew.nn.kernels import grouped_matmul
+from dew.nn.kernels import grouped_matmul, tuning
 from dew.nn.kernels.generation import TARGETS, assumed, capability, compile_only_gpus, gpu_target
 from dew.nn.kernels.lowered import kernel_calls, triton_kernels, unsynced_commits
 from dew.nn.kernels.templates import assembled, report, resources
@@ -425,6 +425,11 @@ def _compiled(case, generation: str, record: dict,
         record["exhausted"] = isinstance(error, report.Exhausted)
         record["uncertified"] = _uncertified_since(uncertified)
         record["certifications"] = _certified_since(certifying)
+        if lowering is not None:
+            # Every offer refused under the certifying build, each judged under the others too: one another
+            # build holds is a launch production there runs that no gate compiled (row 10766).
+            record["refused_builds"] = _judged_across_builds(
+                certifying, printed_modules(dumps(str(lowering), ".ptx")), generation)
         return None
     # A launch the lowering could not certify (`report.certified`) is a failure of its own: its run would
     # find its spills only as its whole program compiles.
@@ -462,7 +467,11 @@ def _compiled(case, generation: str, record: dict,
     if directory is not None:
         record["binaries"] = [dataclasses.asdict(found)
                               for found in assembled.binaries(executable, decoded=True)]
-        write_modules(dumps(str(lowering), ".ptx"), dumps(str(compiling), ".ptx"), directory, modules)
+        # The lowering's print read once: the settled kernels' modules and the refused configs' alike.
+        lowered_modules = printed_modules(dumps(str(lowering), ".ptx"))
+        written({**lowered_modules, **printed_modules(dumps(str(compiling), ".ptx"))}, directory, modules)
+        # Each config certification refused, judged under every build its generation's GPUs run (row 10766).
+        record["refused_builds"] = _judged_across_builds(certifying, lowered_modules, generation)
     if expected is not None:
         record["route"] = _route(lowered, executable, _device(generation, expected.axes))
     record["thunks"] = assembled.launched_thunks(executable)
@@ -499,21 +508,86 @@ def write_modules(lowering: str, compiling: str, directory: str, kernels: Collec
     certification's of its name and launch, which the program does not run (a gradient's forward is another
     kernel than the one certified, the recurrence template's); one of no kernel of the program is a config
     certification refused. Two modules of one name and launch in one print raise."""
-    modules: dict[str, str] = {}
-    for printed in (lowering, compiling):
-        printed_modules: dict[str, str] = {}
-        for part in printed.split(PTX_MODULE)[1:]:
-            entry = PTX_ENTRY.search(part)
-            if entry is None:
-                raise ValueError(f"a printed PTX module names no entry: {part[:200]}")
-            name = assembled.launch_name(*assembled.kernel_of(entry.group(1)))
-            if name in printed_modules:
-                raise ValueError(f"two PTX modules of {name}")
-            printed_modules[name] = part
-        modules.update(printed_modules)
+    written({**printed_modules(lowering), **printed_modules(compiling)}, directory, kernels)
+
+
+def written(modules: Mapping[str, str], directory: str, kernels: Collection[str]) -> None:
+    """Each module of `modules` (`printed_modules`) of the program's `kernels` into `directory` as
+    `<kernel>.ptx` (`write_modules`)."""
     for name, part in modules.items():
         if name in kernels:
-            Path(directory, f"{name}.ptx").write_text("//\n" + PTX_MODULE + part)
+            Path(directory, f"{name}.ptx").write_text(part)
+
+
+def printed_modules(printed: str) -> dict[str, str]:
+    """Each PTX module Mosaic GPU printed in `printed` (`PTX_MODULE`), whole, by its kernel's name and launch
+    (`assembled.launch_name`, its entry's: `assembled.kernel_of`). Two modules of one name and launch in one
+    print raise."""
+    modules: dict[str, str] = {}
+    for part in printed.split(PTX_MODULE)[1:]:
+        entry = PTX_ENTRY.search(part)
+        if entry is None:
+            raise ValueError(f"a printed PTX module names no entry: {part[:200]}")
+        name = assembled.launch_name(*assembled.kernel_of(entry.group(1)))
+        if name in modules:
+            raise ValueError(f"two PTX modules of {name}")
+        modules[name] = "//\n" + PTX_MODULE + part
+    return modules
+
+
+def refused_across_builds(certifications, printed: dict[str, str], builds: Sequence[str],
+                          read: Callable[[str, str], Assembled]) -> list[dict]:
+    """Each Mosaic GPU launch config certification refused (`report.Certification.refused`) judged under every
+    build of `builds` a GPU of its generation runs (row 10766): `refused` where that build's assembler
+    refuses a kernel of it too (`read`, its ptxas's report of a kernel's PTX under a build: a spill or a
+    serialization, `assembled.refuses`), production there stepping past it as the gate did; else production
+    on that build certifies it, a launch the gate's settled kernels are not, held here to the gate's own
+    kernel checks under that build: `qualified` where no kernel of it notes a loss the gate fails
+    (`LOSSES`), else `failed` and the codes. Each kernel's PTX is the module Mosaic GPU printed as it
+    certified (`printed`, `printed_modules`, by name and launch; else by its module where an earlier case
+    printed it, `PTX`): a config whose kernel printed none here (its module compiled before the gate) is
+    `unverified`. A Triton launch's config is not judged here: no print of its PTX is read (its certifying
+    build's verdict alone). Each `{op, config, builds}`."""
+    judged = []
+    for found in certifications:
+        triton = any(binary.kind != "mosaic_gpu" for _, binary in found.kernels.values())
+        if not found.refused or triton:
+            continue
+        sources = {}
+        for name, (module, _) in found.kernels.items():
+            if name in printed:
+                PTX[module] = printed[name]
+            sources[name] = PTX.get(module)
+        verdicts = {}
+        for build in builds:
+            if None in sources.values():
+                verdicts[build] = "unverified"
+                continue
+            reads = [read(ptx, build) for ptx in sources.values()]
+            losses = sorted({code for each in reads for code in each.losses if code in LOSSES})
+            if any(assembled.refuses(each.spilled, each.losses) for each in reads):
+                verdicts[build] = "refused"
+            else:
+                verdicts[build] = f"failed: {', '.join(losses)}" if losses else "qualified"
+        judged.append({"op": found.op, "config": repr(found.config), "builds": verdicts})
+    return judged
+
+
+def _judged_across_builds(certifying: int, printed: dict[str, str], generation: str) -> list[dict]:
+    """`refused_across_builds` of the certifications since the first `certifying`, their PTX as the case's
+    lowering printed it (`printed`, `printed_modules`)."""
+    return refused_across_builds(report.certifications()[certifying:], printed, judged_builds(generation),
+                                 functools.partial(_assembled_under, generation))
+
+
+def refused_across_build_failures(record: dict) -> list[str]:
+    """Each config `record`'s certification refused that a build of its generation's holds but fails the
+    gate's kernel checks under, or that no build's assembler judged here (`refused_across_builds`): a launch
+    production on that build may run that the gate does not qualify."""
+    return [f"{record['name']}: {judged['op']} at {judged['config']} refused as it certified, "
+            f"{verdict} under {build}"
+            for judged in record.get("refused_builds", ()) for build, verdict in judged["builds"].items()
+            if verdict not in ("refused", "qualified")]
 
 
 def _route(lowered, executable, mesh: Mesh) -> dict:
@@ -888,19 +962,26 @@ def ptxas_notes(ptx: str, generation: str) -> str:
     return _ptxas_text(ptx, generation, RELOCATABLE)[0]
 
 
+def _assembled_under(generation: str, ptx: str, build: str) -> Assembled:
+    """ptxas's report of the kernel `ptx` for the CUDA `generation` under JAX's CUDA `build` (`ptxas_of`),
+    compiled as the GPU compiles it (`RELOCATABLE`); a kernel it does not compile raises."""
+    ptxas = ptxas_of(build)
+    text, took = _ptxas_text(ptx, generation, RELOCATABLE, ptxas)
+    if not took:
+        raise RuntimeError(f"{ptxas} does not compile a kernel for {generation}: {text[-400:]}")
+    return ptxas_read(text)
+
+
 def _compiled_reports(directory: str, generation: str) -> dict[str, dict]:
     """Each kernel's registers a thread and spilled bytes as the GPU compiles the PTX Mosaic printed into
     `directory` (`_ptxas_text`, at its own entry), by its name and launch (`assembled.launch_name`), the most
-    of each under every CUDA build the gate judges the generation under (`assemblers`) and every build's
-    notes: its binary is its compile in this process, which may not be the GPU's (`RELOCATABLE`)."""
+    of each under every CUDA build the gate judges the generation under (`judged_builds`,
+    `_assembled_under`) and every build's notes: its binary is its compile in this process, which may not be
+    the GPU's (`RELOCATABLE`)."""
     found = {}
     for path in Path(directory).glob("*.ptx"):
-        reads = []
-        for ptxas in assemblers(generation):
-            text, took = _ptxas_text(path.read_text(), generation, RELOCATABLE, ptxas)
-            if not took:
-                raise RuntimeError(f"{ptxas} does not compile {path.name} for {generation}")
-            reads.append(ptxas_read(text))
+        ptx = path.read_text()
+        reads = [_assembled_under(generation, ptx, build) for build in judged_builds(generation)]
         worst = max(reads, key=lambda read: (read.spilled, read.registers))
         found[path.stem] = {"registers": worst.registers, "spilled": worst.spilled,
                             "losses": tuple(dict.fromkeys(code for read in reads for code in read.losses)),
@@ -922,7 +1003,11 @@ def _compiled_here(cases, generation: str) -> list[dict]:
         # gate's evidence, only as it compiles it, and a program JAX's persistent cache loads compiles
         # nothing, its kernels' records then empty (train 953: three programs loaded from the shared cache
         # gave a B200's gathered cells no registers, no spills and no producer).
-        with tempfile.TemporaryDirectory(prefix="dew-mosaic-") as directory, _cache.uncached():
+        # Its certifications' verdicts kept apart from the store a run reads (`tuning.verdicts_kept_in`), so
+        # each config certifies here and prints its PTX, refused ones among them (row 10766).
+        with (tempfile.TemporaryDirectory(prefix="dew-mosaic-") as directory, _cache.uncached(),
+              tempfile.TemporaryDirectory(prefix="dew-verdicts-") as verdicts,
+              tuning.verdicts_kept_in(verdicts)):
             _compiled(case, generation, record, directory)
             kernels = mosaic_kernels(record)
             # Each kernel's model its launch stated as it traced (`report.Launch.kernels`), whose producer
@@ -967,6 +1052,8 @@ def mosaic_failures(found: list[dict], *, traced_models: bool = False) -> list[s
     none, its launch's as it traced (a case settled as a call takes its tile, `KernelOp.lowering` at None)."""
     failed = failures(found)
     for record in found:
+        # A config the certifying build refused that another holds, a case's every offer refused among them.
+        failed += refused_across_build_failures(record)
         if refused(record):
             continue
         failed += [f"{record['name']}: a launch not certified, {why}"
