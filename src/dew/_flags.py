@@ -14,6 +14,7 @@ from typing import Annotated, Literal, Union
 
 import tyro
 
+from dew import registry
 from dew.registry import Annotation, Bound, Configured, JsonRecords, member_fields
 
 _PLAIN = (int, float, str, bool)
@@ -40,8 +41,9 @@ def _flat(annotation: Annotation) -> Annotation | None:
     return None
 
 
-def _fits(value: Configured, annotation: Annotation) -> bool:
-    """Whether `value` is one a flag of the flat `annotation` (`_flat`) holds."""
+def _fits(value: registry.Configured, annotation: Annotation) -> bool:
+    """Whether `value` is one a flag of the flat `annotation` (`_flat`) holds: any configured value, a union
+    `dew.registry` declares (`Configured`), which this asks of its shape."""
     origin = typing.get_origin(annotation)
     if origin in (Union, types.UnionType):
         return any(_fits(value, member) for member in typing.get_args(annotation))
