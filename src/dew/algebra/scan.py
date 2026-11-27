@@ -46,6 +46,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from jax import lax
+from jax._src.lax import lax as lax_internal
 from jax.custom_batching import custom_vmap
 from jax.custom_derivatives import SymbolicZero
 from jax.extend import core as jcore
@@ -1720,10 +1721,38 @@ def scaled_exp(value, exponent):
 
 
 def _scaled_exp_value(value, exponent):
-    """`scaled_exp`'s value: the factors applied in turn."""
-    for part in _exponents(exponent, _normal_floor(exponent.dtype, base2=False)):
-        value = value * accurate_exp(part)
+    """`scaled_exp`'s value: the factors applied in turn, the exponent split in its own dtype, or in the
+    product's where that is wider (an operand of another dtype, the product's as its arithmetic makes it),
+    widened to it first: a wider value's decay split in a 16-bit exponent's dtype rounded to zero a factor its
+    product keeps (the 2026-11-27 audit's K01)."""
+    exponent = exponent if isinstance(exponent, jax.Array) else jnp.asarray(exponent)
+    held = value if isinstance(value, jax.Array) else jnp.asarray(value)
+    split = exponent.dtype
+    if held.dtype != split:
+        # The product's own type with its first factor as the split makes it (`_by_first`: a TPU's
+        # exponential strong, a weak pair of one dtype keeping it, which `jnp.result_type` reads as the
+        # current default's, a factor its floor promotes), its real lane: the exponent stays real.
+        product = jnp.finfo(jax.eval_shape(_by_first, held, exponent).dtype).dtype
+        if product.itemsize > split.itemsize:
+            # Weak where the exponent is: its factors' type in the product is the parent's.
+            exponent = lax_internal._convert_element_type(exponent, product,
+                                                          weak_type=jax.typeof(exponent).weak_type)
+            split = product
+    for part in _exponents(exponent, _normal_floor(split, base2=False)):
+        value = _by_exp(value, part)
     return value
+
+
+def _by_first(value, exponent):
+    """`value` by the first of `exponent`'s factors split at its own dtype's floor (`_exponents`), as
+    `scaled_exp` applies it: the type its product has (one callable, so its type trace is reused)."""
+    return _by_exp(value, _exponents(exponent, _normal_floor(exponent.dtype, base2=False))[0])
+
+
+def _by_exp(value, exponent):
+    """`value` by `exponent`'s exponential as `scaled_exp`'s factors multiply it: the type their product has
+    (`_scaled_exp_value`'s)."""
+    return value * accurate_exp(exponent)
 
 
 def _scaled_exp_tangent(primals, tangents):
