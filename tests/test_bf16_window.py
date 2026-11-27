@@ -788,6 +788,7 @@ def test_a_stage_stacked_packed_leaf_reads_as_its_stored_layers_rows():
     assert np.shape(np.asarray(first[True])) == (1, 2, 256, 64)
 
 
+@pytest.mark.cpu(reason="a mesh of four of the CPU lane's simulated devices, which a GPU lane holds one of")
 def test_a_packed_bank_split_by_stage_over_an_explicit_axis_reads_its_rows():
     """A packed bank a stage-local store places on this host's simulated devices, its leading (stage) axis
     split over an Explicit mesh axis as `StageLocal` places it and its last over another, read for an export
