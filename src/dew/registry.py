@@ -2099,6 +2099,9 @@ class Bound[Member](ABC):
         its default; one the kind does not declare raises."""
         own = {field.name for field in dataclasses.fields(cls)} - {"bound"}
         unknown = sorted(set(record) - own - {"name", "fields"})
+        if unknown:
+            raise ValueError(f"{cls.__name__} is the record {{'name': ..., 'fields': {{...}}, 'defaults': "
+                             f"{{...}}}}; unknown fields {unknown}")
         default = next(field for field in dataclasses.fields(cls) if field.name == "bound").default_factory
         if "name" in record:
             member = cls._member(text(record["name"], f"{cls.__name__}.name"))
@@ -2107,9 +2110,6 @@ class Bound[Member](ABC):
             member = default().func
         else:
             raise ValueError(f"{cls.__name__}'s record names no member, and the kind has no default one")
-        if unknown:
-            raise ValueError(f"{cls.__name__} is the record {{'name': ..., 'fields': {{...}}, 'defaults': "
-                             f"{{...}}}}; unknown fields {unknown}")
         fields = _records.record(record.get("fields") or {}, f"{cls.__name__}.fields")
         settings: dict[str, Any] = {name: _rebuilt(declared_type(cls, name), value, dtypes=dtypes, name=name)
                                     for name, value in record.items() if name in own}
