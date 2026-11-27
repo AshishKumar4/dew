@@ -16,7 +16,7 @@ from flax.typing import Dtype, PrecisionLike
 from jax.custom_derivatives import SymbolicZero
 
 from ..derivatives import KernelGlue, Protected, contracted, declared_tangent
-from ..precision import accumulated, at_least_fp32, rounded_operand, scaled_partial
+from ..precision import accumulated, at_least_fp32, rounded_operand, scaled_partial, stated_algorithm
 from . import generation
 from .templates.product import SCALE_DEPTH, eight
 
@@ -114,9 +114,10 @@ def dispatched(kernel, portable, interpret_on_cpu: bool, *operands):
 def as_multiplied(tokens: jax.Array, kernel: jax.Array, precision: PrecisionLike) -> tuple:
     """`tokens` and `kernel` as XLA's portable product multiplies them, and its precision (`xla_ragged_dot`,
     `xla_dot`). A precision level (`lax.Precision`) on 16-bit operands is their product's at the default,
-    every level the same exact products; an explicit dot algorithm a call states (`lax.DotAlgorithm`,
-    `DotAlgorithmPreset`: its accumulator among it) reaches XLA as stated, run or refused by the backend,
-    never another computation (audit K2-7)."""
+    every level the same exact products; a dot algorithm the product is declared with (`lax.DotAlgorithm`,
+    `DotAlgorithmPreset`: its accumulator among it), the call's or, where it states none, the run's
+    (`precision.stated_algorithm`), reaches XLA as stated, run or refused by the backend, never another
+    computation (audit K2-7)."""
     if any(eight(operand.dtype) for operand in (tokens, kernel)):
         # FP8 codes are each exact in bfloat16: the product is theirs there, summed in the preferred type
         # (the FP8 contract's reference arm, testing.md, FP8 products). XLA's GPU compiler rewrites no
@@ -124,8 +125,10 @@ def as_multiplied(tokens: jax.Array, kernel: jax.Array, precision: PrecisionLike
         # product holds no F8 GEMM, FS-1625-HLO, row 1625).
         return tokens.astype(jnp.bfloat16), kernel.astype(jnp.bfloat16), jax.lax.Precision.DEFAULT
     if all(jnp.finfo(operand.dtype).bits == 16 for operand in (tokens, kernel)):
-        explicit = isinstance(precision, (jax.lax.DotAlgorithm, jax.lax.DotAlgorithmPreset))
-        return tokens, kernel, precision if explicit else jax.lax.Precision.DEFAULT
+        # The algorithm the product is declared with, the call's or the run's (an omitted precision under a
+        # run's algorithm is that algorithm, row 13686's review), passed explicitly; a level, the default's.
+        algorithm = stated_algorithm(precision)
+        return tokens, kernel, jax.lax.Precision.DEFAULT if algorithm is None else algorithm
     if tokens.dtype != kernel.dtype:
         # A 16-bit operand beside a wider one would reach the TPU kernel
         # 16-bit at HIGHEST too; widened, it is the same values (exactly),

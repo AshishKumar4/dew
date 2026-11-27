@@ -89,7 +89,14 @@ from dew.nn.kernels.templates.gemm.hooks import (
 )
 from dew.nn.kernels.templates.hooks import NO_HOOK, Hook, Side
 from dew.nn.kernels.templates.product import SCALE_DEPTH, bf16_part_count, declared, formed, terms
-from dew.nn.precision import accumulated, asks_default_precision, at_least_fp32, exact_products, twice_scaled
+from dew.nn.precision import (
+    accumulated,
+    asks_default_precision,
+    at_least_fp32,
+    exact_products,
+    stated_algorithm,
+    twice_scaled,
+)
 from dew.nn.programs import read_by
 from dew.nn.sharding import automatic_axes, explicit_spec, varying_like
 
@@ -167,6 +174,7 @@ def gemm(lhs: jax.Array, rhs: jax.Array | NvFp4 | TernaryWeights | Bf16Window,
     gradient chained in one accumulator, each kernel gradient its own; no kernels joined, no output split (row
     6794, M-EM-59i); with no other part (`_gemm_refused`). `selected`, a caller's route of the forward
     (`side_by_side`'s), runs as found."""
+    rhs = _window_served(lhs, rhs, compute, precision, out_dtypes or (out_dtype,))
     if isinstance(rhs, PACKED_FORMATS):
         return _packed_gemm(lhs, rhs, group_sizes, epilogue=epilogue, out_dtype=out_dtype, layer=layer,
                             gather=gather, scatter=scatter, interpret_on_cpu=interpret_on_cpu,
@@ -179,8 +187,7 @@ def gemm(lhs: jax.Array, rhs: jax.Array | NvFp4 | TernaryWeights | Bf16Window,
                   prologue=before, lhs=lhs,
                   beside=beside and (before, after, paired, gather, scatter, applied, compute, layer,
                                      out_dtypes, *named))
-    straight = compute is not None
-    compute = jnp.dtype(lhs.dtype if compute is None else compute)
+    straight, compute = compute is not None, jnp.dtype(lhs.dtype if compute is None else compute)
     dense = group_sizes is None and layer is None
     before = _prologued(before, prologue_jvp)
     paired = None if paired is None else _grouped(lhs, paired, group_sizes, layer)[0]
@@ -355,6 +362,20 @@ def _gemm_refused(group_sizes, *, prologue, gather, scatter, compute, applied, l
     if applied is not None and (prologue is None or (applied.shape, applied.dtype) != (lhs.shape, expected)):
         raise ValueError(f"a formed operand is a prologue's, of the rows' shape {lhs.shape} and dtype "
                          f"{expected}, not {applied.shape} {applied.dtype}")
+
+def _window_served(lhs, rhs, compute, precision, outputs: tuple):
+    """`gemm`'s matrix: a `Bf16Window` whose product (`window_product`: bf16 rows' exact products, fp32 sums
+    none promoted, its dot the run's) is the call's (`templates.product.declared`'s of its `compute` into
+    its `outputs`, neither the call nor the run stating an algorithm), else its decoded matrix (13686)."""
+    if not isinstance(rhs, Bf16Window):
+        return rhs
+    computed = jnp.dtype(lhs.dtype if compute is None else compute)
+    asked = declared(computed, precision, outputs=outputs)
+    from .templates.gemm import window as window_module
+    return rhs if (computed == jnp.dtype(jnp.bfloat16) and not asked.promoted and asked.refusal is None and
+                   stated_algorithm(precision) is stated_algorithm(None) is None) else window_module.admitted(
+                       rhs).decoded()
+
 
 def _packed_gemm(lhs, matrix: NvFp4 | TernaryWeights | Bf16Window, group_sizes, *, epilogue: Hook,
                  out_dtype, layer, gather, scatter, interpret_on_cpu: bool, refused: tuple) -> jax.Array:
