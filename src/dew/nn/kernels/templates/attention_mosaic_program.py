@@ -730,10 +730,17 @@ def _off_tile(jaxpr: jax_core.Jaxpr, tile: tuple[int, int]) -> bool:
     return False
 
 
-def _iota(jaxpr: jax_core.Jaxpr) -> bool:
-    """Whether `jaxpr`, or a computation it nests, forms an iota: a value of its places, not its entries."""
-    return any(eqn.primitive.name == "iota" or any(_iota(nested) for nested in jax_core.jaxprs_in_params(
-        eqn.params)) for eqn in jaxpr.eqns)
+def _rearranges(jaxpr: jax_core.Jaxpr) -> bool:
+    """Whether `jaxpr`, or a computation it nests, reads or lays entries by their places (`REARRANGING`, a
+    cumulative primitive, a broadcast of more than a scalar)."""
+    for eqn in jaxpr.eqns:
+        name = eqn.primitive.name
+        scalar = name == "broadcast_in_dim" and all(not getattr(var.aval, "shape", ()) for var in eqn.invars)
+        if (name in REARRANGING and not scalar) or name.startswith("cum"):
+            return True
+        if any(_rearranges(nested) for nested in jax_core.jaxprs_in_params(eqn.params)):
+            return True
+    return False
 
 
 def _hook_jaxprs(hooks: Hooks, tile: tuple[int, int], value_width: int, *,
@@ -1954,28 +1961,50 @@ def forward_block_plan(total_v: int, columns: int | None, out_dtype, *, has_outp
     return BlockPlan(split, jnp.float32 if split else out_dtype, has_output_mod and not split, pointwise)
 
 
-POINTWISE_TILE = (8, 16)
-"""The tile an output hook is traced at to read whether it is pointwise (`pointwise_tiles`)."""
+POINTWISE_ROWS = 8
+"""The rows an output hook is traced at to read whether it is pointwise (`pointwise_tiles`)."""
+
+REARRANGING = frozenset({"reshape", "transpose", "rev", "slice", "dynamic_slice", "dynamic_update_slice",
+                         "gather", "scatter", "scatter-add", "concatenate", "pad", "iota", "sort",
+                         "broadcast_in_dim", "squeeze"})
+"""Primitives that read or lay an array's entries by their places, not each entry alone: a hook taking one
+is no pointwise hook (`pointwise_tiles`), whatever shapes its values keep; a cumulative one (`cumsum` and
+its kin) alike, by its name."""
 
 
-def pointwise_tiles(hook: Callable | None, kinds: tuple[Kind, ...], dtypes: tuple[str, ...]
+def pointwise_tiles(hook: Callable | None, kinds: tuple[Kind, ...], dtypes: tuple[str, ...], width: int
                     ) -> tuple[str, ...] | None:
     """The dtypes of the tiles an output hook `hook(o, *sides)` makes past its input, where it is pointwise:
-    traced at a tile (`POINTWISE_TILE`) of fp32 output and its parameters' tiles (a head's a scalar), every
-    value of its program that tile's or a scalar's (`_off_tile`, a jitted helper's read so) and none an
-    iota's, so a block of an output tile's columns and the parameters' same columns give that block of its
-    value (`BlockPlan.epilogue_chunk`); None where it is not (a hook laying its parameter at the whole width,
-    a reshape's, keeps the whole-width finish) or where there is none. Its tiles' dtypes are plain data, which
+    traced at a tile `[POINTWISE_ROWS, width]` of fp32 output (`width` the launch's padded value width) and
+    its parameters' tiles (a head's a scalar), every value of its program that tile's or a scalar's
+    (`_off_tile`, a jitted helper's read so) and no equation, nested ones' too, one that reads or lays
+    entries by their places (`REARRANGING`, a broadcast of a scalar its only broadcast), so a block of an
+    output tile's columns and the parameters' same columns give that block of its value
+    (`BlockPlan.epilogue_chunk`); None where it is not (a hook laying its parameter at the whole width, a
+    reshape's, keeps the whole-width finish) or where there is none. Its tiles' dtypes are plain data, which
     a launch keyed by its hook's fingerprint (`tuning.KernelOp.keyed`) keeps."""
     if hook is None or not callable(hook):
         return None
-    params = [jax.ShapeDtypeStruct(() if kind is Kind.HEAD else POINTWISE_TILE, kept)
-              for kind, kept in zip(kinds, dtypes, strict=True)]
-    closed = jax.make_jaxpr(hook)(jax.ShapeDtypeStruct(POINTWISE_TILE, jnp.float32), *params)
-    if _off_tile(closed.jaxpr, POINTWISE_TILE) or _iota(closed.jaxpr):
+
+    def traced(columns: int):
+        # Its program at a tile `columns` wide, or None where it takes none (a hook of a fixed width's).
+        tile = (POINTWISE_ROWS, columns)
+        params = [jax.ShapeDtypeStruct(() if kind is Kind.HEAD else tile, kept)
+                  for kind, kept in zip(kinds, dtypes, strict=True)]
+        try:
+            closed = jax.make_jaxpr(hook)(jax.ShapeDtypeStruct(tile, jnp.float32), *params)
+        except (TypeError, ValueError):
+            return None
+        return None if _off_tile(closed.jaxpr, tile) or _rearranges(closed.jaxpr) else closed
+
+    # Traced at the launch's width and at a chunk's narrowest, so a hook whose program holds at the whole
+    # width alone (an operation the reshape of a same shape elides) is none.
+    closed, narrow = traced(width), traced(POINTWISE_ROWS)
+    if closed is None or narrow is None:
         return None
+    tile = (POINTWISE_ROWS, width)
     return tuple(jnp.dtype(var.aval.dtype).name for eqn in closed.jaxpr.eqns for var in eqn.outvars
-                 if tuple(var.aval.shape) == POINTWISE_TILE)
+                 if tuple(var.aval.shape) == tile)
 
 
 def value_columns(padded: int, columns: int | None) -> int:

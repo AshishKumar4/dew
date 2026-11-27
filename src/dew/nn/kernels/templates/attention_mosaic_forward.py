@@ -1602,8 +1602,8 @@ def _stored_walk(program: _Program, spec: algebra.Forward, state: algebra.Partia
         elif (chunk := BlockPlan(
                 split=False, out_dtype=out_view.dtype, output_hook=hooks.output.fn is not None,
                 pointwise=pointwise_tiles(hooks.output.fn, kinds_of(hooks.output.sides),
-                                          tuple(kept_dtype(side.value.dtype) for side in hooks.output.sides))
-                is not None).epilogue_chunk(
+                                          tuple(kept_dtype(side.value.dtype) for side in hooks.output.sides),
+                                          state.acc.shape[-1]) is not None).epilogue_chunk(
                 family, state.acc.shape[-1], out_view.dtype, masked=keep is not None, kept=False)):
             # so `state.acc` and `output` fit without spilling (rows 5272, 10864); the output hook, pointwise
             # in its entries (`Hooks.output`), on each chunk with its parameters' block of the chunk's

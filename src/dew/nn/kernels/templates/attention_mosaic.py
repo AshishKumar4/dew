@@ -1567,7 +1567,8 @@ def _forward_call(query: jax.Array, key: jax.Array, value: jax.Array, spans: Key
                        output_dtypes=tuple(kept_dtype(param.value.dtype) for param in hooks.output.sides),
                        output_tiles=pointwise_tiles(hooks.output.fn, kinds_of(hooks.output.sides),
                                                     tuple(kept_dtype(param.value.dtype)
-                                                          for param in hooks.output.sides)),
+                                                          for param in hooks.output.sides),
+                                                    head_width(value.shape[3])),
                        score_reduces=hook_reduces(hooks), output_width=head_width(value.shape[3]),
                        form=spans.form, keys=spans.keys,
                        scale=logit_scale(query.shape[3], scale), natural=natural,
