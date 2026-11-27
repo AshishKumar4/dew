@@ -73,11 +73,12 @@ def test_a_tight_start_compiles_second_a_place_that_fits(tmp_path, monkeypatch, 
 
 
 def test_a_looped_decoder_reading_its_passes_apart_compiles_second_its_unfused_tile(tmp_path, monkeypatch):
-    """A looped decoder whose loss weighs each pass's exit scores its tiled head unfused (a tile of 4096 tokens
-    by 8192 columns, 128 MiB of logits, where a fused head's chunk scores the whole vocabulary, 512 MiB): on
-    an H100 whose allocator holds halfway between what its step needs whole and tiled, its second compile is
-    its head tiled unfused, no layer recomputed, and fits. A quote of the fused chunk it never runs still
-    reads that tile as fitting there, and compiles it second as a fused head's (train 1387's P2)."""
+    """A looped decoder whose loss weighs each pass's exit scores its tiled head unfused (a tile of 4096
+    tokens by 8192 columns, 128 MiB of logits, where a fused head's chunk scores the whole vocabulary, 512
+    MiB): on an H100 whose allocator holds halfway between what its step needs whole and tiled, its second
+    compile is its head tiled unfused, no layer recomputed, and fits. A quote of the fused chunk it never
+    runs still reads that tile as fitting there, and compiles it second as a fused head's (train 1387's
+    P2)."""
     monkeypatch.setenv("DEW_RUNG_RECORDS", str(tmp_path))
     room = (need(None, tiled=True, looped=True) + need(None, looped=True)) // 2
     probes = searched(decoder(room, looped=True))["probes"]
