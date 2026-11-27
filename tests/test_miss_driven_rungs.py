@@ -152,10 +152,9 @@ def scripted_search(gather):
 
     model = models.build("causal_transformer", vocab_size=32, emb_features=16, num_layers=1, num_heads=2,
                          mlp_features=32, max_seq_len=8)
-    search = FitSearch(lower=None, options=lambda candidate: None, objective=LMObjective(model, seq_len=8),
-                       mesh=MeshSpec().build(jax.devices()[:1]), xla_defaults=False, narrow=False,
-                       ns_group=None, base=None, resumed=None, gather=gather)
-    return search
+    return FitSearch(lower=None, options=lambda candidate: None, objective=LMObjective(model, seq_len=8),
+                     mesh=MeshSpec().build(jax.devices()[:1]), xla_defaults=False, narrow=False,
+                     ns_group=None, base=None, resumed=None, gather=gather)
 
 
 def test_a_jumped_rung_fitting_at_a_split_its_walk_passed_over_is_admitted_there():
