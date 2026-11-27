@@ -71,7 +71,13 @@ from op_certificates import BFLOAT16, FLOAT16, FLOAT32
 from dew._hashing import array_fingerprint
 from dew.nn.kernels import recurrence_algebra, tables
 from dew.nn.kernels.templates import product
-from dew.nn.kernels.templates.recurrence import chunk_forward, intra, mainloop, template
+from dew.nn.kernels.templates.recurrence import (
+    anchored as anchored_pairs,
+    chunk_forward,
+    intra,
+    mainloop,
+    template,
+)
 
 LOG2E = recurrence_algebra.LOG2_E
 EXPONENT_BOUND = 2.0 ** -38
@@ -733,8 +739,8 @@ class Run:
     """Whether its own pairs fold each decay into the key before the row (`Lane.unit_pairs`): a delta rule's
     unit keys, as the draws' layers declare them."""
     anchored: bool
-    """Whether its own pairs are anchored products (`Lane.anchored`: the layer declares its decay bound,
-    `anchored.anchoring`)."""
+    """Whether its own pairs are anchored products (`Lane.anchored`: the layer declares its decay bound and
+    its family's products read shared memory, `anchored.anchoring`)."""
     rounded_prefix: bool
     """Whether its decay a key dimension's prefix is its rounded sum alone (`Lane.rounded_prefix`,
     `mainloop.prefix_limbs`)."""
@@ -1024,7 +1030,8 @@ def recorded(q, k, v, g, beta, h0, *, starts=None, max_segments: int | None = No
                pairing=intra.pairing_parts(held),
                merged=mainloop.merge_parts(family, jnp.float32 if wide else dtype, held=held, ranged=False),
                tf32=tf32_conversion(family), trained=bool(trained), unit_pairs=unit_pairs,
-               anchored=np.ndim(g) == 4 and decay_bound is not None and jnp.dtype(dtype).itemsize == 2,
+               anchored=(np.ndim(g) == 4 and decay_bound is not None and jnp.dtype(dtype).itemsize == 2
+                         and anchored_pairs.anchors_on(family)),
                solve=(mainloop.merge_parts(solving, jnp.float32 if wide else dtype, held=held, ranged=False),
                       tf32_conversion(solving)),
                rounded_prefix=mainloop.prefix_limbs(np.ndim(g) == 4, decay_bound, chunk, dtype) == 1,
