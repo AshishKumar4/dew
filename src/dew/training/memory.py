@@ -996,11 +996,16 @@ class LiveProfile:
                          or any(backward_made(op_name) for _, op_name in within(interval))))
 
         def until(interval: LiveInterval) -> int:
-            # Past its forward's last read of it; to its end where a forward read is placed nowhere.
+            # Past its forward's last read of it; to its end where a forward read is placed nowhere. A value
+            # made before the backward begins is read by its forward before then: a read named the
+            # forward's past it is a fusion of the backward's that took a forward op's name.
             read = [position for position, op_name in within(interval) if forward_made(op_name)]
             if UNPLACED in read:
                 return interval.end
-            return max(read, default=interval.start) + 1
+            last = max(read, default=interval.start) + 1
+            if backward is not None and interval.start < backward:
+                return min(last, backward)
+            return last
 
         return LiveProfile(tuple(
             Held(interval.bytes, interval.op_name, tuple(interval.names),
