@@ -134,7 +134,6 @@ def stage_packed(args) -> dict:
     import jax
     from jax.sharding import NamedSharding, PartitionSpec
     from multiprocess_worker import pipeline_trainer
-
     from stage_save_worker import paired_devices
 
     from dew._coordination import PeerFailure
