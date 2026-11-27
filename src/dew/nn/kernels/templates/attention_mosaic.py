@@ -2444,14 +2444,18 @@ class CertifiedBackward(MosaicBackward):
 def backward_certified(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans,
                        hooks: Hooks | None, dout: jax.Array, *,
                        residuals: tuple[jax.Array, jax.Array, jax.Array, Split], scale: float | None = None,
-                       natural: bool = NATURAL, interpret: bool = False) -> tuple[Gradients, BackwardRows]:
-    """The accurate backward's certify form, `backward`'s two launches at the tiles its call derives
-    (`MosaicBackward.derived`): their gradients and the rows of D they took (`BackwardRows`). Off in
-    production; tests/attention_witness.py holds each gradient to its enclosure from them. A call no config
-    holds raises the reason the backward declines it (`MosaicBackward.declined`)."""
+                       natural: bool = NATURAL, accurate: bool = True, interpret: bool = False
+                       ) -> tuple[Gradients, BackwardRows, BackwardTiles]:
+    """The backward's certify form in the form `accurate` names, `backward`'s launches at the tiles its call
+    derives (`MosaicBackward.derived`): their gradients, the rows of D they took (`BackwardRows`), a fused
+    launch's its forward's own (its denominator, D as `split_delta` took it, nothing lost), two launches'
+    the dQ launch's (its own denominator and D refined, `gradient.dq_finish`), and those tiles, which say
+    whether one launch ran or two (`BackwardTiles.fused`). Off in production;
+    tests/attention_witness.py holds each gradient to its enclosure from them. A call no config holds raises
+    the reason the backward declines it (`MosaicBackward.declined`)."""
     query, key, hooks = prologues_taken(query, key, hooks)
     op, args = _backward_call(query, key, value, spans, hooks, dout, residuals, scale=scale, natural=natural,
-                              accurate=True, certify=True)
+                              accurate=accurate, certify=True)
     ba = op.bind(*args, interpret=interpret)
     target = generation.gpu_target()
     config = op.derived(ba, target)
@@ -2460,7 +2464,7 @@ def backward_certified(query: jax.Array, key: jax.Array, value: jax.Array, spans
     kwargs = {name: value for name, value in ba.kwargs.items() if name != "return_residuals"}
     # Its kernels named and refused as its own launch's (`report.launching`), as a call's are.
     with report.launching(op, ba, config):
-        return op.gradients_of(*ba.args, config=config, certify=True, **kwargs)
+        return (*op.gradients_of(*ba.args, config=config, certify=True, **kwargs), config)
 
 
 def _backward_call(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks | None,

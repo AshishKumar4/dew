@@ -350,6 +350,7 @@ def backward_launched(query, key, value, dout, form: str, *, interpret: bool, si
     its certify form (`attention_mosaic.backward_certified`), with the rows of D its launches took
     (`template.BackwardRows`)."""
     import jax
+    import jax.numpy as jnp
 
     from dew.nn.kernels import generation
 
@@ -358,13 +359,13 @@ def backward_launched(query, key, value, dout, form: str, *, interpret: bool, si
         kept = template.Kept.SPLIT if accurate else template.Kept.OUTPUT
         out, *residuals = attention_mosaic.forward(q, k, v, spans, hooks_of(form), residuals=kept,
                                                    interpret=interpret)
-        if accurate:
-            grads, rows = attention_mosaic.backward_certified(q, k, v, spans, hooks_of(form), do,
-                                                              residuals=tuple(residuals), interpret=interpret)
-        else:
-            grads, rows = attention_mosaic.backward(q, k, v, spans, hooks_of(form), do,
-                                                    residuals=tuple(residuals), interpret=interpret), ()
-        return out, residuals[0], residuals[1], grads.query, grads.key, grads.value, *rows
+        grads, rows, tiles = attention_mosaic.backward_certified(
+            q, k, v, spans, hooks_of(form), do, residuals=tuple(residuals), accurate=accurate,
+            interpret=interpret)
+        # Whether one launch ran or two (`BackwardTiles.fused`), an output of the program, so a prepared
+        # native run's stored program gives it too (no Python of it runs there).
+        fused = jnp.asarray(tiles.fused, jnp.float32)
+        return out, residuals[0], residuals[1], grads.query, grads.key, grads.value, *rows, fused
 
     if interpret:
         with generation.assumed("sm90"):
@@ -377,41 +378,43 @@ def backward_launched(query, key, value, dout, form: str, *, interpret: bool, si
         form_of = f"{form}, accurate" if accurate else form
         label = f"attention backward witness, {site}, {form_of}, {generation.assumption()}, {shapes}"
         found = ahead_arm(jax.jit(program), label)(query, key, value, dout)
-    names = ("out", "m", "l", "dq", "dk", "dv", *(template.BackwardRows._fields if accurate else ()))
+    names = ("out", "m", "l", "dq", "dk", "dv", *template.BackwardRows._fields, "fused")
     # On the host (a prepare's zeros are NumPy's; no device array is made under a compile-only default).
-    return {name: np.asarray(np.asarray(x).astype(np.float32), np.float64)
-            for name, x in zip(names, found, strict=True)}
+    records = {name: np.asarray(np.asarray(x).astype(np.float32), np.float64)
+               for name, x in zip(names, found, strict=True)}
+    return {**records, "accurate": np.asarray(accurate), "fused": records["fused"] != 0}
 
 
 def backward_witnessed(query, key, value, dout, kept, records: dict, *, lane: Lane | None = None,
                        softcap: float | None = None, sloped: bool = True
                        ) -> dict[str, tuple[np.ndarray, np.ndarray]]:
-    """Each gradient of the fast backward's `records` (`backward_launched`) held elementwise to its
-    enclosure under the mask `kept`, from the forward's stored output, maxima and denominators, natural
-    units (as the forward's witness holds each state from the stored ones; the attention lane's order,
-    2026-11-27): each query's and key's products `s` (fp32 on the tensor cores), the weights
+    """Each gradient of the backward's `records` (`backward_launched`: its certify form's, with the rows of D
+    its launches took, `template.BackwardRows`) held elementwise to its enclosure under the mask `kept`, from
+    the forward's stored maxima and denominators, natural units (as the forward's witness holds each state
+    from the stored ones; the attention lane's order, 2026-11-27), for the schedule that ran, which its rows
+    state: each query's and key's products `s` (fp32 on the tensor cores), the weights
     `P = exp2(s f - m log2(e)) (1/l)` (the walk's factor `f`; the maximum's units an fp32 product; the
     multiply and the subtraction one FMA or two roundings; `1/l` a divide within two steps of its correctly
-    rounded value, `div.full`'s reach), `dP = dO Vᵀ` (fp32), the score cotangents `P ((dP - c) - (D - c))`
-    about an anchor `c`, one of the row's `dP` as XLA sums it (`gradient.split_delta`), held for any such
-    anchor: `dP - D` within three fp32 roundings of the row's magnitudes, `D`'s and `D - c`'s sums `gamma`
-    of their terms; times the call's whole scale (`grad_scale`) in fp32, cast to bf16; and the gradients
-    `dV = bf16(P)ᵀ dO`, `dK = dSᵀ Q`, `dQ = dS K`, each a tensor-core sum over every walked query or key in
-    any order, cast to bf16. Under a cap (`softcap`), the logits are recomputed natural as the hook states
-    them, `cap tanh(fp32(s scale) / cap)` (each divide within two steps, `div.full`'s reach; tanh within
-    its lane's reach), their weights `exp2` of their natural units, and each score cotangent times the hook's
-    slope as JAX's vjp of it takes it on ones: `cap`, times `1 - t²` (`one_minus_square`, fused or not),
-    over `cap` (none where not `sloped`: a fault's witness, all else capped). The accurate form's (`records`
-    holding its centre): its cotangents about the D its dQ pass refines (`_centred`), fp32 at their products
-    as three bf16 parts summing to each exactly (`attention_algebra.formed_parts`), where the fast form casts
-    them to bf16 once, and its dQ as that pass forms it (`_accurate_dq`). For each gradient, the entries held
-    and those inside."""
+    rounded value, `div.full`'s reach), the dK/dV launch's over its own denominator (`T'` where two launches
+    ran, the forward's `l` where one did), `dP = dO Vᵀ` (fp32), the score cotangents
+    `P ((dP - c) - (D - c))` about the anchor and D the launch took (`_centred`: two launches' D refined from
+    the dQ launch's sums, `gradient.dq_finish`); times the call's whole scale (`grad_scale`) in fp32, cast to
+    bf16; and the gradients `dV = bf16(P)ᵀ dO`, `dK = dSᵀ Q`, each a tensor-core sum over every walked query
+    in any order, and `dQ` as its launch forms it (`_fast_dq`), cast to bf16. Under a cap (`softcap`), the
+    logits are recomputed natural as the hook states them, `cap tanh(fp32(s scale) / cap)` (each divide
+    within two steps, `div.full`'s reach; tanh within its lane's reach), their weights `exp2` of their
+    natural units, and each score cotangent times the hook's slope as JAX's vjp of it takes it on ones:
+    `cap`, times `1 - t²` (`one_minus_square`, fused or not), over `cap` (none where not `sloped`: a fault's
+    witness, all else capped). The accurate form's (`records["accurate"]`): its cotangents fp32 at their
+    products as three bf16 parts summing to each exactly (`attention_algebra.formed_parts`), where the fast
+    form casts them to bf16 once, and its dQ as its pass forms it (`_accurate_dq`). For each gradient, the
+    entries held and those inside."""
     lane = attention_lane() if lane is None else lane
     lane = dataclasses.replace(lane, block=0)
     q, k, v, do = (np.asarray(np.asarray(x, np.float32), np.float64) for x in (query, key, value, dout))
     power, left = template.prescale(np.dtype(query.dtype), q.shape[3], None)
     factor, grad_scale = float(np.float32(left * LOG2E)) * power, power * left
-    unit = 2.0 ** -FLOAT32.precision
+    accurate = bool(records["accurate"])
     held = {name: [] for name in ("dq", "dk", "dv")}
     for b in range(q.shape[0]):
         keeps = np.broadcast_to(kept, (q.shape[0], 1, *kept.shape[2:]))[b, 0]
@@ -453,32 +456,16 @@ def backward_witnessed(query, key, value, dout, kept, records: dict, *, lane: La
                 found = fp32(mul(unnormalized, Iv(low[:, None], high[:, None])), lane)
                 return Iv(np.where(keeps, found.lo, 0.0), np.where(keeps, found.hi, 0.0))
 
-            # The forward's denominator, the fast form's and the accurate dQ pass's; the accurate dK/dV
-            # launch's the dQ pass's own (`dq_finish`).
+            # The dQ launch's weights over the forward's denominator; the dK/dV launch's over its launch's own
+            # (`BackwardRows.denominator`: two launches' the dQ pass's `T'`, `attention_gradient.dq_finish`;
+            # a fused launch's the forward's), about the D it took (the refined one, or the fused launch's).
             weights = over(total)
-            weighed = over(records["denominator"][b, h]) if "denominator" in records else weights
+            weighed = over(records["denominator"][b, h])
             pulled = dot(point(do[b, :, h]), point(v[b, :, kv].T), lane)
-            if "delta" in records:
-                differences = _centred(pulled, records, b, h, lane)
-            else:
-                # D and an anchor's terms: dO times the output, and times any key's values (`D - c`'s,
-                # summed whole), each bf16 product exact in fp32, their sums gamma_n of their magnitudes.
-                out, width = records["out"][b, :, h], do.shape[3]
-                gamma = width * unit / (1 - width * unit) + (width + 2) * 2.0 ** -52
-                magnitudes = (np.abs(do[b, :, h]) * (np.abs(out) + np.abs(v[b, :, kv]).max(0))).sum(-1)
-                delta = (do[b, :, h] * out).sum(-1)
-                reach = np.maximum(np.abs(pulled.lo), np.abs(pulled.hi))
-                anchor = reach.max(-1)
-                slack = ((gamma * magnitudes)[:, None]
-                         + 3 * unit * (reach + np.abs(delta)[:, None] + 3 * anchor[:, None]))
-                differences = Iv(pulled.lo - delta[:, None] - slack, pulled.hi - delta[:, None] + slack)
-            cotangents = fp32(mul(weighed, differences), lane)
-            if slope is not None:
-                cotangents = fp32(mul(cotangents, slope), lane)
-            cotangents = fp32(mul(cotangents, point(grad_scale)), lane)
-            cotangents = Iv(np.where(keeps, cotangents.lo, 0.0), np.where(keeps, cotangents.hi, 0.0))
+            cotangents = _scored(fp32(mul(weighed, _centred(pulled, records, b, h, lane)), lane), slope,
+                                 grad_scale, keeps, lane)
             dv = dot(cast(Iv(weighed.lo.T, weighed.hi.T), BFLOAT16), point(do[b, :, h]), lane)
-            if "prior" in records:
+            if accurate:
                 # The accurate form's cotangents fp32, as three bf16 parts summing to each exactly
                 # (`attention_algebra.formed_parts`, `product.bf16_parts`), each part's product exact.
                 dk = dot(Iv(cotangents.lo.T, cotangents.hi.T), point(q[b, :, h]), lane, parts=(3, 1))
@@ -486,7 +473,11 @@ def backward_witnessed(query, key, value, dout, kept, records: dict, *, lane: La
             else:
                 cotangents = cast(cotangents, BFLOAT16)
                 dk = dot(Iv(cotangents.lo.T, cotangents.hi.T), point(q[b, :, h]), lane)
-                dq = dot(cotangents, point(k[b, :, kv]), lane)
+                dq = _fast_dq(pulled, weights, slope, grad_scale, keeps, k[b, :, kv], records, b, h, lane)
+                for name, inside in _fast_rows(pulled, weights, unnormalized, keeps, do[b, :, h],
+                                               records["out"][b, :, h], v[b, :, kv], records, b, h,
+                                               lane).items():
+                    held.setdefault(name, []).append((np.ones(inside.shape, bool), inside))
             for name, found in (("dq", dq), ("dk", dk), ("dv", dv)):
                 stored = records[name][b, :, h if name == "dq" else kv]
                 held[name].append((np.ones(stored.shape, bool), within(stored, cast(found, BFLOAT16))))
@@ -516,6 +507,87 @@ def _centred(pulled: Iv, records: dict, b: int, h: int, lane: Lane, *, prior: bo
                        Iv(refined.lo[:, None], refined.hi[:, None])), lane)
     summed = fp32(add(pulled, Iv(-centred.hi, -centred.lo)), lane)
     return hull(stepwise, summed)
+
+
+def _scored(cotangents: Iv, slope: Iv | None, grad_scale: float, keeps: np.ndarray, lane: Lane) -> Iv:
+    """Softmax cotangents as a launch finishes its score cotangents (`backward_witnessed`): times the cap's
+    slope where there is one, then the call's whole scale, each in fp32, zero where a query sees no key."""
+    if slope is not None:
+        cotangents = fp32(mul(cotangents, slope), lane)
+    cotangents = fp32(mul(cotangents, point(grad_scale)), lane)
+    return Iv(np.where(keeps, cotangents.lo, 0.0), np.where(keeps, cotangents.hi, 0.0))
+
+
+def _fast_dq(pulled: Iv, weights: Iv, slope: Iv | None, grad_scale: float, keeps: np.ndarray,
+             keys: np.ndarray, records: dict, b: int, h: int, lane: Lane) -> Iv:
+    """The fast backward's dQ of one head (`backward_witnessed`) as its dQ launch forms it: its score
+    cotangents over the forward's denominator about the D `split_delta` took (`records["prior"]`), cast to
+    bf16, their tensor-core sum with the keys, times the forward's denominator over the launch's own
+    (`attention_gradient.dq_finish`'s ratio, one division within `div.full`'s reach), rounded, where two
+    launches ran (row 13697: the GPU tier's under deterministic ops); a fused launch's sum alone."""
+    first = _scored(fp32(mul(weights, _centred(pulled, records, b, h, lane, prior=True)), lane), slope,
+                    grad_scale, keeps, lane)
+    sums = dot(cast(first, BFLOAT16), point(keys), lane)
+    if records["fused"]:
+        return sums
+    ratio = _quotient(point(records["l"][b, h]), point(records["denominator"][b, h]), lane)
+    return fp32(mul(sums, Iv(ratio.lo[:, None], ratio.hi[:, None])), lane)
+
+
+def _fast_rows(pulled: Iv, weights: Iv, exponentials: Iv, keeps: np.ndarray, do: np.ndarray, out: np.ndarray,
+               values: np.ndarray, records: dict, b: int, h: int, lane: Lane) -> dict[str, np.ndarray]:
+    """The fast backward's rows of D (`template.BackwardRows`) held to enclosures of their own, apart from
+    the gradients they centre (a launch that took and stated a wrong D refused): the prior `D - c` within
+    `gamma` of its terms' magnitudes of `dO · O` less the chosen key's `dO · v_c` (exact, float64; 0 where
+    it took none), and the anchor `c` within the same of its own; where two launches ran (the denominator
+    the dQ launch's own), that denominator within its exponentials' fp32 sum in any order, and the refined
+    `D - c` within `fl((D - c) + r)` of `dq_finish`'s refinement `r = fl(fl(R ratio) / fl(T' fl(1/T')))`,
+    `R` the first pass's cotangents' fp32 sum; where one did (`records["fused"]`, the certify launch's
+    tiles', never read off its rows: two launches may take the forward's denominator to the bit), the
+    forward's denominator and its D, nothing lost. Each `[Q]` the entries inside."""
+    width = do.shape[-1]
+    gamma = width * FLOAT32.unit_roundoff / (1 - width * FLOAT32.unit_roundoff) + (width + 2) * 2.0 ** -52
+    chosen = records["chosen"][b, h].astype(np.int64)
+    centre = np.where(chosen < 0, 0.0, (do * values[np.maximum(chosen, 0)]).sum(-1))
+    magnitudes = (np.abs(do) * (np.abs(out) + np.abs(values).max(0))).sum(-1)
+    delta = (do * out).sum(-1) - centre
+    prior, anchor = records["prior"][b, h], records["anchor"][b, h]
+    # Each sum within `gamma` of its terms' magnitudes, `D - c` one more rounding.
+    reach = gamma * magnitudes + 2 * FLOAT32.unit_roundoff * np.abs(delta)
+    own_reach = gamma * magnitudes
+    found = {"prior": within(prior, Iv(delta - reach, delta + reach)),
+             "anchor": (chosen < 0) | within(anchor, Iv(centre - own_reach, centre + own_reach))}
+    total, own = records["l"][b, h], records["denominator"][b, h]
+    if records["fused"]:
+        # One launch (`BackwardTiles.fused`, as the certify form derived it): the forward's own rows.
+        found["denominator"] = own == total
+        found["delta"] = (records["delta"][b, h] == prior) & (records["lost"][b, h] == 0)
+        return found
+    kept = Iv(np.where(keeps, exponentials.lo, 0.0), np.where(keeps, exponentials.hi, 0.0))
+    found["denominator"] = within(own, summed(kept, lane))
+    first = fp32(mul(weights, _centred(pulled, records, b, h, lane, prior=True)), lane)
+    first = Iv(np.where(keeps, first.lo, 0.0), np.where(keeps, first.hi, 0.0))
+    # `1 / T'` and `l / T'` each one division within `div.full`'s reach, as `dq_finish` forms them.
+    inverse = _quotient(point(np.ones_like(own)), point(own), lane)
+    mass = fp32(mul(point(own), inverse), lane)
+    scaled = fp32(mul(summed(first, lane), _quotient(point(total), point(own), lane)), lane)
+    refinement = _quotient(scaled, mass, lane)
+    found["delta"] = within(records["delta"][b, h], fp32(add(point(prior), refinement), lane))
+    return found
+
+
+def _quotient(numerator: Iv, divisor: Iv, lane: Lane) -> Iv:
+    """An fp32 quotient of values within `numerator` by positive ones within `divisor`, within two steps of
+    its correctly rounded value (`div.full`'s reach); 0 where the divisor may be (`dq_finish`'s guard)."""
+    positive = divisor.lo > 0
+    safe = Iv(np.where(positive, divisor.lo, 1.0), np.where(positive, divisor.hi, 1.0))
+    ends = np.stack(np.broadcast_arrays(numerator.lo / safe.lo, numerator.lo / safe.hi,
+                                        numerator.hi / safe.lo, numerator.hi / safe.hi))
+    found = fp32(Iv(ends.min(0), ends.max(0)), lane)
+    lo, hi = found.lo, found.hi
+    for _ in range(2):
+        lo, hi = stepped(lo, FLOAT32, -np.inf), stepped(hi, FLOAT32, np.inf)
+    return Iv(np.where(positive, lo, np.minimum(lo, 0.0)), np.where(positive, hi, np.maximum(hi, 0.0)))
 
 
 def _accurate_dq(pulled: Iv, weights: Iv, slope: Iv | None, grad_scale: float, keeps: np.ndarray,
@@ -556,11 +628,8 @@ def _accurate_dq(pulled: Iv, weights: Iv, slope: Iv | None, grad_scale: float, k
     twice = 3 * FLOAT32.unit_roundoff * np.maximum(np.abs(product.lo), np.abs(product.hi))
     correction = fp32(Iv(product.lo - twice, product.hi + twice), lane)
     difference = fp32(add(sums, Iv(-correction.hi, -correction.lo)), lane)
-    total, own = records["l"][b, h], records["denominator"][b, h]
-    lo = hi = nearest(np.where(own > 0, total / np.where(own > 0, own, 1.0), 0.0), FLOAT32)
-    for _ in range(2):
-        lo, hi = stepped(lo, FLOAT32, -np.inf), stepped(hi, FLOAT32, np.inf)
-    return fp32(mul(difference, Iv(lo[:, None], hi[:, None])), lane)
+    ratio = _quotient(point(records["l"][b, h]), point(records["denominator"][b, h]), lane)
+    return fp32(mul(difference, Iv(ratio.lo[:, None], ratio.hi[:, None])), lane)
 
 
 def _divided(numerator: Iv, divisor: float, lane: Lane) -> Iv:
@@ -598,6 +667,55 @@ def assert_backward_witnessed(seed: int, form: str, *, interpret: bool, lane: La
         assert inside[rows].all(), f"{name}: {int((rows & ~inside).sum())} of {int(rows.sum())} outside"
 
 
+def assert_two_launches_held_to_their_own_d(*, interpret: bool, lane: Lane | None = None) -> None:
+    """The backward's two launches (deterministic ops, under which `MosaicBackward.legal` refuses the fused
+    one: the GPU tier's, row 13697) held to their own schedule: their gradients about the D they refined and
+    over the dQ launch's own denominator held, the same gradients held as the fused launch's (the D
+    `split_delta` took, nothing lost, the forward's denominator) refused at dK."""
+    import tier_wire
+
+    q, k, v, do = backward_operands(3)
+    records = backward_launched(q, k, v, do, "causal", interpret=interpret, site="two launches")
+    if not interpret and tier_wire.preparing():
+        return
+    assert (records["denominator"] != records["l"]).any(), "two launches ran: the dQ launch's own denominator"
+    mask = mask_of("causal")
+    assert not sum(refused(backward_witnessed(q, k, v, do, mask, records, lane=lane), name)
+                   for name in ("dq", "dk", "dv"))
+    fused = dict(records, delta=records["prior"], lost=np.zeros_like(records["lost"]),
+                 denominator=records["l"])
+    assert refused(backward_witnessed(q, k, v, do, mask, fused, lane=lane), "dk")
+    # A refined D taken and stated a sixty-fourth off, refused at the row whatever the gradients.
+    off = dict(records, delta=records["delta"] * (1 + 2.0 ** -6) + 2.0 ** -6)
+    assert refused(backward_witnessed(q, k, v, do, mask, off, lane=lane), "delta")
+
+
+def assert_equal_totals_held(*, interpret: bool, lane: Lane | None = None) -> None:
+    """Two launches (deterministic ops) whose dQ launch's own denominator is the forward's to the bit: a full
+    call of zero queries and keys over every key (each weight `1/K`), its values 1 in their first column but
+    one 2, a unit cotangent there. Its output `1 + 1/K` rounds to bf16's 1, so the forward's D is 1, and
+    the dQ launch's residual `1/K` refines it to `1 + 1/K` all the same: its gradients and rows held by the
+    schedule its certify launch derived (`records["fused"]`), not by its rows, whose equal denominators read
+    as one launch's refused the refined D."""
+    import jax.numpy as jnp
+    import tier_wire
+
+    bf16 = np.dtype(jnp.bfloat16)
+    query = np.zeros(SHAPE, bf16)
+    value = np.zeros(SHAPE, bf16)
+    value[:, :, :, 0] = 1
+    value[:, 0, :, 0] = 2
+    dout = np.zeros(SHAPE, bf16)
+    dout[:, :, :, 0] = 1
+    records = backward_launched(query, query, value, dout, "full", interpret=interpret, site="equal totals")
+    if not interpret and tier_wire.preparing():
+        return
+    assert not records["fused"], "two launches ran"
+    held = backward_witnessed(query, query, value, dout, mask_of("full"), records, lane=lane)
+    for name, (rows, inside) in held.items():
+        assert inside[rows].all(), f"{name}: {int((rows & ~inside).sum())} of {int(rows.sum())} outside"
+
+
 def _exact_scores(query, key, value, dout, kept) -> np.ndarray:
     """The exact score cotangents `dS` `[B, H, Q, K]` of the call (`attention_oracle.float64_weights`,
     float64 on the CPU): `P (dP - D)` over sqrt(D)."""
@@ -628,8 +746,9 @@ def assert_backward_faults_refused(*, interpret: bool, lane: Lane | None = None)
     held without the cap's slope (`sloped`; its dV held); the accurate form's at
     twice its scale and a sixty-fourth off alike, a dK of the exact score cotangents cast to one bf16 part
     where the accurate form takes three (the same cotangents whole held), and the fast form's dQ and dK
-    held as the accurate form's (one part, about the first pass's D). Every
-    native program launches before any check (row 9546)."""
+    held as the accurate form's (one part, about the first pass's D), and the fast form's D taken and
+    stated a sixty-fourth off (refused at its row). Every native program launches before any check (row
+    9546)."""
     import tier_wire
 
     q, k, v, do = backward_operands(3)
@@ -644,6 +763,11 @@ def assert_backward_faults_refused(*, interpret: bool, lane: Lane | None = None)
         assert refused(held, name), name
     held = backward_witnessed(q, k, v, do, mask_of("full"), causal, lane=lane)
     assert sum(refused(held, name) for name in ("dq", "dk", "dv"))
+    # The fast form's D taken and stated a sixty-fourth off (its prior and the D its launch read alike),
+    # refused at the row whatever the gradients.
+    off = dict(causal, prior=causal["prior"] * (1 + 2.0 ** -6) + 2.0 ** -6,
+               delta=causal["delta"] * (1 + 2.0 ** -6) + 2.0 ** -6)
+    assert refused(backward_witnessed(q, k, v, do, mask, off, lane=lane), "prior")
     # The cap's slope read: a capped call's gradients held with it, and without it, its logits and weights
     # capped (`sloped`), its dQ and dK refused and its dV (no slope in it) held.
     for sloped in (True, False):
