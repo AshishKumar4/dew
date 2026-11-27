@@ -222,10 +222,11 @@ _RECORDING: contextvars.ContextVar[tuple[Recorded, ...]] = _cache.untraced(conte
 """The `recording` scopes open in this context, innermost last."""
 
 
-_STORED_IN: contextvars.ContextVar[tuple[_Registry | Recorded, ...] | None] = _cache.untraced(
-    contextvars.ContextVar("stored_in", default=None))
-"""Within a replacement's proposal (`_proposing`), the registry and `recording` scopes its stored
-derivations' outcomes are recorded in: the kept program's, whether or not the replacement is kept."""
+_STORED_RECORDING: contextvars.ContextVar[tuple[Recorded, ...]] = _cache.untraced(
+    contextvars.ContextVar("stored_recording", default=()))
+"""The `recording` scopes open in this context that a stored derivation's outcome reaches (`record_stored`):
+`_RECORDING`'s, but for a replacement's proposal (`_proposing`), whose stored outcomes, the cache's work done
+whether or not the replacement is kept, are the scopes' it was proposed in."""
 
 
 _PROCESS = _Registry()
@@ -1412,14 +1413,12 @@ def record_pass(seconds: float) -> None:
 
 def record_stored(outcome: StoredOutcome) -> None:
     """Record one stored derivation's lookup by its `outcome`: the cache's reading or writing, done whether or
-    not a replacement it was made for is kept, recorded as the kept program's at once (`_STORED_IN`)."""
+    not a replacement it was made for is kept, recorded as the kept program's at once (`_STORED_RECORDING`,
+    a proposal's registry sharing its parent's count, `_proposing`)."""
     if outcome not in get_args(StoredOutcome):
         raise ValueError(f"no stored derivation's outcome {outcome!r}")
-    if (holders := _STORED_IN.get()) is None:
-        _add(stored=(outcome,))
-        return
     with _GUARD:
-        for held in holders:
+        for held in (_registry(), *_STORED_RECORDING.get()):
             held.stored[outcome] += 1
 
 
@@ -1450,9 +1449,11 @@ def recording() -> Iterator[Recorded]:
     it is kept (`_commit`)."""
     recorded = Recorded()
     token = _RECORDING.set((*_RECORDING.get(), recorded))
+    stored = _STORED_RECORDING.set((*_STORED_RECORDING.get(), recorded))
     try:
         yield recorded
     finally:
+        _STORED_RECORDING.reset(stored)
         _RECORDING.reset(token)
 
 
@@ -1479,15 +1480,14 @@ def _proposing(entries: list[tuple[tuple[str, Hashable], Refused]]) -> Iterator[
     for identity, kernel in entries:
         proposed[identity] = _joined(proposed.get(identity, frozenset()) | {kernel})
     # A replacement's records reach the registry and a `recording` only once it is kept (`_commit`); its
-    # stored derivations' outcomes, the cache's work done either way, reach them at once (`record_stored`).
+    # stored derivations' outcomes, the cache's work done either way, reach them at once: its registry counts
+    # them in its parent's count, and the scopes' `recording`s are left open to them (`record_stored`).
     proposal = Recorded()
-    stored_in = _STORED_IN.get() or (registry, *_RECORDING.get())
-    token, held = _SCOPE.set(_Registry(refused=proposed)), _RECORDING.set((proposal,))
-    storing = _STORED_IN.set(stored_in)
+    token = _SCOPE.set(_Registry(refused=proposed, stored=registry.stored))
+    held = _RECORDING.set((proposal,))
     try:
         yield proposal
     finally:
-        _STORED_IN.reset(storing)
         _RECORDING.reset(held)
         _SCOPE.reset(token)
 
@@ -1498,8 +1498,7 @@ def _commit(proposal: Recorded) -> None:
     _add(rewritten=proposal.rewritten, passes=proposal.passes)
 
 
-def _add(*, missed: Sequence["Miss"] = (), rewritten: Sequence = (), passes: Sequence[float] = (),
-         stored: Sequence[StoredOutcome] = ()) -> None:
+def _add(*, missed: Sequence["Miss"] = (), rewritten: Sequence = (), passes: Sequence[float] = ()) -> None:
     """`Recorded` entries added to this context's registry and to every `recording` open in it: a miss once
     a holder (`_record`), each rewrite and pass as often as it is made."""
     with _GUARD:
@@ -1507,7 +1506,6 @@ def _add(*, missed: Sequence["Miss"] = (), rewritten: Sequence = (), passes: Seq
             held.missed.extend(miss for miss in missed if miss not in held.missed)
             held.rewritten.extend(rewritten)
             held.passes.extend(passes)
-            held.stored.update(stored)
 
 
 def _joined(kernels: frozenset[Refused]) -> frozenset[Refused]:

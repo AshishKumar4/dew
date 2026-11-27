@@ -335,3 +335,36 @@ def test_a_replacements_stored_outcomes_are_the_kept_programs_whether_or_not_it_
             kernel_report.record_stored("miss")
         kernel_report._commit(proposal)
         assert recorded.stored == {"hit": 1, "miss": 1} and kernel_report.stored() == {"hit": 1, "miss": 1}
+
+
+def test_a_proposals_stored_outcomes_reach_the_scopes_opened_within_it():
+    """Within a proposal, a `recording` opened there counts the store's outcomes too, a `refusals` scope
+    opened there counts its own apart from the registry's, and a nested proposal discarded counts its own in
+    the kept program's."""
+    with kernel_report.refusals(), kernel_report.recording() as outer:
+        with kernel_report._proposing([]):
+            with kernel_report.recording() as inner:
+                kernel_report.record_stored("hit")
+            with kernel_report.refusals():
+                kernel_report.record_stored("miss")
+                assert kernel_report.stored() == {"miss": 1}
+            with kernel_report._proposing([]):
+                kernel_report.record_stored("invalid")
+        assert inner.stored == {"hit": 1}
+        assert outer.stored == {"hit": 1, "miss": 1, "invalid": 1}
+        assert kernel_report.stored() == {"hit": 1, "invalid": 1}
+
+
+def test_a_fused_multiply_adds_terms_read_as_the_operations_they_bind():
+    """A fused multiply-add's terms (`rules.CONTRACTED`), named apart from the multiply and add whose
+    parameters they bind, read back over those; over another operation's parameters, refused."""
+    operand = Term.leaf(i64(0))
+    form = operand.binary(String("fmul"), operand, i64(0)).binary(String("fadd"), operand, i64(1))
+    writer = stored._Writer()
+    at = writer.term(form)
+    table = json.loads(json.dumps(writer.table))
+    decoded = stored._decoded(table, leaves=1, literals=0, primitives=[jax.lax.mul_p, jax.lax.add_p],
+                              states=0)
+    assert terms.key(decoded(at, sides=())) == terms.key(form)
+    with pytest.raises(ValueError):
+        stored._decoded(table, leaves=1, literals=0, primitives=[jax.lax.add_p, jax.lax.add_p], states=0)

@@ -49,7 +49,7 @@ from jax.extend.core import Jaxpr, Primitive, primitives
 
 from dew import _code, _files
 from dew._builds import dew_cache_dir
-from dew.algebra import terms
+from dew.algebra import rules, terms
 from dew.algebra.terms import Term
 from dew.nn.kernels.templates import report as kernel_report
 
@@ -336,21 +336,27 @@ def _decoded(table: list, *, leaves: int, literals: int, primitives: Sequence[Pr
 
 
 _WRITTEN = {written.constructor: (kind, written.names) for kind, written in terms.WRITTEN.items()}
-"""Each operation's constructor by its name: its kind of operation and what names the operation in it."""
+"""Each operation's constructor by its name: its kind of operation and the field of it its name is
+(`terms.Written.names`)."""
+
+_BOUND_AS = {contracted: name for name, contracted in rules.CONTRACTED.items()}
+"""A fused multiply-add's names by the operation each binds as (`rules.CONTRACTED`)."""
 
 
 def _operated(name: str, values: list, primitive: Primitive) -> None:
     """That the parameters of `primitive` a term of constructor `name` over `values` reads are of its own
-    operation (`terms.OPERATIONS`): its kind, and its symbol or monoid where the term names it, its second
-    argument (`ValueError` otherwise). A derived walk's rescale (`terms.RESCALE`), no program's operation,
-    reads the parameters its declaration's exponent gives it."""
+    operation (`terms.OPERATIONS`): its kind, and where the term names it (its second argument) its symbol
+    or monoid, a fused multiply-add's name the one it binds as (`ValueError` otherwise). A derived walk's
+    rescale (`terms.RESCALE`), no program's operation, reads the parameters its declaration's exponent gives
+    it."""
     kind, names = _WRITTEN[name]
-    named = terms.text(values[1]) if names is not None else None
-    if named == terms.RESCALE and name == "binary":
+    named = None if names is None else terms.text(values[1])
+    if name == "binary" and named == terms.RESCALE:
         return
     operation = terms.OPERATIONS.get(primitive)
-    if (operation is None or operation.kind != kind
-            or named != {"symbol": operation.symbol, "monoid": operation.monoid, None: None}[names]):
+    if operation is None or operation.kind != kind or (
+            names is not None and _BOUND_AS.get(named, named) != (
+                operation.symbol if names == "symbol" else operation.monoid)):
         raise ValueError(f"a {name} {named or ''} reading {primitive}'s parameters")
 
 
