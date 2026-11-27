@@ -9,7 +9,7 @@ import jax
 import jax.numpy as jnp
 import pytest
 from attention_oracle import plain_merged
-from contract_support import EDGES, ORDER_SETS, REVERSE_ONLY, assert_drawn_contract, normal_draw
+from contract_support import EDGES, ORDER_SETS, REVERSE_ONLY, assert_drawn_contract, normal_draw, order_set
 from reference_error import FEWEST_SEEDS
 
 from dew.nn import attention, kv_cache
@@ -75,20 +75,22 @@ def test_a_heads_sinks_hold_every_order(edge):
                           f"a head's sinks {edge}", plain_fn=plain)
 
 
-@pytest.mark.parametrize(("implementation", "edge"), list(itertools.product(("template", "tpu"), EDGES)))
-def test_a_fused_attention_kernel_holds_every_order(implementation, edge):
+@pytest.mark.parametrize(("implementation", "edge", "taken"),
+                         list(itertools.product(("template", "tpu"), EDGES, ORDER_SETS)))
+def test_a_fused_attention_kernel_holds_every_order(implementation, edge, taken):
     """The template's route (`attention_route._attend`) and splash (`splash._attention`, interpreted off a
     TPU), each differentiated at every order (`generation.linear_tangent`, row 2654): every order runs
     (forward mode, reverse mode, higher orders, remat, nested jit, scanned), finite wherever float64 is a
     normal float32 and the plain attention formula is, at queries, keys and values whose products near
-    float32's ends."""
+    float32's ends. Each order set a case of its own (`ORDER_SETS`; row 12781: the template's every order in
+    one case took 212 to 346 s at unit operands, its interpreted kernel run at each order and draw)."""
     def fused(query, key, value):
         return attention.scaled_dot_product_attention(query, key, value, implementation=implementation)
 
     assert_drawn_contract(fused, attention_inputs(2657, (1, 128, 2, 64)), EDGES[edge],
-                          f"{implementation} attention {edge}", truth_fn=plain_attention,
-                          plain_fn=plain_attention)
-    if implementation == "template" and edge == "near the largest":
+                          f"{implementation} attention {edge} ({taken})", truth_fn=plain_attention,
+                          plain_fn=plain_attention, taking=ORDER_SETS[taken])
+    if implementation == "template" and edge == "near the largest" and taken == "first orders":
         # Prescaling Q by scale's power of two before the fp32 dot keeps value-only JVP finite at 2^64.
         big = jnp.zeros((1, 2, 1, 64), jnp.float32).at[:, :, :, 0].set(jnp.float32(2.0 ** 64))
         vals = jnp.zeros((1, 2, 1, 64), jnp.float32)
@@ -233,13 +235,15 @@ def test_a_nudged_quotient_narrows_once_and_keeps_its_tangent():
     assert settled.astype(jnp.float16) == 1.0 and tangent == 1.0
 
 
+@pytest.mark.parametrize("taken", list(ORDER_SETS))
 @pytest.mark.parametrize("edge", EDGES)
-def test_the_sparse_latent_kernel_holds_every_order(edge):
+def test_the_sparse_latent_kernel_holds_every_order(edge, taken):
     """`sparse_selection.templated_context` (the attention template's decode over each query's selected
     latents, its value, interpreted off a GPU), the blocked XLA path's derivatives through
     `generation.linear_tangent`: every order runs in the absorbed queries, the rope queries, the latents and
     the rope heads, finite wherever float64 is a normal float32 and the plain formula, each query's softmax
-    over its selected latents and rope heads, is; a slot naming no key reads nothing."""
+    over its selected latents and rope heads, is; a slot naming no key reads nothing. Each order set a case
+    of its own (`ORDER_SETS`; row 12781: every order in one case took 104 to 179 s at unit operands)."""
     from dew.nn import sparse_selection
 
     shapes = ((1, 3, 2, 32), (1, 3, 2, 32), (1, 3, 32), (1, 3, 32))
@@ -271,8 +275,9 @@ def test_the_sparse_latent_kernel_holds_every_order(edge):
     # to differentiate (same as `template_paged` above); on a GPU, every order including remat runs.
     without = () if generation.placed_platform() == "gpu" else ("jvp of grad, remat", "second jvp, remat")
     with generation.assumed("sm80"):
-        assert_drawn_contract(sparse, inputs, EDGES[edge], f"the sparse latent kernel {edge}",
-                              truth_fn=plain, plain_fn=plain, without=without, seeds=8)
+        assert_drawn_contract(sparse, inputs, EDGES[edge], f"the sparse latent kernel {edge} ({taken})",
+                              truth_fn=plain, plain_fn=plain, without=without, seeds=8,
+                              taking=order_set(taken, without))
 
 
 @pytest.mark.parametrize("edge", EDGES)
