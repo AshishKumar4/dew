@@ -469,7 +469,7 @@ def test_a_partial_symbolic_zero_uses_its_generated_tangent_and_the_original_val
                 return loaded(*values)
             rows |= {(policy, target, _generated.case_of(operands)): form
                      for policy in component.cases.policies for target in component.cases.targets}
-        tables[_generated.table_name(name)] = _generated.Forms(False, rows)
+        tables[_generated.table_name(name)] = _generated.Forms(single=False, cases=rows)
 
     composed = declared.assembled(types.SimpleNamespace(**tables))
     x = np.arange(8, dtype=np.float32)
@@ -670,4 +670,4 @@ def test_a_surrogate_whose_tangent_name_is_taken_registers_nothing():
     with pytest.raises(ValueError):
         generate.SurrogateBodies(lambda x: x, lambda *values: values[1][0], (), symbolic_zeros=False,
                                  cases=(((), case),)).declared(__name__)
-    assert generate.DECLARATIONS == before
+    assert before == generate.DECLARATIONS
