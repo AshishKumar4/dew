@@ -3,6 +3,8 @@ and its batch, a student stepped once and saved as a run, and a trainer's update
 objective's gradient by check 1 (`moved_weights`, `applied`, `objective_gradient`)."""
 
 
+import dataclasses
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -244,8 +246,8 @@ def saved_unstepped(config, directory):
 
     task = config.build()
     state, _, _ = Trainer(task, optax.adam(1e-2), key=jax.random.PRNGKey(3)).place()
-    state = state.replace(variables={**state.variables,
-                                     "params": moved(state.variables["params"], jax.random.key(3), 0.02)})
+    state = dataclasses.replace(state, variables={
+        **state.variables, "params": moved(state.variables["params"], jax.random.key(3), 0.02)})
     _saved_run(config, task, state, 0, directory)
     return task, state
 
