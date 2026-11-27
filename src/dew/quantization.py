@@ -663,9 +663,10 @@ def _resident_window(kernel: jax.Array, site: str):
     """A resident `[depth, width]` kernel's window encoded where it lives, as `frozen_fp8_leaves` packs one
     on its resident devices: each distinct shard's columns and whole `WINDOW_GROUP`-deep groups encoded from
     the shard its process holds (`Bf16Window.of`), each plane `[width, groups * words]` placed on the
-    kernel's devices as its columns and depths are (a column split the planes' rows, a depth split their
-    groups' words). A depth split off whole groups is refused by the site's name, as is a kernel placed by
-    no mesh's names."""
+    kernel's devices as its columns are (a column split the planes' rows). A kernel split by its depth is
+    refused by the site's name: its window decodes each column's depths through one permutation across
+    its groups (`Bf16Window.decoded`), which no device holding a part of them can take where it lives; as
+    is a kernel placed by no mesh's names."""
     from jax.sharding import NamedSharding, PartitionSpec
 
     from dew.nn.kernels.formats import WINDOW_WORDS, Bf16Window, window_form_version
@@ -677,16 +678,14 @@ def _resident_window(kernel: jax.Array, site: str):
                          "it where it lives on a mesh")
     depth, width = kernel.shape
     rows, columns = (*sharding.spec, None, None)[:2]
-    planes = NamedSharding(sharding.mesh, PartitionSpec(columns, rows))
+    if rows is not None:
+        raise ValueError(f"{site}'s kernel is split by its depth ({rows!r}), which its window's decode reads "
+                         "whole for each column: window it split by its columns alone")
+    planes = NamedSharding(sharding.mesh, PartitionSpec(columns, None))
     encoded: dict[tuple, Bf16Window] = {}
     words, meta = [], []
     for shard in kernel.addressable_shards:
-        depths, widths = (part.indices(extent)[:2] for part, extent in zip(shard.index, (depth, width),
-                                                                           strict=True))
-        if depths[0] % WINDOW_GROUP or depths[1] % WINDOW_GROUP:
-            raise ValueError(f"{site}'s kernel is split at depths {depths}, off its window's whole "
-                             f"{WINDOW_GROUP}-deep groups")
-        key = (depths, widths)
+        key = shard.index[1].indices(width)[:2]
         if key not in encoded:
             encoded[key] = Bf16Window.of(np.asarray(shard.data), site=site)
         words.append(jax.device_put(encoded[key].words, shard.device))

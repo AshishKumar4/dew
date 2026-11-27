@@ -39,7 +39,28 @@ def width_split(args) -> dict:
     return {"planes": planes, "decoded": decoded}
 
 
-MODES = {"width_split": width_split}
+def depth_split(args) -> dict:
+    """A `[256, 256]` bfloat16 kernel split by its depth across the pool's processes, two whole 128-deep
+    groups apart: its window refused by its site's name, which no device holding a part of a column's
+    groups decodes where it lives."""
+    import jax
+    import jax.numpy as jnp
+    from jax.sharding import Mesh, NamedSharding, PartitionSpec
+
+    from dew import quantization
+
+    kernel = (np.random.default_rng(13702).normal(size=(256, 256)) * 0.02).astype(jnp.bfloat16)
+    mesh = Mesh(np.asarray(jax.devices()), ("depths",))
+    placed = jax.make_array_from_callback(kernel.shape, NamedSharding(mesh, PartitionSpec("depths", None)),
+                                          lambda index: kernel[index])
+    try:
+        quantization.bf16_windows({"params": {"kernel": placed}}, sites=[""])
+    except ValueError as error:
+        return {"refused": type(error).__name__}
+    return {"refused": None}
+
+
+MODES = {"width_split": width_split, "depth_split": depth_split}
 
 
 def main(argv=None) -> None:

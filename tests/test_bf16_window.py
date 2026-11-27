@@ -370,3 +370,30 @@ def test_a_kernel_no_process_holds_whole_packs_where_its_columns_live(tmp_path):
     for report in run_pool("width_split", tmp_path / "pool", 2, devices=2, script=worker):
         assert report["planes"] and all(report["planes"]), report
         assert report["decoded"] and all(report["decoded"]), report
+    # Split by its depth, a column's groups apart, which its window's decode reads whole: refused.
+    for report in run_pool("depth_split", tmp_path / "depths", 2, devices=2, script=worker):
+        assert report["refused"] == "ValueError", report
+
+
+def test_a_windowed_dense_under_delayed_nvfp4_records_its_rows_largest_magnitude():
+    """A bfloat16 Dense whose kernel is its window, under a delayed-scaling NVFP4 recipe that takes it,
+    reads its amax history and sows its rows' largest magnitude as the layer over its kernel does: its
+    output and its sown amax bit for bit the unpacked layer's (row 13699; review)."""
+    from dew.nn.dense import NVFP4_AMAX
+    from dew.nn.kernels import generation
+    from dew.nn.precision import DTYPE_PRESETS, LowPrecision, Numerics, projection_role
+
+    delayed = Numerics(DTYPE_PRESETS["bf16-mixed"], low_precision=LowPrecision(recipe="nvfp4",
+                                                                              tensor_scaling="delayed"))
+    rng = np.random.default_rng(13699)
+    x = jnp.asarray(rng.standard_normal((4, 128)), jnp.bfloat16)
+    layer = Dense(128, dtype=jnp.bfloat16, param_dtype=jnp.bfloat16, use_bias=False)
+    with generation.run_precision(delayed), projection_role("mlp"):
+        variables = layer.init(jax.random.key(0), x)
+        windowed = quantization.bf16_windows(variables, sites=[""])
+        runs = [layer.apply(held, x, mutable=[NVFP4_AMAX]) for held in (variables, windowed)]
+    (plain, plain_amax), (served, served_amax) = runs
+    assert jax.tree.leaves(plain_amax), "the unpacked layer sows its rows' largest magnitude"
+    np.testing.assert_array_equal(np.asarray(served).view(np.uint16), np.asarray(plain).view(np.uint16))
+    for sown, own in zip(jax.tree.leaves(served_amax), jax.tree.leaves(plain_amax), strict=True):
+        np.testing.assert_array_equal(np.asarray(sown), np.asarray(own))
