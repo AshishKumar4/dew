@@ -390,19 +390,23 @@ def graded(rows: list[dict], unprepared: Mapping[str, list[dict]], before: set[C
             # Main's decision_laya prepare capped its five tests, which a run that reached them failed
             # alike at main's commit (2026-11-25): no run of main's says how they go. A baseline keeping its
             # cells by their fields gives main's capped ones so; an older one's identities are read back.
-            if all(isinstance(cell, tuple) for cell in before):
-                known = {identity(record_of(cell)) for cell in before}
-                untried = {test for test, where, label in before if where == capped_at and label is None}
-                untried_cells = {(test, label) for test, where, label in before
-                                 if where == capped_at and label is not None}
-            else:
-                known = {cell if isinstance(cell, str) else identity(record_of(cell)) for cell in before}
-                whole = f" @ {capped_at}"
-                untried = {cell[:-len(whole)] for cell in known if cell.endswith(whole)}
-                labeled = f" @ {capped_at} ["
-                untried_cells = {(cell[:cell.rfind(labeled)], cell[cell.rfind(labeled) + len(labeled):-1])
-                                 for cell in known if labeled in cell and cell.endswith("]")}
-            new = [record for record in judged_ if record["identity"] not in known
+            # Kept apart: main's cells by their fields, compared and read for its caps by field alone, and an
+            # older baseline's identities, parsed for its caps as they always were.
+            fields = {cell for cell in before if isinstance(cell, tuple)}
+            legacy = {cell for cell in before if isinstance(cell, str)}
+            untried = {test for test, where, label in fields if where == capped_at and label is None}
+            untried_cells = {(test, label) for test, where, label in fields
+                             if where == capped_at and label is not None}
+            whole = f" @ {capped_at}"
+            untried |= {cell[:-len(whole)] for cell in legacy if cell.endswith(whole)}
+            labeled = f" @ {capped_at} ["
+            untried_cells |= {(cell[:cell.rfind(labeled)], cell[cell.rfind(labeled) + len(labeled):-1])
+                              for cell in legacy if labeled in cell and cell.endswith("]")}
+            # A record main left so: by its fields where it has them, else (a reused row's identity) rendered.
+            rendered = legacy | {identity(record_of(cell)) for cell in fields}
+            new = [record for record in judged_
+                   if not (cell_of(record) in fields or record["identity"] in legacy if "test" in record
+                           else record["identity"] in rendered)
                    and not skipped_whole(record, untried) and not capped_alike(record, untried_cells)]
             said = [f"unprepared in its {generation} prepare, which main's did not leave so: "
                     f"{record['identity']}" + (f": {record['error']}" if record.get("error") else "")
@@ -608,9 +612,7 @@ def _before(ci, python: str, name: str, group: str, until: float) -> set[Cell] |
                     break
                 found |= kept
             else:
-                # Cuts kept by fields and by identities alike are read as identities, as the older are.
-                if not all(isinstance(cell, tuple) for cell in found):
-                    found = {cell if isinstance(cell, str) else identity(record_of(cell)) for cell in found}
+                # Cuts kept by fields and by identities alike stay apart (`graded`).
                 return found
     except (Unread, *failures, ValueError) as failure:
         print(f"dry prepare: main's runs of {name} not read whole ({type(failure).__name__}: {failure}); its "

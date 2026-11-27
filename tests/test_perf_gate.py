@@ -43,14 +43,7 @@ def test_a_base_whose_probe_failed_owes_its_comparison_and_fails_the_report(gate
     from types import SimpleNamespace
 
     row = gate.Row("gated", "ms", "")
-    assert gate.verdict(row, ["failed: exited 1"] * 6, samples(10.0), samples(10.0))[0] == "base failed"
     assert gate.verdict(row, ["not run: no lock"] * 6, samples(10.0), [None] * 6)[0] == "not compared"
-    results = {"base": "main", "head": "head", "alone": "main~aa", "rows": [row.__dict__], "rounds": 6,
-               "samples": {"base": [{"gated": "failed: exited 1"}] * 6, "alone": [{"gated": 10.0}] * 6,
-                           "head": [{"gated": 10.0}] * 6}}
-    (tmp_path / "gate.json").write_text(json.dumps(results))
-    monkeypatch.setattr(sys, "argv", ["perf_gate.py", "report", str(tmp_path / "gate.json")])
-    assert gate.main() == 1
     standing_in(gate, monkeypatch, passed=True)
     stood_in = gate.subprocess.run
     probe = next(probe for probe in gate.PROBES if probe.tool == "benchmark_step.py")

@@ -459,6 +459,17 @@ def test_a_baseline_keeps_its_cells_by_their_fields_and_main_s_capped_cells_are_
     assert graded([], before={capped}, found=json.loads(json.dumps(row)))["exitCode"] == 0
     sibling = {**same, "cell": "three"}
     assert graded([same, sibling], before={capped})["new_unprepared"] == [ci.prepares.identity(sibling)]
+    # A cut kept by fields beside an older one kept by identities: each read as it is, so the lookalike's
+    # fields still name no cap, and an older identity at the cap still exempts as before.
+    older = f"tests/test_gpu_vae.py::test_other @ {wire.CAPPED}"
+    mixed = graded([reached], before={lookalike, older})
+    assert mixed["new_unprepared"] == [ci.prepares.identity(reached)]
+    other = {"test": "tests/test_gpu_vae.py::test_other", "where": "x", "error": "e"}
+    assert graded([other], before={lookalike, older})["exitCode"] == 0
+    # Two cells whose fields differ but render alike: compared by field, one is never the other.
+    one = {"test": "t @ a", "where": "b", "error": "e"}
+    assert ci.prepares.identity(one) == ci.prepares.identity(ci.prepares.record_of(("t", "a @ b", None)))
+    assert graded([one], before={("t", "a @ b", None)})["new_unprepared"] == [ci.prepares.identity(one)]
 
 
 @pytest.mark.parametrize("capped", [False, True])
@@ -898,6 +909,11 @@ def test_a_commits_baseline_is_its_green_prepares_and_a_red_run_writes_none(ci, 
     assert json.loads(stored[baseline]) == {"unprepared": ["a @ x"]}
     assert ci.run_keys.baselined("3.12", place, "cls", "token", {"exitCode": 0})
     assert json.loads(stored[baseline]) == {"unprepared": ["a @ x"]}
+    # A row keeping its cells by their fields publishes them so, and its baseline reads them back by field.
+    fields = [["tests/test_gpu_a.py::t[p] @ " + ci.tier_wire().CAPPED + " [q", "a site", "c"]]
+    assert ci.run_keys.baselined("3.12", place, "cls", "token",
+                                 {"exitCode": 0, "unprepared": ["a @ x"], "unprepared_cells": fields})
+    assert ci.prepares.cells_of(json.loads(stored[baseline])) == {tuple(fields[0])}
 
 
 @pytest.mark.parametrize("taken", [True, False])
