@@ -722,14 +722,14 @@ def test_a_run_places_no_training_batch_while_it_evaluates():
 def test_a_window_pooling_other_statistics_is_refused_by_its_shapes():
     """A window an earlier Dew saved, its statistics pooling fewer leaves than the step now traces (an
     indexer's KL beside its prediction, row 13705), is no window the step reads (`Accumulation.replays`),
-    refused by its shapes alone (`refuse_unread_window`) whatever it holds, its occupancy unread: a
-    checkpoint keeps a window only while it holds microbatches."""
+    refused by its shapes alone (`refuse_unread_window`) whatever it holds, its occupancy unread (a
+    checkpoint keeps a window only while it holds microbatches), in a ramped run as in any."""
     from dew.state import Accumulation, refuse_unread_window
 
-    def window(statistics: int) -> Accumulation:
+    def window(statistics: int, rows: int = 2) -> Accumulation:
         pooled = tuple(jax.ShapeDtypeStruct((), jnp.float32) for _ in range(statistics))
         return Accumulation(gradient=None, mass=None, statistics=pooled, effects=(), qk_stats=None,
-                            batches={"x": jax.ShapeDtypeStruct((2, 4), jnp.float32)}, variables=None,
+                            batches={"x": jax.ShapeDtypeStruct((rows, 4), jnp.float32)}, variables=None,
                             attempts=None, fill=jax.ShapeDtypeStruct((), jnp.int32))
 
     traced = window(4)
@@ -737,3 +737,8 @@ def test_a_window_pooling_other_statistics_is_refused_by_its_shapes():
     refuse_unread_window(None, traced)
     with pytest.raises(ValueError):
         refuse_unread_window(window(2), traced)
+    # In a ramped run, whose stage boundaries change a window's batch shapes, other batches are its
+    # boundary's to rebuild; other statistics are refused at any stage, a resume inside one among them.
+    refuse_unread_window(window(4, rows=3), traced, staged=True)
+    with pytest.raises(ValueError):
+        refuse_unread_window(window(2), traced, staged=True)

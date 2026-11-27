@@ -70,20 +70,21 @@ class Accumulation:
     keeps none."""
 
     def replays(self, other: Accumulation | None) -> bool:
-        """Whether this window's replay slots hold batches of the shapes `other`'s do, and its pooled
-        statistics the leaves `other`'s do, so a step compiled for `other` reads it: a batch ramp's stage
-        changes the batches, and a pooled mean, which keeps no batch, replays none; an objective whose
-        statistics gained a term (an indexer's KL beside its prediction, row 13705) pools more leaves than
-        a window an earlier Dew saved holds. A batch's few fields are compared leaf by leaf, without
+        """Whether this window's replay slots hold batches of the shapes `other`'s do, so a step
+        compiled for `other` reads it: a batch ramp's stage changes them, and a pooled mean,
+        which keeps no batch, replays none. A batch's few fields are compared leaf by leaf, without
         building a tree, as a ramped run's runner does each step."""
-        def laid(window: Accumulation | None) -> tuple:
-            return (None,) * 4 if window is None else (window.batches, window.statistics,
-                                                       window.batch_statistics, window.replayed_statistics)
+        return _laid_alike(self.batches, None if other is None else other.batches)
 
-        held, compiled = laid(self), laid(other)
-        return jax.tree.structure(held) == jax.tree.structure(compiled) and all(
-            (mine.shape, mine.dtype) == (theirs.shape, theirs.dtype)
-            for mine, theirs in zip(jax.tree.leaves(held), jax.tree.leaves(compiled), strict=True))
+    def pools(self, other: Accumulation | None) -> bool:
+        """Whether this window's pooled statistics are the leaves `other`'s are, so a step compiled for
+        `other` continues its sums: an objective whose statistics gained a term (an indexer's KL beside its
+        prediction, row 13705) pools more leaves than a window an earlier Dew saved holds, at any stage."""
+        def pooled(window: Accumulation | None) -> tuple:
+            return (None,) * 3 if window is None else (window.statistics, window.batch_statistics,
+                                                       window.replayed_statistics)
+
+        return _laid_alike(pooled(self), pooled(other))
 
 
 def paired(donor: Accumulation | None, window) -> dict[int, int]:
@@ -147,13 +148,22 @@ def kept_window(held: Accumulation | None, pending: Accumulation, read: bool) ->
 
 
 
-def refuse_unread_window(held: Accumulation | None, pending: Accumulation | None) -> None:
-    """Refuse a held window a step compiled for `pending`'s shapes reads none of (`Accumulation.replays`),
-    by its shapes alone: in a run, outside a ramp's stage change, only a resumed one, a checkpoint's, which
-    keeps a window only while it holds microbatches, pooled by an earlier Dew (an objective whose statistics
-    gained a term since: an indexer's KL beside its prediction, row 13705), whose sums no step of this one
-    continues."""
-    if held is not None and not held.replays(pending):
+def _laid_alike(held, compiled) -> bool:
+    """Whether two trees hold leaves of the same shapes and dtypes, compared leaf by leaf."""
+    return jax.tree.structure(held) == jax.tree.structure(compiled) and all(
+        (mine.shape, mine.dtype) == (theirs.shape, theirs.dtype)
+        for mine, theirs in zip(jax.tree.leaves(held), jax.tree.leaves(compiled), strict=True))
+
+
+def refuse_unread_window(held: Accumulation | None, pending: Accumulation | None, *, staged: bool = False
+                         ) -> None:
+    """Refuse a held window a step compiled for `pending`'s shapes cannot continue, by its shapes alone:
+    one pooling other statistics (`Accumulation.pools`), at any stage, or, outside a ramp's stages (whose
+    boundaries change a window's batch shapes, `staged`), replaying other batches (`replays`). In a run
+    only a resumed window, a checkpoint's, which keeps one only while it holds microbatches, can: pooled
+    by an earlier Dew (an objective whose statistics gained a term since: an indexer's KL beside its
+    prediction, row 13705), whose sums no step of this one continues."""
+    if held is not None and (not held.pools(pending) or (not staged and not held.replays(pending))):
         raise ValueError("the state's accumulation window holds batches or statistics of other shapes than "
                          "the step's, which it cannot replay or pool: resume from a step that closed its "
                          "window, or with the Dew that wrote it")

@@ -1018,11 +1018,12 @@ class Trainer(Generic[Loss, Effects]):
 
     def _builds_window(self, state: TrainState, candidate: Candidate, window: int) -> bool:
         """Whether a step of `window` microbatches over `state` builds its window first (`_window_of`): a
-        state that holds none, or a ramp's stage whose window replays other shapes. Outside a ramp's stage, a
-        held window the step reads none of is refused (`refuse_unread_window`), shapes alone."""
+        state that holds none, or a ramp's stage whose window replays other shapes. A held window the step
+        cannot continue is refused (`refuse_unread_window`), shapes alone: one pooling other statistics at
+        any stage."""
         held, staged = state.window, self._shape.ramp or self._shape.stage_starts
-        if window > 1 and self.step is None and not staged:
-            refuse_unread_window(held, candidate.prepared.window)
+        if window > 1 and self.step is None:
+            refuse_unread_window(held, candidate.prepared.window, staged=bool(staged))
         return window > 1 and self.step is None and (
             held is None or (bool(staged) and not held.replays(candidate.prepared.window)))
 

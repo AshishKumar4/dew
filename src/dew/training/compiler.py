@@ -1609,7 +1609,8 @@ class StepCompiler[L, E]:
         # step reads it as built, compiling and tracing nothing (`executable_only`).
         # A held window the step reads none of is refused (`refuse_unread_window`), shapes alone.
         if window > 1:
-            refuse_unread_window(state.accumulation, prepared.accumulation)
+            staged = bool(stepping.shape.ramp or stepping.shape.stage_starts)
+            refuse_unread_window(state.accumulation, prepared.accumulation, staged=staged)
         empty = (None if window == 1 or state.accumulation is not None else stepping.initialize_accumulation(
             state, microbatch_shapes(cpu_batch, split), shapes, window=window, split=split,
             shape_only=not concrete).accumulation)
