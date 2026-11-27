@@ -92,7 +92,10 @@ fork.
 4. **mma.sync streaming across tiles.** Today each mma.sync tile's `emit_pipeline` drains. The existing
    alternative is one flattened `emit_pipeline` over (tile, step), carrying the accumulator in `init_carry`,
    storing and resetting it at tile boundaries while JAX prefetches across them (:320-323, :416-427,
-   :502-529). It is evaluated after the per-tile form is measured. No new producer machinery.
+   :502-529). Measured, the per-tile form leaves it nothing to recover (M-FS-95, an A100): every grouped
+   GEMM row within 1.04x of Triton, five of eight ahead (input gradients 0.83-0.86x, an 8-group MoE
+   forward 0.46x), and a recurrence walk split into documents running faster, not slower (2.032 ms whole,
+   1.846 in two). The per-tile drain stays; the flattened pipeline is not built.
 
 ### Sources the derivation learns from (owner, bible §6)
 
