@@ -577,7 +577,7 @@ class Opened:
 
 @dataclasses.dataclass(frozen=True)
 class Simulated:
-    renderer: Opened = Opened()
+    renderer: Opened
 """
 
 
