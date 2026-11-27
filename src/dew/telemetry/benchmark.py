@@ -404,8 +404,8 @@ class AmbiguousCapture(NoKernels):
     does (`NoKernels`)."""
 
 
-def tpu_ops(directory: str | Path, devices: Iterable[int], module: str, *, annotation: str
-            ) -> tuple[KernelTime, ...]:
+def tpu_ops(directory: str | Path, devices: Iterable[int], module: str, *, annotation: str,
+            instructions: Mapping[str, str]) -> tuple[KernelTime, ...]:
     """The ops one call of the program `module` names ran on the TPU `devices` (their ids), as the newest
     capture under `directory` holds them (`dew.telemetry.trace.device_events`): its one run on each device
     (an `XLA Modules` event of its name, `jit_run` or `jit_run(7)`, a TPU's run naming its program so), the
@@ -414,9 +414,14 @@ def tpu_ops(directory: str | Path, devices: Iterable[int], module: str, *, annot
     every op within that run's span on the device's `XLA Ops` line, each its device milliseconds. A TPU core
     runs one program at a time, so the ops inside a run's span are its own: a v5e's XProf names a run's
     program in its name alone and its ops state none (M-FS-90); a run stating its program by stat takes the
-    ops stating it, no host transfer. A capture whose runs name no program, or not one program on every
-    device, or where another program's run overlaps the call's on a device, or an op inside it states
-    another program, is refused (`AmbiguousCapture`). A run its call did not enqueue is no run of the call's,
+    ops stating it, no host transfer. Where its ops state none, each is read as the instruction of the
+    call's module it names (`instructions`, each instruction's opcode by name; an op's name the
+    instruction's, or its HLO text, `%name = ...`, `_opcode_of`): one no instruction of the module names is
+    another's, refused (`AmbiguousCapture`), and a run of transfers alone (`TRANSFERS`: copies, sends,
+    receives, infeeds and outfeeds) times no kernel of the call's (`NoKernels`), never scored as its kernels'
+    time. A capture whose runs name no program, or not one program on every device, or where another
+    program's run overlaps the call's on a device, or an op inside it states another program, is refused
+    (`AmbiguousCapture`). A run its call did not enqueue is no run of the call's,
     whatever its name, so none stands in for one the capture lacks; two runs the call enqueued on one
     device, or another run overlapping the call's, are ambiguous (`AmbiguousCapture`). The call
     ran on every one of `devices`, so a capture holding no run of it, or no op of its run, on any one of
@@ -458,14 +463,43 @@ def tpu_ops(directory: str | Path, devices: Iterable[int], module: str, *, annot
             raise AmbiguousCapture(f"{module}'s run under {directory} holds ops {foreign} of another program "
                                    f"on TPU {device}")
         # A run stating its program by stat has ops stating it too, a host transfer none; a v5e's names it in
-        # its name alone, its ops none, each op within its span its own.
+        # its name alone, its ops none, each op within its span its own, as the instruction it names.
         stated = trace.program_of(run) is not None
         inside = [op for op in within if not stated or trace.program_of(op) == programs[device]]
         if not inside:
             raise NoKernels(f"{module}'s run under {directory} holds no op on TPU {device} of the call's "
                             f"{sorted(runs)}")
+        if not stated:
+            opcodes = [_opcode_of(op.name, instructions) for op in inside]
+            if None in opcodes:
+                unnamed = [op.name for op, opcode in zip(inside, opcodes, strict=True) if opcode is None]
+                raise AmbiguousCapture(f"{module}'s run under {directory} holds ops on TPU {device} no "
+                                       f"instruction of its module names: {unnamed}")
+            if all(opcode in TRANSFERS for opcode in opcodes):
+                raise NoKernels(f"{module}'s run under {directory} holds transfers alone on TPU {device}: "
+                                f"{[op.name for op in inside]}")
         timed += [KernelTime(op.name, op.duration_ns / 1e6) for op in inside]
     return tuple(timed)
+
+
+TRANSFERS = frozenset({"copy", "copy-start", "copy-done", "send", "send-done", "recv", "recv-done", "infeed",
+                       "outfeed"})
+"""The opcodes of an HLO instruction that moves data and computes nothing: a run of these alone times no
+kernel of its call's (`tpu_ops`)."""
+
+
+def _opcode_of(op: str, instructions: Mapping[str, str]) -> str | None:
+    """The opcode of the instruction of `instructions` (opcodes by name) a TPU op's name states: the name
+    whole, or, where it is an instruction's HLO text (`%name = ...`, a v5e's XProf's), the name it assigns;
+    None for any other label, though its first word name an instruction."""
+    if op in instructions:
+        return instructions[op]
+    assigned = HLO_ASSIGNMENT.match(op)
+    return instructions.get(assigned.group(1)) if assigned else None
+
+
+HLO_ASSIGNMENT = re.compile(r"%([^\s=]+) = ")
+"""An HLO instruction's text, its name assigned (`%name = ...`)."""
 
 
 class TpuTime:
@@ -481,7 +515,7 @@ class TpuTime:
 
     def __init__(self):
         # The last program read and its module's name: no earlier program held past its reads.
-        self._named: tuple[jax.stages.Compiled, str] | None = None
+        self._named: tuple[jax.stages.Compiled, str, dict[str, str]] | None = None
 
     def kernels(self, fn: Callable, *args, evicted: bool = False) -> tuple[KernelTime, ...]:
         """The ops one call of `fn(*args)` ran (`tpu_ops`); `evicted` is a GPU's (`DeviceTime.kernels`), whose
@@ -509,8 +543,8 @@ class TpuTime:
 
         program = _program_of(fn)
         if self._named is None or self._named[0] is not program:
-            self._named = (program, _module_of(program))
-        module = self._named[1]
+            self._named = (program, *_module_of(program))
+        module, instructions = self._named[1:]
         warm = jax.block_until_ready(program(*args))
         devices = (_devices_of(warm) or _devices_of(args))
         if not devices:
@@ -533,7 +567,7 @@ class TpuTime:
             finally:
                 profiler.stop()
             (capture,) = profiler.captures
-            return tpu_ops(capture, devices, module, annotation=annotation)
+            return tpu_ops(capture, devices, module, annotation=annotation, instructions=instructions)
 
 
 def _devices_of(tree) -> set[int]:
@@ -554,15 +588,17 @@ def _program_of(fn: Callable) -> jax.stages.Compiled:
                            "(`jax.stages.Compiled`), called with its dynamic operands")
 
 
-def _module_of(program: jax.stages.Compiled) -> str:
+def _module_of(program: jax.stages.Compiled) -> tuple[str, dict[str, str]]:
     """The module name `program`'s runs carry in a TPU capture (`tpu_ops`), its executable's module's own
-    (`instrumentation.hlo_module`, read typed, never printed)."""
+    (`instrumentation.hlo_module`, read typed, never printed), and each of its instructions' opcodes by name
+    (`dew.telemetry.hlo.instructions`), which its ops name."""
+    from dew.telemetry import hlo
     from dew.telemetry.instrumentation import hlo_module
 
     module = hlo_module(program)
     if module is None:
         raise AmbiguousCapture(f"{program} holds no module")
-    return module.name
+    return module.name, {instruction.name: instruction.opcode for instruction in hlo.instructions(module)}
 
 
 @contextlib.contextmanager
