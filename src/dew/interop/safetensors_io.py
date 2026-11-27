@@ -420,6 +420,12 @@ def weight_stem(name: str) -> str | None:
     return None
 
 
+def weight_payload(name: str) -> str | None:
+    """The stem of `WEIGHT_STEMS` a directory's entry `name` holds weights of (`_replaced`: its single file
+    or a shard under any token, not its index); None for any other."""
+    return next((stem for stem in WEIGHT_STEMS if _replaced(stem).fullmatch(name)), None)
+
+
 def weight_shard(name: str) -> bool:
     """Whether a directory's entry `name` is a shard of a stem's weights (`_shards`), under any token, not its
     single file or its index."""
@@ -499,17 +505,17 @@ def save_sharded(
         filename_pattern=stem + "{suffix}.safetensors", max_shard_size=max_shard_size)
     old_index = folder / f"{stem}.safetensors.index.json"
     # An interrupted export may leave both an index and a single file.
-    replaced = {name for name in _listing(folder) if _replaced(stem).fullmatch(name)}
+    listed = _listing(folder)
+    replaced = {name for name in listed if _replaced(stem).fullmatch(name)}
     # Written into a staging that replaces a tree whole (`dew._files.swapped`), its shards are named apart
     # from the weights the tree it replaces held there too: a reader holding the earlier index finds its
     # files gone rather than this export's under their names (train 1411's return).
     earlier = published_counterpart(folder)
     # Named apart wherever the folder, or the tree its staging replaces, holds weights of the stem, an index
     # alone among them: the rule a commit refuses a first save's names by (`releases.refused_entries`).
-    holding = [name for name in (*_listing(folder), *(_listing(earlier) if earlier else ()))
-               if weight_stem(name) == stem]
     token = secrets.token_hex(4)
-    replacing = split.is_sharded and bool(holding)
+    replacing = split.is_sharded and any(weight_stem(name) == stem for name in (
+        *listed, *(_listing(earlier) if earlier else ())))
     names = {filename: (filename.replace(f"{stem}-", f"{stem}-{token}-", 1) if replacing else filename)
              for filename in split.filename_to_tensors}
     for filename, members in split.filename_to_tensors.items():

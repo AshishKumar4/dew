@@ -597,6 +597,30 @@ def test_a_resharded_release_keeps_its_weights_private(tmp_path):
         assert stat.S_IMODE(shard.stat().st_mode) == 0o600, shard
 
 
+def test_a_resharded_release_keeps_its_index_and_its_weights_access_apart(tmp_path):
+    """A sharded release whose index is readable by others (`0644`) and whose shards are private (`0600`),
+    saved again in shards: the index keeps its access and the shards theirs (train 1414's review: the index
+    and the shards took the access both allowed, the index made private)."""
+    import stat
+
+    from dew.interop.releases import Placed, ReleasePlan
+
+    weight = np.arange(4096, dtype=np.float32).reshape(64, 64)
+    plan = ReleasePlan(Placed({'': ({'model_type': 'tiny'}, {'model.a': weight, 'model.b': weight + 1})}))
+    target = tmp_path / 'release'
+    plan.write(target, max_shard_size=20000)
+    index = target / 'model.safetensors.index.json'
+    index.chmod(0o644)
+    for shard in target.glob('model-*.safetensors'):
+        shard.chmod(0o600)
+    plan.write(target, max_shard_size=20000)
+    assert stat.S_IMODE(index.stat().st_mode) == 0o644
+    shards = sorted(target.glob('model-*.safetensors'))
+    assert len(shards) > 1
+    for shard in shards:
+        assert stat.S_IMODE(shard.stat().st_mode) == 0o600, shard
+
+
 def _scaled(scale):
     """A tiny release of two 64 x 64 weights, both moved by `scale`."""
     from dew.interop.releases import Placed, ReleasePlan

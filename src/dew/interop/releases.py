@@ -43,6 +43,7 @@ from dew.interop.safetensors_io import (
     joined_tensors,
     save_sharded,
     tensor_specs,
+    weight_payload,
     weight_shard,
     weight_stem,
     write_file,
@@ -89,9 +90,11 @@ def pooled_destination(destination: str | Path, *, publishes: bool, shared: bool
     one, and its own `destination` where it does not (`shared`); and committed in another as the
     block ends, the staging published and the scratch removed, its removal failing nothing. A process that
     fails making its directory, writing, or committing is heard by the others at that boundary, none left
-    waiting in a round alone (train 1406's review). One lifecycle for every pooled release: a saved run's
-    (`saved_sources.export_run`) and a rollout's weights (`inference.rollouts.SafetensorsReload`). A
-    location with a scheme is the publisher's as named, no stage made of it."""
+    waiting in a round alone (train 1406's review); a block whose writer publishes, a `stage` given none,
+    agrees its own commit, and no round is taken after it (train 1414's review). One lifecycle for every
+    pooled release: a saved run's (`saved_sources.export_run`) and a rollout's weights
+    (`inference.rollouts.SafetensorsReload`). A location with a scheme is the publisher's as named, no
+    stage made of it."""
     with contextlib.ExitStack() as held:
         def made() -> str | Path:
             if not publishes and shared:
@@ -101,7 +104,12 @@ def pooled_destination(destination: str | Path, *, publishes: bool, shared: bool
             return destination if stage is None else held.enter_context(stage(Path(destination)))
 
         yield agreed_reading(made)
-        agreed_reading(held.close)
+        if stage is None:
+            # The block's own publication agreed its commit (`published_release`): what is left, a scratch
+            # removed, is this process's own.
+            held.close()
+        else:
+            agreed_reading(held.close)
 
 
 def replaced_entries(written: Entries, held: Entries) -> Replacements:
@@ -109,11 +117,12 @@ def replaced_entries(written: Entries, held: Entries) -> Replacements:
     shards of its weights of one stem in one folder with every shard of that stem the earlier tree held
     there, however the two shard them, so a resharded release keeps the access its earlier weights allowed
     (train 1407's review: `model.safetensors` replaced by `model-00001-of-00002.safetensors`); any other
-    entry with the same entry, as `same_entries` groups it."""
+    entry, their index among them, with the same entry, as `same_entries` groups it, so an index keeps its
+    own access and its weights theirs (train 1414's review: the two took the access both allowed)."""
     def stem_of(entries: Entries) -> dict[tuple[Path, str], list[Path]]:
         grouped: dict[tuple[Path, str], list[Path]] = {}
         for entry, kind in entries.items():
-            if kind == "file" and (stem := weight_stem(entry.name)) is not None:
+            if kind == "file" and (stem := weight_payload(entry.name)) is not None:
                 grouped.setdefault((entry.parent, stem), []).append(entry)
         return grouped
 

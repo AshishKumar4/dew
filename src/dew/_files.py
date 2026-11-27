@@ -305,21 +305,47 @@ def _removed(tree: Path) -> None:
 
     def retried(remove: Callable[..., None], path: str, failure: BaseException) -> None:
         # An entry's removal alone retried (no traversal, whose calls take more than a path), and only in a
-        # folder of the tree: its root's own parent, the release's, is never changed.
+        # folder of the tree: its root's own parent, the release's, is never changed. The folder is reached
+        # from the root a component at a time, no link followed, and changed and emptied through that
+        # descriptor, so a link put in the tree's place meanwhile leads nowhere outside it (train 1414's
+        # review).
         folder = os.path.dirname(os.path.abspath(path))
         if (remove not in (os.unlink, os.rmdir) or not isinstance(failure, PermissionError)
-                or not (folder == root or folder.startswith(root + os.sep))
-                or os.access(folder, os.W_OK | os.X_OK)):
+                or not (folder == root or folder.startswith(root + os.sep))):
             return
         try:
-            os.chmod(folder, 0o700)
-            remove(path)
+            opened = _folder(root, os.path.relpath(folder, root))
+            try:
+                held = os.fstat(opened)
+                # Only a folder of this process's own whose mode keeps the entry: no other touched.
+                if held.st_uid != os.geteuid() or held.st_mode & 0o300 == 0o300:
+                    return
+                os.fchmod(opened, 0o700)
+                remove(os.path.basename(path), dir_fd=opened)
+            finally:
+                os.close(opened)
         except OSError as left:
             # A save's own leftover, named for whoever clears it; the save's outcome is its own.
             logging.getLogger(__name__).warning("could not remove %s from a save's discarded tree: %s",
                                                 path, left)
 
     shutil.rmtree(tree, onexc=retried)
+
+
+def _folder(root: str, relative: str) -> int:
+    """A descriptor of the folder `relative` names below `root`, opened from `root` one component at a time,
+    none a link followed."""
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    opened = os.open(root, flags)
+    try:
+        for name in Path(relative).parts:
+            inner = os.open(name, flags, dir_fd=opened)
+            os.close(opened)
+            opened = inner
+    except BaseException:
+        os.close(opened)
+        raise
+    return opened
 
 
 def _granted(staging: Path, directory: Path, held_at: os.stat_result | None, made: int, written: Entries,
