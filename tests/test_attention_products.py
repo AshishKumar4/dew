@@ -143,9 +143,11 @@ def test_banded_products_are_on_par_on_the_mosaic_mainloop_interpreted(device, f
         (query, wide_key, wide_values), pull = jax.vjp(layout, q1, q2, k1, k2, value)
         key, values = wide_key.astype(value.dtype), wide_values.astype(value.dtype)
         with generation.assumed(device, interpreted=True):
+            # The residuals the route keeps for the form (`attention_route._forward`).
+            output = template.takes_output_residuals(hooks, query.dtype, accurate=accurate)
+            kept = template.Kept.OUTPUT if output else template.Kept.SPLIT
             out, *residuals = attention_mosaic.forward(query, key, values, chosen, hooks, scale=SCALE,
-                                                       natural=natural, residuals=template.Kept.SPLIT,
-                                                       interpret=True)
+                                                       natural=natural, residuals=kept, interpret=True)
             grads = attention_mosaic.backward(query, key, values, chosen, hooks, dout, residuals=residuals,
                                               scale=SCALE, natural=natural, accurate=accurate, interpret=True,
                                               rounded=False)
