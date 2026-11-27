@@ -48,6 +48,14 @@ class HloModule(Protocol):
     def as_serialized_hlo_module_proto(self) -> bytes: ...
 
 
+class NativeModule(HloModule, Protocol):
+    """An HLO module XLA's bindings hold natively (a compiled executable's `hlo_modules()`,
+    `module_from_text`'s), which names itself; a lowering's `XlaComputation` names itself by a method."""
+
+    @property
+    def name(self) -> str: ...
+
+
 class Instruction(NamedTuple):
     """An instruction of a module (`instructions`): the computation holding it, its name and opcode, its
     custom-call target (None where it is no custom call), its operands and the computations it calls (a
@@ -88,7 +96,7 @@ def message_class(name: str) -> type[Message]:
     return message_factory.GetMessageClass(pool().FindMessageTypeByName(name))
 
 
-def module_from_text(text: str) -> HloModule:
+def module_from_text(text: str) -> NativeModule:
     """The HLO module `text` writes (an XLA dump file, a test's module), parsed by XLA's own HLO parser, which
     `instructions` reads as it reads a compiled one."""
     # jaxlib's binding of XLA's parser (`jaxlib._hlo`), which no typed module states.
