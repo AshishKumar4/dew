@@ -141,10 +141,37 @@ jobs:
         python3 tools/armada/gates_told.py "$RUNNER_TEMP/lint.jsonl" || status=1
         exit "$status"
 
-  # What a release attaches and Dew's index serves, installed the way a user installs it (tools/ci/package.sh).
+  # The template derivations a release's wheel ships (tools/ci/derived.sh), each CUDA generation's on an armada
+  # container of its own in the commit's environment, whose locks are the egglog and JAX builds every entry's key
+  # states: a release's run alone, as a pull request's holds no armada credentials. sm120 is none of them until
+  # its Mosaic kernel's layout inference holds there (row 14034): the tool fails a generation it cannot lower.
+  derived:
+    if: github.event_name == 'release'
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - uses: oven-sh/setup-bun@v2
+    - name: Install the armada CLI
+      run: bun install --global "$ARMADA"
+    - name: Each generation's derivations, on armada
+      env:
+        ARMADA_URL: ${{ secrets.ARMADA_URL }}
+        ARMADA_TOKEN: ${{ secrets.ARMADA_TOKEN }}
+      run: |
+        printf '%s\n' sm80 sm90 sm100 | armada map --commit=${{ github.sha }} --items=- --size=large \
+          --label="derived-$GITHUB_REF_NAME" --artifacts="$RUNNER_TEMP/derived" --json -- \
+          sh -c 'sh tools/ci/derived.sh "$1" "$2/derived"' sh '{item}' '{artifacts}' > "$RUNNER_TEMP/derived.jsonl"
+    - uses: actions/upload-artifact@v4
+      with:
+        name: derived
+        path: ${{ runner.temp }}/derived/
+        if-no-files-found: error
+
+  # What a release attaches and Dew's index serves, installed the way a user installs it (tools/ci/package.sh):
+  # a release's with the derivations its run made (`derived`), every other run's without.
   package:
-    needs: proven
-    if: needs.proven.outputs.run == ''
+    needs: [proven, derived]
+    if: ${{ !cancelled() && needs.proven.outputs.run == '' && needs.derived.result != 'failure' }}
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v4
@@ -152,7 +179,14 @@ jobs:
       with:
         python-version-file: .python-version
     - uses: astral-sh/setup-uv@v6
+    - if: github.event_name == 'release'
+      uses: actions/download-artifact@v4
+      with:
+        name: derived
+        path: ${{ runner.temp }}/derived/
     - name: Build, check, install and run the sdist and wheel; resolve the accelerator extras
+      env:
+        DEW_DERIVED: ${{ github.event_name == 'release' && format('{0}/derived', runner.temp) || '' }}
       run: sh tools/ci/package.sh dist
     # A release publishes this sdist and wheel, the ones built and smoked here (python-publish.yml).
     - if: github.event_name == 'release'

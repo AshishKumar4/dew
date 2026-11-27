@@ -6,6 +6,11 @@
 # which Dew carries fixes; and the accelerator extras resolve against the indexes constraints.txt names. GitHub's CI
 # runs it for a pull request and a release on a hosted runner (.github/workflows/ci.yml).
 #
+# A release's package carries the template derivations its CI derived for each CUDA generation (DEW_DERIVED, a
+# directory of tools/ci/derived.sh's outputs, one a generation, each under its own directory's derived/): put in the
+# package's place before it is built, their union, one name one content whichever generation derived it (an entry is
+# named by its key), and its wheel refused unless it holds every one.
+#
 # Usage: sh tools/ci/package.sh [dist directory]   from the checkout's top, with uv on PATH; the directory (dist by
 #                                                   default) is left holding the sdist and wheel it checked.
 set -eu
@@ -19,7 +24,27 @@ uv venv -q --seed -p "$python" "$work/build"
 "$work/build/bin/python" -m pip install -q -r tools/pip.txt
 "$work/build/bin/python" -m pip install -q build twine
 rm -rf "$dist"
+if [ -n "${DEW_DERIVED:-}" ]; then
+  into=src/dew/algebra/derived
+  rm -rf "$into"
+  mkdir -p "$into"
+  for entry in "$DEW_DERIVED"/*/derived/*.json; do
+    [ -e "$entry" ] || { echo "package: DEW_DERIVED ($DEW_DERIVED) holds no derivation"; exit 1; }
+    name=$(basename "$entry")
+    if [ -e "$into/$name" ]; then
+      cmp -s "$entry" "$into/$name" || { echo "package: derivation $name differs between generations"; exit 1; }
+    else
+      cp "$entry" "$into/$name"
+    fi
+  done
+  derived=$(ls "$into" | wc -l)
+fi
 "$work/build/bin/python" -m build --outdir "$dist"
+if [ -n "${DEW_DERIVED:-}" ]; then
+  held=$("$work/build/bin/python" -m zipfile -l "$dist"/*.whl | grep -c 'dew/algebra/derived/[^/]*\.json' \
+    || true)
+  [ "$held" = "$derived" ] || { echo "package: the wheel holds $held of the $derived derivations"; exit 1; }
+fi
 "$work/build/bin/python" -m twine check --strict "$dist"/*
 "$work/build/bin/python" tools/check_distribution.py "$dist"/*
 "$work/build/bin/python" tools/smoke_wheel.py "$dist"/*.whl
