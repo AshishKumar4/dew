@@ -460,9 +460,13 @@ JEPA video encoder's two cells took 137 and 134 s whole (CI's durations record a
 7403). The DiTs' fsdp cells took 144 to 171 s whole in CI and 76 to 130 s alone cold, 39 to 60 s of it
 compiling, 30 s of that both arms' `fit` (armada at c27860888, rows 7652 and 8533)."""
 
+HYBRID_DIT_DATA_CELLS = [cell for cell in cells_of("hybrid_dit") if cell[2] == "8x1 data"]
+"""The hybrid DiT's data cell, its draws as armada's map tasks too: it took 129 s whole in train 1170's CI
+(row 11699) and 110 s warm, 235 s cold in main 2f6b65a64's durations record."""
+
 SHARDED_CELLS = [*THREE_D_UNET_CELLS, *UNET_CELLS, *HIERARCHICAL_MMDIT_CELLS, *QWEN35_CELLS, *GPT_OSS_CELLS,
                  *GLM4_MOE_CELLS, *JEPA_STAGE_CELLS, *JEPA_VIDEO_CELLS, *VIDEO_DIT_CELLS, *GEMMA4_MOE_CELLS,
-                 *MLA_CELLS, *DIT_FSDP_CELLS]
+                 *MLA_CELLS, *DIT_FSDP_CELLS, *HYBRID_DIT_DATA_CELLS]
 UNSHARDED_CELLS = [cell for cell in LAYOUT_CELLS if cell not in SHARDED_CELLS]
 
 
@@ -557,6 +561,15 @@ def test_a_qwen35_decoder_trains_on_every_layout_as_on_one_device(case, steps, l
 @pytest.mark.check1_shards(seeds=8, per_task=2)
 def test_a_video_dits_fsdp_cell_trains_as_on_one_device(case, steps, layout, tmp_path):
     """`test_architecture_trains_on_every_layout_as_on_one_device` over the video DiT's fsdp cell."""
+    assert_trains_on_the_layout_as_on_one_device(case, steps, layout, tmp_path)
+
+
+@pytest.mark.parametrize(("case", "steps", "layout"), HYBRID_DIT_DATA_CELLS,
+                         ids=cell_ids(HYBRID_DIT_DATA_CELLS))
+@pytest.mark.check1_shards(seeds=8, per_task=4)
+def test_a_hybrid_dits_data_cell_trains_as_on_one_device(case, steps, layout, tmp_path):
+    """`test_architecture_trains_on_every_layout_as_on_one_device` over the hybrid DiT's data cell, each arm's
+    `fit` checked in the map task that draws its placed seed."""
     assert_trains_on_the_layout_as_on_one_device(case, steps, layout, tmp_path)
 
 

@@ -1897,6 +1897,8 @@ def test_a_wrappers_decoder_reads_as_its_language_model_load_reads_it():
                                        dtype="float32"))
     alone = Pretrained.load(FIXTURES / "kimi-k25-tiny", text_only=True, dtype="float32").model
     assert kimi.kinds == alone.kinds and kimi.num_layers == alone.num_layers
+    # Its text decoder zeroes its own placeholders' embeddings, the ids the bundle's config states.
+    assert alone.embedding_zero_ids == (whole["image_token_id"], whole["video_token_id"]) == (255, 256)
     plain = json.loads((FIXTURES / "llama-tiny" / "config.json").read_text())
     assert decoder_config(plain) is plain
 

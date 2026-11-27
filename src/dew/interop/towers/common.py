@@ -93,6 +93,11 @@ class TowerLayout:
     """The tower's vision_config, both ways (`dew.interop.layouts.ConfigLayout`): read into its fields
     (its reader), written from its value (`vision_config`); None for a tower whose config is read apart."""
     model_type: str | None = None
+    unread: Callable[[Mapping[str, Stored], str], Mapping[str, Stored]] | None = None
+    """`read`'s inverse where it rewrites the tensors it places (Inkling 2's patch order and class position):
+    a table holding the tower's tensors among others, each under its source name, whose names past
+    `prefix` (its second argument) end the tower's, given back as its source stores them, the others as
+    they are. None where `read` places the tensors as stored."""
     """The vision_config's own model_type, which a written config states."""
 
     def vision_config(self, tower: TowerBase) -> Mapping[str, object]:
@@ -100,6 +105,10 @@ class TowerLayout:
         assert self.config is not None, "the tower reads its config apart"
         return {**({} if self.model_type is None else {"model_type": self.model_type}),
                 **self.config.write(tower)}
+
+    def written_back(self, tensors: Mapping[str, Stored]) -> Mapping[str, Stored]:
+        """`tensors`, the tower's among them, its as its source stores them (`unread`)."""
+        return tensors if self.unread is None else self.unread(tensors, self.prefix)
 
     def path(self, name: str) -> tuple[str, ...] | None:
         """The leaf of tensor `name`, rooted at its collection; None for one the tower does not compute

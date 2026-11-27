@@ -327,3 +327,91 @@ def test_a_transparent_or_turned_image_reads_alike_however_it_is_given(tmp_path)
     media.tokenizer.padding_side = 'middle'
     with pytest.raises(ValueError):
         loaded.processor('w1 <|image|>', images=[rgba])
+
+
+def test_a_saved_bundle_writes_back_each_spelling_its_source_stores(tmp_path):
+    """A save of the bundle, its language model written back through Inkling 2's `unprepare` (row 13561),
+    writes every tensor the source stores under each name it stores it, an alias of its head (`model.`
+    taken off, one tensor to the wrapper's reading) among them, and loads back as the variables
+    it was saved from, bit for bit."""
+    import shutil
+
+    from flax.traverse_util import flatten_dict
+    from safetensors.numpy import load_file, save_file
+
+    directory = tmp_path / 'source'
+    shutil.copytree(BUNDLE, directory)
+    stored = load_file(directory / 'model.safetensors')
+    head = 'model.llm.unembed.weight'
+    alias = head.removeprefix('model.')
+    # The position table spelled twice beside one class position, which its read joins into it.
+    table = 'model.visual.backbone.embeddings.position_embedding'
+    aliases = {alias: stored[head], table.removeprefix('model.'): stored[table]}
+    save_file({**stored, **aliases}, directory / 'model.safetensors')
+    loaded = Pretrained.load(directory, dtype='float32')
+    loaded.save(tmp_path / 'saved')
+    written = {name: value for file in (tmp_path / 'saved').glob('*.safetensors') for name, value in
+               load_file(file).items()}
+    source = {**stored, **aliases}
+    assert sorted(written) == sorted(source)
+    for name, tensor in source.items():
+        assert (written[name].dtype, written[name].tobytes()) == (tensor.dtype, tensor.tobytes()), name
+    reloaded = flatten_dict(Pretrained.load(tmp_path / 'saved', dtype='float32').variables)
+    held = flatten_dict(loaded.variables)
+    assert sorted(reloaded) == sorted(held)
+    for path, value in held.items():
+        np.testing.assert_array_equal(np.asarray(reloaded[path]), np.asarray(value), err_msg=str(path))
+
+
+def test_a_bundle_whose_tower_computes_otherwise_is_refused_its_save():
+    """A save writes the bundle's vision_config as published, so a loaded bundle whose tower runs at another
+    norm epsilon than its config states is refused before a tensor is written (row 13561; review)."""
+    import dataclasses
+
+    from dew.interop.decoder_parts import ExportRefused
+
+    loaded = Pretrained.load(BUNDLE, dtype='float32')
+    vision = dataclasses.replace(loaded.model.vision, layer_norm_eps=2 * loaded.model.vision.layer_norm_eps)
+    with pytest.raises(ExportRefused):
+        dataclasses.replace(loaded, model=loaded.model.clone(vision=vision)).export()
+
+
+def test_a_bundle_whose_published_config_was_edited_since_its_load_is_refused_its_save(tmp_path):
+    """A save validates the config it publishes: a loaded bundle whose vision config's norm epsilon was
+    edited after its load, which the model it would write does not compute, is refused before a tensor is
+    written, as is one whose text config's residual normalization was (train 1366's review F2)."""
+    import dataclasses
+
+    from dew.interop.decoder_parts import ExportRefused
+
+    loaded = Pretrained.load(BUNDLE, dtype='float32')
+    for section, field in (('vision_config', 'layer_norm_eps'), ('text_config', 'attn_res_normalize_values')):
+        value = loaded.config[section][field]
+        changed = (not value) if isinstance(value, bool) else 2 * value
+        edited = dataclasses.replace(loaded, config={**loaded.config,
+                                                     section: {**loaded.config[section], field: changed}})
+        with pytest.raises(ExportRefused):
+            edited.save(tmp_path / field)
+        assert not any((tmp_path / field).glob('*.safetensors')), field
+
+
+def test_a_bundles_language_model_saved_alone_refuses_an_edited_towers_section(tmp_path):
+    """A bundle loaded for its language model alone (`text_only`) retains its towers' tensors unread and
+    writes back the config that names them, so a save whose config's vision section was edited since its
+    load is refused before a tensor is written: no model computes the tower to check it (train 1370's
+    review F1); one as loaded saves."""
+    import dataclasses
+
+    from dew.interop.decoder_parts import ExportRefused
+
+    loaded = Pretrained.load(BUNDLE, dtype='float32', text_only=True)
+    loaded.save(tmp_path / 'as-loaded')
+    vision = loaded.config['vision_config']
+    edited = dataclasses.replace(loaded, config={
+        **loaded.config, 'vision_config': {**vision, 'layer_norm_eps': 2 * vision['layer_norm_eps']}})
+    with pytest.raises(ExportRefused):
+        edited.save(tmp_path / 'edited')
+    # Edited in place, the section the load's snapshot holds stays as loaded.
+    vision['layer_norm_eps'] = 2 * vision['layer_norm_eps']
+    with pytest.raises(ExportRefused):
+        loaded.save(tmp_path / 'edited-in-place')

@@ -974,7 +974,9 @@ FROM_THE_HOST = {"slots": 1, "cache": PagedKV(page_size=4, pages=6, prefix_cache
     ((Served(12), Served(12), Served(12)), {"admission": 1}, (0, 16), (1, 2), NARROW_HYBRID),
     ((Served(12), Served(12, flipped=(0,)), Served(12)), FROM_THE_HOST, (0, 0, 8), None, NARROW_HYBRID)],
     ids=["by-default", "in-pieces", "every-page", "restores-past-admission", "from-the-host"])
-@pytest.mark.check1_shards(seeds=256, per_task=64)
+# Each map task draws every case's seeds it holds: 64 a task took 832 s in train 86a8d6d97's CI, past its
+# 651 s bound (row 12644); 16 a task holds a quarter of that.
+@pytest.mark.check1_shards(seeds=256, per_task=16)
 def test_a_hybrid_stack_reads_a_shared_prefix_with_the_state_its_prompt_left(requests, options, hits, rounds,
                                                                              site):
     """`assert_reads_a_shared_prefix`'s sites of 256 seeds, which CI draws in map tasks of 64: the default

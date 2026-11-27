@@ -15,8 +15,8 @@ from gpu_flow import Cell, run_cells
 
 pytestmark = [pytest.mark.gpu(reason="TF32 is a GPU's default float32 product"), pytest.mark.torchax]
 
-AT_RUN = "torchax models and a tier-3 source, no check-1 site"
-"""Why the first two cells compile at their run (`Cell.at_run`)."""
+AT_RUN = "a tier-3 source in a process of its own, no check-1 site"
+"""Why the second cell compiles at its run (`Cell.at_run`)."""
 PLACED_AT_LOAD = ("a tier-3 load places the source's tensors on the device as it loads "
                   "(MakeArraysFromHostBufferShards), which a prepare's compile-only device refuses")
 """Why the bf16 Qwen3-Next cell, whose check-1 site follows its load, compiles at its run (`Cell.at_run`)."""
@@ -25,9 +25,10 @@ PLACED_AT_LOAD = ("a tier-3 load places the source's tensors on the device as it
 def test_the_torchax_fallback_runs_on_the_gpu(tmp_path):
     """Every torchax cell above on this GPU (`gpu_flow.run_cells`)."""
     run_cells([
+        # Its site prepared, its load deferred to its arm's first run (row 12869).
         Cell("a float32 torchax model's logits and output tables are as exact as torch's (TF32)",
              lambda: fallback.a_float32_forwards_logits_and_its_output_tables_are_as_exact_as_torchs(
-                 tmp_path / "exact"), at_run=AT_RUN),
+                 tmp_path / "exact")),
         Cell("a tier-3 source runs in a process with no CPU backend",
              lambda: fallback.a_tier_three_source_runs_in_a_process_with_no_cpu_backend(tmp_path / "alone"),
              at_run=AT_RUN),

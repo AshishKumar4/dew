@@ -36,6 +36,7 @@ from types import MappingProxyType
 from typing import TYPE_CHECKING, Protocol
 
 import numpy as np
+from flax import linen as nn
 
 from dew import _records
 from dew._files import write_atomically
@@ -1521,7 +1522,7 @@ NUMERICS_FIELDS = frozenset(field.name for field in dataclasses.fields(CausalTra
 decoder's, and every part of a wrapper's (its towers, projections), which no export's config reads back
 as fields."""
 
-_RESOLVED: Mapping[str, Callable[[CausalTransformer], object]] = {
+_RESOLVED: Mapping[str, Callable[[nn.Module], object]] = {
     "num_kv_heads": lambda model: model.kv_heads,
     # Each layer's width, which an unstated width (four times the residual's) and its export state alike
     # (ledger 3065).
@@ -1541,7 +1542,7 @@ _RESOLVED: Mapping[str, Callable[[CausalTransformer], object]] = {
 the loop without `backprop_steps`, which says how it trains."""
 
 
-def refuse_lossy_export(model: CausalTransformer, config: Mapping[str, object]) -> None:
+def refuse_lossy_export(model: nn.Module, config: Mapping[str, object]) -> None:
     """Refuse an exported config that reads back as a different computation.
 
     The config is translated again by the family it names, which is the
@@ -1562,7 +1563,7 @@ def refuse_lossy_export(model: CausalTransformer, config: Mapping[str, object]) 
     refuse_rebuilt(model, rebuilt, str(config['model_type']))
 
 
-def refuse_rebuilt(model: CausalTransformer, rebuilt: CausalTransformer, model_type: str) -> None:
+def refuse_rebuilt(model: nn.Module, rebuilt: nn.Module, model_type: str) -> None:
     """Refuse a decoder whose written config reads back as `rebuilt`, another computation than `model`,
     naming the fields that differ."""
     # Each field that says what the model computes (`registry.computing_fields`), read as `_RESOLVED` does.
@@ -1650,11 +1651,14 @@ def bundle_media(config: Mapping[str, object], names: Collection[str]) -> frozen
 
 def bundle_text_config(config: Mapping[str, object]) -> Mapping[str, object]:
     """A media bundle's config as its family's text checkpoint states it: the same record without its
-    towers' sections (`_BUNDLE_MEDIA`) and its folders' configs (`DecoderFamily.wrapper_folders`),
-    which its decoder family reads as text alone."""
+    towers' sections (`_BUNDLE_MEDIA`), the keys its towers alone read (`DecoderFamily.wrapper_placeholders`)
+    and its folders' configs (`DecoderFamily.wrapper_folders`), which its decoder family reads as text
+    alone."""
     family = _bundled(_records.text(config["model_type"], "model_type"))
-    folders = () if family is None else tuple(folder_config(folder) for folder in family.wrapper_folders)
-    return {name: value for name, value in config.items() if name not in (*_BUNDLE_MEDIA, *folders)}
+    own = () if family is None else (*family.wrapper_placeholders,
+                                     *(folder_config(folder) for folder in family.wrapper_folders))
+    left_out = (*_BUNDLE_MEDIA, *own)
+    return {name: value for name, value in config.items() if name not in left_out}
 
 
 @functools.cache

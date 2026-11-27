@@ -40,7 +40,7 @@ from dew.interop import decoder_parts, gguf, hf_decoders as decoders, mamba2, qu
 from dew.interop.codecs import SourceQuantization, source_quantization
 from dew.interop.composite import CompositeSource, NativeComponent
 from dew.interop.config_records import NativeFields
-from dew.interop.decoder_bindings import decoder_layouts, reading_layout
+from dew.interop.decoder_bindings import decoder_layouts
 from dew.interop.drawn import extension_drawn, initialized
 from dew.interop.generation_config import (
     audit_masked,
@@ -87,7 +87,9 @@ from dew.interop.saved_sources import (
     released_source,
 )
 from dew.interop.streaming import WeightLayout
+from dew.interop.towers import tower_layout
 from dew.interop.weights import AUTO, checkpoint_dtype, declared_dtype
+from dew.interop.wrapper_export import bundle_media_sections, unprepared_export, wrapper_layouts
 from dew.interop.wrappers import corrected
 from dew.nn.autoencoders import AutoEncoder
 from dew.nn.backbones.causal_transformer import CausalTransformer
@@ -139,45 +141,6 @@ class Placing(Protocol):
 
     def __call__(self, variables: Variables, model: RefinesLayout | None = None,
                  axes: Mapping[tuple[str, ...], tuple[str | None, ...]] | None = None) -> Variables: ...
-
-
-def _in_language_model(path: tuple[str, ...]) -> tuple[str, ...]:
-    """Where a media wrapper holds its decoder's leaf: under `language_model` in the leaf's collection."""
-    return (path[0], "language_model", *path[1:])
-
-
-def _wrapper_layouts(tensors, record, variables, language: Sequence[decoder_parts.Reading],
-                     media: tuple[WeightLayout, ...]):
-    """Return one `WeightLayout` per wrapper source tensor, and the tensors no layout reads.
-
-    Each layout keeps the source's own tensor name and points at the leaf path
-    the loader built, so an export writes the names the source shipped. The
-    language model's tensors bind through the readings its load placed
-    (`language`, by its local names; one its family's `prepare` rewrote into others none), an alias of a
-    local name through the same one; the media components' through the layouts their readers placed
-    them by (`media`). A media tensor no component computes with (SigLIP's
-    pooling head, auxiliary tensors the reference ignores) keeps its source
-    bytes for export.
-    """
-    readings = {reading.name: reading for reading in language}
-    # The decoder's own tree, each collection's `language_model` entry, which its readings index.
-    language_tree = {collection: tree["language_model"] for collection, tree in variables.items()
-                     if isinstance(tree, Mapping) and "language_model" in tree}
-    bindings = list(media)
-    placed = {layout.name for layout in media}
-    retained = {}
-    for name, tensor in tensors.items():
-        group, local = decoders.wrapper_route(name, record)
-        if group == "language_model" and local in readings:
-            layout = reading_layout(name, readings[local]._replace(stored=tensor), record["text"],
-                                    record["text_model_type"], language_tree, _in_language_model)
-            if layout is None:
-                retained[name] = tensor
-            else:
-                bindings.append(layout)
-        elif group != "language_model" and name not in placed:
-            retained[name] = tensor
-    return tuple(bindings), retained
 
 
 def _share_quantized_aliases(tensors: dict[str, unread.Stored], aliases: tuple[tuple[str, str], ...],
@@ -825,7 +788,8 @@ class Pretrained:
         from dew.nn.projections import unpacked
         from dew.nn.protocols import Differential
 
-        if (reason := unwritten_extension(self.model)) is not None:
+        family = decoders.families().get(str(self.config.get("model_type")))
+        if (reason := unwritten_extension(self.model, family)) is not None:
             raise ValueError(reason)
         # A tree enters plain: a draw's boxes are its model's table, which no export reads. A stage-local
         # fit's store, and a banked one, is read by its layers' names (`stored_layers`), a bank's rows read
@@ -1889,8 +1853,24 @@ def _wrapper_source(config: Mapping[str, object], record: decoder_parts.WrapperF
     # Every component the record builds holds every leaf it computes with: a tower, projector or
     # prediction-depth tensor the checkpoint lacks is refused here, as a decoder's is.
     axes = decoder_parts.check_decoder_tree(variables, model)
-    layouts, retained = _wrapper_layouts(tensors, record, variables, language, media)
-    return _Built(model, variables, record, wrapper, layouts, retained, axes=axes)
+    layouts, retained = wrapper_layouts(tensors, record, variables, language, media)
+    entry = decoders.family_entry(record["text_model_type"])
+    export_adapter = None
+    if entry.unprepare is not None:
+        local = {reading.name for reading in language}
+        # Each local name's every wrapper spelling the source stores (`wrapper_route`), which `unprepare`
+        # writes back under each: a checked alias (a head stored twice) as well as the name.
+        spelled: dict[str, tuple[str, ...]] = {}
+        for name in tensors:
+            group, held = decoders.wrapper_route(name, record)
+            if group == "language_model":
+                spelled[held] = (*spelled.get(held, ()), name)
+        tower = record["tower"]
+        layout = None if tower is None else tower_layout(
+            _records.text(_records.record(tower, "tower")["class"], "tower class"))
+        export_adapter = partial(unprepared_export, entry.unprepare, wrapper["text"], layouts, retained,
+                                 local, spelled, None if layout is None else layout.written_back, None)
+    return _Built(model, variables, record, wrapper, layouts, retained, export_adapter, axes=axes)
 
 
 def _spelled_source_weights(spelling: Mapping[str, str], model: CausalTransformer,
@@ -1956,7 +1936,12 @@ def _decoder_source(config: Mapping[str, object], tensors: Mapping[str, unread.S
     if media:
         retained = {**retained, **{name: held[name] for name in sorted(media)}}
     export_adapter = None
-    if verified is None and not entry.preserve_source_layout:
+    if entry.unprepare is not None:
+        # A bundle's language model alone checks its retained towers' sections against its load's.
+        export_adapter = partial(unprepared_export, entry.unprepare, built, layouts, retained,
+                                 {layout.name for layout in layouts} | set(retained), {}, None,
+                                 bundle_media_sections(config) if media else None)
+    elif verified is None and not entry.preserve_source_layout:
         # The family's own encoder, the inverse `PretrainedDecoder.from_model` writes
         # through too. A quantized source keeps its packed format by going back
         # over its source names (`weight_layouts`) where it binds them; a family

@@ -125,8 +125,14 @@ def scored(model, sampling: Sampling):
     return score
 
 
-@pytest.mark.parametrize("kind", sorted(MODELS))
-@pytest.mark.parametrize("sampling", [GREEDY, SAMPLED], ids=["greedy", "sampled"])
+# The slow greedy hybrid's draws run as armada's map tasks: it took 137 s whole in train 1246's CI and 135 s
+# cold in main 2f6b65a64's durations record (row 12407).
+@pytest.mark.parametrize(("kind", "sampling"), [
+    pytest.param("attention", GREEDY, id="greedy-attention"),
+    pytest.param("hybrid", GREEDY, id="greedy-hybrid",
+                 marks=pytest.mark.check1_shards(seeds=64, per_task=16)),
+    pytest.param("attention", SAMPLED, id="sampled-attention"),
+    pytest.param("hybrid", SAMPLED, id="sampled-hybrid")])
 def test_a_served_cohort_draws_what_its_policy_draws_whole(kind, sampling):
     """A cohort of conversations served over a paged cache, each turn's context continuing its row's last
     (the server reading that history's pages, and an attention-and-delta-net hybrid its recurrent state,
@@ -134,7 +140,8 @@ def test_a_served_cohort_draws_what_its_policy_draws_whole(kind, sampling):
     action token for token on every draw check 1 takes, greedy and sampled alike (the key stream folded
     by the global row, however a prompt was split), and the likelihoods it draws them with on par with
     the whole policy's, by check 1 against the actions teacher-forced in the float64 twin, over drawn
-    weights."""
+    weights. The contexts and actions are check 1's leaves too, their truth the whole policy's: a served
+    draw that differs by one token is infinitely further from it than the whole one, which is it."""
     model = MODELS[kind]()
     initialized = jax.jit(model.init)
 
@@ -145,15 +152,18 @@ def test_a_served_cohort_draws_what_its_policy_draws_whole(kind, sampling):
     whole = collector(model, draw(0)[0], sampling)
     names = ("raw", "behavior") if sampling.temperature else ("raw",)
     truth_score = scored(float64_twin(model), sampling)
-    # Each arm's contexts and actions by the bytes of the weights it drew them over: the draws check 1 takes.
-    discrete: dict[str, dict[str, tuple[np.ndarray, np.ndarray]]] = {"served": {}, "whole": {}}
+    # The whole arm's contexts and actions by the bytes of the weights it drew them over, which its truth
+    # teacher-forces.
+    drawn_whole: dict[str, tuple[np.ndarray, np.ndarray]] = {}
 
-    def likelihoods(arm, name):
+    def likelihoods(arm, kept=None):
         @as_given
         def run(variables):
             drawn = collected(arm, variables)
-            discrete[name][digest(variables)] = (drawn["contexts"], drawn["tokens"])
-            return {held: drawn[held] for held in names}
+            if kept is not None:
+                kept[digest(variables)] = (drawn["contexts"], drawn["tokens"])
+            return {**{held: drawn[held] for held in names}, "contexts": drawn["contexts"],
+                    "tokens": drawn["tokens"]}
         return run
 
     @as_given
@@ -162,22 +172,17 @@ def test_a_served_cohort_draws_what_its_policy_draws_whole(kind, sampling):
         # the gate widened (float32's exactly), or drawn as its arm draws them, in float32 outside the
         # truth's x64 (row 12407: under x64 the collection compiled and ran each draw a second time).
         narrow = jax.tree.map(lambda leaf: np.asarray(leaf, np.float32), variables)
-        drawn = discrete["whole"].get(digest(narrow))
+        drawn = drawn_whole.get(digest(narrow))
         if drawn is None:
             with jax.enable_x64(new_val=False):
                 collection = collected(whole, narrow)
             drawn = (collection["contexts"], collection["tokens"])
         with jax.enable_x64(new_val=True):
             wide = jax.tree.map(lambda leaf: jnp.asarray(leaf, jnp.float64), variables)
-            return truth_score(wide, *drawn)
+            return {**truth_score(wide, *drawn), "contexts": drawn[0], "tokens": drawn[1]}
 
-    assert_as_exact(likelihoods(served, "served"), likelihoods(whole, "whole"), draw,
-                    f"served {kind} episodes", seeds=SEEDS, truth_fn=truth)
-    # Every draw the served arm took, the whole one took too.
-    assert discrete["served"].keys() <= discrete["whole"].keys() and len(discrete["served"]) >= SEEDS
-    for key, (contexts, tokens) in discrete["served"].items():
-        np.testing.assert_array_equal(contexts, discrete["whole"][key][0])
-        np.testing.assert_array_equal(tokens, discrete["whole"][key][1])
+    assert_as_exact(likelihoods(served), likelihoods(whole, drawn_whole), draw, f"served {kind} episodes",
+                    seeds=SEEDS, truth_fn=truth)
 
 
 PAGE = 2
