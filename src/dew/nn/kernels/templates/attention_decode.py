@@ -629,10 +629,12 @@ def priced_step(target: generation.GpuTarget, *, rows: int, queries: int, keys: 
                 normalized=equation.params.get("normalized", False), traced=True,
                 merge=equation.params.get("merge")))
     all_launches = launches + merges
-    # The launches one after another: their spans summed, and their dependent paths each its longest at the
-    # target's latencies, followed by the next's (`cost.Chain.then`), not the longest of them alone.
-    paths = [max(each.chains, key=lambda chain: cost.chained(Work(chains=(chain,)), target))
-             for each in all_launches if each.chains]
+    # The launches one after another: their spans summed, and their dependent paths in sequence
+    # (`cost.Chain.then`), each launch's its longest at the target's latencies, its span's steps
+    # (`cost.path`'s) or one of its chains, not the step's longest alone.
+    paths = [max((cost.Chain(span=each.span), *each.chains),
+                 key=lambda chain: cost.chained(Work(chains=(chain,)), target))
+             for each in all_launches]
     return dataclasses.replace(sum(all_launches, Work()), span=sum(each.span for each in all_launches),
                                chains=(functools.reduce(cost.Chain.then, paths),) if paths else ())
 
