@@ -657,3 +657,32 @@ def test_a_first_save_a_third_replaced_between_is_refused_its_names(tmp_path):
                  for name, value in load_file(target / file).items()}
     np.testing.assert_array_equal(published['model.a'], weight * 2)
     np.testing.assert_array_equal(published['model.b'], weight + 2)
+
+
+def test_a_release_whose_index_alone_is_left_saves_again_in_shards(tmp_path):
+    """A release whose shards are gone but whose index is left saves again in shards, named apart from what
+    that index names, rather than refused as another save's on every attempt (train 1414's review: an
+    index alone was weights to the commit but none to the naming)."""
+    import json
+
+    from safetensors.numpy import load_file
+
+    from dew.interop.releases import Placed, ReleasePlan
+
+    weight = np.arange(4096, dtype=np.float32).reshape(64, 64)
+    target = tmp_path / 'release'
+
+    def plan(scale):
+        return ReleasePlan(Placed({'': ({'model_type': 'tiny'}, {'model.a': weight * scale,
+                                                                 'model.b': weight + scale})}))
+
+    plan(1).write(target, max_shard_size=20000)
+    named = set(json.loads((target / 'model.safetensors.index.json').read_text())['weight_map'].values())
+    for name in named:
+        (target / name).unlink()
+    plan(2).write(target, max_shard_size=20000)
+    index = json.loads((target / 'model.safetensors.index.json').read_text())['weight_map']
+    assert not named & set(index.values())
+    published = {name: value for file in set(index.values())
+                 for name, value in load_file(target / file).items()}
+    np.testing.assert_array_equal(published['model.a'], weight * 2)

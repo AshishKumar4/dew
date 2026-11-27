@@ -43,6 +43,7 @@ from dew.interop.safetensors_io import (
     joined_tensors,
     save_sharded,
     tensor_specs,
+    weight_shard,
     weight_stem,
     write_file,
 )
@@ -131,15 +132,17 @@ class ConcurrentRelease(FileExistsError):
 def refused_entries(written: Entries, held: Entries, directory: Path) -> set[Path]:
     """What keeps a release from replacing the tree at `directory`, read under the publication lock
     (`swapped`'s `foreign`): its foreign entries (`foreign_entries`); and raised (`ConcurrentRelease`), a
-    shard of its weights named as a first save names them (`first_shard`), which a save names only where
-    the tree it replaces held no weights of that stem in that folder (`save_sharded`), where the tree it
-    replaces now holds such weights: another save published them while this one was written, and a reader
-    holding that save's index, or the index of one a third save replaced since, would open this one's
-    shards under the names it reads (train 1411's review; train 1414's review: the third save's)."""
+    shard of its weights the tree it replaces holds under its name, or one named as a first save names them
+    (`first_shard`), which a save names only where the tree it replaces held no weights of that stem in
+    that folder (`save_sharded`), where the tree it replaces now holds such weights: another save
+    published them while this one was written, and a reader holding that save's index, or the index of one
+    a third save replaced since, would open this one's shards under the names it reads (train 1411's
+    review; train 1414's review: the third save's)."""
     holding = {(entry.parent, stem) for entry, kind in held.items()
                if kind == "file" and (stem := weight_stem(entry.name)) is not None}
     shards = sorted(entry for entry, kind in written.items()
-                    if kind == "file" and (entry.parent, first_shard(entry.name)) in holding)
+                    if kind == "file" and weight_shard(entry.name)
+                    and (held.get(entry) == "file" or (entry.parent, first_shard(entry.name)) in holding))
     if shards:
         raise ConcurrentRelease(f"{directory} was published by another save while this one was written, "
                                 f"which named its shards {list(map(str, shards))} for a destination holding "

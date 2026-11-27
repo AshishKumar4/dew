@@ -420,6 +420,12 @@ def weight_stem(name: str) -> str | None:
     return None
 
 
+def weight_shard(name: str) -> bool:
+    """Whether a directory's entry `name` is a shard of a stem's weights (`_shards`), under any token, not its
+    single file or its index."""
+    return any(_shards(stem).fullmatch(name) for stem in WEIGHT_STEMS)
+
+
 def first_shard(name: str) -> str | None:
     """The stem a directory's entry `name` is a shard of, named as a first save names it, under no token
     (`save_sharded`, as its library names it); None for any other entry."""
@@ -498,9 +504,12 @@ def save_sharded(
     # from the weights the tree it replaces held there too: a reader holding the earlier index finds its
     # files gone rather than this export's under their names (train 1411's return).
     earlier = published_counterpart(folder)
-    held = {name for name in _listing(earlier) if _replaced(stem).fullmatch(name)} if earlier else set()
+    # Named apart wherever the folder, or the tree its staging replaces, holds weights of the stem, an index
+    # alone among them: the rule a commit refuses a first save's names by (`releases.refused_entries`).
+    holding = [name for name in (*_listing(folder), *(_listing(earlier) if earlier else ()))
+               if weight_stem(name) == stem]
     token = secrets.token_hex(4)
-    replacing = split.is_sharded and bool(replaced | held)
+    replacing = split.is_sharded and bool(holding)
     names = {filename: (filename.replace(f"{stem}-", f"{stem}-{token}-", 1) if replacing else filename)
              for filename in split.filename_to_tensors}
     for filename, members in split.filename_to_tensors.items():
