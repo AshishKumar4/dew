@@ -15,7 +15,7 @@ from typing import Annotated, Literal, Union
 import tyro
 
 from dew import registry
-from dew.registry import Annotation, Bound, Configured, JsonRecords, member_fields
+from dew.registry import Annotation, Bound, JsonRecords, member_fields
 
 _PLAIN = (int, float, str, bool)
 """The values a command line sets a model's field to by a plain flag (`_flat`)."""
@@ -42,8 +42,7 @@ def _flat(annotation: Annotation) -> Annotation | None:
 
 
 def _fits(value: registry.Configured, annotation: Annotation) -> bool:
-    """Whether `value` is one a flag of the flat `annotation` (`_flat`) holds: any configured value, a union
-    `dew.registry` declares (`Configured`), which this asks of its shape."""
+    """Whether `value` is one a flag of the flat `annotation` (`_flat`) holds."""
     origin = typing.get_origin(annotation)
     if origin in (Union, types.UnionType):
         return any(_fits(value, member) for member in typing.get_args(annotation))
@@ -62,7 +61,7 @@ def _fits(value: registry.Configured, annotation: Annotation) -> bool:
 
 
 @functools.cache
-def record_flags[R: Bound](record: type[R], member: type | Callable[..., Configured], path: str,
+def record_flags[R: Bound](record: type[R], member: type | Callable[..., registry.Configured], path: str,
                            alias: str) -> type[R]:
     """`member`'s record (`record`, a `Bound` kind's) as a command line sets it (api03): a subclass whose
     own fields are the member's arguments a plain flag sets (`_flat`; one the run builds, an object, takes
@@ -75,7 +74,7 @@ def record_flags[R: Bound](record: type[R], member: type | Callable[..., Configu
     # reads a value by.
     flags = []
     flats: dict[str, Annotation] = {}
-    stated_defaults: dict[str, Configured] = {}
+    stated_defaults: dict[str, registry.Configured] = {}
     for name, declared, annotation in member_fields(member):
         flat = None if annotation is None or name in reserved else _flat(annotation)
         if flat is None:
@@ -104,7 +103,7 @@ def record_flags[R: Bound](record: type[R], member: type | Callable[..., Configu
     return made
 
 
-def implied_subcommand(default: Configured) -> str | None:
+def implied_subcommand(default: registry.Configured) -> str | None:
     """The subcommand a field's `default` is (`record_flags`'s `_alias`: `env:flight`), which a flag of the
     field given without one implies; None for any other default."""
     return vars(type(default)).get("_alias") if isinstance(default, Bound) else None
