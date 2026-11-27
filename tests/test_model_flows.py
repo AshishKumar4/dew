@@ -224,6 +224,15 @@ def test_a_parts_prepare_compiles_a_flows_programs_and_its_truths_programs_for_i
     filed = json.loads(needs.read_text())
     stated = json.loads((store / model_flows.NEED).read_text())["programs"]
     assert (filed["unit"], filed["programs"]) == ("a dense decoder's unit", stated)
+    # Each of its own programs filed under its flow's and its own name (`train dew`), each truth under its
+    # site's (row 13580; train 1355's review, F2).
+    from dew.training.ahead import AheadPrograms
+
+    named = {f"{flow.name}: {name}" for arm in ("dew", "reference")
+             for name, program in AheadPrograms.load(store / f"{arm}.programs").programs.items()
+             if program.memory is not None}
+    labels = [program["label"] for program in stated]
+    assert named and named == {label for label in labels if label.startswith(f"{flow.name}: ")}, labels
 
 
 def test_a_flows_prepare_leaves_a_convolution_to_its_run_and_says_so(store, monkeypatch):

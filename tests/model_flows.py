@@ -741,7 +741,7 @@ def prepare(flow: ModelFlow) -> bool:
     (directory / ON_DEVICE).write_text(json.dumps({"programs": {**on_device, **refused}, "stamp": stamp()}))
     for kind in flow.kinds:
         judge(flow, {}, kind, target)
-    programs = need(dew, reference, directory / "truths")
+    programs = need(flow, dew, reference, directory / "truths")
     (directory / NEED).write_text(json.dumps(programs))
     unit_needs(programs["programs"])
     return True
@@ -752,14 +752,16 @@ NEED = "need.json"
 by which the GPU tier admits a part's worker to a slot (`dew.training.memory.admitted` of each)."""
 
 
-def need(dew, reference, truths: Path) -> dict[str, list[dict[str, int]]]:
+def need(flow: ModelFlow, dew, reference, truths: Path) -> dict[str, list[dict[str, int | str]]]:
     """A flow's run's programs as the allocator admits them (`truths_ahead.admitted_needs`): its own programs'
-    (Dew's and its reference's, each `Executable.memory`), the state its run holds while its truths compute,
-    and its truths' (`truths_ahead.compiled_memory`)."""
+    (Dew's and its reference's, each `Executable.memory`, labelled `<flow>: <program>`, as `train dew`), the
+    state its run holds while its truths compute, and its truths' (`truths_ahead.compiled_memory`, each
+    labelled by its site), so a unit's needs say which program asks for what (row 13580)."""
     # A program its run compiles on its GPU (`ON_DEVICE`) states none ahead, as one whose compile states
     # none (`Executable.memory`).
-    arms = [executable.memory._asdict() for programs in (dew, reference) if programs is not None
-            for executable in programs.programs.values() if executable.memory is not None]
+    arms = [{**executable.memory._asdict(), "label": f"{flow.name}: {name}"}
+            for programs in (dew, reference) if programs is not None
+            for name, executable in programs.programs.items() if executable.memory is not None]
     return {"programs": admitted_needs(arms, compiled_memory(truths))}
 
 
