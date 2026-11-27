@@ -727,3 +727,20 @@ ENTRY %main {
         "pairs": ((1, 0), (3, 2), (5, 4), (7, 6)),
         "every": (),
         "reduced": ((0, 1, 2, 3), (4, 5, 6, 7))}
+
+
+def test_each_compile_of_a_program_counts_its_own_flops():
+    """A step's FLOP count (`step_flops`) is its module's whoever compiled it: a matrix product's 2 m n k,
+    a second compile of the same program's alike, a product of other shapes its own (row 13739: a count
+    kept for a module read again, keyed by the whole module it reads)."""
+    from dew.telemetry.instrumentation import step_flops
+
+    def product(x, y):
+        return x @ y
+
+    def counted(columns: int) -> float | None:
+        flops = step_flops(jax.jit(product).lower(jnp.ones((32, 16)), jnp.ones((16, columns))).compile())
+        return None if flops is None else flops.hardware
+
+    assert counted(8) == counted(8) == 2 * 32 * 16 * 8
+    assert counted(4) == 2 * 32 * 16 * 4
