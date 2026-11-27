@@ -11,7 +11,11 @@ from pathlib import Path
 
 from tool_support import load
 
-GATE = Path(__file__).resolve().parents[1] / "tools" / "duplicates.py"
+REPO = Path(__file__).resolve().parents[1]
+GATE = REPO / "tools" / "duplicates.py"
+# The gate runs as a module of the tools package (`python -m tools.duplicates`), from any directory.
+RUN = [sys.executable, "-m", "tools.duplicates"]
+ENVIRONMENT = {**os.environ, "PYTHONPATH": str(REPO)}
 BASE_HISTORY = GATE.with_name("base_history.sh")
 duplicates = load("duplicates")
 
@@ -53,8 +57,8 @@ def range_over_count(items, floor):
 
 
 def gate(root: Path, *arguments: str) -> subprocess.CompletedProcess:
-    return subprocess.run([sys.executable, str(GATE), *arguments, "."], cwd=root, capture_output=True,
-                          text=True, timeout=300)
+    return subprocess.run([*RUN, *arguments, "."], cwd=root, env=ENVIRONMENT, capture_output=True, text=True,
+                          timeout=300)
 
 
 def sources(root: Path) -> dict[str, str]:
@@ -370,7 +374,7 @@ def test_held_to_a_base_only_a_copy_the_base_lacked_fails(tmp_path):
     assert gate(root, "--base=main").returncode == 1
     assert owners(added(root)) == [
         ("function", ["ranges.py range_over_count", "spread.py spread", "third.py third"])]
-    absolute = subprocess.run([sys.executable, str(GATE), "--base=main", str(root)], cwd=root, timeout=300,
+    absolute = subprocess.run([*RUN, "--base=main", str(root)], cwd=root, env=ENVIRONMENT, timeout=300,
                               capture_output=True)
     assert absolute.returncode == 1
 

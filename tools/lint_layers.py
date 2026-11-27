@@ -7,7 +7,7 @@ checker's. A contract joins its closure as the bridges its modules' imports cros
 rows). A crossing names its contract, its module, the package it reaches and the chain of imports that
 reaches it. tools/check_gates runs it on every head:
 
-    python tools/lint_layers.py [SOURCE]
+    python -m tools.lint_layers [SOURCE]
 
 SOURCE is the directory that holds the `dew` package (`src`, the default).
 """
@@ -17,8 +17,7 @@ from collections.abc import Iterator, Mapping, Sequence
 from pathlib import Path
 from typing import NamedTuple
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-import lint_scopes as scopes
+from tools import lint_scopes as scopes
 
 FEATURES = ("dew.nn", "dew.data", "dew.inputs", "dew.objectives", "dew.training", "dew.inference",
             "dew.interop", "dew.rl", "dew.decision", "dew._cli", "dew.config", "dew.checkpoints",

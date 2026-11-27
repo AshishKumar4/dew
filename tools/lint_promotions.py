@@ -30,7 +30,7 @@ from __future__ import annotations
 import ast
 from collections.abc import Iterator, Mapping, Sequence
 
-import lint_scopes as scopes
+from tools import lint_scopes as scopes
 
 FLOAT64 = frozenset({"torch.float64", "torch.double", "torch.DoubleTensor"})
 """The dtypes a promotion casts to, with `type`'s tensor class for float64, by name or spelled."""

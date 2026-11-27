@@ -163,15 +163,16 @@ from collections.abc import Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-import lint_assertions as assertion_rules
-import lint_derivatives as derivative_rules
-import lint_divisors as divisor_rules
-import lint_precisions as precision_rules
-import lint_promotions as promotion_rules
-import lint_scopes as scopes
-import lint_tolerances as tolerance_rules
-from forked import forked_map
+from tools import (
+    lint_assertions as assertion_rules,
+    lint_derivatives as derivative_rules,
+    lint_divisors as divisor_rules,
+    lint_precisions as precision_rules,
+    lint_promotions as promotion_rules,
+    lint_scopes as scopes,
+    lint_tolerances as tolerance_rules,
+)
+from tools.forked import forked_map
 
 ROOT = Path(__file__).resolve().parent.parent
 

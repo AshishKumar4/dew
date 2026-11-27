@@ -19,7 +19,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Protocol, TypeGuard
 
-import lint_scopes as scopes
+from tools import lint_scopes as scopes
 
 
 class Calls(Protocol):

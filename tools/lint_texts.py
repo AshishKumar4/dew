@@ -10,7 +10,7 @@ import ast
 from collections.abc import Iterator, Mapping
 from dataclasses import dataclass, field
 
-import lint_scopes as scopes
+from tools import lint_scopes as scopes
 
 IR_TEXTS = {"as_text", "as_hlo_text", "pretty_print", "as_hlo_dot_graph", "mlir_module"}
 """A lowered or compiled program's text, by the method that prints it (jax.stages, jax.core.Jaxpr)."""
