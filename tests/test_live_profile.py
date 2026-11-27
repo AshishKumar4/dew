@@ -163,7 +163,7 @@ START = rung()
 
 def tiled(held: int):
     """A head policy whose tile holds `held` bytes whatever the logits and tile."""
-    return lambda whole, tile, fused: held
+    return lambda whole, tile, fused, itemsize: held
 
 
 def test_a_whole_heads_tile_frees_its_logits_and_holds_its_tile_where_they_were():
@@ -175,7 +175,7 @@ def test_a_whole_heads_tile_frees_its_logits_and_holds_its_tile_where_they_were(
                            held(80, 3, 6, 1)))
     assert priced(rung(tile=(16, 128), fused=True), START, profile, 0, tiled(10)) == 20
     assert priced(rung(tile=(16, 128)), START, profile, 0, tiled(90)) == 10
-    assert priced(rung(tile=(16, 128)), START, profile, 0, lambda whole, tile, fused: None) is None
+    assert priced(rung(tile=(16, 128)), START, profile, 0, lambda whole, tile, fused, itemsize: None) is None
     assert priced(rung(tile=(16, 128)), rung(tile=(16, 128), fused=True), profile, 0, tiled(10)) is None
 
 

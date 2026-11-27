@@ -410,8 +410,8 @@ class Probe:
         beside = None if stats is None else placed_beside(stats, held)
         # A compile stopped before optimizing (its arguments alone over the limit) states no temporaries,
         # its zero no measure of them: the record says none was read.
-        temp = None if stats is None or (stats.stopped and stats.temp == 0) else stats.temp
-        return cls(split, rows_of(candidate.micro), rung, fit, headroom, temp,
+        temporaries = None if stats is None or (stats.stopped and stats.temp == 0) else stats.temp
+        return cls(split, rows_of(candidate.micro), rung, fit, headroom, temporaries,
                    None if stats is None else stats.argument, beside=beside)
 
     def record(self) -> dict[str, JSON]:
