@@ -8,7 +8,7 @@ This page is generated from the maintainers' findings ledger as each change land
 
 ## Kernels and performance
 
-- GEMM cells at parity: the template the default on every NVIDIA cell. [1295, 153, 2109, 5623, 5634, 5666, 13557, 13562, 13588, 13592, 13734, 13740, 13743, 13751]
+- GEMM cells at parity: the template the default on every NVIDIA cell. [1295, 153, 2109, 5623, 5634, 5666, 13557, 13562, 13588, 13592, 13734, 13740, 13743, 13751, 13986]
 - One recurrence algebra, the template for every form and product, and port retirement. [2076, 3426, 3427]
 - Family toolkit: resources derived and checked against ptxas, one planner, one traversal. [2987, 6010]
 - The kernel challenge's lessons in the templates. [5271]
@@ -27,6 +27,7 @@ This page is generated from the maintainers' findings ledger as each change land
 - The recurrence template refuses the gated delta net's training on sm120. [13064]
 - Every consumer runs the template's program. [13741]
 - Log-linear bf16 training backward regression. [13750]
+- Log-linear NaN across live spans. [13991]
 - Low-precision and decode-size GEMMs. [483, 4518, 4519]
 - Model consumers fused through the template's hooks. [1376, 3422, 3428, 822]
 - Further attention variants. [1461, 1462, 1463, 1465, 1317, 1466]
@@ -36,7 +37,6 @@ This page is generated from the maintainers' findings ledger as each change land
 - A forked chunked call whose readout reads the memory entering its token or weighs its own write (recurrence.Hooks.reads 'before', Hooks.own_weight: RWKV6's)…. [6267]
 - Block-selected attention's other selections as mixers. [6301]
 - CuDNN's response to a non-finite K or V at a key a query does not see is unknown. [7190]
-- The GEMM compile gate certifies each launch with one CUDA build's compile-only client (the kernel-compile extra's), then checks the settled kernel under each…. [10766]
 - A gathered gemm call through a narrow prologue rounds each route's operand cotangent at the prologue's dtype before the token's wide sum. [13508]
 - A paged decode step whose pages are smaller than its key tile (page 16, the reads a key a run) at width 128 never finishes under the Mosaic interpreter on sm90. [13656]
 - The fork takes no static register cap for a Mosaic GPU kernel. [12686]
@@ -112,4 +112,5 @@ This page is generated from the maintainers' findings ledger as each change land
 - The JAX fork, releases and installs. [3569, 3376, 3378, 3379, 3380, 3382, 3384, 3385, 3388, 3390, 3391, 3397, 3403, 3404]
 - Tests/test_gpu_mesh.py and tests/test_gpu_systems.py each span three lanes' code. [6421]
 - Tools that import their siblings by putting tools/ on sys.path at import time. [11756]
+- Dew pins egglog 14.0.0.post2 on Linux. [14069]
 - Jaxlib/XLA fork (abort a GPU's NCCL cliques when an execution fails on one rank, so its peers end instead of hanging in a running collective). [12352]
