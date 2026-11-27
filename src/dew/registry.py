@@ -1240,9 +1240,10 @@ def _unread_partial(value: Configured, annotation: Annotation) -> functools.part
     except ValueError:
         types_ = [None] * len(value)
     entries = value.values() if isinstance(value, Mapping) else value
-    # A held argument's entries are the configured values it was given (a record mapping's among them).
+    # Only a partial or a container holds one: any other entry is passed over.
     return next((found for entry, held in zip(entries, types_, strict=True)
-                 if (found := _unread_partial(typing.cast(Configured, entry), held)) is not None), None)
+                 if isinstance(entry, functools.partial | Mapping | list | tuple)
+                 and (found := _unread_partial(entry, held)) is not None), None)
 
 
 def _argument_type(member: type | Callable[..., Configured], name: str) -> Annotation:
