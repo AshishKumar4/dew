@@ -36,14 +36,17 @@ from reference_error import as_given, assert_as_exact, assert_computes_the_oracl
 from residual_orders import permuted, residual_width
 from sharded import split_axes
 
+from dew import registry
 from dew.artifacts import ImageGrid, Representations, TokenScores, VideoGrid
 from dew.config import MetricConfig, ObjectiveConfig
 from dew.config.diffusion import DiffusionRunConfig
 from dew.data.dataset import Loader
 from dew.diffusion import presets
 from dew.distributed.batches import shard_batch
+from dew.eval.images import CLIPDistance
 from dew.inputs import Condition, ConditionEncoder, Field, InputSpec
 from dew.nn.attention_blocks import Stage
+from dew.nn.backbones.unet import Unet
 from dew.nn.sharding import boxed_axes
 from dew.objectives.diffusion import DiffusionObjective
 from dew.objectives.jepa import JepaObjective
@@ -788,9 +791,10 @@ JSON_UNET = {"emb_features": 32, "feature_depths": [8, 16], "norm_groups": 4,
 
 def unet_run(fields):
     return DiffusionRunConfig(
-        model=ModelConfig("unet", {**fields, "dtype": "float32"}),
+        model=ModelConfig(functools.partial(Unet, **{**fields, "dtype": "float32"})),
         data=images_of("tfds://oxford_flowers102", 8), text=None,
-        objective=ObjectiveConfig("diffusion", {"guidance": None, "solver": Euler(), "steps": SAMPLER_STEPS}))
+        objective=ObjectiveConfig(functools.partial(DiffusionObjective, guidance=None,
+                                                    solver=Euler(), steps=SAMPLER_STEPS)))
 
 
 @attending("reference")
@@ -799,7 +803,7 @@ def test_a_unet_from_a_json_record_generates_what_its_value_twin_does():
     metrics, while unknown metric names and unparsed string metric lists are refused."""
     value_unet = {**JSON_UNET, "feature_depths": (8, 16),
                   "attention_configs": (None, Stage(heads=2, use_projection=True))}
-    clip = MetricConfig("clip")
+    clip = MetricConfig(functools.partial(CLIPDistance))
     assert from_record(MetricConfig, to_record(clip, MetricConfig)) == clip
     run = replace(unet_run(JSON_UNET), val_metrics=(clip,))
     record = json.loads(json.dumps(run.to_dict()))
@@ -818,12 +822,12 @@ def test_a_unet_from_a_json_record_generates_what_its_value_twin_does():
             prompts, steps=SAMPLER_STEPS, key=key).host().images)
 
     for name in sorted(metrics):
-        metric_cfg = MetricConfig(name)
+        metric_cfg = MetricConfig(functools.partial(registry.metrics[name]))
         roundtripped = DiffusionRunConfig.from_dict(
             json.loads(json.dumps(replace(unet_run(JSON_UNET), val_metrics=(metric_cfg,)).to_dict())))
         assert roundtripped.val_metrics == (metric_cfg,)
     with pytest.raises(KeyError):
-        MetricConfig("fid_score")
+        MetricConfig(functools.partial(registry.metrics["fid_score"]))
     with pytest.raises(TypeError):
         DiffusionRunConfig.from_dict({**run.to_dict(), "val_metrics": ["psnr"]})
     with pytest.raises(TypeError):

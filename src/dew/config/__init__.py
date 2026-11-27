@@ -29,9 +29,10 @@ import types
 import typing
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from pathlib import Path
-from typing import TYPE_CHECKING, Annotated, ClassVar, NoReturn, Self, Union
+from typing import TYPE_CHECKING, Annotated, Any, ClassVar, NoReturn, Self, Union
 
 import jax
+import numpy as np
 import tyro
 from etils import epath
 from tyro.conf._confstruct import _SubcommandConfig
@@ -80,9 +81,9 @@ from dew.nn.precision import Numerics
 from dew.objectives.base import Effects, Loss, Metric, Objective
 from dew.optim import OptimConfig, ParamGroup
 from dew.registry import (
+    Bound,
     Configured,
     ModelConfig,
-    Registered,
     declared_type,
     from_record,
     implied_subcommand,
@@ -124,19 +125,20 @@ topology it compiles ahead for and saves (`AheadTarget`), or a CUDA generation i
 
 
 @dataclasses.dataclass(frozen=True)
-class ObjectiveConfig(Registered):
-    """An objective's class and the arguments the run gives it.
+class ObjectiveConfig(Bound["Objective"]):
+    """An objective's class bound to the arguments the run gives it.
 
-    `name` is an alias or an import path, held as the path. `fields` are the
-    constructor arguments the run states, held as their records
-    (`registry.argument_records`); what the objective is built around, the
-    model and what a recipe reads off its data, `build` takes from the caller.
-    `defaults` holds every other argument the class defaults, as `ModelConfig`
-    holds a model's, so an EMA decay, a loss weighting or a sampling step count
-    the class defaults differently later leaves a recorded run as it was.
+    `bound` is the class, of `dew.registry.objectives` or any objective by its
+    import path, by the constructor arguments the run states; what the
+    objective is built around, the model and what a recipe reads off its data,
+    `build` takes from the caller. `defaults` holds every other argument the
+    class defaults, as `ModelConfig` holds a model's, so an EMA decay, a loss
+    weighting or a sampling step count the class defaults differently later
+    leaves a recorded run as it was.
     """
 
-    name: str
+    bound: functools.partial[Any]
+    """The objective's class, an `Objective`, bound to the arguments the run states."""
 
     @staticmethod
     def _member(name: str) -> type:
@@ -154,18 +156,19 @@ class ObjectiveConfig(Registered):
 
 
 @dataclasses.dataclass(frozen=True)
-class MetricConfig(Registered):
-    """A metric's class and the arguments the run gives it.
+class MetricConfig(Bound["Metric"]):
+    """A metric's class bound to the arguments the run gives it.
 
-    `name` is an alias of `dew.registry.metrics` or an import path, held as
-    the path. `fields` are the constructor arguments the run states, as
-    `ObjectiveConfig` holds an objective's: a CLIP metric's `modelname`, an
-    FID's `weights`. `defaults` holds every other argument the class defaults,
-    so a metric whose default model changes later scores a recorded run as it
-    did. The split it scores is its suite's (`Suite`, `RunConfig.suites`).
+    `bound` is the class, of `dew.registry.metrics` or any metric by its import
+    path, by the constructor arguments the run states, as `ObjectiveConfig`
+    binds an objective's: a CLIP metric's `modelname`, an FID's `weights`.
+    `defaults` holds every other argument the class defaults, so a metric whose
+    default model changes later scores a recorded run as it did. The split it
+    scores is its suite's (`Suite`, `RunConfig.suites`).
     """
 
-    name: str
+    bound: functools.partial[Any]
+    """The metric's class bound to the arguments the run states."""
 
     @staticmethod
     def _member(name: str) -> type:
@@ -194,8 +197,8 @@ class Suite:
             object.__setattr__(self, "metrics", tuple(self.metrics))
             stray = [metric for metric in self.metrics if not isinstance(metric, MetricConfig)]
             if stray:
-                raise TypeError(f"a suite's metrics are metrics' configs, {{'name': ..., 'fields': "
-                                f"{{...}}}}, not {stray!r}")
+                raise TypeError(f"a suite's metrics are metrics' configs, MetricConfig(functools.partial("
+                                f"Metric, ...)), not {stray!r}")
 
 
 def _metric_class(name: str) -> type:
@@ -440,7 +443,8 @@ def _learns_alike(before: ObjectiveConfig | None, now: ObjectiveConfig | None) -
     resumable = objectives[now.name].resumed_freely()
 
     def kept(config: ObjectiveConfig) -> dict:
-        return {name: value for name, value in {**config.defaults, **config.fields}.items()
+        # Each argument as its record holds it, a stated one and a recorded default alike.
+        return {name: value for name, value in {**config.defaults, **config.field_records}.items()
                 if name not in resumable}
 
     return kept(before) == kept(now)
@@ -638,11 +642,11 @@ def _placed(config: "RunConfig | DataclassInstance", path: str, record: Mapping[
         else:
             held, kind = value, type(value)
         node = stated
-    if isinstance(held, Registered):
+    if isinstance(held, Bound):
         # A command line's subcommand (`registry.record_flags`) is the record it makes: its plain flags are
-        # that record's `fields` entries.
+        # that record's bound arguments.
         held = held.recorded()
-    if isinstance(held, Registered) and field not in _names(held):
+    if isinstance(held, Bound) and field not in _names(held):
         if field not in parameters(held.member)[0]:
             raise KeyError(f"{path} names no argument of {held.name}")
         return [*groups, "fields", field], unset
@@ -669,8 +673,8 @@ def _declared(field: dataclasses.Field) -> Configured:
 
 def _flagged(value: Configured) -> Configured:
     """`value` as a command line's parser holds it: a record of a kind chosen by subcommands its
-    subcommand's (`Registered.flagged`), any other value as it is."""
-    return value.flagged() if isinstance(value, Registered) else value
+    subcommand's (`Bound.flagged`), any other value as it is."""
+    return value.flagged() if isinstance(value, Bound) else value
 
 
 
@@ -1024,8 +1028,8 @@ class RunConfig:
             cls.__name__, held_fields,
             bases=(cls,), frozen=True, namespace={"__post_init__": lambda self: None})
         # A kind its command line chooses by subcommands holds its default as that subcommand's record
-        # (`Registered.flagged`), which tyro reads a union's default by; the run it parses holds each as
-        # its kind's own record again (`Registered.recorded`), its subcommands the parser's alone.
+        # (`Bound.flagged`), which tyro reads a union's default by; the run it parses holds each as
+        # its kind's own record again (`Bound.recorded`), its subcommands the parser's alone.
         held = parser(**{field.name: _flagged(getattr(default, field.name) if default is not None
                                               else _declared(declared[field.name]))
                          for field in dataclasses.fields(cls)})
@@ -1034,7 +1038,7 @@ class RunConfig:
             raise ValueError("the command line built no run config")
         values = {field.name: vars(parsed)[field.name] for field in dataclasses.fields(cls)}
         for name, value in values.items():
-            if isinstance(value, Registered):
+            if isinstance(value, Bound):
                 values[name] = value.recorded()
         # A rate the run left to its optimizer (`OptimizerSpec.OWN_RATE`) follows the optimizer its flags
         # choose, unless a flag names the rate: Gauss-Newton's whole step, never the default AdamW's.
@@ -1170,14 +1174,14 @@ class RunConfig:
                                                                                            "optim")))
 
     def _defaulted_as(self, recorded: Self) -> Self:
-        """This run with each class it names (`Registered`: its model, its objective) that `recorded`, the
-        saved run it resumes, names too, defaulting every argument it leaves unstated as `recorded` did:
-        the defaults a run records are the ones it trained under (`Registered.defaults`), and an argument
+        """This run with each class it binds (`Bound`: its model, its objective) that `recorded`, the
+        saved run it resumes, binds too, defaulting every argument it leaves unstated as `recorded` did:
+        the defaults a run records are the ones it trained under (`Bound.defaults`), and an argument
         the class gained since keeps the default it takes now."""
         changed = {}
         for field in dataclasses.fields(self):
             mine, theirs = getattr(self, field.name), getattr(recorded, field.name, None)
-            if isinstance(mine, Registered) and isinstance(theirs, Registered) and mine.name == theirs.name:
+            if isinstance(mine, Bound) and isinstance(theirs, Bound) and mine.name == theirs.name:
                 kept = {name: value for name, value in theirs.defaults.items() if name not in mine.fields}
                 changed[field.name] = dataclasses.replace(mine, defaults={**mine.defaults, **kept})
         return dataclasses.replace(self, **changed) if changed else self
@@ -1384,11 +1388,12 @@ class RunConfig:
         with.
         """
         trained = registry.import_path(type(objective))
-        stated = ObjectiveConfig(trained) if self.objective is None else self.objective
+        unstated = ObjectiveConfig(functools.partial(type(objective)))
+        stated = unstated if self.objective is None else self.objective
         if stated.name != trained:
             if stated.fields:
                 raise ValueError(f"the run states the arguments of {stated.name} and trains {trained}")
-            stated = ObjectiveConfig(trained)
+            stated = unstated
         missing = [name for name in objective.resolved if not hasattr(objective, name)]
         if missing:
             raise ValueError(f"{trained} resolves {missing} and holds no attribute of that name to record")
@@ -1750,7 +1755,9 @@ class RunConfig:
         """The dtype the run's model computes in: the one its record states, else its numerics'
         (`TrainerConfig.precision`)."""
         stated = self.model.fields.get("dtype")
-        return str(stated) if stated is not None else self.trainer.precision.dtypes.compute
+        # Any dtype spelling the model takes (a name, `jnp.bfloat16`, `"f4"`), named as a record names it.
+        held = registry.dtype_name(stated) if isinstance(stated, str | np.dtype | type) else None
+        return held if held is not None else self.trainer.precision.dtypes.compute
 
     def trained_numerics[LossT, EffectsT](self, objective: Objective[LossT, EffectsT]) -> Numerics | None:
         """The run's numerics as its trainer reads them over `objective` (`TrainerAdvanced.numerics`): its
@@ -1768,7 +1775,8 @@ class RunConfig:
             return None
         precision = self.trainer.precision
         stated = self.model.fields.get("param_dtype")
-        params = precision.dtypes.params if stated is None else str(stated)
+        named = registry.dtype_name(stated) if isinstance(stated, str | np.dtype | type) else None
+        params = precision.dtypes.params if named is None else named
         return dataclasses.replace(precision, dtypes=dataclasses.replace(
             precision.dtypes, compute=computes, params=params))
 

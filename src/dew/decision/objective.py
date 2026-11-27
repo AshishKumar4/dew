@@ -120,7 +120,7 @@ class DecisionObjective(Objective[Ratio | Weighted]):
     `Encoding` describes, a choice of fewer than `none_of_the_above_options`
     options drawing no "none of the above" (by default three: a yes or a no draws none, where it would
     change what the question asks; a run recorded before keeps its recorded floor,
-    `dew.registry.Registered.defaults`), and `data` supplies their pipeline steps. The
+    `dew.registry.Bound.defaults`), and `data` supplies their pipeline steps. The
     training stream and the validation pass pack rows first-fit into windows
     of the layout's `max_len` tokens (`packing`), as many rows, questions and
     options as its `bounds` let a window hold, so a step pays for its tokens

@@ -2,6 +2,7 @@
 dynamics' stage over the saved tokenizer, each from its record."""
 
 import dataclasses
+import functools
 import itertools
 import json
 from pathlib import Path
@@ -12,6 +13,7 @@ import pytest
 from run_kinds import stated
 from test_env_runs import assert_bitwise
 
+from dew import registry
 from dew.config import ObjectiveConfig, RunConfig, TrainerConfig
 from dew.config.world_model import TokenizerConfig, WorldModelRunConfig
 from dew.data import Files, Memory
@@ -61,14 +63,17 @@ def trainer(root: Path, steps: int, key: int) -> TrainerConfig:
 
 
 def tokenizer_run(root: Path, clips: Pipeline) -> WorldModelRunConfig:
-    return WorldModelRunConfig(data=clips, model=ModelConfig(f"{WORLD}:CausalTokenizer", TOKENIZER),
+    return WorldModelRunConfig(data=clips,
+                               model=ModelConfig(functools.partial(
+                                   registry.models[f"{WORLD}:CausalTokenizer"], **TOKENIZER)),
                                optim=OPTIM, trainer=trainer(root, TOKENIZER_STEPS, 0))
 
 
 def dynamics_run(root: Path, clips: Pipeline | None, tokenizer: Path, **fields) -> WorldModelRunConfig:
     run = WorldModelRunConfig(
-        data=clips, model=ModelConfig(f"{WORLD}:Dynamics", DYNAMICS),
-        objective=ObjectiveConfig(f"{WORLD}:WorldModelObjective"), tokenizer=TokenizerConfig(str(tokenizer)),
+        data=clips, model=ModelConfig(functools.partial(registry.models[f"{WORLD}:Dynamics"], **DYNAMICS)),
+        objective=ObjectiveConfig(functools.partial(registry.objectives[f"{WORLD}:WorldModelObjective"])),
+        tokenizer=TokenizerConfig(str(tokenizer)),
         optim=OPTIM, trainer=trainer(root, DYNAMICS_STEPS, 1))
     return dataclasses.replace(run, **fields)
 
@@ -195,15 +200,15 @@ def test_a_world_model_run_refuses_a_setup_it_cannot_train(stages, other_frames,
     dynamics = dynamics_run(root, clips, root / "tokenizer")
     model = dynamics.model
     runs = {
-        "a tokenizer stage that states its frame": dataclasses.replace(tokenizer, model=dataclasses.replace(
-            tokenizer.model, fields={**tokenizer.model.fields, "frame": [SIZE, SIZE, 1]})),
-        "a dynamics stage that states its latents": dataclasses.replace(dynamics, model=dataclasses.replace(
-            model, fields={**model.fields, "latents": 4})),
+        "a tokenizer stage that states its frame": dataclasses.replace(
+            tokenizer, model=tokenizer.model.with_fields(frame=[SIZE, SIZE, 1])),
+        "a dynamics stage that states its latents": dataclasses.replace(
+            dynamics, model=model.with_fields(latents=4)),
         "a dynamics stage with no tokenizer": dataclasses.replace(dynamics, tokenizer=None),
         "a tokenizer stage that names a tokenizer": dataclasses.replace(
             tokenizer, tokenizer=dynamics.tokenizer),
         "a dynamics model that holds fewer frames than the clips": dataclasses.replace(
-            dynamics, model=dataclasses.replace(model, fields={**model.fields, "frames": WINDOW - 1})),
+            dynamics, model=model.with_fields(frames=WINDOW - 1)),
         "a dynamics model under a tokenizer's objective": dataclasses.replace(
             tokenizer, model=model),
         "a tokenizer of other frames than the clips": dataclasses.replace(dynamics, data=other_frames),

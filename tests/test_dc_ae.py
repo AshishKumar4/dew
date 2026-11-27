@@ -18,6 +18,7 @@ held to the source's recorded float64 truths over drawn operands and probes
 claimed: no count of draws resolves the walks' float32 errors (row 705).
 """
 
+import functools
 import shutil
 from pathlib import Path
 
@@ -38,6 +39,8 @@ from safetensors.numpy import load_file, save_file
 
 from dew.interop.autoencoders.dc_ae import load_dc_ae
 from dew.nn.autoencoders.dc_ae import DCAE
+from dew.nn.backbones.dit import SimpleDiT
+from dew.objectives.diffusion.objective import DiffusionObjective
 
 ROOT = Path(__file__).resolve().parents[1]
 VARIANTS = ("conv", "shuffle", "plain")
@@ -168,16 +171,14 @@ def test_a_latent_run_trains_behind_the_dc_ae_and_leaves_it_frozen(source):
     from dew.training import Trainer
 
     config = DiffusionRunConfig(
-        model=ModelConfig(
-            "simple_dit",
-            {"patch_size": 1, "emb_features": 16, "num_layers": 1, "num_heads": 2, "mlp_ratio": 1,
-             "dtype": "float32"},
-        ),
+        model=ModelConfig(functools.partial(SimpleDiT, patch_size=1, emb_features=16,
+                                            num_layers=1, num_heads=2, mlp_ratio=1, dtype="float32")),
         data=images_of("tfds://oxford_flowers102", 16, batch=8),
         trainer=TrainerConfig(steps=2),
         text=TextCondition(encoder=STUB_TEXT, checkpoint="stub-clip"),
         autoencoder=PretrainedAutoencoder(modelname=str(source / "conv"), dtype="float32"),
-        objective=ObjectiveConfig("diffusion", {"solver": Euler(), "steps": 2}),
+        objective=ObjectiveConfig(functools.partial(DiffusionObjective, solver=Euler(),
+                                                    steps=2)),
     )
     objective = config.build()
     images = (np.random.default_rng(0).random((8, 16, 16, 3)) * 255).astype(np.uint8)

@@ -8,6 +8,7 @@ reads, the updates an optimizer makes, the placement a harness loads into, and t
 trains in."""
 
 import dataclasses
+import functools
 import json
 from pathlib import Path
 
@@ -33,6 +34,7 @@ from test_eval_harness import instance
 from test_lm_recipe import SEQ, export_tiny_decoder, recipe_run, write_token_files
 from test_run_option_matrix import recorded
 
+from dew import registry
 from dew._cli.main import main
 from dew.checkpoints import Checkpoints
 from dew.config import RunConfig, earlier_run
@@ -182,8 +184,9 @@ def test_a_runs_recorded_forms_are_the_forms_it_trains_in(tmp_path):
 
     # On an H100 target, which its step is lowered for (`LowerFor`), an fp32 run takes an old route in
     # the fast form, so the routes it lowers say which form the run took.
-    wide = dataclasses.replace(run, model=ModelConfig(run.model.name, {**run.model.fields,
-                                                                       "dtype": "float32"}))
+    wide = dataclasses.replace(
+        run, model=ModelConfig(functools.partial(registry.models[run.model.name], **{**run.model.fields,
+                                                                       "dtype": "float32"})))
 
     def lowered(name: str, fields) -> set[str]:
         with pytest.raises(Lowered) as raised:
@@ -351,8 +354,7 @@ def test_a_run_resumes_under_another_remat_or_dropout_and_is_refused_another_com
     saved = earlier_run(json.loads((record / "run.json").read_text()))
 
     def under(**fields) -> RunConfig:
-        return dataclasses.replace(run, model=dataclasses.replace(run.model, fields={**run.model.fields,
-                                                                                     **fields}))
+        return dataclasses.replace(run, model=run.model.with_fields(**fields))
 
     under(remat="full", dropout_rate=0.1).check_resume(saved)
     for name, value in (("num_heads", 1), ("dtype", "bfloat16"), ("mask_token_id", 3)):
@@ -533,10 +535,13 @@ def test_a_run_saved_before_numerics_computes_in_what_its_main_computed_in(tmp_p
     float32; and a model that names its dtype computes in it."""
     run = {"lm": lm, "diffusion": diffusion, "decision": decision}[kind](tmp_path, drawn=False)
     fields = {name: value for name, value in run.model.fields.items() if name != "dtype"}
-    run = dataclasses.replace(run, model=ModelConfig(run.model.name, fields),
+    run = dataclasses.replace(
+        run, model=ModelConfig(functools.partial(registry.models[run.model.name], **fields)),
                               **({"pretrained": str(TINY_LAYA)} if sourced and kind == "lm" else {}))
     assert RunConfig.load(str(earlier(run, tmp_path))).compute_dtype() == computed
-    stated = dataclasses.replace(run, model=ModelConfig(run.model.name, {**fields, "dtype": "float16"}))
+    stated = dataclasses.replace(
+        run, model=ModelConfig(
+            functools.partial(registry.models[run.model.name], **{**fields, "dtype": "float16"})))
     assert RunConfig.load(str(earlier(stated, tmp_path / "stated"))).compute_dtype() == "float16"
 
 

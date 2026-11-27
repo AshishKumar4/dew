@@ -1,6 +1,7 @@
 """REPA and iREPA against their official code (`tools/repa_reference.py`),
 and the alignment inside the diffusion objective."""
 
+import functools
 import json
 from pathlib import Path
 
@@ -304,9 +305,10 @@ def test_a_published_pipeline_aligns_beside_its_own_tree(tmp_path):
     config = DiffusionRunConfig(pretrained=str(tmp_path / "flux_source" / "pipeline"), preset=None,
                                 model=precision(), data=images_of("tfds://oxford_flowers102", 16),
                                 val_metrics=(),
-                                objective=ObjectiveConfig("diffusion", {
-                                    "alignment": alignment, "solver": Euler(), "guidance": None, "steps": 2,
-                                    "ema_decay": None}))
+                                objective=ObjectiveConfig(
+                                    functools.partial(DiffusionObjective, alignment=alignment,
+                                                      solver=Euler(), guidance=None, steps=2,
+                                                      ema_decay=None)))
     objective = config.build()
     trainer = Trainer(objective, optax.sgd(1e-1), key=jax.random.PRNGKey(3))
     state = trainer.initial_state()

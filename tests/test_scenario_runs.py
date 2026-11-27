@@ -37,6 +37,7 @@ from selection_margins import MARGIN, NARROW_MARGIN, clearing, top_margin
 from test_mixers import KIND_FIELDS
 
 import dew
+from dew import registry
 from dew.checkpoints import Checkpoints
 from dew.config import ObjectiveConfig, RunConfig
 from dew.config.lm import LMRunConfig
@@ -275,7 +276,8 @@ def masked_trained(cell: Mapping, root: Path) -> Recorded:
     """A masked diffusion LM over the shared LM data path, its documents packed or padded, a bidirectional
     decoder masking at the vocabulary's last id."""
     config = dataclasses.replace(lm_run(cell, root),
-                                 objective=ObjectiveConfig("masked_diffusion", {"ema_decay": None}))
+                                 objective=ObjectiveConfig(functools.partial(
+                                     registry.objectives["masked_diffusion"], ema_decay=None)))
     return Recorded(saved_record(config, root, "cell"),
                     settings(cell, root, {**EVALUATED, "max_new_tokens": "0", "model.causal": "False",
                                           "model.mask_token_id": str(MASK)}), cell["devices"])
@@ -287,7 +289,9 @@ def block_trained(cell: Mapping, root: Path) -> Recorded:
     more than a run's steps read, its model's dtype left for the run's precision to derive."""
     config = blockwise(root, drawn=False, tokens=5 * 8 * 12)
     fields = {name: value for name, value in config.model.fields.items() if name != "dtype"}
-    config = dataclasses.replace(config, model=dataclasses.replace(config.model, fields=fields))
+    config = dataclasses.replace(
+        config, model=dataclasses.replace(
+            config.model, bound=functools.partial(config.model.member, **fields)))
     return Recorded(saved_record(config, root, "cell"), settings(cell, root), cell["devices"])
 
 
@@ -470,7 +474,9 @@ def online_rl_trained(cell: Mapping, root: Path) -> Recorded | Called:
         return called("diffusion_rl_trained")(cell, root)
     config = rl_support.recorded_grpo_config(root, "--rollout.method", cell["method"])
     fields = {name: value for name, value in config.model.fields.items() if name != "dtype"}
-    config = dataclasses.replace(config, model=dataclasses.replace(config.model, fields=fields))
+    config = dataclasses.replace(
+        config, model=dataclasses.replace(
+            config.model, bound=functools.partial(config.model.member, **fields)))
     return Recorded(saved_record(config, root, "cell"), settings(cell, root), cell["devices"],
                     trust=(rl_support.__name__,))
 

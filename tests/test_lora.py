@@ -52,6 +52,7 @@ from dew.data.dataset import Loader
 from dew.interop.pretrained import Pretrained
 from dew.interop.safetensors_io import read_file, write_file
 from dew.lora import Adapter, AdapterBase, LoRA, Target
+from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.inputs import DenoisingCondition
 from dew.nn.sharding import ADAPTER_RANK, boxed, boxed_axes, declared_axes, drawn_axes, parameter_path
 from dew.objectives.base import Step
@@ -1115,8 +1116,8 @@ def _registry_decoder():
     no published checkpoint, so no weight layouts to resolve names through."""
     from dew.registry import ModelConfig
 
-    config = ModelConfig("causal_transformer", {**REGISTRY_FIELDS,
-                                              "dtype": "float32"})
+    config = ModelConfig(functools.partial(CausalTransformer, **{**REGISTRY_FIELDS,
+                                              "dtype": "float32"}))
     model = config.build()
     return config, model, nn.unbox(model.init(jax.random.key(0), jnp.zeros((1, 8), jnp.int32)))
 
@@ -1762,16 +1763,18 @@ def test_an_imported_adapter_binds_to_its_bundle_as_a_fresh_one_does(decoder, tm
 
 
 TRAIN_IMPORTED = """
+import functools
 import sys
 from dew.config.lm import LMRunConfig
 from dew.data import Loading, presets
 from dew.data.sources.tokens import TokenFiles
+from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.registry import ModelConfig
 
 tokens, root, name = sys.argv[1:4]
 chain = TokenFiles(tokens).pipe(presets.lm, None, seq_len=8, batch=8, pack=None).loading(Loading(workers=0))
-model = ModelConfig("causal_transformer",
-                    {"emb_features": 16, "num_layers": 1, "num_heads": 2, "dtype": "float32"})
+model = ModelConfig(functools.partial(CausalTransformer, emb_features=16, num_layers=1,
+                                      num_heads=2, dtype="float32"))
 LMRunConfig.cli([*sys.argv[4:], "--trainer.name", name, "--trainer.checkpoint-dir", root,
                  "--trainer.steps", "1",
                  "--trainer.compilation-cache-dir", "None", "--trainer.multi-host", "False",

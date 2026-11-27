@@ -410,12 +410,10 @@ dew.config.DecoderRunConfig
   loop: Annotated[dew.nn.backbones.decoder_stack.Loop | None, Suppress] = None
   passes: Annotated[PassPolicy | None, Suppress] = None
 dew.config.MetricConfig
-  name: str
-  fields: JsonDict = builtins.dict()
+  bound: functools.partial[Any]
   defaults: JsonRecords = builtins.dict()
 dew.config.ObjectiveConfig
-  name: str
-  fields: JsonDict = builtins.dict()
+  bound: functools.partial[Any]
   defaults: JsonRecords = builtins.dict()
 dew.config.Prepared
   run: RunConfig
@@ -445,7 +443,7 @@ dew.config.Suite
   metrics: tuple[dew.config.MetricConfig, ...] | None = None
   every: int | str | None = None
 dew.config.diffusion.DiffusionRunConfig
-  model: ModelConfig = (lambda: ModelConfig('unet', dict(DEFAULT_MODEL_CONFIG)))()
+  model: ModelConfig = (lambda: ModelConfig(_unet()))()
   data: Annotated[dew.data.pipeline.Dataset | None, Suppress] = None
   validation: Annotated[dew.data.pipeline.Dataset | collections.abc.Mapping[str, dew.data.pipeline.Dataset] | None, Suppress] = None
   data_seed: int = 0
@@ -454,7 +452,7 @@ dew.config.diffusion.DiffusionRunConfig
   source: dew.interop.source_options.SourceOptions = dew.interop.source_options.SourceOptions()
   optim: dew.optim.OptimConfig = dew.optim.OptimConfig()
   trainer: dew.config.trainer.TrainerConfig = dew.config.trainer.TrainerConfig()
-  objective: ObjectiveConfig = (lambda: ObjectiveConfig('diffusion', {'solver': to_record(EulerAncestral(), Solver)}))()
+  objective: ObjectiveConfig = (lambda: ObjectiveConfig(functools.partial(DiffusionObjective, solver=EulerAncestral())))()
   lora: Annotated[dew.lora.LoRA, _SubcommandConfig] | None = None
   val_metrics: Annotated[tuple[dew.config.MetricConfig, ...], PrimitiveConstructorSpec] | None = None
   suites: Annotated[collections.abc.Mapping[str, dew.config.Suite], PrimitiveConstructorSpec] = builtins.dict()
@@ -472,14 +470,13 @@ dew.config.diffusion.FlowRolloutConfig
   steps: int = 11
   train_steps: int | None = None
 dew.config.env.EnvConfig
-  name: str
-  fields: JsonDict = builtins.dict()
+  bound: functools.partial[Any]
   defaults: JsonRecords = builtins.dict()
   count: int | None = None
   episode_length: int | None = None
   action_repeat: int = 1
 dew.config.env.EnvRunConfig
-  model: ModelConfig = (lambda: ModelConfig('dew.objectives.rl.dreamer:WorldModel'))()
+  model: ModelConfig = (lambda: ModelConfig(functools.partial(WorldModel)))()
   data: Annotated[dew.data.pipeline.Dataset | None, Suppress] = None
   validation: Annotated[dew.data.pipeline.Dataset | collections.abc.Mapping[str, dew.data.pipeline.Dataset] | None, Suppress] = None
   data_seed: int = 0
@@ -488,7 +485,7 @@ dew.config.env.EnvRunConfig
   source: dew.interop.source_options.SourceOptions = dew.interop.source_options.SourceOptions()
   optim: dew.optim.OptimConfig = dew.optim.OptimConfig()
   trainer: TrainerConfig = (lambda: TrainerConfig(eval_every=None, checkpoint_every=None))()
-  objective: ObjectiveConfig = (lambda: ObjectiveConfig('dew.objectives.rl.dreamer:DreamerV3Objective'))()
+  objective: ObjectiveConfig = (lambda: ObjectiveConfig(functools.partial(DreamerV3Objective)))()
   lora: Annotated[dew.lora.LoRA, _SubcommandConfig] | None = None
   val_metrics: Annotated[tuple[dew.config.MetricConfig, ...], PrimitiveConstructorSpec] | None = None
   suites: Annotated[collections.abc.Mapping[str, dew.config.Suite], PrimitiveConstructorSpec] = builtins.dict()
@@ -504,15 +501,14 @@ dew.config.env.EpisodesConfig
   reached: tuple[str, ...] = ()
   drawn: bool = False
 dew.config.env.RolloutConfig
-  name: str = 'dreamer'
-  fields: JsonDict = builtins.dict()
+  bound: functools.partial[Any] = (lambda: functools.partial(DreamerRollout))()
   defaults: JsonRecords = builtins.dict()
 dew.config.env.TeacherConfig
   run: str
   step: int | str | None = None
   demonstrates: bool = False
 dew.config.jepa.JepaRunConfig
-  model: ModelConfig = (lambda: ModelConfig('jepa_encoder', {'precision': 'default'}))()
+  model: ModelConfig = (lambda: ModelConfig(functools.partial(JepaEncoder, precision='default')))()
   data: Annotated[dew.data.pipeline.Dataset | None, Suppress] = None
   validation: Annotated[dew.data.pipeline.Dataset | collections.abc.Mapping[str, dew.data.pipeline.Dataset] | None, Suppress] = None
   data_seed: int = 0
@@ -521,19 +517,19 @@ dew.config.jepa.JepaRunConfig
   source: dew.interop.source_options.SourceOptions = dew.interop.source_options.SourceOptions()
   optim: OptimConfig = (lambda: OptimConfig(lr=0.001))()
   trainer: dew.config.trainer.TrainerConfig = dew.config.trainer.TrainerConfig()
-  objective: ObjectiveConfig = (lambda: ObjectiveConfig('jepa'))()
+  objective: ObjectiveConfig = (lambda: ObjectiveConfig(functools.partial(JepaObjective)))()
   lora: Annotated[dew.lora.LoRA, _SubcommandConfig] | None = None
   val_metrics: Annotated[tuple[dew.config.MetricConfig, ...], PrimitiveConstructorSpec] | None = None
   suites: Annotated[collections.abc.Mapping[str, dew.config.Suite], PrimitiveConstructorSpec] = builtins.dict()
   val_summaries: Annotated[tuple[dew.scores.Summary, ...], PrimitiveConstructorSpec] = ()
-  predictor: JsonDict = builtins.dict()
+  predictor: Annotated[functools.partial[JepaPredictor], record_argument(functools.partial[JepaPredictor])] = (lambda: functools.partial(JepaPredictor))()
   num_target_blocks: int = 4
   target_scale: tuple[float, float] = (0.15, 0.2)
   target_aspect: tuple[float, float] = (0.75, 1.5)
   probe_classes: int | None = None
   knn_k: int = 20
 dew.config.lm.LMRunConfig
-  model: ModelConfig = (lambda: ModelConfig('causal_transformer', {}))()
+  model: ModelConfig = (lambda: ModelConfig(_transformer()))()
   data: Annotated[dew.data.pipeline.Dataset | None, Suppress] = None
   validation: Annotated[dew.data.pipeline.Dataset | collections.abc.Mapping[str, dew.data.pipeline.Dataset] | None, Suppress] = None
   data_seed: int = 0
@@ -542,7 +538,7 @@ dew.config.lm.LMRunConfig
   source: dew.interop.source_options.SourceOptions = dew.interop.source_options.SourceOptions()
   optim: OptimConfig = (lambda: OptimConfig(lr=0.0006, optimizer=AdamW(weight_decay=0.1), clip=1.0))()
   trainer: dew.config.trainer.TrainerConfig = dew.config.trainer.TrainerConfig()
-  objective: ObjectiveConfig = (lambda: ObjectiveConfig('lm'))()
+  objective: ObjectiveConfig = (lambda: ObjectiveConfig(functools.partial(LMObjective)))()
   lora: Annotated[dew.lora.LoRA, _SubcommandConfig] | None = None
   val_metrics: Annotated[tuple[dew.config.MetricConfig, ...], PrimitiveConstructorSpec] | None = None
   suites: Annotated[collections.abc.Mapping[str, dew.config.Suite], PrimitiveConstructorSpec] = builtins.dict()
@@ -629,7 +625,7 @@ dew.config.world_model.TokenizerConfig
   run: str
   step: int | str | None = None
 dew.config.world_model.WorldModelRunConfig
-  model: ModelConfig = (lambda: ModelConfig('dew.objectives.world_model:CausalTokenizer'))()
+  model: ModelConfig = (lambda: ModelConfig(functools.partial(CausalTokenizer)))()
   data: Annotated[dew.data.pipeline.Dataset | None, Suppress] = None
   validation: Annotated[dew.data.pipeline.Dataset | collections.abc.Mapping[str, dew.data.pipeline.Dataset] | None, Suppress] = None
   data_seed: int = 0
@@ -638,7 +634,7 @@ dew.config.world_model.WorldModelRunConfig
   source: dew.interop.source_options.SourceOptions = dew.interop.source_options.SourceOptions()
   optim: dew.optim.OptimConfig = dew.optim.OptimConfig()
   trainer: dew.config.trainer.TrainerConfig = dew.config.trainer.TrainerConfig()
-  objective: ObjectiveConfig = (lambda: ObjectiveConfig('dew.objectives.world_model:TokenizerObjective'))()
+  objective: ObjectiveConfig = (lambda: ObjectiveConfig(functools.partial(TokenizerObjective)))()
   lora: Annotated[dew.lora.LoRA, _SubcommandConfig] | None = None
   val_metrics: Annotated[tuple[dew.config.MetricConfig, ...], PrimitiveConstructorSpec] | None = None
   suites: Annotated[collections.abc.Mapping[str, dew.config.Suite], PrimitiveConstructorSpec] = builtins.dict()
@@ -660,7 +656,7 @@ dew.decision.config.CrossContext
   text: TextCondition | None = None
   form: Literal['idefics', 'shared'] = 'idefics'
 dew.decision.config.DecisionRunConfig
-  model: ModelConfig = (lambda: ModelConfig('causal_transformer', {}))()
+  model: ModelConfig = (lambda: ModelConfig(_transformer()))()
   data: Annotated[dew.data.pipeline.Dataset | None, Suppress] = None
   validation: Annotated[dew.data.pipeline.Dataset | collections.abc.Mapping[str, dew.data.pipeline.Dataset] | None, Suppress] = None
   data_seed: int = 0
@@ -669,7 +665,7 @@ dew.decision.config.DecisionRunConfig
   source: dew.interop.source_options.SourceOptions = dew.interop.source_options.SourceOptions()
   optim: OptimConfig = (lambda: OptimConfig(lr=2.5e-05))()
   trainer: dew.config.trainer.TrainerConfig = dew.config.trainer.TrainerConfig()
-  objective: ObjectiveConfig = (lambda: ObjectiveConfig('decision'))()
+  objective: ObjectiveConfig = (lambda: ObjectiveConfig(functools.partial(DecisionObjective)))()
   lora: Annotated[dew.lora.LoRA, _SubcommandConfig] | None = None
   val_metrics: Annotated[tuple[dew.config.MetricConfig, ...], PrimitiveConstructorSpec] | None = None
   suites: Annotated[collections.abc.Mapping[str, dew.config.Suite], PrimitiveConstructorSpec] = builtins.dict()
@@ -952,6 +948,26 @@ dew.nn.backbones.decoder_stack.Loop
   gathered: bool = False
   exit_at: Literal['coda', 'block'] = 'coda'
   exit_by: Literal['token', 'row'] = 'token'
+dew.nn.backbones.jepa.JepaPredictor
+  mlp_ratio: int = 4  [keyword-only]
+  dtype: str | type[Any] | numpy.dtype | jax._src.typing.SupportsDType | Any | None = None  [keyword-only]
+  precision: None | str | jax._src.lax.lax.Precision | tuple[str, str] | tuple[jax._src.lax.lax.Precision, jax._src.lax.lax.Precision] = None  [keyword-only]
+  force_fp32_for_softmax: bool = True  [keyword-only]
+  norm_epsilon: float = 1e-05  [keyword-only]
+  dropout_rate: float = 0.0  [keyword-only]
+  qk_norm: bool = False  [keyword-only]
+  num_heads: int = 6
+  ssm_attention_ratio: str = 'all-attn'  [keyword-only]
+  ssm_state_dim: int = 64  [keyword-only]
+  bidirectional_ssm: bool = True  [keyword-only]
+  grid: tuple[int, int] = (14, 14)
+  emb_features: int = 384
+  predictor_features: int = 192
+  num_layers: int = 6
+  scan_order: str = 'raster'
+  factorized: bool = False
+  parent: flax.linen.module.Module | flax.core.scope.Scope | flax.linen.module._Sentinel | None = <flax.linen.module._Sentinel object>
+  name: str | None = None
 dew.nn.cross_pass.CrossPass
   block_size: int = 4
   rank: int = 64
@@ -1139,8 +1155,7 @@ dew.quantization.Quantization
   bwd_qtype: QuantizedDtype | None = None
   bwd_stochastic_rounding: Rounding | None = None
 dew.registry.ModelConfig
-  name: str = 'simple_dit'
-  fields: JsonDict = builtins.dict()
+  bound: functools.partial[Any] = dew.registry._simple_dit()
   defaults: JsonRecords = builtins.dict()
   wrappers: tuple[Wrapper, ...] = ()
 dew.sampling.text.Sampling

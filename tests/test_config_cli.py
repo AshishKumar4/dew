@@ -2,6 +2,7 @@
 that rebuilds from what it logged."""
 
 import dataclasses
+import functools
 import json
 import os
 import subprocess
@@ -21,8 +22,11 @@ from dew.config.lm import LMRunConfig
 from dew.data import Files
 from dew.data.dataset import Loader
 from dew.diffusion.presets import CosineContinuous, CosineGeneral, Exp, Flow
+from dew.nn.backbones.dit import SimpleDiT
+from dew.nn.backbones.jepa import JepaEncoder, JepaPredictor
+from dew.objectives.jepa.objective import JepaObjective
 from dew.optim import Adam, ScheduleSpec
-from dew.registry import ModelConfig, import_path, record_argument
+from dew.registry import ModelConfig, record_argument
 from dew.sampling import Heun
 from dew.training import LocalTracker, MeshSpec
 
@@ -39,7 +43,8 @@ def test_the_flags_set_a_runs_own_settings_and_none_of_what_it_trains():
     """The command line sets a run's own settings (`RunConfig.cli`): its preset and its trainer's; what it
     trains, its model and its objective, is built in Python, and their flags are refused, the run kept as
     its default holds them."""
-    default = DiffusionRunConfig(model=ModelConfig("simple_dit", {"scan_order": "hilbert"}))
+    default = DiffusionRunConfig(
+        model=ModelConfig(functools.partial(SimpleDiT, scan_order="hilbert")))
     config = parse(DiffusionRunConfig, ["preset:flow", "--preset.shift", "3.0", "--trainer.steps",
                                         "10",
                                         "--trainer.mesh.fsdp", "2"], default=default)
@@ -51,7 +56,7 @@ def test_the_flags_set_a_runs_own_settings_and_none_of_what_it_trains():
         with pytest.raises(SystemExit):
             parse(DiffusionRunConfig, flags, default=default)
     solved = default.override({"objective.solver": {"class": "heun"}})
-    assert solved.objective.fields["solver"]["class"] == import_path(Heun)
+    assert type(solved.objective.fields["solver"]) is Heun
     # The data's settings are its chain's calls', set by name (`dew.data.records.override`).
     chained = dataclasses.replace(config, data=images_of("tfds://oxford_flowers102", 32, batch=16))
     set_ = chained.override({"data.images.size": 64, "data.images.batch": 8})
@@ -393,9 +398,9 @@ def test_a_jepa_run_without_probes_trains_and_validates_its_loss(tmp_path, size)
                 .read("memory").loading(Loading(workers=0)))
 
     run = JepaRunConfig(
-        model=ModelConfig("jepa_encoder", {"patch_size": 2, "emb_features": 16, "num_layers": 1,
-                                           "num_heads": 2, "mlp_ratio": 2, "dtype": "float32"}),
-        predictor={"num_layers": 1, "predictor_features": 8}, num_target_blocks=2,
+        model=ModelConfig(functools.partial(JepaEncoder, patch_size=2, emb_features=16,
+                                            num_layers=1, num_heads=2, mlp_ratio=2, dtype="float32")),
+        predictor=functools.partial(JepaPredictor, num_layers=1, predictor_features=8), num_target_blocks=2,
         data=prepared(train), validation=prepared(held),
         trainer=TrainerConfig(checkpoint_dir=str(tmp_path), steps=1, log_every=1,
                               eval_every=1, checkpoint_every=None))
@@ -423,9 +428,9 @@ def test_a_jepa_runs_predictor_computes_as_its_encoder_where_the_run_derives_the
 
     root = REPO_ROOT / "tests" / "fixtures" / "tfds" / "dew_images" / "1.0.0"
     run = JepaRunConfig(
-        model=ModelConfig("jepa_encoder", {"patch_size": 2, "emb_features": 16, "num_layers": 1,
-                                           "num_heads": 2, "mlp_ratio": 2}),
-        predictor={"num_layers": 1, "predictor_features": 8}, num_target_blocks=2,
+        model=ModelConfig(functools.partial(JepaEncoder, patch_size=2, emb_features=16,
+                                            num_layers=1, num_heads=2, mlp_ratio=2)),
+        predictor=functools.partial(JepaPredictor, num_layers=1, predictor_features=8), num_target_blocks=2,
         data=TFDS("dew_images", path=str(root), split="all").pipe(presets.images, 16, batch=8),
         trainer=TrainerConfig(precision=numerics_of(precision), steps=1))
     objective = run.build_run().objective
@@ -456,10 +461,10 @@ def test_a_jepa_run_trains_its_lora_factors_and_ramps_their_momentum_over_its_up
     images = TFDS("dew_images", path=str(REPO_ROOT / "tests" / "fixtures" / "tfds" / "dew_images" / "1.0.0"),
                   split="all")
     run = JepaRunConfig(
-        model=ModelConfig("jepa_encoder", {"patch_size": 2, "emb_features": 16, "num_layers": 1,
-                                           "num_heads": 2, "mlp_ratio": 2, "dtype": "float32"}),
-        objective=ObjectiveConfig("jepa", {"momentum": (1.0, 0.0)}),
-        predictor={"num_layers": 1, "predictor_features": 8}, num_target_blocks=2,
+        model=ModelConfig(functools.partial(JepaEncoder, patch_size=2, emb_features=16,
+                                            num_layers=1, num_heads=2, mlp_ratio=2, dtype="float32")),
+        objective=ObjectiveConfig(functools.partial(JepaObjective, momentum=(1.0, 0.0))),
+        predictor=functools.partial(JepaPredictor, num_layers=1, predictor_features=8), num_target_blocks=2,
         lora=LoRA(rank=2, modules=("up_proj",)),
         data=images.pipe(presets.images, 16, batch=8).read("memory").loading(Loading(workers=0)),
         trainer=TrainerConfig(checkpoint_dir=str(tmp_path), steps=4,
@@ -493,9 +498,9 @@ def test_a_jepa_run_of_epochs_over_a_streamed_read_ramps_its_momentum_over_its_p
     images = TFDS("dew_images", path=str(REPO_ROOT / "tests" / "fixtures" / "tfds" / "dew_images" / "1.0.0"),
                   split="all")
     run = JepaRunConfig(
-        model=ModelConfig("jepa_encoder", {"patch_size": 2, "emb_features": 16, "num_layers": 1,
-                                           "num_heads": 2, "mlp_ratio": 2, "dtype": "float32"}),
-        predictor={"num_layers": 1, "predictor_features": 8}, num_target_blocks=2,
+        model=ModelConfig(functools.partial(JepaEncoder, patch_size=2, emb_features=16,
+                                            num_layers=1, num_heads=2, mlp_ratio=2, dtype="float32")),
+        predictor=functools.partial(JepaPredictor, num_layers=1, predictor_features=8), num_target_blocks=2,
         # Every image decodes (no rejecting step), so a pass's source examples are its shards' rows.
         data=images.pipe(presets.images, 16, batch=8, rejects=False).read("streamed")
         .loading(Loading(workers=0)),

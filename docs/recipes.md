@@ -61,12 +61,15 @@ The recipe's data is a chain, which it records with the run, and its model a `Mo
 <!-- not run: the file `dew train byte_demo.py` reads -->
 ```python
 # byte_demo.py
+import functools
+
 from dew.config import TrainerConfig
 from dew.config.trainer import Diagnostics
 from dew.config.lm import LMRunConfig
 from dew.data import Loading, presets
 from dew.data.sources import TokenFiles
 from dew.kernels import Kernels
+from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.registry import ModelConfig
 
 loading = Loading(workers=0, threads=1, read_buffer=2)
@@ -75,8 +78,8 @@ run = LMRunConfig(
     data=TokenFiles("tokens/train").shuffle(seed=0).repeat().pipe(presets.token_windows, **windows)
     .loading(loading),
     validation=TokenFiles("tokens/val").pipe(presets.token_windows, **windows, records=16).loading(loading),
-    model=ModelConfig("causal_transformer", {"dtype": "float32", "emb_features": 16, "num_layers": 1,
-                                             "num_heads": 2, "mlp_features": 32}),
+    model=ModelConfig(functools.partial(CausalTransformer, dtype="float32", emb_features=16,
+                                        num_layers=1, num_heads=2, mlp_features=32)),
     diagnostics=Diagnostics(kernels=Kernels(attention="reference")),
     trainer=TrainerConfig(steps=2, log_every=1, eval_every=2, checkpoint_every=2,
                           checkpoint_dir="runs", name="byte-demo", multi_host=False),
@@ -112,13 +115,13 @@ Every recipe's configuration extends `RunConfig` with five parts:
 
 | Part | Holds | CLI example |
 | --- | --- | --- |
-| `model` (`ModelConfig`) | The model's class and its constructor fields, compute dtype and attention kernel among them. | Python: `ModelConfig("causal_transformer", {"num_layers": 12})` |
-| `objective` (`ObjectiveConfig`) | The objective's class and the constructor arguments the run states. | Python: `ObjectiveConfig("lm", {"ema_decay": 0.999})` |
+| `model` (`ModelConfig`) | The model's class and its constructor fields, compute dtype and attention kernel among them. | Python: `ModelConfig(functools.partial(CausalTransformer, num_layers=12))` |
+| `objective` (`ObjectiveConfig`) | The objective's class and the constructor arguments the run states. | Python: `ObjectiveConfig(functools.partial(LMObjective, ema_decay=0.999))` |
 | `data`, `validation` | Chains: a source, its steps and a preset, recorded with the run. | Python: `presets.token_windows(seq_len=16)` |
 | `optim` (`OptimConfig`) | Optimizer, constant or scheduled rate, weight decay, clipping, optimizer-state dtype. | `--optim.lr 0.0001` |
 | `trainer` (`TrainerConfig`) | Run length, checkpoint and logging intervals, mesh and layout, tracking. | `--trainer.steps 1000` |
 
-A dotted flag sets one of the run's own settings, `--optim.lr 0.0001` or `--trainer.steps 1000`. What the run trains, its model, its objective and its data, is built in Python: the recipe's `default`, or a run file of your own, which states each class by alias or import path (`ModelConfig("hybrid_dit")`, `ModelConfig("mypackage.models:Net")`) and its fields, a field holding records (a UNet's `attention_configs`) as its record. `RunConfig.override` sets any field by its dotted path, `data.<preset>.<setting>` a setting of the run's data chain, as a sweep does.
+A dotted flag sets one of the run's own settings, `--optim.lr 0.0001` or `--trainer.steps 1000`. What the run trains, its model, its objective and its data, is built in Python: the recipe's `default`, or a run file of your own, which binds each class to its fields (`ModelConfig(functools.partial(HybridSSMAttentionDiT))`, a model of your own package's `ModelConfig(functools.partial(Net))`), a field holding records (a UNet's `attention_configs`) as its record. `RunConfig.override` sets any field by its dotted path, `data.<preset>.<setting>` a setting of the run's data chain, as a sweep does.
 
 Each setting's default is the recipe's own, which can differ from the configuration class's: the language-model recipe states its own optimizer settings (`LMRunConfig`). A recipe's `--help` prints every flag with the default that recipe runs with, for example `python recipes/lm/train.py --help`.
 
@@ -174,9 +177,9 @@ For a committed store, the chain's source is its URL (`RunConfig.override({"data
 
 `preset:none` trains with the convention the pipeline's scheduler reads, using the flow shift its sampler applies at that resolution. That shift is 3.0 for SD3, and for Flux it is exp(mu), with mu linear in the packed latent's token count. A scheduler file says how its checkpoint samples and says nothing about how it was trained, so this is a choice Dew makes for fine-tuning. A preset of the same kind replaces it, for example `preset:flow --preset.shift 1.0`. `run.json` records a Hub source as `repo@commit`.
 
-To train one of these published architectures from scratch, state it as the run's model, `ModelConfig("<alias>", {...})`, with its fields. To condition it on a pipeline's text encoders, pass `--text.encoder diffusion_text --text.checkpoint REPO`.
+To train one of these published architectures from scratch, state it as the run's model, `ModelConfig(functools.partial(<ModelClass>, ...))`, with its fields. To condition it on a pipeline's text encoders, pass `--text.encoder diffusion_text --text.checkpoint REPO`.
 
-`ObjectiveConfig("flow_grpo")` trains the model with Flow-GRPO in place of the denoising loss, and it needs a flow preset. For each prompt it samples `--rollout.groups` images through the flow SDE and scores them with the image metric named by `--rollout.reward`. That metric has to give better images higher scores, as `clip_score`, the default, does. `--rollout.steps` counts the rollout's time points and `--rollout.train-steps` the transitions it trains on.
+`ObjectiveConfig(functools.partial(FlowGRPOObjective))` trains the model with Flow-GRPO in place of the denoising loss, and it needs a flow preset. For each prompt it samples `--rollout.groups` images through the flow SDE and scores them with the image metric named by `--rollout.reward`. That metric has to give better images higher scores, as `clip_score`, the default, does. `--rollout.steps` counts the rollout's time points and `--rollout.train-steps` the transitions it trains on.
 
 A JEPA configuration adds predictor fields, target-mask settings and optional representation probes; the target encoder's EMA momentum is the objective's (its `momentum` field, `[0.996, 1.0]`), ramped over the whole run unless its `momentum_steps` says otherwise. The predictor estimates the encoded features of hidden image or video regions. The dataset and the model must both be image or both be video. Set the run length explicitly and prepare the dataset before starting.
 
@@ -186,10 +189,12 @@ A JEPA configuration adds predictor fields, target-mask settings and optional re
 
 <!-- not run: the file `dew train experiment.py` imports; its MLP is recorded by that module's import path -->
 ```python
+import functools
+
 from flax import linen as nn
 
 from dew.config import ObjectiveConfig, RunConfig, TrainerConfig
-
+from dew.objectives.supervised import Supervised
 from dew.registry import ModelConfig
 from dew.data import Files
 from dew.data.steps.generic import Formatting
@@ -208,8 +213,8 @@ class MLP(nn.Module):
 run = RunConfig(
     model=ModelConfig.from_model(MLP(hidden=32)),
     data=Files("rows.jsonl").map(Formatting()).shuffle(seed=0).repeat().batch(64),
-    objective=ObjectiveConfig("supervised", {
-        "loss": CrossEntropy(), "metrics": (Accuracy(),), "inputs": InputSpec(Field("x", (2,)))}),
+    objective=ObjectiveConfig(functools.partial(Supervised, loss=CrossEntropy(),
+                                                metrics=(Accuracy(),), inputs=InputSpec(Field("x", (2,))))),
     trainer=TrainerConfig(steps=300))
 ```
 

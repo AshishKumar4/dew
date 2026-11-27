@@ -9,6 +9,7 @@ the reason the run's own layout refuses them for, so none goes uncounted; and it
 axis the cell sets and answers over every option its data asks."""
 
 import dataclasses
+import functools
 import json
 import math
 from collections.abc import Mapping
@@ -37,9 +38,11 @@ from dew.decision import Choice, Example, decisions
 from dew.decision.config import DecisionRunConfig, JointShape, Letters, RowBudgets
 from dew.decision.data import Group
 from dew.decision.head import DecisionHead, JointSchemaHead, LabelReadout
+from dew.decision.objective import DecisionObjective
 from dew.decision.sources import PretrainedDecision
 from dew.decision.task import Decide
 from dew.interop.layouts import Unwritable
+from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.registry import ModelConfig
 
 INTENTS = tuple(f"intent_{index}" for index in range(64))
@@ -167,13 +170,16 @@ def run_of(cell: Cell, backbone: Path, root: Path) -> DecisionRunConfig:
         return (Files(str(path), format="jsonl").pipe(decisions).read("memory").batch(BATCH)
                 .loading(Loading(workers=0)))
     return DecisionRunConfig(
-        pretrained=str(backbone), model=ModelConfig("causal_transformer", {"dtype": "float32"}),
+        pretrained=str(
+            backbone), model=ModelConfig(functools.partial(CausalTransformer,
+                                                           dtype="float32")),
         head=HEADS[cell.head],
         # A question head's rows a question each, as Laya's release lays them; a letter readout's as its
         # layout derives them, a request's questions over one copy of its state.
         rows=RowBudgets(max_len=MAX_LEN[cell.head], shared_state=1 if cell.head == "question" else None,
                         option_tokens=None if cell.joint else OPTION_TOKENS),
-        objective=ObjectiveConfig("decision", {"consistency": cell.consistency}), calibrate=False,
+        objective=ObjectiveConfig(functools.partial(DecisionObjective,
+                                                    consistency=cell.consistency)), calibrate=False,
         data=read(TRAIN[0], "train"), validation=read(HELD[0], "held"))
 
 

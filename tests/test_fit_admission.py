@@ -2,6 +2,7 @@
 effective record, and a trainer makes its key only after the process is ready."""
 
 import dataclasses
+import functools
 import json
 import os
 import subprocess
@@ -24,6 +25,7 @@ from dew.data import TFDS, Loading, Memory, presets
 from dew.data.dataset import DataPartition, Loader, rows_of
 from dew.data.pipeline import DeviceStep, Pipeline
 from dew.inputs import Field, InputSpec
+from dew.nn.backbones.jepa import JepaEncoder, JepaPredictor
 from dew.objectives.jepa.objective import JepaObjective
 from dew.objectives.supervised import Supervised
 from dew.registry import ModelConfig
@@ -46,10 +48,11 @@ def test_a_jepa_predictor_takes_the_width_its_encoder_was_built_at(tmp_path):
     is built at that width, and the predictor it feeds takes the same width: before, the predictor
     read the stated fields alone and took its class's 384 (AT-06)."""
     rows = TFDS("dew_images", path=str(IMAGES), split="all").pipe(presets.images, 16, batch=8)
-    encoder = ModelConfig("jepa_encoder", {"patch_size": 2, "num_layers": 1, "num_heads": 2, "mlp_ratio": 2,
-                                           "dtype": "float32"},
-                          defaults={"emb_features": 16})
-    run = Built(model=encoder, predictor={"num_layers": 1, "predictor_features": 8}, num_target_blocks=2,
+    encoder = ModelConfig(functools.partial(JepaEncoder, patch_size=2, num_layers=1,
+                                            num_heads=2, mlp_ratio=2, dtype="float32"),
+                                            defaults={"emb_features": 16})
+    run = Built(model=encoder, predictor=functools.partial(JepaPredictor, num_layers=1, predictor_features=8),
+                num_target_blocks=2,
                 data=rows.read("memory").loading(Loading(workers=0)),
                 trainer=TrainerConfig(checkpoint_dir=str(tmp_path), steps=1))
     objective = run.prepare().train("built")

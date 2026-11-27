@@ -10,6 +10,7 @@ trainer has just written.
 import contextlib
 import dataclasses
 import datetime
+import functools
 import json
 import logging
 import types
@@ -28,6 +29,7 @@ from steady_state import steady_state
 
 import dew
 import dew.nn.backbones  # registers the models
+from dew import registry
 from dew.artifacts import VideoGrid
 from dew.batch import merge
 from dew.config import MetricConfig, ObjectiveConfig, TrainerConfig
@@ -38,10 +40,15 @@ from dew.data.images import CAPTIONS
 from dew.data.sources import source
 from dew.data.sources.files import Files
 from dew.diffusion.presets import EDM, Flow
+from dew.eval.images import CLIPDistance
+from dew.eval.psnr import PSNR
 from dew.inference import Images, RunProcessor, TextGeneration, TextToImage
 from dew.inputs import Field, TextCondition, unit_range
+from dew.nn.backbones.causal_transformer import CausalTransformer
+from dew.nn.backbones.dit import SimpleDiT
 from dew.nn.projections import inference_projections
-from dew.registry import ModelConfig
+from dew.objectives.diffusion.objective import DiffusionObjective
+from dew.registry import ModelConfig, to_record
 from dew.sampling import CFG, DPMSolverSDE, Euler, Heun
 from dew.telemetry.compiles import Compiles
 from dew.training import Checkpoints, Keep, LocalTracker, Trainer
@@ -57,17 +64,17 @@ def run_config(directory, preset=_DEFAULT_RUN_CONFIG_PRESET, encoder=STUB_TEXT, 
     """The resolved config of a tiny conditional DiT run in `directory`; the
     text condition names the registered stub encoder by default."""
     return DiffusionRunConfig(
-        model=ModelConfig("simple_dit", {**MODEL, "dtype": "float32"}),
+        model=ModelConfig(functools.partial(SimpleDiT, **{**MODEL, "dtype": "float32"})),
         data=source("tfds://oxford_flowers102").pipe(presets.images, RES, batch=8),
         trainer=TrainerConfig(checkpoint_dir=str(directory), steps=2, keep=Keep(latest=1)),
         preset=preset, text=TextCondition(encoder=encoder, checkpoint=checkpoint),
-        objective=ObjectiveConfig("diffusion", {"solver": Euler(), "steps": 3}))
+        objective=ObjectiveConfig(functools.partial(DiffusionObjective, solver=Euler(),
+                                                    steps=3)))
 
 
 def stating(config, **fields):
     """`config` with its objective stating `fields` beside what it states."""
-    return dataclasses.replace(config, objective=dataclasses.replace(
-        config.objective, fields={**config.objective.fields, **fields}))
+    return dataclasses.replace(config, objective=config.objective.with_fields(**fields))
 
 
 _DEFAULT_MAKE_RUN_PRESET = EDM()
@@ -266,13 +273,15 @@ def test_validation_metrics_follow_the_sample_field(tmp_path):
     video = dataclasses.replace(run_config(tmp_path),
                                 data=Files("clips", format="files").pipe(presets.video, 2 / 25, frames=2,
                                                                           fps=25, size=8, batch=2),
-                                val_metrics=(MetricConfig("psnr"),))
+                                val_metrics=(MetricConfig(functools.partial(PSNR)),))
     held = types.SimpleNamespace(val=object())
     (metric,) = video.evaluation_suites(held, None)["val"].metrics
     images = np.zeros((2, 2, 8, 8, 3), np.uint8)
     assert np.isinf(metric.finalize(metric(VideoGrid(unit_range(images)), {"video": images})))
     with pytest.raises(ValueError):
-        dataclasses.replace(video, val_metrics=(MetricConfig("clip"),)).evaluation_suites(held, None)
+        dataclasses.replace(video,
+                            val_metrics=(MetricConfig(functools.partial(
+                                registry.metrics["clip"])),)).evaluation_suites(held, None)
 
 
 TINY_CLIP = str(Path(__file__).parent / "fixtures" / "clip" / "tiny")
@@ -320,7 +329,8 @@ def test_an_image_run_validates_on_clip_by_default_with_the_model_its_metric_nam
     # Named as a command line names it: one JSON list of the metrics' records.
     named = DiffusionRunConfig.cli(["--val-metrics", json.dumps([{"name": "clip",
                                                                   "fields": {"modelname": TINY_CLIP}}])])
-    assert named.val_metrics == (MetricConfig("clip", {"modelname": TINY_CLIP}),)
+    assert named.val_metrics == (MetricConfig(functools.partial(CLIPDistance,
+                                                                modelname=TINY_CLIP)),)
     scalars, _ = validated_run(tmp_path / "named", validates=True, val_metrics=named.val_metrics)
     final = {name: value for step, values in scalars if step == 2 for name, value in values.items()}
     assert 0.0 <= final["val/clip_similarity"] <= 2.0
@@ -334,7 +344,7 @@ def test_a_metric_a_run_names_without_a_validation_split_refuses_before_an_updat
     """A run that names a metric asks for it whatever its data holds, so data with no validation
     split refuses the run as it builds its splits' metrics (`RunConfig.suites`), before its first
     update writes a checkpoint."""
-    named = (MetricConfig("psnr"),)
+    named = (MetricConfig(functools.partial(PSNR)),)
     with pytest.raises(ValueError):
         validated_run(tmp_path, validates=False, val_metrics=named)
     assert Checkpoints(str(tmp_path / "checkpoints"), keep=1).latest is None
@@ -428,9 +438,9 @@ def _tiny_lm(processor):
     """A tiny byte-level decoder's LM objective over `processor`, its state as a trainer starts it."""
     from dew.objectives.lm import LMObjective
 
-    model = ModelConfig("causal_transformer", {"vocab_size": 256, "emb_features": 16, "num_layers": 1,
-                                               "num_heads": 2, "head_dim": 8, "mlp_features": 32,
-                                               "max_seq_len": 16, "dtype": "float32"}).build()
+    model = ModelConfig(functools.partial(CausalTransformer, vocab_size=256,
+                                          emb_features=16, num_layers=1, num_heads=2, head_dim=8,
+                                          mlp_features=32, max_seq_len=16, dtype="float32")).build()
     objective = LMObjective(model, 8, ema_decay=None, processor=processor)
     return objective, Trainer(objective, optax.sgd(0.1), key=jax.random.PRNGKey(0)).initial_state()
 
@@ -538,8 +548,8 @@ def make_lm_run(directory, *, mesh=None, ema_decay=0.9, max_seq_len=16, fields=N
 
     fields = {"vocab_size": 256, "emb_features": 16, "num_layers": 1, "num_heads": 2, "head_dim": 8,
               "mlp_features": 32, "max_seq_len": max_seq_len, **(fields or {})}
-    model_config = ModelConfig("causal_transformer", {**fields,
-                                                    "dtype": "float32"})
+    model_config = ModelConfig(functools.partial(CausalTransformer, **{**fields,
+                                                    "dtype": "float32"}))
     objective = LMObjective(model_config.build(), 8, ema_decay=ema_decay,
                             samples=Samples([1, 2, 3], 4,
                                             sampling=Sampling(temperature=0, eos_token_ids=255)),
@@ -556,7 +566,7 @@ def make_lm_run(directory, *, mesh=None, ema_decay=0.9, max_seq_len=16, fields=N
                         steps=2, log_every=100, checkpoint_every=2)
     checkpoints.wait()
     (directory / "run.json").write_text(json.dumps({
-        "objective": "lm", "model": dataclasses.asdict(model_config), "tokenizer": "byte",
+        "objective": "lm", "model": to_record(model_config, ModelConfig), "tokenizer": "byte",
         "max_new_tokens": 4, "sampling": dataclasses.asdict(objective.samples.sampling),
         "ema_decay": ema_decay, "data": {"seq_len": 8}}))
     return objective, state
@@ -1140,8 +1150,8 @@ def test_a_quantized_runs_record_re_wraps_the_model_it_rebuilds(tmp_path):
 
     ids = np.random.RandomState(0).randint(1, 250, (batch, seq + 1)).astype(np.int32)
     config = LMRunConfig(
-        model=ModelConfig("causal_transformer", {**fields,
-                                               "dtype": "float32"}),
+        model=ModelConfig(functools.partial(CausalTransformer, **{**fields,
+                                               "dtype": "float32"})),
         trainer=TrainerConfig(checkpoint_dir=str(tmp_path), steps=1, eval_every=None,
                               checkpoint_every=1, compilation_cache_dir=None, quantization=Quantization()))
     state = config.train(LMObjective(config.model.build(), seq, ema_decay=0.9),

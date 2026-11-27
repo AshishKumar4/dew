@@ -13,9 +13,12 @@ autoencoder and convention; a run whose objective is `ObjectiveConfig("flow_grpo
 denoising loss.
 """
 
+import functools
+
 from dew.config.diffusion import DiffusionRunConfig
 from dew.data import images, presets
 from dew.data.sources import source
+from dew.nn.backbones.dit import SimpleDiT
 from dew.registry import ModelConfig
 
 TEMPLATES = ("a photo of a {}", "a photo of a {} flower", "This is a photo of a {}",
@@ -36,8 +39,8 @@ def default(train, held) -> DiffusionRunConfig:
     An image that does not decode is dropped and counted (`data/rejected/`), its record still read by the
     pass its epochs count."""
     return DiffusionRunConfig(
-        model=ModelConfig("simple_dit", {"patch_size": 4, "emb_features": 512, "num_layers": 12,
-                                         "num_heads": 8}),
+        model=ModelConfig(functools.partial(SimpleDiT, patch_size=4, emb_features=512,
+                                            num_layers=12, num_heads=8)),
         data=train.shuffle(seed=0).repeat().pipe(presets.images, 128, batch=32, augment=True,
                                                  caption=images.caption(templates=TEMPLATES)),
         validation=held.pipe(presets.images, 128, batch=32, caption=images.caption(VALIDATION_TEMPLATE)))

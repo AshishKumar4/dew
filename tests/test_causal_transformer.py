@@ -219,8 +219,9 @@ def test_old_decoder_record_keeps_zero_dropout_and_computes_its_export():
 
     config = {"vocab_size": 17, "emb_features": 8, "num_layers": 1, "num_heads": 2,
                   "mlp_features": 16, "max_seq_len": 8}
-    model = ModelConfig("causal_transformer", {**config, "dtype": "float32",
-                                              "precision": "highest"}).build()
+    model = ModelConfig(
+        functools.partial(CausalTransformer, **{**config, "dtype": "float32",
+                                              "precision": "highest"})).build()
     assert model.embedding_dropout_rate == model.attention_dropout_rate == 0
     directory = Path(__file__).with_name("fixtures")
     held = np.load(directory / "decoder-default-dropout.npz")

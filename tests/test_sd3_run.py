@@ -33,6 +33,7 @@ runs, `caption_projection_dim` is `emb_features` through `txt_embed`,
 ("rms_norm") is `SimpleMMDiT(qk_norm=True)`.
 """
 
+import functools
 from pathlib import Path
 
 import jax
@@ -48,8 +49,9 @@ from dew.data.dataset import Loader
 from dew.diffusion.presets import Flow
 from dew.inputs import TextCondition
 from dew.interop.autoencoders.pretrained import PretrainedAutoencoder
+from dew.nn.backbones.mmdit import SimpleMMDiT
 from dew.objectives.base import Step
-from dew.objectives.diffusion.objective import VALIDATION_SAMPLES
+from dew.objectives.diffusion.objective import VALIDATION_SAMPLES, DiffusionObjective
 from dew.registry import ModelConfig
 from dew.sampling import Euler
 from dew.training import Trainer
@@ -67,15 +69,15 @@ PROMPTS = ["a red bird", "two cats", "a harbour at dawn", "x",
 def run_config(directory):
     """The SD3-shaped run: MMDiT, flow matching, T5 text, the 16-channel VAE."""
     return DiffusionRunConfig(
-        model=ModelConfig("simple_mmdit", {"patch_size": 2, "emb_features": 32, "num_layers": 1,
-                                               "num_heads": 2, "mlp_ratio": 1,
-                                               "dtype": "float32"}),
+        model=ModelConfig(functools.partial(SimpleMMDiT, patch_size=2, emb_features=32,
+                                            num_layers=1, num_heads=2, mlp_ratio=1, dtype="float32")),
         data=images_of("tfds://oxford_flowers102", RES, batch=BATCH),
         trainer=TrainerConfig(checkpoint_dir=str(directory), steps=2),
         preset=Flow(), text=TextCondition(encoder="t5", checkpoint=str(T5_TINY), max_length=8),
         autoencoder=PretrainedAutoencoder(modelname=str(VAE_TINY), dtype="float32"),
         val_metrics=(),
-        objective=ObjectiveConfig("diffusion", {"solver": Euler(), "steps": 3, "guidance": None}))
+        objective=ObjectiveConfig(functools.partial(DiffusionObjective, solver=Euler(), steps=3,
+                                                    guidance=None)))
 
 
 def batches(objective):

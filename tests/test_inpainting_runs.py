@@ -5,6 +5,7 @@ pipeline's denoiser through its masked-image inputs. A chain without a mask is r
 that draws one."""
 
 import dataclasses
+import functools
 import json
 import shutil
 from pathlib import Path
@@ -22,6 +23,8 @@ from dew.config.diffusion import DiffusionRunConfig, FlowRolloutConfig
 from dew.data import TFDS, images as image_steps, presets
 from dew.data.dataset import DataPartition
 from dew.interop.pretrained import load_diffusion_source
+from dew.objectives.diffusion.objective import DiffusionObjective
+from dew.objectives.rl.flow import FlowGRPOObjective
 from dew.registry import ModelConfig
 from dew.sampling.solvers import Euler
 
@@ -67,14 +70,18 @@ def masked_images(batch: int = 8, *, rejects: bool = True, ratio: float = 1.0):
 
 def precision() -> ModelConfig:
     model = DiffusionRunConfig().model
-    return dataclasses.replace(model, fields={**model.fields, "dtype": "float32"})
+    return model.with_fields(dtype="float32")
 
 
 RUNS = {
-    "diffusion": ("ddim", {"objective": ObjectiveConfig("diffusion", {"solver": Euler(), "guidance": None,
-                                                                      "steps": 2, "ema_decay": None})}),
-    "flow_grpo": ("flow", {"objective": ObjectiveConfig("flow_grpo", {"solver": Euler(), "guidance": None,
-                                                                      "steps": 2, "clip_range": 0.2}),
+    "diffusion": (
+        "ddim", {"objective": ObjectiveConfig(functools.partial(DiffusionObjective,
+                                                                solver=Euler(), guidance=None, steps=2,
+                                                                ema_decay=None))}),
+    "flow_grpo": (
+        "flow", {"objective": ObjectiveConfig(functools.partial(FlowGRPOObjective,
+                                                                solver=Euler(), guidance=None, steps=2,
+                                                                clip_range=0.2)),
                            "rollout": FlowRolloutConfig(reward="psnr", groups=2, steps=3, train_steps=2)}),
 }
 

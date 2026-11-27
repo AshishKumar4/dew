@@ -10,6 +10,7 @@ advantages, and a mask with short tails, with entries past every clip point.
 `GRPOObjective` reads the same terms out of the rolled-out batch.
 """
 
+import functools
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -40,6 +41,7 @@ from steady_state import steady_state
 
 from dew.data.prompts import INFO_KEY, LENGTH_KEY, PROMPT_KEY, SOURCE_KEY, TRUTH_KEY, _utf8
 from dew.objectives.base import Step
+from dew.objectives.lm.objective import LMObjective
 from dew.objectives.rl import GRPOObjective, RolloutScheduler
 from dew.objectives.rl.sessions import (
     ADVANTAGES_KEY,
@@ -464,7 +466,7 @@ def test_a_recorded_grpo_run_trains_on_the_rollout_it_records(tmp_path):
     with pytest.raises(ValueError):
         dataclasses.replace(config, rollout=None)
     with pytest.raises(ValueError):
-        dataclasses.replace(config, objective=ObjectiveConfig("lm"))
+        dataclasses.replace(config, objective=ObjectiveConfig(functools.partial(LMObjective)))
 
 
 COUNT_HIGH = 11

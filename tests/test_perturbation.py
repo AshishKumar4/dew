@@ -14,7 +14,7 @@ model whose layers are mapped is refused. The estimator's settings are its const
 record holds.
 """
 
-import dataclasses
+import functools
 import json
 from typing import NamedTuple
 
@@ -42,6 +42,7 @@ from dew.objectives.lm import IndexerTraining, LMObjective
 from dew.objectives.perturbation import NodePerturbation
 from dew.objectives.routing import ExpertBalance
 from dew.objectives.supervised import CrossEntropy, Supervised
+from dew.registry import from_record, to_record
 from dew.training import Layout, Trainer, TrainerAdvanced
 
 LAYOUT = Layout(min_shard=1, tolerance=1.0)
@@ -519,10 +520,9 @@ def test_a_batch_norms_statistics_are_kept_as_the_clean_loss_keeps_them():
 def test_a_runs_record_holds_its_estimators_settings():
     """A forward-only objective's draws and jitter scales are its constructor's arguments: a run's record
     states the ones it sets, defaults the rest, and builds them again from its JSON."""
-    config = ObjectiveConfig("test_perturbation:Forward", {"loss": CrossEntropy(labels="label"),
-                                                           "inputs": InputSpec(Field("x", (3,))),
-                                                           "draws": 7, "sigma": 0.1})
-    again = ObjectiveConfig(**json.loads(json.dumps(dataclasses.asdict(config))))
+    config = ObjectiveConfig(functools.partial(Forward, loss=CrossEntropy(labels="label"),
+                                               inputs=InputSpec(Field("x", (3,))), draws=7, sigma=0.1))
+    again = from_record(ObjectiveConfig, json.loads(json.dumps(to_record(config, ObjectiveConfig))))
     assert again.defaults["weight_draws"] == 8 and again.defaults["weight_sigma"] == 0.03
     built = again.build(model=Normed())
     assert isinstance(built, Forward)

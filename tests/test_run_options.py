@@ -18,6 +18,7 @@ through `dew train` to the task the run saves (row 2285, which would have caught
 walk, an option with no public path)."""
 
 import dataclasses
+import functools
 import json
 from pathlib import Path
 
@@ -46,6 +47,7 @@ from dew.batch import FROZEN
 from dew.config import Diagnostics, SourceOptions, TrainerConfig
 from dew.kernels import Kernels
 from dew.lora import LoRA
+from dew.nn.backbones.dit import SimpleDiT
 from dew.registry import ModelConfig, objectives
 from dew.scores import Summary
 
@@ -156,7 +158,7 @@ def test_a_kind_whose_source_decides_its_model_refuses_another_model_name(kind, 
     """A run that starts from a source takes its architecture from it, and its model's fields'
     few choices alone: a model it names is refused as it is prepared, not dropped."""
     run = KINDS[kind](tmp_path, drawn=False)
-    model = ModelConfig("simple_dit", {})
+    model = ModelConfig(functools.partial(SimpleDiT))
     pretrained = {"pretrained": str(TINY_LAYA)} if kind == "lm" else {}
     with pytest.raises(ValueError):
         dataclasses.replace(run, model=model, **pretrained).prepare()

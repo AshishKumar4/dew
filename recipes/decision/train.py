@@ -10,9 +10,9 @@ the hash of each, are held out; validation scores them, and after training they 
 temperatures saved into the run. A table of your own is a run file whose `run` names its chains,
 `dew train tickets.py` (docs/guides/decision-models.md).
 
-The loss is the log loss unless the run's objective names another rule, or a weighted sum of rules,
-`ObjectiveConfig("decision", {"loss": {"class": "dew.decision.scoring:Combined", "fields": {"terms":
-[[1.0, {"class": "log_loss"}], [0.5, {"class": "brier"}]]}}})` in `default`.
+The loss is the log loss unless the run's objective binds another rule, or a weighted sum of rules,
+`ObjectiveConfig(functools.partial(DecisionObjective, loss=...))` with a `dew.decision.scoring.Combined`
+of log loss and a half of Brier, in `default`.
 """
 
 from dew.data import Hub

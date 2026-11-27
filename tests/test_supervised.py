@@ -2,6 +2,7 @@
 names it, its loss and its metrics in a record that builds it again;
 `RunConfig.override` changes one field of a run by its dotted path, read as that field's type reads it."""
 
+import functools
 import json
 import os
 import subprocess
@@ -179,8 +180,9 @@ def test_the_loss_is_the_mean_over_the_real_rows_and_metrics_report_by_name():
 
 def supervised_run(loss) -> RunConfig:
     return RunConfig(model=ModelConfig.from_model(Affine()), trainer=TrainerConfig(steps=1),
-                     objective=ObjectiveConfig("supervised", {"loss": loss, "metrics": (Accuracy(),),
-                                                              "inputs": INPUTS}))
+                     objective=ObjectiveConfig(
+                         functools.partial(Supervised, loss=loss,
+                                           metrics=(Accuracy(),), inputs=INPUTS)))
 
 
 def test_the_run_record_builds_the_same_objective_again():

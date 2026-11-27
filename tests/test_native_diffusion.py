@@ -16,6 +16,7 @@ import pytest
 from interop_support import extract_fixture
 from model_support import attending
 
+from dew import registry
 from tools.diffusers_scheduler_pipeline_reference import SCHEDULERS, scheduler as grid_scheduler
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -332,9 +333,11 @@ def test_an_objective_on_a_loaded_pipeline_samples_on_the_pipelines_own_grid(sav
     model = DiffusionRunConfig().model
     configured = DiffusionRunConfig(
         pretrained=str(directory), preset=None,
-        model=dataclasses.replace(model, fields={**model.fields, "dtype": "float32"}),
+        model=model.with_fields(dtype="float32"),
         data=images_of("tfds://oxford_flowers102", size), val_metrics=(),
-        objective=ObjectiveConfig("diffusion", {**settings, "unconditional_prob": 0.0})).build()
+        objective=ObjectiveConfig(
+            functools.partial(
+                registry.objectives["diffusion"], **{**settings, "unconditional_prob": 0.0}))).build()
     variables = source.variables
     batch = batch_for(objective, size)
     rows = batch["image"].shape[0]

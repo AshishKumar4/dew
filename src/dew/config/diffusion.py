@@ -10,6 +10,7 @@ returns for the same file.
 from __future__ import annotations
 
 import dataclasses
+import functools
 from collections.abc import Mapping
 from typing import TYPE_CHECKING, Annotated, TypedDict
 
@@ -44,20 +45,18 @@ from dew.registry import (
     ModelConfig,
     dtype_name,
     encoders,
-    from_record,
     metrics,
     models,
     objectives,
     presets,
     resolve_dtype,
-    to_record,
 )
-from dew.sampling.solvers import EulerAncestral, Solver
+from dew.sampling.solvers import EulerAncestral
 
 if TYPE_CHECKING:
-
     from dew.data.pipeline import Dataset
     from dew.diffusion.presets import Preset
+    from dew.nn.backbones.unet import Unet
     from dew.objectives.rl.flow import FlowGRPOObjective, FlowRollout
     from dew.objectives.rl.nft import DiffusionNFTObjective, NFTRollout
 
@@ -81,6 +80,13 @@ DEFAULT_MODEL_CONFIG = {
     "precision": "default",
 }
 
+
+
+def _unet() -> functools.partial[Unet]:
+    """A diffusion run's model from scratch, the U-Net at its default widths, read where a run is made."""
+    from dew.nn.backbones.unet import Unet
+
+    return functools.partial(Unet, **DEFAULT_MODEL_CONFIG)
 
 @dataclasses.dataclass(frozen=True)
 class FlowRolloutConfig:
@@ -138,7 +144,7 @@ class DiffusionRunConfig(RunConfig):
 
 
     model: ModelConfig = dataclasses.field(
-        default_factory=lambda: ModelConfig("unet", dict(DEFAULT_MODEL_CONFIG)))
+        default_factory=lambda: ModelConfig(_unet()))
     preset: PresetSpec | None = dataclasses.field(default_factory=EDM)
     """The convention the model is trained and sampled with.
 
@@ -146,12 +152,12 @@ class DiffusionRunConfig(RunConfig):
     may restate.
     """
     objective: ObjectiveConfig = dataclasses.field(default_factory=lambda: ObjectiveConfig(
-        "diffusion", {"solver": to_record(EulerAncestral(), Solver)}))
+        functools.partial(DiffusionObjective, solver=EulerAncestral())))
     """The objective and its arguments: the denoising loss (`diffusion`) with its
     EMA, condition dropout and validation sampling (its `ema_decay`,
     `guidance` and `steps` fields), or a loss of its own in its
-    place, as `ObjectiveConfig("mean_flow", {"omega": 2})` or `ObjectiveConfig("rcm"
-    --teacher-run runs/teacher`. Each objective refuses a preset or a
+    place, as `ObjectiveConfig(functools.partial(MeanFlowObjective, omega=2))`, or an `rcm` objective's
+    with `--teacher-run runs/teacher`. Each objective refuses a preset or a
     guidance its loss cannot train or sample with.
     """
     text: TextCondition | None = dataclasses.field(default_factory=TextCondition)
@@ -203,7 +209,7 @@ class DiffusionRunConfig(RunConfig):
         if self.pretrained is not None:
             # The pipeline's own denoiser trains; the model flag it reads is its compute dtype (its
             # attention kernel the run's, `diagnostics.kernels`).
-            scratch = ModelConfig("unet", dict(DEFAULT_MODEL_CONFIG))
+            scratch = ModelConfig(_unet())
             reads = ("dtype",)
             chosen = [name for name, named in (
                 ("model", self.model.name != scratch.name or any(
@@ -434,13 +440,10 @@ class DiffusionRunConfig(RunConfig):
         from dew.interop.sources import pinned_source
 
         objective = self.objective
-        stated = objective.fields.get("alignment")
-        if isinstance(stated, Mapping):
-            alignment = from_record(Alignment, stated)
-            if alignment.source is not None:
-                pinned = dataclasses.replace(alignment, source=pinned_source(alignment.source))
-                objective = dataclasses.replace(
-                    objective, fields={**objective.fields, "alignment": to_record(pinned, Alignment)})
+        alignment = objective.fields.get("alignment")
+        if isinstance(alignment, Alignment) and alignment.source is not None:
+            objective = objective.with_fields(
+                alignment=dataclasses.replace(alignment, source=pinned_source(alignment.source)))
         pretrained = None if self.pretrained is None else pinned_source(self.pretrained)
         return dataclasses.replace(super().pinned().with_pinned_run(self.pretrained), objective=objective,
                                    pretrained=pretrained)
@@ -476,7 +479,7 @@ class DiffusionRunConfig(RunConfig):
         too; None where it names none, each encoder its own, as its data plan records it (its
         tokenizer's identity holds its dtype)."""
         held = self.model.fields.get("dtype")
-        return None if held is None else dtype_name(resolve_dtype(str(held)))
+        return None if held is None else dtype_name(resolve_dtype(held))
 
     def _source(self, variables: Variables | None):
         """The `pretrained` pipeline, or saved run's task, at the data's resolution: its own
@@ -519,7 +522,10 @@ class DiffusionRunConfig(RunConfig):
 
     def default_metrics(self, *, validates: bool) -> tuple[MetricConfig, ...]:
         """CLIP for an image run whose data `validates`, and nothing otherwise."""
-        return (MetricConfig("clip"),) if validates and len(self.sample_field().shape) != 4 else ()
+        from dew.eval.images import CLIPDistance
+
+        return ((MetricConfig(functools.partial(CLIPDistance)),)
+                if validates and len(self.sample_field().shape) != 4 else ())
 
     def metric(self, config: MetricConfig) -> Metric:
         """`config` built, loading its own weights: a video run scores a `VideoGrid` against its `video`

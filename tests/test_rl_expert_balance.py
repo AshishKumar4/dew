@@ -9,6 +9,7 @@ and the flag reads it so.
 """
 
 import dataclasses
+import functools
 import json
 
 import jax
@@ -20,6 +21,7 @@ from flax import linen as nn
 from flax.traverse_util import flatten_dict, unflatten_dict
 from moe_support import BALANCED_EXPERTS, BALANCED_VOCAB, balanced_decoder, favour_expert_zero, uniform_gates
 
+from dew import registry
 from dew.config import ObjectiveConfig
 from dew.data.preferences import MASK_KEY as PAIR_MASK_KEY, pair_windows
 from dew.objectives.base import Step
@@ -34,6 +36,7 @@ from dew.objectives.rl.sessions import (
     SEGMENT_IDS_KEY,
 )
 from dew.objectives.routing import ExpertBalance
+from dew.registry import from_record, to_record
 from dew.training import Trainer
 
 VOCAB = BALANCED_VOCAB
@@ -271,9 +274,8 @@ def test_a_json_record_rebuilds_a_policy_run_that_balances_its_routers(kind):
     record's JSON rebuilds the same run: its policy balances its routers, and the rebuilt
     objective evaluates a loss."""
     balance = ExpertBalance(balance_rate=RATE, aux_loss_alpha=0.2)
-    config = ObjectiveConfig(kind, {"balance": balance})
-    saved = json.loads(json.dumps({"fields": config.fields, "defaults": config.defaults}))
-    rebuilt = ObjectiveConfig(kind, **saved)
+    config = ObjectiveConfig(functools.partial(registry.objectives[kind], balance=balance))
+    rebuilt = from_record(ObjectiveConfig, json.loads(json.dumps(to_record(config, ObjectiveConfig))))
     assert rebuilt == config
     _balances(kind, rebuilt, balance)
 
@@ -292,7 +294,9 @@ def test_a_policy_runs_balance_flag_builds_a_policy_that_balances_its_routers(ki
     from rl_support import completion_length
 
     rollout = {"rollout": PromptRollout(reward=completion_length)} if kind == "grpo" else {}
-    run = dataclasses.replace(LMRunConfig(), objective=ObjectiveConfig(kind, {"balance": json.loads(spec)}),
+    run = dataclasses.replace(LMRunConfig(),
+                              objective=ObjectiveConfig(
+                                  functools.partial(registry.objectives[kind], balance=json.loads(spec))),
                               **rollout)
     objective = run.objective
     assert isinstance(objective, ObjectiveConfig)

@@ -39,6 +39,7 @@ the module finishes; no other model the daemon holds is touched.
 the training run did not already use.
 """
 
+import functools
 import json
 import os
 import shutil
@@ -59,6 +60,7 @@ from dew.data import HFTokenizer, Loading, presets
 from dew.data.sources.tokens import TokenFiles
 from dew.inference import Completion, OllamaCompletion
 from dew.interop import Pretrained, PretrainedDecoder
+from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.inputs import ModelInputs
 from dew.registry import ModelConfig, models
 from dew.sampling.text import Sampling, generate
@@ -139,7 +141,8 @@ def train_and_export(root: Path) -> Path:
         "--trainer.compilation-cache-dir", "None", "--trainer.multi-host", "False",
         "--max-new-tokens", "0", "--optim.lr", "3e-3"],
         default=LMRunConfig(data=windows,
-                            model=ModelConfig("causal_transformer", {**FIELDS, "dtype": "float32"})))
+                            model=ModelConfig(functools.partial(CausalTransformer,
+                                                                **{**FIELDS, "dtype": "float32"}))))
     state = config.run()
     assert int(state.step) == STEPS
 

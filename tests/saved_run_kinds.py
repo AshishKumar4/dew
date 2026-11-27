@@ -13,6 +13,7 @@ tools/saved_runs_reference.py for them. No source file of that main differs: wha
 which it held no kind to record."""
 
 import dataclasses
+import functools
 import json
 from pathlib import Path
 
@@ -31,7 +32,9 @@ from dew.decision.task import Decide
 from dew.inference.images import TextToImage
 from dew.inference.tasks import BlockGeneration, MaskedGeneration, TextGeneration
 from dew.lora import LoRA
+from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.precision import Numerics, numerics_of
+from dew.objectives.rl.preference import DPOObjective
 from dew.registry import ModelConfig
 from dew.training.budget import Pause
 
@@ -58,7 +61,9 @@ def windows(path):
 def over(source: str, root: Path, drawn: bool) -> RunConfig:
     """An LM run over `source`, its windows token files in the source's own tokenizer."""
     corpus = write_token_files(root / "source-tokens", 40 * SEQ, 8 * SEQ, tokenizer=source)
-    return dataclasses.replace(lm(root, drawn), model=ModelConfig("causal_transformer", {"dtype": "float32"}),
+    return dataclasses.replace(lm(root, drawn),
+                               model=ModelConfig(
+                                   functools.partial(CausalTransformer, dtype="float32")),
                                pretrained=source, tokenizer=source, data=windows(corpus.train),
                                validation=windows(corpus.val))
 
@@ -136,10 +141,11 @@ def preferred(root: Path, drawn: bool) -> RunConfig:
               "rejected_mask": [0, 0, 1]}] * 8
     data = read(Memory(pairs).pipe(presets.preferences, seq_len=4, batch=8))
     # A run that names its objective, built around its whole model on its data (`RunConfig.build_run`).
-    return RunConfig(model=ModelConfig("causal_transformer", {"vocab_size": 8, "emb_features": 16,
-                                                              "num_layers": 1, "num_heads": 2,
-                                                              "dtype": "float32"}),
-                     objective=ObjectiveConfig("dpo", {"seq_len": 3}), data=data, validation=None)
+    return RunConfig(model=ModelConfig(functools.partial(CausalTransformer, vocab_size=8,
+                                                         emb_features=16, num_layers=1, num_heads=2,
+                                                         dtype="float32")),
+                     objective=ObjectiveConfig(functools.partial(DPOObjective, seq_len=3)),
+                     data=data, validation=None)
 
 
 def blockwise(root: Path, drawn: bool) -> RunConfig:
@@ -161,7 +167,8 @@ def fresh(root: Path, drawn: bool, precision: str = "bf16-mixed") -> RunConfig:
     """An LM run whose fresh model states no dtype, computing in its numerics' (`precision`)."""
     run = lm(root, drawn)
     fields = {name: value for name, value in run.model.fields.items() if name != "dtype"}
-    return dataclasses.replace(run, model=ModelConfig("causal_transformer", fields),
+    return dataclasses.replace(
+        run, model=ModelConfig(functools.partial(CausalTransformer, **fields)),
                                trainer=TrainerConfig(precision=numerics_of(precision)))
 
 

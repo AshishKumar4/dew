@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import functools
 import json
 import math
 import time
@@ -45,10 +46,12 @@ from pathlib import Path
 import jax
 import numpy as np
 
+from dew import registry
 from dew._files import write_atomically
 from dew.checkpoints import Checkpoints, Keep
 from dew.config import ObjectiveConfig, TrainerConfig
 from dew.config.env import EnvConfig, EnvRunConfig, RolloutConfig
+from dew.objectives.rl.dreamer import DreamerRollout, WorldModel
 from dew.optim import LaProp, Linear, OptimConfig
 from dew.registry import ModelConfig
 from dew.rl.hyperlux import HyperLuxRenderer
@@ -142,18 +145,20 @@ def run(out: Path, assets: Path, drones: int = ENVIRONMENTS, setting: Setting = 
     race = {"renderer": setting.renderer(assets, drones),
             **({"sky": {"class": "dew.rl.skydreamer:Sky", "fields": sky}} if sky else {})}
     return EnvRunConfig(
-        env=EnvConfig("skydreamer", race),
-        model=ModelConfig("dew.objectives.rl.dreamer:WorldModel", {
-            "reads": "image", "proprio": list(SENSED),
-            "auxiliary": [list(head) for head in DECODED], "deter": 2048, "hidden": 256, "stoch": 32,
-            "classes": 16, "blocks": 8, "units": 256, "conv_depth": 16, "dtype": "bfloat16"}),
-        objective=ObjectiveConfig("dew.objectives.rl.dreamer:DreamerV3Objective",
-                                  {"slow_targets": True, "smoothness": 0.002, "scales": {"decoder": 0.0},
-                                   "entropy": phase.entropy}),
+        env=EnvConfig(functools.partial(SkyDreamerRace, **race)),
+        # The entries it reads and decodes named alone, by the record, whose widths the race declares
+        # (`dew.objectives.rl.run.filled`), the rest of its arguments its class's.
+        model=ModelConfig(functools.partial(WorldModel, reads="image", deter=2048, hidden=256, stoch=32,
+                                            classes=16, blocks=8, units=256, conv_depth=16,
+                                            dtype="bfloat16")).with_fields(
+            proprio=list(SENSED), auxiliary=[list(head) for head in DECODED]),
+        objective=ObjectiveConfig(functools.partial(
+            registry.objectives["dew.objectives.rl.dreamer:DreamerV3Objective"], slow_targets=True,
+            smoothness=0.002, scales={"decoder": 0.0}, entropy=phase.entropy)),
         # The prefill holds one window, of the phase's length.
-        rollout=RolloutConfig("dreamer", {"batch": WINDOWS, "length": phase.length,
-                                          "train_ratio": TRAIN_RATIO, "capacity": setting.replay // drones,
-                                          "prefill": phase.length}),
+        rollout=RolloutConfig(functools.partial(DreamerRollout, batch=WINDOWS,
+                                                length=phase.length, train_ratio=TRAIN_RATIO,
+                                                capacity=setting.replay // drones, prefill=phase.length)),
         optim=OptimConfig(optimizer=LaProp(), schedule=Linear(peak_value=phase.learning_rate,
                                                                    warmup_steps=1000,
                                                                    end_value=phase.learning_rate)),

@@ -140,7 +140,9 @@ def test_a_config_built_runs_step_exchanges_on_an_expert_mesh_by_default(tmp_pat
 
     run = lm(tmp_path, drawn=False)
     fields = {**run.model.fields, "mixture": {"experts": 8, "top_k": 2, "expert_features": 16}}
-    run = dataclasses.replace(run, model=dataclasses.replace(run.model, fields=fields))
+    run = dataclasses.replace(run, model=dataclasses.replace(run.model,
+                                                             bound=functools.partial(
+                                                                 run.model.member, **fields)))
     with pytest.raises(Lowered) as lowered:
         trained(run, tmp_path, "lowered", lowering=LowerFor("sm90"),
                 trainer={"mesh": MeshSpec(expert=expert, fsdp=8 // expert)})
