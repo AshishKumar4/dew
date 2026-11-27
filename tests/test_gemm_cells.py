@@ -14,17 +14,17 @@ from dew.nn.kernels import gemm, generation, grouped_cells, grouped_matmul, sele
 
 
 def _dense_case(generation_name: str, made: grouped_cells.Made, matrix: tuple[int, int], rows: int,
-                dtype=jnp.bfloat16, stored=None) -> grouped_matmul.GroupedCase:
+                dtype=jnp.bfloat16, stored=None, precision=None) -> grouped_matmul.GroupedCase:
     """The `GroupedCase` of a dense product of `dtype` operands on `generation_name` making `made` of `matrix`
     `[in, out]` over `rows` tokens into `stored` (the receipts' own output dtype, `grouped_cells.STORED`,
-    where None)."""
+    where None), its product declared at `precision` (the configured one where None)."""
     from dew.nn.kernels.templates.product import declared
 
     width_in, width_out = matrix
     stored = jnp.dtype(grouped_cells.STORED[made] if stored is None else stored)
     shaped = functools.partial(jax.ShapeDtypeStruct, dtype=dtype)
     sizes = jax.ShapeDtypeStruct((1,), jnp.int32)
-    product = declared(dtype, None, outputs=(stored,))
+    product = declared(dtype, precision, outputs=(stored,))
     with generation.assumed(generation_name):
         if made == grouped_cells.Made.KERNEL_GRADIENT:
             call = grouped_matmul.tgmm_call(shaped((rows, width_in)), shaped((rows, width_out)), sizes,
@@ -105,21 +105,26 @@ def test_a_generation_no_receipt_timed_runs_the_template():
             assert _route(_dense_case("sm103", made, (2560, 9216), 24576)) == "mosaic", made
 
 
-@pytest.mark.parametrize("generation_name, takes", [("sm80", True), ("sm90", False), ("sm100", False)])
-def test_an_fp32_products_template_launch_is_a_family_that_rounds_to_tf32(generation_name, takes):
+@pytest.mark.parametrize("generation_name, held", [("sm80", False), ("sm90", True), ("sm100", True)])
+def test_an_fp32_products_tf32_template_launch_rounds_its_operands(generation_name, held):
     """A dense fp32 input gradient at the default precision (TF32 products, `product.declared`) of a 4B
-    projection: the template derives a launch on an A100, whose mma.sync rounds each fp32 operand to TF32 to
-    nearest as XLA's TF32 product does, and none on an H100 or a B200, whose warpgroup MMA and tcgen05 read
-    it unrounded (row 13735: a GH200's fp32 SSD flow's gradients 3.0 times XLA's error), whose selector so
-    runs XLA's product."""
+    projection: the template's launch derives a tile on a family that rounds each fp32 operand to TF32 to
+    nearest first (`Family.rounds_tf32`), as XLA's TF32 product does, never on warpgroup MMA, which reads
+    it unrounded; and where the device's own issuer takes no rounded TF32 operand (an H100's warpgroup MMA,
+    a B200's tcgen05), the selector runs XLA's product (`TF32_HELD`, row 13735: a GH200's fp32 SSD flow's
+    train gradients 3.0 times XLA's error), an A100's held by no TF32 requirement."""
+    from dew.nn.kernels.templates.gemm import pricing
+
     case = _dense_case(generation_name, grouped_cells.Made.INPUT_GRADIENT, (2560, 9216), 4096,
-                       dtype=jnp.float32, stored=jnp.float32)
+                       dtype=jnp.float32, stored=jnp.float32, precision=jax.lax.Precision.DEFAULT)
+    assert case.tf32 and case.product.refusal is None, case.product
     launch, ba = case.call.bound[grouped_matmul.MosaicGmm.name]
     with generation.assumed(generation_name):
         derived = launch.derived(ba, case.call.target)
-    assert isinstance(launch, grouped_matmul.MosaicGmm) and (derived is not None) == takes, derived
-    if not takes:
-        assert _route(case) == "xla"
+        route = selection.decided(grouped_matmul.GROUPED, case)
+    assert derived is None or pricing.family_of(derived, jnp.float32).rounds_tf32, derived
+    code = None if route.refusal is None else route.refusal.code
+    assert (route.kernel, code) == ("xla", "tf32") if held else code != "tf32", route
 
 
 def test_a_pinned_split_runs_only_where_its_partials_fit_the_workspace():

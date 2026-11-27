@@ -337,12 +337,9 @@ class _Mosaic(tiling.TilesTemplate, _GroupedLaunch[tiling.Tiles]):
     def _tf32(self, ba, dtype, family: mosaic.Family) -> bool:
         """Whether an fp32 TF32 call runs here (`product.declared` at DEFAULT precision, `takes_tf32`,
         row 3428): plain unscaled unhooked call on a family that rounds each fp32 operand to TF32 to nearest
-        (`rounds_tf32`: mma.sync's), as XLA's TF32 product does; non-transposing TF32 families require
-        K-major B (`trans_rhs=True`, not `STAGED_ROWS`), while transposing families take both orientations
-        and kernel gradients. A family reading its fp32 operands as TF32 unrounded (warpgroup MMA's,
-        tcgen05's: their low 13 bits dropped, each product's magnitude biased low, the bias summed over the
-        depth) takes none: a GH200's dense input gradients of an fp32 SSD flow read 3.0 times XLA's error
-        through them (row 13735)."""
+        first (`rounds_tf32`: mma.sync's), as XLA's TF32 product does, never one that reads it unrounded
+        (row 13735); non-transposing TF32 families require K-major B (`trans_rhs=True`, not
+        `STAGED_ROWS`), while transposing families take both orientations and kernel gradients."""
         k_major = not self.STAGED_ROWS and self._matrix_transposed(ba)
         return (jnp.dtype(dtype) == jnp.float32 and family.takes_tf32 and family.rounds_tf32
                 and not ba.arguments.get('exact_sums') and not self._scaled
@@ -1754,6 +1751,12 @@ class GroupedCase:
         return self.kind.scattered
 
     @property
+    def tf32(self) -> bool:
+        """Whether a GPU multiplies its products in TF32: fp32 operands at the default precision
+        (`product.declared`; above it the product's own requirement refuses the template)."""
+        return self.product.compute == jnp.float32 and not generation.tpu(self.call.target)
+
+    @property
     def cell(self) -> tuple[str | None, Kind]:
         """Its cell among `DECLARED`: its target's generation, whose receipts alone time it (one instruction
         family's generations part in speed against their references, `grouped_cells`), and its kind; a
@@ -1810,6 +1813,25 @@ DECLARED_ONLY = _Need('declared', lambda case: DECLARED.get(case.cell, (None,))[
                       "(`DECLARED`), and where a call names them", row='bible da64ae5', kind='measured')
 """Keeps CUTLASS off non-declared cells (bible §6)."""
 
+def _rounds_tf32_first(generation_name: str) -> bool:
+    """Whether a GPU's most capable bundle multiplies fp32 operands in TF32 rounded to nearest first
+    (`bundles.of`, `Family.takes_tf32` and `rounds_tf32`: an A100's mma.sync), as XLA's TF32 product does."""
+    from .templates import bundles
+
+    leading = bundles.of(generation_name, jnp.float32, stated=True)
+    return leading is not None and leading.takes_tf32 and leading.rounds_tf32
+
+
+TF32_HELD = _Need(
+    'tf32', lambda case: not case.tf32 or _rounds_tf32_first(case.call.target.generation),
+    lambda case: f"{case.call.target.generation}'s leading matrix issuer takes no fp32 operand rounded to "
+                 "TF32 (warpgroup MMA and tcgen05 read it unrounded, PTX), so the template's TF32 products "
+                 "would run on mma.sync, which no receipt timed against XLA's TF32 product",
+    row='ledger 13735', kind='measured')
+"""Keeps fp32 products at the default precision on XLA where the template's own issuer does not round them:
+a GH200's fp32 SSD flow read 3.0 times XLA's train-gradient error with its input gradients on warpgroup MMA
+(row 13735)."""
+
 DENSE_MEASURED = _Need('dense', lambda case: not case.kind.dense,
                       "Triton's dense launches measured slower than XLA's dot on every generation timed "
                       "(DENSE1, 10 projections at 8192 tokens: A100 1.735x to 1.947x, H100 1.149x to 1.738x)",
@@ -1840,7 +1862,7 @@ class Apart:
 
 APART = Apart()
 
-MOSAIC = _launch_kernel(MosaicGmm.name)
+MOSAIC = _launch_kernel(MosaicGmm.name, TF32_HELD)
 TRITON = _launch_kernel(Gmm.name, DENSE_MEASURED)
 """Triton's launches, off the dense products the template's launches cannot run (`DENSE_MEASURED`)."""
 CUTLASS = _launch_kernel(CutlassGmm.name, DECLARED_ONLY)
