@@ -21,7 +21,7 @@ from reference_error import assert_as_exact
 
 from dew.nn import precision
 from dew.nn.kernels import formats, gemm, generation, grouped_matmul
-from dew.nn.kernels.templates.gemm import packed
+from dew.nn.kernels.templates.gemm import factored, packed
 
 
 def test_ternary_weights_pack_decode_and_stage_match_bitwise():
@@ -105,6 +105,113 @@ def test_a_ternary_product_at_a_subnormal_scale_keeps_its_values(quantize, colum
                 jnp.asarray(rows, jnp.bfloat16), weights)
         np.testing.assert_array_equal(np.asarray(got, np.float32).view(np.uint32), want.view(np.uint32),
                                       err_msg=f"interpret={interpret}")
+
+
+@pytest.mark.parametrize("order", ["the scaling's tangent", "the product's cotangent"])
+def test_a_packed_products_derivative_at_a_subnormal_scale_keeps_its_values(order):
+    """A packed product's derivative at a subnormal scale (`2**-127`), each value IEEE's multiplies give, on
+    a process that flushes subnormal operands (XLA's CPU) too (row 13703; the value's own rule is row
+    13340's): the scaling's tangent (`factored.scaled_exactly`) along a product direction of `+-2**126` is
+    `+-0.5`, and a ternary product's row cotangent (codes +1 and -1, rows of 1) at output cotangents
+    `+-2**126` is `0.5 + 0.5`, where the plain multiply by the scale read 0."""
+    if order == "the scaling's tangent":
+        product = jnp.ones((2,), jnp.float32)
+        scale = jnp.float32(2.0 ** -127)
+        direction = jnp.asarray([2.0 ** 126, -(2.0 ** 126)], jnp.float32)
+        def tangent(product, scale, direction):
+            return jax.jvp(factored.scaled_exactly, (product, scale), (direction, jnp.zeros_like(scale)))[1]
+
+        got = np.asarray(jax.jit(tangent)(product, scale, direction))
+        want = np.asarray([0.5, -0.5], np.float32)
+    else:
+        values = np.zeros((256, 2), np.float32)
+        values[0] = (1.0, -1.0)
+        weights = formats.TernaryWeights.of(values, scale=np.asarray(2.0 ** -127, np.float32))
+
+        def ternary(rows):
+            return gemm.ternary_weight_product(rows, weights, quantize_activations=False,
+                                               out_dtype=jnp.float32)
+
+        cotangent = jnp.asarray([[2.0 ** 126, -(2.0 ** 126)]], jnp.float32)
+        rows = jnp.ones((1, 256), jnp.bfloat16)
+        pulled = jax.jit(lambda x, c: jax.vjp(ternary, x)[1](c)[0])(rows, cotangent)
+        got = np.asarray(pulled, np.float32)[0, :2]
+        want = np.asarray([1.0, 0.0], np.float32)
+    np.testing.assert_array_equal(got.view(np.uint32), want.view(np.uint32))
+
+
+@pytest.mark.parametrize(("direction", "scale"), [(11184812 / 2 ** 23, 6291455 * 2.0 ** -149),
+                                                 (11184808 / 2 ** 23, 6291457 * 2.0 ** -149)],
+                         ids=["rounds up to the least normal", "rounds to the largest subnormal"])
+def test_a_scalings_tangent_rounds_once_at_the_least_normal(direction, scale):
+    """`factored.scaled_exactly`'s tangent along a product direction at a subnormal scale is the exact
+    product rounded once, on either side of fp32's least normal (row 13703's review: a product rounded in
+    two multiplies met the same value from both sides); its exact product a float64's, rounded by the host."""
+    def tangent(product, scale, direction):
+        # The scale held (its tangent a symbolic zero), so no term of its adds to, and flushes, a subnormal.
+        return jax.jvp(lambda p: factored.scaled_exactly(p, scale), (product,), (direction,))[1]
+
+    got = np.asarray(jax.jit(tangent)(jnp.float32(1), jnp.float32(scale), jnp.float32(direction)))
+    want = np.float32(np.float64(direction) * np.float64(scale))
+    np.testing.assert_array_equal(got.view(np.uint32), np.asarray(want).view(np.uint32))
+
+
+def test_a_scalings_tangent_keeps_its_derivative_in_the_scale():
+    """The derivative in the scale of `factored.scaled_exactly`'s tangent along a unit product direction, at a
+    product of 1 and a normal scale of 2, is 1, the mixed derivative of `product * scale` (row 13703's
+    review: a tangent formed from the scale's bits held it constant)."""
+    def tangent(scale):
+        unit = jnp.float32(1)
+        return jax.jvp(factored.scaled_exactly, (unit, scale), (unit, jnp.zeros_like(scale)))[1]
+
+    assert float(jax.grad(tangent)(jnp.float32(2))) == 1.0
+
+
+@pytest.mark.mesh(devices=2)
+def test_a_scalings_tangent_sums_a_device_local_scale_in_a_checked_map():
+    """Reverse mode through `factored.scaled_exactly`'s tangent rule in a `shard_map` that checks the axes
+    its values vary over, a replicated product and each device its own scale (2 and 3): the product's
+    gradient is the devices' scales summed, 5, its cotangent summed over the axis the scale alone varies
+    over (row 13703's review: the rule's transpose handed it back varying)."""
+    mesh = jax.sharding.Mesh(np.asarray(jax.devices()[:2]), ("data",))
+    data, whole = jax.sharding.PartitionSpec("data"), jax.sharding.PartitionSpec()
+
+    def each_device(product, scale):
+        return jax.grad(lambda p: jnp.sum(factored.scaled_exactly(p, scale)))(product)
+
+    mapped = jax.jit(jax.shard_map(each_device, mesh=mesh, in_specs=(whole, data), out_specs=whole,
+                                   check_vma=True))
+    got = mapped(jnp.ones((1,), jnp.float32), jnp.asarray([2.0, 3.0], jnp.float32))
+    assert float(got[0]) == 5.0
+
+
+@pytest.mark.mesh(devices=2)
+def test_a_scalings_tangent_places_a_replicated_products_gradient_on_an_explicit_mesh():
+    """Reverse mode through `factored.scaled_exactly`'s tangent rule on an Explicit two-device mesh, a
+    replicated product and a scale split over the devices (2 and 3): the product's gradient is the scales,
+    placed replicated as the product is (row 13703's review: its pullback handed back the scale's split)."""
+    from jax.sharding import AxisType, NamedSharding, PartitionSpec
+
+    mesh = jax.make_mesh((2,), ("data",), axis_types=(AxisType.Explicit,), devices=jax.devices()[:2])
+    with jax.set_mesh(mesh):
+        product = jax.device_put(jnp.ones((2,), jnp.float32), NamedSharding(mesh, PartitionSpec(None)))
+        scale = jax.device_put(jnp.asarray([2.0, 3.0], jnp.float32),
+                               NamedSharding(mesh, PartitionSpec("data")))
+        got = jax.jit(jax.grad(lambda p, s: jnp.sum(factored.scaled_exactly(p, s))))(product, scale)
+    assert got.sharding.spec == PartitionSpec(None), got.sharding
+    np.testing.assert_array_equal(np.asarray(got), np.asarray([2.0, 3.0], np.float32))
+
+
+def test_a_scalings_bf16_product_sums_its_broadcast_cotangents_wide():
+    """Reverse mode through `factored.scaled_exactly` of a bf16 scalar product over fp32 factors
+    `[256, -255.5]` at an output cotangent of ones: the product's cotangent is their fp32 sum 0.5, rounded
+    once to bf16, where each broadcast term rounded to bf16 first (256 and -256) summed 0 (train 1362's
+    review of row 13703)."""
+    def summed(product, factors):
+        return jnp.sum(factored.scaled_exactly(product, factors))
+
+    got = jax.jit(jax.grad(summed))(jnp.asarray(1.0, jnp.bfloat16), jnp.asarray([256.0, -255.5], jnp.float32))
+    assert got.dtype == jnp.bfloat16 and float(got) == 0.5
 
 
 _MIDPOINT_SCALE = float(np.asarray(0x0040003F, np.uint32).view(np.float32))
