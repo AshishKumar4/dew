@@ -1471,16 +1471,16 @@ the written trace and independent truth. Sharing and case selection add no run-t
   typed case manifest and `--check` share the stable-form writer and its gate suite; no receipt means
   no replacement. Production integration of later components needs those receipts, not just a generated file.
 - **The opt-in seam.** A template's own function asks `dew.algebra.generated.body(qualified, operands,
-  when=...)` for its component's generated body, `when` its static program being the declared one, and
-  runs it in place of its written math where given. Under the kernel choice `generated` ("written", the
-  default) nothing changes: the site's written math runs and its program is the one traced before. Under
-  "generated" a call whose case (policy, target, operand shapes and dtypes) its generated module declares
-  runs the checked body, and any other call its written math; every answer is counted by its outcome
+  when=...)` for its component's generated body, `when` its static program being the declared one, and runs
+  it in place of its written math where given. Under the kernel choice `generated` ("written", the default)
+  nothing changes: the site's written math runs and its program is the one traced before. Under "generated"
+  a call whose case (policy, target, operand shapes and dtypes) its generated module declares runs the
+  checked body, and any other call its written math; every answer is counted by its outcome
   (`generated.taken`), so a measurement tells a generated body that ran from a written one that stood in.
   The selective scan's decay, token stage, readout, backward step lift and adjoint, the recurrence skip's
-  pullback, the gated delta rule's value pullback and key memory decay, and the derived split-KV merge
-  (`attention_algebra._derived_merge`, every walk's and split decode's) are its sites. A component's default changes only on its native
-  receipts (M-AL-5).
+  pullback, the gated delta rule's value pullback, key memory decay and scores tile, and the derived
+  split-KV merge (`attention_algebra._derived_merge`, every walk's and split decode's) are its sites. A
+  component's default changes only on its native receipts (M-AL-5).
 
 - `python -m dew.algebra.generate [names] [--check]` traces each declared case. For a stable form it
   saturates with the dev-time sets, measures error against the declaration at float64 and selects

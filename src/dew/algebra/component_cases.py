@@ -13,7 +13,7 @@ import numpy as np
 from dew.algebra.generate import Cases, ComponentForm, declare, float32_cases, normal_operands
 from dew.nn import precision
 from dew.nn.kernels import recurrence_algebra, ssd
-from dew.nn.kernels.recurrence_algebra import apart, derived_tile
+from dew.nn.kernels.recurrence_algebra import apart
 from dew.nn.kernels.templates import attention, attention_algebra, attention_gradient
 from dew.nn.kernels.templates.attention_backward_algebra import (
     derived_cotangents,
@@ -22,10 +22,6 @@ from dew.nn.kernels.templates.attention_backward_algebra import (
     softmax_gradients,
 )
 from dew.nn.kernels.templates.operands import Parts
-
-
-def _scores(products, decays, scales):
-    return derived_tile("scores").mapped({"products": products, "decays": decays, "scales": scales})
 
 
 def _scores_truth(products, decays, scales):
@@ -439,7 +435,8 @@ def _recompute_form(function, truth, *, keys_first, dropped):
                          _attention_recompute_cases(keys_first=keys_first, dropped=dropped))
 
 SCORES = declare(__name__, "scores", ComponentForm(
-    _scores, _scores_truth, float32_cases(*[((n, n), (n, n), (n,)) for n in (16, 32, 64)])))
+    recurrence_algebra.scores_tile, _scores_truth,
+    float32_cases(*[((n, n), (n, n), (n,)) for n in (16, 32, 64)])))
 PREFIX_DIFFERENCE = declare(__name__, "prefix_difference", ComponentForm(
     apart, _apart_truth,
     dataclasses.replace(float32_cases(((32,), (32,), (64,), (64,))), draw=_apart_draw)))

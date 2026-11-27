@@ -720,9 +720,16 @@ def chunk_scores(queries: Load, keys: Load, columns: int, gate, low, dtype, issu
     for c in range(columns):
         scores += issue("scores", queries(c), keys(c).T)
     scales = jnp.ones((gate.shape[0],), jnp.float32) if column_scale is None else column_scale
-    # The tile's algebra over its products and decays its declaration's derived forms (`scores_of`).
-    tile = derived_tile("scores", apart)
-    return tile.mapped({"products": scores, "decays": decay, "scales": scales}).astype(dtype)
+    return scores_tile(scores, decay, scales, apart).astype(dtype)
+
+
+def scores_tile(products, decays, scales, apart: int = 0) -> jax.Array:
+    """The scores tile's algebra over a chunk's products, their decays and the key columns' scales, its
+    declaration's derived forms (`derived_tile("scores", apart)`, `scores_of`); the algebra's generated and
+    checked body of a tile read with its own writes, where the run asks for it (`_generated_body`)."""
+    if not apart and (generated := _generated_body("scores", (products, decays, scales))) is not None:
+        return generated(products, decays, scales)
+    return derived_tile("scores", apart).mapped({"products": products, "decays": decays, "scales": scales})
 
 
 def chunk_output(queries: Load, entered: Load, columns: int, gate, low, scores, value, scale: float,
