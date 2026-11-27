@@ -529,12 +529,14 @@ def test_the_generated_recurrence_score_tile_holds_on_the_gpu():
     from dew.nn.kernels.templates import bundles
 
     form = component_cases.SCORES
-    family = bundles.of("sm90", jnp.bfloat16)
-    assert family is not None
+    assert bundles.of("sm90", jnp.bfloat16) is not None
     shape = (64, 64)
 
     def call(component):
         def scores(products, decays, scales, out, product_tile, decay_tile, column, staged, ready):
+            # The family taken where the kernel is traced: a bundle instance has no statement, and an arm
+            # closing over one runs unprepared (M-AL-4's native run compiled all three arms on its GPU).
+            family = bundles.of("sm90", jnp.bfloat16)
             for source, tile in ((products, product_tile), (decays, decay_tile), (scales, column)):
                 plgpu.copy_gmem_to_smem(source, tile, ready)
             plgpu.barrier_wait(ready)
