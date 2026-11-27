@@ -39,6 +39,7 @@ from dew.nn.kernels.templates.attention import (
     NATURAL,
     TILED,
     AttentionLaunch,
+    BackwardRows,
     Gradients,
     Hooks,
     Kept,
@@ -1672,9 +1673,28 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
     """Whether its score hook reads its queries' places and its keys' (`score_places`), as its builder reads
     them off the hook (`_backward_call`): a keyed launch's hook is its fingerprint, which keeps no trace of
     them, and its registers hold each it reads (`backward_registers`' `hooked`)."""
-
     def _fwd(self, query, key, value, dout, start, end, query_ids, key_ids, score_params, initial, residuals,
              drop=None, *, interpret: bool, config: BackwardTiles, return_residuals: bool = False):
+        return self.gradients_of(query, key, value, dout, start, end, query_ids, key_ids, score_params,
+                                 initial, residuals, drop, interpret=interpret, config=config), None
+
+    @overload
+    def gradients_of(self, query, key, value, dout, start, end, query_ids, key_ids, score_params, initial,
+                     residuals, drop=None, *, interpret: bool, config: BackwardTiles,
+                     certify: Literal[False] = False) -> Gradients:
+        ...
+
+    @overload
+    def gradients_of(self, query, key, value, dout, start, end, query_ids, key_ids, score_params, initial,
+                     residuals, drop=None, *, interpret: bool, config: BackwardTiles,
+                     certify: Literal[True]) -> tuple[Gradients, BackwardRows]:
+        ...
+
+    def gradients_of(self, query, key, value, dout, start, end, query_ids, key_ids, score_params, initial,
+                     residuals, drop=None, *, interpret: bool, config: BackwardTiles, certify: bool = False):
+        """The call's gradients at `config` (`template.gradients` over `_launch_backward`), `_fwd`'s and its
+        certify form's (`backward_certified`) alike: under `certify` its launch returns last the D
+        `split_delta` took, and the rows of D its launches took come beside the gradients."""
         family = bundle_of(config, query.dtype)
         spans = self.spans(start, end, query_ids, key_ids)
         hooks = Hooks(score=Hook(self.score_mod, tuple(map(Side, score_params, self.score_kinds))),
@@ -1689,9 +1709,13 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
         launch = functools.partial(_launch_backward, spec=spec, accurate=self.accurate, tiles=config,
                                    family=family, interpret=interpret,
                                    drop=placed_draws(drop, padded_queries, padded_keys), rounded=self.rounded,
-                                   registered=self.registered(query, value, score_params, drop, config))
-        return gradients(launch, query, key, value, spans, hooks, dout, residuals,
-                         block=_block(config), scale=self.scale, rounded=self.rounded), None
+                                   registered=self.registered(query, value, score_params, drop, config),
+                                   certify=certify)
+        if certify:
+            return gradients(launch, query, key, value, spans, hooks, dout, residuals, block=_block(config),
+                             scale=self.scale, rounded=self.rounded, certify=True)
+        return gradients(launch, query, key, value, spans, hooks, dout, residuals, block=_block(config),
+                         scale=self.scale, rounded=self.rounded)
 
     def _spec(self, queries: int, keys: int, *, ids: bool, initial: bool,
               config: BackwardTiles) -> algebra.Forward:
@@ -2400,14 +2424,44 @@ def backward_declined(query: jax.Array, key: jax.Array, value: jax.Array, spans:
     return op.uncertified(ba, target) if certified else op.declined(ba, target)
 
 
+class CertifiedBackward(MosaicBackward):
+    """`MosaicBackward` as its certify form launches it (`backward_certified`): the same launches, returning
+    the rows of D they took too (`gradients_of`'s `certify`). Its class keys its launches apart from
+    `MosaicBackward`'s (`report._identity`), so its derivations, refusals and timings are its own, warming no
+    production call."""
+
+
+def backward_certified(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans,
+                       hooks: Hooks | None, dout: jax.Array, *,
+                       residuals: tuple[jax.Array, jax.Array, jax.Array, Split], scale: float | None = None,
+                       natural: bool = NATURAL, interpret: bool = False) -> tuple[Gradients, BackwardRows]:
+    """The accurate backward's certify form, `backward`'s two launches at the tiles its call derives
+    (`MosaicBackward.derived`): their gradients and the rows of D they took (`BackwardRows`). Off in
+    production; tests/attention_witness.py holds each gradient to its enclosure from them. A call no config
+    holds raises the reason the backward declines it (`MosaicBackward.declined`)."""
+    query, key, hooks = prologues_taken(query, key, hooks)
+    op, args = _backward_call(query, key, value, spans, hooks, dout, residuals, scale=scale, natural=natural,
+                              accurate=True, certify=True)
+    ba = op.bind(*args, interpret=interpret)
+    target = generation.gpu_target()
+    config = op.derived(ba, target)
+    if config is None:
+        raise ValueError(f"the Mosaic backward declines the call: {op.declined(ba, target)}")
+    kwargs = {name: value for name, value in ba.kwargs.items() if name != "return_residuals"}
+    # Its kernels named and refused as its own launch's (`report.launching`), as a call's are.
+    with report.launching(op, ba, config):
+        return op.gradients_of(*ba.args, config=config, certify=True, **kwargs)
+
+
 def _backward_call(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks | None,
                    dout: jax.Array, residuals: tuple, *, scale: float | None, natural: bool,
-                   accurate: bool, rounded: bool = True) -> tuple[MosaicBackward, tuple]:
+                   accurate: bool, rounded: bool = True, certify: bool = False
+                   ) -> tuple[MosaicBackward, tuple]:
     """`backward`'s op and its arguments, a dropping call's draw among them (`_forward_call`), its spans an
-    interval a query (`KeySpans.per_query`)."""
+    interval a query (`KeySpans.per_query`); its certify form's (`CertifiedBackward`) where `certify`."""
     hooks, spans = Hooks() if hooks is None else hooks, spans.per_query()
     walked_initial(hooks.initial)
-    op = MosaicBackward(score_mod=hooks.score.fn,
+    op = (CertifiedBackward if certify else MosaicBackward)(score_mod=hooks.score.fn,
                         score_kinds=kinds_of(hooks.score.sides),
                         score_dtypes=tuple(kept_dtype(param.value.dtype) for param in hooks.score.sides),
                         score_reduces=hook_reduces(hooks), form=spans.form, keys=spans.keys,

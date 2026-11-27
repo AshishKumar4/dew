@@ -11,7 +11,6 @@ import jax
 import numpy as np
 import pytest
 from attention_witness import (
-    BACKWARD_FORMS,
     FORMS,
     assert_backward_faults_refused,
     assert_backward_witnessed,
@@ -78,9 +77,10 @@ def test_native_attention_witness_cells_prepare_without_deferring(tmp_path, monk
         assert any(expected in label for label in labels), (expected, labels)
 
 
-@pytest.mark.parametrize("form", BACKWARD_FORMS)
-def test_each_gradient_of_the_fast_backward_lies_in_its_enclosure(form):
-    assert_backward_witnessed(0, form, interpret=True)
+@pytest.mark.parametrize("accurate", [False, True], ids=["fast", "accurate"])
+@pytest.mark.parametrize("form", FORMS)
+def test_each_gradient_of_the_backward_lies_in_its_enclosure(form, accurate):
+    assert_backward_witnessed(0, form, interpret=True, accurate=accurate)
 
 
 def test_each_backward_fault_is_refused_at_its_elements():
