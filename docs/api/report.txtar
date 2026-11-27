@@ -169,6 +169,7 @@ class Objective()  [dew.objectives.base]
   .predict(self, params: Variables, batch: Batch, step: Step, *, train: bool, layers: Sequence[int] = (), logits: bool = True) -> tuple[Loss, Aux[Effects], Prediction]
   .predicts_by_head: property -> bool
   .preview(self, params: Variables, batch: Batch, step: Step, *, scored: Artifacts | None = None) -> Artifacts | None
+  .preview_refusal(self) -> str | None
   .program(self, name: Hashable, function: Callable, *, static_argnames: tuple[str, ...] = (), donate_argnames: tuple[str, ...] = (), holds: tuple[DeviceStep | AutoEncoder | Guidance | Stepping, ...] = (), modules: tuple[nn.Module, ...] = (), step: Mapping[str, Option] | None = None)
   .program_key(self) -> tuple[ProgramModule, ...]
   .progress(self, step: Step) -> Progress
@@ -278,6 +279,7 @@ class Supervised(model: nn.Module | Source[nn.Module], loss: Criterion, metrics:
   .predict(self, params: Variables, batch: Batch, step: Step, *, train: bool, layers: Sequence[int] = (), logits: bool = True) -> tuple[Loss, Aux[Effects], Prediction]
   .predicts_by_head: property -> bool
   .preview(self, params: Variables, batch: Batch, step: Step, *, scored: Artifacts | None = None) -> Artifacts | None
+  .preview_refusal(self) -> str | None
   .program(self, name: Hashable, function: Callable, *, static_argnames: tuple[str, ...] = (), donate_argnames: tuple[str, ...] = (), holds: tuple[DeviceStep | AutoEncoder | Guidance | Stepping, ...] = (), modules: tuple[nn.Module, ...] = (), step: Mapping[str, Option] | None = None)
   .program_key(self) -> tuple[ProgramModule, ...]
   .progress(self, step: Step) -> Progress
