@@ -293,8 +293,8 @@ def unprepared_in(truths: Path, records: tuple[str, ...],
 
 
 Cell = tuple[str, str, str | None]
-"""An unprepared cell as a row and its baseline keep it (`cells`): its test, where in it, and its label or
-None, each a field, so no node id that reads like a where or a label (" @ ", " [") is parsed for one."""
+"""An unprepared cell as a row and its baseline keep it (`unprepared_cells`): its test, where in it, and its
+label or None, each a field, so no node id reading like a where or a label (" @ ", " [") is parsed for one."""
 
 
 def cell_of(record: Mapping) -> Cell:
@@ -374,8 +374,9 @@ def graded(rows: list[dict], unprepared: Mapping[str, list[dict]], before: set[C
     judged = []
     for found in rows:
         own = unprepared.get(file_of(found["name"]), [])
-        # A reused row's cells by their fields where its record keeps them (`cells`), else by its identities.
-        held = ([record_of(tuple(cell)) for cell in found["cells"]] if "cells" in found
+        # A reused row's cells by their fields where its record keeps them (`unprepared_cells`), else by its
+        # identities.
+        held = ([record_of(tuple(cell)) for cell in found["unprepared_cells"]] if "unprepared_cells" in found
                 else [{"identity": cell} for cell in found["unprepared"]] if "unprepared" in found
                 else [{**record, "identity": identity(record)} for record in own])
         cells = sorted(record["identity"] for record in held)
@@ -416,8 +417,8 @@ def graded(rows: list[dict], unprepared: Mapping[str, list[dict]], before: set[C
             red = {}
         said = ({"capped": capped, "output": "\n".join([capped_banner(capped), red.get(
             "output", found.get("output") or "")])} if capped else {})
-        # Its cells by their fields too, which its baseline keeps (`cells_of`), where each has them.
-        fields = ({"cells": sorted((cell_of(record) for record in held),
+        # Its unprepared cells by their fields too, its baseline's (`cells_of`), where each has them.
+        fields = ({"unprepared_cells": sorted((cell_of(record) for record in held),
                                    key=lambda cell: (cell[0], cell[1], cell[2] or ""))}
                   if all("test" in record for record in held) else {})
         judged.append(as_ran({**found, "unprepared": cells, **fields, **red, **said}, stale))
@@ -512,13 +513,13 @@ def bounded_get(store, key: str, until: float, failures: tuple[type[BaseExceptio
 
 def cells_of(record: dict | None) -> set[Cell] | set[str] | None:
     """The cells a commit's baseline record (`baseline_key`, a green prepare's alone) keeps unprepared: by
-    their fields (`Cell`) where it keeps them so (`cells`), an older record's by their identities
+    their fields (`Cell`) where it keeps them so (`unprepared_cells`), an older record's by their identities
     (`identity`'s strings); None where there is no record; `Unread` where the record keeps neither as a list
     of cells."""
     if record is None:
         return None
-    if "cells" in record:
-        kept = record["cells"]
+    if "unprepared_cells" in record:
+        kept = record["unprepared_cells"]
         if not (isinstance(kept, list) and all(
                 isinstance(cell, list) and len(cell) == 3 and isinstance(cell[0], str)
                 and isinstance(cell[1], str) and (cell[2] is None or isinstance(cell[2], str))

@@ -426,7 +426,7 @@ def test_a_cell_its_prepares_cap_left_is_named_and_counted_but_reds_no_row(ci):
 
 
 def test_a_baseline_keeps_its_cells_by_their_fields_and_main_s_capped_cells_are_read_so(ci):
-    """A graded row keeps its cells by their fields (`cells`), which its baseline gives back as such
+    """A graded row keeps its cells by their fields (`unprepared_cells`), which its baseline gives back so
     (prepares.py's `cells_of`), and main's capped cells are read from those fields: a baseline cell whose
     node id merely holds " @ <cap> [" (a parameter id), at a site of its own, is no cell main capped, where
     its identity read back as a string named one; a cell main did cap still exempts the same cell reached
@@ -452,7 +452,8 @@ def test_a_baseline_keeps_its_cells_by_their_fields_and_main_s_capped_cells_are_
             "cell": "two"}
     row = graded([same], before={capped})
     assert row["exitCode"] == 0
-    assert row["cells"] == [["tests/test_gpu_vae.py::test_flow", "tests/test_gpu_vae.py", "two"]]
+    assert json.loads(json.dumps(row))["unprepared_cells"] == [
+        ["tests/test_gpu_vae.py::test_flow", "tests/test_gpu_vae.py", "two"]]
     assert ci.prepares.cells_of(json.loads(json.dumps(row))) == {
         ("tests/test_gpu_vae.py::test_flow", "tests/test_gpu_vae.py", "two")}
     assert graded([], before={capped}, found=json.loads(json.dumps(row)))["exitCode"] == 0
