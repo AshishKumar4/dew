@@ -220,3 +220,81 @@ def test_a_level_without_blocks_resamples_nothing_and_the_factor_counts_it():
     assert model.downscale_factor == 2
     assert latent.shape[1:3] == (16 // model.downscale_factor,) * 2
     assert model.apply(variables, latent, method=DCAE.decode).shape == image.shape
+
+
+def test_the_linear_attention_and_its_gradients_are_on_par_with_diffusers(monkeypatch):
+    """DC-AE's ReLU linear attention (`linear_attention`) over 1024 positions of four 32-wide heads, a
+    released DC-AE's head width, and its queries', keys' and values' gradients, check 1 against Diffusers'
+    `apply_linear_attention` in float32, the truth its float64 run. The queries and keys keep two channels
+    positive, so every normalizer sums its positions, the rest drawn on both sides of the ReLU off its
+    kink (row 13524: one float32 sum over the positions left the gradients 1.5-2x Diffusers' error). Its
+    CPU arithmetic a library process's, float32 products summed in float32, not the suite's wide sums."""
+    import torch
+    from arm_forms import as_given
+    from diffusers.models.attention_processor import SanaMultiscaleLinearAttention
+    from reference_error import assert_as_exact
+
+    from _dew_torch.precision import float64
+    from dew.nn.autoencoders.dc_ae import linear_attention
+    from dew.nn.precision import WIDE_CPU_ARITHMETIC
+
+    monkeypatch.delenv(WIDE_CPU_ARITHMETIC, raising=False)
+
+    positions, heads, width = 1024, 4, 32
+    attention = SanaMultiscaleLinearAttention(heads * width, heads * width, attention_head_dim=width).eval()
+
+    def draw(seed):
+        rng = np.random.default_rng([13524, seed])
+        shape = (2, positions, heads, width)
+
+        def gated():
+            magnitudes = rng.uniform(0.25, 1.5, size=shape)
+            magnitudes[..., 2:] *= rng.integers(0, 2, size=(*shape[:-1], width - 2)) * 2 - 1
+            return magnitudes.astype(np.float32)
+        return (gated(), gated(), rng.uniform(-1, 1, size=shape).astype(np.float32),
+                rng.standard_normal(shape).astype(np.float32))
+
+    @jax.jit
+    def dew(query, key, value, cotangent):
+        attended, backward = jax.vjp(lambda q, k, v: linear_attention(jax.nn.relu(q), jax.nn.relu(k), v),
+                                     query, key, value)
+        return (attended, *backward(cotangent))
+
+    def diffusers_run(query, key, value, cotangent, dtype):
+        # Diffusers' heads lie `[batch, heads, width, positions]`.
+        query, key, value, cotangent = (torch.as_tensor(array, dtype=dtype).permute(0, 2, 3, 1).contiguous()
+                                        for array in (query, key, value, cotangent))
+        for leaf in (query, key, value):
+            leaf.requires_grad_()
+        attended = attention.apply_linear_attention(query.relu(), key.relu(), value)
+        gradients = torch.autograd.grad(attended, (query, key, value), cotangent)
+        return tuple(array.detach().permute(0, 3, 1, 2).numpy() for array in (attended, *gradients))
+
+    def truth(*inputs):
+        with float64():
+            return diffusers_run(*inputs, dtype=torch.float64)
+
+    reference = as_given(lambda *inputs: diffusers_run(*inputs, dtype=torch.float32))
+    # `seeds_for`'s count at this geometry (probe IG-P13524U, 567ad6bed: green at 8 seeds, the one dot red).
+    assert_as_exact(dew, reference, draw, "DC-AE linear attention", truth_fn=as_given(truth), seeds=8)
+
+
+def test_the_linear_attentions_sums_cancel_past_float32s_range_under_wide_cpu_arithmetic():
+    """Under the suite's wide CPU arithmetic, where a CPU's float32 products sum in float64 and round once
+    (`precision.sums_in_float64`), DC-AE's linear attention on the CPU takes each sum over its positions
+    whole: values
+    `2^27, 2^27, -2^27, -2^26` under keys of `2^100` leave `2^26 * 2^100` over the keys' sum `2^106`,
+    `2^20` exactly, where a first group's `2^128` rounded to float32 alone overflowed to infinity (train
+    1387's review)."""
+    from dew.nn.autoencoders.dc_ae import linear_attention
+    from dew.nn.precision import sums_in_float64
+
+    query = jnp.ones((1, 64, 1, 1), jnp.float32)
+    key = jnp.full((1, 64, 1, 1), 2.0 ** 100, jnp.float32)
+    value = np.zeros((1, 64, 1, 1), np.float32)
+    value[0, [0, 1, 4, 5], 0, 0] = (2.0 ** 27, 2.0 ** 27, -2.0 ** 27, -2.0 ** 26)
+    assert sums_in_float64(key, key), "the suite runs wide CPU arithmetic"
+    # On the CPU, whose lowering alone sums wide.
+    with jax.default_device(jax.devices("cpu")[0]):
+        attended = jax.jit(linear_attention)(query, key, jnp.asarray(value))
+    np.testing.assert_array_equal(np.asarray(attended), np.full((1, 64, 1, 1), 2.0 ** 20, np.float32))

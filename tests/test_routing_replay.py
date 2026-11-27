@@ -300,11 +300,12 @@ def test_the_gate_keeps_its_gradient_under_replay():
 
     def forward(loss, one):
         # A directional derivative a kernel entry at a time, looped: the experts' ragged product has
-        # no batching rule past its first dimension.
+        # no batching rule past its first dimension. The stack's forward linearized once, each entry's
+        # pass its tangent's alone, the primal not recomputed per entry (row 13012).
         def run(kernel):
             basis = jnp.eye(kernel.size, dtype=kernel.dtype).reshape(-1, *kernel.shape)
-            return jax.lax.map(lambda tangent: jax.jvp(loss, (kernel,), (tangent,))[1], basis).reshape(
-                kernel.shape)
+            tangent_of = jax.linearize(loss, kernel)[1]
+            return jax.lax.map(tangent_of, basis).reshape(kernel.shape)
         return run
 
     def gradient(obj, differentiate):

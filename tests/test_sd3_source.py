@@ -27,6 +27,7 @@ from dew.diffusion.schedules.source import SourceSchedule
 from dew.interop.diffusion import component_tensors, sd3_fields, translate_sd3_weights
 from dew.nn.backbones.sd3 import SD3Transformer
 from dew.nn.inputs import DenoisingCondition
+from dew.nn.kernels import generation
 from dew.sampling import sample
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -422,13 +423,16 @@ def test_a_trained_step_keeps_the_frozen_buffer_and_exports_for_the_source(sourc
                              "trained SD3")
 
 
-@attending("reference")
-def test_the_published_t5_tower_over_its_whole_window_is_on_par_with_the_reference(source):
+@pytest.mark.parametrize("kernel", ["reference", None], ids=["reference", "auto"])
+def test_the_published_t5_tower_over_its_whole_window_is_on_par_with_the_reference(source, kernel):
     """The pipeline's T5 tower in float32 over its prompts' whole 256-token window, every key attended as
     the pipeline's encode attends them (no mask): its last hidden state on par with transformers' float32
-    encoder from its float64 one over drawn token ids (check 1). One fp32 dot over the 256 keys of its
-    attention's probability-value product rounded 2.2 times as far from float64 as torch's CPU attention,
-    which sums keys in blocks (`attention.weighted_values`, row 13655)."""
+    encoder from its float64 one over drawn token ids (check 1), on the reference route and on the one its
+    selector takes (`auto`, a CPU's xla where a process computes as a user's does). One fp32 dot over the
+    256 keys of its attention's probability-value product rounded 2.2 times as far from float64 as torch's
+    CPU attention, which sums keys in blocks (`attention.weighted_values`, row 13655); tests/
+    test_users_process.py runs both cells in a user's arithmetic, where the reference route's blocked sum
+    is the one it takes (train 1373's F5: 1.555 times with the one dot there)."""
     import torch
     from transformers import T5EncoderModel
 
@@ -461,5 +465,6 @@ def test_the_published_t5_tower_over_its_whole_window_is_on_par_with_the_referen
         tokens = {"input_ids": np.asarray(ids), "attention_mask": np.ones(np.shape(ids), np.int32)}
         return {"last_hidden_state": np.asarray(encoder.encode(encoder.params, tokens).hidden, np.float32)}
 
-    assert_as_exact(ours, as_given(transformers(narrow)), draw, "SD3's T5 tower over its window", seeds=8,
-                    truth_fn=truth)
+    with generation.chosen(**({} if kernel is None else {"attention": kernel})):
+        assert_as_exact(ours, as_given(transformers(narrow)), draw, "SD3's T5 tower over its window", seeds=8,
+                        truth_fn=truth)
