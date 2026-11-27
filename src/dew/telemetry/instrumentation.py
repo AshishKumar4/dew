@@ -363,11 +363,16 @@ def _integer(literal, element: str) -> int | None:
     return int(values[0]) if len(values) == 1 else None
 
 
-def _read(source: str | Iterable[str] | jax.stages.Compiled) -> tuple[dict[str, _Computation], str | None]:
+def _read(source: str | Iterable[str] | jax.stages.Compiled, *, described: bool = True
+          ) -> tuple[dict[str, _Computation], str | None]:
     """The module's computations, and the name of its entry computation (`hlo_module`), each instruction
     read through XLA's own schema (`dew.telemetry.hlo.instructions`), keeping the facts the counts read: of
     its metadata, which is most of a module, only its traced name. No computations for an executable that
-    holds no module."""
+    holds no module. A count alone (`described` False, `hlo_flops`) reads none of what describes an
+    instruction beside its work: no traced name, no result's buffers, groups or types, and a backend
+    config and frontend attributes only where it reads them (a custom call's, a loop's), which a module of
+    many fusions reads again for each of its instructions (row 13739: 286,407 instructions, 10 s a
+    count)."""
     module = hlo_module(source)
     computations: dict[str, _Computation] = {}
     entry = None
@@ -385,9 +390,11 @@ def _read(source: str | Iterable[str] | jax.stages.Compiled) -> tuple[dict[str, 
         computation.elements[read.name] = element
         metadata = proto.metadata
         traced = ((sys.intern(f"{metadata.op_name} {metadata.source_file}:{metadata.source_line}"
-                              if metadata.source_file else metadata.op_name),) if metadata.op_name else ())
-        moved = collective(read.opcode)
+                              if metadata.source_file else metadata.op_name),)
+                  if described and metadata.op_name else ())
+        moved = described and collective(read.opcode)
         sized = moved or read.opcode == 'custom-call'
+        configured = described or read.opcode in ('custom-call', 'while')
         convolution = None
         if proto.HasField('convolution_dimension_numbers'):
             numbers = proto.convolution_dimension_numbers
@@ -398,7 +405,8 @@ def _read(source: str | Iterable[str] | jax.stages.Compiled) -> tuple[dict[str, 
                                        proto.feature_group_count or 1)
         computation.instructions[read.name] = _Instruction(
             read.opcode, dims, read.operands, read.called, read.custom_call_target or '',
-            proto.backend_config.decode('latin-1'), dict(proto.frontend_attributes.map),
+            proto.backend_config.decode('latin-1') if configured else '',
+            dict(proto.frontend_attributes.map) if configured else {},
             tuple(proto.dot_dimension_numbers.lhs_contracting_dimensions), convolution,
             proto.comparison_direction, proto.tuple_index, proto.parameter_number,
             ('.remat' in read.name or '.remat' in read.computation
@@ -1160,7 +1168,7 @@ def hlo_flops(source: str | jax.stages.Compiled) -> StepFlops | None:
     it states, the model's share of it where it declares one (`MODEL_FLOPS`),
     beside the custom calls it runs whose work neither counts
     (`StepFlops.unsized`, `sizes`)."""
-    computations, entry = _read(source)
+    computations, entry = _read(source, described=False)
     if entry is None:
         return None
     found = _inclusive(entry, computations, {})
