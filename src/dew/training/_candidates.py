@@ -40,7 +40,7 @@ from dew.state import Accumulation, TrainState, apart, taken, together
 from dew.training._lowering import Routed, kernel_report, routed
 from dew.training.diloco import group_of, windowed
 from dew.training.distributed import microbatch, microbatch_shapes
-from dew.training.memory import resident_on
+from dew.training.memory import layer_gathers, resident_on, step_options, unlimited
 from dew.training.model_flops import batch_consumed, batch_tokens
 from dew.training.narrow import holds_copies, narrow_copies, narrowed, state_reads
 from dew.training.planning import Candidate, splits
@@ -494,18 +494,24 @@ def step_program[LossT, EffectsT](stepping: Stepping[LossT, EffectsT], shapes, c
 
 
 def lowered_for[LossT, EffectsT](stepping: Stepping[LossT, EffectsT], state: TrainState, batch: Batch,
-                                 generation: str, narrow: bool) -> jax.stages.Lowered:
+                                 generation: str, narrow: bool
+                                 ) -> tuple[jax.stages.Lowered, jax.stages.CompilerOptions | None]:
     """The step `compile` builds first, traced as on a GPU of the CUDA `generation` and lowered for one
     (`dew.training._lowering`) on this process's devices. It traces on an abstract mesh of that GPU's
     devices, from which JAX's Pallas lowering reads the GPU, at the base rung its trainer put the
     objective at (`StepCompiler.at_base_rung`), its narrow copies where that rung keeps them (`narrow`), and
     the plan's first split: a run that does not fit splits its batch or recomputes more, no other kernel.
-    A step whose state the host holds lowers its programs apart (`StepCompiler._lowered_host`)."""
+    A step whose state the host holds lowers its programs apart (`StepCompiler._lowered_host`). Beside it,
+    the XLA options its plan compiles it under (`step_options`, a compile's limit aside, `unlimited`): a
+    step's fingerprint is its program under them (`dew.training.ahead._fingerprint`)."""
     settings = stepping.settings
     mesh = gpu_mesh(settings.device_mesh, generation)
     with assumed(generation), stepping.traced_on(mesh) as schedule:
         state, batch = jax.tree.map(lambda x: jax.ShapeDtypeStruct(x.shape, x.dtype), (state, batch))
         split = splits(stepping.shape.rows, batch, mesh, settings.microbatches, stepping.shape.split)[0]
         placement, replicated = batch_shardings(mesh, batch), NamedSharding(mesh, P())
-        return candidate_for(stepping, state, batch, schedule, placement, replicated, split, narrow,
-                             mesh=mesh, platforms=('cuda',)).lowered
+        candidate = candidate_for(stepping, state, batch, schedule, placement, replicated, split, narrow,
+                                  mesh=mesh, platforms=('cuda',))
+        gathered = layer_gathers(stepping.objective, state.variables, mesh.devices.size)
+        return candidate.lowered, unlimited(step_options(stepping.objective, candidate.micro,
+                                                         candidate.prepared.variables, mesh, gathered))

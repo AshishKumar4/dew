@@ -2271,6 +2271,8 @@ class Trainer(Generic[Loss, Effects]):
             self.checkpoints.python_run(unrecorded_parts(
                 type(self.objective).__name__, stated, optimized=self._config is not None,
                 seeded=self.seed is not None, mesh=self.mesh, given=given))
+        if preview and self.tracker is not None and (refusal := self.objective.preview_refusal()) is not None:
+            raise ValueError(f"preview=True samples the model, which refuses generation: {refusal}")
         for name, suite in suites.items():
             if loss and not episodic(suite.data) and all(metric.name != 'loss' for metric in suite.metrics):
                 self.objective._check_validation_loss()

@@ -23,6 +23,7 @@ import contextlib
 import dataclasses
 import functools
 import json
+import logging
 import os
 import sys
 import types
@@ -1399,6 +1400,17 @@ class RunConfig:
                              "carries none of it: train the run through `run()`, or call prepare_process "
                              "with them before anything calls JAX")
 
+    def _previews(self, objective: Objective[Loss, Effects]) -> bool:
+        """Whether the run previews its model at validation: a tracker's run does by default, but not one
+        whose objective cannot sample (`Objective.preview_refusal`, a model that refuses generation), which
+        it skips, saying why, where a preview asked of `Trainer.fit` is refused."""
+        if self.trainer.wandb is None:
+            return False
+        if (refusal := objective.preview_refusal()) is not None:
+            logging.getLogger(__name__).warning("the run's validation previews no samples: %s", refusal)
+            return False
+        return True
+
     def readied(self, objective: Objective[Loss, Effects], dataset: Dataset | Loader,
                 validation: Dataset | Mapping[str, Dataset | Split] | None, metrics: Sequence[Metric],
                 name: str) -> tuple[Self, Loader, Mapping[str, Split] | None, Mapping[str, EvalSuite] | None,
@@ -1477,7 +1489,7 @@ class RunConfig:
             examples=dataset.examples if steps is None else None,
             eval_every=trainer.eval_interval(dataset), checkpoint_every=trainer.checkpoint_interval(dataset),
             checkpoint_final=trainer.checkpoint_final, scored_to=trainer.scored_to,
-            metrics=metrics if suites is None else (), preview=trainer.wandb is not None,
+            metrics=metrics if suites is None else (), preview=self._previews(objective),
             best=trainer.best_policies(), stop=trainer.stop, restore_best=trainer.restore_best,
             cooldowns=trainer.cooldowns,
             # A run that names no metrics and validates no split has no suite to score.

@@ -1354,6 +1354,15 @@ class TokenScorer(HeadedObjective[Ratio | RoutedStatistics, Variables]):
                 f"{self.context}-token context of the objective's seq_len and the model's max_seq_len")
         return tokens[:, :-finals], tokens[:, 1:]
 
+    def preview_refusal(self) -> str | None:
+        """The model's generation refusal (`generation_refusal`, a block-sparse selection reading a row's own
+        tokens uncached) where the preview samples (`samples`, a token budget), None otherwise."""
+        settings = self.samples
+        if settings is None or settings.max_new_tokens <= 0:
+            return None
+        refusal = getattr(self.model, "generation_refusal", None)
+        return None if refusal is None else refusal()
+
     def preview(self, params, batch, step: Step, *, scored=None):
         """Sample the configured prompt once, then decode only on process zero.
 

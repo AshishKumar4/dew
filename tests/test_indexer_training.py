@@ -452,8 +452,8 @@ def test_an_msa_decoder_trains_its_index_branch_by_the_indexer_objective_alone()
     for weight in (0.5, 2.0):
         seen[weight], weighted_main, weighted_ce = gradients(
             LMObjective(model, SEQ, indexer=IndexerTraining("sparse", weight=weight)))
-        # Both of the branch's projections take the term's gradient, the queries' and the keys'.
-        assert weighted_ce == ce and len(seen[weight]) == 2 and all(leaf.any() for leaf in seen[weight])
+        # Every leaf of the branch takes the term's gradient, its queries' projection and its keys' both.
+        assert weighted_ce == ce and all(leaf.any() for leaf in seen[weight])
         for got, plain_leaf in zip(weighted_main, main, strict=True):
             np.testing.assert_array_equal(got, plain_leaf)
     for heavy, light in zip(seen[2.0], seen[0.5], strict=True):
@@ -470,8 +470,33 @@ def test_an_msa_decoder_trains_its_index_branch_by_the_indexer_objective_alone()
         return {jax.tree_util.keystr(path): np.asarray(leaf)
                 for path, leaf in jax.tree_util.tree_leaves_with_path(variables["params"]) if branch(path)}
     before, after = projections(initial.variables), projections(state.variables)
-    assert {name.split("'")[-4] for name in before} == {"wq", "wk"}
+    assert all(any(f"['{name}']" in path for path in before) for name in ("wq", "wk"))
     assert all((after[name] != before[name]).any() for name in before)
+
+
+def test_a_preview_of_a_decoder_that_refuses_generation_is_refused_or_skipped():
+    """An MSA decoder refuses generation (`generation_refusal`), so its objective's preview cannot sample
+    (`preview_refusal`): a preview asked of `fit` is refused before a step, and a run's default preview,
+    a tracker's, is skipped (train 1345's review F6)."""
+    from test_mixers import tiny
+
+    from dew.config import LMRunConfig
+    from dew.config.trainer import TrainerConfig
+    from dew.objectives.lm.objective import Samples
+    from dew.registry import mixers
+    from dew.training.tracker import Wandb
+
+    selected = mixers.build("block_sparse_attention", selection="msa", block=4, top_k=2, index_width=8)
+    model = tiny(mixer=selected, dtype="float32", max_seq_len=SEQ, vocab_size=VOCAB)
+    objective = LMObjective(model, SEQ, samples=Samples(prompt=[1, 2], max_new_tokens=2))
+    assert "uncached" in objective.preview_refusal()
+    trainer = Trainer(objective, optax.sgd(1.0), key=jax.random.key(0), tracker=RecordingTracker())
+    with pytest.raises(ValueError, match="refuses generation"):
+        trainer.fit(Loader(lambda partition: token_batches(), None, batch=8, records=None), steps=1,
+                    preview=True)
+    tracked = LMRunConfig(trainer=TrainerConfig(wandb=Wandb(project="dew", offline=True)))
+    assert not tracked._previews(objective)
+    assert tracked._previews(LMObjective(model, SEQ))
 
 
 @pytest.mark.parametrize("phase, topk", [("warmup", None), ("sparse", 4)])

@@ -287,11 +287,18 @@ def _wheel_targets_registered() -> None:
         wheel.load()()
 
 
-def _fingerprint(lowered: jax.stages.Lowered, options: jax.stages.CompilerOptions | None) -> str | None:
-    """A program compiled ahead's fingerprint as a run lowers it (`stated_digest`): its program under the
-    XLA options it compiles under, a compile's limit aside (`unlimited`), the limit admission's alone, so a
-    run whose own compile would send XLA another option takes another program (row 13553: one compiled
-    under none of a scoped option the run sends was loaded for it)."""
+def _fingerprint(lowered: jax.stages.Lowered, options: jax.stages.CompilerOptions | None) -> str:
+    """A program compiled ahead's fingerprint (`program_digest`): its program under the XLA options it
+    compiles under, a compile's limit aside (`unlimited`), the limit admission's alone, so a run whose own
+    compile would send XLA another option takes another program (row 13553: one compiled under none of a
+    scoped option the run sends was loaded for it). Refused (`Unestablished`) for a program no file holds,
+    which no step compiled ahead can be; a run's lowering of one is no step compiled ahead (`_lowered_as`)."""
+    return program_digest(lowered, unlimited(options))
+
+
+def _lowered_as(lowered: jax.stages.Lowered, options: jax.stages.CompilerOptions | None) -> str | None:
+    """A run's step's fingerprint as `_fingerprint` takes it, None where no file can hold its program
+    (`stated_digest`)."""
     return stated_digest(lowered, unlimited(options))
 
 
@@ -320,7 +327,7 @@ class AheadProgram:
         """The executable, loaded onto `devices`, for a run whose program lowered as `lowered` and compiles
         under `options`: refused where that is another program than this one or compiles under other options
         (`_fingerprint`), and admitted as a compiled one is (`dew.communicators.admit`)."""
-        if _fingerprint(lowered, options) != self.program:
+        if _lowered_as(lowered, options) != self.program:
             raise NotTheStepCompiledAhead(
                 "the sampled step compiled ahead is another program than the one this run compiles, or "
                 "compiled under other XLA options: compile it ahead from this run's config and options, with "
@@ -529,7 +536,7 @@ class AheadOfTime:
         `options`: refused where that is another program than the one compiled ahead, a config, a data
         shape, a rung or a Dew that differs, or other XLA options than it compiled under (`_fingerprint`),
         which the executable would not run as the run's step."""
-        if _fingerprint(lowered, options) != self.program:
+        if _lowered_as(lowered, options) != self.program:
             raise NotTheStepCompiledAhead(
                 "the step compiled ahead is another program than the one this run compiles first, or "
                 "compiled under other XLA options: compile it ahead from this run's config, data and options "
