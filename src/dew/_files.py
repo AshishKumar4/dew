@@ -237,12 +237,13 @@ def swapped(directory: Path, foreign: Callable[[Entries, Entries, Path], set[Pat
                 raise FileExistsError(f"{directory} holds {sorted(map(str, refused))}, which the export "
                                       "would not write: export into an empty directory, or one holding only "
                                       "an export")
-            staging.chmod(stat.S_IMODE(held_at.st_mode))
             # Each entry the new tree writes where the earlier one held the same kind takes its access as
-            # held, a private file kept private, a new one its umask's (train 1406's review).
+            # held, a private file kept private, a new one its umask's (train 1406's review), while the
+            # staging is still private; its own mode last, just before it is put in place.
             for entry, kind in written.items():
                 if kind in ("file", "folder") and held.get(entry) == kind:
                     (staging / entry).chmod(stat.S_IMODE((directory / entry).lstat().st_mode))
+            staging.chmod(stat.S_IMODE(held_at.st_mode))
             if held:
                 exchange(staging, directory)
             else:
@@ -318,9 +319,12 @@ def _lock_file(path: Path) -> int:
             if refused.errno != errno.ENXIO:
                 raise
             raise FileExistsError(f"{path} is no regular file, which Dew's publishers lock") from refused
-    if not stat.S_ISREG(os.fstat(lock).st_mode):
+    try:
+        if not stat.S_ISREG(os.fstat(lock).st_mode):
+            raise FileExistsError(f"{path} is no regular file, which Dew's publishers lock")
+    except BaseException:
         os.close(lock)
-        raise FileExistsError(f"{path} is no regular file, which Dew's publishers lock")
+        raise
     return lock
 
 
