@@ -124,6 +124,7 @@ def enqueued(capture, annotation: str) -> dict[int, set[int]]:
         return outer.start_ns <= event.start_ns and event.start_ns + event.duration_ns <= (
             outer.start_ns + outer.duration_ns)
 
+    # Each event's stats read only once its name and span select it: a capture's host holds a great many.
     flows = {(stats.get("_pt"), stats["_p"]) for events in hosts for outer in events
              if outer.name == annotation for event in events
              if event.name == f"{EXECUTE} linkage" and within(event, outer)
@@ -131,14 +132,17 @@ def enqueued(capture, annotation: str) -> dict[int, set[int]]:
     found: dict[int, set[int]] = {}
     for events in hosts:
         for execute in events:
+            if execute.name != EXECUTE:
+                continue
             stats = dict(execute.stats)
-            if execute.name != EXECUTE or (stats.get("_ct"), stats.get("_c")) not in flows:
+            if (stats.get("_ct"), stats.get("_c")) not in flows:
                 continue
             for event in events:
+                if event.name != "DoEnqueueProgram" or not within(event, execute):
+                    continue
                 held = dict(event.stats)
                 device, run = held.get("device_ordinal"), held.get("run_id")
-                if (event.name == "DoEnqueueProgram" and within(event, execute) and isinstance(device, int)
-                        and isinstance(run, int)):
+                if isinstance(device, int) and isinstance(run, int):
                     found.setdefault(device, set()).add(run)
     return found
 

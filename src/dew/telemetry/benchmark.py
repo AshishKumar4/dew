@@ -528,7 +528,7 @@ class TpuTime:
             # The call's enqueue named apart from any other's in the capture (`tpu_ops`' `annotation`).
             annotation = f"dew.tpu_read.{uuid.uuid4().hex}"
             try:
-                with jax.profiler.TraceAnnotation(annotation):
+                with profiler.region(annotation):
                     jax.block_until_ready(program(*args))
             finally:
                 profiler.stop()
