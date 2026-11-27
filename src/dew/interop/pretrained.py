@@ -858,7 +858,7 @@ class Pretrained:
         recorded no tensors to write back in it."""
         quantization = source_quantization(self.config, scale_dtype=self.quantized_scale_dtype,
                                            grid=self.quantization_grid, loaded=self.quantized_dtypes)
-        if quantization is not None and not self.quantized_tensors:
+        if quantization is not None and not self.quantized:
             raise ValueError(
                 "this source's config declares a quantization_config and the loader recorded "
                 "no quantized tensors to write back in it")
