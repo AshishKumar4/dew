@@ -113,8 +113,10 @@ def attend(queries: Sequence[jax.Array], keys: Sequence[jax.Array], value: jax.A
     # computed in its own dtype (`attention_route.attend`'s `operand_dtypes`), so each sums its copies' and
     # rounds once; the queries as they come.
     dtypes = (jnp.result_type(*keys), value.dtype)
-    query, key, value, spans, hooks = selected(queries, [key.astype(jnp.float32) for key in keys],
-                                               value.astype(jnp.float32), spans, combine, hooks, places)
+    # Widened, never narrowed: an fp64 operand stays fp64 (`promote_types`).
+    query, key, value, spans, hooks = selected(
+        queries, [key.astype(jnp.promote_types(key.dtype, jnp.float32)) for key in keys],
+        value.astype(jnp.promote_types(value.dtype, jnp.float32)), spans, combine, hooks, places)
     scale = queries[0].shape[-1] ** -0.5 if scale is None else scale
     return attention_route.attend(query, key, value, spans, hooks, scale=scale, natural=natural,
                                   accurate=accurate, operand_dtypes=dtypes)

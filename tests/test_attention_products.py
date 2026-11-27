@@ -12,7 +12,12 @@ from generation_support import INTERPRETS
 from reference_error import assert_as_exact, with_gradients
 
 from dew.nn.kernels import generation
-from dew.nn.kernels.templates import attention as template, attention_mosaic, attention_products
+from dew.nn.kernels.templates import (
+    attention as template,
+    attention_decode,
+    attention_mosaic,
+    attention_products,
+)
 from dew.nn.kernels.templates.hooks import Hook, Side
 from dew.nn.precision import float32_einsum
 
@@ -337,3 +342,76 @@ def test_the_mosaic_mainloop_declines_narrow_queries_and_keys_over_wide_values()
                                              residuals=template.Kept.SPLIT, interpret=True)[1:]
         assert attention_mosaic.backward_declined(query, key, value, spans, template.Hooks(), query,
                                                   residuals=tuple(residuals)) is not None
+
+
+def test_a_banded_call_keeps_its_fp64_operands():
+    """A banded call (`Banded((0,))`) of fp64 operands at x64, scale 1: one query at place 0 of
+    `[2^24 + 1, 1]` against its near key `[1, -(2^24 + 1)]` has the logit 0 exactly, its far key's product
+    0, so its two keys weigh alike and its values 0 and 1 read 0.5 exactly; its keys and values widened,
+    never narrowed (`jnp.promote_types`), where staged in fp32 `-(2^24 + 1)` rounded to `-2^24`, the logit
+    read 1 and the output `1 / (1 + e)` (train 1389's P0)."""
+    with jax.enable_x64(new_val=True):
+        spans = template.spans(1, 2, 1)
+        near = jnp.asarray([2.0 ** 24 + 1, 1.0], jnp.float64)[None, None, None]
+        near_keys = jnp.asarray([[1.0, -(2.0 ** 24 + 1)], [0.0, 0.0]], jnp.float64)[None, :, None]
+        far = jnp.zeros((1, 1, 1, 2), jnp.float64)
+        far_keys = jnp.zeros((1, 2, 1, 2), jnp.float64)
+        value = jnp.asarray([0.0, 1.0], jnp.float64)[None, :, None, None]
+        out = attention_products.attend((near, far), (near_keys, far_keys), value, spans,
+                                        attention_products.Banded((0,)), places=jnp.asarray([[0]]), scale=1.0,
+                                        natural=True, accurate=True)
+        assert out.dtype == jnp.float64
+        np.testing.assert_array_equal(np.asarray(out)[0, 0, 0, 0], 0.5)
+
+
+def test_a_mixed_banded_call_takes_the_plain_jax_mainloop_on_a_gpu():
+    """A banded call of bf16 queries and keys over fp32 values, forward and backward, on an H100: the same
+    to the bit as on the host's plain-JAX mainloop, the Mosaic and Triton mainloops each declining its
+    mixed operands (`mixed_operands`, `attention_triton._holding`'s `_eligible`), where Triton's backward
+    took them and narrowed the wider one (train 1389's P1)."""
+    spans = template.spans(16, 16, 1, causal=True)
+    rng = np.random.default_rng(0)
+    query = jnp.asarray(rng.standard_normal((1, 16, 2, 16)), jnp.bfloat16)
+    key = jnp.asarray(rng.standard_normal((1, 16, 1, 16)), jnp.bfloat16)
+    value = jnp.asarray(rng.standard_normal((1, 16, 1, 16)), jnp.float32)
+    dout = jnp.asarray(rng.standard_normal((1, 16, 2, 16)), jnp.float32)
+
+    def run():
+        def attended(query, key, value):
+            return attention_products.attend((query, query), (key, key), value, spans,
+                                             attention_products.Banded((2,)))
+
+        out, pull = jax.vjp(attended, query, key, value)
+        return out, pull(dout.astype(out.dtype))
+
+    host = run()
+    # A compiling H100's route (not interpreted: an interpreted one stays on the host's mainloop), which
+    # takes neither GPU mainloop here, so the call runs on the host.
+    with generation.assumed("sm90"):
+        gpu = run()
+    for found, expected in zip(jax.tree.leaves(gpu), jax.tree.leaves(host), strict=True):
+        np.testing.assert_array_equal(np.asarray(found, np.float32), np.asarray(expected, np.float32))
+
+
+@INTERPRETS
+def test_a_banded_decode_step_on_a_64_row_tile_reads_each_rows_own_query_place():
+    """A banded decode step (`Banded((0,))`) of one position and two query heads over one key head, its
+    keys' products zero, values 0 and 1, a score hook adding `q_pos · k_pos` on a 64-row tile alone, its
+    tiles pinned to 64 rows: each head's packed row reads its own query's place, 0, both heads 0.5
+    (`attention_decode.unpacked_places`, train 1389's K-F4 note)."""
+    from dew.nn.kernels import tuning
+
+    def placed(s, q_pos, k_pos):
+        return s + (q_pos * k_pos).astype(s.dtype) if s.shape[0] == 64 else s
+
+    spans = template.spans(1, 2, 1)
+    query = jnp.zeros((1, 1, 2, 64), jnp.bfloat16)
+    keys = jnp.zeros((1, 2, 1, 64), jnp.bfloat16)
+    value = jnp.broadcast_to(jnp.asarray([0.0, 1.0], jnp.bfloat16)[None, :, None, None], (1, 2, 1, 64))
+    # The banded layout's one call (`selected`), its decode step on the Mosaic mainloop interpreted.
+    laid = attention_products.selected((query, query), (keys, keys), value, spans, attention_products.Banded(
+        (0,)), template.Hooks(score=Hook(placed, ())), places=jnp.asarray([[0]]))
+    pinned = {attention_mosaic.MosaicForward: attention_mosaic.Tiles(64, 64, 2, 1, family="wgmma")}
+    with generation.assumed("sm90"), tuning.pinned(pinned):
+        out = attention_decode.attend(*laid, interpret=True)
+    np.testing.assert_array_equal(np.asarray(out, np.float32)[0, 0, :, 0], [0.5, 0.5])

@@ -1132,11 +1132,10 @@ class MosaicForward(_Mainloop[Tiles]):
         steps = padded_k // config.block_k
         training = ba.arguments.get("residuals") is Kept.SPLIT
         out_dtype = None if self.out_dtype is None else jnp.dtype(self.out_dtype)
-        # The forward's one plan (`forward_block_plan`), as its pricing and emission take it.
+        # The forward's plan of its columns (`forward_block_plan`): its output's dtype and the hook's place,
+        # which no program of the hook decides.
         plan = forward_block_plan(full_v, config.columns, out_dtype,
-                                  has_output_mod=self.output_mod is not None, training=training,
-                                  output=(self.output_mod, self.output_kinds, self.output_dtypes),
-                                  rows=config.block_q)
+                                  has_output_mod=self.output_mod is not None, training=training)
         # A paged call's key tile of several pages loaded as its launch loads it (`paged_reads`).
         page = _page(ba)
         deciding = self.deciding(ba, config, target=target) if decides is None else decides

@@ -975,7 +975,7 @@ def on_tile(jaxpr: jcore.Jaxpr, consts, logical: tuple, tile: tuple, *args) -> l
     parameter that is the logical shape the tile's, and a program a parameter holds (a jit's, a custom
     derivative's primal) retraced at the tile's shapes, the equation kept. Its values alone: a caller states
     the derivative (`dew.nn.kernels.norm_swiglu`'s `_Logical`, a row kernel's epilogue on a tile of a row's
-    columns; `attention_mosaic_program.sliced_hook`, an output hook's program on a block of its tile's
+    columns; `attention_mosaic_program.BlockPlan.sliced`, an output hook's program on a block of its tile's
     columns)."""
     values = dict(zip(jaxpr.constvars, consts, strict=True)) | dict(zip(jaxpr.invars, args, strict=True))
 

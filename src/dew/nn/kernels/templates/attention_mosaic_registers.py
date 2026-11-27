@@ -136,19 +136,17 @@ def _converted(block_k: int, *widths: int) -> list[list[tuple]]:
 
 
 def _epilogue_registers(family: mosaic.Family, carried: list, block_q: int, value_width: int, dtype, *,
-                        residuals: bool, plan: BlockPlan | None = None, masked: bool = False,
-                        output: tuple[str, ...] | None = None) -> int:
+                        residuals: bool, plan: BlockPlan | None = None, masked: bool = False) -> int:
     """Wide (>128) inference epilogue's live registers (chunked, or whole-width finish + masked preserve),
-    a pointwise output hook's tiles past its input at its chunk (`output`, their dtypes:
-    `attention_mosaic_program.pointwise_tiles`) beside the chunk's finish."""
+    a pointwise output hook's tiles past its input at its chunk (the plan's `tile_dtypes`) beside the
+    chunk's finish."""
     if residuals or not family.budgets_registers or family.places_on_role or value_width <= 128:
         return 0
     block = plan or BlockPlan(split=False, out_dtype=None, output_hook=False)
     ed = dtype if block.out_dtype is None else block.out_dtype
     w = block.epilogue_chunk(family, value_width, dtype, training=residuals, masked=masked) or value_width
     r, live = family.row_registers(block_q, jnp.float32), resources.live_registers
-    hooked = ([(block_q, w, jnp.dtype(kept)) for kept in output]
-              if output is not None and block.output_hook else [])
+    hooked = [(block_q, w, jnp.dtype(kept)) for kept in block.tile_dtypes] if block.pointwise else []
     fin = live(family, carried, [(block_q, w, jnp.float32)] * 3 + [(block_q, w, ed)] + hooked) + 2 * r
     return max(fin, live(family, [], [(block_q, value_width, ed)] * 2) + r) if masked else fin
 
@@ -174,8 +172,7 @@ def forward_registers(family: mosaic.Family, tiles: Tiles, value_width: int, dty
                       runs: int = 1,
                       merged: bool = False, started: bool = False, dropped: bool = False,
                       weight_parts: int = 1, scaled_products: bool = False,
-                      block_plan: BlockPlan | None = None, masked: bool = False,
-                      output: tuple[str, ...] | None = None) -> int:
+                      block_plan: BlockPlan | None = None, masked: bool = False) -> int:
     """The registers a forward consumer holds at `tiles` (`resources.live_registers`): its weighted values'
     sums `[bq, Dv]` fp32 carried, and a step's logits fp32 beside its weights in the operands' dtype. A
     training forward (`_trained`, at its anchor known) holds the other keys' weights beside them too, in the
@@ -282,7 +279,7 @@ def forward_registers(family: mosaic.Family, tiles: Tiles, value_width: int, dty
     if codes:
         phases += _converted(block_k, depth, value_width)
     epilogue = _epilogue_registers(family, carried, block_q, value_width, dtype, residuals=residuals,
-                                   plan=block_plan, masked=masked, output=output)
+                                   plan=block_plan, masked=masked)
     held = _held_registers(family, block_q, params, residuals=residuals, natural=natural) + (
         _started_rows(family, block_q) if started else 0) + _runs_bounds(family, block_q, runs)
     walked = max(max(resources.live_registers(family, carried, *phases, *products), scored) + held, epilogue)
@@ -432,7 +429,7 @@ class ForwardRegisters:
     output: tuple | None = None
     """The output hook its consumers apply as they finish, `(hook, kinds, dtypes)` (`MosaicForward`'s), whose
     program at each candidate's own output tile decides and prices its epilogue
-    (`attention_mosaic_program.pointwise_tiles`, as the walk replays it there, `sliced_hook`); None where it
+    (`forward_block_plan`'s `tile_dtypes`, as the walk replays it there, `BlockPlan.sliced`); None where it
     has none."""
 
     def at(self, family: mosaic.Family, tiles: Tiles, *, peaks: bool = False,
@@ -457,11 +454,10 @@ class ForwardRegisters:
         padded_v = _width(self.value_width, family, self.dtype)
         value_width = value_columns(padded_v, columns or tiles.columns)
         # The forward's one plan (`forward_block_plan`): a hook its launch keeps traced at this candidate's
-        # own output tile alone, as its walk takes it (`sliced_hook`).
+        # own output tile alone, as its walk takes it (`BlockPlan.sliced`).
         plan = forward_block_plan(padded_v, columns or tiles.columns, self.out_dtype,
                                   has_output_mod=self.has_output_mod, training=self.residuals,
                                   output=self.output, rows=tiles.block_q)
-        hooked = plan.tile_dtypes if plan.pointwise else None
         return max(before, forward_registers(
             family, tiles, value_width, self.dtype, self.residuals,
             natural=tiles.natural_form or self.natural, params=self.params, width=width, parts=self.parts,
@@ -469,7 +465,7 @@ class ForwardRegisters:
             positions=self.positions, per_span=self.per_span, runs=self.runs, merged=self.merged,
             started=self.started,
             dropped=self.dropped, weight_parts=self.weight_parts,
-            scaled_products=self.scaled_products, block_plan=plan, masked=masked, output=hooked))
+            scaled_products=self.scaled_products, block_plan=plan, masked=masked))
 
 
 def prologue_registers(family: mosaic.Family, block_q: int, width: int, dtype, hook: Callable,

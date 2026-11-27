@@ -1462,6 +1462,9 @@ class _Program[T: (Tiles, BackwardTiles)]:
     training: bool = False
     """Whether this launch is a training/backward walk where padding query rows must never see unmasked
     interior tiles."""
+    block_plan: "BlockPlan | None" = None
+    """A forward launch's one plan of its output hook and value columns (`forward_block_plan`), built where
+    its kernel is (`attention_mosaic_forward._launched`), which its epilogue reads."""
 
     @property
     def ahead(self) -> bool:
@@ -1934,7 +1937,7 @@ class BlockPlan(NamedTuple):
     """A forward's one plan of its output hook and value columns (`forward_block_plan`), which its pricing,
     allocation and emission read alike: the hook split past the launch, the block's `out_dtype`, the hook
     held in the kernel, and that hook's program at its launch's `tile` where it acts one entry at a time
-    (`entrywise_hook`), with the dtypes of the tiles it makes (`pointwise_tiles`), which its epilogue
+    (`entrywise_hook`), with the dtypes of the tiles it makes (`tile_dtypes`), which its epilogue
     replays a chunk of columns at a time (`sliced`)."""
     split: bool
     out_dtype: Any
@@ -1949,7 +1952,8 @@ class BlockPlan(NamedTuple):
         return self.program is not None
 
     def sliced(self) -> Callable | None:
-        """Its held hook's program replayed on any block of its tile's columns (`sliced_hook`), None where
+        """Its held hook's program replayed on any block of its tile's columns (`programs.on_tile`), None
+        where
         it holds none."""
         if self.program is None or self.tile is None:
             return None
@@ -1982,7 +1986,7 @@ def forward_block_plan(total_v: int, columns: int | None, out_dtype, *, has_outp
     all read (row 9542): the hook's placement decided first, split out of an inference launch of a block of
     the value columns to run on the joined columns in XLA, else held in the kernel; the block's `out_dtype`;
     and an in-kernel hook's program, `output` `(hook, kinds, dtypes)`, traced at its launch's tile, `rows`
-    by its value columns, alone, which decides whether it is pointwise (`pointwise_tiles`). A split hook's
+    by its value columns, alone, which decides whether it is pointwise. A split hook's
     program is never traced at a block's columns, where a hook of the whole width fails (train 1375's F5);
     a launch holding no program of its hook (`output` None) finishes whole."""
     split = not training and has_output_mod and value_columns(total_v, columns) < total_v
@@ -1998,18 +2002,6 @@ def forward_block_plan(total_v: int, columns: int | None, out_dtype, *, has_outp
     return plan._replace(program=closed, tile=tile, tile_dtypes=_tile_dtypes(closed, tile))
 
 
-def pointwise_tiles(hook: Callable | None, kinds: tuple[Kind, ...], dtypes: tuple[str, ...],
-                    tile: tuple[int, int]) -> tuple[str, ...] | None:
-    """The dtypes of the tiles an output hook `hook(o, *sides)` makes past its input where its program at a
-    `tile` of fp32 output acts one entry at a time (`entrywise_hook`), which its epilogue then replays on a
-    chunk of the tile's columns (`sliced_hook`); None where it does not, or there is none (the whole-width
-    finish): the forward's pricing and its walk read it at the one tile, a config's `[block_q, width]`. A
-    launch keyed by its hook's fingerprint (`tuning.KernelOp.keyed`) holds no program, so prices the
-    whole-width finish, the larger."""
-    closed = entrywise_hook(hook, kinds, dtypes, tile)
-    return None if closed is None else _tile_dtypes(closed, tile)
-
-
 def _tile_dtypes(closed, tile: tuple[int, int]) -> tuple[str, ...]:
     """The dtypes of the tiles an entrywise program (`entrywise_hook`) makes past its input."""
     return tuple(jnp.dtype(_aval(var).dtype).name for eqn in closed.jaxpr.eqns for var in eqn.outvars
@@ -2022,7 +2014,7 @@ def entrywise_hook(hook: Callable | None, kinds: tuple[Kind, ...], dtypes: tuple
     where it acts one entry at a time: every equation entrywise (`layout.entrywise`, a call's or a
     conditional's program so), every value that tile's or a scalar's, every constant it closes over a
     scalar. None where it does not or there is none. Whatever it reads of its tile's shape (`o.shape`) is
-    a literal of that shape in the program, which `sliced_hook` replays as it is on each chunk. A hook a
+    a literal of that shape in the program, which `BlockPlan.sliced` replays as it is on each chunk. A hook a
     cache may hold (`tuning.holdable`) held by its identity (`_Identity`), tile and the context a kernel is
     chosen in (`fusion.choice_context`: its numerics among it), so a hook traced under one run's numerics is
     never replayed under another's (train 1375's F4); any other traced each call."""
@@ -2078,15 +2070,6 @@ def _entrywise_hook(hook: Callable, kinds: tuple[Kind, ...], dtypes: tuple[str, 
                                                                *params)
     held = closed is not None and _acts_by_entry(closed.jaxpr, tile)
     return closed if held else None
-
-
-def sliced_hook(hook: Callable | None, kinds: tuple[Kind, ...], dtypes: tuple[str, ...],
-                tile: tuple[int, int]) -> Callable | None:
-    """An entrywise output hook (`entrywise_hook`) as its program at the whole `tile` computes it, replayed on
-    any block of the tile's columns and its parameters' same columns (`programs.on_tile`): its block of the
-    whole tile's value, whatever the hook reads of the tile's shape. None where it is not entrywise."""
-    closed = entrywise_hook(hook, kinds, dtypes, tile)
-    return None if closed is None else _replaying(closed, tile)
 
 
 def _replaying(closed, tile: tuple[int, int]) -> Callable:

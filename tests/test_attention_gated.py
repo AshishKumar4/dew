@@ -8,6 +8,7 @@ import jax.extend.core
 import jax.numpy as jnp
 import pytest
 from generation_support import INTERPRETS
+from jax.core import Tracer
 from reference_error import assert_as_exact
 
 from dew.nn.kernels import generation, tuning
@@ -54,7 +55,8 @@ def _wide(queries: int, width: int):
 def test_a_wide_gated_launch_is_on_par_with_its_16_bit_gate_interpreted(device, hook):
     """A bf16 gate over a forward 256 wide under the interpreter: a pointwise gate in one launch of every
     value column (pinned on an H100, `UNSPLIT`), finished a chunk of columns at a time with the gate's own
-    columns (`attention_mosaic_program.pointwise_tiles`); a gate its hook lays at the whole width (a reshape
+    columns (`attention_mosaic_program.forward_block_plan`); a gate its hook lays at the whole width (a
+    reshape
     to `[-1, 256]`, no chunk's) at the tiles its call derives, the whole width's; one reading its width
     (`out.shape[-1]`), shape-preserving, in the pinned launch finished whole; the gate read at its own bytes
     and widened as the hook takes it; on par with the reference (check 1)."""
@@ -176,3 +178,27 @@ def test_two_output_hooks_equal_by_their_fields_keep_their_own_epilogue_programs
         program = attention_mosaic_program.entrywise_hook(Scaled(factor), (), (), tile)
         (found,) = jax.extend.core.jaxpr_as_fun(program)(ones)
         assert float(found[0, 0]) == factor
+
+
+def test_an_epilogue_program_holds_no_tracer_of_its_callers_trace():
+    """An output hook of a keyword default traced in its caller (`def gate(o, *, bias=bias)`, `bias` a value
+    of an enclosing jit), its epilogue program traced inside that jit (`entrywise_hook`): no program the
+    epilogue cache holds (`_ENTRYWISE`) closes over a tracer once the trace ends, a hook so captured never
+    held (`tuning.holdable` reads keyword defaults, train 1389's P1)."""
+    from dew.nn.kernels.templates import attention_mosaic_program
+
+    tile = (64, 128)
+
+    @jax.jit
+    def traced(bias):
+        def gate(out, *, bias=bias):
+            return out + bias
+
+        attention_mosaic_program.entrywise_hook(gate, (), (), tile)
+        return bias
+
+    traced(jnp.float32(1.0))
+    for held in attention_mosaic_program._ENTRYWISE.values():
+        program = held[0]
+        constants = () if program is None else program.consts
+        assert not any(isinstance(constant, Tracer) for constant in constants)
