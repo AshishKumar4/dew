@@ -15,6 +15,8 @@ JSON. The `JSON` alias both directions speak is declared here, once.
 
 from __future__ import annotations
 
+import contextlib
+import contextvars
 import dataclasses
 import datetime
 import functools
@@ -22,7 +24,7 @@ import json
 import math
 import re
 import typing
-from collections.abc import Callable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Collection, Iterator, Mapping, Sequence
 from numbers import Real
 from typing import TYPE_CHECKING
 
@@ -306,6 +308,52 @@ ATTENTION_KERNEL_HOLDERS = (
 """The classes that held an attention kernel (`attention_impl`), the run's since row 11938
 (`Diagnostics.kernels`, `generation.chosen(attention=...)`), never a model's."""
 
+RETIRED_KERNELS = frozenset({"generated"})
+"""The kernel choices Dew retired since records were saved pinning them: `generated`, which ran the
+algebra's checked twins of a template's written math where a call's exact case was declared (rows 3272,
+6109: on measurement the twins run in no program), so a saved record that pinned it runs the written math, as
+every run does now. A saved record's kernel choices are read without them (`DECODED_REMOVED`, a release's
+and a saved run's step's pins `retired_kernels`); a live choice naming one is refused."""
+
+
+def retired_kernels[V](pins: Mapping[str, V]) -> Mapping[str, V]:
+    """A saved record's kernel pins by choice (a release's `dew_release.json`, a saved run's step's) without
+    the choices retired since (`RETIRED_KERNELS`); `pins` itself where it holds none."""
+    if RETIRED_KERNELS.isdisjoint(pins):
+        return pins
+    return {choice: kernel for choice, kernel in pins.items() if choice not in RETIRED_KERNELS}
+
+
+_SAVED: contextvars.ContextVar[bool] = contextvars.ContextVar("reading_saved", default=False)
+
+
+@contextlib.contextmanager
+def reading_saved() -> Iterator[None]:
+    """Within the block, records are read as saved ones (`saved_fields`): a run's (`RunConfig.load`,
+    `RunConfig.read`), whose classes may have lost fields since it was written. Outside it, a record's every
+    field is its class's or refused, as any live configuration's."""
+    token = _SAVED.set(True)
+    try:
+        yield
+    finally:
+        _SAVED.reset(token)
+
+
+def saved_fields[V](member: type, fields: Mapping[str, V], accepted: Collection[str]) -> Mapping[str, V]:
+    """`fields`, a record of the class `member`, read as a saved record is
+    (`reading_saved`), without the fields `member` or a base lost since (`DECODED_REMOVED`, by each class's
+    import path in `member`'s order of resolution) that its reader does not accept (`accepted`, the names the
+    decoder takes for it: a subclass that records a retired name keeps it); `fields` itself outside a saved
+    record's reading, or where it holds none."""
+    if not _SAVED.get():
+        return fields
+    removed = frozenset().union(*(DECODED_REMOVED.get(f"{kind.__module__}:{kind.__qualname__}", frozenset())
+                                  for kind in member.__mro__)) - frozenset(accepted)
+    if removed.isdisjoint(fields):
+        return fields
+    return {name: value for name, value in fields.items() if name not in removed}
+
+
 REMOVED_FIELDS: Mapping[str, frozenset[str]] = {
     "dew.decision.layout:OptionLines": frozenset({"stream"}),
     "dew.nn.backbones.causal_transformer:CausalTransformer": frozenset({"scan_layers", "attention_impl"}),
@@ -318,6 +366,12 @@ and never what it computes (a decoder's layer scan, which its structure decides 
 kernel, the run's since row 11938, which a saved run's model's moves to: `dew.config.earlier`), so a saved
 record of one means what today's, which has none, does. A saved run's records read without them
 (`earlier_fields`)."""
+
+DECODED_REMOVED: Mapping[str, frozenset[str]] = {"dew.kernels:Kernels": RETIRED_KERNELS}
+"""The fields a saved record's class lost since that the decoder reads out of a saved record wherever its
+field's type reads the class (`saved_fields`): a run's kernel choices retired since (`RETIRED_KERNELS`),
+which only a field typed as kernel choices holds, never data that looks like them. `REMOVED_FIELDS` stay
+`earlier_fields`' alone."""
 
 
 MOVED_CLASSES: Mapping[tuple[str, str], tuple[str, ...]] = {

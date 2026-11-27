@@ -89,8 +89,12 @@ def _online_truth(acc, peak, total, logits, values):
     return old[:, None] * acc + weights @ values, maximum, old * total + weights.sum(axis=1)
 
 
+_MERGED = attention_algebra.Forward("full", 2, ids=False, scale=0.5, natural=False)
+"""The spec the split-KV merge is declared at: a merge reads a spec's base and forms alone."""
+
+
 def _split_kv_merge(left, left_peak, left_total, right, right_peak, right_total):
-    state = attention_algebra.merge(attention_algebra.GENERATED_MERGE,
+    state = attention_algebra.merge(_MERGED,
                                     attention_algebra.Partial(left, left_peak, left_total),
                                     attention_algebra.Partial(right, right_peak, right_total))
     return state.acc, state.m, state.total

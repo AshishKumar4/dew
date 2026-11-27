@@ -362,13 +362,14 @@ class SavedRun:
     @property
     def kernels(self) -> tuple[tuple[str, str], ...]:
         """The kernel choices the run's step pinned, by choice: a saved model's attention kernel, its field
-        until row 11938, which its declaration holds as its run's (`earlier_shapes`); none for a record that
-        names none."""
+        until row 11938, which its declaration holds as its run's (`earlier_shapes`); a choice retired since
+        left out; none for a record that names none."""
         recorded = self.record.get("kernels")
         if recorded is None:
             return ()
-        return tuple(sorted((choice, named(kernel, f"kernels.{choice}"))
-                            for choice, kernel in named_fields(recorded, "kernels").items()))
+        # A choice retired since the step was saved, read without (`_records.retired_kernels`).
+        pins = _records.retired_kernels(named_fields(recorded, "kernels"))
+        return tuple(sorted((choice, named(kernel, f"kernels.{choice}")) for choice, kernel in pins.items()))
 
     def formed[TaskT](self, task: TaskT) -> TaskT:
         """`task`, built from this run (`from_saved`), under the numerics its step trained in and the kernels

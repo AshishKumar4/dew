@@ -113,6 +113,177 @@ def test_a_run_whose_model_named_its_attention_kernel_runs_it_as_the_runs_own(ke
     assert "attention_impl" not in json.loads(json.dumps(run.record()))["fields"]["model"]["fields"]
 
 
+@dataclasses.dataclass(frozen=True)
+class _TaggedKernels(Kernels):
+    """Kernel choices of a subclass, which a run's record tags with its class."""
+
+
+@pytest.mark.parametrize("tagged", [False, True], ids=["plain", "tagged"])
+@pytest.mark.parametrize("generated", [None, "generated", "written"])
+def test_a_run_saved_with_a_retired_kernel_choice_reads_as_the_run_it_trained(generated, tagged):
+    """The published run as a Dew of rows 3272/6109's opt-in seam saved it, its kernel choices stating the
+    retired `generated` (written None where unset, as a record of its kernels writes each), in a plain
+    record or a subclass's tagged one, reads as today's run of the written math, the choice left out
+    (`earlier_retired_kernels`), its other choices and its class kept."""
+    held = json.loads(PUBLISHED.read_text())
+    choices = {**held["fields"]["diagnostics"]["kernels"], "generated": generated, "attention": "xla"}
+    name = f"{_TaggedKernels.__module__}:{_TaggedKernels.__qualname__}"
+    kernels = {"class": name, "fields": choices} if tagged else choices
+    diagnostics = {**held["fields"]["diagnostics"], "kernels": kernels}
+    run = RunConfig.read(earlier_run({**held, "fields": {**held["fields"], "diagnostics": diagnostics}}))
+    assert run.diagnostics.kernels == (_TaggedKernels if tagged else Kernels)(attention="xla")
+    assert type(run.diagnostics.kernels) is (_TaggedKernels if tagged else Kernels)
+
+
+@dataclasses.dataclass(frozen=True)
+class _ChildRun(RunConfig):
+    """A run of a kind of its own, which its parent's record tags with its class."""
+
+
+@dataclasses.dataclass(frozen=True)
+class _ParentRun(RunConfig):
+    """A run of a kind that holds other runs as fields, and data of its own."""
+
+    child: RunConfig = dataclasses.field(default_factory=RunConfig)
+    children: tuple[RunConfig, ...] = ()
+    named: dict[str, RunConfig] = dataclasses.field(default_factory=dict)
+    either: RunConfig | str = ""
+    payload: dict[str, object] = dataclasses.field(default_factory=dict)
+
+
+def _with_generated(record: dict) -> dict:
+    """`record`'s diagnostics' kernel choices, untagged or tagged, also naming the retired `generated`."""
+    tagged = "class" in record and "fields" in record
+    fields = record["fields"] if tagged else record
+    diagnostics = fields["diagnostics"]
+    kernels = diagnostics["kernels"]
+    named = "class" in kernels
+    choices = {**(kernels["fields"] if named else kernels), "generated": "generated"}
+    retired = {**fields, "diagnostics": {**diagnostics,
+                                         "kernels": {**kernels, "fields": choices} if named else choices}}
+    return {**record, "fields": retired} if tagged else retired
+
+
+@pytest.mark.parametrize("tagged", [False, True], ids=["plain", "tagged"])
+def test_a_nested_run_saved_with_a_retired_kernel_choice_loads(tmp_path, tagged):
+    """A saved run of a kind holding runs, its own, its child's (of the field's class, untagged, or a
+    subclass, tagged), a tuple's, a typed mapping's and a mixed union's kernel choices naming the retired
+    `generated`, each kernels record plain or a subclass's tagged one, loads (`RunConfig.load`), each run as
+    it saved it; a payload of data that looks like a kernels record stays as written."""
+    kernels = (_TaggedKernels if tagged else Kernels)(attention="xla")
+    def run(kind):
+        return kind(diagnostics=dataclasses.replace(RunConfig().diagnostics, kernels=kernels))
+
+    payload = {"class": "dew.kernels:Kernels", "fields": {"generated": "keep"}}
+    parent = dataclasses.replace(run(_ParentRun), child=run(_ChildRun if tagged else RunConfig),
+                                 children=(run(RunConfig), run(_ChildRun)), named={"one": run(RunConfig)},
+                                 either=run(_ChildRun), payload=payload)
+    saved = json.loads(Path(parent.save(str(tmp_path))).read_text())
+    fields = _with_generated(saved["fields"])
+    fields = {**fields, "child": _with_generated(fields["child"]),
+              "children": [_with_generated(each) for each in fields["children"]],
+              "named": {"one": _with_generated(fields["named"]["one"])},
+              "either": _with_generated(fields["either"])}
+    (tmp_path / "run.json").write_text(json.dumps({**saved, "fields": fields}))
+    loaded = _ParentRun.load(str(tmp_path))
+    assert loaded == parent
+    assert loaded.payload == payload
+
+
+@dataclasses.dataclass(frozen=True)
+class _GeneratedKernels(Kernels):
+    """Kernel choices of a subclass that declares a `generated` field of its own."""
+
+    generated: str = "its own"
+
+
+def test_a_kernels_subclass_that_declares_the_retired_name_keeps_it(tmp_path):
+    """A run whose kernel choices are a subclass declaring `generated` as its own field saves and loads it
+    as it is: only a name its class does not declare is retired."""
+    run = RunConfig(diagnostics=dataclasses.replace(RunConfig().diagnostics,
+                                                    kernels=_GeneratedKernels(generated="kept")))
+    assert RunConfig.load(run.save(str(tmp_path))) == run
+
+
+def test_a_run_of_before_its_diagnostics_loses_the_retired_choice_it_moves():
+    """A run's `kernels` of before its diagnostics held them, naming the retired choice, read as today's
+    run's diagnostics' kernel choices without it (`earlier_run`)."""
+    held = json.loads(PUBLISHED.read_text())
+    fields = {key: value for key, value in held["fields"].items() if key != "diagnostics"}
+    record = {**held, "fields": {**fields, "kernels": {"attention": "xla", "generated": "generated"}}}
+    assert RunConfig.read(earlier_run(record)).diagnostics.kernels == Kernels(attention="xla")
+
+
+@dataclasses.dataclass(frozen=True)
+class _UnrecordedKernels(Kernels):
+    """Kernel choices of a subclass holding a `generated` attribute its record does not carry."""
+
+    generated: str = dataclasses.field(default="its own", metadata={"record": False})
+
+
+class _ForwardingKernels(Kernels):
+    """Kernel choices of a subclass whose constructor forwards its keywords to the base's."""
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+
+
+@pytest.mark.parametrize("kind", [_UnrecordedKernels, _ForwardingKernels], ids=["unrecorded", "forwarding"])
+def test_a_kernels_subclass_its_decoder_reads_without_the_retired_name_loses_it(tmp_path, kind):
+    """A saved run whose kernel choices are a subclass that records no `generated` (an attribute its record
+    leaves out, or a constructor forwarding to the base's) and whose record names the retired choice loads
+    without it: only a name its decoder accepts is kept."""
+    run = RunConfig(diagnostics=dataclasses.replace(RunConfig().diagnostics, kernels=kind(attention="xla")))
+    saved = json.loads(Path(run.save(str(tmp_path))).read_text())
+    kernels = saved["fields"]["diagnostics"]["kernels"]
+    kernels["fields"] = {**kernels["fields"], "generated": "generated"}
+    (tmp_path / "run.json").write_text(json.dumps(saved))
+    loaded = RunConfig.load(str(tmp_path)).diagnostics.kernels
+    assert type(loaded) is kind and loaded.attention == "xla"
+
+
+def test_a_run_resumed_from_a_record_pinning_the_retired_choice_resumes(tmp_path):
+    """A run resuming one whose saved record pins the retired choice (`check_resume`, `resumed`'s reading
+    of the saved run) reads the record as a saved one: the same run, resumable."""
+    pinned = Kernels(attention="xla")
+    run = RunConfig(diagnostics=dataclasses.replace(RunConfig().diagnostics, kernels=pinned))
+    saved = json.loads(Path(run.save(str(tmp_path))).read_text())
+    saved["fields"]["diagnostics"]["kernels"] = {"attention": "xla", "generated": "generated"}
+    run.check_resume(earlier_run(saved))
+
+
+def test_a_saved_decision_runs_untagged_segment_reads_as_the_one_class_it_names_as_written():
+    """A saved decision run's untagged row segment `{"stream": "context"}` reads as the schema it is, the one
+    class of the union whose fields it names as written: a class's retired field never makes another
+    class read it too (`registry._unnamed`)."""
+    from dew.decision.layout import Schema
+
+    saved = {"class": "decision", "fields": {"rows": {"segments": [{"stream": "context"}]}}}
+    run = RunConfig.read(earlier_run(saved))
+    assert isinstance(run, DecisionRunConfig) and run.rows.segments == (Schema(stream="context"),)
+
+
+def test_a_live_configuration_naming_the_retired_choice_is_refused():
+    """Outside a saved record's reading (`_records.reading_saved`) the retired choice is no field: a record
+    read live naming it is refused, one without it read."""
+    from dew.registry import from_record
+
+    with pytest.raises(ValueError):
+        from_record(Kernels, {"attention": "xla", "generated": "written"})
+    assert from_record(Kernels, {"attention": "xla"}) == Kernels(attention="xla")
+
+
+def test_a_saved_runs_kernel_pins_and_a_releases_leave_the_retired_choice_out():
+    """A saved run's step's kernel pins (`SavedRun.kernels`) and a release's (`ReleaseTask.read`, its
+    `dew_release.json`'s task) naming the retired choice read as today's, the choice left out."""
+    from dew.inference.tasks import SavedRun
+    from dew.interop.release import ReleaseTask
+
+    pins = {"attention": "reference", "generated": "written"}
+    assert SavedRun("", {"kernels": pins}, 0).kernels == (("attention", "reference"),)
+    assert ReleaseTask.read({"kernels": pins}).kernels == {"attention": "reference"}
+
+
 def test_a_run_saved_scanning_its_stack_resumes_scanned():
     """A run an earlier Dew saved with its stack scanned (`scan_layers=True`, its source options' or its
     model's until row 4074) reads as a run whose kernel choices scan it (`Diagnostics.kernels`'

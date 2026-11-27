@@ -26,7 +26,6 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
 from dew._devices import deterministic_ops_requested
-from dew.algebra import generated
 from dew.nn import derivatives
 from dew.nn.kernels import generation, launches, recurrence_algebra as algebra, tuning
 from dew.nn.kernels.chunked_launch import Forked, zero_padded
@@ -201,17 +200,9 @@ class Documents:
 def token_stage(h: list, rates: list, b_of: Callable[[int], jax.Array], step, value, kept) -> list:
     """Each state's update by a token of the selective scan (`algebra.selective_token`) after its decay
     (`algebra.selective_decay`): `h` and `rates` a list a state, `b_of(n)` state `n`'s B at the token (a
-    scalar), `kept` the token's document mask or None. The algebra's generated stage where the run asks for
-    it and the token's case is declared (`dew.algebra.generated.body`), its B read once either way."""
-    loaded = None
-    if generated.enabled():
-        loaded = [b_of(n) for n in range(len(h))]
-        operands = (*h, *rates, *loaded, step, value, *(() if kept is None else (kept,)))
-        if body := generated.body("dew.algebra.recurrence_cases.selective_token", operands):
-            return list(body(*operands))
+    scalar), `kept` the token's document mask or None."""
     decays = [algebra.selective_decay(step, rate, kept) for rate in rates]
-    return algebra.selective_token(h, decays, step * value,
-                                   [b_of(n) for n in range(len(h))] if loaded is None else loaded)
+    return algebra.selective_token(h, decays, step * value, [b_of(n) for n in range(len(h))])
 
 
 @tuning.lowered_once(("scan",))

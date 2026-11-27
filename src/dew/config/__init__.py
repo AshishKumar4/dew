@@ -972,7 +972,7 @@ class RunConfig:
         named = registry.class_record(saved)
         if named is None or registry.runs[named[0]] is not type(self):
             return None
-        return type(self).from_dict({name: value for name, value in named[1].items() if name not in CHAINS})
+        return type(self)._from_saved({name: value for name, value in named[1].items() if name not in CHAINS})
 
     @staticmethod
     def _saved_record(directory: str, checkpoints: Checkpoints) -> Mapping[str, object] | None:
@@ -1080,7 +1080,15 @@ class RunConfig:
         run_class = registry.runs[named[0]]
         if not (isinstance(run_class, type) and issubclass(run_class, cls)):
             raise ValueError(f"the record names {named[0]}, which is no {cls.__name__}")
-        return run_class.from_dict(named[1])
+        return run_class._from_saved(named[1])
+
+    @classmethod
+    def _from_saved(cls, fields: Mapping[str, object]) -> Self:
+        """The run a saved record's `fields` state, as every reader of a saved run reads them (`read`,
+        `_saved_as`): a field a class it holds lost since, at any depth, read without
+        (`_records.reading_saved`, `_records.DECODED_REMOVED`)."""
+        with _records.reading_saved():
+            return cls.from_dict(fields)
 
     def prepare(self) -> Prepared:
         """Build what this run trains, as `build_run` builds it from the run with the fields it leaves to
