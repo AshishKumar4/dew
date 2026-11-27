@@ -20,7 +20,7 @@ import jax.extend.core as jax_core
 import jax.numpy as jnp
 import numpy as np
 from jax import lax
-from jax.core import ShapedArray
+from jax.core import ShapedArray, Tracer
 from jax.experimental import pallas as pl
 
 from dew import _cache
@@ -679,14 +679,15 @@ def refused(dtype, width: int, value_width: int, hooks: Hooks | None, *, backwar
 
 
 def approximate(hooks: Hooks, tile: tuple[int, int], value_width: int, *, differentiated: bool,
-                query: tuple | None = None) -> bool:
+                query: tuple | None = None, output: jax_core.Jaxpr | None = None) -> bool:
     """Whether a launch running `hooks` on `tile` takes the hardware's approximate transcendentals
     (`Family.kernel`'s `approx_math`): only where no hook computes one Mosaic GPU approximates
     (`emission.APPROXIMATED`), with `differentiated` the score hook's pullback too. The mainloop's own
     exponentials hold check 1 at ex2.approx; a hook's need not: on an H100 a softcap's tanh.approx (2^-11
     relative) beside an initial state put the state's sums' gradient at 7.04 times the reference's error from
-    float64, every hook on par with exact math (the hooked backward, HOOKS-FIX-h100)."""
-    traced = _hook_jaxprs(hooks, tile, value_width, differentiated=differentiated, query=query)
+    float64, every hook on par with exact math (the hooked backward, HOOKS-FIX-h100). `output` the output
+    hook's program as its launch traced it once (`output_program`), which it reads where given."""
+    traced = _hook_jaxprs(hooks, tile, value_width, differentiated=differentiated, query=query, output=output)
     return not any(_primitives(jaxpr) & emission.APPROXIMATED for jaxpr in traced)
 
 
@@ -751,7 +752,8 @@ def _off_tile(jaxpr: jax_core.Jaxpr, tile: tuple[int, int]) -> bool:
 
 
 def _hook_jaxprs(hooks: Hooks, tile: tuple[int, int], value_width: int, *,
-                 differentiated: bool = False, query: tuple | None = None) -> list[jax_core.Jaxpr]:
+                 differentiated: bool = False, query: tuple | None = None,
+                 output: jax_core.Jaxpr | None = None) -> list[jax_core.Jaxpr]:
     """`hooks` traced as a launch runs them on `tile`, its outputs `value_width` wide: the score hook (and,
     `differentiated`, its pullback along the logits and its floating parameters), the output hook, and the
     query prologue where the launch takes it on its query tile, `query`'s `(rows, D, dtype)`
@@ -768,7 +770,9 @@ def _hook_jaxprs(hooks: Hooks, tile: tuple[int, int], value_width: int, *,
         traced += _score_jaxprs(hooks.score.fn, tuple((param.axes, param.value.dtype)
                                                        for param in hooks.score.sides),
                                 tile, differentiated=differentiated)
-    if callable(hooks.output.fn):
+    if output is not None:
+        traced.append(output.jaxpr)
+    elif callable(hooks.output.fn):
         traced.append(jax.make_jaxpr(hooks.output.fn)(
             jax.ShapeDtypeStruct((tile[0], value_width), jnp.float32),
             *(_entries(kind_of(param), param.value.dtype, (tile[0], value_width))
@@ -1981,14 +1985,16 @@ def output_stage_swizzle(family: mosaic.Family, value_width: int, out_dtype) -> 
 
 
 def forward_block_plan(total_v: int, columns: int | None, out_dtype, *, has_output_mod: bool,
-                       training: bool, output: tuple | None = None, rows: int | None = None) -> BlockPlan:
+                       training: bool, output: tuple | None = None, rows: int | None = None,
+                       program: jax_core.Jaxpr | None = None) -> BlockPlan:
     """A forward's one plan of its output hook and value columns, which its pricing, allocation and emission
     all read (row 9542): the hook's placement decided first, split out of an inference launch of a block of
     the value columns to run on the joined columns in XLA, else held in the kernel; the block's `out_dtype`;
     and an in-kernel hook's program, `output` `(hook, kinds, dtypes)`, traced at its launch's tile, `rows`
     by its value columns, alone, which decides whether it is pointwise. A split hook's
     program is never traced at a block's columns, where a hook of the whole width fails (train 1375's F5);
-    a launch holding no program of its hook (`output` None) finishes whole."""
+    a launch holding no program of its hook (`output` None) finishes whole. `program` the hook's program
+    as its launch traced it once at that tile (`output_program`), read where given."""
     split = not training and has_output_mod and value_columns(total_v, columns) < total_v
     held = has_output_mod and not split
     plan = BlockPlan(split, jnp.float32 if split else out_dtype, held)
@@ -1996,7 +2002,8 @@ def forward_block_plan(total_v: int, columns: int | None, out_dtype, *, has_outp
         return plan
     hook, kinds, dtypes = output
     tile = (rows, value_columns(total_v, columns))
-    closed = entrywise_hook(hook, kinds, dtypes, tile)
+    closed = (entrywise_hook(hook, kinds, dtypes, tile) if program is None
+              else program if _acts_by_entry(program.jaxpr, tile) else None)
     if closed is None:
         return plan
     return plan._replace(program=closed, tile=tile, tile_dtypes=_tile_dtypes(closed, tile))
@@ -2012,25 +2019,69 @@ def entrywise_hook(hook: Callable | None, kinds: tuple[Kind, ...], dtypes: tuple
                    tile: tuple[int, int]):
     """An output hook's program at a `tile` of fp32 output and its parameters' tiles (a head's a scalar),
     where it acts one entry at a time: every equation entrywise (`layout.entrywise`, a call's or a
-    conditional's program so), every value that tile's or a scalar's, every constant it closes over a
-    scalar. None where it does not or there is none. Whatever it reads of its tile's shape (`o.shape`) is
-    a literal of that shape in the program, which `BlockPlan.sliced` replays as it is on each chunk. A hook a
-    cache may hold (`tuning.holdable`) held by its identity (`_Identity`), tile and the context a kernel is
-    chosen in (`fusion.choice_context`: its numerics among it), so a hook traced under one run's numerics is
-    never replayed under another's (train 1375's F4); any other traced each call."""
+    conditional's program so), every value that tile's or a scalar's, every constant and literal it or a
+    program it nests reads a scalar (`_acts_by_entry`). None where it does not or there is none. Whatever
+    it reads of its tile's shape (`o.shape`) is a literal of that shape in the program, which
+    `BlockPlan.sliced` replays as it is on each chunk. Its program `output_program`'s."""
+    program = output_program(hook, kinds, dtypes, tile)
+    return program if program is not None and _acts_by_entry(program.jaxpr, tile) else None
+
+
+def output_program(hook: Callable | None, kinds: tuple[Kind, ...], dtypes: tuple[str, ...],
+                   tile: tuple[int, int]):
+    """An output hook's program at a `tile` of fp32 output and its parameters' tiles (a head's a scalar),
+    traced once for a launch's every reading of it (`approximate`, `forward_block_plan`); None where it
+    traces at none of this tile. A hook a cache may hold (`tuning.holdable`) held by its identity
+    (`_Identity`), tile and the context a kernel is chosen in (`fusion.choice_context`: its numerics
+    among it), so a hook traced under one run's numerics is never replayed under another's (train 1375's
+    F4); a program that captures a tracer of its caller's trace (a value an ordinary default object holds,
+    `Box(bias)`) never held (train 1427's review); any other traced each call."""
     from dew.algebra import fusion
 
     if hook is None or not callable(hook):
         return None
     if not tuning.holdable(hook):
         # A closure or callable object may reach an array its caller's trace made: traced here, held by none.
-        return _entrywise_hook(hook, kinds, dtypes, tile)
+        return _traced_output(hook, kinds, dtypes, tile)
     try:
         identity = _Identity(hook)
     except TypeError:
-        return _entrywise_hook(hook, kinds, dtypes, tile)
-    return _cache.holding(_ENTRYWISE, (identity, kinds, dtypes, tile, fusion.choice_context()),
-                          lambda: _entrywise_hook(hook, kinds, dtypes, tile), ENTRYWISE_HELD)
+        return _traced_output(hook, kinds, dtypes, tile)
+
+    def made():
+        program = _traced_output(hook, kinds, dtypes, tile)
+        if program is not None and _captures_tracer(program.jaxpr, program.consts):
+            raise _Captured(program)
+        return program
+
+    try:
+        return _cache.holding(_ENTRYWISE, (identity, kinds, dtypes, tile, fusion.choice_context()), made,
+                              ENTRYWISE_HELD)
+    except _Captured as captured:
+        return captured.program
+
+
+class _Captured(Exception):
+    """An output hook's program closing over a tracer of its caller's trace (`output_program`): run, never
+    held."""
+
+    def __init__(self, program):
+        super().__init__("an output hook's program captured a tracer")
+        self.program = program
+
+
+def _captures_tracer(jaxpr: jax_core.Jaxpr, consts) -> bool:
+    """Whether a program's constants, or a literal it or a program it nests reads, hold a tracer."""
+    if any(isinstance(const, Tracer) for const in consts):
+        return True
+    for eqn in jaxpr.eqns:
+        if any(isinstance(atom, jax_core.Literal) and isinstance(atom.val, Tracer)
+               for atom in eqn.invars):
+            return True
+        for nested in jax_core.jaxprs_in_params(eqn.params):
+            if _captures_tracer(nested, nested.consts):
+                return True
+    return False
 
 
 class _Identity:
@@ -2059,17 +2110,14 @@ ENTRYWISE_HELD = 256
 identity (`_Identity`), the least recently read dropped first."""
 
 
-def _entrywise_hook(hook: Callable, kinds: tuple[Kind, ...], dtypes: tuple[str, ...], tile: tuple[int, int]):
-    """`entrywise_hook` of `hook`, traced at `tile`."""
+def _traced_output(hook: Callable, kinds: tuple[Kind, ...], dtypes: tuple[str, ...], tile: tuple[int, int]):
+    """`output_program` of `hook`, traced at `tile`: None where it traces at none of it."""
     params = [jax.ShapeDtypeStruct(() if kind is Kind.HEAD else tile, kept)
               for kind, kept in zip(kinds, dtypes, strict=True)]
-    closed = None
     with contextlib.suppress(TypeError, ValueError):  # a hook of another tile's shape traces at none of this
         # A fresh function, which JAX's tracing cache keys by identity: it keys a callable by equality.
-        closed = jax.make_jaxpr(lambda *values: hook(*values))(jax.ShapeDtypeStruct(tile, jnp.float32),
-                                                               *params)
-    held = closed is not None and _acts_by_entry(closed.jaxpr, tile)
-    return closed if held else None
+        return jax.make_jaxpr(lambda *values: hook(*values))(jax.ShapeDtypeStruct(tile, jnp.float32), *params)
+    return None
 
 
 def _replaying(closed, tile: tuple[int, int]) -> Callable:
@@ -2087,14 +2135,25 @@ def _aval(var) -> ShapedArray:
     return aval
 
 
+def _scalar_literals(atoms) -> bool:
+    """Whether every literal among `atoms` is a scalar."""
+    return all(np.ndim(atom.val) == 0 for atom in atoms if isinstance(atom, jax_core.Literal))
+
+
 def _acts_by_entry(jaxpr: jax_core.Jaxpr, tile: tuple[int, int]) -> bool:
     """Whether every equation of `jaxpr` reads and writes `tile`s and scalars alone, each entrywise
     (`layout.entrywise`: JAX's own statement of its operation, or a scalar's broadcast) or a call or a
-    conditional over programs so (`called`, `branches`), and every constant it or a program it nests closes
-    over a scalar (an array's is read by place)."""
+    conditional over programs so (`called`, `branches`), and every constant and literal it or a program it
+    nests reads, and every literal it returns, a scalar (an array's is read by place)."""
     if any(np.ndim(const) != 0 for const in jaxpr.consts):
         return False
+    if not _scalar_literals(jaxpr.outvars):
+        return False
     for eqn in jaxpr.eqns:
+        if not _scalar_literals(eqn.invars):
+            # A literal array (a closed-over bias the tracer folded in): read whole, not by place, where a
+            # chunk's replay takes a block of its columns (train 1427's review).
+            return False
         shapes = [tuple(getattr(var.aval, "shape", ())) for var in (*eqn.invars, *eqn.outvars)]
         if any(shape not in ((), tile) for shape in shapes):
             return False

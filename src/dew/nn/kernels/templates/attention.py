@@ -1360,6 +1360,19 @@ def score_modded(products: jax.Array, hooks: Hooks) -> jax.Array:
     return jax.vmap(jax.vmap(one, in_axes=(None, 0)), in_axes=(0, None))(jnp.arange(batch), jnp.arange(heads))
 
 
+@overload
+def reference(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks | None = None,
+              *, scale: float | None = None, residuals: Literal[False] = False) -> jax.Array:
+    ...
+
+
+@overload
+def reference(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks | None = None,
+              *, scale: float | None = None, residuals: Literal[True]
+              ) -> tuple[jax.Array, jax.Array, jax.Array]:
+    ...
+
+
 def reference(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks | None = None,
               *, scale: float | None = None, residuals: bool = False):
     """The template's arithmetic in XLA ops: `query` `[B, Q, H, D]` over `key` and `value` `[B, K, Hk, D]` and

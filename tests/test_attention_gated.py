@@ -180,19 +180,35 @@ def test_two_output_hooks_equal_by_their_fields_keep_their_own_epilogue_programs
         assert float(found[0, 0]) == factor
 
 
-def test_an_epilogue_program_holds_no_tracer_of_its_callers_trace():
+class _Box:
+    """An ordinary object holding a value, neither callable nor a dataclass (`tuning.holdable` holds it)."""
+
+    def __init__(self, bias):
+        self.bias = bias
+
+
+@pytest.mark.parametrize("held", ["keyword default", "an object's attribute"])
+def test_an_epilogue_program_holds_no_tracer_of_its_callers_trace(held):
     """An output hook of a keyword default traced in its caller (`def gate(o, *, bias=bias)`, `bias` a value
-    of an enclosing jit), its epilogue program traced inside that jit (`entrywise_hook`): no program the
-    epilogue cache holds (`_ENTRYWISE`) closes over a tracer once the trace ends, a hook so captured never
-    held (`tuning.holdable` reads keyword defaults, train 1389's P1)."""
+    of an enclosing jit), or of an ordinary object holding it (`box=_Box(bias)`, which `tuning.holdable`
+    holds), its epilogue program traced inside that jit (`entrywise_hook`): no program the epilogue cache
+    holds (`_ENTRYWISE`) closes over a tracer once the trace ends, a hook so captured never held
+    (`tuning.holdable` reads keyword defaults, train 1389's P1; a program capturing a tracer is never held,
+    `attention_mosaic_program.output_program`, train 1427's)."""
     from dew.nn.kernels.templates import attention_mosaic_program
 
     tile = (64, 128)
 
     @jax.jit
     def traced(bias):
-        def gate(out, *, bias=bias):
-            return out + bias
+        if held == "keyword default":
+            def gate(out, *, bias=bias):
+                return out + bias
+        else:
+            holder = _Box(bias)
+
+            def gate(out, *, box=holder):
+                return out + box.bias
 
         attention_mosaic_program.entrywise_hook(gate, (), (), tile)
         return bias
@@ -202,3 +218,32 @@ def test_an_epilogue_program_holds_no_tracer_of_its_callers_trace():
         program = held[0]
         constants = () if program is None else program.consts
         assert not any(isinstance(constant, Tracer) for constant in constants)
+
+
+def test_an_output_hooks_literal_array_is_no_entrywise_program():
+    """An output hook's program at a 64 x 256 tile whose bias is a literal of the tile's shape (as JAX's
+    simplified constants fold a closed-over array in): no entrywise program (`forward_block_plan` holds
+    none), its literal read whole where a chunk's replay takes a block of its columns, where its shape
+    passed as the tile's and the replay failed (train 1427's review)."""
+    import numpy as np
+
+    from dew.nn.kernels.templates import attention_mosaic_program
+
+    tile = (64, 256)
+    bias = np.arange(64 * 256, dtype=np.float32).reshape(tile)
+    closed = jax.make_jaxpr(lambda out, b: out + b)(jax.ShapeDtypeStruct(tile, jnp.float32),
+                                                    jax.ShapeDtypeStruct(tile, jnp.float32))
+    jaxpr = closed.jaxpr
+    folded = jax.extend.core.Literal(bias, jaxpr.invars[1].aval)
+    equations = [eqn.replace(invars=[folded if var is jaxpr.invars[1] else var for var in eqn.invars])
+                 for eqn in jaxpr.eqns]
+    literal = jax.extend.core.ClosedJaxpr(jaxpr.replace(invars=jaxpr.invars[:1], eqns=equations), [])
+    plan = attention_mosaic_program.forward_block_plan(256, None, jnp.float32, has_output_mod=True,
+                                                       training=False, output=(None, (), ()), rows=64,
+                                                       program=literal)
+    assert plan.program is None
+    plan = attention_mosaic_program.forward_block_plan(256, None, jnp.float32, has_output_mod=True,
+                                                       training=False, output=(None, (), ()), rows=64,
+                                                       program=jax.make_jaxpr(lambda out: out * 2.0)(
+                                                           jax.ShapeDtypeStruct(tile, jnp.float32)))
+    assert plan.program is not None

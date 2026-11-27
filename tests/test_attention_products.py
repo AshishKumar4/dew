@@ -344,24 +344,39 @@ def test_the_mosaic_mainloop_declines_narrow_queries_and_keys_over_wide_values()
                                                   residuals=tuple(residuals)) is not None
 
 
-def test_a_banded_call_keeps_its_fp64_operands():
-    """A banded call (`Banded((0,))`) of fp64 operands at x64, scale 1: one query at place 0 of
-    `[2^24 + 1, 1]` against its near key `[1, -(2^24 + 1)]` has the logit 0 exactly, its far key's product
-    0, so its two keys weigh alike and its values 0 and 1 read 0.5 exactly; its keys and values widened,
-    never narrowed (`jnp.promote_types`), where staged in fp32 `-(2^24 + 1)` rounded to `-2^24`, the logit
-    read 1 and the output `1 / (1 + e)` (train 1389's P0)."""
+@pytest.mark.parametrize("gap", ["cancelled", "one unit"])
+def test_a_banded_call_keeps_its_fp64_operands(gap):
+    """A banded call (`Banded((0,))`) of fp64 operands at x64, scale 1, its values 0 and 1, forward and
+    backward in fp64: one query at place 0 of `[2^24 + 1, 1]` against its near key `[1, -(2^24 + 1)]` has
+    the logit 0 exactly beside its far key's 0, so the output reads 0.5 exactly (`cancelled`), where staged
+    in fp32 `-(2^24 + 1)` rounded to `-2^24` and read `1 / (1 + e)` (train 1389's P0); and a query `[1, 0]`
+    against keys `2^24` and `2^24 + 1` (`one unit`) has logits a unit apart, `e / (1 + e)`, where the
+    route's fp32 mainloop tied them and read 0.5 (train 1427's P0)."""
     with jax.enable_x64(new_val=True):
         spans = template.spans(1, 2, 1)
-        near = jnp.asarray([2.0 ** 24 + 1, 1.0], jnp.float64)[None, None, None]
-        near_keys = jnp.asarray([[1.0, -(2.0 ** 24 + 1)], [0.0, 0.0]], jnp.float64)[None, :, None]
-        far = jnp.zeros((1, 1, 1, 2), jnp.float64)
-        far_keys = jnp.zeros((1, 2, 1, 2), jnp.float64)
+        unit = jnp.asarray([1.0, 0.0], jnp.float64)[None, None, None]
+        if gap == "cancelled":
+            near = jnp.asarray([2.0 ** 24 + 1, 1.0], jnp.float64)[None, None, None]
+            near_keys = jnp.asarray([[1.0, -(2.0 ** 24 + 1)], [0.0, 0.0]], jnp.float64)[None, :, None]
+            far, far_keys = jnp.zeros_like(near), jnp.zeros((1, 2, 1, 2), jnp.float64)
+        else:
+            # The first key on the near product, the second on the far one: logits `2^24` and `2^24 + 1`.
+            near, far = unit, unit
+            near_keys = jnp.asarray([[2.0 ** 24, 0.0], [0.0, 0.0]], jnp.float64)[None, :, None]
+            far_keys = jnp.asarray([[0.0, 0.0], [2.0 ** 24 + 1, 0.0]], jnp.float64)[None, :, None]
         value = jnp.asarray([0.0, 1.0], jnp.float64)[None, :, None, None]
-        out = attention_products.attend((near, far), (near_keys, far_keys), value, spans,
-                                        attention_products.Banded((0,)), places=jnp.asarray([[0]]), scale=1.0,
-                                        natural=True, accurate=True)
-        assert out.dtype == jnp.float64
-        np.testing.assert_array_equal(np.asarray(out)[0, 0, 0, 0], 0.5)
+
+        def attend(near_keys, far_keys):
+            return attention_products.attend((near, far), (near_keys, far_keys), value, spans,
+                                             attention_products.Banded((0,)), places=jnp.asarray([[0]]),
+                                             scale=1.0, natural=True, accurate=True)
+
+        out, pull = jax.vjp(attend, near_keys, far_keys)
+        grads = pull(jnp.ones_like(out))
+        assert out.dtype == jnp.float64 and all(grad.dtype == jnp.float64 for grad in grads)
+        # Its softmax at fp64 as jax.nn's of the two logits forms it (the fp32 mainloop's tie read 0.5).
+        logits = jnp.asarray([0.0, 0.0] if gap == "cancelled" else [2.0 ** 24, 2.0 ** 24 + 1], jnp.float64)
+        np.testing.assert_array_equal(np.asarray(out)[0, 0, 0, 0], np.asarray(jax.nn.softmax(logits))[1])
 
 
 def test_a_mixed_banded_call_takes_the_plain_jax_mainloop_on_a_gpu():
@@ -415,3 +430,60 @@ def test_a_banded_decode_step_on_a_64_row_tile_reads_each_rows_own_query_place()
     with generation.assumed("sm90"), tuning.pinned(pinned):
         out = attention_decode.attend(*laid, interpret=True)
     np.testing.assert_array_equal(np.asarray(out, np.float32)[0, 0, :, 0], [0.5, 0.5])
+
+
+@pytest.mark.parametrize("case", ["an fp32 query over fp64 keys", "an fp64 bias along the keys"])
+def test_a_wide_banded_call_keeps_fp64_where_any_of_it_is(case):
+    """A banded call at x64 with values 0 and 1, scale 1: an fp32 query `[1, 0]` against fp64 keys `2^24`
+    (near) and `2^24 + 1` (far) reads `e / (1 + e)` at fp64's softmax, its output fp32 (the call's softmax at
+    its widest operand's dtype, `attention_products._widely`, where the query's fp32 tied the logits and read
+    0.5); and an fp64 near logit `2^24 + 1` under an fp64 KEY bias of `-(2^24 + 1)` beside a far logit 0
+    reads 0.5 exactly (the bias kept fp64 in its copies, `_copied_hooks`, where narrowed to fp32 it read
+    `1 / (1 + e)`) (train 1427's review of ed7ded3cc)."""
+    with jax.enable_x64(new_val=True):
+        spans = template.spans(1, 2, 1)
+        value = jnp.asarray([0.0, 1.0], jnp.float64)[None, :, None, None]
+        if case == "an fp32 query over fp64 keys":
+            unit = jnp.asarray([1.0, 0.0], jnp.float32)[None, None, None]
+            queries = (unit, unit)
+            keys = (jnp.asarray([[2.0 ** 24, 0.0], [0.0, 0.0]], jnp.float64)[None, :, None],
+                    jnp.asarray([[0.0, 0.0], [2.0 ** 24 + 1, 0.0]], jnp.float64)[None, :, None])
+            hooks, logits = None, [2.0 ** 24, 2.0 ** 24 + 1]
+        else:
+            unit = jnp.asarray([1.0, 0.0], jnp.float64)[None, None, None]
+            queries = (unit, jnp.zeros_like(unit))
+            keys = (jnp.asarray([[2.0 ** 24 + 1, 0.0], [0.0, 0.0]], jnp.float64)[None, :, None],
+                    jnp.zeros((1, 2, 1, 2), jnp.float64))
+            bias = jnp.asarray([[[-(2.0 ** 24 + 1), 0.0]]], jnp.float64)
+            hooks = template.Hooks(score=Hook(lambda s, q_pos, k_pos, b: s + b,
+                                              (Side(bias, template.Kind.KEY),)))
+            logits = [0.0, 0.0]
+        out = attention_products.attend(queries, keys, value, spans, attention_products.Banded((0,)), hooks,
+                                        places=jnp.asarray([[0]]), scale=1.0, natural=True, accurate=True)
+        assert out.dtype == queries[0].dtype
+        expected = np.asarray(jax.nn.softmax(jnp.asarray(logits, jnp.float64)))[1]
+        np.testing.assert_array_equal(np.asarray(out)[0, 0, 0, 0], np.asarray(expected, out.dtype))
+
+
+def _by_dtype(x, positions):
+    """A query prologue whose program depends on its operand's dtype: `x` on fp32, `-x` on any other."""
+    return x if x.dtype == jnp.float32 else -x
+
+
+def test_a_wide_summed_calls_prologue_sees_its_queries_own_dtype():
+    """A summed call at x64 of two products, an fp32 query 1 over fp64 keys `[0, 1]` and zeros, values
+    `[0, 1]`, scale 1, under a query prologue whose program depends on its operand's dtype (`_by_dtype`):
+    its prologue run on the fp32 query, the logits `[0, 1]`, the output `sigmoid(1)`, the query widened
+    after its prologue (`attention_products._widely`), where widened first the prologue read fp64, negated
+    it and the output read `sigmoid(-1)` (train 1427's review of 2b4f553fa)."""
+    with jax.enable_x64(new_val=True):
+        spans = template.spans(1, 2, 1)
+        query = jnp.ones((1, 1, 1, 1), jnp.float32)
+        keys = (jnp.asarray([0.0, 1.0], jnp.float64)[None, :, None, None],
+                jnp.zeros((1, 2, 1, 1), jnp.float64))
+        value = jnp.asarray([0.0, 1.0], jnp.float64)[None, :, None, None]
+        hooks = template.Hooks(query=Hook(_by_dtype, ()))
+        out = attention_products.attend((query, jnp.zeros_like(query)), keys, value, spans,
+                                        attention_products.SUM, hooks, scale=1.0, natural=True, accurate=True)
+        expected = np.asarray(jax.nn.softmax(jnp.asarray([0.0, 1.0], jnp.float64)))[1]
+        np.testing.assert_array_equal(np.asarray(out)[0, 0, 0, 0], np.asarray(expected, out.dtype))

@@ -103,6 +103,7 @@ from dew.nn.kernels.templates.attention_mosaic_program import (
     issued_pairs,
     launch_scope,
     modelled,
+    output_program,
     output_stage_swizzle,
     param_types,
     params_read,
@@ -2206,17 +2207,19 @@ def _launched(query, key, value, read: _Read, *, hooks: Hooks, spec: algebra.For
         query, key, value, read, page=page, column_width=column_width, parts=parts)
     group, consumers = heads // kv_heads, tiles.consumers
     block_q, block_k = tiles.block_q, tiles.block_k
-    spec = dataclasses.replace(spec, approximate=approximate(
-        hooks, (block_q, block_k), value_width, differentiated=False, query=(block_q, width, query.dtype)))
-    pair = consumers * block_q
-    steps = keys_count // block_k
-    # The launch's one plan of its output hook (`forward_block_plan`), its hook's program traced here at the
-    # walk's own tile, which its epilogue reads (`_Program.block_plan`).
+    # The launch's output hook traced once at its walk's tile (`output_program`), which its approximate math
+    # and its one plan (`forward_block_plan`, read by its epilogue, `_Program.block_plan`) both read.
     output = (hooks.output.fn, kinds_of(hooks.output.sides),
               tuple(kept_dtype(side.value.dtype) for side in hooks.output.sides))
+    traced = output_program(*output, (block_q, value_width))
+    spec = dataclasses.replace(spec, approximate=approximate(
+        hooks, (block_q, block_k), value_width, differentiated=False, query=(block_q, width, query.dtype),
+        output=traced))
+    pair = consumers * block_q
+    steps = keys_count // block_k
     plan = forward_block_plan(value_width, None, query.dtype if out_dtype is None else jnp.dtype(out_dtype),
                               has_output_mod=hooks.output.fn is not None, training=training, output=output,
-                              rows=block_q)
+                              rows=block_q, program=traced)
     program = _program_of(family, tiles, spec, read, key, steps, value_width, query.dtype, splits=splits,
                           peaks=peaks, parts=parts, training=training, value_columns=value_columns,
                           tmem_columns=tmem_columns, block_plan=plan)
