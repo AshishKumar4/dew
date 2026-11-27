@@ -35,7 +35,6 @@ This page is generated from the maintainers' findings ledger as each change land
 - Block-selected attention's other selections as mixers. [6301]
 - CuDNN's response to a non-finite K or V at a key a query does not see is unknown. [7190]
 - The GEMM compile gate certifies each launch with one CUDA build's compile-only client (the kernel-compile extra's), then checks the settled kernel under each…. [10766]
-- Certification admits a spill only where every STL/LDL of its SASS sits at loop depth 0 (prologue/epilogue) or in call slow-path code. [12387]
 - A gathered gemm call through a narrow prologue rounds each route's operand cotangent at the prologue's dtype before the token's wide sum. [13508]
 - Dew's DC-AE ReLU linear attention (src/dew/nn/autoencoders/dc_ae.py linear_attention) on a CPU's float32 sums leaves its queries', keys' and values' gradients…. [13524]
 - The fork takes no static register cap for a Mosaic GPU kernel. [12686]
@@ -50,8 +49,9 @@ This page is generated from the maintainers' findings ledger as each change land
 
 ## Models and interop
 
-- Every recurrence transition and state family. [1300, 1448, 1450, 1451, 1452, 1454, 1457, 1458, 1459, 1460, 1646]
+- Every recurrence transition and state family. [1300, 1448, 1450, 1451, 1452, 1454, 1457, 1459, 1460, 1646]
 - The suite's wall. [5478, 12431, 12433, 12644]
+- SD3's conditioner (the tiny published pipeline with CLIP x2 + T5) encodes drawn prompts with its context 2.23x Diffusers' float32 encode_prompt's RMS error…. [13655]
 - The remaining releases' media towers. [851, 879]
 - Formats read and written. [871, 2548]
 - Looped residuals: InfiLoop on Dory. [1314]
@@ -67,6 +67,7 @@ This page is generated from the maintainers' findings ledger as each change land
 - Distributed and memory training modes. [156, 873, 1306, 617]
 - A fact and a question for the step's owner. [6646]
 - Gradients held to an update placed after the backward are parameter-sized temporaries. [6698]
+- Euler over a FlowMatch source schedule (SD3's FlowMatchEulerDiscreteScheduler files) rounds worse than Diffusers' own x + dt v under check 1. [13654]
 - Narrow copies at the Qwen3.5-4B decision step. [6638]
 - A program compiled ahead without its GPU that holds a convolution is refused and compiled on its GPU. [8527]
 - sampled_passes over a loop that chooses its passes itself. [12300]
