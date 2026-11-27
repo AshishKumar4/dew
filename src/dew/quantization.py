@@ -684,7 +684,9 @@ def _resident_window(kernel: jax.Array, site: str):
     if split > 1:
         raise ValueError(f"{site}'s kernel is split by its depth ({rows!r}), which its window's decode reads "
                          "whole for each column: window it split by its columns alone")
-    planes = NamedSharding(sharding.mesh, PartitionSpec(columns, rows))
+    # The planes placed by the columns alone: a depth name of one device, kept on them, would mark the
+    # axis the window's decode permutes as split (an Explicit one's gather refuses it).
+    planes = NamedSharding(sharding.mesh, PartitionSpec(columns, None))
     encoded: dict[tuple, Bf16Window] = {}
     words, meta = [], []
     for shard in kernel.addressable_shards:

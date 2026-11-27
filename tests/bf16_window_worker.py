@@ -16,15 +16,16 @@ def width_split(args) -> dict:
     decoded on each process its own columns' bits again."""
     import jax
     import jax.numpy as jnp
-    from jax.sharding import Mesh, NamedSharding, PartitionSpec
+    from jax.sharding import AxisType, Mesh, NamedSharding, PartitionSpec
 
     from dew import quantization
     from dew.nn.kernels.formats import Bf16Window
 
     rng = np.random.default_rng(13702)
     kernel = (rng.normal(size=(256, 256)) * 0.02).astype(jnp.bfloat16)
-    # Its depth named by an axis of one device, which leaves each column whole.
-    mesh = Mesh(np.asarray(jax.devices()).reshape(1, -1), ("depths", "columns"))
+    # Its depth named by an Explicit axis of one device, which leaves each column whole.
+    mesh = Mesh(np.asarray(jax.devices()).reshape(1, -1), ("depths", "columns"),
+                axis_types=(AxisType.Explicit, AxisType.Explicit))
     spec = PartitionSpec("depths", "columns")
     placed = jax.make_array_from_callback(kernel.shape, NamedSharding(mesh, spec),
                                           lambda index: kernel[index])
