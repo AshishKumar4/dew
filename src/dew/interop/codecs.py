@@ -1978,10 +1978,14 @@ def _encode_inkling2(name: str, weight: np.ndarray, *, grid: Mapping[str, Stored
     given = np.asarray(weight)
     kept_as = np.dtype(loaded[name])
 
+    # Both sides held exactly in the wider of the two dtypes (bfloat16's values are float32's), no copy
+    # where they match.
+    common = np.promote_types(kept_as, given.dtype)
+
     def unchanged(decoded) -> np.ndarray:
-        # Each value as given against its code's decode as the load kept it, both exactly in float64.
-        as_loaded = np.asarray(decoded, np.float32).astype(kept_as).astype(np.float64)
-        return as_loaded == given.astype(np.float64)
+        # Each value as given against its code's decode as the load kept it.
+        as_loaded = np.asarray(decoded, np.float32).astype(kept_as, copy=False).astype(common, copy=False)
+        return as_loaded == given.astype(common, copy=False)
 
     if grid is not None and name + "_amax" in grid:
         scale, amax, denominator, original = _gridded(
