@@ -43,7 +43,7 @@ from __future__ import annotations
 
 import collections
 import dataclasses
-from collections.abc import Callable, Hashable, Sequence
+from collections.abc import Callable, Hashable, Iterator, Sequence
 from typing import TYPE_CHECKING, NamedTuple
 
 import jax
@@ -107,7 +107,7 @@ def fused_program(jaxpr: jcore.Jaxpr, *, _base: tuple[Hashable, Hashable] | None
         if held & set(found.places):
             continue
         taken = _taken(index, found, lambda region: _decided(
-            _identity(jaxpr, region), lambda: _takes(fused_gemm, jaxpr, region), _base=base))
+            _identity(jaxpr, region), lambda: _takes(jaxpr, region), _base=base))
         if taken is not None:
             identities[taken] = _identity(jaxpr, taken)
     products = list(identities)
@@ -128,21 +128,26 @@ def _taken(index: Index, found: Region, decided: Callable[[Region], RegionDecisi
     `decided` once for its structure), its product the template's where it can be and the stages it drops
     left as the program wrote them, XLA's beside the launch; None where none is taken (row 8996: a refused
     epilogue left the product a plain dot)."""
-    level, seen = [found], set()
+    return next((region for region, decision in _walked(index, found, decided) if decision.taken), None)
+
+
+def _walked(index: Index, found: Region, decided: Callable[[Region], RegionDecision]
+            ) -> Iterator[tuple[Region, RegionDecision]]:
+    """`found` and each region of fewer of its stages `_fewer` reaches as each one's `decided` allows, each
+    with its decision, breadth first, each once (a product alone reached without its prologue and without its
+    epilogue alike): the walk `_taken` stops at its first taken region and `fewer` reads whole."""
+    level, seen = [found], {(found.places, found.prologue)}
     while level:
-        fewer = []
+        reached = []
         for region in level:
             decision = decided(region)
-            if decision.taken:
-                return region
-            fewer += _fewer(index, region, decision)
-        # One region each, a product alone reached without its prologue and without its epilogue alike.
+            yield region, decision
+            reached += _fewer(index, region, decision)
         level = []
-        for region in fewer:
+        for region in reached:
             if (region.places, region.prologue) not in seen:
                 seen.add((region.places, region.prologue))
                 level.append(region)
-    return None
 
 
 def _fewer(index: Index, region: Region, decision: RegionDecision) -> list[Region]:
@@ -153,7 +158,7 @@ def _fewer(index: Index, region: Region, decision: RegionDecision) -> list[Regio
     the template's or undecided (`RegionDecision.launched`: an epilogue keys no launch's cell). Each where the
     region has the stage it drops."""
     jaxpr = index.jaxpr
-    (product,) = (place for place in region.places if _form(jaxpr.eqns[place]) is not None)
+    (product,) = (place for place in region.places if product_form(jaxpr.eqns[place]) is not None)
     fewer = []
     if region.prologue and decision.launchable:
         places = tuple(place for place in region.places if place not in region.prologue)
@@ -220,9 +225,9 @@ class Written(NamedTuple):
 
 
 class Form(NamedTuple):
-    """A product the template takes (`_form`): its right operand held columns by depth (`transpose_rhs`),
-    its left one contracted over its rows (`transpose_lhs`: a kernel gradient's xᵀ @ dy), and its groups
-    (`grouped`: a `ragged_dot_general`'s, its group sizes its third operand)."""
+    """A product the template takes (`product_form`): its right operand held columns by depth
+    (`transpose_rhs`), its left one contracted over its rows (`transpose_lhs`: a kernel gradient's xᵀ @ dy),
+    and its groups (`grouped`: a `ragged_dot_general`'s, its group sizes its third operand)."""
 
     transpose_rhs: bool
     transpose_lhs: bool
@@ -244,7 +249,7 @@ matrix (`[groups, depth, columns]`, or columns by depth), and the kernel gradien
 each group (`[groups, depth, columns]` out)."""
 
 
-def _form(equation: jcore.JaxprEqn) -> Form | None:
+def product_form(equation: jcore.JaxprEqn) -> Form | None:
     """`equation`'s form as a product the template takes (`Form`): a `dot_general` of rank-2 operands (x @ W,
     dy @ Wᵀ, xᵀ @ dy) or a `ragged_dot_general` of rows ragged by group (`GROUPED_FORMS`), each of floating
     operands, no batch axes; None for any other equation (an integer product is XLA's own,
@@ -388,7 +393,7 @@ def _decode_call(body: jcore.Jaxpr) -> Callable:
 
 
 def _decode_product(equation: jcore.JaxprEqn) -> bool:
-    form = _form(equation)
+    form = product_form(equation)
     return form is not None and not (form.grouped or form.transpose_lhs)
 
 
@@ -420,7 +425,7 @@ def _prologue(index: Index, start: int, claimed: set[int]) -> tuple[int, ...]:
     the rows). A product whose left operand is not its rows (Xᵀ @ dY) has no prologue."""
     jaxpr, producer = index.jaxpr, index.producer
     equation = jaxpr.eqns[start]
-    form, lhs = _form(equation), equation.invars[0]
+    form, lhs = product_form(equation), equation.invars[0]
     if form is None or form.transpose_lhs or not isinstance(lhs, jcore.Var):
         return ()
     shape, members, frontier = _shape(lhs), set(), [lhs]
@@ -436,17 +441,47 @@ def _prologue(index: Index, start: int, claimed: set[int]) -> tuple[int, ...]:
     return tuple(sorted(members | _captured(index, sorted(members), members, claimed)))
 
 
+def regions(jaxpr: jcore.Jaxpr) -> tuple[Region, ...]:
+    """Each product region of `jaxpr` as `fused_program` finds it (`_regions`), before any is weighed: a
+    caller weighing a region's variants itself (`fewer`, `analyzed`) starts from these. `fused_program` skips
+    those an attention or recurrence region `recognize` writes holds an equation of."""
+    return tuple(_regions(Index(jaxpr)))
+
+
+def fewer(jaxpr: jcore.Jaxpr, region: Region) -> tuple[Region, ...]:
+    """Every region of `region`'s product with stages fewer (`_fewer`, each stage it has dropped in turn:
+    without its prologue, without its epilogue, the product alone), each once, whatever any launch decides,
+    in the order `_taken` reaches them: a caller weighing them itself (`analyzed`) sees each one
+    `fused_program` may weigh."""
+    every = RegionDecision(taken=False, launchable=True, launched=True)
+    return tuple(found for found, _ in _walked(Index(jaxpr), region, lambda _: every))[1:]
+
+
+def analyzed(jaxpr: jcore.Jaxpr, region: Region):
+    """`region` of `jaxpr` as `fused_program` weighs it (`_takes`): `fused_gemm.analysis` of the region
+    replayed (`_replayed`) over its inputs' shapes, its routes and both prices (`fused_gemm.Analysis`), a
+    region of a program staged under x64 (the CPU arithmetic's float64 sums) analyzed under it, its 64-bit
+    values as it states them."""
+    from dew.nn.kernels import fused_gemm
+
+    inputs = _shapes(region.inputs)
+    wide = any(shape.dtype.itemsize == 8 for shape in (*inputs, *_shapes(region.outputs)))
+    with jax.enable_x64(new_val=wide):
+        return fused_gemm.analysis(_replayed(jaxpr, region, fused_gemm), *inputs)
+
+
 def _regions(index: Index) -> list[Region]:
-    """Each product of `jaxpr` (`_form`), its prologue (`_prologue`) and the elementwise equations after it
-    that read its values, each of the product's shape over operands that follow its tiles (`_elementwise`),
-    up to the first equation outside them that reads one of their values, with the layout equations of its
-    captured operands that no other equation reads (`CAPTURED`). A prologue's equation nothing outside the
-    region reads is replaced with it (`Region.places`); one something else reads stays in the program too."""
+    """Each product of `jaxpr` (`product_form`), its prologue (`_prologue`) and the elementwise equations
+    after it that read its values, each of the product's shape over operands that follow its tiles
+    (`_elementwise`), up to the first equation outside them that reads one of their values, with the layout
+    equations of its captured operands that no other equation reads (`CAPTURED`). A prologue's equation
+    nothing outside the region reads is replaced with it (`Region.places`); one something else reads stays in
+    the program too."""
     jaxpr, escaping = index.jaxpr, index.escaping
     found: list[Region] = []
     claimed: set[int] = set()
     for start, equation in enumerate(jaxpr.eqns):
-        if _form(equation) is None or start in claimed:
+        if product_form(equation) is None or start in claimed:
             continue
         prologue = _prologue(index, start, claimed)
         shape = _shape(equation.outvars[0])
@@ -514,7 +549,7 @@ def _replayed(jaxpr: jcore.Jaxpr, region: Region, fused_gemm):
         for place in region.replayed:
             equation = jaxpr.eqns[place]
             operands = [read(atom) for atom in equation.invars]
-            form = _form(equation)
+            form = product_form(equation)
             if form is not None:
                 # At its traced result's dtype, the dot's own (JAX's rule, not a promotion of its operands').
                 (traced,) = _shapes(equation.outvars)
@@ -643,7 +678,7 @@ def _decided(identity: Hashable, decide: Callable[[], RegionDecision], *,
     return _cache.holding(_held, (identity, choice_context_of(_base)), weighed, DECISIONS_HELD)
 
 
-def _takes(fused_gemm, jaxpr: jcore.Jaxpr, region: Region) -> RegionDecision:
+def _takes(jaxpr: jcore.Jaxpr, region: Region) -> RegionDecision:
     """Whether the region is fused (`fused_gemm.analysis`): its product's launch the template's (its
     selector's choice, or a call's, `generation.chosen`), its prologue and epilogue the kernel's, nothing
     refused, fused the cheaper (`fused_gemm.Analysis.cheaper`), and its launch keeping with them the
@@ -653,12 +688,8 @@ def _takes(fused_gemm, jaxpr: jcore.Jaxpr, region: Region) -> RegionDecision:
     cell where the launch is not declared for the template (`grouped_matmul.DECLARED`, per generation) they
     favour fusion more than measurement does, so a region whose launch the selector gives XLA is never fused
     by price alone; a call naming the template (an A/B's arm) fuses it."""
-    inputs = _shapes(region.inputs)
-    # A region of a program staged under x64 (the CPU arithmetic's float64 sums) is analyzed under it, its
-    # 64-bit values as it states them.
-    wide = any(shape.dtype.itemsize == 8 for shape in (*inputs, *_shapes(region.outputs)))
-    with jax.enable_x64(new_val=wide):
-        found = fused_gemm.analysis(_replayed(jaxpr, region, fused_gemm), *inputs)
+    found = analyzed(jaxpr, region)
+
     def kernel(route) -> bool:
         return route is not None and route.refusal is None and route.kernel != "xla"
 
