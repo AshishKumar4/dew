@@ -13,6 +13,7 @@ and the main model's apart, and a packed batch scores its documents as it
 would alone. Everything runs at fp32 on CPU.
 """
 
+import dataclasses
 import json
 from pathlib import Path
 
@@ -605,9 +606,11 @@ def test_an_index_branchs_kl_pools_by_its_queries_across_a_split_step():
     def draw(seed: int):
         params = nn.unbox(jax.jit(objective.init)(jax.random.key(seed)))["params"]
         batch = rows(seed)
-        moved = [step(jax.tree.map(jnp.copy, start.replace(variables={**start.variables, "params": params})),
-                      batch)[0].variables["params"] for step, start in ((split_step, split_start),
-                                                                        (whole_step, whole_start))]
+        def stepped(step, start):
+            held = dataclasses.replace(start, variables={**start.variables, "params": params})
+            return step(jax.tree.map(jnp.copy, held), batch)[0].variables["params"]
+
+        moved = [stepped(*pair) for pair in ((split_step, split_start), (whole_step, whole_start))]
         return params, batch, *moved
 
     wide = LMObjective(deepseek_stack(4, dtype="float64"), SEQ, indexer=IndexerTraining("sparse"))
