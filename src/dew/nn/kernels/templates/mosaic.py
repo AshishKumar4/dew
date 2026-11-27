@@ -502,12 +502,15 @@ def laid(condition, like: jax.Array) -> jax.Array:
     return (jnp.zeros_like(like, jnp.float32) + jnp.asarray(condition, jnp.float32)) != 0.0
 
 
-def _warpgroup_barrier(ctx) -> None:
+@dataclasses.dataclass(frozen=True)
+class WarpgroupBarrier:
     """A warpgroup's barrier (`synced`), inlined, collective: every thread of the warpgroup reaches it from
     one program point, so the fork drops a repeat of it (`core._drop_repeated_barriers`); synchronization
-    alone, no work a count prices."""
-    del ctx
-    mgpu_utils.warpgroup_barrier(collective=True)
+    alone, no work a count prices. A type of its own, which a checker reads it by (tests/ring_protocol.py)."""
+
+    def __call__(self, ctx) -> None:
+        del ctx
+        mgpu_utils.warpgroup_barrier(collective=True)
 
 
 def synced(interpret: bool) -> None:
@@ -518,7 +521,7 @@ def synced(interpret: bool) -> None:
     tile at once."""
     if interpret:
         return
-    plgpu.inline_mgpu()(_warpgroup_barrier)()
+    plgpu.inline_mgpu()(WarpgroupBarrier())()
 
 
 MAGIC_INT, MAGIC_FLOAT = 0x4B400000, 12582912.0
@@ -1646,7 +1649,7 @@ class Transport[Allocated, Opened](abc.ABC):
     gathers_rows: bool = False
     """Whether the warpgroup loading its rings gathers a step's rows from a table (a gathered stream's `Rows`
     of one row: `gathered.Ring`, its threads' cp.async copies; a ring family's producer, or a consumer that
-    feeds its rings; mma.sync's one warpgroup beside its pipeline, `mosaic_sm80._gathered_walk`)."""
+    feeds its rings; mma.sync's one warpgroup beside its pipeline, `mosaic_sm80._Gathered`)."""
 
     selects_sources: bool = False
     """Whether a step's view may choose its source at run time among several arrays' views (`rings.Among`, a

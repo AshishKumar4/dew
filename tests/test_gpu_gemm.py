@@ -331,7 +331,9 @@ def _toolkit_cells() -> list[Cell]:
           for consumers, lo in ((1, 0), (2, 0), (2, 3))),
         *(Cell(f"consumers sharing one cp.async pipeline: {consumers} consumers{', split' * split}",
                functools.partial(fed_walks.consumers_sharing_one_pipeline_on_an_a100, consumers, split),
-               "sm80", fault=SHARED)
+               # Its cp.async copies, which Mosaic GPU lowers for the process's own device and refuses on a
+               # GPU copying by TMA (`lowers_as`; train 1378's sm90 prepare).
+               "sm80", mosaic=True, fault=SHARED)
           for consumers, split in ((1, False), (2, False), (2, True))),
     ]
 

@@ -281,6 +281,27 @@ def row_copies(source, rows, slot, *, swizzle: int) -> None:
 
 
 @dataclasses.dataclass(frozen=True)
+class CommitGroup:
+    """`commit_group` as an inlined body of its own type (`plgpu.inline_mgpu`'s function): what a checker
+    reads a commit of the thread's open cp.async group from (tests/ring_protocol.py)."""
+
+    def __call__(self, ctx) -> None:
+        commit_group(ctx)
+
+
+@dataclasses.dataclass(frozen=True)
+class RowCopies:
+    """`row_copies` at `swizzle` as an inlined body of its own type, over `(source, rows, slot)`: what a
+    checker reads its copies into `slot` from (tests/ring_protocol.py)."""
+
+    swizzle: int
+
+    def __call__(self, ctx, source, rows, slot) -> None:
+        del ctx
+        row_copies(source, rows, slot, swizzle=self.swizzle)
+
+
+@dataclasses.dataclass(frozen=True)
 class Gathers:
     """`Committed.load`'s body: its copies by one of the producer's load warps (`share`: its index among them
     and their count): row `r` of `slot` (`[height, width]`, 8-row tiles at `swizzle` bytes) row `rows[r]` of

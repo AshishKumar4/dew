@@ -1,6 +1,6 @@
 """The mma.sync instruction family's bundle (Ampere and its consumer kin, sm80 to sm89 and consumer
 Blackwell; `generation.family` 'mma.sync') for the templates' Mosaic mainloops (`mosaic.Family`): one
-warpgroup a program, its operand tiles streamed into shared memory by `plgpu.emit_pipeline` (cp.async),
+warpgroup a program, its operand tiles streamed into shared memory by its own cp.async walk (`_streamed`),
 read into registers in the MMA layouts (ldmatrix), and multiplied synchronously (mma.sync) into an
 accumulator the walk carries in registers. An accumulator's value is the next product's left operand in
 registers (the fork's relayout, jax 0.11.2.post13 and later), as FlashAttention-2 reuses its fragments.
@@ -13,7 +13,7 @@ import importlib
 import itertools
 import operator
 from collections.abc import Callable, Iterator, Sequence
-from typing import Any, Self
+from typing import Any, ClassVar, Self
 
 import jax
 import jax.numpy as jnp
@@ -42,7 +42,6 @@ from dew.nn.kernels.templates import (
 )
 from dew.nn.kernels.templates.cost import Stated
 from dew.nn.kernels.templates.product import Support
-from dew.nn.programs import meshless
 
 
 def _staging(block: tuple, swizzle: int | None) -> tuple:
@@ -60,132 +59,360 @@ def _at(index_map, placed: Callable, trip):
     return index_map(placed(trip))
 
 
-def _gathered_walk(streams, segments, carry, interpret: bool):
-    """`CpAsync.walk` over streams whose step's rows a table gathers (`Pipeline.gathered`), `segments` as
-    `walk`'s: each stream's slots the walk's own, staged at the swizzle its rows' copy tiles
-    (`gathered.swizzled`), a step's rows copied by the warpgroup a row a copy (`gathered.row_copies`), every
-    stream's copies of a step one cp.async group, as `emit_pipeline` loads its own: a step waits for its own
-    group (`plgpu.wait_gmem_to_smem`, the later groups in flight `stages - 2`, a group committed empty where
-    no step remains to load, so the count stays an immediate), then issues the group of the step `stages - 1`
-    ahead into the slot the step before read, once the warpgroup is past those reads (`mosaic.synced`).
-    Interpreted, each row copied by the program's own loads and stores."""
+@dataclasses.dataclass(frozen=True)
+class _Contiguous:
+    """A walk's copy policy for blocks its operands hold whole (`_filled`): each stream's block a cp.async
+    copy and a group of its own, none committed past the walk's last trip, so a step's wait counts the later
+    steps' groups (`_Walk.run`'s drain); the copy's native lowering guards the reads of the slot it refills.
+    Its slots `_ring`'s, staged swizzled for ldmatrix."""
+
+    sources: dict
+    """Each stream's `[S, D]` operand and its block indices at a trip, by name."""
+
+    empty_commits: ClassVar[bool] = False
+    guards_refill: ClassVar[bool] = False
+
+    def groups(self, pipeline: "Pipeline") -> int:
+        return len(pipeline.blocks)
+
+    def fill(self, walk: "_Walk", slot, trip, ordinal) -> None:
+        """Trip `trip`'s blocks into `slot`, the walk's `ordinal`-th fill, which the walk issues only within
+        its trips (`_Walk.fetched`, `prologue`)."""
+        del ordinal
+        _filled(walk.pipeline, self.sources, walk.slots, slot, trip, walk.interpret)
+
+
+@dataclasses.dataclass(frozen=True)
+class _Gathered:
+    """A walk's copy policy for blocks whose rows a table gathers (`Pipeline.gathered`): a step's rows copied
+    by the warpgroup a row a copy (`gathered.row_copies`, `_row_copied`), every stream's copies one cp.async
+    group, committed empty past the walk's last trip so a step's wait count stays one immediate, and the
+    warpgroup synced before a refill (`mosaic.synced`: no lowering guards its reads of that slot), a
+    one-slot walk's step filling its own slot before its wait. Interpreted, each row copied by the program's
+    own loads and stores. Its slots `_ring`'s, staged at the swizzle its rows' copy tiles."""
+
+    views: dict
+    """Each stream's operand and its gathered rows at a step (`Streams.views`), by name."""
+    placed: Callable
+    """A trip's step in the walk."""
+
+    empty_commits: ClassVar[bool] = True
+    guards_refill: ClassVar[bool] = True
+
+    def groups(self, pipeline: "Pipeline") -> int:
+        del pipeline
+        return 1
+
+    def fill(self, walk: "_Walk", slot, trip, ordinal) -> None:
+        """Trip `trip`'s rows into `slot`, the walk's `ordinal`-th fill (a count past its trips, not wrapped):
+        its copies where the ordinal is one of the walk's trips, its group committed either way."""
+        from dew.nn.kernels.templates import gathered as gathered_rows  # it builds on the toolkit's rings
+
+        @pl.when(ordinal < walk.trips)
+        def _():
+            for name, ring in walk.slots.items():
+                ref, index_map = self.views[name]
+                rows = index_map(self.placed(trip))
+                [depth] = rows.rest
+                height, width = walk.pipeline.blocks[name][0]
+                source = ref.at[:, pl.ds(depth * width, width)]
+                table = rows.table.at[pl.ds(rows.start, height)]
+                # At the swizzle its ring is staged at (`_ring`), the one decision.
+                _row_copied(source, table, ring.at[slot], swizzling.swizzle_of(ring), walk.interpret)
+
+        if not walk.interpret:
+            plgpu.inline_mgpu()(gathered_rows.CommitGroup())()
+
+
+def _depth(pipeline: "Pipeline", steps: int | None) -> int:
+    """The slots a stream's ring holds in a walk of `steps` steps over `pipeline`: a stage each, no more than
+    the walk's steps where they are known."""
+    return pipeline.stages if steps is None else min(pipeline.stages, steps)
+
+
+def _ring(pipeline: "Pipeline", steps: int | None) -> tuple:
+    """The shared memory a walk of `steps` steps over `pipeline`'s streams scopes (`_streamed`, which runs it,
+    and `CpAsync.lifetimes`, which prices it): `_depth`'s slots of each stream's block, its tile staged for
+    the copies that fill it (a gathered walk's at the swizzle its rows' copy tiles, `gathered.swizzled`;
+    another's swizzled for ldmatrix, `_staging`); and, where several consumers run the walk together, the
+    two barriers they meet at in turn, so none arrives at a barrier's next phase before every one has seen
+    its last."""
     from dew.nn.kernels.templates import gathered as gathered_rows  # it builds on the toolkit's rings
 
-    blocks = streams.pipeline.blocks
-    names = tuple(blocks)
-    for step, lo, hi in segments:
-        if isinstance(lo, int) and isinstance(hi, int) and hi <= lo:
+    depth = _depth(pipeline, steps)
+    if pipeline.gathered:
+        slots = tuple(swizzling.staged((depth, *shape), dtype, gathered_rows.swizzled(shape, dtype))
+                      for shape, dtype in pipeline.blocks.values())
+    else:
+        slots = tuple(plgpu.SMEM((depth, *shape), dtype,
+                                 transforms=_staging((shape, dtype), pipeline.swizzles.get(name)))
+                      for name, (shape, dtype) in pipeline.blocks.items())
+    meets = () if pipeline.consumers == 1 else (plgpu.Barrier(num_arrivals=pipeline.consumers,
+                                                             num_barriers=2),)
+    return slots + meets
+
+
+def _filled(pipeline: "Pipeline", sources: dict, slots: dict, slot, trip, interpret: bool) -> None:
+    """Each stream's block of the walk's `trip` (`sources[name]`: its `[S, D]` operand and its block indices
+    at a trip) copied into its `slot`: by cp.async, each copy a group of its own, every consumer its share of
+    the block's rows (whole 8-row tiles of each of a warpgroup's four warps; a vector's whole 16-byte
+    chunks) where several run the walk (the calling one's read where it copies, held live no longer);
+    interpreted, loaded and stored by one consumer alone, so no two write one row. Each
+    read inside its operand: the launch extends every operand its rows read past (`bounded_loads`,
+    `mosaic_gpu._walked_rows`), so each copy is promised in bounds, unchecked."""
+    for name, (shape, _) in pipeline.blocks.items():
+        ref, index_map = sources[name]
+        source = ref.at[tuple(pl.ds(index * size, size) for index, size in zip(index_map(trip), shape,
+                                                                               strict=True))]
+        destination = slots[name].at[slot]
+        if interpret:
+            def copied(source=source, destination=destination):
+                destination[...] = source[...]
+
+            # One consumer's store of the whole block, ordered before any reads by the meets.
+            if pipeline.consumers == 1:
+                copied()
+            else:
+                pl.when(lax.axis_index("wg") == 0)(copied)
             continue
-        known = isinstance(lo, int) and isinstance(hi, int)
-        scoped = _gathered_slots(streams.pipeline, hi - lo if known else None)
-        stages = scoped[0].shape[0]
-
-        def walked(*slots, step=step, lo=lo, hi=hi, stages=stages, carry=carry):
-            def load(index) -> None:
-                # Step `index`'s rows of every stream into its slot, committed as one group (empty past `hi`).
-                @pl.when(index < hi)
-                def _():
-                    for name, ring in zip(names, slots, strict=True):
-                        ref, index_map = streams.views[name]
-                        rows = index_map(index)
-                        [depth] = rows.rest
-                        height, width = blocks[name][0]
-                        source = ref.at[:, pl.ds(depth * width, width)]
-                        table = rows.table.at[pl.ds(rows.start, height)]
-                        slot = ring.at[lax.rem(index - lo, stages)]
-                        # At the swizzle its ring is staged at (`_gathered_slots`), the one decision.
-                        _row_copied(source, table, slot, swizzling.swizzle_of(ring), interpret)
-
-                if not interpret:
-                    plgpu.inline_mgpu()(gathered_rows.commit_group)()
-
-            for ahead in range(stages - 1):
-                load(lo + ahead)
-
-            def body(index, carried):
-                if stages == 1:
-                    mosaic.synced(interpret)
-                    load(index)
-                if not interpret:
-                    plgpu.wait_gmem_to_smem(max(0, stages - 2))
-                if stages > 1:
-                    # The slot the step before read is the one this step's copies `stages - 1` ahead fill.
-                    mosaic.synced(interpret)
-                    load(index + stages - 1)
-                slot = lax.rem(index - lo, stages)
-                started, accumulators = carried
-                tiles = {name: ring.at[slot] for name, ring in zip(names, slots, strict=True)}
-                return step(index, rings.WholeSlots(tiles), started, accumulators)
-
-            return lax.fori_loop(lo, hi, body, carry)
-
-        carry = pl.run_scoped(walked, *scoped)
-    return carry
+        if pipeline.consumers == 1:
+            plgpu.copy_gmem_to_smem(source, destination, None, oob_mode=plgpu.OOBFillMode.PROMISE_IN_BOUNDS)
+            continue
+        rows, threads = shape[0], pipeline.consumers
+        granule = 4 * 8 if len(shape) > 1 else 16 // jnp.dtype(destination.dtype).itemsize
+        if rows % (threads * granule):
+            raise NotImplementedError(f"a block of {rows} rows splits into no {threads} shares of whole "
+                                      f"{granule}-row chunks")
+        part = rows // threads
+        thread = lax.axis_index("wg")
+        for share in range(threads):
+            @pl.when(thread == share)
+            def _(share=share, source=source, destination=destination, part=part):
+                rows_of = pl.ds(share * part, part)
+                plgpu.copy_gmem_to_smem(source.at[rows_of], destination.at[rows_of], None,
+                                        oob_mode=plgpu.OOBFillMode.PROMISE_IN_BOUNDS)
 
 
-def _gathered_slots(pipeline: "Pipeline", steps: int | None) -> tuple:
-    """A gathered walk's ring of each stream (`_gathered_walk`, which scopes them, and `CpAsync.lifetimes`,
-    which sizes them): a slot of each block a stage, no more than the walk's `steps` where they are known,
-    staged at the swizzle its rows' copy tiles (`gathered.swizzled`)."""
-    from dew.nn.kernels.templates import gathered as gathered_rows  # it builds on the toolkit's rings
+def _streamed(pipeline: "Pipeline", copier: "_Contiguous | _Gathered", trips, body: Callable, carry, *,
+              interpret: bool, prefetch: Callable | None = None):
+    """A walk of `trips` steps over `pipeline`'s streams, its stages' slots (`_ring`) a ring each
+    step's blocks are copied into by cp.async (`copier`'s policy: `_Contiguous` blocks, `_Gathered` rows),
+    `body(trip, slots, carry)` giving the next carry from the step's slots (each stream's by name).
+    CUTLASS's multistage order: a step waits for its own copies (`plgpu.wait_gmem_to_smem`, the later
+    steps' groups in flight, its count an immediate: the drain's unrolled where the steps are known, each
+    awaited whole where not, every step's the same where the copier commits a group every step), then
+    fetches the step `stages - 1` ahead into the slot the step before read, the native cp.async lowering's
+    barrier ahead of each copy the guard of those reads (or the copier's sync, `guards_refill`; on an A100
+    the fetch after the body left warps waiting at three warpgroup barriers a step, 13.5% of a dense GEMM's
+    stall samples, row 2152). Its slot is carried, not
+    recomputed (three stages on an A100: the remainder each step ran a GEMM at 13.3 ms against 9.1). Several
+    consumers running it together (`pipeline.consumers`, the kernel's thread axis 'wg') each copy their
+    share of every block and meet past each wait and each step, so every share has landed before any reads
+    and every one has read a slot before any refills it.
 
-    stages = pipeline.stages if steps is None else min(pipeline.stages, steps)
-    return tuple(swizzling.staged((stages, *shape), dtype, gathered_rows.swizzled(shape, dtype))
-                 for shape, dtype in pipeline.blocks.values())
+    With `prefetch(slots)` (two slots or more), a step's first fragments are read under the step before's
+    last product: `body(trip, slots, carry, prefetched, boundary)` returns `(next carry, next prefetched)`,
+    `boundary()`, called once in the body's own trace, awaiting the next step's slots and reading theirs
+    (the step's own standing in past the last step); a walk of trips known only as it runs, none of them,
+    fills no slot and reads none."""
+    known = isinstance(trips, int)
+    stages = _depth(pipeline, trips if known else None)
+    if prefetch is not None and stages == 1 and not (known and trips == 1):
+        raise ValueError("a walk's prefetch needs two slots or more: one is refilled past its step's body")
 
+    def scoped(*refs):
+        copies = len(pipeline.blocks)
+        walk = _Walk(pipeline, copier, trips, stages, interpret, prefetch,
+                     dict(zip(pipeline.blocks, refs[:copies], strict=True)),
+                     refs[copies] if pipeline.consumers > 1 else None)
+        walk.prologue()
+        if prefetch is None or known:
+            return walk.run(body, carry)
+        # A walk of no steps fills no slot and reads none: its carry crosses the guard alone, at the types
+        # the loop gives it (a weak float's promoted to a narrower one).
+        typed = jax.eval_shape(functools.partial(walk.run, body), carry)
+        return lax.cond(trips > 0, functools.partial(walk.run, body), lambda carried: jax.tree.map(
+            lambda value, aval: lax.convert_element_type(value, aval.dtype), carried, typed), carry)
 
-def _specs(pipeline: "Pipeline", index_maps: dict | None = None) -> list:
-    """Each stream's block spec as the walk hands `emit_pipeline` its tiles (`CpAsync.walk`), and as its
-    allocations are read (`_pipelined`, at no `index_maps`, which an allocation does not read): a tile's
-    blocks staged swizzled for ldmatrix (`_staging`), each read inside its operand: its launch extends every
-    operand its rows read past (`bounded_loads`, `mosaic_gpu._walked_rows`), so its copies are promised in
-    bounds, unchecked."""
-    return [plgpu.BlockSpec(shape, None if index_maps is None else index_maps[name],
-                            transforms=_staging((shape, dtype), pipeline.swizzles.get(name)),
-                            oob_fill_mode=plgpu.OOBFillMode.PROMISE_IN_BOUNDS)
-            for name, (shape, dtype) in pipeline.blocks.items()]
-
-
-CP_ASYNC_GENERATION = "sm80"
-"""The generation an mma.sync walk's shared memory is planned for (`_pipelined`): its copies are cp.async's
-on every device the family runs on (`bundles.legal`: no device moving its blocks by TMA runs it), so one
-plan holds for each; Ampere's, the least of them (`generation.BF16_GPU`)."""
-
-
-@functools.lru_cache(maxsize=256)
-def _pipelined(key: tuple, steps: int | None) -> tuple:
-    """The shared memory `emit_pipeline` scopes for a walk of `steps` steps (its stages where they are not
-    known) over the streams `key` names (`_pipeline_key`), as JAX's own builder allocates them
-    (`get_allocations`) for the copies the walk makes (`CP_ASYNC_GENERATION`'s, a slot of each block a stage,
-    fewer for fewer steps, no barrier) and, where several consumers run it together over their thread axis,
-    the two barriers they meet at (`meet_ref`), whatever GPU, mesh or trace the caller is in: traced on an
-    abstract device of that generation, in a trace of its own that runs nothing, once a walk of the candidate
-    search's."""
-    stages, streams, consumers = key
-    pipeline = Pipeline({name: (shape, jnp.dtype(dtype)) for name, shape, dtype, _ in streams}, stages,
-                        {name: swizzle for name, _, _, swizzle in streams if swizzle is not None})
-    found = {}
-
-    def allocated() -> None:
-        built = plgpu.emit_pipeline(lambda *_: None, grid=(stages if steps is None else steps,),
-                                    in_specs=_specs(pipeline), max_concurrent_steps=stages,
-                                    thread_axis=None if consumers == 1 else "wg")
-        found.update(built.get_allocations(*(jax.ShapeDtypeStruct(shape, dtype)
-                                             for shape, dtype in pipeline.blocks.values())))
-
-    planned = generation.gpu_mesh(jax.sharding.AbstractMesh((1,), ("walk",)), CP_ASYNC_GENERATION)
-    threads = () if consumers == 1 else (("wg", consumers),)
-    with meshless(), jax.sharding.use_abstract_mesh(planned), jax_core.extend_axis_env_nd(threads):
-        jax.make_jaxpr(allocated)()
-    leaves = (*found["in_smem_refs"], *found["out_smem_refs"], found["barrier_ref"], found["meet_ref"])
-    return tuple(leaf for leaf in leaves if leaf is not None)
+    return pl.run_scoped(scoped, *_ring(pipeline, trips if known else None),
+                         collective_axes="wg" if pipeline.consumers > 1 else ())
 
 
-def _pipeline_key(pipeline: "Pipeline") -> tuple:
-    """`pipeline`'s streams as `_pipelined` caches their allocations: its stages, each stream's name, tile
-    shape, dtype and named swizzle, and the consumers running it together."""
-    return (pipeline.stages, tuple((name, tuple(shape), jnp.dtype(dtype).name, pipeline.swizzles.get(name))
-                                   for name, (shape, dtype) in pipeline.blocks.items()), pipeline.consumers)
+@dataclasses.dataclass(frozen=True)
+class _Walk:
+    """`_streamed`'s walk within its scope: its streams' `slots` (each stream's ring by name) and, where
+    several consumers run it, the two barriers they `meets` at in turn (`_ring`)."""
+
+    pipeline: "Pipeline"
+    copier: "_Contiguous | _Gathered"
+    trips: "int | jax.Array"
+    stages: int
+    interpret: bool
+    prefetch: Callable | None
+    slots: dict
+    meets: Any
+
+    @property
+    def known(self) -> bool:
+        return isinstance(self.trips, int)
+
+    @property
+    def lead(self) -> int:
+        """1 where the step fetches before its body (two slots or more, or a copier syncing before its
+        refill, `guards_refill`), 0 where after it."""
+        return int(self.stages > 1 or self.copier.guards_refill)
+
+    @property
+    def own(self) -> bool:
+        """Whether a step fetches its own trip, before its wait: a one-slot walk fetching before its body."""
+        return self.stages - self.lead == 0
+
+    @property
+    def copies(self) -> int:
+        """The cp.async groups a step's fetch commits (`copier.groups`)."""
+        return self.copier.groups(self.pipeline)
+
+    def meet(self) -> None:
+        if self.meets is not None:
+            for barrier in (self.meets.at[0], self.meets.at[1]):
+                plgpu.barrier_arrive(barrier)
+                plgpu.barrier_wait(barrier)
+
+    def landed(self, count: int) -> None:
+        """This step's copies landed, each consumer's share of them, the later steps' `count` in flight."""
+        if not self.interpret:
+            plgpu.wait_gmem_to_smem(count)
+        self.meet()
+
+    def at(self, slot) -> dict:
+        return {name: ring.at[slot] for name, ring in self.slots.items()}
+
+    def following(self, slot):
+        wrapped = slot + 1
+        return jnp.where(wrapped == self.stages, 0, wrapped)
+
+    def wrapped(self, trip):
+        """The trip after `trip`, the first past the last: a count the compiler takes for no induction
+        variable, so it peels no step off the walk's loop for a body's test of its trip and shares no address
+        with the prologue's copies (an A100's recurrence, peeled, contracted its sums into fmas whose operands
+        spilled; its fused backward held the prologue's operand base live through the walk, spilling 8
+        bytes), as Mosaic GPU's pipelines carry their grid indices."""
+        following = trip + 1
+        return jnp.where(following == self.trips, 0, following)
+
+    def fetched(self, index, ahead, slot) -> None:
+        """The fetch of trip `ahead` (wrapped) into `slot`, the walk's `index`-th step's, the walk's fill
+        `index + stages - lead` (not wrapped): a copier committing a group every step (`empty_commits`) fills
+        each, past the last trip an empty one; another fills a trip the walk holds alone."""
+        ordinal = index + (self.stages - self.lead)
+        if self.copier.guards_refill:
+            mosaic.synced(self.interpret)
+        if self.copier.empty_commits:
+            self.copier.fill(self, slot, ahead, ordinal)
+            return
+        lax.cond(ordinal < self.trips, lambda: self.copier.fill(self, slot, ahead, ordinal), lambda: None)
+
+    def prologue(self) -> None:
+        """The steps before the first fetched, a slot each, its trip carried (`wrapped`) beside the slot,
+        the loop's index."""
+        def filled(slot, trip):
+            # The loop's index the fill's slot and its ordinal, its trip carried wrapped.
+            self.copier.fill(self, slot, trip, slot)
+            return self.wrapped(trip)
+
+        # Every stage-ahead slot where each commits a group however few trips remain; else the trips there
+        # are, a traced count in its own dtype (an int64 segment's under x64), which `lax.min` matches.
+        if self.copier.empty_commits or isinstance(self.trips, int):
+            count = self.stages - self.lead
+            known = True
+        else:
+            count = lax.min(jnp.asarray(self.stages - self.lead, self.trips.dtype), self.trips)
+            known = False
+        lax.fori_loop(0, count, filled, jnp.int32(0), unroll=known)
+
+    def boundary(self, index, slot, prefetched, next_wait: int) -> tuple[Callable, list]:
+        """A step's boundary (`_streamed`'s `prefetch`) and the record of its calls: the next step's slots
+        awaited and their first fragments read, once in the body's trace (a wait under a cond or a loop would
+        run on some paths alone while the next step skips its own), the step's own standing in past the last
+        step."""
+        prefetch, outer, called = self.prefetch, jax_core.trace_ctx.trace, []
+        assert prefetch is not None
+
+        def boundary():
+            if jax_core.trace_ctx.trace is not outer or called:
+                raise ValueError("a walk's body calls its boundary once, in its own trace")
+            called.append(True)
+            self.landed(next_wait)
+            return lax.cond(index + 1 < self.trips, lambda: prefetch(self.at(self.following(slot))),
+                            lambda: prefetched)
+
+        return boundary, called
+
+    def step(self, body: Callable, index, state, *, wait: int, next_wait: int):
+        """One step: its trip and the one it fetches carried (`wrapped`), as its slot and the one it fills
+        are; its tests read the loop's `index`."""
+        trip, ahead, carried, slot, fill_slot, prefetched = state
+        if self.own:
+            self.fetched(index, ahead, fill_slot)
+        if self.prefetch is None:
+            self.landed(wait)
+        if self.lead and not self.own:
+            self.fetched(index, ahead, fill_slot)
+        if self.prefetch is None:
+            carried = body(trip, self.at(slot), carried)
+        else:
+            boundary, called = self.boundary(index, slot, prefetched, next_wait)
+            carried, prefetched = body(trip, self.at(slot), carried, prefetched, boundary)
+            if not called:
+                raise ValueError("a walk's body with a prefetch calls its boundary: the next step does not "
+                                 "wait for its slots")
+        # Every consumer has read the slot before any refills it, and before the slots leave scope.
+        self.meet()
+        if not self.lead:
+            self.fetched(index, ahead, fill_slot)
+        return (self.wrapped(trip), self.wrapped(ahead), carried, self.following(slot),
+                self.following(fill_slot), prefetched)
+
+    def run(self, body: Callable, carried):
+        """The walk's steps from its first, its carry `carried`: the steady ones leaving every later group in
+        flight, then the drain (unrolled at fewer where the steps are known, each awaited whole where not)."""
+        stages, lead, copies = self.stages, self.lead, self.copies
+        first = None
+        if self.prefetch is not None:
+            # The first step's slots, awaited before the loop as each later step's are by the one before (its
+            # boundary): past the groups the prologue issued after the first step's, every one where the steps
+            # are not known.
+            self.landed((stages - lead - 1) * copies if self.known else 0)
+            first = self.prefetch(self.at(jnp.int32(0)))
+        ahead = jnp.int32(0)
+        for _ in range(stages - lead):
+            ahead = self.wrapped(ahead)
+        state = (jnp.int32(0), ahead, carried, jnp.int32(0), jnp.int32((stages - lead) % stages), first)
+        # The steps whose wait leaves every later group in flight, the last of them stopping one short where
+        # a boundary awaits the next step's slots at the next step's count.
+        steady = self.trips - (stages - 1 - lead) - (self.prefetch is not None)
+        in_flight = max(0, stages - 1 - lead) * copies
+        if self.copier.empty_commits:
+            # Every step's wait the same: the later stages' groups always committed, empty past the last.
+            state = lax.fori_loop(0, self.trips, functools.partial(self.step, body, wait=in_flight,
+                                                                   next_wait=in_flight), state)
+        elif isinstance(self.trips, int):
+            state = lax.fori_loop(0, max(0, steady), functools.partial(self.step, body, wait=in_flight,
+                                                                       next_wait=in_flight), state)
+            # A wait's count an immediate: the drain unrolled, each step's fewer.
+            for index in range(max(0, steady), self.trips):
+                state = self.step(body, jnp.int32(index), state, wait=(self.trips - 1 - index) * copies,
+                                  next_wait=max(0, self.trips - 2 - index) * copies)
+        else:
+            steady = jnp.maximum(steady, 0)
+            state = lax.fori_loop(0, steady, functools.partial(self.step, body, wait=in_flight,
+                                                               next_wait=in_flight), state)
+            state = lax.fori_loop(steady, self.trips, functools.partial(self.step, body, wait=0, next_wait=0),
+                                  state)
+        # No copy outlives the walk's scope: every group its fills committed retired as the scope ends.
+        if not self.interpret:
+            plgpu.wait_gmem_to_smem(0)
+        return state[2]
 
 
 def _row_copied(source, table, slot, swizzle: int, interpret: bool) -> None:
@@ -201,9 +428,7 @@ def _row_copied(source, table, slot, swizzle: int, interpret: bool) -> None:
         return
     transforms = swizzling.swizzle_transforms(source.dtype, swizzle)
     refs = (plgpu.RefType(), plgpu.RefType(), plgpu.RefType(transforms))
-    plgpu.inline_mgpu(arg_types=refs)(
-        lambda ctx, source, rows, slot: gathered_rows.row_copies(source, rows, slot, swizzle=swizzle))(
-            source, table, slot)
+    plgpu.inline_mgpu(arg_types=refs)(gathered_rows.RowCopies(swizzle))(source, table, slot)
 
 
 def swizzled(shape: tuple[int, ...], dtype) -> tuple:
@@ -228,7 +453,7 @@ def _depth_granule(ref, axis: int, instruction: int) -> int:
 @dataclasses.dataclass(frozen=True)
 class Pipeline:
     """A program's operand streams as `Mma.streams` describes them: each stream's tile `(shape, dtype)` by
-    name, the tiles `emit_pipeline` keeps in flight (`stages`) and the consumer warpgroups that run it
+    name, the tiles its walk keeps in flight (`stages`, `_streamed`) and the consumer warpgroups that run it
     together (`consumers`, its thread axis 'wg' where two); it allocates their slots itself."""
 
     blocks: dict
@@ -238,9 +463,9 @@ class Pipeline:
     gathered: tuple = ()
     """The streams whose step's rows a table gathers (a `Rows` view of one row a run): the warpgroup's own
     cp.async copies, a row a copy (`gathered.row_copies`), into slots of the walk's own, in the pipeline's
-    cp.async groups (`_gathered_walk`); a walk gathers every stream or none."""
+    cp.async groups (`_Gathered`); a walk gathers every stream or none."""
     consumers: int = 1
-    """The consumer warpgroups that run its pipeline together (`emit_pipeline`'s thread axis 'wg' where
+    """The consumer warpgroups that run its walk together (`_streamed`, the kernel's thread axis 'wg' where
     two), each copying an equal share of every block and reading every slot whole."""
 
 
@@ -705,7 +930,7 @@ class MmaIssuer(mosaic.Issuer[jax.Array]):
         # A step's fresh accumulator starts from zeros tied to the running sum (an optimization barrier),
         # so no step's products issue before the last step's add. Its products are values, independent of
         # the running sum, so the compiler otherwise issued an unrolled walk's steps at once
-        # (`emit_pipeline`'s drain), a whole accumulator live each: at five stages three beside the running
+        # (`_streamed`'s drain), a whole accumulator live each: at five stages three beside the running
         # sum, 616 bytes spilled at the A100 forward's 128 x 128 tile; a traced grid's walk, its drain not
         # unrolled, spilled none (NSDBG-5).
         running, fresh = lax.optimization_barrier((running, self.zeros(running.shape)))
@@ -801,13 +1026,13 @@ def _tf32_product(ctx, acc, left, right):
 
 class CpAsync(mosaic.Family[Pipeline, Streams, jax.Array]):
     """The execution policy before Hopper (`mosaic.Transport`): one or two compute warpgroups a program and
-    no producer, its loads `emit_pipeline`'s cp.async copies into each walk's own slots (two consumers run
-    one pipeline over their thread axis 'wg', each copying its share of every block and meeting the other
-    before a slot is read and before it is refilled: FlashAttention 2's eight warps over one shared tile),
-    its accumulators in the pipeline's carry (a register home), its output stored through registers. A
+    no producer, its loads cp.async copies into each walk's own slots (`_streamed`; two consumers run one
+    walk over their thread axis 'wg', each copying its share of every block and meeting the other before a
+    slot is read and before it is refilled: FlashAttention 2's eight warps over one shared tile), its
+    accumulators in the walk's carry (a register home), its output stored through registers. A
     family whose issuer half an issuer composed with it gives (`Mma`)."""
 
-    walks_scoped = True  # `emit_pipeline` allocates each walk's slots in its own scope
+    walks_scoped = True  # `_streamed` allocates each walk's slots in its own scope
 
     stores_narrowed = True  # a narrowed output staged whole at its stored shape, at its caller's place
 
@@ -816,7 +1041,7 @@ class CpAsync(mosaic.Family[Pipeline, Streams, jax.Array]):
     @property
     def shared_consumers(self) -> int:
         # Two consumer warpgroups run one collective pipeline at most, each copying its share of every block
-        # (`emit_pipeline`'s thread_axis), as FlashAttention 2's eight warps share a step's queries over two
+        # (`_streamed`'s thread axis), as FlashAttention 2's eight warps share a step's queries over two
         # key halves: a launch that names two (the A100 backward's dK/dV, its dQ adds halved, row 5272), not
         # a derivation's own pick (`consumers`).
         return 2
@@ -824,7 +1049,7 @@ class CpAsync(mosaic.Family[Pipeline, Streams, jax.Array]):
     def compiled_with(self, *, approx_math: bool) -> plgpu.CompilerParams:
         # Its kernels' lane-level lowering (`kernel`'s), Mosaic GPU's default.
         return plgpu.CompilerParams(approx_math=approx_math)
-    prefetches_fragments = True  # `emit_pipeline`'s `prefetch`: a step's first fragments under the last's
+    prefetches_fragments = True  # `_streamed`'s `prefetch`: a step's first fragments under the last's
 
     # Its programs fix a tile up across programs through global-memory atomics (`Family.fixed_up`), which
     # sm_70 on issues: a balanced tail's and a decode's split partials merge in the launch.
@@ -840,8 +1065,8 @@ class CpAsync(mosaic.Family[Pipeline, Streams, jax.Array]):
     stores_through_registers = True
 
     copies_vectors = False  # cp.async spreads a copy over the warpgroup's threads, 128 elements at least
-    gathers_rows = True  # its one warpgroup's cp.async copies gather a step's rows (`_gathered_walk`)
-    # `emit_pipeline` would allocate a folded once block a slot per stage in the walk's scope, where its
+    gathers_rows = True  # its one warpgroup's cp.async copies gather a step's rows (`_Gathered`)
+    # `_streamed` would allocate a folded once block a slot per stage in the walk's scope, where its
     # planned once allocation (`lifetimes`) holds one: no once stream walks here until the plan counts it.
     walks_once = False
     gathers_alone = False  # its walk gathers every stream's rows or none (`streams`)
@@ -927,18 +1152,11 @@ class CpAsync(mosaic.Family[Pipeline, Streams, jax.Array]):
 
 
     def lifetimes(self, streams: Pipeline, steps: int | None = None) -> tuple[tuple, tuple]:
-        # A walk's shared memory in its own scope: `emit_pipeline`'s, as JAX's builder allocates it for its
-        # cp.async copies (`_pipelined`), or a gathered walk's own rings (`_gathered_slots`); none for a walk
+        # A walk's shared memory in its own scope, the one plan its walk allocates (`_ring`); none for a walk
         # of no steps, which the walk skips.
         if steps == 0:
             return (), ((),)
-        if streams.gathered:
-            return (), (_gathered_slots(streams, steps),)
-        # Keyed by its slots, `steps` only where fewer than its stages (`emit_pipeline` allocates
-        # min(stages, steps)): a call's every depth past them plans one walk, not one each (row 11639); two
-        # consumers running it together, the barriers they meet at among them.
-        slots = steps if steps is not None and steps < streams.stages else None
-        return (), (_pipelined(_pipeline_key(streams), slots),)
+        return (), (_ring(streams, steps),)
 
     def opened(self, allocated, views: dict | None = None):
         if views is None:
@@ -1026,12 +1244,12 @@ class CpAsync(mosaic.Family[Pipeline, Streams, jax.Array]):
                 first: jax.Array | int = 0, in_flight: int = 0, initial: tuple | None = None,
                 unrolled: bool = False, products: Sequence[mosaic.Product] = (),
                 prefetch: Callable | None = None) -> tuple[C, tuple[jax.Array, ...]]:
-        # Its products are synchronous: none stays in flight past its step, and `emit_pipeline` gives
+        # Its products are synchronous: none stays in flight past its step, and `_streamed` gives
         # each stage back as its step ends, so no step holds one past it, nor reads one ahead. With
-        # `prefetch(slots)` (`prefetches_fragments`), `emit_pipeline` reads a step's first fragments under the
+        # `prefetch(slots)` (`prefetches_fragments`), `_streamed` reads a step's first fragments under the
         # step before's last product: each step is given them and the boundary that reads the next's
         # (`step(..., prefetched=, boundary=)`, returning its carry and the next's fragments), where it keeps
-        # two slots or more (its prefetch's own refill) and gathers no rows (`_gathered_walk`'s own copies);
+        # two slots or more (its prefetch's own refill) and gathers no rows (`_Gathered`'s own copies);
         # elsewhere each step is called as without it.
         if mosaic.ahead_streams(products):
             raise NotImplementedError(f"{self.name}'s pipeline reads no stream ahead")
@@ -1040,17 +1258,15 @@ class CpAsync(mosaic.Family[Pipeline, Streams, jax.Array]):
         blocks = streams.pipeline.blocks
         names = tuple(blocks)
         carry = (start, self.started(shapes, initial))
-        if streams.pipeline.gathered:
-            return _gathered_walk(streams, segments, carry, interpret)
-        prefetching = prefetch is not None and streams.pipeline.stages > 1
+        gathered = streams.pipeline.gathered
+        prefetching = prefetch is not None and streams.pipeline.stages > 1 and not gathered
 
-        def prefetched_of(indices, *slots):
+        def prefetched_of(slots: dict):
             assert prefetch is not None
-            del indices
             return prefetch(slots_of(slots))
 
-        def slots_of(refs) -> rings.WholeSlots:
-            return rings.WholeSlots(dict(zip(names, refs, strict=True)))
+        def slots_of(slots: dict) -> rings.WholeSlots:
+            return rings.WholeSlots(slots)
 
         # Each pipeline's step, its trips' steps (a trip's place in the walk), and its trips.
         walks = [(step, functools.partial(operator.add, lo), hi - lo) for step, lo, hi in segments]
@@ -1074,33 +1290,25 @@ class CpAsync(mosaic.Family[Pipeline, Streams, jax.Array]):
                     prefetching = False
         for step, placed, trips in walks:
             if isinstance(trips, int) and trips <= 0:
-                # No steps: the carry and its zero accumulators as they start (`emit_pipeline` takes no
-                # empty grid).
+                # No steps: the carry and its zero accumulators as they start (no slot to fill).
                 continue
 
-            def body(indices, *refs, step=step, placed=placed):
-                (trip,) = indices
+            def body(trip, slots, carried, *ahead, step=step, placed=placed):
+                carried, accumulators = carried
                 if prefetching:
-                    *slots, (carried, accumulators), prefetched, boundary = refs
-                    (carried, accumulators), following = step(
-                        placed(trip), slots_of(slots), carried, accumulators, prefetched=prefetched,
-                        boundary=boundary)
-                    return (carried, accumulators), following
-                carried, accumulators = refs[-1]
-                return step(placed(trip), slots_of(refs[:-1]), carried, accumulators)
+                    prefetched, boundary = ahead
+                    return step(placed(trip), slots_of(slots), carried, accumulators, prefetched=prefetched,
+                                boundary=boundary)
+                return step(placed(trip), slots_of(slots), carried, accumulators)
 
-            specs = _specs(streams.pipeline,
-                           {name: functools.partial(_at, streams.views[name][1], placed) for name in names})
-
-            # Two consumers run one pipeline, each copying its share of every block (`thread_axis`). A
-            # pipeline that prefetches reads a step's fragments only once a copy filled its slot (Dew's fork
-            # at post131, row 12695), so a segment whose trips are known only as it runs (a common
-            # segment's) runs its pipeline whatever their count: an empty one prefetches nothing.
-            carry = plgpu.emit_pipeline(
-                body, grid=(trips,), in_specs=specs, max_concurrent_steps=streams.pipeline.stages,
-                init_carry=carry, prefetch=prefetched_of if prefetching else None,
-                thread_axis=None if streams.pipeline.consumers == 1 else "wg",
-            )(*(streams.views[name][0] for name in names))
+            # A walk that prefetches reads a step's fragments only once a copy filled its slot (row 12695),
+            # so a segment whose trips are known only as it runs (a common segment's) runs its walk whatever
+            # their count: an empty one prefetches nothing (`_streamed`).
+            copier = (_Gathered(streams.views, placed) if gathered else _Contiguous(
+                {name: (streams.views[name][0], functools.partial(_at, streams.views[name][1], placed))
+                 for name in names}))
+            carry = _streamed(streams.pipeline, copier, trips, body, carry, interpret=interpret,
+                              prefetch=prefetched_of if prefetching else None)
         return carry
 
     def passed(self, streams, lo, hi, *, first: jax.Array | int = 0, between=None) -> None:
@@ -1108,7 +1316,7 @@ class CpAsync(mosaic.Family[Pipeline, Streams, jax.Array]):
 
     def walk_own[R](self, streams, views: dict, own: tuple, streamed: tuple, wg,
                     walk: Callable[..., R], *, between=None, counted=0, common: bool = False) -> R:
-        # Two consumers run one collective pipeline (`thread_axis`), whose meets pair their steps: each
+        # Two consumers run one collective walk (`_streamed`), whose meets pair their steps: each
         # walks every streamed step, its step masking those outside its own range, as a consumer-fed
         # family's do (`ConsumerFed.walk_own`; a causal attention program's two consumers reach different
         # diagonals, and walks of their own ranges would meet unpaired). One consumer walks its own.
@@ -1178,7 +1386,7 @@ class CpAsync(mosaic.Family[Pipeline, Streams, jax.Array]):
 
 @dataclasses.dataclass(frozen=True)
 class Mma(MmaIssuer, CpAsync):
-    """mma.sync's bundle: its issuer and register home (`MmaIssuer`) on `emit_pipeline`'s cp.async policy
+    """mma.sync's bundle: its issuer and register home (`MmaIssuer`) on its walk's cp.async policy
     (`CpAsync`)."""
 
     name = "mma.sync"

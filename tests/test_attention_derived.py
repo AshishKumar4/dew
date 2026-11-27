@@ -16,6 +16,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from generation_support import COMPILES_ON_CPU
+from jax.sharding import Mesh
 from reference_error import assert_as_exact
 from test_algebra_derive import shaped, walked
 
@@ -1094,7 +1095,9 @@ def test_row_indexed_hooks_take_and_lower_at_fewer_rows_on_mma_sync():
     ]
     pins = [attention_mosaic.BackwardTiles(block_q=rows, block_k=32, stages=2, consumers=1, fused=False,
                                            family="mma.sync") for rows in (32, 64)]
-    with generation.assumed("sm80"):
+    # Lowered for the A100 itself (its compile-only mesh), where its walks' copies are cp.async's.
+    mesh = generation.gpu_mesh(Mesh(np.array(jax.devices()[:1]), ("data",)), "sm80")
+    with generation.assumed("sm80"), jax.sharding.use_abstract_mesh(mesh):
         target = generation.gpu_target()
         for spans, hooks in cases:
             op, args = attention_mosaic._backward_call(

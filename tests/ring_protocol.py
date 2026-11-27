@@ -68,7 +68,7 @@ from jax.experimental.pallas import mosaic_gpu as plgpu
 from jax.extend import core as jcore
 
 from dew.nn import derivatives
-from dew.nn.kernels.templates import across, after_walk, gathered
+from dew.nn.kernels.templates import across, after_walk, gathered, mosaic
 from dew.nn.programs import called
 
 THREAD_AXIS = "wg"
@@ -200,11 +200,8 @@ class _Interpreter:
     def scanned(self, params, values) -> list:
         # The scan's operands in its three groups (`ft_in`: consts, carry, stacked), each group's count its
         # leaves'.
-        num_consts, num_carry, _ = (len(jax.tree.leaves(group, is_leaf=lambda leaf: leaf is None))
-                                    for group in params["ft_in"].elts)
-        consts = values[:num_consts]
-        carry = values[num_consts:num_consts + num_carry]
-        stacked = values[num_consts + num_carry:]
+        consts, carry, stacked = map(list, params["ft_in"].update(values).unpack())
+        num_carry = len(carry)
         body = params["jaxpr"]
         for index in range(params["length"]):
             sliced = [None if value is None else value[index] for value in stacked]
@@ -256,7 +253,12 @@ class _Interpreter:
                                  num_arrivals=inner.dtype.num_arrivals if barrier else 0,
                                  shape=tuple(inner.shape)))
         self.allocated += allocated
-        return self.run(jaxpr, [], [*values, *allocated])
+        before = len(self.events)
+        found = self.run(jaxpr, [], [*values, *allocated])
+        if any(event.kind.startswith("cp_") for event in self.events[before:]):
+            # A scope its cp.async copies wrote into ends: its allocations' memory no longer its own.
+            self.emit("cp_scope_end", (), frozenset(ref.name for ref in allocated))
+        return found
 
     def emit(self, kind: str, at: tuple = (), argument=None) -> list:
         self.events.append(Event(kind, at, argument))
@@ -438,7 +440,11 @@ def _load(self: _Interpreter, equation, values) -> list:
                                                                           "a load's predicate"))):
         return []
     destination = _slot(refs[1], trees[1], leaves[split[1]:split[2]])
-    barrier = _slot(refs[2], trees[2], leaves[split[2]:split[3]]) if refs[2] is not None else ()
+    if refs[2] is None:
+        # A pre-Hopper load's cp.async copy, committed as a group of its own (`LaunchContext.async_copy`).
+        self.emit("cp_copy", destination)
+        return self.emit("cp_commit")
+    barrier = _slot(refs[2], trees[2], leaves[split[2]:split[3]])
     return self.emit("load", destination, barrier)
 
 
@@ -463,6 +469,12 @@ def _store_wait(self: _Interpreter, equation, values) -> list:
 
 def _commit(self: _Interpreter, equation, values) -> list:
     return self.emit("commit")
+
+
+def _cp_wait(self: _Interpreter, equation, values) -> list:
+    """A wait for the thread's cp.async groups (`wait_gmem_to_smem`), its argument the latest committed
+    groups it leaves in flight."""
+    return self.emit("cp_wait", (), equation.params["n"])
 
 
 def _access(kind: str, indexed: int) -> Callable:
@@ -599,7 +611,7 @@ SYNC: dict[str, Callable] = {
     "async_copy_smem_to_tmem": _tmem_copy, "async_store_tmem": _tmem_store, "async_load": _tmem_load,
     "wait_load_tmem": _tmem_load_wait, "commit_tmem": _tmem_commit, "copy_gmem_to_smem": _load,
     "copy_smem_to_gmem": _store, "commit_group": _store_group, "wait_smem_to_gmem": _store_wait,
-    "commit_smem": _commit,
+    "commit_smem": _commit, "wait_gmem_to_smem": _cp_wait,
     "get": _access("read", 1), "load": _access("read", 1), "swap": _access("write", 2),
     "wgmma": _product, "wgmma_ref": _wgmma_product, "wgmma_wait": _product_wait,
 }
@@ -899,10 +911,26 @@ def _entry_events(self: _Interpreter, events: list, entries, warp: int, step: in
             self.emit(kind, (entries, argument, warp), ("filled", step))
 
 
+def _row_copies(self: _Interpreter, body: gathered.RowCopies, values, located) -> None:
+    """A warpgroup's cp.async copies of a slot's rows (`gathered.RowCopies`): copies into its slot, in the
+    thread's open group."""
+    del body, values
+    self.emit("cp_copy", located[2])
+
+
+def _commit_group(self: _Interpreter, body: gathered.CommitGroup, values, located) -> None:
+    """A commit of the thread's open cp.async group (`gathered.CommitGroup`), empty where no copy is open."""
+    del body, values, located
+    self.emit("cp_commit")
+
+
 INLINED: dict[type, Callable] = {gathered.Initialized: _initialized, gathered.Waited: _waited,
                                  gathered.Gathers: _gathers, gathered.Started: _started,
                                  gathered.Drained: _drain, gathered.Filled: _filled,
-                                 across.LaneZero: _unsynchronized, across.ScaleSmem: _scale_smem}
+                                 across.LaneZero: _unsynchronized, across.ScaleSmem: _scale_smem,
+                                 gathered.RowCopies: _row_copies, gathered.CommitGroup: _commit_group,
+                                 # One program a warpgroup orders its own threads already.
+                                 mosaic.WarpgroupBarrier: _unsynchronized}
 """Each inlined body a checked kernel takes (`plgpu.inline_mgpu`'s function, by its type), as the `Event`s
 its fields and its operands state: the arrivals a phase of the barriers a gathered ring initializes, its
 parity waits at a turn's rotation, and its load warps' gathers. A body of no synchronization (a fence, a
@@ -935,6 +963,44 @@ def programs(kernel: Callable, *operands, threads: int, launch: int = 0, rare: b
         arrivals.update({ref.name: ref.num_arrivals for ref in interpreter.allocated if ref.barrier})
         arrivals.update(interpreter.initialized)
     return found, arrivals
+
+
+def cp_async_violations(program: list[Event]) -> list[str]:
+    """One warpgroup's program's violations of cp.async's semantics (PTX ISA, `cp.async.commit_group`,
+    `cp.async.wait_group`): a copy pending in the thread's open group until a commit closes it, a wait
+    retiring every committed group but its latest `n`, its copies' bytes landed then. Each in program order:
+    a copy into memory another pending copy writes (either's bytes may land last); a read or write of memory
+    a pending copy writes (its bytes may land after); a read of a copied ring's memory no landed copy wrote
+    (a slot never filled); and a scope's end with a copy pending into its allocations (its memory another's
+    next)."""
+    copied = {block[0] for event in program if event.kind == "cp_copy" for block in _each(event.at)}
+    open_copies: list = []
+    groups: list[list] = []
+    landed: list = []
+    found = []
+    for index, event in enumerate(program):
+        pending = [at for group in groups for at in group] + open_copies
+        if event.kind == "cp_copy":
+            if clashing := [at for at in pending if _overlaps(at, event.at)]:
+                found.append(f"event {index}: a copy into {event.at} while copies into {clashing} are "
+                             "pending")
+            open_copies.append(event.at)
+        elif event.kind == "cp_commit":
+            groups.append(open_copies)
+            open_copies = []
+        elif event.kind == "cp_wait":
+            retired = max(0, len(groups) - int(event.argument))
+            landed += [at for group in groups[:retired] for at in group]
+            del groups[:retired]
+        elif event.kind in ("read", "write") and any(_overlaps(at, event.at) for at in pending):
+            found.append(f"event {index}: a {event.kind} of {event.at} while a copy into it is pending")
+        elif (event.kind == "read" and {block[0] for block in _each(event.at)} & copied
+              and not any(_overlaps(at, event.at) for at in landed)):
+            found.append(f"event {index}: a read of {event.at}, which no landed copy wrote")
+        elif event.kind == "cp_scope_end":
+            if left := [at for at in pending if {block[0] for block in _each(at)} & event.argument]:
+                found.append(f"event {index}: its scope ends with copies pending into {left}")
+    return found
 
 
 def _bodies(jaxpr: jcore.Jaxpr) -> Iterator[jcore.ClosedJaxpr]:

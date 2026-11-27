@@ -51,31 +51,34 @@ JAX's `plgpu.emit_pipeline`, at 0.11.2 and at 0.12 (pyjax012 `jax/_src/pallas/mo
 Bible §1 and the owner: integrate JAX's machinery where it is as good or better, and fix its gaps in the
 fork.
 
-1. **mma.sync walks through `emit_pipeline`** (J, aa3936052). This means one call per segment, a dynamic grid,
-   and the derived stages as `max_concurrent_steps`. A walk's segments each drain. GEMM walks have one segment
-   and the recurrence's have one a document range. The round times a recurrence walk at one, two and four
-   documents (§8), each its own segment count and grid, so the drain's cost is bounded, not isolated.
-2. **The fork gives `emit_pipeline`'s cp.async path a collective thread axis** (JAX fork, `pipeline.py:384`,
-   matching `docs/installation.md`). `BlockSpec.collective_axes` stays refused on `emit_pipeline`
-   (`pl.BlockSpec with collective_axes= is not supported`); instead `emit_pipeline(..., thread_axis="wg")`
-   runs every thread of a kernel's warpgroups collectively over one input pipeline of shared buffers:
-   - **Copy.** Each block's first axis splits evenly over the `thread_axis` threads: whole 8-row tiles of a
-     2-D block, whole 16-byte chunks of a vector. Each thread issues its share as one cp.async group a stream
-     a step.
-   - **Ready.** Before `body` reads step s, each thread waits for its own copies of s, then all threads meet
-     at a barrier of the axis's size (the "ready" meet). Past it, every thread's share of slot s has landed.
-   - **Consumed.** JAX's schedule refills slot s right after `body` (:498-516). So before that refill, all
-     threads meet again (the "consumed" meet): every thread has finished reading slot s. One such meet guards
-     each refill.
-   - **Waits.** Per thread, the counts are JAX's own (:450, :562): the prologue fills every stage, and the
-     steady state leaves `(stages - 1) x copies_per_step` groups pending, counted in the thread's own groups.
-   - **End.** A final consumed meet precedes the drain, so a later scope may reuse the slots.
-   - **Allocation.** The pipeline allocates its slots and barriers collectively over `thread_axis`, as the
-     interpreter requires of any threaded scoped allocation.
-   - The TMA path keeps its refusal.
-   - Upstream fit: this is the general cp.async form for warpgroup semantics with several threads, the only
-     way an sm80 kernel splits its loads.
-   - The fork carries the change with its own pipeline test: interpreted, and native on an A100 in the round.
+1. **mma.sync walks through Dew's own cp.async schedule** (`mosaic_sm80._streamed`; the fork audit of
+   2026-11-26, A16-A18 and E08, moved it out of the fork's `emit_pipeline` extensions). One call a segment, its
+   trips known or as they run, its stages the derived ones. A walk's segments each drain. GEMM walks have one
+   segment and the recurrence's have one a document range. The round times a recurrence walk at one, two and
+   four documents (§8), each its own segment count and grid, so the drain's cost is bounded, not isolated. Its
+   schedule is CUTLASS's multistage one over Mosaic GPU's public cp.async pieces
+   (`plgpu.copy_gmem_to_smem` with no barrier, `plgpu.wait_gmem_to_smem`, `plgpu.Barrier`):
+   - **Order.** A step waits for its own copies, then fetches `stages - 1` ahead into the slot the step
+     before read (each copy's barrier the guard of those reads), then runs its body; a walk of one slot
+     refills it past its body, the slot's only reader. Its slot, trips and fetch
+     trip are carried, the trips wrapped at the walk's count so the compiler peels no step and shares no
+     address between the prologue and the loop (either spilled an A100's recurrence or fused backward).
+   - **Waits.** A wait's count is an immediate: the steady steps leave `(stages - 1 - lead) x copies` groups
+     pending, and a walk of known trips unrolls its drain at fewer; one of trips known only as it runs awaits
+     every group past its steady steps.
+   - **Collective.** Two consumers (the kernel's thread axis 'wg') each copy their share of every block
+     (whole 8-row tiles of a 2-D block, whole 16-byte chunks of a vector) and meet at two barriers past each
+     wait and each step, so every share has landed before any reads, and every one has read a slot before
+     any refills it.
+   - **Prefetch.** With a step's first fragments read under the step before's last product, the body calls
+     its boundary once in its own trace (the next slots awaited, their fragments read where a step follows);
+     a walk of no trips fills no slot and reads none.
+   - **Allocation.** The walk's shared memory is one plan (`_ring`), which the walk scopes and the family's
+     pricing reads (`CpAsync.lifetimes`), not a trace of JAX's builder.
+   - The TMA path keeps Mosaic GPU's own pipelines.
+2. **The fork carries none of the walk.** A fresh read of a grid coordinate and a register tile's row shift
+   (A23, A24) stay the fork's until each moves with a native parity cell: Mosaic GPU maps a grid's axes to
+   CUDA's reversed and squashes a fourth (a vmapped launch's) into z, which a Dew `%ctaid` read must undo.
 3. **The wgmma bundle's persistent ring is re-evaluated, not assumed.**
    - The cited BUNDLE-new/base2 0.947 is a historical whole-head aggregate. Its base already had a cross-tile
      ring, and its head changed staging and tiles too, so it isolates nothing.
@@ -88,8 +91,8 @@ fork.
      (its `persist` refused `len(tiles) != 1`), so the two-axis launch (4096x4096x14336) ran on the ring
      alone and holds no comparison. The ring stays for every wgmma launch: nothing is gained where both
      ran.
-4. **mma.sync streaming across tiles.** Today each mma.sync tile's `emit_pipeline` drains. The existing
-   alternative is one flattened `emit_pipeline` over (tile, step), carrying the accumulator in `init_carry`,
+4. **mma.sync streaming across tiles.** Each mma.sync tile's walk drains. The alternative was one
+   flattened `emit_pipeline` over (tile, step), carrying the accumulator in `init_carry`,
    storing and resetting it at tile boundaries while JAX prefetches across them (:320-323, :416-427,
    :502-529). Measured, the per-tile form leaves it nothing to recover against Triton (M-FS-95, an A100):
    every grouped GEMM row within 1.05x of it (the slowest, a 128-group MoE forward, about 1.05x), five
@@ -180,11 +183,9 @@ Lifting the eligibility gate is not enough. The hooked paths today assume TMA an
 
 Port ledger 1604's launch plan (`mosaic.Scope`, `reserved`, `Plan`; feat/candidates b61cc94a5) for the
 allocations Dew owns: output and side staging, meeting barriers, reduction scratch.
-- `emit_pipeline` allocates its own slots and barriers, shortening its stages for a short static grid (:326-329,
-  :353-388), and it takes no external allocation.
-- So the fork gives plain `emit_pipeline` the allocation-spec entry its warp-specialized form has
-  (`get_allocations`, :820-942).
-- The descriptor then reads the pipeline's allocations from JAX's own builder, not from a copy of its rules.
+- The mma.sync walk's slots and barriers are one plan (`mosaic_sm80._ring`, §3.1): its stages shortened to a
+  short static walk's steps, its two consumers' meeting barriers beside them. The walk scopes it and the
+  descriptor reads it (`CpAsync.lifetimes`); nothing reads JAX's builder.
 - `staged_bytes` and `legal` read the descriptor. feat/candidates is pruned once the port lands.
 
 ## 7. One derived launch
