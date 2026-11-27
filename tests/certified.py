@@ -1321,7 +1321,7 @@ def _pair_and_plain_held(params, operands, results, fmt) -> list[np.ndarray]:
     return [*paired, plain]
 
 
-def online_spread(shifted, count: int, reach: float, fmt: Format) -> np.ndarray:
+def online_spread(shifted, count: int | np.ndarray, reach: float, fmt: Format) -> np.ndarray:
     """An online softmax's term `e^(x - M)`, `shifted` its `x - M` (at most 0), as its sum holds it: through
     at most `count` combines, each a subtraction of maxima (its error in the exponent, u|m - M|, summing
     along the path to at most u(M - x)), an exponential (`reach`, its relative error), a product and a sum,
