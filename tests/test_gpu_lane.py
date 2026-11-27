@@ -876,7 +876,7 @@ def test_a_green_dry_row_keeps_its_baseline_whatever_its_record_does(ci, monkeyp
         (set(), True) if taken else ({place}, False))
 
 
-@pytest.mark.parametrize("asked", ["tested", "another", "none", "refused"])
+@pytest.mark.parametrize("asked", ["tested", "another", "none", "refused", "tokenless"])
 def test_a_records_off_run_writes_the_baselines_the_stale_row_pass_asks_of_its_own_commit_alone(
         ci, monkeypatch, tmp_path, cache_worker, asked):
     """A run keeping no record (DEW_RECORDS off, ops queue/suspect.sh) writes its green dry prepare's
@@ -884,7 +884,7 @@ def test_a_records_off_run_writes_the_baselines_the_stale_row_pass_asks_of_its_o
     keyed by that commit, graded against the mainline it was given, an earlier one: a train's stale
     prepare row wrote none, so main's baseline stood part-written once it published (row 13049). It writes
     nothing else, and nothing at all where another commit or none is named (a suspect's comparisons); a
-    baseline the Worker refuses leaves its row stale."""
+    baseline the Worker refuses, or a store the run cannot use (its token gone), leaves its row stale."""
     url, stored, seen = cache_worker
     cached(monkeypatch, url)
     monkeypatch.setenv(ci.RECORDS, "off")
@@ -898,6 +898,8 @@ def test_a_records_off_run_writes_the_baselines_the_stale_row_pass_asks_of_its_o
         monkeypatch.setenv(ci.run_keys.BASELINES, "2" * 40 if asked == "another" else head)
     if asked == "refused":
         seen.refusing.add("-baseline/")
+    if asked == "tokenless":
+        monkeypatch.delenv("DEW_XLA_CACHE_TOKEN")
     before = set(stored)
     out = tmp_path / "rows.json"
     ci.tested("3.12", ["tests/test_gpu_a.py"], "", out, 60.0, "off", 5.0, "common", {},
@@ -912,7 +914,7 @@ def test_a_records_off_run_writes_the_baselines_the_stale_row_pass_asks_of_its_o
         assert row["exitCode"] == 0
     else:
         assert written == set()
-        stale = (1, ci.grading.STALE) if asked == "refused" else (0, None)
+        stale = (1, ci.grading.STALE) if asked in ("refused", "tokenless") else (0, None)
         assert (row["exitCode"], row.get("kind")) == stale
 
 

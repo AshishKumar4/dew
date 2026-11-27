@@ -214,15 +214,22 @@ def baselines_asked() -> bool:
     return (given := os.environ.get(BASELINES)) is not None and given == head_commit()
 
 
-def baselines(python: str, rows: list[dict], network: bool = False, until: float | None = None) -> set[str]:
-    """Each green dry prepare's row of `rows` given its baseline at this commit (`baselined`), within `until`
-    where one is given: the rows whose baseline the store did not take, which stand stale (`ci.unbaselined`).
-    None without the store."""
+def baselines(python: str, rows: list[dict], held: str, until: float | None = None, *,
+              asked: bool = False) -> set[str]:
+    """Each green dry prepare's row of `rows` on class `held` given its baseline at this commit (`baselined`),
+    within `until` where one is given: the rows whose baseline the store did not take, which stand stale
+    (`ci.unbaselined`). Without the store, none where a run's records are its own (they write no baseline
+    either); every one due where its baselines were `asked` of it (`BASELINES`): a pass told to write them
+    that cannot leaves no row green without its baseline."""
     token = os.environ.get("DEW_XLA_CACHE_TOKEN")
     if not token or "DEW_XLA_CACHE_URL" not in os.environ:
-        return set()
-    held = device_class(network)
+        return {row_["name"] for row_ in rows if due(row_)} if asked else set()
     return {row_["name"] for row_ in rows if not baselined(python, row_["name"], held, token, row_, until)}
+
+
+def due(ran: Mapping) -> bool:
+    """Whether a row owes this commit a baseline: a green dry prepare's (`baselined`)."""
+    return head_commit() is not None and ran.get("exitCode") == 0 and "unprepared" in ran
 
 
 def baselined(python: str, place: str, held: str, token: str, ran: Mapping,
@@ -230,9 +237,9 @@ def baselined(python: str, place: str, held: str, token: str, ran: Mapping,
     """Whether a dry prepare's green row (`ran`) on class `held` has this commit's baseline (`baseline_key`)
     written now, tried once within `until` where one is given, or none is due; a green row with none stands
     stale (`unbaselined`)."""
-    if (commit := head_commit()) is None or ran.get("exitCode") != 0 or "unprepared" not in ran:
+    if not due(ran):
         return True
-    return written(baseline_key(commit, python, place, held), token,
+    return written(baseline_key(head_commit(), python, place, held), token,
                    json.dumps({"unprepared": ran["unprepared"]}).encode(), tries=1, until=until)
 
 
@@ -437,10 +444,10 @@ def record(python: str, rows: list[dict], log: Path, common: str, network: bool 
         return set()
     # Each green dry prepare's baseline first, whatever of its admission to reuse below (record, key,
     # epoch): a row is named the commit's own only once its baseline is written (`named_at_commit`).
-    unnamed = baselines(python, rows, network, until)
+    held = device_class(network)
+    unnamed = baselines(python, rows, held, until)
     # Each file's record in the process's log (followed.py's `recorded`): none for a file it never reached.
     executed = followed.recorded(log)
-    held = device_class(network)
     if opened is not None:
         recorded = {read for ran in executed.values() for read in ran["depends"] or ()}
         opened = opened | native_inputs(opened, recorded)
