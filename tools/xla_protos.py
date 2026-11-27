@@ -1,12 +1,15 @@
+# /// script
+# dependencies = ["grpcio-tools==1.85.4"]
+# ///
 """Writes src/dew/telemetry/xla_protos.binpb: XLA's xla/xla_data.proto, xla/service/metrics.proto and
 xla/service/hlo.proto and their imports at an openxla/xla commit, one serialized FileDescriptorSet, the schema
 dew.telemetry.hlo reads compiled modules and buffer assignments through; and that commit, as
 `dew.telemetry.hlo.XLA_COMMIT`.
 
-    python -m tools.xla_protos <xla commit>
+    uv run tools/xla_protos.py <xla commit>
 
-The commit is the one the pinned jaxlib was built from. Needs grpcio-tools (its protoc) and the network (the
-protos are fetched from openxla/xla at that commit).
+The commit is the one the pinned jaxlib was built from. Needs the network (the protos are fetched from
+openxla/xla at that commit); its protoc, grpcio-tools, is this script's dependency, not Dew's.
 """
 
 from __future__ import annotations
@@ -28,7 +31,7 @@ def described(root: Path) -> bytes:
     from grpc_tools import protoc
 
     out = root / "set.pb"
-    include = Path(grpc_tools.__file__).parent / "_proto"
+    include = Path(grpc_tools.__path__[0]) / "_proto"
     if protoc.main(["protoc", f"-I{root}", f"-I{include}", "--include_imports", f"--descriptor_set_out={out}",
                     *PROTOS]):
         sys.exit("protoc failed")
@@ -36,9 +39,9 @@ def described(root: Path) -> bytes:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    parser = argparse.ArgumentParser(description=(__doc__ or "").split("\n\n")[0])
     parser.add_argument("commit", help="the openxla/xla commit the pinned jaxlib was built from")
-    commit = parser.parse_args().commit
+    commit: str = parser.parse_args().commit
     if not re.fullmatch(r"[0-9a-f]{40}", commit):
         sys.exit(f"{commit!r} is no full commit")
     with tempfile.TemporaryDirectory() as work:

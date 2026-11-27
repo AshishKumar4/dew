@@ -6,6 +6,7 @@ entering apart, each one's gradient summed at its own shape. A mesh that splits 
 Explicit axis, no layout traced under, or a product no launch takes leaves the product to the partitioner."""
 import contextlib
 import math
+from typing import Any
 
 import jax
 import jax.numpy as jnp
@@ -390,7 +391,7 @@ def test_a_mapped_stacks_weight_reductions_complete_per_layer(axis):
     # outputs after the input's) leads back to its collective, and that to the product it reduces.
     from dew.telemetry import hlo
 
-    proto = hlo.module_proto(step.runtime_executable().hlo_modules()[0])
+    proto: Any = hlo.module_proto(step.runtime_executable().hlo_modules()[0])
     entry = next(each for each in proto.computations if each.id == proto.entry_computation_id)
     names = {each.id: each.name for each in entry.instructions}
     opcodes = {each.name: each.opcode for each in entry.instructions}

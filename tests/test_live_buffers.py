@@ -19,6 +19,7 @@ allocation's peak and each over its heap simulation, each by what made it, the `
 carries and its dimensions' provenance among the call's arguments; on every backend whose compile states an
 assignment (XLA:CPU's, and XLA:GPU's, tests/test_gpu_live_buffers.py)."""
 from pathlib import Path
+from typing import Any
 
 import jax
 import jax.numpy as jnp
@@ -73,7 +74,7 @@ def test_an_interval_shares_memory_only_with_a_buffer_still_live():
     of a live buffer nothing and a buffer of no bytes never."""
     module = module_bytes(INTERVALS)
     defined = instruction_ids(module)
-    assignment = empty_assignment()
+    assignment: Any = empty_assignment()
     ids = {"a": 1, "b": 2, "c": 3, "d": 4, "e": 5, "p": 6, "z": 7}
     sizes = {"z": 0}
     for name, buffer in ids.items():
@@ -119,7 +120,7 @@ def test_a_fusions_output_is_named_by_what_makes_it_where_it_has_no_name():
     it (a gemm's fusion, its cuBLAS call and its workspace); a fusion named itself keeps its own."""
     module = module_bytes(FUSED)
     defined = instruction_ids(module, "e")
-    assignment = empty_assignment()
+    assignment: Any = empty_assignment()
     assignment.buffer_allocations.add(index=0, size=24)
     peak = assignment.peak_buffers.add(index=0)
     for buffer_id, (name, index) in enumerate((("f", [0]), ("f", [1]), ("g", []))):
@@ -140,7 +141,7 @@ def test_a_fusion_output_a_named_getter_selects_keeps_the_getters_name():
     no name, and each keeps the op_name of the instruction making it."""
     module = module_bytes(GOTTEN)
     defined = instruction_ids(module, "e")
-    assignment = empty_assignment()
+    assignment: Any = empty_assignment()
     assignment.buffer_allocations.add(index=0, size=16)
     peak = assignment.peak_buffers.add(index=0)
     for buffer_id, index in enumerate(([0], [1])):
@@ -165,7 +166,7 @@ def test_a_tuple_makers_name_is_its_result_alone_not_its_workspace(call):
     (`dew.training.memory.LiveSet`)."""
     module = module_bytes(TUPLED.replace("CALL", call))
     defined = instruction_ids(module, "e")
-    assignment = empty_assignment()
+    assignment: Any = empty_assignment()
     assignment.buffer_allocations.add(index=0, size=2 * 33554432 + 16)
     peak = assignment.peak_buffers.add(index=0)
     made = (("f", [0], 2097152), ("f", [1], 33554432), ("g", [0], 8), ("g", [1], 8))
@@ -222,7 +223,7 @@ def _loop_names(steps: int, config: str = _STATED) -> dict[str, tuple[str, ...]]
     peak."""
     module = module_bytes(_LOOP.replace(_STATED, config).replace("STEPS", str(steps)))
     defined = instruction_ids(module, "e")
-    assignment = empty_assignment()
+    assignment: Any = empty_assignment()
     assignment.buffer_allocations.add(index=0, size=128)
     peak = assignment.peak_buffers.add(index=0)
     for element, name in enumerate(("zeros", "ones", "populated", "filled", "spread", "blank", "tardy")):
