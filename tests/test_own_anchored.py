@@ -1,9 +1,8 @@
 """A sub-chunk's own pairs under a decay a key dimension as anchored products (`recurrence_algebra`'s
-`own_anchors`, `own_anchored`, `own_compact`, `own_columns`; the kernels' `anchored.step`, `anchored.back`):
-where the guard holds, the pairs each its own decay (check 1); the guard failing at each edge of its range,
-where the kernels take the pairs each its own decay instead; the backward's compact blocks' layout; and a
-query's gradient through the template, interpreted, of two score cotangents that cancel to their 24th bit,
-bit for bit. (Kimi's template under its declared bound on par with
+`own_anchors`, `own_anchored`, `own_compact`; the forward kernel's `anchored.step`): where the guard holds,
+the pairs each its own decay (check 1); the guard failing at each edge of its range, where the kernel takes
+the pairs each its own decay instead; and a query's gradient through the template, interpreted, of two score
+cotangents that cancel to their 24th bit, bit for bit. (Kimi's template under its declared bound on par with
 the portable math, either side of the guard, waits on row 13271: before any anchored product its final
 memory is far off that math's at the bound.)"""
 
@@ -112,12 +111,12 @@ def test_the_guard_fails_past_each_edge_of_its_range(edge, fails):
 
 UNBOUND_QUERIES = dataclasses.replace(SITES['vector delta'], decay_bound=BOUND, unit_queries=False)
 """Kimi delta attention's hooks under its declared bound, its queries free to be zero: the template takes
-its own pairs as anchored products (`anchored.anchoring`)."""
+its forward's own pairs as anchored products (`anchored.anchoring`), its backward's each its own decay."""
 
 
 EXACT_PAIRS = dataclasses.replace(UNBOUND_QUERIES, decay_bound=None)
-"""The same hooks with no bound declared: the template's own pairs each their own decay
-(`anchored.anchoring`), the reference the anchored backward is held to."""
+"""The same hooks with no bound declared: the template's own pairs each their own decay, forward and back
+(`anchored.anchoring`), the reference the bounded call's gradients are held to."""
 
 
 def _cancelling(seed):
@@ -153,20 +152,20 @@ def _token_by_token(operands, cotangent):
 @COMPILES_ON_CPU
 @pytest.mark.check1_shards(seeds=8, per_task=8)
 def test_a_query_gradient_of_cancelling_score_cotangents_is_as_exact_as_the_exact_pairs():
-    """The cancelling draws' gradients through the template's anchored backward (`anchored.back`),
-    interpreted, on par from float64 with its pairs each their own decay (check 1, `EXACT_PAIRS`): staged in
-    two bf16 parts, both score cotangents took `(a, 2^-9 b)` and the query's gradient was zero (a head
-    review's P0 of 28c4e9f0f); in `anchored.BLOCK_PARTS`, kept (and check 1 rejects that zero,
-    `test_check_1_rejects_a_zeroed_query_gradient_of_the_cancelling_draws`)."""
+    """The cancelling draws' gradients through the template under Kimi's bound (its forward's own pairs
+    anchored), interpreted, on par from float64 with its pairs each their own decay (check 1,
+    `EXACT_PAIRS`): a backward staging its score cotangents in two bf16 parts took both as `(a, 2^-9 b)` and
+    the query's gradient zero (a head review's P0 of 28c4e9f0f), which check 1 rejects
+    (`test_check_1_rejects_a_zeroed_query_gradient_of_the_cancelling_draws`)."""
     assert_as_exact(_through(UNBOUND_QUERIES), _through(EXACT_PAIRS), _cancelling,
-                    "the cancelling draws' anchored gradients", seeds=8, truth_fn=_token_by_token)
+                    "the cancelling draws' gradients under the bound", seeds=8, truth_fn=_token_by_token)
 
 
 def test_check_1_rejects_a_zeroed_query_gradient_of_the_cancelling_draws():
-    """Check 1 over the cancelling draws rejects their query's gradient zeroed, the anchored backward's loss
-    in two parts, against the portable math's (`chunk_on('xla')`, every gradient its own and the query's
-    zeroed): the draws resolve the `scale 2^-20 m` element the loss would drop, so the template's check
-    above holds it."""
+    """Check 1 over the cancelling draws rejects their query's gradient zeroed, a two-part backward's loss,
+    against the portable math's (`chunk_on('xla')`, every gradient its own and the query's zeroed): the
+    draws resolve the `scale 2^-20 m` element the loss would drop, so the template's check above holds
+    it."""
     portable = with_gradients(lambda given: chunk_on('xla', EXACT_PAIRS, given))
 
     def zeroed(operands, cotangent):
@@ -178,55 +177,13 @@ def test_check_1_rejects_a_zeroed_query_gradient_of_the_cancelling_draws():
                         truth_fn=_token_by_token)
 
 
-@COMPILES_ON_CPU
-def test_the_cancelling_draws_reach_the_anchored_backward():
-    """The cancelling draws take the anchored backward: their call's plan on the interpreted target
-    anchors `key_pairs_own` (`mainloop.Launch.reducing`), and its guard holds on them: zero decays, so every
-    factor is one and no prefix leaves `OWN_REACH`; every operand element zero or within `2^+-OWN_BAND`
-    (`own_rows_failed` clear); and the pairs' gradients at most `a + 2^-9 b + 2^-20 m` below 4, the
-    scaled operands at most 2, their product far within `2^OWN_PRODUCT`."""
-    from dew.nn.kernels.recurrence_chunk import template_bind
-    from dew.nn.kernels.templates.recurrence import template
-
-    operands, _ = _cancelling(0)
-    facts = generation.interpreted_target()
-    with generation.assumed(facts, interpreted=True):
-        call, _ = template_bind(operands.query, operands.key, operands.value, operands.log_decay,
-                                operands.beta, operands.state, rounded=True, decay_bound=BOUND)
-        _, bound = call.bound['mosaic_gpu']
-        tiles = template.MOSAIC.derived(bound, facts)
-        planned = template.MOSAIC.launches(bound, tiles, facts, backward=True)
-    assert {launch.name: launch.reducing for launch in planned}["recurrence_key_pairs_own"] == 1
-    rows = [jnp.asarray(x, jnp.float32).reshape(-1, x.shape[-1]) for x in (operands.query, operands.key)]
-    assert all(np.all(np.asarray(algebra.own_rows_failed(None, [(x, x)])) == 0.0) for x in rows)
-@pytest.mark.parametrize("transposed", [False, True])
-def test_a_sub_chunks_compact_columns_are_its_square_strictly_before_or_after(transposed):
-    """`own_columns` of a call's pairs `[R, H * C]`: row `i`'s column `c` the pair `(i, f + c)` strictly
-    before `i` (`f` its sub-chunk's first token), and `transposed` row `j`'s column `r` the pair `(f + r, j)`
-    strictly after `j`, zero elsewhere: each sub-chunk's own square, the anchored backward's operands."""
-    rows, heads = 2 * CHUNK, 3
-    pairs = np.random.default_rng(3).standard_normal((rows, heads * CHUNK)).astype(np.float32)
-    found = np.asarray(algebra.own_columns(jnp.asarray(pairs), chunk=CHUNK, transposed=transposed))
-    expected = np.zeros((rows, heads * SUB), np.float32)
-    for token in range(rows):
-        start, place = token - token % CHUNK, token % CHUNK
-        first = place - place % SUB
-        for h in range(heads):
-            for c in range(SUB):
-                other = first + c
-                if transposed and other > place:
-                    expected[token, h * SUB + c] = pairs[start + other, h * CHUNK + place]
-                elif not transposed and other < place:
-                    expected[token, h * SUB + c] = pairs[token, h * CHUNK + other]
-    assert np.array_equal(found, expected)
-
-
 @pytest.mark.parametrize("target", ["sm86", "sm120"])
-def test_kimis_training_plan_anchors_its_own_pairs(target):
+def test_kimis_training_plan_anchors_its_forward_own_pairs_alone(target):
     """Kimi delta attention's bf16 training step as the template plans it on `target`: its forward's own pairs
-    anchored (`intra_own` reducing its guard across warps, `mainloop.Launch.reducing`), and its backward's
-    (`key_pairs_own`), an anchored block of it holding a program: an RTX A6000's at 32 keys, an RTX PRO
-    6000's at 16."""
+    anchored (`intra_own` reducing its guard across warps, `mainloop.Launch.reducing`), its backward's
+    (`key_pairs_own`) each its own decay: anchored, a GH200's took 899.7 us where these took 501.8, its
+    training step 2912.7 against 2445.1 (M-JS-293), its block holding half the programs a multiprocessor
+    these do on an H100, a quarter on an A100."""
     from test_recurrence_mosaic import RESOURCE_SHAPES, resource_operands
 
     from dew.nn.kda import KimiDeltaAttention
@@ -246,7 +203,7 @@ def test_kimis_training_plan_anchors_its_own_pairs(target):
                                                                              backward=True)}
     reducing = {name: launches[name].reducing
                 for name in ("recurrence_intra_own", "recurrence_key_pairs_own")}
-    assert reducing == {"recurrence_intra_own": 1, "recurrence_key_pairs_own": 1}, reducing
+    assert reducing == {"recurrence_intra_own": 1, "recurrence_key_pairs_own": 0}, reducing
 
 
 OWN_LAUNCHES = {"recurrence_intra_own", "recurrence_intra_own_scores", "recurrence_key_pairs_own"}

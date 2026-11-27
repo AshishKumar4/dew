@@ -877,25 +877,17 @@ OWN_BAND = 100
 (`own_out_of_band`): both of an element's two bf16 parts normal, its narrowing losing no more of it than its
 parts' 16 bits."""
 
-OWN_PRODUCT = 116
-"""The largest power of two the backward's anchored products' terms reach before their outer factors
-(`anchored.back`): its largest gradient block's element times its largest anchored operand's, so a sum of
-sixteen terms of three part products, two such sums added, stays within fp32's range (2^121)."""
-
-FIRST, MIDDLE, LAST = 0, SUB // 2, SUB - 1
-"""A sub-chunk's tokens its own pairs' anchors are taken at (`own_anchors`): the forward's middle, both
-factors before its product and within half a sub-chunk; the backward's rows' gradients' first and its keys'
-last, each outer factor (applied after its product) at most one."""
+MIDDLE = SUB // 2
+"""A sub-chunk's token its own pairs' anchor is taken at (`own_anchors`): both factors within half a
+sub-chunk's decays."""
 
 
-def own_anchors(at: Callable[[int], tuple], shape: tuple[int, ...], token: int = MIDDLE, sub: int = SUB
-                ) -> tuple:
-    """Each row's sub-chunk's anchor, the separated prefix at its `token` (`at(token)`, a column's vectors;
-    `MIDDLE`, `FIRST` or `LAST`), laid over its rows, each half `shape` `[C, BK]` (`_laid_references`): the
-    point both factors of a sub-chunk's own pair are taken against (`own_anchored`), fla_kda's safe gate's
-    shifted first token."""
+def own_anchors(at: Callable[[int], tuple], shape: tuple[int, ...], sub: int = SUB) -> tuple:
+    """Each row's sub-chunk's anchor, the separated prefix at its `MIDDLE` token (`at(token)`, a column's
+    vectors), laid over its rows, each half `shape` `[C, BK]` (`_laid_references`): the point both factors of
+    a sub-chunk's own pair are taken against (`own_anchored`), fla_kda's safe gate's shifted first token."""
     index, _ = tile_indices(shape)
-    return _laid_references(lambda s: at(s * sub + token), index, shape[0], sub)
+    return _laid_references(lambda s: at(s * sub + MIDDLE), index, shape[0], sub)
 
 
 def own_anchored(prefix: tuple, anchors: tuple) -> tuple[jax.Array, jax.Array]:
@@ -903,9 +895,8 @@ def own_anchored(prefix: tuple, anchors: tuple) -> tuple[jax.Array, jax.Array]:
     `prefix` against its rows' anchors (`own_anchors`): a sub-chunk's own pair `(i, j)` decays by the first's
     on row `i` times the second's on key `j`, `exp2(g_i - g_j)` (`between`, its exponent either sign), so the
     own pairs are one product of rows and keys each scaled once (fla_kda's safe-gate diagonal, chunk_intra.py
-    at 413ad2c), where `key_diagonal_bands` forms each pair's decay apart. Against a sub-chunk's first token
-    the first is at most one, against its last the second (a prefix falls along its tokens). The pairs past
-    a token (`j > i`) take factors past one, which every caller masks."""
+    at 413ad2c), where `key_diagonal_bands` forms each pair's decay apart. The pairs past a token (`j > i`)
+    take factors past one, which every caller masks."""
     return between(prefix, anchors), between(anchors, prefix)
 
 
@@ -933,23 +924,6 @@ def own_rows_failed(reached: jax.Array | None, operands: Sequence[tuple[jax.Arra
     tile's)."""
     flags = ([] if reached is None else [reached]) + [own_out_of_band(*operand) for operand in operands]
     return jnp.max(jnp.where(functools.reduce(jnp.logical_or, flags), 1.0, 0.0), axis=1)
-
-
-def own_columns(pairs: jax.Array, *, chunk: int, transposed: bool = False, sub: int = SUB) -> jax.Array:
-    """A call's pairs `[R, H * chunk]` (each chunk's square of a head's pairs) as each token's own pairs
-    strictly before it, its sub-chunk's earlier tokens a column each `[R, H * sub]`: row `i`'s column `c` the
-    pair `(i, f + c)`, `f` its sub-chunk's first token, zero at and past `i`; `transposed`, each chunk's
-    square transposed first: row `j`'s column `r` the pair `(f + r, j)`, zero at and before `j`. The own
-    pairs' backward's operands (`anchored.back`), a sub-chunk's block of rows against its keys' rows."""
-    rows, heads = pairs.shape[0], pairs.shape[1] // chunk
-    squares = pairs.reshape(rows // chunk, chunk, heads, chunk)
-    if transposed:
-        squares = squares.transpose(0, 3, 2, 1)
-    token = jnp.arange(chunk)[:, None]
-    column = jnp.arange(sub)[None, :]
-    found = jnp.take_along_axis(squares, (token // sub * sub + column)[None, :, None, :], axis=3)
-    before = (column > token % sub) if transposed else (column < token % sub)
-    return jnp.where(before[None, :, None, :], found, jnp.zeros((), pairs.dtype)).reshape(rows, heads * sub)
 
 
 def own_compact(square: jax.Array, *, sub: int = SUB) -> jax.Array:
@@ -1485,6 +1459,14 @@ def system_gradient(lower, keys: TileLoad, columns: int, values: TileLoad, block
     return jnp.where(strict, d_l * decayed(gate, low, column_gate, column_low), 0.0).astype(dtype)
 
 
+def _generated_body(name: str, operands: tuple):
+    """The algebra's generated and checked body of this module's component `name` for a call over `operands`
+    where the run asks for it (`dew.algebra.generated.body`); None, the written math to run, otherwise."""
+    from dew.algebra import generated
+
+    return generated.body(f"dew.algebra.component_cases.{name}", operands)
+
+
 def selective_decay(step, rate, kept=None):
     """Mamba's selective scan's decay of a state by a token, `exp(dt A)` of its `rate` `A`, as `exp2((dt A)
     log2(e))`, zero at a document's first token (`kept` 0, where given): the one decay form of the scan's
@@ -1495,6 +1477,9 @@ def selective_decay(step, rate, kept=None):
     (row 8491: A = -3 2^126 made `A log2(e)` -inf and a padded token's decay NaN), and a step past it times
     a small rate its decay: the step taken to base 2 first, `dt = 3 2^126` overflowed, `A = -2^-126`
     decaying to 0 for `exp(-3)` and `A = 0` to NaN for 1 (mamba1b's review)."""
+    operands = (step, rate) if kept is None else (step, rate, kept)
+    if (generated := _generated_body("selective_decay", operands)) is not None:
+        return generated(*operands)
     decay = jnp.exp2((step * rate) * LOG2_E)
     return decay if kept is None else decay * kept
 
@@ -1520,6 +1505,8 @@ def selective_read(states: list, c: list, skip, value):
     balanced tree, its depth log2 of their count: summed in turn, the readout's 16 states put an fp32 scan's
     output 1.68 times the portable scan's distance from float64 where every decay is near zero, its own
     write the whole state (the interpreted regime test)."""
+    if (generated := _generated_body("selective_read", (*states, *c, skip, value))) is not None:
+        return generated(*states, *c, skip, value)
     return pairwise_sum([c_n * state for c_n, state in zip(c, states, strict=True)]) + skip * value
 
 
