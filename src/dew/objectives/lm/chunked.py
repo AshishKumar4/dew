@@ -59,6 +59,7 @@ from dew.nn.kernels.generation import linear_tangent
 from dew.nn.precision import (
     added_to,
     at_least_fp32,
+    bf16_held_product,
     bf16_product,
     capped_logits,
     compensated_sum,
@@ -265,20 +266,8 @@ def _whole_logits(states, matrix, precision: jax.lax.PrecisionLike) -> jax.Array
     in the product's own type. Its readers widen it where they read it."""
     if precision is not BF16:
         return _tile_logits(states, matrix, precision)
-
-    def written(states, matrix):
-        if not _contracted_whole():
-            return _tile_logits(states, matrix, precision).astype(jnp.bfloat16)
-        numbers = (((1,), (1,)), ((), ()))
-        # Behind a barrier, as `bf16_logits` holds its rounding: XLA's excess precision would otherwise widen
-        # a bf16 result its readers widen, skipping the rounding a tiled head's logits take.
-        return jax.lax.optimization_barrier(jax.lax.dot_general(
-            states.astype(jnp.bfloat16), matrix.astype(jnp.bfloat16), numbers,
-            precision=jax.lax.Precision.DEFAULT, preferred_element_type=jnp.bfloat16))
-
-    return jax.lax.platform_dependent(
-        states, matrix, cuda=written,
-        default=lambda states, matrix: _tile_logits(states, matrix, precision).astype(jnp.bfloat16))
+    # The bf16 head's values (`bf16_product`'s), held as bf16 by the one rule (`precision.bf16_held_product`).
+    return bf16_held_product(states, matrix, (((1,), (1,)), ((), ())), whole=_contracted_whole())
 
 
 def _contracted_whole() -> bool:

@@ -910,15 +910,31 @@ def _discrete_errors(reference, truth, xp):
     return xp.where(held >= true, apart, -apart)
 
 
+def residual(arm, truth, xp=np):
+    """`arm`'s error from its `truth`, elementwise in the gate's format: a discrete leaf's in its own
+    representation (`_discrete_errors`: 2^53 and 2^53 + 1 one apart, where float64 holds them equal), a
+    float leaf's its values less its truth's, each laid as the gate lays it (`_laid`). The one residual
+    every evidence reads, pooled and per example, live and recorded (`_error_rows`, `example_mse`,
+    `example_worst`)."""
+    errors = _discrete_errors(arm, truth, xp)
+    return _laid(arm, xp) - _laid(truth, xp) if errors is None else errors
+
+
+def _laid_residual(arm, truth, xp):
+    """`arm` and `truth` laid as the gate lays them (`_laid`) and `arm`'s error from its truth
+    (`residual`'s rule), each leaf widened once."""
+    values, laid = _laid(arm, xp), _laid(truth, xp)
+    errors = _discrete_errors(arm, truth, xp)
+    return values, laid, values - laid if errors is None else errors
+
+
 def _error_rows(references, truths, *, xp):
     """Each reference leaf against its truth: its mean squared error's log (`log_mean_square`), whether
     its every value is finite, and its error's rows' RMS (`_scaled_rms`) and largest share
     (`_largest_share`)."""
     found = []
     for reference, truth in zip(references, truths, strict=True):
-        errors = _discrete_errors(reference, truth, xp)
-        values, truth = _laid(reference, xp), _laid(truth, xp)
-        errors = values - truth if errors is None else errors
+        values, truth, errors = _laid_residual(reference, truth, xp)
         width = _width(truth)
         rows = errors.reshape(-1, width) if width else xp.zeros((0, 1))
         truth_rows = truth.reshape(-1, width) if width else xp.zeros((0, 1))
@@ -1223,10 +1239,9 @@ class _Draws:
 def example_mse(arm, truth) -> np.ndarray | None:
     """An arm's mean squared error from its float64 `truth` on each of a leaf's independent examples, its
     first axis (`judge`'s `examples`); None for a leaf of no axis."""
-    truth = np.asarray(truth, _wide(truth))
-    if truth.ndim == 0:
+    if np.ndim(truth) == 0:
         return None
-    return np.mean(np.square(np.abs(np.asarray(arm, _wide(arm)) - truth)), axis=tuple(range(1, truth.ndim)))
+    return np.mean(np.square(np.abs(residual(arm, truth))), axis=tuple(range(1, np.ndim(truth))))
 
 
 def example_worst(arm, truth) -> np.ndarray | None:
@@ -1234,7 +1249,7 @@ def example_worst(arm, truth) -> np.ndarray | None:
     float64 `truth` over the row's size, the rows those of the leaf's last axis, sized by their truth's RMS,
     rows under RESOLUTION of their example's size left out. None for a leaf under rank two (no rows), or
     one with an example of no sized row."""
-    truth = np.asarray(truth, _wide(truth))
+    original, truth = truth, np.asarray(truth, _wide(truth))
     if truth.ndim < 2:
         return None
     rows = truth.reshape(truth.shape[0], -1, truth.shape[-1])
@@ -1242,7 +1257,7 @@ def example_worst(arm, truth) -> np.ndarray | None:
     sized = sizes > RESOLUTION * np.sqrt(np.mean(np.square(np.abs(rows)), axis=(1, 2)))[:, None]
     if not sized.any(axis=1).all():
         return None
-    errors = (np.asarray(arm, _wide(arm)) - truth).reshape(rows.shape)
+    errors = residual(arm, original).reshape(rows.shape)
     logs = log_over(np.stack([_scaled_rms(example) for example in errors]), np.where(sized, sizes, 1.0))
     return np.max(np.where(sized, logs, LOG_ZERO), axis=1)
 

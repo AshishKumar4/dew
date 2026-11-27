@@ -66,7 +66,7 @@ from dew.nn.division import (
 )
 from dew.nn.float_bits import exact_power2, split_bits, two_factor_reach, whole_power2, widened_exactly
 from dew.nn.nested import nested
-from dew.nn.programs import equations, own_preset
+from dew.nn.programs import canonical_precision, equations, own_preset
 from dew.nn.sharding import explicit_spec
 
 __all__ = [
@@ -464,15 +464,15 @@ def effective_precision(precision: jax.lax.PrecisionLike) -> jax.lax.PrecisionLi
 
 def stated_algorithm(precision: jax.lax.PrecisionLike
                      ) -> jax.lax.DotAlgorithm | jax.lax.DotAlgorithmPreset | None:
-    """The dot algorithm a product is declared with, `effective_precision(precision)`'s: one the call states,
-    else the run's (`jax_default_matmul_precision` naming a preset), as an object a dot takes; None where the
-    declaration is a precision level (an explicit level overriding a run's algorithm)."""
+    """The dot algorithm a product is declared with, `effective_precision(precision)`'s as JAX canonicalizes
+    it (`programs.canonical_precision`): one the call states, else the run's, as an object a dot takes; None
+    where the declaration is a precision level (an explicit level overriding a run's algorithm) or the
+    default preset, which names no algorithm (`programs._preset_arithmetic`)."""
     effective = effective_precision(precision)
-    if isinstance(effective, jax.lax.DotAlgorithm | jax.lax.DotAlgorithmPreset):
-        return effective
-    if isinstance(effective, str) and effective in jax.lax.DotAlgorithmPreset.__members__:
-        return jax.lax.DotAlgorithmPreset[effective]
-    return None
+    canonical = canonical_precision(effective) if effective is not None else None
+    if canonical == jax.lax.DotAlgorithmPreset.DEFAULT:
+        return None
+    return canonical if isinstance(canonical, jax.lax.DotAlgorithm | jax.lax.DotAlgorithmPreset) else None
 
 
 def rounds_products() -> bool:
@@ -2187,6 +2187,28 @@ def bf16_product(subscripts: str, hidden: jax.Array, head: jax.Array) -> jax.Arr
     in fp32: the one product a bf16 head computes (`head_product`) and a tiled head computes over
     each tile, so the two round each logit alike."""
     return bf16_logits(bf16_einsum(subscripts, hidden, head))
+
+
+def bf16_held_product(lhs: jax.Array, rhs: jax.Array, dimension_numbers, *, whole: bool) -> jax.Array:
+    """`bf16_product`'s values over `jax.lax.dot_general(lhs, rhs, dimension_numbers)`, held as bf16: a
+    product its readers widen where they read it, so its fp32 sums are never held beside their rounding (a
+    whole vocabulary head's logits, `dew.objectives.lm.chunked`). Where `whole`, no device splitting its
+    contraction, a GPU's product writes them as bf16 from its fp32 sums, behind a barrier as `bf16_logits`
+    holds its rounding (XLA's excess precision would otherwise widen a bf16 result its readers widen); a
+    split contraction, and any other platform, rounds `bf16_dot_general`'s fp32 product once, as the
+    partitioner sums the shards' partials in the product's own type. One rounding either way."""
+    def rounded(lhs, rhs):
+        return bf16_logits(bf16_dot_general(lhs, rhs, dimension_numbers)).astype(jnp.bfloat16)
+
+    if not whole:
+        return rounded(lhs, rhs)
+
+    def written(lhs, rhs):
+        return jax.lax.optimization_barrier(jax.lax.dot_general(
+            lhs.astype(jnp.bfloat16), rhs.astype(jnp.bfloat16), dimension_numbers,
+            precision=jax.lax.Precision.DEFAULT, preferred_element_type=jnp.bfloat16))
+
+    return jax.lax.platform_dependent(lhs, rhs, cuda=written, default=rounded)
 
 
 def bf16_dot_general(lhs: jax.Array, rhs: jax.Array, dimension_numbers) -> jax.Array:

@@ -61,21 +61,22 @@ RAE = {variant: _image_walks(image, latent, stream=300 + 10 * index, pixels=(0.0
 def dew_walk(call, params, layouts, *, dtype, collection: str = "autoencoder", prefix: str = "vae/"):
     """Dew's walk of a draw at `dtype`, as the source's recording keeps it: `call(params, x)`'s outputs (a
     tuple) over the draw's operand moved channels last, and against its probes the gradients of their
-    probed sum in the operand and in each of `layouts`' parameters, written into its source tensor's layout
-    (`source_array`, by its name less `prefix`), each array channels first again; compiled once."""
-    names = [layout.name.removeprefix(prefix) for layout in layouts]
+    probed sum in the operand and in each of `layouts`' parameters (check 1's `with_gradients`), written
+    into its source tensor's layout (`source_array`, by its name less `prefix`), each array channels first
+    again; its product compiled once."""
+    from reference_error import with_gradients
 
-    @jax.jit
+    pulled = jax.jit(with_gradients(lambda held, x: tuple(call(held, x))))
+
     def walk(inputs):
         operand = jnp.moveaxis(jnp.asarray(inputs["operand"], dtype), 1, -1)
         probes = tuple(jnp.moveaxis(jnp.asarray(inputs[f"probe_{index}"], dtype), 1, -1)
                        for index in range(sum(key.startswith("probe_") for key in inputs)))
-        outputs, pullback = jax.vjp(lambda held, x: tuple(call(held, x)), params, operand)
-        grad_params, grad_operand = pullback(probes)
+        outputs, grad_params, grad_operand = pulled(params, operand, probes)
         return {**{f"output_{index}": jnp.moveaxis(output, -1, 1) for index, output in enumerate(outputs)},
                 "grad_operand": jnp.moveaxis(grad_operand, -1, 1),
-                **{f"grad_param.{name}": layout.source_array({collection: grad_params})
-                   for name, layout in zip(names, layouts, strict=True)}}
+                **{f"grad_param.{layout.name.removeprefix(prefix)}":
+                   layout.source_array({collection: grad_params}) for layout in layouts}}
     return walk
 
 

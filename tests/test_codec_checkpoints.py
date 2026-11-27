@@ -201,7 +201,7 @@ def test_a_modelopt_sources_w4a16_linears_served_packed_are_on_par_with_them_dec
     from reference_error import assert_as_exact
 
     from dew.nn.kernels.formats import NvFp4
-    from dew.quantization import QUANTIZATION, decoded_banks
+    from dew.quantization import QUANTIZATION, decoded_packed
 
     source = _w4a16_qwen3(tmp_path / "source")
     packed = Pretrained.load(source, dtype="bfloat16", packed_weights=True)
@@ -213,7 +213,7 @@ def test_a_modelopt_sources_w4a16_linears_served_packed_are_on_par_with_them_dec
     params = flatten_dict(dict(packed.variables["params"]))
     assert not set(banks) & set(params)
     stored = {name: np.asarray(value) for name, value in read_weights(source).items()}
-    dense = decoded_banks(packed.variables)
+    dense = decoded_packed(packed.variables)
     held = flatten_dict(dict(dense["params"]))
     for path in banks:
         stem = f"model.layers.0.mlp.{path[-2]}.weight"
@@ -288,7 +288,7 @@ def test_a_packed_output_heads_vocabulary_rows_are_its_decoded_values(tmp_path, 
     packed one (row 11740). Under its tensor scale (`overall`) its planted values' bits are `WITNESSES`':
     float32 subnormals, which XLA's CPU multiply would flush, a product rounded twice would miss, and
     infinities past the largest finite (row 11740's review)."""
-    from dew.quantization import QUANTIZATION, decoded_banks
+    from dew.quantization import QUANTIZATION, decoded_packed
 
     source = _w4a16_qwen3(tmp_path / "source", untied=overall)
     loaded = Pretrained.load(source, dtype="float32", packed_weights=True)
@@ -306,7 +306,7 @@ def test_a_packed_output_heads_vocabulary_rows_are_its_decoded_values(tmp_path, 
     tiny = np.finfo(np.float32).tiny
     assert overall > 1 or np.any((expected != 0) & (np.abs(expected) < tiny))
     rows = type(loaded.model).vocabulary_rows
-    for variables in (loaded.variables, decoded_banks(loaded.variables)):
+    for variables in (loaded.variables, decoded_packed(loaded.variables)):
         np.testing.assert_array_equal(np.asarray(loaded.model.apply(variables, method=rows)).view(np.uint32),
                                       expected.view(np.uint32))
 

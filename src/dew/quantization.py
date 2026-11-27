@@ -384,8 +384,9 @@ class LinearProducts(nn.Module):
         module = getattr(self, name)
         kernel = packed_matrix(module, "kernel", lambda: module.get_variable("params", "kernel"))
         if isinstance(kernel, Bf16Window):
-            # A lossless bfloat16 window's weights, each its bits again (row 5387).
-            return kernel.decoded()
+            # A lossless bfloat16 window's weights, each its bits again (row 5387), once the format admits
+            # its window (`Bf16Window.admitted`, as every reader of it asks).
+            return kernel.admitted().decoded()
         if isinstance(kernel, TernaryWeights):
             # A BitNet b1.58 matrix's codes times its scale (row 1464).
             return kernel.decoded(jnp.float32)
@@ -631,51 +632,44 @@ def bf16_windows(variables: Variables, *, sites: Sequence[str]) -> Variables:
     return {**variables, "params": unflatten_dict(rest), QUANTIZATION: unflatten_dict(held)}
 
 
-def decoded_bf16_windows(variables: Variables) -> Variables:
-    """`variables` with each lossless bfloat16 window in `QUANTIZATION` (`bf16_windows`) its kernel again
-    in `params`, bitwise the one it stored, the collection gone where the windows were all it held."""
-    from dew.nn.kernels.formats import Bf16Window
-
-    held = flatten_dict(dict(variables.get(QUANTIZATION, {})),
-                        is_leaf=lambda _, leaf: isinstance(leaf, Bf16Window))
-    windows = {path: leaf for path, leaf in held.items() if isinstance(leaf, Bf16Window)}
-    if not windows:
-        return variables
-    kernels = {path: leaf.decoded() for path, leaf in windows.items()}
-    rest = {path: leaf for path, leaf in held.items() if path not in windows}
-    decoded = {name: tree for name, tree in variables.items() if name != QUANTIZATION}
-    decoded["params"] = unflatten_dict({**flatten_dict(dict(variables.get("params", {}))), **kernels})
-    return {**decoded, QUANTIZATION: unflatten_dict(rest)} if rest else decoded
-
-
 def _window(kernel: jax.Array | np.ndarray, site: str):
-    """`kernel`'s lossless window (`Bf16Window.of`): one its process holds whole encoded whole, its planes
-    whole as before; one lying in part on other processes' devices encoded where it lives
-    (`_resident_window`)."""
+    """`kernel`'s lossless window (`Bf16Window.of`): a host array's encoded whole, as is a resident one this
+    process holds on devices of its own alone (its default's, a mesh of its own); one placed by a mesh's
+    names over devices of several processes encoded where it lives (`_resident_window`), every process
+    agreeing where the mesh spans the pool (the device set every process sharing it holds the same deciding,
+    and `agreed` meets every process of the pool); one on another
+    process's devices alone encoded as the planes this process holds of it, none, with no agreement to
+    meet (that process encodes it whole)."""
+    from jax.sharding import NamedSharding
+
     from dew.nn.kernels.formats import Bf16Window
 
-    if isinstance(kernel, jax.Array) and not kernel.is_fully_addressable:
-        return _resident_window(kernel, site)
+    if isinstance(kernel, jax.Array) and isinstance(sharding := kernel.sharding, NamedSharding):
+        processes = {device.process_index for device in sharding.device_set}
+        if len(processes) > 1 or jax.process_index() not in processes:
+            # Agreed where every process of the pool holds a part, which is every process that meets it.
+            return _resident_window(kernel, sharding, site, agree=len(processes) == jax.process_count())
     return Bf16Window.of(np.asarray(kernel), site=site)
 
 
-def _resident_window(kernel: jax.Array, site: str):
+def _resident_window(kernel: jax.Array, sharding: jax.sharding.NamedSharding, site: str, *, agree: bool):
     """A resident `[depth, width]` kernel's window encoded where it lives, as `frozen_fp8_leaves` packs one
-    on its resident devices: each distinct shard's columns and whole `WINDOW_GROUP`-deep groups encoded from
-    the shard its process holds (`Bf16Window.of`), each plane `[width, groups * words]` placed on the
-    kernel's devices as its columns are (a column split the planes' rows). A kernel split by its depth is
-    refused by the site's name: its window decodes each column's depths through one permutation across
-    its groups (`Bf16Window.decoded`), which no device holding a part of them can take where it lives; as
-    is a kernel placed by no mesh's names."""
-    from jax.sharding import NamedSharding, PartitionSpec
+    on its resident devices: each distinct shard's columns encoded from the shard its process holds by the
+    window's own codec (`formats.window_planes`, at its served layout, `packed.WINDOW`), each plane
+    `[width, groups * words]` placed on the kernel's devices as its columns are and in their memory (a
+    column split the planes' rows; a kernel offloaded to the host keeps its planes there), a process
+    holding none of them (one outside the kernel's devices) stating their dtype. With `agree`, every process
+    of the kernel's mesh agrees on the encoding (`_coordination.agreed`): one holding a group no window
+    holds refuses on every process, none left waiting. A kernel split by its depth is refused by the site's
+    name: its window decodes each
+    column's depths through one permutation across its groups (`Bf16Window.decoded`), which no device
+    holding a part of them can take where it lives. `sharding`, the kernel's, names a mesh (`_window`)."""
+    from jax.sharding import NamedSharding, PartitionSpec, SingleDeviceSharding
 
-    from dew.nn.kernels.formats import WINDOW_WORDS, Bf16Window, window_form_version
-    from dew.nn.kernels.templates.gemm.packed import WINDOW_GROUP, WINDOW_META_WORDS
+    from dew._coordination import agreed
+    from dew.nn.kernels.formats import Bf16Window, window_form_version, window_planes
+    from dew.nn.kernels.templates.gemm.packed import WINDOW
 
-    sharding = kernel.sharding
-    if not isinstance(sharding, NamedSharding):
-        raise ValueError(f"{site}'s kernel lies on devices of other processes by no mesh's names: encode "
-                         "it where it lives on a mesh")
     depth, width = kernel.shape
     rows, columns = (*sharding.spec, None, None)[:2]
     # The depth's partition's size: a named axis of one device leaves each column whole.
@@ -686,19 +680,27 @@ def _resident_window(kernel: jax.Array, site: str):
                          "whole for each column: window it split by its columns alone")
     # The planes placed by the columns alone: a depth name of one device, kept on them, would mark the
     # axis the window's decode permutes as split (an Explicit one's gather refuses it).
-    planes = NamedSharding(sharding.mesh, PartitionSpec(columns, None))
-    encoded: dict[tuple, Bf16Window] = {}
-    words, meta = [], []
-    for shard in kernel.addressable_shards:
-        key = shard.index[1].indices(width)[:2]
-        if key not in encoded:
-            encoded[key] = Bf16Window.of(np.asarray(shard.data), site=site)
-        words.append(jax.device_put(encoded[key].words, shard.device))
-        meta.append(jax.device_put(encoded[key].meta, shard.device))
-    groups = depth // WINDOW_GROUP
+    planes = NamedSharding(sharding.mesh, PartitionSpec(columns, None), memory_kind=sharding.memory_kind)
+
+    def encoded() -> tuple[list[jax.Array], list[jax.Array]]:
+        held: dict[tuple, tuple[np.ndarray, np.ndarray]] = {}
+        words, meta = [], []
+        for shard in kernel.addressable_shards:
+            key = shard.index[1].indices(width)[:2]
+            if key not in held:
+                held[key] = window_planes(np.asarray(shard.data), site=site)
+            placed = SingleDeviceSharding(shard.device, memory_kind=sharding.memory_kind)
+            words.append(jax.device_put(held[key][0], placed))
+            meta.append(jax.device_put(held[key][1], placed))
+        return words, meta
+
+    words, meta = agreed(f"{site}'s bfloat16 window", encoded) if agree else encoded()
+    groups = depth // WINDOW.group
     return Bf16Window(
-        jax.make_array_from_single_device_arrays((width, groups * WINDOW_WORDS), planes, words),
-        jax.make_array_from_single_device_arrays((width, groups * WINDOW_META_WORDS), planes, meta),
+        jax.make_array_from_single_device_arrays((width, groups * WINDOW.words), planes, words,
+                                                 dtype=np.uint32),
+        jax.make_array_from_single_device_arrays((width, groups * WINDOW.meta_words), planes, meta,
+                                                 dtype=np.uint32),
         window_form_version())
 
 
@@ -716,7 +718,7 @@ def packed_values(matrix: NvFp4) -> jax.Array:
     matrix's (`NvFp4.decoded`, whose values owe `bits.NVFP4_OWED`, times its stored tensor scale), the exact
     product rounded once, a subnormal among them and an overflow an infinity (`_product_rounded`). The one
     decode of a packed matrix's values, a Linear's applied kernel's (`LinearProducts.applied_kernel`, row
-    11740's review) and an export's (`decoded_banks`)."""
+    11740's review) and an export's (`decoded_packed`)."""
     from dew.algebra.bits import NVFP4_OWED
 
     return _product_rounded(matrix.decoded(), jnp.asarray(matrix.scale, jnp.float32)[..., None, None],
@@ -756,23 +758,31 @@ def _product_rounded(values: jax.Array, scale: jax.Array, owed: int) -> jax.Arra
                            infinite=infinite_v | infinite_f, nan=nan)
 
 
-def decoded_banks(variables: Variables) -> Variables:
-    """`variables` with each packed bank (`dew.nn.dense.packed_matrix`) decoded into `params` under its
-    name: an expert bank's `[..., experts, in, out]` float32 (a scanned run's banks stacked on its layer axis
-    before their experts), a Linear's kernel `[..., in, out]`, each value its
-    code times its block's scale times its matrix's, exactly (`NvFp4.decoded` times its factor), the bank
-    gone from `QUANTIZATION`: the float tree an export or a merge takes, as `decoded_frozen_fp8` decodes a
-    frozen FP8 site, each bank's values `packed_values`', on the host's CPU."""
-    from dew.nn.kernels.formats import NvFp4
+def decoded_packed(variables: Variables) -> Variables:
+    """`variables` with each packed leaf of `QUANTIZATION` its parameter again in `params`, under its name,
+    the leaf gone from the collection (and the collection where it held nothing else): the float tree an
+    export, a save or a merge takes, as `decoded_frozen_fp8` decodes a frozen FP8 site. The one traversal
+    of every packed format (train 1349's review F4): a packed bank (`dew.nn.dense.packed_matrix`) decoded
+    float32, an expert bank's `[..., experts, in, out]` (a scanned run's banks stacked on its layer axis
+    before their experts) or a Linear's kernel `[..., in, out]`, each value its code times its block's
+    scale times its matrix's, exactly (`packed_values`, on the host's CPU); a lossless bfloat16 window
+    (`bf16_windows`) its kernel bitwise the one it stored (`Bf16Window.decoded`)."""
+    from dew.nn.kernels.formats import Bf16Window, NvFp4
 
-    held = flatten_dict(dict(variables.get(QUANTIZATION, {})),
-                        is_leaf=lambda _, leaf: isinstance(leaf, NvFp4))
-    banks = {path: bank for path, bank in held.items() if isinstance(bank, NvFp4)}
-    if not banks:
+    def packed(leaf) -> bool:
+        return isinstance(leaf, (NvFp4, Bf16Window))
+
+    held = flatten_dict(dict(variables.get(QUANTIZATION, {})), is_leaf=lambda _, leaf: packed(leaf))
+    banks = {path: leaf for path, leaf in held.items() if isinstance(leaf, NvFp4)}
+    windows = {path: leaf for path, leaf in held.items() if isinstance(leaf, Bf16Window)}
+    leaves = {**banks, **windows}
+    if not leaves:
         return variables
     with jax.default_device(jax.devices("cpu")[0]):
-        dense = {path: np.asarray(packed_values(bank)) for path, bank in banks.items()}
-    rest = {path: leaf for path, leaf in held.items() if path not in banks}
+        # A window admitted by its format first (`Bf16Window.admitted`), as every reader of it asks.
+        dense = {**{path: np.asarray(packed_values(bank)) for path, bank in banks.items()},
+                 **{path: window.admitted().decoded() for path, window in windows.items()}}
+    rest = {path: leaf for path, leaf in held.items() if path not in leaves}
     decoded = {name: tree for name, tree in variables.items() if name != QUANTIZATION}
     decoded["params"] = unflatten_dict({**flatten_dict(dict(variables.get("params", {}))), **dense})
     return {**decoded, QUANTIZATION: unflatten_dict(rest)} if rest else decoded

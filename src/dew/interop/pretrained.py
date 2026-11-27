@@ -830,11 +830,11 @@ class Pretrained:
         # A tree enters plain: a draw's boxes are its model's table, which no export reads. A stage-local
         # fit's store, and a banked one, is read by its layers' names (`stored_layers`), a bank's rows read
         # home as they are written.
-        from dew.quantization import decoded_banks
+        from dew.quantization import decoded_packed
 
-        # A packed load's banks are written as the dense matrices they hold (`decoded_banks`),
+        # A packed load's banks are written as the dense matrices they hold (`decoded_packed`),
         # which the source's format encodes back.
-        held = unboxed(decoded_banks(self.variables if variables is None else variables))
+        held = unboxed(decoded_packed(self.variables if variables is None else variables))
         values = unpacked(self.model, stored_layers(self.model, held, banks=True))
         if self.adapter is not None:
             values = self.adapter.merge(values)

@@ -481,15 +481,15 @@ def test_a_scanned_runs_stacked_packed_banks_are_read_at_its_layer_as_that_layer
 
 
 def test_packed_banks_decode_into_the_parameters_an_export_writes():
-    """A served layer's packed banks decoded for an export or a merge (`quantization.decoded_banks`):
+    """A served layer's packed banks decoded for an export or a merge (`quantization.decoded_packed`):
     each its values exactly, as the layer's `params` under its name, and the bank gone from `QUANTIZATION`;
     the layer applied to them reads what the packed layer reads, to the dense product's rounding."""
     from packed_experts import packed_banks
 
-    from dew.quantization import QUANTIZATION, decoded_banks
+    from dew.quantization import QUANTIZATION, decoded_packed
 
     bank, values = packed_banks(2, 256, 256, seed=3)
-    decoded = decoded_banks({"params": {"router": {"kernel": jnp.zeros((4, 2))}},
+    decoded = decoded_packed({"params": {"router": {"kernel": jnp.zeros((4, 2))}},
                                     QUANTIZATION: {"experts": {"up_proj": {"kernel": bank}}}})
     assert QUANTIZATION not in decoded
     np.testing.assert_array_equal(np.asarray(decoded["params"]["experts"]["up_proj"]["kernel"]), values)
@@ -499,15 +499,15 @@ def test_packed_banks_decode_into_the_parameters_an_export_writes():
 def test_a_runs_stacked_packed_banks_decode_as_each_layers_bank_does():
     """A scanned run's packed banks stacked on its layer axis, as a banked store holds them for serving
     (`dew.inference.banks`: `[layers, experts, in, out]`), decoded for an export
-    (`quantization.decoded_banks`, before the export reads the layers apart): each layer's values
+    (`quantization.decoded_packed`, before the export reads the layers apart): each layer's values
     exactly as its bank alone decodes, over every leading axis."""
     from packed_experts import packed_banks
 
-    from dew.quantization import QUANTIZATION, decoded_banks
+    from dew.quantization import QUANTIZATION, decoded_packed
 
     layers = [packed_banks(2, 256, 256, seed=seed) for seed in (3, 4)]
     stacked = jax.tree.map(lambda *fields: np.stack(fields), *(bank for bank, _ in layers))
-    decoded = decoded_banks({QUANTIZATION: {"experts": {"up_proj": {"kernel": stacked}}}})
+    decoded = decoded_packed({QUANTIZATION: {"experts": {"up_proj": {"kernel": stacked}}}})
     np.testing.assert_array_equal(np.asarray(decoded["params"]["experts"]["up_proj"]["kernel"]),
                                   np.stack([values for _, values in layers]))
 

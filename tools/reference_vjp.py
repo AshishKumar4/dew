@@ -56,20 +56,17 @@ def walked(model: torch.nn.Module, call, inputs: dict[str, np.ndarray], dtype: t
     """A walk of `model` at `dtype` over a draw (tests/autoencoder_walks.py `walk_draw`): `call(model,
     operand)`'s outputs (a tuple), and against the draw's probes the gradients of their probed sum in the
     operand and in each of the model's parameters `names`, zeros where the sum does not reach one, as the
-    test's Dew walk returns them (interop_support.py `assert_walk_as_recorded`)."""
-    parameters = dict(model.named_parameters())
-    operand = torch.from_numpy(np.asarray(inputs["operand"])).to(dtype).requires_grad_()
-    outputs = call(model, operand)
-    loss = torch.stack([(output * torch.from_numpy(np.asarray(inputs[f"probe_{index}"])).to(dtype)).sum()
-                        for index, output in enumerate(outputs)]).sum()
-    every = [operand, *(parameters[name] for name in names)]
-    found = torch.autograd.grad(loss, every, allow_unused=True)
-    gradients = [torch.zeros_like(value) if gradient is None else gradient
-                 for gradient, value in zip(found, every, strict=True)]
-    return {**{f"output_{index}": output.detach().numpy() for index, output in enumerate(outputs)},
-            "grad_operand": gradients[0].numpy(),
-            **{f"grad_param.{name}": gradient.numpy() for name, gradient in zip(names, gradients[1:],
-                                                                                  strict=True)}}
+    test's Dew walk returns them (`autoencoder_walks.dew_walk`): check 1's torch arm of a coder walk
+    (`interop_support.torch_coder_walk`, `reference_error.torch_with_gradients`'), its arrays channels first
+    again under the recording's names."""
+    from interop_support import torch_coder_walk
+
+    count = sum(key.startswith("probe_") for key in inputs)
+    probes = tuple(inputs[f"probe_{index}"] for index in range(count))
+    walk = torch_coder_walk(model, call, dtype, {"operand": inputs["operand"], "probes": probes})
+    return {**{f"output_{index}": np.moveaxis(output, -1, 1) for index, output in enumerate(walk["outputs"])},
+            "grad_operand": np.moveaxis(walk["operand"], -1, 1),
+            **{f"grad_param.{name}": walk["parameters"][name] for name in names}}
 
 
 def record_walk(label: str, model: torch.nn.Module, call, draw, names: Sequence[str],
