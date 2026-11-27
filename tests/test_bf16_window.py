@@ -789,10 +789,11 @@ def test_a_stage_stacked_packed_leaf_reads_as_its_stored_layers_rows():
 
 
 def test_a_packed_bank_split_by_stage_over_an_explicit_axis_reads_its_rows():
-    """A packed bank a stage-local store places on two devices, its leading (stage) axis split over an
-    Explicit mesh axis as `StageLocal` places it, read for an export a row at a time: each row sliced where
-    it lies, placed as the bank's own spec past the stage, and decoded to the bank's own row (#4560's train
-    review: the row's slice, a gather of an Explicit dimension, was refused for want of its placement)."""
+    """A packed bank a stage-local store places on this host's simulated devices, its leading (stage) axis
+    split over an Explicit mesh axis as `StageLocal` places it and its last over another, read for an export
+    a row at a time: each row sliced where it lies, placed as the bank's own spec past the stage (its last
+    axis still split), and decoded to the bank's own row (#4560's train review: the row's slice, a gather of
+    an Explicit dimension, was refused for want of its placement)."""
     from jax.sharding import AxisType, NamedSharding, PartitionSpec
 
     from dew.nn.backbones.layer_names import array_rows
@@ -801,10 +802,26 @@ def test_a_packed_bank_split_by_stage_over_an_explicit_axis_reads_its_rows():
     stacked = np.random.default_rng(4560).standard_normal((2, 256, 64)).astype(np.float32)
     bank = NvFp4.quantized(jnp.asarray(stacked))
     whole = np.asarray(quantization.packed_values(bank))
-    mesh = jax.make_mesh((2,), ("stage",), axis_types=(AxisType.Explicit,), devices=jax.devices()[:2])
-    split = jax.tree.map(lambda plane: jax.device_put(plane, NamedSharding(mesh, PartitionSpec(
-        *(("stage",) if np.ndim(plane) and np.shape(plane)[0] == 2 else ())))), bank)
-    assert any(np.ndim(plane) and plane.sharding.spec[:1] == ("stage",) for plane in jax.tree.leaves(split))
+    mesh = jax.make_mesh((2, 2), ("stage", "model"), axis_types=(AxisType.Explicit,) * 2,
+                         devices=jax.devices("cpu")[:4])
+
+    def placed(plane):
+        stage = ("stage",) if np.ndim(plane) and np.shape(plane)[0] == 2 else ()
+        last = (*(None,) * (np.ndim(plane) - len(stage) - 1), "model") if (
+            np.ndim(plane) > len(stage) and np.shape(plane)[-1] % 2 == 0) else ()
+        return jax.device_put(plane, NamedSharding(mesh, PartitionSpec(*stage, *last)))
+
+    split = jax.tree.map(placed, bank)
+    planes = [plane for plane in jax.tree.leaves(split) if plane.sharding.spec[:1] == ("stage",)]
+    assert planes
+    def spec(array):
+        held = tuple(array.sharding.spec)
+        return held + (None,) * (array.ndim - len(held))
+
+    for plane in planes:
+        # A row keeps the bank's placement past the stage: its last axis still split where it was.
+        assert spec(quantization._row_of(plane, (1,))) == spec(plane)[1:]
+    assert any("model" in spec(plane) for plane in planes)
     tree = quantization.deferred_packed({quantization.QUANTIZATION: {"stages": {"kernel": split}}})
     for index, row in enumerate(array_rows(("params", "stages", "kernel"), tree["params"]["stages"]["kernel"],
                                            (2,))):
