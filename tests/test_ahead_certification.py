@@ -177,11 +177,11 @@ print(json.dumps({"unstacks": len(digests), "carried": [digest in ahead.starts f
 
 
 def test_a_step_compiled_ahead_is_refused_by_a_run_that_compiles_under_other_options():
-    """A step compiled ahead is held to the XLA options it compiled under (`AheadOfTime.options`, a
-    compile's limit aside) beside its program: a run of its program that compiles under an option it took
-    none of, a scoped `compiled_with` one, refuses it, as its own compile would have sent XLA that option
-    (row 13553: it loaded it, the option dropped); under its own options, a compile's limit beside them,
-    the run goes on to load it (here refused as no process's to load, `built` None)."""
+    """A step compiled ahead is held to the XLA options it compiled under (a compile's limit aside) by its
+    one fingerprint (`program_digest` under them): a run of its program that compiles under an option it
+    took none of, a scoped `compiled_with` one, refuses it, as its own compile would have sent XLA that
+    option (row 13553: it loaded it, the option dropped); under its own options, a compile's limit beside
+    them, the run goes on to load it (here refused as no process's to load, `built` None)."""
     import jax
     import jax.numpy as jnp
     import pytest
@@ -192,8 +192,8 @@ def test_a_step_compiled_ahead_is_refused_by_a_run_that_compiles_under_other_opt
 
     lowered = jax.jit(lambda x: jnp.sin(x) * 2).lower(jnp.ones(4))
     options = {"xla_gpu_enable_triton_gemm": False}
-    ahead = AheadOfTime("sm90", 1, {}, program_digest(lowered), Executable(b"", ()), None, 0, 0, 0, 0, 0, {},
-                        options=options)
+    ahead = AheadOfTime("sm90", 1, {}, program_digest(lowered, options), Executable(b"", ()), None, 0, 0, 0,
+                        0, 0, {})
     with pytest.raises(NotTheStepCompiledAhead):
         ahead.taken(lowered, {**options, "xla_gpu_enable_command_buffer": ""})
     with pytest.raises(ValueError) as loading:

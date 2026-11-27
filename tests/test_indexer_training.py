@@ -452,13 +452,26 @@ def test_an_msa_decoder_trains_its_index_branch_by_the_indexer_objective_alone()
     for weight in (0.5, 2.0):
         seen[weight], weighted_main, weighted_ce = gradients(
             LMObjective(model, SEQ, indexer=IndexerTraining("sparse", weight=weight)))
-        assert weighted_ce == ce and any(leaf.any() for leaf in seen[weight])
+        # Both of the branch's projections take the term's gradient, the queries' and the keys'.
+        assert weighted_ce == ce and len(seen[weight]) == 2 and all(leaf.any() for leaf in seen[weight])
         for got, plain_leaf in zip(weighted_main, main, strict=True):
             np.testing.assert_array_equal(got, plain_leaf)
     for heavy, light in zip(seen[2.0], seen[0.5], strict=True):
         np.testing.assert_array_equal(heavy, 4 * light)
     with pytest.raises(ValueError):
         LMObjective(model, SEQ, indexer=IndexerTraining("warmup"))
+    # Through a configured run's step: one update moves the queries' and the keys' projections both.
+    trainer = Trainer(LMObjective(model, SEQ, indexer=IndexerTraining("sparse", weight=1.0)), optax.sgd(1.0),
+                      key=jax.random.key(0))
+    initial = trainer.stored(trainer.place()[0])
+    state = trainer.fit(Loader(lambda partition: token_batches(), None, batch=8, records=None), steps=1)
+
+    def projections(variables) -> dict[str, np.ndarray]:
+        return {jax.tree_util.keystr(path): np.asarray(leaf)
+                for path, leaf in jax.tree_util.tree_leaves_with_path(variables["params"]) if branch(path)}
+    before, after = projections(initial.variables), projections(state.variables)
+    assert {name.split("'")[-4] for name in before} == {"wq", "wk"}
+    assert all((after[name] != before[name]).any() for name in before)
 
 
 @pytest.mark.parametrize("phase, topk", [("warmup", None), ("sparse", 4)])
