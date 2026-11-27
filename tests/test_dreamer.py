@@ -13,7 +13,7 @@ import optax
 import pytest
 from flax import struct
 from recording import bits
-from reference_error import assert_as_exact, assert_computes_the_oracle, chain_roundings
+from reference_error import as_given, assert_as_exact, assert_computes_the_oracle, chain_roundings
 from test_env_rollout import kept_as_left
 
 from dew.objectives.rl.dreamer import DreamerRollout, DreamerV3Objective, LatentEnv, WorldModel, lambda_return
@@ -935,10 +935,13 @@ def test_dreamer_filled_and_split_step_updates_as_the_real_windows_whole(dynamic
         ema_next = ema_update(ema, {"params": params_next}, slow_decay)
         return params_next, ema_next
 
+    # Each step compiled on the host and run as given (`as_given`), the check's arithmetic its compile's.
+    @as_given
     def split_arm(variables, ema, real_batch):
         moved = steps.stepped(2, FilledBatch(8).map(real_batch), variables=variables, ema=ema)
         return moved.variables["params"], moved.ema
 
+    @as_given
     def whole_arm(variables, ema, real_batch):
         moved = steps.stepped(1, real_batch, variables=variables, ema=ema)
         return moved.variables["params"], moved.ema

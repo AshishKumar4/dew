@@ -609,6 +609,8 @@ def test_an_index_branchs_kl_pools_by_its_queries_across_a_split_step():
         return nn.unbox(jax.jit(objective.init)(jax.random.key(seed)))["params"], rows(seed)
 
     def moved(split: int):
+        # A step compiled on the host and run as given (`as_given`), the check's arithmetic its compile's.
+        @as_given
         def stepped(params, batch):
             variables = {**steps.starts[split].variables, "params": params}
             return steps.stepped(split, batch, variables=variables).variables["params"]

@@ -13,7 +13,7 @@ import optax
 import pytest
 from flax import struct
 from recording import bits
-from reference_error import assert_as_exact, assert_computes_the_oracle, chain_roundings
+from reference_error import as_given, assert_as_exact, assert_computes_the_oracle, chain_roundings
 
 from dew.objectives.base import Ratio, Shown
 from dew.objectives.rl.control import (
@@ -428,10 +428,13 @@ def test_ppo_filled_and_split_step_updates_as_the_real_minibatch_whole():
     def draw(seed: int):
         return init_fn(jax.random.key(seed))["params"], batch_for(seed)
 
+    # Each step compiled on the host and run as given (`as_given`), the check's arithmetic its compile's.
+    @as_given
     def moved_split(params, real_batch):
         moved = steps.stepped(2, FilledBatch(8).map(real_batch), variables={"params": params})
         return moved.variables["params"]
 
+    @as_given
     def moved_whole(params, real_batch):
         return steps.stepped(1, real_batch, variables={"params": params}).variables["params"]
 
