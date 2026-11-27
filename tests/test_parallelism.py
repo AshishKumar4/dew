@@ -719,21 +719,21 @@ def test_a_run_places_no_training_batch_while_it_evaluates():
 # Sharding invariants at every fsdp width
 # --------------------------------------------------------------------------
 
-def test_a_window_saved_with_other_statistics_is_rebuilt_empty_and_refused_part_filled():
+def test_a_window_pooling_other_statistics_is_refused_by_its_shapes():
     """A window an earlier Dew saved, its statistics pooling fewer leaves than the step now traces (an
-    indexer's KL beside its prediction, row 13705), is no window the step reads (`Accumulation.replays`):
-    empty, it is replaced by the step's own; part filled, its resume is refused, its pooled sums no
-    statistics the step's could continue."""
-    from dew.state import Accumulation, kept_window
+    indexer's KL beside its prediction, row 13705), is no window the step reads (`Accumulation.replays`),
+    refused by its shapes alone (`refuse_unread_window`) whatever it holds, its occupancy unread: a
+    checkpoint keeps a window only while it holds microbatches."""
+    from dew.state import Accumulation, refuse_unread_window
 
-    def window(statistics: int, fill: int) -> Accumulation:
-        pooled = tuple(jnp.zeros(()) for _ in range(statistics))
+    def window(statistics: int) -> Accumulation:
+        pooled = tuple(jax.ShapeDtypeStruct((), jnp.float32) for _ in range(statistics))
         return Accumulation(gradient=None, mass=None, statistics=pooled, effects=(), qk_stats=None,
-                            batches={"x": jnp.zeros((2, 4))}, variables=None, attempts=None,
-                            fill=jnp.asarray(fill, jnp.int32))
+                            batches={"x": jax.ShapeDtypeStruct((2, 4), jnp.float32)}, variables=None,
+                            attempts=None, fill=jax.ShapeDtypeStruct((), jnp.int32))
 
-    traced = window(4, 0)
-    assert kept_window(window(4, 1), traced, read=True)
-    assert not kept_window(window(2, 0), traced, read=True)
+    traced = window(4)
+    refuse_unread_window(window(4), traced)
+    refuse_unread_window(None, traced)
     with pytest.raises(ValueError):
-        kept_window(window(2, 1), traced, read=True)
+        refuse_unread_window(window(2), traced)

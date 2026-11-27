@@ -579,7 +579,8 @@ def test_an_msa_index_branch_trains_by_its_kl_per_query_whatever_targets_the_rol
 
 
 def test_an_index_branchs_kl_pools_by_its_queries_across_a_split_step():
-    """A step split into two parts of unequal query counts (the second part's rows padded) pools the
+    """A step split into two parts of unequal query counts (its rows alternate full and padded, and a split
+    takes alternate rows: `dew.training.distributed.microbatch`, so one part holds the padded rows) pools the
     indexer's KL as one term of its own mass: each part's KL total and query count beside its prediction's,
     which the step sums leaf by leaf (`dew.training.transaction`), so it updates every parameter, the index
     branch's among them, as the unsplit step does over the same rows, held to the whole update computed in
@@ -590,10 +591,12 @@ def test_an_index_branchs_kl_pools_by_its_queries_across_a_split_step():
     objective = LMObjective(deepseek_stack(4), SEQ, indexer=IndexerTraining("sparse"))
     rate = 0.5
 
-    def rows(seed: int) -> dict:
+    def packed(seed: int) -> list:
         tokens = np.random.default_rng([seed, 13705]).integers(1, VOCAB, size=(4, SEQ + 1))
-        return packed_batch([packed_row(row) for row in tokens[:2]]
-                            + [packed_row(row[:6]) for row in tokens[2:]])
+        return [packed_row(row if index % 2 == 0 else row[:6]) for index, row in enumerate(tokens)]
+
+    def rows(seed: int) -> dict:
+        return packed_batch(packed(seed))
 
     template = rows(0)
     split_start, whole_start, split_step, whole_step, update_key = prepare_split_whole_steps(
@@ -618,6 +621,10 @@ def test_an_index_branchs_kl_pools_by_its_queries_across_a_split_step():
         return jax.tree.map(lambda leaf, grad: leaf - rate * grad, params, grads)
 
     params, _, split_moved, _ = draw(0)
+    # The parts' query masses as the split takes them, alternate rows: unequal.
+    full, padded = (objective.loss({"params": params}, packed_batch(packed(0)[start::2]), step_at())[0]
+                    for start in (0, 1))
+    assert float(full.auxiliary[0].mass) > float(padded.auxiliary[0].mass) > 0
     # The index branch moves, its KL's gradient reaching it through the split step.
     assert any(np.any(np.asarray(after) != np.asarray(before))
                for (path, after), before in zip(jax.tree_util.tree_leaves_with_path(split_moved),

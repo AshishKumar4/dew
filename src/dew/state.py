@@ -147,6 +147,18 @@ def kept_window(held: Accumulation | None, pending: Accumulation, read: bool) ->
 
 
 
+def refuse_unread_window(held: Accumulation | None, pending: Accumulation | None) -> None:
+    """Refuse a held window a step compiled for `pending`'s shapes reads none of (`Accumulation.replays`),
+    by its shapes alone: in a run, outside a ramp's stage change, only a resumed one, a checkpoint's, which
+    keeps a window only while it holds microbatches, pooled by an earlier Dew (an objective whose statistics
+    gained a term since: an indexer's KL beside its prediction, row 13705), whose sums no step of this one
+    continues."""
+    if held is not None and not held.replays(pending):
+        raise ValueError("the state's accumulation window holds batches or statistics of other shapes than "
+                         "the step's, which it cannot replay or pool: resume from a step that closed its "
+                         "window, or with the Dew that wrote it")
+
+
 REPLICA: Mapping[str, bool] = MappingProxyType({"replica": True})
 """The metadata marking a `TrainState` field each DiLoCo replica holds its own of (`Replicas`): the one
 declaration of the replicas' state, from which `Replicas` and `REPLICA_FIELDS` are made."""
