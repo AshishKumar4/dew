@@ -31,7 +31,7 @@ if TYPE_CHECKING:
     import numpy as np
     from flax import linen as nn
 
-    from dew.interop.decoder_parts import SourceCode
+    from dew.interop.decoder_parts import DecoderFamily, SourceCode
     from dew.nn.backbones.causal_transformer import CausalTransformer
 
 type Config = Mapping[str, object]
@@ -727,12 +727,14 @@ CROSSING_UNWRITTEN = ("the source's format holds no cross-attention layers; a ru
 """Why a decoder that reads a context through cross-attention is written in no family's layout."""
 
 
-def unwritten_extension(model: nn.Module) -> str | None:
+def unwritten_extension(model: nn.Module, family: DecoderFamily | None = None) -> str | None:
     """Why no family's format holds `model`, where it extends its source with what none does, read off the
     model alone: cross-attention (`CROSSING_UNWRITTEN`), a loop's cross-pass messages
     (`dew.nn.cross_pass.MESSAGES_UNWRITTEN`), or attention residuals whose values it normalizes
     (`dew.nn.attention_residuals.NORMALIZED_UNWRITTEN`); None where it extends it with none. `source_layout`
-    answers it as `Unwritable`, and an export refuses it before it converts a weight."""
+    answers it as `Unwritable`, and an export refuses it before it converts a weight. `family`, the source's
+    own a save writes it back as, holds the messages and the normalized residuals where its format does
+    (`DecoderFamily.holds_extensions`, Inkling 2's)."""
     from dew.nn.attention_residuals import NORMALIZED_UNWRITTEN
     from dew.nn.cross_pass import MESSAGES_UNWRITTEN
     from dew.nn.protocols import CrossAttending, Looped, MediaWrapper, MixesDepth
@@ -741,6 +743,8 @@ def unwritten_extension(model: nn.Module) -> str | None:
     if any(isinstance(each, CrossAttending) and each.cross_attention is not None
            for each in (model, decoder)):
         return CROSSING_UNWRITTEN
+    if family is not None and family.holds_extensions:
+        return None
     if isinstance(decoder, Looped) and decoder.loop is not None and decoder.loop.messages is not None:
         return MESSAGES_UNWRITTEN
     residuals = decoder.attention_residuals if isinstance(decoder, MixesDepth) else None

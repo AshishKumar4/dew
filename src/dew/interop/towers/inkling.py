@@ -5,11 +5,13 @@ alone (thinkingmachines/Inkling-2-Mini), as its decoder is (`dew.interop.familie
 from collections.abc import Callable, Mapping
 from types import MappingProxyType
 
+import jax
 import numpy as np
 
 from dew import _records
 from dew.interop.config_records import NativeFields
 from dew.interop.layouts import ConfigField, ConfigLayout, ConfigPart, Route, Table, mapped
+from dew.interop.safetensors_io import LazyTensors, tensor_specs
 from dew.interop.unread import Stored, held
 from dew.interop.weights import placed
 from dew.nn.vision.inkling import InklingProjector, InklingVision
@@ -84,6 +86,39 @@ def _inkling_weights(hf_tensors: Mapping[str, Stored], path_of: Callable[[str], 
     return placed(tensors, path_of, param_dtype)
 
 
+def _inkling_unread(tensors: Mapping[str, Stored], prefix: str) -> LazyTensors:
+    """`_inkling_weights`' rewrites undone (`TowerLayout.unread`), each tensor built as it is read, by each
+    tensor's name past `prefix` (its local name), every spelling of one name alike (a checked alias, `model.`
+    put on or taken off): the patch map back in the reference's pixel order, and where the table holds the
+    class position (its source stores one, so the table's tensors are beside it), the class position the
+    table's first row and the table the rest. A class position beside no table is refused."""
+    specs = tensor_specs(tensors)
+    spellings: dict[str, list[str]] = {}
+    for name in specs:
+        if prefix in name:
+            spellings.setdefault(name[name.index(prefix) + len(prefix):], []).append(name)
+    built: dict[str, tuple[jax.ShapeDtypeStruct, Callable[[], np.ndarray]]] = {
+        name: (spec, lambda name=name: np.asarray(tensors[name])) for name, spec in specs.items()}
+    for name in spellings.get("embeddings.patch_embedding.weight", []):
+        width, pixels = specs[name].shape
+        side = round((pixels // 3) ** 0.5)
+        built[name] = (specs[name], lambda name=name, width=width, side=side: np.ascontiguousarray(
+            np.asarray(tensors[name]).reshape(width, 3, side, side).transpose(0, 2, 3, 1).reshape(width, -1)))
+    if _CLASS_POSITION in spellings:
+        tables = spellings.get("embeddings.position_embedding", [])
+        if not tables:
+            raise ValueError(f"{spellings[_CLASS_POSITION]} hold the position table's first row, beside no "
+                             "embeddings.position_embedding")
+        rows, first = specs[tables[0]], tables[0]
+        for name in spellings[_CLASS_POSITION]:
+            built[name] = (jax.ShapeDtypeStruct(rows.shape[1:], rows.dtype),
+                           lambda: np.asarray(tensors[first])[0])
+        for table in tables:
+            built[table] = (jax.ShapeDtypeStruct((rows.shape[0] - 1, *rows.shape[1:]), rows.dtype),
+                            lambda table=table: np.asarray(tensors[table])[1:])
+    return LazyTensors({name: spec for name, (spec, _) in built.items()}, lambda name: built[name][1]())
+
+
 def _mlp_width(vision: Mapping[str, object], used: set[str],
                record: NativeFields[InklingVision]) -> NativeFields[InklingVision]:
     """The feed-forward width: `intermediate_size`, else `mlp_ratio` times the width (the config class's
@@ -154,8 +189,8 @@ def translate_inkling_projector_config(hf_config: Mapping[str, object], text_wid
         "bias": bool(vision.get("projector_bias", False))}}
 
 
-INKLING_VISION = TowerLayout("visual.backbone.", _ROUTES, read=_inkling_weights, config=_CONFIG,
-                             model_type="inkling2_vision")
+INKLING_VISION = TowerLayout("visual.backbone.", _ROUTES, read=_inkling_weights, unread=_inkling_unread,
+                             config=_CONFIG, model_type="inkling2_vision")
 
 INKLING_PROJECTOR = ProjectorLayout("visual.proj_", {
     "in.weight": ("fc1", "kernel"), "in.bias": ("fc1", "bias"),

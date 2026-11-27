@@ -26,6 +26,8 @@ from dew.interop.layouts import ConfigLayout, SourceLayout, Unwritable
 from dew.interop.safetensors_io import LazyTensors
 
 if TYPE_CHECKING:
+    from flax import linen as nn
+
     from dew.interop.decoder_parts import DecoderFields
     from dew.interop.towers.common import ProjectorLayout, TowerLayout
     from dew.nn.backbones.causal_transformer import CausalTransformer
@@ -145,6 +147,7 @@ def wrapper_layout(model: MultimodalTransformer, *,
     own keys), read back as the same model (its language model by `refuse_lossy_export`'s fields, the
     rest by their records), and its tensors under the wrapper's names. `config` is a loaded source's own
     config.json, which a save writes as published."""
+
     from dew.interop import hf_decoders
     from dew.interop.towers import projector_layout, tower_layout
     from dew.nn.multimodal import MultimodalTransformer
@@ -171,7 +174,7 @@ def wrapper_layout(model: MultimodalTransformer, *,
         written = {"model_type": wrapper.family, "architectures": [layout.architecture], "text_config": text,
                    "vision_config": vision, "tie_word_embeddings": wrapper.language_model.tie_embeddings,
                    **layout.keys.write(wrapper)}
-        _refuse_lossy(wrapper, written)
+        refuse_lossy_wrapper(wrapper, written)
     except ExportRefused as refusal:
         return Unwritable(str(refusal))
     stated = written if config is None else config
@@ -198,15 +201,15 @@ def _text(layout: WrapperLayout, wrapper: MultimodalTransformer) -> tuple[Causal
     return plain, {**text, "model_type": layout.text_type or f"{wrapper.family}_text"}
 
 
-def _refuse_lossy(wrapper: MultimodalTransformer, config: Mapping[str, object]) -> None:
+def refuse_lossy_wrapper(wrapper: nn.Module, config: Mapping[str, object]) -> None:
     """Refuse a wrapper config that reads back as another computation than `wrapper`: translated again as
     a load translates it, its language model compared field by field (`refuse_rebuilt`) and the rest by
     their records."""
+
     from dew.interop import hf_decoders
     from dew.interop.pretrained import _wrapper_model, _wrapper_text_fields
     from dew.nn.backbones.causal_transformer import CausalTransformer
-    from dew.nn.multimodal import MultimodalTransformer
-    from dew.registry import from_record, record_fields
+    from dew.registry import from_record
 
     try:
         record = hf_decoders.translate_wrapper_config(config)
@@ -217,14 +220,28 @@ def _refuse_lossy(wrapper: MultimodalTransformer, config: Mapping[str, object]) 
         raise ExportRefused(f"the {wrapper.family} config written for this model does not read back: "
                             f"{error}") from error
     hf_decoders.refuse_rebuilt(wrapper.language_model, language, wrapper.family)
-    ours, theirs = ({name: _computed(value)
-                     for name, value in record_fields(held, MultimodalTransformer).items()
-                     if name != "language_model" and name not in hf_decoders.NUMERICS_FIELDS}
-                    for held in (wrapper, rebuilt))
-    lost = sorted(name for name in ours.keys() | theirs.keys() if ours.get(name) != theirs.get(name))
+    _refuse_parts_changed(wrapper, _parts_computation(rebuilt), wrapper.family)
+
+
+def _parts_computation(wrapper: nn.Module) -> dict[str, JSON]:
+    """What a media wrapper's parts beside its language model compute: each field's record but the
+    language model's and its numerics (`_computed`), as a config written for it reads them back."""
+    from dew.interop import hf_decoders
+    from dew.registry import record_fields
+
+    return {name: _computed(value)
+            for name, value in record_fields(wrapper, type(wrapper), without=("language_model",)).items()
+            if name not in hf_decoders.NUMERICS_FIELDS}
+
+
+def _refuse_parts_changed(wrapper: nn.Module, stated: Mapping[str, JSON], family: str) -> None:
+    """Refuse `wrapper`, whose parts beside its language model compute otherwise than `stated`
+    (`_parts_computation`'s, of the config it would be written with), naming the fields that differ."""
+    ours = _parts_computation(wrapper)
+    lost = sorted(name for name in ours.keys() | stated.keys() if ours.get(name) != stated.get(name))
     if lost:
-        raise ExportRefused(f"{lost} would not survive an export as {wrapper.family}: its config reads back "
-                            f"{', '.join(f'{name}={theirs.get(name)!r}' for name in lost)}")
+        raise ExportRefused(f"{lost} would not survive an export as {family}: its config reads back "
+                            f"{', '.join(f'{name}={stated.get(name)!r}' for name in lost)}")
 
 
 def _computed(record: JSON) -> JSON:

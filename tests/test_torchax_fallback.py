@@ -1077,7 +1077,6 @@ def a_float32_forwards_logits_and_its_output_tables_are_as_exact_as_torchs(tmp_p
     states are each on par with torch's float32 forward from torch's in float64 over drawn token
     ids (check 1), under JAX's own default precision (the test lane sets 'highest' for every
     product that states none)."""
-    loaded = tied_float32(tmp_path)
     model = head_model("tied")
     with float64():
         wide = transformers.AutoModelForCausalLM.from_config(model.config, dtype=torch.float64,
@@ -1087,8 +1086,14 @@ def a_float32_forwards_logits_and_its_output_tables_are_as_exact_as_torchs(tmp_p
     def draw(seed):
         return (np.random.RandomState(seed).randint(0, TINY["vocab_size"], (ROWS, SEQ)).astype(np.int32),)
 
+    # Loaded where Dew's arm first runs, not before the site: a tier-3 load places the source's tensors on
+    # the device as it loads, which a GPU tier part's prepare, its device compiling only, refuses; so the
+    # prepare reaches the site (row 12869), whose eager torchax arm holds no program to compile ahead.
+    held = functools.cache(lambda: tied_float32(tmp_path))
+
     @as_given
     def ours(ids):
+        loaded = held()
         # Run as the model runs, eagerly, at JAX's default precision.
         with jax.default_matmul_precision(None):
             direct = loaded.model.apply(loaded.variables, jnp.asarray(ids))

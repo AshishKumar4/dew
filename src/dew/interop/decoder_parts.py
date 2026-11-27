@@ -1983,6 +1983,17 @@ class DecoderFamily:
     DeepSeek V4's grouped output projection. A quantized format is undone
     before this, by `Pretrained.load`, which records what it undid for the
     export."""
+    unprepare: WeightPreparer | None = None
+    """`prepare`'s exact inverse, where a family declares one: the release's tensors, under its own names,
+    from the tensors `prepare` made of them (Inkling 2's renamed, split and reversed ones). A source of the
+    family binds its tensors as `prepare` made them, and a save writes them through it
+    (`Pretrained.export`), so every tensor a load read is written back. Each tensor `prepare` makes is
+    consumed, and one missing refused; a tensor `prepare` passed through passes through."""
+    holds_extensions: bool = False
+    """Whether the family's format holds the decoder extensions no other family's does
+    (`layouts.unwritten_extension`): a loop's cross-pass messages and attention residuals that normalize their
+    values, as Inkling 2's release stores them. A save of a source of it writes them back, where every other
+    export refuses a decoder that carries them."""
     spelling: Callable[[str], str] = field(default=as_stored)
     """The name the family's encoder writes a stored tensor under, where a checkpoint may store it as
     another its `routes` read too: a bare GPT2Model leaves out GPT-2's `transformer.` (`Spelled.leading`
@@ -2114,7 +2125,9 @@ class DecoderFamily:
         prepared = self.prepare(stored, config)
         if self.head_rows is not None:
             prepared = {name: self.head_rows.read(name, tensor, config) for name, tensor in prepared.items()}
-        return packed_readings(prepared, self.packed, config, stored=stored,
+        # A family that undoes its `prepare` (`unprepare`) binds the tensors as prepared, which a save writes
+        # back through it; the others bind the stored ones.
+        return packed_readings(prepared, self.packed, config, stored=None if self.unprepare else stored,
                                path=lambda part: self.source_path(part, config))
 
     def translate_config(self, hf_config: Mapping[str, object], used: set[str]) -> DecoderFields:
