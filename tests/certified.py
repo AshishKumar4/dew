@@ -15,6 +15,7 @@ from jax.extend.core import primitives
 from op_certificates import (
     DTYPES,
     EXP_RANGE,
+    FLOAT16,
     FORMATS,
     Format,
     exact_sum,
@@ -422,7 +423,7 @@ def _exp2_levels(operands, result, fmt, flushes):
                     np.where(impossible, UNREACHED, levels))
 
 
-def _terms_hold(native, terms, fmt: Format, flushes: bool, counts=None) -> np.ndarray:
+def _terms_hold(native, terms, fmt: Format, flushes: bool, counts=None, given=None) -> np.ndarray:
     """Whether each native sum of `terms` (exact float64 values, summed along the last axis) is within
     the bound of any order of summing them in `fmt`, fused multiply-adds included: γ_n Σ|terms| (Higham,
     Accuracy and Stability of Numerical Algorithms, 2002, §3.1: n terms, at most n - 1 roundings on any
@@ -430,8 +431,12 @@ def _terms_hold(native, terms, fmt: Format, flushes: bool, counts=None) -> np.nd
     Σ|terms|, in the allowance), plus what underflow loses past that relative bound at each rounding:
     where the lane flushes, a flushed partial's least normal; where it keeps subnormals, half their
     spacing (a product, or a sum carried wider and rounded into `fmt`). An empty sum is the additive
-    identity, +0. `counts`, where given, is each sum's own count of terms, its padding zeros left out (a
-    scatter's, whose elements take different numbers of updates)."""
+    identity, +0. A sum whose terms as given (`given`, the operands before a flushing lane reads them; a
+    lane may hand one term through unread) are exact zeros alone is exactly zero in any order, no rounding
+    below the normal range on its path: +0 where any term is +0 (the identity +0 beside it), -0 or +0 where
+    every term is -0 (whether a reduction starts from its identity or its first term), held exactly before
+    any slack (row 13544). `counts`, where given, is each sum's own count of terms, its padding zeros left
+    out (a scatter's, whose elements take different numbers of updates)."""
     native = np.asarray(native, np.float64)
     count = terms.shape[-1]
     if count == 0:
@@ -439,7 +444,13 @@ def _terms_hold(native, terms, fmt: Format, flushes: bool, counts=None) -> np.nd
     error = np.abs(native - exact_sum(terms, -1))
     slack = allowance(magnitude_sum(terms, -1), count if counts is None else counts, fmt,
                       underflow(fmt, flushes))
-    return np.isfinite(error) & (error <= np.nextafter(slack, np.inf))
+    held = np.isfinite(error) & (error <= np.nextafter(slack, np.inf))
+    if given is None:
+        return held
+    zeros = np.asarray(given, np.float64)
+    negative_only = np.all(np.signbit(zeros), axis=-1)
+    zero_held = (native == 0) & (~np.signbit(native) | negative_only)
+    return np.where(np.all(zeros == 0, axis=-1), zero_held, held)
 
 
 def allowance(magnitude, count: int, fmt: Format, underflow: float):
@@ -959,6 +970,11 @@ def _exact_integer(values) -> tuple[np.ndarray, np.ndarray]:
     return hi, lo
 
 
+_HALF = np.dtype(np.float16)
+_FLOAT = np.dtype(np.float32)
+_HALF_CONVERSIONS = frozenset({(_HALF, _FLOAT), (_FLOAT, _HALF)})
+
+
 def _converted(params, operands, result, fmt):
     """A cast, as XLA's CPU lowering casts: between float formats correctly rounded, subnormals kept
     (bit manipulation); to a float from an integer or boolean correctly rounded from the exact integer;
@@ -967,6 +983,9 @@ def _converted(params, operands, result, fmt):
     (value,) = operands
     value, result = np.asarray(value), np.asarray(result)
     source = _format(value.dtype)
+    if (value.dtype, result.dtype) in _HALF_CONVERSIONS:
+        source = FLOAT16 if value.dtype == _HALF else source
+        fmt = FLOAT16 if result.dtype == _HALF else fmt
     if fmt is not None:
         exact = _exact_integer(value) if source is None else (value.astype(np.float64), np.zeros(value.shape))
         return _same(result, rounded(*exact, fmt))
@@ -989,8 +1008,11 @@ def _reduced_sum(params, operands, result, fmt):
         summed = _wrapping(lambda t: np.sum(t, axis=axes, dtype=np.uint64))
         return _bits(result) == _bits(summed(result, terms))
     flushes = lane().flushes
-    return _terms_hold(result, _flattened(np.moveaxis(_read(terms, flushes), axes,
-                                                     tuple(range(-len(axes), 0))), len(axes)), fmt, flushes)
+
+    def laid(values):
+        return _flattened(np.moveaxis(values, axes, tuple(range(-len(axes), 0))), len(axes))
+
+    return _terms_hold(result, laid(_read(terms, flushes)), fmt, flushes, given=laid(np.asarray(terms)))
 
 
 def _flattened(moved: np.ndarray, reduced: int) -> np.ndarray:
@@ -2049,6 +2071,7 @@ CONTRACTS = {
     jax.lax.shift_right_logical_p: _moved(_logical_shift(1)),
     jax.lax.shift_left_p: _moved(_logical_shift(-1)),
     jax.lax.bitcast_convert_type_p: _moved(_bitcast),
+    jax.lax.population_count_p: _moved(lambda params, value: np.bitwise_count(_bits(value))),
     jax.lax.reduce_and_p: _moved(lambda params, a: np.all(a, axis=tuple(params["axes"]))),
     jax.lax.reduce_or_p: _moved(lambda params, a: np.any(a, axis=tuple(params["axes"]))),
     jax.lax.reduce_max_p: _extremum(_signed_max, _integral_extremum(np.max, "max")),
@@ -2196,8 +2219,12 @@ def observing():
         del _OBSERVING[next(index for index, observer in enumerate(_OBSERVING) if observer is seen)]
 
 
-_RAW_BITCAST_PAIRS = frozenset({(np.dtype(np.uint8), np.dtype(jax.numpy.float8_e4m3fn)),
-                               (np.dtype(jax.numpy.float8_e4m3fn), np.dtype(np.uint8))})
+_RAW_BITCAST_PAIRS = frozenset({
+    (np.dtype(np.uint8), np.dtype(jax.numpy.float8_e4m3fn)),
+    (np.dtype(jax.numpy.float8_e4m3fn), np.dtype(np.uint8)),
+    (np.dtype(np.uint8), np.dtype(jax.numpy.float8_e8m0fnu)),
+    (np.dtype(jax.numpy.float8_e8m0fnu), np.dtype(np.uint8)),
+})
 """Explicit integer/FP8 storage views the exact bitcast contract can check without a float format."""
 
 
@@ -2214,8 +2241,13 @@ def _held(eqn, operands, results, findings, at) -> None:
     hosted_results = [_host(result) for result in results]
     raw_bitcast = (primitive is jax.lax.bitcast_convert_type_p
                    and (hosted[0].dtype, hosted_results[0].dtype) in _RAW_BITCAST_PAIRS)
+    half_storage = (primitive is jax.lax.optimization_barrier_p
+                    or (primitive is jax.lax.convert_element_type_p
+                        and (hosted[0].dtype, hosted_results[0].dtype) in _HALF_CONVERSIONS))
     for value in () if raw_bitcast else (*hosted, *hosted_results):
         dtype = getattr(value, "dtype", None)
+        if dtype == _HALF and half_storage:
+            continue
         keyed = dtype is not None and jax.dtypes.issubdtype(dtype, jax.dtypes.prng_key)
         if dtype is not None and not keyed and _inexact(dtype) and _format(dtype) is None:
             findings.append(f"{at}: uncertifiable, no format for {dtype}")
@@ -2223,7 +2255,7 @@ def _held(eqn, operands, results, findings, at) -> None:
     if primitive is jax.lax.reduce_p:
         # A variadic reduction's results are held together, by the reduction its combine is.
         try:
-            held = _reduced(eqn, hosted, [_host(result) for result in results])
+            held = _reduced(eqn, hosted, hosted_results)
         except TypeError:
             findings.append(f"{at}: uncertifiable, no contract for this reduce's combine")
             return
@@ -2231,20 +2263,19 @@ def _held(eqn, operands, results, findings, at) -> None:
             if not np.all(ok):
                 findings.append(f"{at}: {int(ok.size - ok.sum())} of {ok.size} elements break the contract")
         return
-    for index, result in enumerate(results):
-        fmt = _format(getattr(_host(result), "dtype", np.float32))
+    for index, hosted_result in enumerate(hosted_results):
+        fmt = _format(getattr(hosted_result, "dtype", np.float32))
         # A result of its own position reads its own part of the operands alone (a barrier's, a split's).
         given = (RESULT_OPERANDS[primitive](eqn.params, hosted, index) if primitive in RESULT_OPERANDS
                  else hosted)
         try:
-            ok = np.asarray(CONTRACTS[primitive](eqn.params, given, _host(result), fmt))
+            ok = np.asarray(CONTRACTS[primitive](eqn.params, given, hosted_result, fmt))
         except TypeError:
             findings.append(f"{at}: uncertifiable, {name} of these operands has no contract")
             return
         if not np.all(ok):
-            hosted_result = _host(result)
             keyed = not isinstance(hosted_result, np.ndarray)
-            shown = np.asarray(jax.random.key_data(result)) if keyed else hosted_result
+            shown = np.asarray(jax.random.key_data(hosted_result)) if keyed else hosted_result
             first = np.unravel_index(int(np.argmin(ok.ravel())), ok.shape) if ok.ndim else ()
             findings.append(f"{at}: {int(ok.size - ok.sum())} of {ok.size} elements break the contract, "
                             f"first at {first}: {shown[first]!r}")
@@ -2253,7 +2284,9 @@ def _held(eqn, operands, results, findings, at) -> None:
 def assert_certified(fn, draw, label: str, *, seeds: int) -> None:
     """Check 2 of the gate: `fn` on `draw(seed)`'s inputs for each of `seeds`, run one primitive at a
     time (`certified`), every element of every equation within its own operation's contract and every
-    primitive covered by one."""
+    primitive covered by one. A count of seeds below one checks nothing and is refused (row 13546)."""
+    if seeds < 1:
+        raise ValueError(f"{label}: Check 2 runs over one seed or more, got {seeds}")
     for seed in range(seeds):
         _, findings = certified(fn, *draw(seed))
         assert not findings, f"{label}, seed {seed}: " + "; ".join(findings[:8])

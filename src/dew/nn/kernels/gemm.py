@@ -56,11 +56,26 @@ from dew.nn.derivatives import (
     with_gradients_formed,
 )
 from dew.nn.kernels import generation, grouped_matmul, grouped_quantized, selection, xla_products
-from dew.nn.kernels.formats import PACKED_FORMATS, MxFp8, NvFp4, NvFp4Block, TernaryWeights, e8m0_exponents
+from dew.nn.kernels.formats import (
+    PACKED_FORMATS,
+    Bf16Window,
+    MxFp8,
+    NvFp4,
+    NvFp4Block,
+    TernaryWeights,
+    e8m0_exponents,
+)
 from dew.nn.kernels.gemm_xla import XlaConfig, as_tuple, direct_dtype, xla_mainloop
 from dew.nn.kernels.templates import product as product_of
 from dew.nn.kernels.templates.axes import GROUPS
-from dew.nn.kernels.templates.gemm import epilogue_vjp, rows_permuted, scattered, sides as hook_sides, tiling
+from dew.nn.kernels.templates.gemm import (
+    epilogue_vjp,
+    rows_gathered_wide,
+    rows_permuted,
+    scattered,
+    sides as hook_sides,
+    tiling,
+)
 from dew.nn.kernels.templates.gemm.factored import factored
 from dew.nn.kernels.templates.gemm.hooks import (
     NO_HOOKS,
@@ -74,7 +89,14 @@ from dew.nn.kernels.templates.gemm.hooks import (
 )
 from dew.nn.kernels.templates.hooks import NO_HOOK, Hook, Side
 from dew.nn.kernels.templates.product import SCALE_DEPTH, bf16_part_count, declared, formed, terms
-from dew.nn.precision import accumulated, asks_default_precision, at_least_fp32, exact_products, twice_scaled
+from dew.nn.precision import (
+    accumulated,
+    asks_default_precision,
+    at_least_fp32,
+    exact_products,
+    stated_algorithm,
+    twice_scaled,
+)
 from dew.nn.programs import read_by
 from dew.nn.sharding import automatic_axes, explicit_spec, varying_like
 
@@ -100,7 +122,7 @@ def unbuilt():
         _UNBUILT.reset(token)
 
 
-def gemm(lhs: jax.Array, rhs: jax.Array | NvFp4 | TernaryWeights,
+def gemm(lhs: jax.Array, rhs: jax.Array | NvFp4 | TernaryWeights | Bf16Window,
          group_sizes: jax.Array | None = None, *,
          transpose_rhs: bool = False, prologue: Hook = NO_HOOK, epilogue: Hook = NO_HOOK, out_dtype,
          out_dtypes: tuple | None = None,
@@ -152,6 +174,7 @@ def gemm(lhs: jax.Array, rhs: jax.Array | NvFp4 | TernaryWeights,
     gradient chained in one accumulator, each kernel gradient its own; no kernels joined, no output split (row
     6794, M-EM-59i); with no other part (`_gemm_refused`). `selected`, a caller's route of the forward
     (`side_by_side`'s), runs as found."""
+    rhs = _window_served(lhs, rhs, compute, precision, out_dtypes or (out_dtype,))
     if isinstance(rhs, PACKED_FORMATS):
         return _packed_gemm(lhs, rhs, group_sizes, epilogue=epilogue, out_dtype=out_dtype, layer=layer,
                             gather=gather, scatter=scatter, interpret_on_cpu=interpret_on_cpu,
@@ -164,8 +187,7 @@ def gemm(lhs: jax.Array, rhs: jax.Array | NvFp4 | TernaryWeights,
                   prologue=before, lhs=lhs,
                   beside=beside and (before, after, paired, gather, scatter, applied, compute, layer,
                                      out_dtypes, *named))
-    straight = compute is not None
-    compute = jnp.dtype(lhs.dtype if compute is None else compute)
+    straight, compute = compute is not None, jnp.dtype(lhs.dtype if compute is None else compute)
     dense = group_sizes is None and layer is None
     before = _prologued(before, prologue_jvp)
     paired = None if paired is None else _grouped(lhs, paired, group_sizes, layer)[0]
@@ -193,7 +215,7 @@ def gemm(lhs: jax.Array, rhs: jax.Array | NvFp4 | TernaryWeights,
         # `applied` is the prologue's operand formed (`gemm`): the derivative forms it from its operands.
         del applied
         config = XlaConfig(transpose_rhs, precision, compute if straight else None, dense)
-        lhs = lhs if gather is None else lhs.astype(at_least_fp32(lhs.dtype))[gather].astype(lhs.dtype)
+        lhs = lhs if gather is None else rows_gathered_wide(lhs, gather)
         out = scattered(xla_mainloop(config, lhs if straight else lhs.astype(compute), rhs, group_sizes,
                                       before, prologue_arrays, prologue_axes, after, epilogue_arrays,
                                       epilogue_axes, dtypes, several, paired=paired, first=first,
@@ -341,19 +363,37 @@ def _gemm_refused(group_sizes, *, prologue, gather, scatter, compute, applied, l
         raise ValueError(f"a formed operand is a prologue's, of the rows' shape {lhs.shape} and dtype "
                          f"{expected}, not {applied.shape} {applied.dtype}")
 
-def _packed_gemm(lhs, matrix: NvFp4 | TernaryWeights, group_sizes, *, epilogue: Hook, out_dtype, layer,
-                 gather,
-                 scatter, interpret_on_cpu: bool, refused: tuple) -> jax.Array:
-    """`gemm` of a packed weight matrix (`NvFp4`, `TernaryWeights`: its fp32 sums times its
-    scale, frozen), its epilogue on them in XLA before the one rounding, its rows scattered as any, one
-    output; none of `refused` (a transposed matrix, a prologue, its side operands, a pair, a prologue's JVP,
-    several outputs) given."""
+def _window_served(lhs, rhs, compute, precision, outputs: tuple):
+    """`gemm`'s matrix: a `Bf16Window` whose product (`window_product`: bf16 rows' exact products, fp32 sums
+    none promoted, its dot the run's) is the call's (`templates.product.declared`'s of its `compute` into
+    its `outputs`, neither the call nor the run stating an algorithm), else its decoded matrix (13686)."""
+    if not isinstance(rhs, Bf16Window):
+        return rhs
+    computed = jnp.dtype(lhs.dtype if compute is None else compute)
+    asked = declared(computed, precision, outputs=outputs)
+    from .templates.gemm import window as window_module
+    return rhs if (computed == jnp.dtype(jnp.bfloat16) and not asked.promoted and asked.refusal is None and
+                   stated_algorithm(precision) is stated_algorithm(None) is None) else window_module.admitted(
+                       rhs).decoded()
+
+
+def _packed_gemm(lhs, matrix: NvFp4 | TernaryWeights | Bf16Window, group_sizes, *, epilogue: Hook,
+                 out_dtype, layer, gather, scatter, interpret_on_cpu: bool, refused: tuple) -> jax.Array:
+    """`gemm` of a packed weight matrix (`NvFp4`, `TernaryWeights`: its fp32 sums times its scale, frozen;
+    `Bf16Window`: its decoded weights' fp32 sums), its epilogue on them in XLA before the one rounding, its
+    rows scattered as any, one output; none of `refused` (a transposed matrix, a prologue, its side operands,
+    a pair, a prologue's JVP, several outputs) given."""
     if any(given not in (None, False, ()) for given in refused):
         raise ValueError("a packed matrix's product takes no prologue, pair, transposed matrix or several "
                          "outputs")
     if isinstance(matrix, NvFp4):
         summed = nvfp4_product(lhs, matrix, group_sizes, gather=gather, layer=layer, out_dtype=jnp.float32,
                                interpret_on_cpu=interpret_on_cpu)
+    elif isinstance(matrix, Bf16Window):
+        if gather is not None or layer is not None:
+            raise ValueError("a bfloat16 window's product in gemm does not take gather or layer")
+        summed = window_product(lhs, matrix, group_sizes, out_dtype=jnp.float32,
+                                interpret_on_cpu=interpret_on_cpu)
     else:
         if gather is not None or layer is not None:
             raise ValueError(f"{type(matrix).__name__} product in gemm does not take gather or layer")
@@ -807,43 +847,50 @@ def word_packed_op(format_name: str, row: str, receipt: str) -> selection.Op[Wor
 
 
 def _packed_weight_rules(launch: grouped_quantized.MosaicWordPackedGmm, make_bank,
-                         interpret: bool, *, dense: bool):
+                         interpret: bool, *, dense: bool, finite: bool = True):
     """Build `(forward, backward, portable)` rules for an inline-decoding packed weight product
-    (`ternary_weight_product`); callers wrap `linear_tangent` with `contracted(...)`."""
-    def decoded(packed_words: jax.Array) -> jax.Array:
-        matrices = make_bank(packed_words).unscaled()
+    (`ternary_weight_product`, `window_product`) of operands `(rows, words, sizes, *rest)`, its bank
+    `make_bank(words, *rest)` (a window's meta among `rest`); callers wrap `linear_tangent` with
+    `contracted(...)`. Its rows' cotangent is the decoded matrix's products of the cotangent's bfloat16
+    parts where its weights are `finite` (a ternary code's), else its portable product's own transpose (XLA's,
+    the cotangent whole at the configured precision: a window's infinity times a part's zero would be NaN
+    where the one transpose reads it whole)."""
+    def decoded(*bank) -> jax.Array:
+        [matrices, _] = decoded_operands(make_bank(*bank), None)
         return matrices[0] if dense else matrices
 
-    def kernel(r: jax.Array, w: jax.Array, s: jax.Array, *, interpret: bool) -> jax.Array:
-        return launch(r, make_bank(w), s, (), (), None, None, None, out_dtype='float32',
+    def kernel(r: jax.Array, w: jax.Array, s: jax.Array, *rest, interpret: bool) -> jax.Array:
+        return launch(r, make_bank(w, *rest), s, (), (), None, None, None, out_dtype='float32',
                       trans_rhs=False, interpret=interpret, dense=dense, exact_sums=False)
 
-    def portable(r: jax.Array, w: jax.Array, s: jax.Array) -> jax.Array:
-        matrices = decoded(w)
-        return (jax.lax.dot(r, matrices, preferred_element_type=jnp.float32) if dense
-                else xla_products.placed_ragged_dot(r, matrices, s, preferred_element_type=jnp.float32))
+    def portable(r: jax.Array, w: jax.Array, s: jax.Array, *rest) -> jax.Array:
+        return xla_products.decoded_dot(r, decoded(w, *rest), None if dense else s)
 
-    def forward(r: jax.Array, w: jax.Array, s: jax.Array):
+    def forward(r: jax.Array, w: jax.Array, s: jax.Array, *rest):
         with xla_products.interpreted_context(interpret):
-            return xla_products.dispatched(kernel, portable, interpret, r, w, s), ()
+            return xla_products.dispatched(kernel, portable, interpret, r, w, s, *rest), ()
 
     def backward(saved, operands, cotangent, live):
         del saved
-        r, w, s = operands
-        matrices = decoded(w)
-        parts = _bf16_parts(cotangent, bf16_part_count(jnp.float32))
+        r, w, s, *rest = operands
         with xla_products.interpreted_context(interpret):
-            d_rows = functools.reduce(jnp.add, [
-                gemm(part, matrices, None if dense else s, transpose_rhs=True, out_dtype=jnp.float32,
-                     precision=jax.lax.Precision.DEFAULT, interpret_on_cpu=interpret) for part in parts])
-        leaves = (d_rows.astype(r.dtype), zero_from_primal(w), zero_from_primal(s))
+            if finite:
+                matrices = decoded(w, *rest)
+                parts = _bf16_parts(cotangent, bf16_part_count(jnp.float32))
+                d_rows = functools.reduce(jnp.add, [
+                    gemm(part, matrices, None if dense else s, transpose_rhs=True, out_dtype=jnp.float32,
+                         precision=jax.lax.Precision.DEFAULT, interpret_on_cpu=interpret) for part in parts])
+            else:
+                [d_rows] = jax.vjp(lambda rows: portable(rows, w, s, *rest), r)[1](cotangent)
+        leaves = (d_rows.astype(r.dtype), *(zero_from_primal(each) for each in (w, s, *rest)))
         return tuple(leaves[index] for index in live)
     return forward, backward, portable
 
 def decoded_operands(matrix, group_sizes: jax.Array | None) -> tuple:
-    """A packed matrix (`TernaryWeights`, `NvFp4`) decoded to bf16, beside its group sizes:
-    `factored`'s `prepared`, decoded once a rescue, where it runs."""
-    decoded = matrix.decoded() if isinstance(matrix, NvFp4) else matrix.unscaled(jnp.bfloat16)
+    """A packed matrix (`TernaryWeights` its codes unscaled, `NvFp4`, `Bf16Window`) decoded to bf16, beside
+    its group sizes: `factored`'s `prepared`, decoded once a rescue, where it runs."""
+    decoded = (matrix.unscaled(jnp.bfloat16) if isinstance(matrix, TernaryWeights)
+               else matrix.decoded())
     return decoded, group_sizes
 
 
@@ -874,6 +921,14 @@ def _interpreted(product: Callable, interpret_on_cpu: bool, *operands) -> jax.Ar
 def ternary_weight_product(lhs: jax.Array, weights, group_sizes: jax.Array | None = None, **kw) -> jax.Array:
     from .templates.gemm import ternary
     return ternary.ternary_weight_product(lhs, weights, group_sizes, **kw)
+
+
+def window_product(lhs: jax.Array, window: Bf16Window, group_sizes: jax.Array | None = None,
+                   **kw) -> jax.Array:
+    """`window.window_product`: a lossless bfloat16 window's product, decoded in the template's stages
+    (row 5387)."""
+    from .templates.gemm import window as window_module
+    return window_module.window_product(lhs, window, group_sizes, **kw)
 
 
 def fp8_codes_product(lhs: jax.Array, rhs: jax.Array, **kw) -> jax.Array:

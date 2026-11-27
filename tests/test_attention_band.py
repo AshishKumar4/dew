@@ -138,7 +138,8 @@ def test_a_band_of_masked_keys_leaves_the_keys_past_it_unbiased(mainloop):
             Side(values, template.Kind.BAND), Side(origins[:, None, :], template.Kind.QUERY))))
         spans = template.spans(queries, keys, 1)
         run = attention_triton.forward if mainloop == "triton" else attention_mosaic.forward
-        with generation.assumed("sm90", interpreted=True):
+        # An fp32 call's Mosaic parts are the default precision's alone (`MosaicForward.refusal`).
+        with generation.assumed("sm90", interpreted=True), jax.default_matmul_precision("default"):
             out = run(query, key, value, spans, hooks, interpret=True)
     np.testing.assert_array_equal(np.asarray(out), 1.0)
 

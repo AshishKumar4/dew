@@ -381,3 +381,20 @@ def test_the_port_keeps_the_kernel_contract_on_a_mesh(axis, split):
 
     assert_runs_per_shard(ported, draw, specs, mesh, f"ssd split over {axis}", seeds=SHARDED_SEEDS,
                           truth_fn=exact)
+
+
+def test_each_mamba_ssm_stability_site_draws_and_runs_its_leaves():
+    """Every rated-scan stability site (tests/mamba_sites.py, row 6781) draws host arrays of mamba_ssm's
+    operands and runs Dew's portable rule to its leaves: the output and final memory, and a gradient's
+    site every operand's gradient, each the shape of what it differentiates: what
+    tools/mamba_stability_reference.py records against, held on a CPU ahead of a GPU's session."""
+    import mamba_sites
+    from test_recurrence_chunk import chunk_on
+    from test_recurrence_stability import SITES
+
+    for name, site in mamba_sites.sites().items():
+        arrays = site.arrays(0)
+        found = mamba_sites.ruled(functools.partial(chunk_on, "xla", SITES["rated"]), arrays, site.leaves)
+        assert tuple(found) == site.leaves, name
+        for leaf in site.leaves[2:]:
+            assert found[leaf].shape == arrays[leaf.removeprefix("d_")].shape, (name, leaf)

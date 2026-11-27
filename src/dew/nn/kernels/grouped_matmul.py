@@ -46,7 +46,6 @@ from .grouped_cells import (
     MEASURED,
     REFERENCE,
     SCOREBOARDS,
-    STEP_HELD,
     TEMPLATE,
     TOGETHER,
     Kind,
@@ -920,11 +919,12 @@ class MosaicGmm(_Mosaic):
     def _partial_axes(self, ba, family: mosaic.Family, target) -> tuple[bool, bool]:
         """`_Mosaic._partial_axes`: each axis the call does not fill with whole tiles that the launch may run
         partial (`_partial_admitted`) where the tile it derives on the padded call (`_derived`, read once
-        through `derived`) runs it partial as it is (`mosaic_gpu.partial_runs`): the same tile, its operands
-        and output uncopied, so it runs no slower than padded. A partial axis that would take a narrower tile
-        is padded instead: a GH200's grouped 4096 x 200 x 136 product ran its partial tiles one swizzled tile
-        deep and wide 1.07x and its input gradient 1.20x their padded time, where 8192 x 1000 x 1400's ran
-        0.86x and 0.93x (M-EM-22b)."""
+        through `derived`) runs it partial as it is (`mosaic_gpu.partial_runs`): the padded plan's tile, its
+        operands and output uncopied, which on the three GH200 cells M-EM-22c timed ran at or below padded
+        time (grouped 4096 x 200 x 136: 0.818x forward, 0.988x input gradient). A partial axis that would take
+        a narrower tile is padded instead: M-EM-22b timed narrower tiles apart, a GH200's grouped 4096 x 200
+        x 136 product's partial tiles one swizzled tile deep and wide 1.07x and its input gradient 1.20x
+        their padded time, where 8192 x 1000 x 1400's ran 0.86x and 0.93x."""
         from .templates.gemm import mosaic_gpu, pricing
 
         extents, whole = self._whole_extents(ba, family)
@@ -1866,8 +1866,6 @@ def _declared() -> dict[tuple[str | None, Kind], tuple[selection.Kernel[GroupedC
         for made in board.times:
             if board.winner(made) == REFERENCE:
                 cells[board.generation, Kind(dense=True, made=made)] = (XLA, board.why(made))
-            elif (held := STEP_HELD.get((board.generation, made))) is not None:
-                cells[board.generation, Kind(dense=True, made=made)] = (XLA, f"{board.why(made)}; but {held}")
             elif (witness := lagging.get((board.generation, made))) is not None:
                 fewest, most = witness.timed.span
                 cells[board.generation, Kind(dense=True, made=made)] = (XLA, (

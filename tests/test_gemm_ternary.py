@@ -7,6 +7,7 @@ from __future__ import annotations
 import contextlib
 import dataclasses
 import functools
+import types
 
 import jax
 import jax.numpy as jnp
@@ -79,6 +80,102 @@ def test_decoded_ternary_keeps_the_sign_and_bits_of_a_subnormal_scale(dtype):
     expected = (values.astype(np.float64) * scale.astype(np.float64)).astype(dtype)
     bits = np.dtype(f"uint{expected.dtype.itemsize * 8}")
     np.testing.assert_array_equal(decoded.view(bits), expected.view(bits))
+
+
+@pytest.mark.parametrize("quantize", [True, False], ids=["int8 rows", "bf16 rows"])
+@pytest.mark.parametrize("columns", [False, True], ids=["one scale", "a scale a column"])
+def test_a_ternary_product_at_a_subnormal_scale_keeps_its_values(quantize, columns):
+    """Codes of +1 and -1 at a subnormal scale (`2**-127`) times rows of 1 and `2**126`: the products IEEE's
+    multiplies give, `+-2**-127` and `+-0.5`, signs and subnormal bits kept, on the XLA route and the
+    interpreted Mosaic one, with the activations quantized or not, the scale one or a column's: a process
+    that flushes subnormals (XLA's CPU) forms the scale's products among the normals and lowers them once
+    (`factored.scaled_exactly`, row 13340)."""
+    values = np.zeros((256, 2), np.float32)
+    values[0] = (1.0, -1.0)
+    scale = np.full((2,) if columns else (), 2.0 ** -127, np.float32)
+    weights = formats.TernaryWeights.of(values, scale=scale)
+    rows = np.zeros((2, 256), np.float32)
+    rows[:, 0] = (1.0, 2.0 ** 126)
+    want = np.asarray([[2.0 ** -127, -2.0 ** -127], [0.5, -0.5]], np.float32)
+    for interpret in (False, True):
+        ctx = generation.chosen(grouped_matmul="mosaic") if interpret else contextlib.nullcontext()
+        with ctx:
+            got = jax.jit(functools.partial(gemm.ternary_weight_product, quantize_activations=quantize,
+                                            out_dtype=jnp.float32, interpret_on_cpu=interpret))(
+                jnp.asarray(rows, jnp.bfloat16), weights)
+        np.testing.assert_array_equal(np.asarray(got, np.float32).view(np.uint32), want.view(np.uint32),
+                                      err_msg=f"interpret={interpret}")
+
+
+_MIDPOINT_SCALE = float(np.asarray(0x0040003F, np.uint32).view(np.float32))
+"""A subnormal scale whose product with `129 / 128` lies just under a subnormal midpoint, past which a product
+rounded twice (to fp32, then at the subnormal place) rounds up."""
+
+EDGES = {
+    "int8 rows past the scale's raise": (True, (2.0 ** 127,) * 4, 2.0 ** -63),
+    "bf16 rows to a subnormal": (False, (2.0 ** -65,), 2.0 ** -62),
+    "bf16 rows at a subnormal midpoint": (False, (129 / 128,), _MIDPOINT_SCALE),
+    "int8 rows at a subnormal midpoint": (True, (129 / 128,), _MIDPOINT_SCALE),
+    "an infinite row at a subnormal scale": (False, (np.inf,), 2.0 ** -127),
+    "bf16 rows of two binades near the floor": (False, (2.0 ** -120, 129 / 128 * 2.0 ** -126),
+                                                (1 + 2.0 ** -23) * 2.0 ** -7),
+}
+
+
+@pytest.mark.parametrize(("quantize", "entries", "scale"), EDGES.values(), ids=EDGES.keys())
+def test_a_ternary_product_at_its_ranges_edges_keeps_ieees_value(quantize, entries, scale):
+    """+1 codes times a row's entries (each a quantized row's peak, so an int8 code holds it exactly) at a
+    scale: the product IEEE's float64 sum and one rounding to fp32 give, on the XLA route and the interpreted
+    Mosaic one: an int8 epilogue's order kept finite past a normal scale; a normal scale's subnormal result;
+    a product next to a subnormal midpoint rounded once, quantized or not, and one of normal operands near
+    the least normal whose exact residual decides it; an infinite row at a subnormal scale infinite
+    (`factored.lowered_product`, row 13340)."""
+    values = np.zeros((256, 2), np.float32)
+    values[:len(entries)] = 1.0
+    weights = formats.TernaryWeights.of(values, scale=np.float32(scale))
+    rows = np.zeros((1, 256), np.float32)
+    rows[0, :len(entries)] = entries
+    expected = np.full((1, 2), np.float64(sum(entries)) * np.float64(np.float32(scale))).astype(np.float32)
+    for interpret in (False, True):
+        ctx = generation.chosen(grouped_matmul="mosaic") if interpret else contextlib.nullcontext()
+        with ctx:
+            got = jax.jit(functools.partial(gemm.ternary_weight_product, quantize_activations=quantize,
+                                            out_dtype=jnp.float32, interpret_on_cpu=interpret))(
+                jnp.asarray(rows, jnp.bfloat16), weights)
+        np.testing.assert_array_equal(np.asarray(got, np.float32).view(np.uint32),
+                                      expected.view(np.uint32), err_msg=f"interpret={interpret}")
+
+
+@pytest.mark.parametrize("quantize", [True, False], ids=["int8 rows", "bf16 rows"])
+def test_a_subnormal_scale_survives_a_program_traced_for_a_gpu_and_lowered_for_a_cpu(quantize, monkeypatch):
+    """A ternary product at a subnormal scale (`2**-127`, a row of one) traced where its scale's module reads
+    the context placed on a GPU (`generation.placed_platform`, a CUDA host's) and lowered for a CPU, which
+    flushes subnormals:
+    it returns `2**-127`, the lowered platform choosing the scale's software arm (`factored.flushing`, row
+    13569), not the traced one's multiply."""
+    values = np.zeros((256, 2), np.float32)
+    values[0] = (1.0, -1.0)
+    weights = formats.TernaryWeights.of(values, scale=np.float32(2.0 ** -127))
+    rows = np.zeros((1, 256), np.float32)
+    rows[0, 0] = 1.0
+    rows = jnp.asarray(rows, jnp.bfloat16)
+
+    def product(rows):
+        return gemm.ternary_weight_product(rows, weights, quantize_activations=quantize,
+                                           out_dtype=jnp.float32)
+
+    # The scale's module reads its context placed on a GPU (a CUDA host's trace), every other one the host's.
+    from dew.nn.kernels.templates.gemm import factored
+
+    on_gpu = types.SimpleNamespace(**{name: getattr(generation, name) for name in dir(generation)
+                                      if not name.startswith("__")})
+    on_gpu.placed_platform = lambda: "gpu"
+    with monkeypatch.context() as placed:
+        placed.setattr(factored, "generation", on_gpu)
+        lowered = jax.jit(product).trace(rows).lower(lowering_platforms=("cpu",))
+    got = np.asarray(lowered.compile()(rows), np.float32)
+    np.testing.assert_array_equal(got.view(np.uint32),
+                                  np.asarray([[2.0 ** -127, -2.0 ** -127]], np.float32).view(np.uint32))
 
 
 def test_ternary_weight_product_holds_check_1_on_both_routes():

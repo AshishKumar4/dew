@@ -30,7 +30,7 @@ from dew.nn.value_experts import ValueExperts
 
 if TYPE_CHECKING:
     from dew.nn.backbones.decoder_block import Mixture
-    from dew.nn.mla import MLAMixer
+    from dew.nn.protocols import IndexedMixer
 
 @dataclasses.dataclass(frozen=True)
 class MixerContext:
@@ -247,7 +247,7 @@ class MixerBase:
         return frozenset(), frozenset()
 
     @property
-    def indexed_mixers(self) -> tuple[MLAMixer, ...]:
+    def indexed_mixers(self) -> tuple[IndexedMixer, ...]:
         """The kinds within this one that carry an indexer an objective trains (latent attention's,
         `MLAMixer.indexed`): none by default, this kind itself where it carries one, a composed kind's
         branches' own."""

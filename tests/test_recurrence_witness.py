@@ -47,6 +47,14 @@ def test_a_grouped_backwards_records_lie_in_their_key_heads_enclosures(target, d
         assert np.all(inside), (name, float(np.mean(inside)))
 
 
+def test_a_key_decays_forward_on_an_a100s_bundle_is_witnessed_its_read_out_past_its_walk():
+    """Kimi delta attention's bf16 forward on mma.sync's bundle (an A100's), whose walks scope their rings
+    apart, the intra walk's read-out tiles in a scope of their own past its walk (`intra._read_out_staged`,
+    row 13507): every record inside its step's enclosure (`rw.assert_key_decays_witnessed`)."""
+    with generation.assumed("sm80", interpreted=True):
+        rw.assert_key_decays_witnessed(rw.interpreted_lane(), heads=2)
+
+
 def test_an_fp32_forward_the_template_does_not_train_is_witnessed_as_its_inference_forward():
     """An fp32 call on mma.sync's bundle, whose fast backward holds no A100 thread (264 to 328 registers):
     a training step takes another kernel, so the witness holds the template's inference forward

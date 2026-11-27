@@ -15,8 +15,8 @@ from flax.linen.dtypes import promote_dtype
 from flax.typing import Dtype, PrecisionLike
 from jax.custom_derivatives import SymbolicZero
 
-from ..derivatives import Protected, contracted, declared_tangent
-from ..precision import accumulated, at_least_fp32, rounded_operand, scaled_partial
+from ..derivatives import KernelGlue, Protected, contracted, declared_tangent
+from ..precision import accumulated, at_least_fp32, rounded_operand, scaled_partial, stated_algorithm
 from . import generation
 from .templates.product import SCALE_DEPTH, eight
 
@@ -114,9 +114,10 @@ def dispatched(kernel, portable, interpret_on_cpu: bool, *operands):
 def as_multiplied(tokens: jax.Array, kernel: jax.Array, precision: PrecisionLike) -> tuple:
     """`tokens` and `kernel` as XLA's portable product multiplies them, and its precision (`xla_ragged_dot`,
     `xla_dot`). A precision level (`lax.Precision`) on 16-bit operands is their product's at the default,
-    every level the same exact products; an explicit dot algorithm a call states (`lax.DotAlgorithm`,
-    `DotAlgorithmPreset`: its accumulator among it) reaches XLA as stated, run or refused by the backend,
-    never another computation (audit K2-7)."""
+    every level the same exact products; a dot algorithm the product is declared with (`lax.DotAlgorithm`,
+    `DotAlgorithmPreset`: its accumulator among it), the call's or, where it states none, the run's
+    (`precision.stated_algorithm`), reaches XLA as stated, run or refused by the backend, never another
+    computation (audit K2-7)."""
     if any(eight(operand.dtype) for operand in (tokens, kernel)):
         # FP8 codes are each exact in bfloat16: the product is theirs there, summed in the preferred type
         # (the FP8 contract's reference arm, testing.md, FP8 products). XLA's GPU compiler rewrites no
@@ -124,8 +125,10 @@ def as_multiplied(tokens: jax.Array, kernel: jax.Array, precision: PrecisionLike
         # product holds no F8 GEMM, FS-1625-HLO, row 1625).
         return tokens.astype(jnp.bfloat16), kernel.astype(jnp.bfloat16), jax.lax.Precision.DEFAULT
     if all(jnp.finfo(operand.dtype).bits == 16 for operand in (tokens, kernel)):
-        explicit = isinstance(precision, (jax.lax.DotAlgorithm, jax.lax.DotAlgorithmPreset))
-        return tokens, kernel, precision if explicit else jax.lax.Precision.DEFAULT
+        # The algorithm the product is declared with, the call's or the run's (an omitted precision under a
+        # run's algorithm is that algorithm, row 13686's review), passed explicitly; a level, the default's.
+        algorithm = stated_algorithm(precision)
+        return tokens, kernel, jax.lax.Precision.DEFAULT if algorithm is None else algorithm
     if tokens.dtype != kernel.dtype:
         # A 16-bit operand beside a wider one would reach the TPU kernel
         # 16-bit at HIGHEST too; widened, it is the same values (exactly),
@@ -440,3 +443,36 @@ def _portable_projection_jvp(dtype: Dtype | None, precision: PrecisionLike, out_
 portable_projection = contracted("test_a_portable_grouped_projection_holds_every_order")(
     declared_tangent(Protected(), _portable_projection, _portable_projection_jvp,
                      nondiff_argnums=(3, 4, 5), symbolic_zeros=True))
+
+
+def decoded_dot(rows: jax.Array, matrix: jax.Array, group_sizes: jax.Array | None) -> jax.Array:
+    """A packed matrix's decoded product as XLA's own dot: bf16 `rows` times its decoded `matrix`, summed in
+    fp32, dense (XLA's dot at the configured precision, its transpose too) or grouped by `group_sizes`
+    (`_decoded_ragged_dot`); no nested `gemm`, whose native transpose of an fp32 cotangent may round it."""
+    if group_sizes is None:
+        return jax.lax.dot(rows, matrix, preferred_element_type=jnp.float32)
+    return _decoded_ragged_dot(rows, matrix, group_sizes)
+
+
+def _ragged_value(rows: jax.Array, matrix: jax.Array, group_sizes: jax.Array) -> jax.Array:
+    return xla_ragged_dot(rows, matrix, group_sizes, preferred_element_type=jnp.float32)
+
+
+def _ragged_tangent(primals, tangents):
+    rows, matrix, group_sizes = primals
+    d_rows = tangents[0]
+    # The rows' direction whole, widening the matrix beside it, at the configured precision, which reverse
+    # mode transposes into the whole cotangent's product (`xla_ragged_dot` multiplies two 16-bit operands at
+    # the default alone, which a TPU's kernel takes at no other); frozen, the matrix moves nothing.
+    tangent = (jnp.zeros((rows.shape[0], matrix.shape[-1]), jnp.float32) if isinstance(d_rows, SymbolicZero)
+               else xla_ragged_dot(d_rows.astype(jnp.float32), matrix, group_sizes,
+                                                precision=jax.config.jax_default_matmul_precision,
+                                                preferred_element_type=jnp.float32))
+    return _decoded_ragged_dot(rows, matrix, group_sizes), tangent
+
+
+_decoded_ragged_dot = contracted("test_a_window_product_holds_every_order")(
+    declared_tangent(KernelGlue(), _ragged_value, _ragged_tangent, symbolic_zeros=True))
+"""`decoded_dot`'s grouped product: `xla_ragged_dot` (every backend's ragged dot alike, the rows
+past the groups masked), its rows' tangent the ragged dot of the whole fp32 direction at the configured
+precision, whose transpose multiplies the whole cotangent; frozen, its matrix takes none."""

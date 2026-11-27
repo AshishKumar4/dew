@@ -4,6 +4,7 @@ declaration (check 1), a printed program computes what its jaxpr does bit for bi
 keeps what its sums round away (`dew.algebra.printed`), and §1.5's acceptance cases are generated as their
 error decides (`dew.algebra.acceptance`)."""
 
+import dataclasses
 import functools
 import importlib
 import subprocess
@@ -17,6 +18,7 @@ from reference_error import assert_as_exact
 
 from dew import algebra
 from dew.algebra import acceptance, component_cases, error, generate, printed
+from dew.sampling import guidance_cases
 
 FORMS = [(name, policy) for name, form in generate.DECLARATIONS.items() for policy in form.cases.policies]
 
@@ -42,14 +44,15 @@ def test_the_written_modules_are_what_generation_writes(on_its_platform):
     assert {name for found in made for name in found.declarations} == set(generate.DECLARATIONS)
 
 
-def test_the_command_checks_the_declaring_modules_own_declarations(on_its_platform):
-    """`python -m dew.algebra.generate --check`, run as a script (its module `__main__`, beside the one the
-    declaring modules register with), checks the declarations they register, each named: it had held an
-    empty registry of its own, which knew none of them (and passed checking nothing where none was
-    named)."""
-    done = subprocess.run([sys.executable, "-m", "dew.algebra.generate", "--check",
-                           *sorted(generate.DECLARATIONS)], check=False)
-    assert done.returncode == 0
+@pytest.mark.parametrize("named", [False, True], ids=["discovered", "qualified"])
+def test_the_command_checks_the_declaring_modules_own_declarations(named, on_its_platform):
+    """A fresh CLI checks every installed artifact, even without explicit declaration names."""
+    names = sorted(generate.DECLARATIONS) if named else []
+    done = subprocess.run([sys.executable, "-m", "dew.algebra.generate", "--check", *names],
+                          check=False, capture_output=True, text=True)
+    assert done.returncode == 0, done.stderr
+    assert any(line.startswith("checked ") and line.endswith("/guidance_cases_derived.py")
+               for line in done.stderr.splitlines())
 
 
 @pytest.mark.parametrize(("name", "policy"), FORMS, ids=[f"{name}-{policy}" for name, policy in FORMS])
@@ -69,12 +72,19 @@ def test_each_generated_form_is_on_par_with_its_declaration(name, policy):
                                   "softcap_tile", "sink_state", "sliding_visibility", "selective_adjoint",
                                   "kda_strict_band", "gdn_value_pullback", "ssd_chunk_forward",
                                   "ssd_chunk_pullback",
-                                  "gemm_partial_scale", "fp8_epilogue"])
+                                  "gemm_partial_scale", "fp8_epilogue", "mxfp8_scale", "mxfp8_epilogue",
+                                  "nvfp4_scale", "nvfp4_payload", "rounded", "rounded_tangent",
+                                  "rounded_fp16", "rounded_fp16_tangent", "query_walk_factors",
+                                  "key_walk_factors", "walk_output", "quantized_ste", "quantized_ste_tangent",
+                                  "encode_e4m3", "encode_e5m2", "encode_e2m1", "e8m0_decode",
+                                  "decode_e4m3", "decode_e5m2", "selective_read",
+                                  f"{guidance_cases.__name__}.guided",
+                                  f"{guidance_cases.__name__}.guided_tangent"])
 @pytest.mark.parametrize("arm", ["written", "generated"])
 def test_new_template_components_certify_every_primitive_on_the_cpu(name, arm, on_its_platform):
     from certified import assert_certified
 
-    qualified = f"{component_cases.__name__}.{name}"
+    qualified = name if "." in name else f"{component_cases.__name__}.{name}"
     declaration = generate.DECLARATIONS[qualified]
     for policy in declaration.cases.policies:
         function = (declaration.function if arm == "written" else
@@ -103,18 +113,18 @@ def test_shared_component_preserves_layouts_constants_and_live_results():
                            jax.ShapeDtypeStruct((shape[axis],), jnp.bfloat16))
         bias = (np.arange(shape[axis]) * 0.25 + shift).astype(jnp.bfloat16)
         fn = functools.partial(tile, axis=axis, keep_product=keep_product, bias=bias)
-        separate[name] = printed.source(jax.make_jaxpr(fn)(*arguments[name]), name, borrow_shapes=True)[0]
+        separate[name] = printed.formed(jax.make_jaxpr(fn)(*arguments[name]), borrow_shapes=True)[0]
     # An existing emitted body and a public wrapper can both occupy the helper's preferred name.
     occupied = "_shared_component_0"
     arguments[occupied] = (jax.ShapeDtypeStruct((7,), jnp.bfloat16),)
-    separate[occupied] = printed.source(jax.make_jaxpr(lambda x: (x * x,))(*arguments[occupied]),
-                                        occupied, borrow_shapes=True)[0]
+    separate[occupied] = printed.formed(jax.make_jaxpr(lambda x: (x * x,))(*arguments[occupied]),
+                                        borrow_shapes=True)[0]
     reserved = "_shared_component_1"
     shared = _component_sharing.shared(separate, reserved=(reserved,))
     assert len(shared) == len(separate) + 1 and reserved not in shared
     for name, operands in arguments.items():
-        before = printed.loaded(separate[name], name)
-        after = printed.loaded("\n\n".join(shared.values()), name)
+        before = printed.loaded(separate[name].render(name), name)
+        after = printed.loaded("\n\n".join(body.render(key) for key, body in shared.items()), name)
         original = jax.make_jaxpr(before)(*operands)
         composed = jax.make_jaxpr(after)(*operands)
         values = tuple(np.full(operand.shape, 0.75, operand.dtype) for operand in operands)
@@ -140,10 +150,10 @@ def test_shared_component_preserves_two_ordered_spans_in_one_body():
 
     shape = jax.ShapeDtypeStruct((8,), jnp.uint32)
     written = jax.make_jaxpr(twice)(shape)
-    source, _ = printed.source(written, "twice", borrow_shapes=True)
+    source, _ = printed.formed(written, borrow_shapes=True)
     factored = _component_sharing.shared({"twice": source})
     assert len(factored) == 2
-    loaded = printed.loaded("\n\n".join(factored.values()), "twice")
+    loaded = printed.loaded("\n\n".join(body.render(key) for key, body in factored.items()), "twice")
     rebuilt = jax.make_jaxpr(loaded)(shape)
     assert terms.jaxpr_digest(rebuilt, in_process=True) == terms.jaxpr_digest(written, in_process=True)
     value = np.arange(shape.size, dtype=np.uint32)
@@ -153,14 +163,14 @@ def test_shared_component_preserves_two_ordered_spans_in_one_body():
 
 @pytest.mark.parametrize("kind", ["placed", "duplicate"])
 def test_component_dispatch_refuses_cases_its_flat_key_cannot_distinguish(kind):
-    (example,) = component_cases.ROUNDED.cases.operands[0]
+    form = component_cases.ROUNDED.cases[jnp.bfloat16,].forward
+    (example,) = form.cases.operands[0]
     if kind == "placed":
         mesh = jax.make_mesh((1,), ("data",), devices=jax.devices()[:1])
         sharding = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec("data"))
         operands = ((jax.ShapeDtypeStruct(example.shape, example.dtype, sharding=sharding),),)
     else:
         operands = ((example,), (example,))
-    form = component_cases.ROUNDED
     cases = generate.Cases(operands, form.cases.draw, seeds=form.cases.seeds)
     form = generate.ComponentForm(form.function, form.truth, cases)
     with pytest.raises(ValueError):
@@ -328,24 +338,106 @@ def test_generated_value_gradient_accumulates_two_query_tiles():
     assert_as_exact(generated, written, draw, "generated dV across query tiles", seeds=8, truth_fn=truth)
 
 
-def test_generated_rounded_bodies_keep_the_written_surrogate_law():
+def test_an_unhashable_static_surrogate_case_uses_the_written_primal_and_jvp():
     from dew.algebra import component_cases_derived as emitted
-    from dew.nn import derivatives, precision
+    from dew.nn import precision
 
-    def tangent(primals, tangents, value):
-        return emitted.rounded_tangent(primals[0], tangents[0], value)
+    def dtype_of(spec):
+        return spec["dtype"] if isinstance(spec, dict) else spec
 
-    rounded = derivatives.surrogate(emitted.rounded, tangent)
-    x = np.full((16, 32), 1.003, np.float32)
-    dx = np.full_like(x, 1.007)
-    primal, direction = jax.jit(lambda x, dx: jax.jvp(rounded, (x,), (dx,)))(x, dx)
-    np.testing.assert_array_equal(primal, precision.rounded_operand(x, jnp.bfloat16))
+    def forward(value, spec):
+        return precision._rounded(value, dtype_of(spec))
+
+    def tangent(spec, primals, directions, value):
+        return precision._rounded_tangent(dtype_of(spec), primals, directions, value)
+
+    paired = dataclasses.replace(component_cases.ROUNDED, forward=forward, tangent=tangent)
+    composed = paired.assembled(lambda name: getattr(emitted, name))
+    options = {"dtype": jnp.bfloat16}
+    x = jnp.full((16, 32), 1.003, jnp.float32)
+    dx = jnp.full_like(x, 1.007)
+
+    def fallback(value):
+        return composed(value, options)
+
+    primal = jax.jit(fallback)(x)
+    value, direction = jax.jit(lambda x, dx: jax.jvp(fallback, (x,), (dx,)))(x, dx)
+    expected = precision.rounded_operand(x, jnp.bfloat16)
+    np.testing.assert_array_equal(primal, expected)
+    np.testing.assert_array_equal(value, expected)
     np.testing.assert_array_equal(direction, dx)
-    _, pullback = jax.vjp(rounded, jnp.asarray(x))
-    np.testing.assert_array_equal(pullback(jnp.asarray(dx))[0], dx)
-    gradient = jax.grad(lambda x: jnp.sum(rounded(x) ** 2))
-    _, higher = jax.jit(lambda x, dx: jax.jvp(gradient, (x,), (dx,)))(x, dx)
-    np.testing.assert_array_equal(higher, 2 * dx)
+
+
+def test_a_partial_symbolic_zero_uses_its_generated_tangent_and_the_original_value():
+    from jax.custom_derivatives import SymbolicZero
+
+    def value(operands):
+        x, y = operands["x"], operands["y"]
+        return {"difference": x - y, "sum": x + y} if x.shape == (8,) else (x - y, x + y)
+
+    def tangent(primals, directions, written):
+        (operands,), (directions_by_name,) = primals, directions
+        dx, dy = (jnp.zeros_like(operands[name]) if isinstance(d, SymbolicZero) else d
+                  for name, d in directions_by_name.items())
+        if isinstance(written, tuple):
+            difference, total = written
+            return difference * (dx - dy), total * (dx + dy)
+        return {"difference": written["difference"] * (dx - dy), "sum": written["sum"] * (dx + dy)}
+
+    def flat_value(x, y):
+        return x - y, x + y
+
+    def active_tangent(x, y, dx, difference, total):
+        return difference * dx, total * dx
+
+    def draw(seed, operands):
+        return tuple(np.random.default_rng(seed + i).standard_normal(part.shape).astype(np.float32)
+                     for i, part in enumerate(operands))
+
+    tile = jax.ShapeDtypeStruct((8,), jnp.float32)
+    forward = generate.ComponentForm(flat_value, flat_value, generate.Cases(((tile, tile),), draw, 8))
+    small = jax.ShapeDtypeStruct((4,), jnp.float32)
+    active = generate.ComponentForm(active_tangent, active_tangent,
+                                    generate.Cases(((tile,) * 5, (small,) * 5), draw, 8))
+    case = generate.SurrogateCase("partial", forward, {(1,): active},
+                                  input_tree=(jax.tree.structure(({"x": tile, "y": tile},)),),
+                                  output_tree=(jax.tree.structure({"difference": tile, "sum": tile}),))
+    declared = generate.SurrogateBodies(value, tangent, (), symbolic_zeros=True, cases={(): case})
+    reachable = {}
+    for name, component in ((case.name, forward), (case.tangent_name((1,)), active)):
+        _, body, _ = generate._component(component, component.cases.operands[0], "default", "sm90", name)
+        reachable[name] = printed.loaded(body.render("form"), "form")
+
+    called = set()
+
+    def emitted(name):
+        fn = reachable[name]
+        called.add(fn)
+        return lambda *operands, policy, target: fn(*operands)
+
+    composed = declared.assembled(emitted)
+    x = np.arange(8, dtype=np.float32)
+    y = np.full_like(x, 3.5)
+    dx = np.full_like(x, 2.25)
+
+    def moved(x, y, dx):
+        return jax.jvp(lambda z: composed({"x": z, "y": y}), (x,), (dx,))
+
+    primal, direction = jax.jit(moved)(x, y, dx)
+    np.testing.assert_array_equal(primal["difference"], x - y)
+    np.testing.assert_array_equal(primal["sum"], x + y)
+    np.testing.assert_array_equal(direction["difference"], (x - y) * dx)
+    np.testing.assert_array_equal(direction["sum"], (x + y) * dx)
+    assert called == set(reachable.values())
+
+    # The tangent key is valid at this size, but the forward fallback returns a different PyTree.
+    called.clear()
+    pair, direction = jax.jit(moved)(x[:4], y[:4], dx[:4])
+    np.testing.assert_array_equal(pair[0], x[:4] - y[:4])
+    np.testing.assert_array_equal(pair[1], x[:4] + y[:4])
+    np.testing.assert_array_equal(direction[0], (x[:4] - y[:4]) * dx[:4])
+    np.testing.assert_array_equal(direction[1], (x[:4] + y[:4]) * dx[:4])
+    assert not called
 
 
 def nested(x, y):
@@ -365,6 +457,7 @@ PROGRAMS = {
                                                           x.astype(jnp.bfloat16).astype(jnp.float32)),
     "a sort's several results": lambda x, y: jax.lax.sort((x, y), num_keys=1),
     "a sort's one result": lambda x, y: jax.lax.sort(x),
+    "no outputs": lambda x, y: (),
     "a NaN's payload": lambda x, y: jax.lax.bitcast_convert_type(jnp.full_like(x, PAYLOAD), jnp.int32),
 }
 

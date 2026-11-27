@@ -84,10 +84,18 @@ fork.
    - The ring stays only where a stated limit forces it: dynamic grouped step counts (static grids only),
      step counts not divisible by the stages, or the in-flight wgmma release (`delay_release` refused). The
      note then names that limit and the measurement.
+   - Measured (M-FS-94b, GH200, 128x256x64 at four stages, two consumers, three alternating rounds): the two
+     forms tie wherever the pipeline of pipelines compiles (2048x4096x4096 0.998, 8192x4096x4096 and
+     16384x2048x2048 1.000), and it walks one tile axis, so a launch of two (4096x4096x14336) runs on the ring
+     alone. The ring stays for every wgmma launch: nothing is gained where both run, and only it runs where
+     a launch takes two tile axes.
 4. **mma.sync streaming across tiles.** Today each mma.sync tile's `emit_pipeline` drains. The existing
    alternative is one flattened `emit_pipeline` over (tile, step), carrying the accumulator in `init_carry`,
    storing and resetting it at tile boundaries while JAX prefetches across them (:320-323, :416-427,
-   :502-529). It is evaluated after the per-tile form is measured. No new producer machinery.
+   :502-529). Measured, the per-tile form leaves it nothing to recover (M-FS-95, an A100): every grouped
+   GEMM row within 1.04x of Triton, five of eight ahead (input gradients 0.83-0.86x, an 8-group MoE
+   forward 0.46x), and a recurrence walk split into documents running faster, not slower (2.032 ms whole,
+   1.846 in two). The per-tile drain stays; the flattened pipeline is not built.
 
 ### Sources the derivation learns from (owner, bible §6)
 

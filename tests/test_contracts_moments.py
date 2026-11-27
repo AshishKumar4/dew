@@ -28,15 +28,52 @@ def _weights(weights, scale):
     return ((jnp.abs(weights) + 0.25) * scale).at[:, 0].set(0.0)
 
 
-@pytest.mark.parametrize(("orders", "placement"), _ORDERS)
+_SECOND = frozenset({"jvp of grad", "jvp of grad, nested jit", "jvp of grad, remat", "jvp of grad, scanned",
+                     "grad of grad-mesh"})
+"""The weighted walk's orders whose program, both gradients' leaves at once, peaked at 6.9 to 9.1 GiB of a
+CI container's 10 (armada at main 448d44837, alone in a fresh process; Train 1357's OOM kill at 10.0 GiB):
+each runs a leaf at a time (`result_leaf`), its program the leaf's own."""
+
+
+@pytest.mark.parametrize(("orders", "placement"),
+                         [case for case in _ORDERS
+                          if case.id != "grad of grad-local" and case.id not in _SECOND])
 def test_the_weighted_moments_walk_holds_every_order(orders, placement):
+    _weighted_contract(orders, placement, EDGES)
+
+
+def _value_gradient(result):
+    value, _ = result
+    return value
+
+
+def _weight_gradient(result):
+    _, weight = result
+    return weight
+
+
+@pytest.mark.parametrize("result_leaf", [_value_gradient, _weight_gradient], ids=["value", "weight"])
+@pytest.mark.parametrize(("orders", "placement"), [case for case in _ORDERS if case.id in _SECOND])
+def test_the_weighted_moments_walk_holds_each_second_orders_leaf(orders, placement, result_leaf):
+    _weighted_contract(orders, placement, EDGES, result_leaf=result_leaf)
+
+
+@pytest.mark.fresh_process
+@pytest.mark.parametrize("edge", EDGES)
+@pytest.mark.parametrize("result_leaf", [_value_gradient, _weight_gradient], ids=["value", "weight"])
+def test_the_local_weighted_walk_holds_reverse_over_reverse_at_every_scale(edge, result_leaf):
+    _weighted_contract(("grad of grad",), "local", {edge: EDGES[edge]}, result_leaf=result_leaf)
+
+
+def _weighted_contract(orders, placement, edges, *, result_leaf=None):
     x, _, w = normal_draw(9045, (2, 8), (2, 8), (2, 8))
     dx, _, dw = normal_draw(9046, (2, 8), (2, 8), (2, 8))
     c_mean, _, c_var = normal_draw(9047, (2,), (2,), (2,))
-    for edge, scale in EDGES.items():
+    for edge, scale in edges.items():
         assert_contract(_weighted, (x * scale, _weights(w, scale)), (dx * scale, dw * scale), (c_mean, c_var),
                         f"chunked moments {edge}", plain_fn=moments.weighted_moments,
-                        truth_fn=moments.weighted_moments, taking=orders, placement=placement)
+                        truth_fn=moments.weighted_moments, taking=orders, placement=placement,
+                        result_leaf=result_leaf)
 
 
 @pytest.mark.parametrize(("orders", "placement"), _ORDERS)

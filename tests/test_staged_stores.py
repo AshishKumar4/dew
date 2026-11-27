@@ -81,22 +81,19 @@ def _accesses(call) -> str:
         shared = mgpu_utils.WORKGROUP_NVPTX_ADDRESS_SPACE
         return isinstance(kind, llvm.PointerType) and kind.address_space == shared
 
-    def walk(operation) -> None:
-        for region in operation.regions:
-            for block in region.blocks:
-                for inner in block.operations:
-                    name = inner.operation.name
-                    shared = any(in_shared(each) for each in inner.operation.operands)
-                    if name == "nvvm.barrier":
-                        found.append("B")
-                    elif shared and name.endswith("store"):
-                        found.append("W")
-                    elif shared and (name.endswith("load") or name == "nvvm.ldmatrix"):
-                        found.append("R")
-                    walk(inner.operation)
+    def visit(operation) -> ir.WalkResult:
+        name = operation.name
+        shared = any(in_shared(each) for each in operation.operands)
+        if name == "nvvm.barrier":
+            found.append("B")
+        elif shared and name.endswith("store"):
+            found.append("W")
+        elif shared and (name.endswith("load") or name == "nvvm.ldmatrix"):
+            found.append("R")
+        return ir.WalkResult.ADVANCE
 
     with module.context:
-        walk(module.operation)
+        module.operation.walk(visit, ir.WalkOrder.PRE_ORDER)
     return "".join(found)
 
 

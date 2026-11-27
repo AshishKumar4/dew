@@ -1207,7 +1207,7 @@ class CausalSelfAttention(nn.Module):
                                  f"{masking.key.shape[-3]} keys are not its {S} tokens")
             relative = self._relative_bias(x, places, query_slots, key_slots, banded=indexed and bias is None)
             bias = relative if bias is None else bias + dense_bias(relative, key.shape[-3])
-        attention = self._attended(masking, positions, append, sinks, train, bias=bias)
+        attention = self._attended(masking, positions, append, sinks, train, bias=bias, hidden=x)
         return self._output(attention, gate, B, S, own_value, progress)
 
     @property
@@ -1700,11 +1700,15 @@ class CausalSelfAttention(nn.Module):
         """Whether the layer reads its keys' places, a chunk or ALiBi, so its cache keeps them."""
         return self.ctx.attention_chunk is not None or self.alibi
 
-    def _attended(self, masking: _Masking, positions, append, sinks, train: bool, *, bias=None):
+    def _attended(self, masking: _Masking, positions, append, sinks, train: bool, *, bias=None,
+                  hidden=None):
         """The attention output through the kernel the masking chose: the
         paged kernel or a per-row key count for a plain decode step, the
         general kernel otherwise, with the per-head logit maxima sown for
-        QK-Clip when a caller opened that collection."""
+        QK-Clip when a caller opened that collection. `hidden` is the layer's
+        input before its projections, which a selection that reads it takes
+        (`dew.nn.block_sparse`'s MSA index branch); this kernel reads none of it."""
+        del hidden
         (query, key, value, causal, window, mask, documents, max_segments, implementation, cursor, starts,
          key_places, groups, valid, runs, query_places, query_slots) = masking
         B, S = query.shape[:2]

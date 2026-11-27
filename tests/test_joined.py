@@ -312,7 +312,11 @@ def test_a_gate_multiplier_keeps_gate_and_up_joined():
                            seeds=JOINED_SEEDS["gate multiplier"])
 
 
-@pytest.mark.parametrize("recipe", ["blockwise_fp8", "mxfp8", "nvfp4"])
+@pytest.mark.parametrize("recipe", [
+    "blockwise_fp8", "mxfp8",
+    # NVFP4's emulated quantization of every arm's products and gradients took its cell past one group's
+    # 120 s (123 s in train 1341): its draws run in armada's map tasks.
+    pytest.param("nvfp4", id="nvfp4", marks=pytest.mark.check1_shards(seeds=8, per_task=8))])
 def test_a_delta_nets_gates_joined_under_a_recipe_are_as_exact_as_apart_from_float64(recipe):
     """Under each preset's low-precision recipe, a gated delta net of Qwen3.5-0.8B's 16 value heads, its b
     and a gates 16 wide each and 32 joined, whose row joins them: as exact as the layer with them apart,

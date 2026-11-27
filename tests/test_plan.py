@@ -306,12 +306,14 @@ class Counted(LMObjective):
 
 
 def lm(split="auto", accumulation=1, objective=LMObjective, *, seq=SEQ, width=16, layers=1, vocab=64,
-       policy="auto", **fields):
+       policy="auto", optimizer=None, **fields):
     """A tiny LM's trainer on one device: its step's batch read in `split` microbatches, `accumulation`
-    steps an update, recomputing as its fit `policy` asks (`FitPolicy.remat`), its model's `fields` given."""
+    steps an update, recomputing as its fit `policy` asks (`FitPolicy.remat`), its model's `fields` given,
+    updated by `optimizer` (SGD at 1e-2 where none is given)."""
     model = CausalTransformer(vocab_size=vocab, emb_features=width, num_layers=layers, num_heads=2,
                               mlp_features=2 * width, max_seq_len=seq, **fields)
-    return one_device(Trainer(objective(model, seq_len=seq), optax.sgd(1e-2), key=jax.random.key(0),
+    optimizer = optax.sgd(1e-2) if optimizer is None else optimizer
+    return one_device(Trainer(objective(model, seq_len=seq), optimizer, key=jax.random.key(0),
                               accumulation=accumulation,
                               split=split, remat=policy))
 
@@ -1772,8 +1774,10 @@ remat at their own head, each read as asked (`climbed`): no other rung's need is
 @pytest.mark.parametrize(("shape", "target"), [
     pytest.param("decoder", "cpu", id="decoder-cpu"),
     pytest.param("decoder", "h100", id="decoder-h100"),
+    # Six places a task at most: the cut weighs each span by its own measured rate (tools/armada/costs.py's
+    # Cost.cut), so the walk's heavy first places are a task alone and its light ones merge (row 8611).
     pytest.param("delta-scanned", "h100", id="delta-scanned-h100",
-                 marks=pytest.mark.shards(units=18, per_task=2)),
+                 marks=pytest.mark.shards(units=18, per_task=6)),
 ])
 def test_a_starts_climb_settles_the_lightest_rung_an_exhaustive_walk_finds_fits(monkeypatch, shape, target,
                                                                                     request, tmp_path):
@@ -2070,6 +2074,29 @@ def test_a_rung_key_states_the_settings_a_step_computes_by():
     first, skipped, chunks = key(plain), key(skipping), key(chunked)
     assert None not in (first, skipped, chunks)
     assert first == key(lm()) and skipped != first and chunks != first
+
+
+def test_a_rung_key_states_a_raw_optimizers_functions_by_what_they_read():
+    """A raw optimizer (an Optax transformation handed in built) names its rung record by its functions and
+    what they read: two of one state's type (`optax.EmptyState`) whose updates scale by other factors name
+    two records, SGD at two rates two, and the same values one (row 13556: every raw optimizer named one,
+    so a stored split was tried first for a step that updates otherwise)."""
+    from dew.training.rungs import rung_key
+
+    def scaled(factor: float) -> optax.GradientTransformation:
+        return optax.GradientTransformation(
+            lambda params: optax.EmptyState(),
+            lambda updates, state, params=None: (jax.tree.map(lambda u: -factor * u, updates), state))
+
+    def key(optimizer):
+        trainer = lm(optimizer=optimizer)
+        state, _, _ = trainer.place()
+        return rung_key(trainer.objective.program_key(), (state, BATCH), [1, 2], trainer.device_mesh,
+                        settings=trainer._settings())
+
+    once, twice = key(scaled(1.0)), key(scaled(2.0))
+    assert None not in (once, twice) and once == key(scaled(1.0)) != twice
+    assert key(optax.sgd(1e-2)) == key(optax.sgd(1e-2)) != key(optax.sgd(2e-2))
 
 
 def test_a_rung_key_holds_a_flag_given_twice_by_its_order(monkeypatch):

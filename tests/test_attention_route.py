@@ -13,6 +13,7 @@ rows' arguments name.
 
 import functools
 import math
+import os
 
 import jax
 import jax.numpy as jnp
@@ -1122,12 +1123,13 @@ def test_a_cpu_call_whose_xla_scores_pass_its_devices_memory_holds_temporaries_l
 
 @pytest.mark.parametrize(("generation_name", "tokens", "width", "declared"), [
     ("sm80", 8192, 128, True), ("sm90", 32768, 64, True), ("sm80", 4096, 128, False),
-    ("sm80", 8192, 256, False),
+    ("sm90", 4096, 128, False), ("sm80", 8192, 256, False),
     ("sm90", 65536, 128, False), ("sm80", 65536, 64, False), ("sm120", 4096, 64, True),
     ("sm120", 4096, 128, False), ("sm86", 4096, 128, False), ("sm100", 4096, 256, True),
     ("sm100", 32768, 128, True), ("sm100", 256, 64, True), ("sm100", 128, 128, False),
     ("sm100", 4096, 32, False), ("sm100", 65536, 256, False)],
-    ids=["a100-measured", "h100-longest", "a100-off-pair", "wider", "longer", "longer-narrower",
+    ids=["a100-measured", "h100-longest", "a100-off-pair", "h100-off-pair", "wider", "longer",
+         "longer-narrower",
          "g4-measured",
          "g4-wider", "a10-unmeasured", "b200-measured", "b200-longest", "b200-shortest", "b200-shorter",
          "b200-narrower", "b200-longer"])
@@ -1135,8 +1137,8 @@ def test_a_16_bit_calls_declared_cell_holds_only_within_its_generations_receipts
         generation_name, tokens, width, declared):
     """A bf16 causal call of one row over 8 key heads: on an A100, whose declared cell names FlashAttention's
     forward (`attention_kernels.DECLARED`), M-NA-44's sweep exactly (its (rows, tokens) pairs, 1 x 8192 among
-    them and 1 x 4096 not, widths 64 and 128, 32/8); on an
-    H100 up to 32768 tokens (`MEASURED`'s interim placeholder until M-NA-44's GH200 rows); on a G4 at 4096
+    them and 1 x 4096 not, widths 64 and 128, 32/8); on an H100 the same pairs (M-NA-44's GH200 sweep, 1 x
+    32768 among them and 1 x 4096 not); on a G4 at 4096
     tokens and width 64 alone (M-NA-35); on an A10, an mma.sync GPU no receipt
     timed, in none (an A100's receipt declared its FlashAttention-2 for every mma.sync GPU, 2026-11-26
     audit); on a B200, whose cell names cuDNN, its receipts' shapes alone: 256 to 32768 tokens at widths 64,
@@ -1200,6 +1202,31 @@ def test_flash_inference_infers_on_flashattention_and_trains_on_the_template():
         trained = _launches(jax.grad(lambda *x: jnp.sum(call(*x).astype(jnp.float32)), argnums=(0, 1, 2)),
                             query, key, key)
     assert inferred == {"flash"} and trained == {"template"}, (inferred, trained)
+
+
+def test_flash_inference_takes_a_call_under_deterministic_ops_that_flash_refuses(monkeypatch):
+    """Under --xla_gpu_deterministic_ops, which FlashAttention's backward's atomic dQ sum does not keep
+    (`attention_kernels.FLASH_BACKWARD`), a bf16 causal call named onto 'flash' on an A100 is refused, and
+    one named onto 'flash_inference', whose derivatives are the template's, is taken: differentiated, its
+    template's kernels alone (row 13535)."""
+    from dew._devices import deterministic_ops_requested
+    from dew.nn.kernels.selection import KernelRefused
+
+    monkeypatch.setenv("XLA_FLAGS", " ".join(filter(None, (os.environ.get("XLA_FLAGS"),
+                                                             "--xla_gpu_deterministic_ops=true"))))
+    assert deterministic_ops_requested()
+    query = jax.ShapeDtypeStruct((2, 4096, 32, 128), jnp.bfloat16)
+    key = jax.ShapeDtypeStruct((2, 4096, 8, 128), jnp.bfloat16)
+
+    def named(implementation):
+        def call(query, key, value):
+            return scaled_dot_product_attention(query, key, value, causal=True, implementation=implementation)
+        return jax.grad(lambda *x: jnp.sum(call(*x).astype(jnp.float32)), argnums=(0, 1, 2))
+
+    with generation.assumed("sm80"):
+        assert _launches(named("flash_inference"), query, key, key) == {"template"}
+        with pytest.raises(KernelRefused):
+            _launches(named("flash"), query, key, key)
 
 
 def test_flash_inference_where_flash_lowers_not_trains_a_rematerialized_block_and_refuses_its_inference():

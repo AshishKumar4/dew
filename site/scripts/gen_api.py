@@ -33,13 +33,14 @@ import tempfile
 import tokenize
 from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass, field
-from typing import NamedTuple
 from pathlib import Path
+from typing import NamedTuple
 
 import griffe
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "tools"))
-import lint_scopes as scopes
+# The scope analyzer as the checkout's tools package holds it: its launchers put the checkout root on
+# PYTHONPATH (tools/check_gates' api-pages, site/package.json), and pytest's run from the root has it there.
+from tools import lint_scopes as scopes
 
 DEW_GROUPS: list[tuple[str, list[str]]] = [
     ("Top level", ["dew", "dew.batch", "dew.mesh"]),

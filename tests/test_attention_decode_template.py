@@ -72,6 +72,23 @@ def _drawn(positions: int, heads: int, kv_heads: int, dtype, width: int = 64, va
     return draw
 
 
+def _pooled(cache: jax.Array, table: jax.Array, page: int) -> jax.Array:
+    """`[B, K, KV, D]` keys as pools `[KV, P, page, D]` holding each row's at the pages its `table` names."""
+    rows, keys = cache.shape[:2]
+    pages = jnp.moveaxis(cache.reshape(rows * keys // page, page, *cache.shape[2:]), 2, 0)
+    return pages[:, jnp.argsort(table.reshape(-1))]
+
+
+def _one_query_draws(rows: int, heads: int, keys: int, kv_heads: int, dtype):
+    """A draw of `rows` rows' one query of `heads` heads 64 wide, and their keys and values over `keys`."""
+    def draw(seed: int):
+        streams = jax.random.split(jax.random.key(seed), 3)
+        return (jax.random.normal(streams[0], (rows, 1, heads, 64), dtype),
+                *(jax.random.normal(stream, (rows, keys, kv_heads, 64), dtype) for stream in streams[1:]))
+
+    return draw
+
+
 def _operands(query_shape: tuple[int, ...], keys: int):
     """A draw of bf16 queries `query_shape` `[rows, T, 8, 64]` and two rows' keys and values over `keys`, two
     heads 64 wide."""
@@ -210,6 +227,41 @@ def test_an_absorbed_mla_decode_step_whose_values_are_its_keys_leading_columns_i
 
 
 @INTERPRETS
+def test_a_page_selected_decode_step_over_a_paged_cache_is_on_par_interpreted():
+    """MiniMax M3's sparse decode (kernel-templates.md §A row 37a): a decode step over a paged cache of
+    128-token pages reading only the pages its selection names (the first, its own, and one between, as
+    `msa_selection`'s M3 forcing and top take them), as the indexed form's key runs (`runs`), each row's
+    pages at shuffled places of the pool through its table, as an H100 runs it under the interpreter: on par
+    with the reference path over the same runs of the dense keys (check 1)."""
+    page, keys, heads, kv_heads = 128, 512, 8, 2
+    lengths = jnp.asarray([keys - 40, keys - 200], jnp.int32)
+    # Each row's one query: its first page, one between and its own up to its last key.
+    runs = np.zeros((2, 1, 3, 2), np.int32)
+    for row, (end, between) in enumerate(zip(np.asarray(lengths), (2, 1), strict=True)):
+        own = (end - 1) // page
+        runs[row, 0] = [(0, page), (between * page, (between + 1) * page), (own * page, end)]
+    spans = template.spans(1, keys, 2, lengths=lengths, runs=jnp.asarray(runs))
+    per_row = keys // page
+    table = jnp.asarray(np.random.default_rng(37).permutation(2 * per_row).reshape(2, per_row), jnp.int32)
+
+    def pooled(rows):
+        # `[B, K, KV, D]` as a pool `[KV, P, page, D]` holding row `b`'s page `j` at `table[b, j]`.
+        held = jnp.moveaxis(rows.reshape(2, per_row, page, *rows.shape[2:]), 3, 0)
+        pool = jnp.zeros((kv_heads, 2 * per_row, page, *rows.shape[3:]), rows.dtype)
+        return pool.at[:, table].set(held)
+
+    draw = _one_query_draws(2, heads, keys, kv_heads, jnp.bfloat16)
+
+    def ours(query, key, value):
+        with generation.assumed("sm90"):
+            return attention_decode.attend(query, pooled(key), pooled(value), spans, interpret=True,
+                                           table=table)
+
+    assert_as_exact(jax.jit(ours), jax.jit(lambda *operands: template.reference(*operands, spans)), draw,
+                    "template decode page-selected paged", seeds=SEEDS)
+
+
+@INTERPRETS
 def test_a_split_absorbed_mla_decode_step_whose_values_are_its_keys_leading_columns_is_on_par_interpreted():
     """An absorbed MLA decode step over 512 keys whose plan cuts its row into slices (`plan`: a split launch
     keeps its rows, `Kept.OUTPUT`), its values its keys' leading 512 columns read from the key's slot
@@ -294,9 +346,7 @@ def test_a_decode_rows_logits_past_the_folds_reach_walk_again_natural_interprete
         np.random.default_rng(page).permutation(2 * KEYS // page).reshape(2, KEYS // page), jnp.int32)
 
     def pooled(cache):
-        # [B, K, KV, D] as pools [KV, P, page, D] holding each row's keys at the pages its table names.
-        pages = jnp.moveaxis(cache.reshape(2 * KEYS // page, page, *cache.shape[2:]), 2, 0)
-        return pages[:, jnp.argsort(table.reshape(-1))]
+        return _pooled(cache, table, page)
 
     def draw(seed: int):
         query, key, value, _ = drawn(seed)
@@ -1027,7 +1077,9 @@ def test_a_walk_its_compile_refused_plans_a_config_its_launch_pins(dtype):
     query = jnp.zeros((24, 1, 16, 64), dtype)
     key = value = jnp.zeros((24, KEYS, 8, 64), dtype)
     spans = template.spans(1, KEYS, 24, lengths=jnp.full((24,), KEYS, jnp.int32))
-    with generation.assumed("sm90"):
+    # An fp32 walk's parts are the default precision's alone (`MosaicForward.refusal`); the suite runs at
+    # HIGHEST.
+    with generation.assumed("sm90"), jax.default_matmul_precision("default"):
         work, rows, row_spans, whole = attention_decode.planned(query, key, value, spans, template.Hooks())
         walk = "scaled" if "scaled" in work else "plain"
         assert work[walk].slices == 1
@@ -1206,6 +1258,50 @@ def test_a_walk_on_a_gpu_of_no_issue_interval_has_no_issued_price():
         assert op.price_config(ba, tiles, target) is not None
 
 
+@pytest.mark.parametrize("rows, keys, width", [(1, 32768, 128), (8, 4096, 64)])
+def test_an_a100s_decode_walk_prices_its_larger_key_tile_at_or_below_its_smaller(rows, keys, width):
+    """A decode step on an A100, bf16, 32 heads over 8, a cache full to its length, as the planner prices it
+    (`attention_decode.plan`): its query packed over the key heads (`packed`), priced over every key, at each
+    slice count the plan weighs (powers of two to its bound: four programs a multiprocessor, two of its
+    ring's stages a slice), its walk's issued price (`MosaicForward.price_config`) at each key tile it
+    streams at; the larger tile at or below the smaller at every such count. The smaller tile's programs are
+    two a multiprocessor, priced at one program's issue interval on an A100
+    (`Multiprocessor.programs_hide_issue`): priced over both programs' warps, the smaller tile ranked below
+    and walked slower at these cells (M-NA-27c-a100: +20.5% and +40.5%, row 5274)."""
+    target = generation.gpu_target("sm80")
+    query = jnp.zeros((rows, 1, 32, width), jnp.bfloat16)
+    key = jnp.zeros((rows, keys, 8, width), jnp.bfloat16)
+    spans = attention_decode.key_spans(1, keys, rows)
+    compared = 0
+    with generation.assumed(target):
+        packed, packed_spans, _ = attention_decode.packed(query, spans, 8)
+        every = (packed_spans if packed_spans.form == "full"
+                 else attention_decode.key_spans(packed.shape[1], packed_spans.keys, packed.shape[0]))
+        walk = attention_decode.WALKS["plain"]
+        single_op, single_ba = attention_decode._stream_op(packed, key, key, every, None, scale=None,
+                                                           table=None, sources=None, scales=None,
+                                                           out_dtype=None, chosen=walk, in_key=False)
+        single = single_op.streaming(single_ba, single_op.remaining(single_ba), target)
+        programs = attention_decode.launch_programs(packed, single)
+        longest = math.ceil(keys / single.block_k) // (2 * min(single.stages, 2))
+        most = min(longest, max(2, 4 * target.multiprocessors // programs))
+        for count in (1 << power for power in range(1, most.bit_length()) if 1 << power <= most):
+            op, ba = attention_decode._bound(packed, key, key, every, None, scale=None, table=None,
+                                             sources=None, scales=None, splits=count, chosen=walk,
+                                             in_key=False)
+            derived = op.derived(ba, target)
+            if derived is None:
+                continue
+            prices = {tile.block_k: op.price_config(ba, tile, target, issued=True)
+                      for tile in op.streamings(ba, derived, target)}
+            if len(prices) < 2:
+                continue
+            ranked = [prices[block] for block in sorted(prices)]
+            assert None not in ranked and ranked[-1] <= ranked[0], (count, prices)
+            compared += 1
+    assert compared, "no slice count the plan weighs streams at two key tiles"
+
+
 @COMPILES_ON_CPU
 @pytest.mark.parametrize("width", [128, 256])
 @pytest.mark.parametrize("generation_name", ["sm80", "sm90", "sm100", "sm120"])
@@ -1327,18 +1423,20 @@ def test_one_row_decode_split_k_keeps_sm_utilization_and_per_slice_stage_depth()
 
 @INTERPRETS
 def test_an_fp32_decode_steps_programs_are_its_walks_grid_and_its_step_is_on_par_interpreted():
-    """An fp32 decode step of 8 rows of 16 query heads over 8 key heads and 4096 keys on an H100: at an
+    """An fp32 decode step of 8 rows of 16 query heads over 8 key heads and 1024 keys on an H100: at an
     explicit tile its planner's programs a slice (`attention_decode.launch_programs`, a row's key head's
     packed query rows each, its parts stacked within their rows) times its slices are its walk's launch
     grid, 64 a slice, short of the device's 132, where counted with its parts the step filled it on paper
     (2026-11-26 audit); and the step as it plans itself is on par with the reference path (check 1)."""
-    keys, heads, kv_heads = 4096, 16, 8
+    keys, heads, kv_heads = 1024, 16, 8
     spans = template.spans(1, keys, 8, lengths=jnp.full((8,), keys, jnp.int32))
     query = jnp.zeros((8, 1, heads, 64), jnp.float32)
     key = jnp.zeros((8, keys, kv_heads, 64), jnp.float32)
     # The walk's columns its launch splits the value's 64 into (an fp32 step's parts' launch's).
     tiles = attention_mosaic.Tiles(64, 64, 2, 1, family="wgmma", columns=32)
-    with generation.assumed("sm90"), tuning.pinned({attention_mosaic.MosaicForward: tiles}):
+    # Its parts' walk is the default precision's alone (`MosaicForward.refusal`); the suite runs at HIGHEST.
+    with (generation.assumed("sm90"), tuning.pinned({attention_mosaic.MosaicForward: tiles}),
+          jax.default_matmul_precision("default")):
         work, rows, *_ = attention_decode.planned(query, key, key, spans, template.Hooks())
         traced = jax.make_jaxpr(lambda q, k, v: attention_decode.attend(q, k, v, spans, interpret=True))(
             query, key, key).jaxpr
@@ -1352,19 +1450,16 @@ def test_an_fp32_decode_steps_programs_are_its_walks_grid_and_its_step_is_on_par
         walks, work)
     assert attention_decode.launch_programs(rows, tiles) == 64
 
-    def draw(seed: int):
-        streams = jax.random.split(jax.random.key(seed), 3)
-        return (jax.random.normal(streams[0], (8, 1, heads, 64), jnp.float32),
-                *(jax.random.normal(stream, (8, keys, kv_heads, 64), jnp.float32) for stream in streams[1:]))
+    draw = _one_query_draws(8, heads, keys, kv_heads, jnp.float32)
 
     def ours(query, key, value):
-        with generation.assumed("sm90"):
+        with generation.assumed("sm90"), jax.default_matmul_precision("default"):
             return attention_decode.attend(query, key, value, spans, interpret=True)
 
     def reference(query, key, value):
         return template.reference(query, key, value, spans)
 
-    assert_as_exact(jax.jit(ours), jax.jit(reference), draw, "template fp32 decode of 4096 keys", seeds=SEEDS)
+    assert_as_exact(jax.jit(ours), jax.jit(reference), draw, "template fp32 decode of 1024 keys", seeds=SEEDS)
 
 
 def test_an_a100_decode_plan_prices_the_count_of_slices_filling_one_wave():

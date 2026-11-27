@@ -422,8 +422,9 @@ def test_rows_of_one_document_each_read_whole_blocks_by_their_documents():
 
 def test_whole_blocks_route_as_the_non_causal_call_by_documents():
     """A block layer reading whole blocks (`AttentionMetadata.whole_blocks`) computes bitwise what a
-    non-causal decoder computes over the documents, and its call routes as that decoder's does on an
-    H100 (the kernels that run a non-causal call by documents, which block groups' spans refuse)."""
+    non-causal decoder computes over the documents, and its fp32 call routes as that decoder's does on an
+    H100 (its fp32 cell's kernel, `attention_kernels.DECLARED`, which takes a non-causal call by documents
+    and refuses block groups' spans; its bf16 cell holds no call of documents)."""
     kinds = {"full_attention": {"mixer": AttentionMixer(bidirectional_blocks=True)}}
     decoder = model(**kinds)
     ids = jax.random.randint(jax.random.key(0), (2, LENGTH), 0, VOCAB)
@@ -439,11 +440,11 @@ def test_whole_blocks_route_as_the_non_causal_call_by_documents():
                                   states(decoder.clone(causal=False)))
 
     def routes(decoder, **fields):
-        bf16 = decoder.clone(dtype="bfloat16", head_dim=64)
-        shapes = jax.eval_shape(lambda: bf16.init(jax.random.key(1), ids))
+        wide = decoder.clone(dtype="float32", head_dim=64)
+        shapes = jax.eval_shape(lambda: wide.init(jax.random.key(1), ids))
         with generation.assumed("sm90"), generation.routes() as found:
             laid = coordinates(ids.shape, segments=segments)
-            jax.jit(lambda params: bf16.apply(params, ids, coordinates=laid,
+            jax.jit(lambda params: wide.apply(params, ids, coordinates=laid,
                                               method=CausalTransformer.hidden_states, **fields)).trace(shapes)
         return [(route.choice, route.kernel) for route in found]
 

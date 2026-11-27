@@ -16,8 +16,11 @@ store between them held inside its launch step's enclosure on the native records
 (`recurrence_witness`), its faults a dropped carry, a state rounded to bf16 where fp32 is held, the decay from
 rounded cumulative sums and an off-by-one chunk boundary. Link 4: the attention template's Mosaic forward,
 each online-softmax state its certify launch stores after a key tile and its output held inside one plain
-step's enclosure on the state before it (`attention_witness`), its faults a dropped rescale, a maximum from
-the wrong tile, sums rounded to bf16 and a mask off by one key."""
+step's enclosure on the state before it (`attention_witness`), full, causal, windowed, over packed documents
+and capped, its faults a dropped rescale, a maximum from the wrong tile, sums rounded to bf16, a mask off by
+one key, a window's or the documents' records held as one undivided call's and a cap's read; and its fast
+backward's gradients held to their enclosures from the forward's stored residuals, capped too, its faults a
+wrong scale, a sixty-fourth off, a mask and a cap."""
 
 import collections
 import functools
@@ -30,9 +33,16 @@ import numpy as np
 import pytest
 import recurrence_witness as rw
 import tier_wire
-from attention_witness import assert_faults_refused, assert_witnessed
+from attention_witness import (
+    BACKWARD_FORMS,
+    FORMS,
+    assert_backward_faults_refused,
+    assert_backward_witnessed,
+    assert_faults_refused,
+    assert_witnessed,
+)
 from gpu_flow import RUNNING, Cell, in_parts, run_cells
-from interval_certificates import Lane, exp2_reach
+from interval_certificates import Lane, exp2_reach, tanh_reach
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 from native_certificates import (
@@ -599,25 +609,27 @@ def subnormal_operands_certify_natively_at_their_formats_least_normal(dtype, ker
             assert np.all(native_dot_holds(native, products, FLOAT32, flushes=False))
 
 
-def mosaic_exp2(semantics: str):
-    """Mosaic GPU's `exp2` under `approx_math` on fp32 operands, a multiple of 128 of them, in a kernel
-    lowered with `semantics` (`plgpu.LoweringSemantics`' name: Lane, mma.sync's bundle's; Warpgroup,
-    wgmma's), beside each operand's product with 2^-100 (whether a product below the normal range
-    flushes)."""
+def mosaic_exp2(semantics: str, function=jnp.exp2, approx: bool = True):
+    """Mosaic GPU's `function` (`exp2`) on fp32 operands, a multiple of 128 of them, in a kernel lowered with
+    `semantics` (`plgpu.LoweringSemantics`' name: Lane, mma.sync's bundle's; Warpgroup, wgmma's) under
+    `approx_math` where `approx` (a launch of no hook its approximation refuses, `approximate`; a capped
+    score's tanh takes none), beside each operand's product with 2^-100 (whether a product below the normal
+    range flushes)."""
     def body(x_ref, out_ref, tiny_ref):
         span = pl.ds(jax.lax.axis_index("x") * 128, 128)
         value = x_ref[span]
-        out_ref[span] = jnp.exp2(value)
+        out_ref[span] = function(value)
         tiny_ref[span] = value * np.float32(2.0 ** -100)
 
     def run(x):
         f32 = jax.ShapeDtypeStruct(np.shape(x), jnp.float32)
-        params = plgpu.CompilerParams(approx_math=True,
+        params = plgpu.CompilerParams(approx_math=approx,
                                       lowering_semantics=getattr(plgpu.LoweringSemantics, semantics))
         kernel = plgpu.kernel(body, out_type=(f32, f32), grid=(np.size(x) // 128,), grid_names=("x",),
                               compiler_params=params)
         # Compiled in a tier's prepare and run in its run, one label a shape (`ahead_arm`, row 8497).
-        ran = ahead_arm(jax.jit(kernel), f"Mosaic GPU's exp2, {semantics}, {np.size(x)} operands")
+        named = f"Mosaic GPU's {function.__name__}{'' if approx else ', exact'}, {semantics}"
+        ran = ahead_arm(jax.jit(kernel), f"{named}, {np.size(x)} operands")
         return tuple(np.asarray(out, np.float64) for out in ran(np.asarray(x, np.float32)))
 
     return run
@@ -626,18 +638,24 @@ def mosaic_exp2(semantics: str):
 @functools.cache
 def mosaic_lane() -> Lane:
     """The arithmetic the recurrence mainloop's launches run in on this GPU, probed natively in each lowering
-    its bundles take: `exp2`'s reach (`interval_certificates.exp2_reach`), at most PTX's (`PTX_EX2`, past it a
-    finding), and whether an fp32 product below the normal range flushes (2^-30 times 2^-100); a 16-bit
-    call's. Its fp32 adds, multiplies, contractions and casts to bf16 and fp16 round to nearest, subnormals
-    kept (row 2084's link 3 probe, both GPUs and lowerings)."""
-    reaches, flushes = [], False
+    its bundles take: `exp2`'s reach (`interval_certificates.exp2_reach`), approximated or not, at most
+    PTX's (`PTX_EX2`, past it a finding); `tanh`'s unapproximated (`interval_certificates.tanh_reach`, a
+    capped attention score's); and whether an fp32 product below the normal range flushes (2^-30 times
+    2^-100); a 16-bit call's. Its fp32 adds, multiplies, contractions and casts to bf16 and fp16 round to
+    nearest, subnormals kept (row 2084's link 3 probe, both GPUs and lowerings)."""
+    reaches, flushes, tanh_reaches = [], False, []
     for semantics in ("Lane", "Warpgroup"):
-        run = mosaic_exp2(semantics)
-        reaches.append(exp2_reach(lambda x, run=run: run(x)[0]))
-        flushes |= bool(np.any(run(np.full(128, 2.0 ** -30, np.float32))[1] == 0))
-    # The witness takes the ISA's stated reach, the probes within it, not the sampled one.
+        for approx in (True, False):
+            run = mosaic_exp2(semantics, approx=approx)
+            reaches.append(exp2_reach(lambda x, run=run: run(x)[0]))
+            flushes |= bool(np.any(run(np.full(128, 2.0 ** -30, np.float32))[1] == 0))
+        tanh_run = mosaic_exp2(semantics, jnp.tanh, approx=False)
+        tanh_reaches.append(tanh_reach(lambda x, run=tanh_run: run(x)[0]))
+    # The witness takes the ISA's stated reach, the probes within it, not the sampled one; tanh's, which no
+    # instruction states (LLVM's expansion, a capped launch taking no approximation), its sampled one.
     assert max(reaches) <= PTX_EX2, reaches
-    return Lane(PTX_EX2, flushes, mainloop.block_of(mainloop.family_of(jnp.bfloat16)))
+    return Lane(PTX_EX2, flushes, mainloop.block_of(mainloop.family_of(jnp.bfloat16)),
+                tanh_reach=max(tanh_reaches))
 
 
 def the_recurrence_templates_records_certify_natively_a_step_at_a_time(generation_name, regime):
@@ -730,18 +748,34 @@ def the_recurrence_witness_holds_a_decay_a_key_dimension_natively(generation_nam
         rw.assert_key_decays_witnessed(mosaic_lane(), heads=2, width=width)
 
 
-def the_attention_templates_states_certify_natively_a_step_at_a_time(generation_name, mask):
+def the_attention_templates_states_certify_natively_a_step_at_a_time(generation_name, form):
     """Every online-softmax state the attention template's certify launch stores after a key tile, and its
-    output, lies inside its step's enclosure on the state before it, under a causal or a full `mask`
-    (`attention_witness.assert_witnessed`), at this GPU's `ex2` (PTX's reach)."""
+    output, lies inside its step's enclosure on the state before it, under `form`: full, causal, windowed or
+    over packed documents (`attention_witness.assert_witnessed`), at this GPU's `ex2` (PTX's reach)."""
     with generation.assumed(generation_name):
-        assert_witnessed(0, mask == "causal", interpret=False, lane=mosaic_lane())
+        assert_witnessed(0, form, interpret=False, lane=mosaic_lane())
+
+
+def the_attention_backwards_gradients_certify_natively(generation_name, form):
+    """Every gradient of the attention template's fast backward under `form` lies inside its enclosure from
+    the forward's stored output, maxima and denominators (`attention_witness.assert_backward_witnessed`), at
+    this GPU's `ex2` (PTX's reach)."""
+    with generation.assumed(generation_name):
+        assert_backward_witnessed(0, form, interpret=False, lane=mosaic_lane())
+
+
+def the_attention_backward_witness_refuses_its_faults_natively(generation_name):
+    """The backward witness's faults, each refused where it lands natively
+    (`attention_witness.assert_backward_faults_refused`)."""
+    with generation.assumed(generation_name):
+        assert_backward_faults_refused(interpret=False, lane=mosaic_lane())
 
 
 def the_attention_witness_refuses_its_faults_natively(generation_name):
     """The attention step witness's faults, each refused where it lands natively
     (`attention_witness.assert_faults_refused`): a dropped rescale, a maximum from the wrong tile, sums
-    rounded to bf16 and a mask off by one key."""
+    rounded to bf16, a mask off by one key, and a window's or the documents' records held as one undivided
+    call's."""
     with generation.assumed(generation_name):
         assert_faults_refused(interpret=False, lane=mosaic_lane())
 
@@ -802,9 +836,13 @@ FLOWS = {
         *(cell(the_recurrence_witness_holds_a_decay_a_key_dimensions_fast_backward_natively, g, heads)
           for g in GENERATIONS for heads in (1, 2))],
     "attention": lambda: [
-        *(cell(the_attention_templates_states_certify_natively_a_step_at_a_time, g, mask)
-          for g in GENERATIONS for mask in ("causal", "full")),
+        *(cell(the_attention_templates_states_certify_natively_a_step_at_a_time, g, form)
+          for g in GENERATIONS for form in FORMS),
         *(cell(the_attention_witness_refuses_its_faults_natively, g)
+          for g in GENERATIONS),
+        *(cell(the_attention_backwards_gradients_certify_natively, g, form)
+          for g in GENERATIONS for form in BACKWARD_FORMS),
+        *(cell(the_attention_backward_witness_refuses_its_faults_natively, g)
           for g in GENERATIONS)],
 }
 """The flows the native cells run in (`gpu_flow.run_cells`), a family's links each: a GPU part runs each

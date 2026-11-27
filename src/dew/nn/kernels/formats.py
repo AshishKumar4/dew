@@ -18,7 +18,7 @@ from jax.typing import DTypeLike
 
 from dew.algebra import bits
 from dew.nn.derivatives import Protected, contracted, declared_tangent
-from dew.nn.float_bits import exact_power2, raw_fields, rounded_binary
+from dew.nn.float_bits import exact_power2, quiet_nan, raw_fields, rounded_binary
 from dew.nn.kernels import generation
 from dew.nn.kernels.templates import product as formats_of
 from dew.nn.kernels.templates.gemm import packed
@@ -299,12 +299,7 @@ def _mxfp8_decoded(dtype, codes, exponents, invalid):
     stored = jax.lax.bitcast_convert_type(codes, jnp.uint8)
     special = (stored & np.uint8(0x7F)) == np.uint8(0x7F)
     negative = (stored == np.uint8(0xFF)) & ~invalid
-    limits = jnp.finfo(landed.dtype)
-    word = jnp.dtype(f"uint{limits.bits}")
-    quiet = word.type((((1 << limits.nexp) - 1) << limits.nmant) | (1 << (limits.nmant - 1)))
-    bits = quiet | (negative.astype(word) << word.type(limits.bits - 1))
-    nan = jax.lax.bitcast_convert_type(bits, landed.dtype)
-    return jnp.where(special | invalid, nan, landed).astype(dtype)
+    return jnp.where(special | invalid, quiet_nan(negative, landed.dtype), landed).astype(dtype)
 
 
 def _mxfp8_decode_tangent(dtype, primals, tangents):
@@ -618,7 +613,169 @@ _decode_ternary = contracted("test_decoded_ternary_preserves_its_linear_scale_ru
                      nondiff_argnums=(0,), symbolic_zeros=True))
 
 
-PACKED_FORMATS = (NvFp4, TernaryWeights)
+WINDOW_BINADES = 15
+"""The binades a `Bf16Window` group codes in its 4-bit offsets, `[base, base + 14]` (offsets 1 to 15),
+offset 0 a signed zero or an escape."""
+WINDOW_ESCAPES = 4
+"""The exact values a `Bf16Window` group holds beside its window (`Bf16Window.of` refuses a group of
+more): a nonzero bfloat16 below its window (a subnormal, a tiny weight beside the group's largest)."""
+
+
+def window_byte_rows(depth: int) -> np.ndarray:
+    """The depth each byte of a `Bf16Window`'s staged byte plane holds (`packed.window_byte_depth`)."""
+    return _staged_rows(depth, 64, 8, packed.window_byte_depth, "bfloat16 window")
+
+
+def window_nibble_rows(depth: int) -> np.ndarray:
+    """The depth each nibble of a `Bf16Window`'s staged offset plane holds (`packed.window_nibble_depth`)."""
+    return _staged_rows(depth, packed.WINDOW_GROUP, 4, packed.window_nibble_depth, "bfloat16 window")
+
+
+def window_form_version() -> np.ndarray:
+    """The 8-byte digest of the `Bf16Window` encoding: its encoder's name and both planes' staged orders."""
+    group = packed.WINDOW_GROUP
+    return form_version(b"bf16-window-v2\x00".hex(),
+                        np.concatenate([window_byte_rows(group), window_nibble_rows(group)]))
+
+
+@jax.tree_util.register_dataclass
+@dataclasses.dataclass(frozen=True)
+class Bf16Window:
+    """A frozen bfloat16 matrix `[..., depth, width]` stored lossless in 13 bits a weight (row 5387): each
+    column's `packed.WINDOW_GROUP` depths share a base exponent `b`, each weight its sign, its 7 mantissa
+    bits and a 4-bit offset `1..15` of its exponent from `b - 1`; offset 0 is a signed zero where its
+    mantissa bits are, else the index `1..4` of the group's exact escape (`WINDOW_ESCAPES`: a nonzero below
+    the window). K-major, each group's 48 words a column in the order a stage decodes them a lane at a time
+    (`words`, `[..., width, 3 * depth // 8]` uint32): its bytes (sign and mantissa, or an escape's index),
+    32 words in two 64-deep blocks of 16 (`packed.window_byte_depth`), then its nibbles, 16 words
+    (`packed.window_nibble_depth`); `meta` each group's four words `[..., width, depth // 32]` uint32 (its
+    base, its escapes' bits two a word, a zero word); `form` its encoder's digest. Decoded, every weight is
+    its bits again, signed zeros, subnormals, infinities and NaNs among them (`decoded`, `window_bits`)."""
+
+    words: jax.Array | np.ndarray
+    meta: jax.Array | np.ndarray
+    form: jax.Array | np.ndarray
+    fmt: str = dataclasses.field(metadata={"static": True}, default="window")
+
+    @classmethod
+    def of(cls, weights: jax.Array | np.ndarray, *, site: str = "a matrix") -> "Bf16Window":
+        """`weights` (`[..., depth, width]` bfloat16, `depth` whole `packed.WINDOW_GROUP`s) encoded on the
+        host, each group's base its largest normal exponent less 14; refused where a group of `site`'s
+        holds more than `WINDOW_ESCAPES` nonzeros below its window (a heavy tail no window of 15 binades
+        holds), its weights then served as they are."""
+        source = np.asarray(weights)
+        group = packed.WINDOW_GROUP
+        if source.dtype != np.dtype(jnp.bfloat16) or source.ndim not in (2, 3) or source.shape[-2] % group:
+            raise ValueError(f"a bfloat16 window encodes a 2D/3D bfloat16 matrix of whole {group}-deep "
+                             f"groups, not {site}'s {source.dtype} {source.shape}")
+        *lead, depth, width = source.shape
+        held = np.swapaxes(source.view(np.uint16).astype(np.uint32), -1, -2)
+        grouped = held.reshape(*lead, width, depth // group, group)
+        # Its exponents signed: a group whose largest is below the window's binades floors its base at 1.
+        sign, exponent, mantissa = grouped >> 15, ((grouped >> 7) & 0xFF).astype(np.int32), grouped & 0x7F
+        zero = (grouped & 0x7FFF) == 0
+        normal = exponent > 0
+        base = np.maximum(np.where(normal, exponent, 0).max(-1, keepdims=True) - (WINDOW_BINADES - 1), 1)
+        window = normal & (exponent >= base)
+        escape = ~zero & ~window
+        count = escape.sum(-1)
+        if (count > WINDOW_ESCAPES).any():
+            column, at = np.argwhere(count > WINDOW_ESCAPES)[0][-2:]
+            raise ValueError(f"{site}'s column {column}, depths {at * group} to {(at + 1) * group}, holds "
+                             f"{count.max()} weights below its window of {WINDOW_BINADES} binades, past "
+                             f"the {WINDOW_ESCAPES} exact escapes a group stores: serve it as its bfloat16 "
+                             "weights")
+        slot = np.cumsum(escape, axis=-1) * escape
+        byte = np.where(escape, slot, (sign << 7) | np.where(window, mantissa, 0))
+        offset = np.where(window, exponent - base + 1, 0)
+        table = np.zeros((*grouped.shape[:-1], WINDOW_ESCAPES), np.uint32)
+        found = np.nonzero(escape)
+        table[(*found[:-1], slot[found] - 1)] = grouped[found]
+        pairs = [table[..., 2 * pair] | table[..., 2 * pair + 1] << 16 for pair in range(2)]
+        meta = np.stack([base[..., 0], *pairs, np.zeros_like(base[..., 0])], axis=-1).astype(np.uint32)
+        bytes_ = byte.reshape(*lead, width, depth)[..., window_byte_rows(depth)]
+        nibbles = offset.reshape(*lead, width, depth)[..., window_nibble_rows(depth)]
+        low = (bytes_.reshape(*lead, width, depth // 4, 4) << (8 * np.arange(4, dtype=np.uint32))).sum(
+            -1, dtype=np.uint32)
+        offsets = (nibbles.reshape(*lead, width, depth // 8, 8) << (4 * np.arange(8, dtype=np.uint32))).sum(
+            -1, dtype=np.uint32)
+        groups = depth // group
+        words = np.concatenate([low.reshape(*lead, width, groups, 16 * packed.WINDOW_BYTE_BLOCKS),
+                                offsets.reshape(*lead, width, groups, 16 * packed.WINDOW_NIBBLE_BLOCKS)],
+                               axis=-1)
+        return cls(words.reshape(*lead, width, groups * WINDOW_WORDS),
+                   meta.reshape(*lead, width, groups * packed.WINDOW_META_WORDS), window_form_version())
+
+    @property
+    def dtype(self) -> jnp.dtype:
+        return jnp.dtype(jnp.bfloat16)
+
+    @property
+    def shape(self) -> tuple[int, ...]:
+        *lead, width, words = jnp.shape(self.words)
+        return (*lead, words // WINDOW_WORDS * packed.WINDOW_GROUP, width)
+
+    @property
+    def meta_halves(self) -> jax.Array:
+        """Its meta words as their 16-bit halves, low half first (`[..., width, depth // 16]` uint16: a
+        group's base, a zero, its four escapes' bits and two zeros), the stream a stage decode reads beside
+        its words, a 256-deep step's a 32-byte row (`packed.weight_format('window')`)."""
+        meta = jnp.asarray(self.meta, jnp.uint32)
+        halves = jnp.stack([meta & 0xFFFF, meta >> 16], axis=-1).astype(jnp.uint16)
+        return halves.reshape(*meta.shape[:-1], 2 * meta.shape[-1])
+
+    def checked(self, form=None) -> "Bf16Window":
+        """Verify the stored `form` (every addressable shard) is this Dew's encoder's."""
+        _checked_form(self.form, window_form_version(), "Bf16Window", "Bf16Window.of", form=form)
+        return self
+
+    def decoded(self, dtype=jnp.bfloat16) -> jax.Array:
+        """The matrix `[..., depth, width]` in `dtype`, each weight its stored bits again (a bit operation a
+        weight, traced or not): its base and offset's exponent beside its sign and mantissa, a signed zero,
+        or its group's escape."""
+        group = packed.WINDOW_GROUP
+        words, meta = (jnp.asarray(plane, jnp.uint32) for plane in (self.words, self.meta))
+        *lead, width, count = words.shape
+        groups = count // WINDOW_WORDS
+        depth = groups * group
+        grouped = words.reshape(*lead, width, groups, WINDOW_WORDS)
+        low = grouped[..., :16 * packed.WINDOW_BYTE_BLOCKS].reshape(*lead, width, depth // 4)
+        offsets = grouped[..., 16 * packed.WINDOW_BYTE_BLOCKS:].reshape(*lead, width, depth // 8)
+        bytes_ = ((low[..., None] >> (8 * jnp.arange(4, dtype=jnp.uint32))) & 0xFF).reshape(
+            *lead, width, depth)
+        nibbles = ((offsets[..., None] >> (4 * jnp.arange(8, dtype=jnp.uint32))) & 0xF).reshape(
+            *lead, width, depth)
+        shape = (*lead, width, depth // group, group)
+        byte = bytes_[..., np.argsort(window_byte_rows(depth))].reshape(shape)
+        offset = nibbles[..., np.argsort(window_nibble_rows(depth))].reshape(shape)
+        words4 = meta.reshape(*lead, width, depth // group, packed.WINDOW_META_WORDS)
+        escapes = tuple(words4[..., 1 + pair // 2, None] >> (16 * (pair % 2)) & 0xFFFF for pair in range(4))
+        held = window_bits(byte, offset, words4[..., :1], escapes)
+        values = jax.lax.bitcast_convert_type(held.astype(jnp.uint16).reshape(*lead, width, depth),
+                                              jnp.bfloat16)
+        return jnp.swapaxes(values, -1, -2).astype(dtype)
+
+
+WINDOW_WORDS = 16 * (packed.WINDOW_BYTE_BLOCKS + packed.WINDOW_NIBBLE_BLOCKS)
+"""The uint32 words a `Bf16Window` group of `packed.WINDOW_GROUP` depths holds a column: its 128 bytes and its
+128 nibbles, three blocks of 16 words its stage streams apart (`packed.weight_format`'s `blocks`)."""
+
+
+def window_bits(byte: jax.Array, offset: jax.Array, base: jax.Array, escapes: tuple) -> jax.Array:
+    """Each `Bf16Window` weight's bfloat16 bits (in a uint32's low half) from its stored byte (sign and
+    mantissa, or an escape's index), its 4-bit offset and its group's base and four escapes' bits (each
+    broadcast against the weights): the one decode a matrix decoded whole (`Bf16Window.decoded`) and a
+    stage decoded a lane at a time (`packed`'s window lanes) read, in integer operations alone (a select of
+    the escapes, no gather)."""
+    sign, mantissa = byte >> 7, byte & 0x7F
+    coded = (sign << 15) | ((base + offset - 1) << 7) | mantissa
+    first, second, third, fourth = escapes
+    escaped = jnp.where(mantissa <= 2, jnp.where(mantissa == 1, first, second),
+                        jnp.where(mantissa == 3, third, fourth))
+    return jnp.where(offset > 0, coded, jnp.where(mantissa > 0, escaped, sign << 15))
+
+
+PACKED_FORMATS = (NvFp4, TernaryWeights, Bf16Window)
 """The packed matrices a variables tree holds in its `QUANTIZATION` collection, a layer's served as its
 codes (`dense.packed_matrix`), each stating its encoder's `form` its `checked` verifies on restore
 (`checkpoints._packed_checked`)."""

@@ -353,21 +353,6 @@ SCOREBOARDS = (M_NG_45_A100, M_NG_27_GH200, M_NG_33_G4)
 product it timed is at parity, its products at parity the template's (`Scoreboard`): an A100's, a GH200's
 and an RTX PRO 6000's at 8,192 tokens (records/scoreboard.md's GEMM rows)."""
 
-STEP_HELD: dict[tuple[str, Made], str] = {
-    ('sm90', Made.INPUT_GRADIENT): (
-        "tests/step_memory.py (lane/gemm 75fd93d24bd): a trainer step over two and four rematerialized "
-        "blocks on two compile-only H100s, its dense input gradients the template's, holds layers' "
-        "cotangents past their layer (attention and Kimi delta attention blocks: live growth 63-113 MB past "
-        "what the forward saves and the gradients hold), which XLA's dot there does not"),
-}
-"""Kinds the template's products are at parity in, in time and each product's temporaries (`SCOREBOARDS`),
-held on XLA's dot by evidence about the step around them, each with it (kernel-templates.md §1: peak
-memory). The GH200's dense input gradient's step leaked through the mapped projections' weight reductions
-(row 12898, fixed in `sharding.on_shards`) and an nGPT block's XLA fallback's fp32 product and convert
-(`gemm_xla.direct_dtype`); it stays held until the JAX build names a checkpointed value through
-`platform_dependent`'s inlined branch (post135; tests/test_miss_driven_rungs.py), with which every step
-memory test holds with it (witness/stepheld-post135-6)."""
-
 M_FS_34 = {
     'sm86': ("M-FS-34 / LF-P0-sm86-a10 (an A10, main 45131ca01, XLA tuned on the GPU): the template "
              "1.277x, 1.583x and 1.488x XLA's dot (forward, input and kernel gradient, medians of 13 "

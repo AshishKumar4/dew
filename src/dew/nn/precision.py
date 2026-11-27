@@ -462,6 +462,19 @@ def effective_precision(precision: jax.lax.PrecisionLike) -> jax.lax.PrecisionLi
     return precision if precision_names(precision) else jax.config.jax_default_matmul_precision
 
 
+def stated_algorithm(precision: jax.lax.PrecisionLike
+                     ) -> jax.lax.DotAlgorithm | jax.lax.DotAlgorithmPreset | None:
+    """The dot algorithm a product is declared with, `effective_precision(precision)`'s: one the call states,
+    else the run's (`jax_default_matmul_precision` naming a preset), as an object a dot takes; None where the
+    declaration is a precision level (an explicit level overriding a run's algorithm)."""
+    effective = effective_precision(precision)
+    if isinstance(effective, jax.lax.DotAlgorithm | jax.lax.DotAlgorithmPreset):
+        return effective
+    if isinstance(effective, str) and effective in jax.lax.DotAlgorithmPreset.__members__:
+        return jax.lax.DotAlgorithmPreset[effective]
+    return None
+
+
 def rounds_products() -> bool:
     """Whether the run's declaration lets a native route round an fp32 product's operands (TF32, or bf16
     parts): its fast forms (`Numerics.forms`) at a configured precision of no more than the default
@@ -1752,12 +1765,21 @@ def twice_scaled(product: jax.Array, first: jax.Array, second: jax.Array) -> jax
     near 2**-65), so no one order holds both ends; the result overflows only where the product does. Its
     tests are comparisons alone (finite: a magnitude below infinity), so a kernel's epilogue runs it as XLA
     does: Mosaic GPU lowers no `is_finite` (`gemm.nvfp4_block_finished`, row 12721)."""
+    left, right = twice_scaled_operands(product, first, second)
+    return left * right
+
+
+def twice_scaled_operands(product: jax.Array, first: jax.Array,
+                          second: jax.Array) -> tuple[jax.Array, jax.Array]:
+    """`twice_scaled`'s last multiply's two operands, in its order: the product times the scale whose
+    intermediate is normal, and the other scale; a caller rounding that multiply itself takes them (the
+    int8-row ternary epilogue's one rounding past a flushing platform, `factored.lowered_product`)."""
     tiny = jnp.finfo(product.dtype).tiny
     once = product * first
     magnitude = jnp.abs(once)
     # Not `jnp.isfinite`: Mosaic GPU lowers no is_finite, and the fused NVFP4 epilogue runs this in a kernel.
     kept = (magnitude < np.inf) & ((magnitude >= tiny) | (product == 0))
-    return jnp.where(kept, once, product * second) * jnp.where(kept, second, first)  # no cotangent unchosen
+    return jnp.where(kept, once, product * second), jnp.where(kept, second, first)  # no cotangent unchosen
 
 
 def scaled_partial(partial: jax.Array, row: jax.Array, column: jax.Array) -> jax.Array:
