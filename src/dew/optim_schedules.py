@@ -529,7 +529,7 @@ def injected_edited(opt_state: optax.OptState, edit: Callable[[jax.tree_util.Key
     """`opt_state` with each injected state (`INJECTED`) as `edit` gives it for its path, a state an
     injected wrapper holds reached through the wrapper's inner state first: the one walk of Optax's injected
     states, which the learning rate's readers and editors and a step's numerical view of the state
-    (`dew.training.transaction.checked`) read."""
+    (`dew.nn.finite.checked`) read."""
     def walked(tree, prefix: jax.tree_util.KeyPath):
         def replaced(path: jax.tree_util.KeyPath, node):
             if not isinstance(node, INJECTED):

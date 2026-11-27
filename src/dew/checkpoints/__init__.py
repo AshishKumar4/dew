@@ -138,6 +138,7 @@ from dew.checkpoints.averaging import (
 from dew.checkpoints.submesh import SubmeshArrays, save_args
 from dew.mesh import LogicalAxes
 from dew.nn import sharding
+from dew.nn.finite import refuse_non_finite
 from dew.nn.precision import at_least_fp32
 from dew.registry import from_record, to_record
 from dew.telemetry.profile import region
@@ -1478,7 +1479,6 @@ class Checkpoints:
                              "records")
         if not mapping:
             # No tier writes a non-finite state, before any write or retention (`refuse_non_finite`).
-            from dew.training.transaction import refuse_non_finite
             refuse_non_finite(state, step, lambda: self.latest)
         persistent = self._open()
         self._project()
@@ -1850,7 +1850,6 @@ class Checkpoints:
         placement is saved with the state, which a pool's resume is held to
         (`_check_placement`). A non-finite state is refused before the previous local step is touched
         (`refuse_non_finite`): a local copy is the one a restarted node reads first."""
-        from dew.training.transaction import refuse_non_finite
         refuse_non_finite(state, step, lambda: self.latest)
         state_tree = self._item(state, saved, share, rollout)
         written = placement(state_tree)

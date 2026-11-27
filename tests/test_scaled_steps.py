@@ -85,7 +85,7 @@ def test_a_scaled_steps_state_report_names_the_leaf_its_committed_state_holds(sp
     and how many are not, as the state it leaves holds them, whatever microbatches it steps in: a step of
     two parts reports its last part's, where the two parts' reports were summed and named another leaf
     (row 8269)."""
-    from dew.training.transaction import checked
+    from dew.nn.finite import checked
 
     trainer = Trainer(ScaledObjective(), optax.sgd(1e30), key=jax.random.key(0),
                       advanced=TrainerAdvanced(dynamic_scale=True),

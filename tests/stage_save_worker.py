@@ -19,7 +19,7 @@ def mode_stage_save(args) -> dict:
 
     from dew.checkpoints import Checkpoints
     from dew.training import MeshSpec
-    from dew.training.transaction import finite_flags
+    from dew.nn.finite import finite_flags
 
     # One leaf on each process's devices alone, the second holding a NaN.
     flags = []

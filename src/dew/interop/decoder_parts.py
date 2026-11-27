@@ -2091,8 +2091,8 @@ class Restacked:
         # of, is no tensor of the release: refused, not written as it is.
         if stray := sorted(name for name in specs if name not in owner and name not in unstored
                            and self.reserved.fullmatch(name)):
-            raise ValueError(f"{stray} are named as the release's stacked tensors or their parts, which its "
-                             "record stacks none of")
+            raise ValueError(f"{stray} are named as the release's stacked tensors or their parts, but are none "
+                             "the record stacks back: no tensor `unprepare` writes")
         stacked: set[str] = set()
         for name, spec in specs.items():
             stack = owner.get(name)
