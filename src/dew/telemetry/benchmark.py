@@ -408,9 +408,11 @@ def tpu_ops(directory: str | Path, devices: Iterable[int], module: str) -> tuple
     capture under `directory` holds them (`dew.telemetry.trace.device_events`): its one run on each device
     (an `XLA Modules` event of its name, `jit_run` or `jit_run(7)`, a TPU's run naming its program so), and
     every op within that run's span on the device's `XLA Ops` line, each its device milliseconds. A TPU core
-    runs one program at a time, so the ops inside a run's span are its own: a TPU's ops state no program
-    (a v5e's XProf, M-FS-90), and a capture where another program's run overlaps the call's on a device, or
-    an op inside it states another program, is refused (`AmbiguousCapture`). A call of one program always
+    runs one program at a time, so the ops inside a run's span are its own: a v5e's XProf names a run's
+    program in its name alone and its ops state none (M-FS-90); a run stating its program by stat takes the
+    ops stating it, no host transfer. A capture whose runs name no program, or not one program on every
+    device, or where another program's run overlaps the call's on a device, or an op inside it states
+    another program, is refused (`AmbiguousCapture`). A call of one program always
     runs its module (`_module_of`), so a run of another executable of the same name beside it is a second
     run, refused with the rest of a capture where it ran twice on one device (`AmbiguousCapture`). The call
     ran on every one of `devices`, so a capture holding no run of it, or no op of its run, on any one of
@@ -429,6 +431,11 @@ def tpu_ops(directory: str | Path, devices: Iterable[int], module: str) -> tuple
     if any(len(each) > 1 for each in runs.values()):
         raise AmbiguousCapture(f"the capture under {directory} holds {module} run more than once on a device "
                                f"of TPU {sorted(runs)}, which no one call's own are told apart from")
+    programs = {device: trace.program_of(run) or (found[3] if (found := own.fullmatch(run.name)) else None)
+                for device, (run,) in runs.items()}
+    if None in programs.values() or len(set(programs.values())) > 1:
+        raise AmbiguousCapture(f"{module}'s runs under {directory} name programs {programs}, not the one "
+                               "program one call runs on each of its devices")
     planes, _ = trace.device_events(directory)
     timed = []
     for device, (run,) in runs.items():
@@ -437,13 +444,15 @@ def tpu_ops(directory: str | Path, devices: Iterable[int], module: str) -> tuple
                       if other is not run and other.start_ns < run.end_ns and run.start_ns < other.end_ns]:
             raise AmbiguousCapture(f"{module}'s run under {directory} overlaps {beside} on TPU {device}, so "
                                    "the ops within it are not told apart")
-        named = own.fullmatch(run.name)
-        program = trace.program_of(run) or (named.group(3) if named else None)
-        inside = [op for op in planes.get(plane, [])
+        within = [op for op in planes.get(plane, [])
                   if run.start_ns <= op.start_ns and op.end_ns <= run.end_ns]
-        if foreign := [op.name for op in inside if trace.program_of(op) not in (None, program)]:
+        if foreign := [op.name for op in within if trace.program_of(op) not in (None, programs[device])]:
             raise AmbiguousCapture(f"{module}'s run under {directory} holds ops {foreign} of another program "
                                    f"on TPU {device}")
+        # A run stating its program by stat has ops stating it too, a host transfer none; a v5e's names it in
+        # its name alone, its ops none, each op within its span its own.
+        stated = trace.program_of(run) is not None
+        inside = [op for op in within if not stated or trace.program_of(op) == programs[device]]
         if not inside:
             raise NoKernels(f"{module}'s run under {directory} holds no op on TPU {device} of the call's "
                             f"{sorted(runs)}")

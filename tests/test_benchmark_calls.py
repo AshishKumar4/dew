@@ -467,9 +467,9 @@ def test_a_tpu_call_is_timed_by_its_own_programs_run_on_its_own_devices(tmp_path
     """A TPU call's device time (`benchmark.tpu_ops`, the kernel tuner's on a TPU core) is the ops of its
     program's one run on its devices, each its device milliseconds: another program's ops and run, a host
     transfer and another device's left out; a call on two devices, each one's. A capture where the call's
-    program did not run on one of its devices, or ran there without an op, is refused, though another
-    program ran there (`NoKernels`), and one where it ran twice on a device is refused as ambiguous
-    (`AmbiguousCapture`)."""
+    program did not run on one of its devices, or ran there without an op (a host transfer its only one), is
+    refused, though another program ran there (`NoKernels`), and one where it ran twice on a device, or whose
+    runs name no program or two, is refused as ambiguous (`AmbiguousCapture`)."""
     from dew.telemetry.benchmark import AmbiguousCapture, NoKernels, tpu_ops
 
     ops = [(0, "fusion.1", 0.0, 0.25, 7), (0, "custom-call.2", 0.25, 1.0, 7), (0, "transfer", 1.0, 1.5, None),
@@ -511,6 +511,19 @@ def test_a_tpu_call_is_timed_by_its_own_programs_run_on_its_own_devices(tmp_path
         _tpu_capture(stray, listed, ran)
         with pytest.raises(AmbiguousCapture):
             tpu_ops(stray, {0}, "jit_run")
+    # Runs naming two programs on the call's two devices, or a run naming none, its ops stating none (a v5e's
+    # layout): not one call's, refused. A host transfer the only op inside a run stating its program by stat:
+    # no op of the call's.
+    for name, ran in (("two", [(0, "jit_run(7)", 0.0, 1.0, None), (1, "jit_run(9)", 0.0, 4.0, None)]),
+                      ("bare", [(0, "jit_run", 0.0, 1.0, None), (1, "jit_run", 0.0, 4.0, None)])):
+        unnamed = tmp_path / name
+        _tpu_capture(unnamed, [(0, "fusion.1", 0.0, 0.25, None), (1, "fusion.9", 0.0, 4.0, None)], ran)
+        with pytest.raises(AmbiguousCapture):
+            tpu_ops(unnamed, {0, 1}, "jit_run")
+    carried = tmp_path / "carried"
+    _tpu_capture(carried, [(0, "transfer", 0.25, 0.5, None)], runs[:1])
+    with pytest.raises(NoKernels):
+        tpu_ops(carried, {0}, "jit_run")
 
 
 def test_a_tpu_call_is_timed_by_the_ops_inside_its_run_as_a_v5e_records_them(tmp_path):
