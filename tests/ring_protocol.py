@@ -100,6 +100,10 @@ class Event:
     kind: str
     at: tuple = ()
     argument: object = None
+    covers: "tuple | frozenset[tuple] | None" = dataclasses.field(default=None, compare=False)
+    """The memory a copy writes or a read reads exactly (`_extent`), where `at`, the location its aliasing is
+    read by, states more (`_located` widens a slot's partial slice to the slot): a copy stating none covers
+    nothing (`cp_async_violations`); None where `at` is exact."""
 
 
 class _Interpreter:
@@ -236,8 +240,14 @@ class _Interpreter:
         transforms = jax.tree.unflatten(params["pytree_ref_transforms"], values[count:])
         located = [_located(value, transform) if isinstance(value, Ref) else value
                    for value, transform in zip(values[:count], transforms, strict=True)]
-        # Each operand's abstract value (a ref's shape and dtype as the body takes it), and where it is.
-        read(self, body, [variable.aval for variable in equation.invars[:count]], located)
+
+        def extent_of(index: int) -> "tuple | frozenset[tuple] | None":
+            # The memory ref operand `index`'s view takes exactly (a body writing through it writes no more).
+            return _extent(values[index], transforms[index])
+
+        # Each operand's abstract value (a ref's shape and dtype as the body takes it), where it is, and the
+        # exact extent of the one a reader asks for.
+        read(self, body, [variable.aval for variable in equation.invars[:count]], located, extent_of)
         return [None] * len(equation.outvars)
 
     def scoped(self, params, values) -> list:
@@ -260,8 +270,8 @@ class _Interpreter:
             self.emit("cp_scope_end", (), frozenset(ref.name for ref in allocated))
         return found
 
-    def emit(self, kind: str, at: tuple = (), argument=None) -> list:
-        self.events.append(Event(kind, at, argument))
+    def emit(self, kind: str, at: tuple = (), argument=None, covers=None) -> list:
+        self.events.append(Event(kind, at, argument, covers))
         return []
 
 
@@ -272,6 +282,53 @@ def _slot(ref, treedef, leaves) -> "tuple | frozenset[tuple]":
     if treedef is None or (not treedef.num_leaves and not leaves):
         return (ref.name, None)
     return _located(ref, jax.tree_util.tree_unflatten(treedef, list(leaves)))
+
+
+def _slot_extent(ref, treedef, leaves) -> "tuple | frozenset[tuple] | None":
+    """A transformed ref's exact extent (`_extent`), its transforms flattened (`treedef`, `leaves`)."""
+    if ref is None:
+        return None
+    if treedef is None or (not treedef.num_leaves and not leaves):
+        return (ref.name,)
+    return _extent(ref, jax.tree_util.tree_unflatten(treedef, list(leaves)))
+
+
+def _extent(ref, transforms) -> "tuple | frozenset[tuple] | None":
+    """The memory an access through `transforms` touches exactly, where one such tuple states it: the ref,
+    each leading index that is one value, then at most one contiguous range of the next axis,
+    `(start, stop)`, the axes past it whole (a slot's first rows); nothing where it selects none. None where
+    none states it: a gather, a strided or open slice, or an index past a range, past an axis taken whole
+    within its indexer or past an axis that moved; the alias location (`_located`), which widens a partial
+    slice to its prefix, states more."""
+    transforms = list(transforms or ())
+    if any(_selects_none(transform) for transform in transforms):
+        return frozenset()
+    if any(_gathering(transform) for transform in transforms):
+        return None
+    found: list = []
+    closed = False  # a range taken, or an axis moved: every later index whole
+    for transform in transforms:
+        indices = getattr(transform, "indices", None)
+        if indices is None:
+            closed = closed or _moves_axes(transform)
+            continue
+        shape, kept = getattr(transform, "shape", None), False
+        for axis, index in enumerate(indices):
+            if index is None:
+                return None
+            sliced = hasattr(index, "start")
+            if sliced and (index.start is None or getattr(index, "stride", 1) != 1 or shape is None):
+                return None
+            start = int(np.asarray(index.start if sliced else index))
+            if sliced and start == 0 and index.size == shape[axis]:
+                # Taken whole: kept, the next indexer's first axis where every later one here is whole too.
+                kept = True
+                continue
+            if closed or kept:
+                return None
+            found.append((start, start + index.size) if sliced else start)
+            closed = sliced
+    return (ref.name, *found)
 
 
 def _located(ref, transforms) -> "tuple | frozenset[tuple]":
@@ -441,8 +498,10 @@ def _load(self: _Interpreter, equation, values) -> list:
         return []
     destination = _slot(refs[1], trees[1], leaves[split[1]:split[2]])
     if refs[2] is None:
-        # A pre-Hopper load's cp.async copy, committed as a group of its own (`LaunchContext.async_copy`).
-        self.emit("cp_copy", destination)
+        # A pre-Hopper load's cp.async copy, committed as a group of its own (`LaunchContext.async_copy`),
+        # writing its extent alone (none stated, nothing).
+        written = _slot_extent(refs[1], trees[1], leaves[split[1]:split[2]])
+        self.emit("cp_copy", destination, covers=frozenset() if written is None else written)
         return self.emit("cp_commit")
     barrier = _slot(refs[2], trees[2], leaves[split[2]:split[3]])
     return self.emit("load", destination, barrier)
@@ -487,9 +546,10 @@ def _access(kind: str, indexed: int) -> Callable:
             if tree is None:
                 tree = equation.params["transforms_treedef"]
             at = _slot(ref, tree, values[indexed:])
-            # An empty gather touches nothing: no access.
+            # An empty gather touches nothing: no access. A read states what it reads exactly.
             if at != frozenset():
-                self.emit(kind, at)
+                covers = _slot_extent(ref, tree, values[indexed:]) if kind == "read" else None
+                self.emit(kind, at, covers=covers)
             if kind == "read" and ref.value is not None:
                 # A known operand's read, through its transforms as JAX's state discharge reads one.
                 transforms = jax.tree_util.tree_unflatten(tree, values[indexed:])
@@ -618,17 +678,19 @@ SYNC: dict[str, Callable] = {
 """Each primitive of the toolkit's synchronization and shared memory, as an `Event`."""
 
 
-def _initialized(self: _Interpreter, body: gathered.Initialized, values, located) -> None:
+def _initialized(self: _Interpreter, body: gathered.Initialized, values, located, extent_of) -> None:
+    del extent_of
     (barriers,) = located
     self.initialized[barriers[0]] = body.arrivals
 
 
-def _waited(self: _Interpreter, body: gathered.Waited, values, located) -> None:
+def _waited(self: _Interpreter, body: gathered.Waited, values, located, extent_of) -> None:
+    del extent_of
     barrier, rotation = located
     self.emit("wait", barrier, int(np.asarray(_governing(rotation, "a wait's phase"))))
 
 
-def _gathers(self: _Interpreter, body: gathered.Gathers, values, located) -> None:
+def _gathers(self: _Interpreter, body: gathered.Gathers, values, located, extent_of) -> None:
     """A load warp's gathers of a step (`gathered.Gathers`): the first warp's arrival expecting every tile's
     copy, and a copy of each tile the warp issues into its part of the slot, each completing its bytes at
     the slot's barrier; read a step ahead (`body.ahead`), its tiles' entries read where its lowered loads
@@ -636,6 +698,7 @@ def _gathers(self: _Interpreter, body: gathered.Gathers, values, located) -> Non
     the load's next body (`_filled`).
     The warp's lanes are its one program: the body's warp syncs, which make a lane's fill seen by the
     others, are its own statement, not an event."""
+    del extent_of
     _, _, slot, barrier, _, *ahead = located
     # The slot's tiles: its leading axis as its allocation stages it (`swizzling.swizzle_transforms`'
     # `TILE_ROWS`-row tiles), the memref's the body reads.
@@ -850,12 +913,13 @@ def _derives(value, memory) -> bool:
     return False
 
 
-def _started(self: _Interpreter, body: gathered.Started, values, located) -> None:
+def _started(self: _Interpreter, body: gathered.Started, values, located, extent_of) -> None:
     """A load warp's start of its step's entries (`gathered.Started`, every ring's before its one drain and
     any ring's gathers), its events its lowered ops' (`_lowered`): a tile's first step its own fill of them,
     one asynchronous write of the half its copies' addresses take. Each start is the warp's next logical
     step over the entries (`entry_steps`), which its fills and reads carry (base review 571a5ee10 F2: a read
     of a parity a stale step filled passed)."""
+    del extent_of
     entries, _, parity, held = located
     parity, held = (int(np.asarray(_governing(value, "an entry's parity"))) for value in (parity, held))
     key = (entries[0], body.share[0])
@@ -866,32 +930,34 @@ def _started(self: _Interpreter, body: gathered.Started, values, located) -> Non
     _entry_events(self, _lowered(body, values, {2: parity, 3: held}), entries[0], body.share[0], step)
 
 
-def _drain(self: _Interpreter, body: gathered.Drained, values, located) -> None:
+def _drain(self: _Interpreter, body: gathered.Drained, values, located, extent_of) -> None:
     """A load warp's one drain of its entries' fills for a step (`gathered.Drained`), its wait its lowered
     op's, with the groups it leaves in flight (`fill_wait`), where its `needed` takes its branch."""
+    del extent_of
     (needed,) = located
     needed = int(np.asarray(_governing(needed, "a drain's need")))
     for kind, argument in _lowered(body, values, {0: needed}):
         self.emit(kind, (), argument)
 
 
-def _unsynchronized(self: _Interpreter, body, values, located) -> None:
+def _unsynchronized(self: _Interpreter, body, values, located, extent_of) -> None:
     """A body of no synchronization: a register's move between lanes (`across.LaneZero`, a shuffle)."""
-    del self, body, values, located
+    del self, body, values, located, extent_of
 
 
-def _scale_smem(self: _Interpreter, body: across.ScaleSmem, values, located) -> None:
+def _scale_smem(self: _Interpreter, body: across.ScaleSmem, values, located, extent_of) -> None:
     """In-place SMEM query scaling (`across.ScaleSmem`): reads and overwrites the query stage."""
-    del body, values
+    del body, values, extent_of
     (slot,) = located
     self.emit("read", slot)
     self.emit("write", slot)
 
 
-def _filled(self: _Interpreter, body: gathered.Filled, values, located) -> None:
+def _filled(self: _Interpreter, body: gathered.Filled, values, located, extent_of) -> None:
     """A load warp's fill of its next step's entries (`gathered.Filled`, where the walk has a next step), its
     events its lowered ops' (`_lowered`): one asynchronous write of the parity it fills, its tiles' all, a
     cp.async group the next step awaits, tagged with that step (`entry_steps`)."""
+    del extent_of
     entries, _, parity = located
     parity = int(np.asarray(_governing(parity, "an entry's parity")))
     events = _lowered(body, values, {2: parity})
@@ -911,16 +977,17 @@ def _entry_events(self: _Interpreter, events: list, entries, warp: int, step: in
             self.emit(kind, (entries, argument, warp), ("filled", step))
 
 
-def _row_copies(self: _Interpreter, body: gathered.RowCopies, values, located) -> None:
-    """A warpgroup's cp.async copies of a slot's rows (`gathered.RowCopies`): copies into its slot, in the
-    thread's open group."""
+def _row_copies(self: _Interpreter, body: gathered.RowCopies, values, located, extent_of) -> None:
+    """A warpgroup's cp.async copies of a slot's rows (`gathered.RowCopies`): copies into its slot, every row
+    of the view it takes (its extent, nothing where none states it), in the thread's open group."""
     del body, values
-    self.emit("cp_copy", located[2])
+    written = extent_of(2)
+    self.emit("cp_copy", located[2], covers=frozenset() if written is None else written)
 
 
-def _commit_group(self: _Interpreter, body: gathered.CommitGroup, values, located) -> None:
+def _commit_group(self: _Interpreter, body: gathered.CommitGroup, values, located, extent_of) -> None:
     """A commit of the thread's open cp.async group (`gathered.CommitGroup`), empty where no copy is open."""
-    del body, values, located
+    del body, values, located, extent_of
     self.emit("cp_commit")
 
 
@@ -971,35 +1038,39 @@ def cp_async_violations(program: list[Event]) -> list[str]:
     retiring every committed group but its latest `n`, its copies' bytes landed then. Each in program order:
     a copy into memory another pending copy writes (either's bytes may land last); a read or write of memory
     a pending copy writes (its bytes may land after); a read of a copied ring's memory the landed copies do
-    not write whole (a slot never filled, or one part of it: each block it reads within one landed copy's
-    location, `_holds`, so a read the parts' copies cover only together is refused, as no walk reads); and a
-    scope's end with a copy pending into its allocations (its memory another's next)."""
+    not write whole (a slot never filled, or one part of it: each block it reads, exactly where its extent
+    is known, within one landed copy's extent, `_holds`, so a read the parts' copies cover only together is
+    refused, as no walk reads); and a scope's end with a copy pending into its allocations (its memory
+    another's next). Aliasing is read by locations (`Event.at`), coverage by extents (`Event.covers`): a
+    copy of a slot's first rows shares its slot's location but writes those rows alone."""
     copied = {block[0] for event in program if event.kind == "cp_copy" for block in _each(event.at)}
-    open_copies: list = []
-    groups: list[list] = []
+    open_copies: list[Event] = []
+    groups: list[list[Event]] = []
     landed: list = []
     found = []
     for index, event in enumerate(program):
-        pending = [at for group in groups for at in group] + open_copies
+        pending = [copy for group in groups for copy in group] + open_copies
         if event.kind == "cp_copy":
-            if clashing := [at for at in pending if _overlaps(at, event.at)]:
+            if clashing := [copy.at for copy in pending if _overlaps(copy.at, event.at)]:
                 found.append(f"event {index}: a copy into {event.at} while copies into {clashing} are "
                              "pending")
-            open_copies.append(event.at)
+            open_copies.append(event)
         elif event.kind == "cp_commit":
             groups.append(open_copies)
             open_copies = []
         elif event.kind == "cp_wait":
             retired = max(0, len(groups) - int(event.argument))
-            landed += [at for group in groups[:retired] for at in group]
+            landed += [_touched(copy) for group in groups[:retired] for copy in group]
             del groups[:retired]
-        elif event.kind in ("read", "write") and any(_overlaps(at, event.at) for at in pending):
+        elif event.kind in ("read", "write") and any(_overlaps(copy.at, event.at) for copy in pending):
             found.append(f"event {index}: a {event.kind} of {event.at} while a copy into it is pending")
         elif (event.kind == "read" and {block[0] for block in _each(event.at)} & copied
-              and not all(any(_holds(at, block) for at in landed) for block in _each(event.at))):
+              and not all(any(_holds(written, block) for written in landed)
+                          for block in _each(_touched(event)))):
             found.append(f"event {index}: a read of {event.at}, which no landed copy wrote whole")
         elif event.kind == "cp_scope_end":
-            if left := [at for at in pending if {block[0] for block in _each(at)} & event.argument]:
+            if left := [copy.at for copy in pending
+                        if {block[0] for block in _each(copy.at)} & event.argument]:
                 found.append(f"event {index}: its scope ends with copies pending into {left}")
     return found
 
@@ -1617,13 +1688,31 @@ def _overlaps(one: "tuple | frozenset[tuple]", other: "tuple | frozenset[tuple]"
 
 
 def _holds(outer: "tuple | frozenset[tuple]", inner: tuple) -> bool:
-    """Whether location `outer` holds all of the block `inner`: one of its blocks the same ref, each of its
-    indices `inner`'s own (none past them: the rest whole, a ref's `None` the ref whole)."""
-    def indices(block: tuple) -> tuple:
-        return () if block[1:] == (None,) else block[1:]
+    """Whether the extent `outer` (`_extent`) holds all of the block `inner`, an extent too: one of its
+    blocks the same ref, each of its items spanning `inner`'s on that axis (an index one entry, a range its
+    entries), none past them (the rest whole)."""
+    def span(item) -> tuple[int, int]:
+        return item if isinstance(item, tuple) else (item, item + 1)
 
-    return any(block[0] == inner[0] and indices(inner)[:len(indices(block))] == indices(block)
-               for block in _each(outer))
+    def within(block: tuple) -> bool:
+        return (block[0] == inner[0] and len(block) <= len(inner)
+                and all(span(mine)[0] <= span(theirs)[0] and span(theirs)[1] <= span(mine)[1]
+                        for mine, theirs in zip(block[1:], inner[1:], strict=False)))
+
+    return any(within(block) for block in _each(outer))
+
+
+def _touched(event: Event) -> "tuple | frozenset[tuple]":
+    """The extent `event` touches: its own where it states one (`Event.covers`), else its location's
+    (`_exact`)."""
+    return _exact(event.at) if event.covers is None else event.covers
+
+
+def _exact(location: "tuple | frozenset[tuple]") -> "tuple | frozenset[tuple]":
+    """A location (`_located`) as an extent (`_extent`): a ref's whole, `(ref, None)`, its ref alone."""
+    if isinstance(location, frozenset):
+        return frozenset(_exact(block) for block in location)
+    return location[:1] if location[1:] == (None,) else location
 
 
 def _each(location: "tuple | frozenset[tuple]") -> "tuple | frozenset[tuple]":

@@ -883,6 +883,64 @@ def test_a_read_past_the_part_of_a_slot_its_landed_copy_wrote_is_refused():
         assert len(violations(("ring", 1, 0), read)) == 1, read
 
 
+@pytest.mark.parametrize(("rows", "refused"),
+                         [((2, 3), False), ((0, 8), False), ((8, 9), True), ((0, 16), True)],
+                         ids=["a-copied-row", "the-copied-rows", "the-next-row", "the-slot-whole"])
+def test_an_emitted_copy_of_a_slots_first_rows_holds_their_reads_alone(rows, refused):
+    """A kernel's cp.async copy of a 16-row slot's first 8 rows (`plgpu.copy_gmem_to_smem` with no barrier),
+    committed and waited for, interpreted (`programs`): a read of rows within them held, a read of row 8 or
+    of the slot whole refused (`cp_async_violations`), though every one of them shares the copy's alias
+    location, the slot (`_located` widens a partial slice to it)."""
+    from jax.experimental import pallas as pl
+    from jax.experimental.pallas import mosaic_gpu as plgpu
+
+    def body(source_gmem, out_gmem):
+        def scoped(ring):
+            plgpu.copy_gmem_to_smem(source_gmem.at[0:8], ring.at[0, 0:8], None)
+            plgpu.wait_gmem_to_smem(0)
+            out_gmem[0] = ring[0, rows[0]:rows[1]][0, 0].astype(jnp.float32)
+
+        pl.run_scoped(scoped, plgpu.SMEM((2, 16, 64), jnp.bfloat16))
+
+    kernel = plgpu.kernel(body, out_type=jax.ShapeDtypeStruct((1,), jnp.float32))
+    (events,), _ = programs(kernel, jnp.zeros((16, 64), jnp.bfloat16), threads=1)
+    copied = [event.kind for event in events if event.kind.startswith("cp_")][:3]
+    assert copied == ["cp_copy", "cp_commit", "cp_wait"]
+    assert bool(ring_protocol.cp_async_violations(events)) == refused
+
+
+@pytest.mark.parametrize(("rows", "refused"),
+                         [((2, 3), False), ((0, 8), False), ((8, 9), True), ((0, 16), True)],
+                         ids=["a-copied-row", "the-copied-rows", "the-next-row", "the-slot-whole"])
+def test_inlined_row_copies_into_a_slots_first_rows_hold_their_reads_alone(rows, refused):
+    """A warpgroup's inlined cp.async row copies (`gathered.RowCopies`, an A100 gathered walk's) into a view
+    of a 16-row slot's first 8 rows, committed (`gathered.CommitGroup`) and waited for, interpreted
+    (`programs`): they write that view alone (its extent), so a read of rows within it is held and one of
+    row 8 or of the slot whole refused (`cp_async_violations`)."""
+    from jax.experimental import pallas as pl
+    from jax.experimental.pallas import mosaic_gpu as plgpu
+
+    from dew.nn.kernels.templates import gathered as gathered_rows, swizzling
+
+    transforms = swizzling.swizzle_transforms(jnp.bfloat16, 128)
+
+    def body(source_gmem, table_gmem, out_gmem):
+        def scoped(ring):
+            refs = (plgpu.RefType(), plgpu.RefType(), plgpu.RefType(transforms))
+            plgpu.inline_mgpu(arg_types=refs)(gathered_rows.RowCopies(128))(source_gmem, table_gmem,
+                                                                           ring.at[0, 0:8])
+            plgpu.inline_mgpu()(gathered_rows.CommitGroup())()
+            plgpu.wait_gmem_to_smem(0)
+            out_gmem[0] = ring[0, rows[0]:rows[1]][0, 0].astype(jnp.float32)
+
+        pl.run_scoped(scoped, plgpu.SMEM((2, 16, 64), jnp.bfloat16, transforms=transforms))
+
+    kernel = plgpu.kernel(body, out_type=jax.ShapeDtypeStruct((1,), jnp.float32))
+    (events,), _ = programs(kernel, jnp.zeros((16, 64), jnp.bfloat16), jnp.zeros((16,), jnp.int32), threads=1)
+    assert [event.kind for event in events if event.kind.startswith("cp_")][:2] == ["cp_copy", "cp_commit"]
+    assert bool(ring_protocol.cp_async_violations(events)) == refused
+
+
 @pytest.mark.parametrize("gathered", [True, False], ids=["gathered", "contiguous"])
 @pytest.mark.parametrize(("stages", "trips"), [(3, 1), (3, 2), (1, 2)],
                          ids=["deep-short", "deep-two", "one-slot"])
