@@ -251,22 +251,19 @@ class Assignment:
                       if buffer in sizes and (described := self.described(buffer, allocation)) is not None]
         return tuple(found)
 
-    def built_readers(self) -> dict[int, list[Any]]:
-        """Each instruction's readers, built where an interval is read alone, and kept (`readers`)."""
-        readers: dict[int, list[Any]] = {}
-        for instruction in self.instructions.values():
-            for operand in instruction.operand_ids:
-                readers.setdefault(operand, []).append(instruction)
-        self.readers = readers
-        return readers
-
     def used(self, buffer_id: int, ran: Mapping[tuple[str, str], int]) -> tuple[tuple[int, str], ...]:
         """Where in a trace (`ran`: each instruction's position in it) the instructions reading logical
         buffer `buffer_id`'s value run, with their `op_name`s: its defining instruction's readers, a tuple
         element's through the getter of its index; a reader the trace states no event of is none of them. A
         fusion of no op_name of its own reads as each op its computation names (`_read_as`), and as "" where
         it names none, a read no phase is told of."""
-        readers = self.readers if self.readers is not None else self.built_readers()
+        readers = self.readers
+        if readers is None:
+            # Each instruction's readers, built where an interval is read alone.
+            readers = self.readers = {}
+            for instruction in self.instructions.values():
+                for operand in instruction.operand_ids:
+                    readers.setdefault(operand, []).append(instruction)
         buffer = self.buffers[buffer_id]
         index = tuple(buffer.defined_at.shape_index)
         found: list[tuple[int, str]] = []
@@ -285,10 +282,10 @@ class Assignment:
             if key in ran:
                 found += [(ran[key], op_name)
                           for op_name in _read_as(reader, self.computations)]
-            elif readers.get(reader.id):
+            elif followers := readers.get(reader.id):
                 # A reader the trace places no buffer for (a view of its operand, a bitcast): its readers read
                 # the value through it.
-                reading += [(next_, ()) for next_ in readers.get(reader.id, ())]
+                reading += [(next_, ()) for next_ in followers]
             else:
                 # Read where the trace states no position (`UNPLACED`).
                 found.append((UNPLACED, reader.metadata.op_name))
