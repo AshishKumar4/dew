@@ -27,6 +27,7 @@ import os
 import secrets
 import shutil
 import stat
+import unicodedata
 from collections.abc import Callable, Iterator, Mapping
 from pathlib import Path
 
@@ -443,17 +444,31 @@ def _publishing(directory: Path) -> Iterator[None]:
     sticky folder refuses creating over another user's), else made exclusively, as every file Dew writes is,
     under the umask, and left in place, the one inode every publisher locks. Whoever the umask lets write
     beside the release takes its lock; one it does not is refused opening it, not left waiting. The lock is
-    keyed by the destination's name as given, so publishers of one release name it alike: two spellings a
-    case-folding filesystem takes for one entry take two locks."""
-    # Keyed by the name as given: publishers of one release name it alike; two spellings a case-folding
-    # filesystem takes for one entry take two locks (row 13744).
-    name = PUBLISHING_LOCK + hashlib.sha256(os.fsencode(directory.name)).hexdigest()[:16]
+    keyed by the destination's name, so publishers of one release name it alike; in a folder that takes two
+    spellings of a name for one entry (a case-folding or normalizing filesystem, `_folds_names`), whose
+    rules no digest of a spelling follows, by the folder alone, every publication in it one at a time
+    (row 13744)."""
+    key = b"" if _folds_names(directory.parent) else os.fsencode(directory.name)
+    name = PUBLISHING_LOCK + hashlib.sha256(key).hexdigest()[:16]
     lock = _lock_file(directory.parent / name)
     try:
         fcntl.flock(lock, fcntl.LOCK_EX)
         yield
     finally:
         os.close(lock)
+
+
+def _folds_names(folder: Path) -> bool:
+    """Whether `folder` takes two spellings of a name for one entry: a probe made in it under a name of a
+    lower-case letter and a composed `é` found by its upper-cased or its decomposed spelling (casefold
+    ext4's and NFS's, APFS's and HFS+'s), then removed."""
+    probe = _beside(folder / "probe", ".n\u00e9")
+    probe.mkdir()
+    try:
+        return any(os.path.lexists(folder / spelling)
+                   for spelling in (probe.name.upper(), unicodedata.normalize("NFD", probe.name)))
+    finally:
+        probe.rmdir()
 
 
 def _lock_file(path: Path) -> int:
