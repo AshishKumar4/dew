@@ -1772,8 +1772,10 @@ remat at their own head, each read as asked (`climbed`): no other rung's need is
 @pytest.mark.parametrize(("shape", "target"), [
     pytest.param("decoder", "cpu", id="decoder-cpu"),
     pytest.param("decoder", "h100", id="decoder-h100"),
+    # Six places a task at most: the cut weighs each span by its own measured rate (tools/armada/costs.py's
+    # Cost.cut), so the walk's heavy first places are a task alone and its light ones merge (row 8611).
     pytest.param("delta-scanned", "h100", id="delta-scanned-h100",
-                 marks=pytest.mark.shards(units=18, per_task=2)),
+                 marks=pytest.mark.shards(units=18, per_task=6)),
 ])
 def test_a_starts_climb_settles_the_lightest_rung_an_exhaustive_walk_finds_fits(monkeypatch, shape, target,
                                                                                     request, tmp_path):
