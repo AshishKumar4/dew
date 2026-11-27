@@ -178,8 +178,7 @@ def computation_differs[LossT, EffectsT](trainer: "Trainer[LossT, EffectsT]", ch
     """Where the computation `checkpoints`' `step` trained and `trainer`'s differ (`differing_records`):
     their inference records and what their steps compute beside the model (`PhasePasses.training_record`,
     a pass count's sampled law among it, row 10783), the numerics its programs ran under among it."""
-    saved = products_stated(checkpoints.training(step))
-    now = trainer.phase_passes.training_record(trainer.objective)
+    saved, now = checkpoints.training(step), trainer.phase_passes.training_record(trainer.objective)
     # A law the checkpoint records binds a run that draws none: a fixed-pass resume would stop drawing (a
     # checkpoint that records none, a fixed-pass run's, any run resumes).
     dropped = (["training.sampled_passes"] if isinstance(saved, dict) and "sampled_passes" in saved
@@ -196,40 +195,20 @@ def refuse_other_computation[LossT, EffectsT](trainer: "Trainer[LossT, EffectsT]
     the precision its products computed at) before it replaces its record (`RunConfig.train`, row 13708),
     the rest once its start is laid out as the checkpoint's."""
     from dew.training.distributed import under_numerics
-    from dew.training.phase_passes import numerics_record
 
     with under_numerics(trainer.numerics):
         if numerics_alone:
-            saved = products_stated(checkpoints.training(step))
+            saved = checkpoints.training(step)
+            now = trainer.phase_passes.training_record(trainer.objective)
             differs = [] if not isinstance(saved, dict) else _differing(
                 {name: value for name, value in saved.items() if name in ("numerics", "products")},
-                numerics_record(), "training")
+                {name: value for name, value in now.items() if name in ("numerics", "products")}, "training")
         else:
             differs = computation_differs(trainer, checkpoints, step)
     if differs:
         raise ValueError(f"the checkpoint at step {step} in {checkpoints.directory} trained another "
                          f"computation ({', '.join(differs)}); resume it with the objective, its settings "
                          "and model it recorded, or train in another directory")
-
-
-def products_stated(training: JSON | None) -> JSON:
-    """A checkpoint's training record with the precision its products computed at (`products`), as this Dew
-    records it (`numerics_record`), where it states one: a step a Dew wrote before it recorded `products`
-    states its numerics' declared `matmul`, the precision its products computed at where it names one
-    (not "default", which left JAX's own, unrecorded); its products are unknown otherwise (row 13708)."""
-    if not isinstance(training, dict) or "products" in training:
-        return training
-    numerics = training.get("numerics")
-    declared = numerics.get("matmul") if isinstance(numerics, dict) else None
-    if not isinstance(declared, str) or declared == "default":
-        return training
-    import jax
-
-    from dew.nn.precision import precision_names
-
-    stated = declared if declared not in jax.lax.DotAlgorithmPreset.__members__ else (
-        jax.lax.DotAlgorithmPreset[declared])
-    return {**training, "products": [*sorted(precision_names(stated))]}
 
 
 def differing_records(saved: JSON, now: JSON, trained: JSON, training: JSON) -> list[str]:
