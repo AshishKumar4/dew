@@ -1578,8 +1578,11 @@ class FitSearch[LossT, EffectsT]:
                 return split
             coarser.append(jump)
         if resumed is not None:
+            # On from where the start's walk stopped: its next split, down past a fit to the one after its
+            # miss, as its walk would have gone on.
             self.at(start)
-            if (split := walked(candidates, resumed, self.fits_here, after)) is not None:
+            if (split := walked(candidates, resumed[0], self.fits_here, after,
+                                coarsest=resumed[1] + 1)) is not None:
                 self.said(named)
                 return split
         missed = self.short(named[0])
@@ -1624,20 +1627,21 @@ class FitSearch[LossT, EffectsT]:
         self.said(named)
         return split
 
-    def start_walked(self, candidates: Sequence[int], first: int) -> tuple[int | None, int | None]:
+    def start_walked(self, candidates: Sequence[int], first: int
+                     ) -> tuple[int | None, tuple[int, int] | None]:
         """The split the start's rung fits at from `candidates[first]` (`walked`, `after`), or None and where
         its walk goes on: at its first miss that some process computes no split above it as fitting
         (`MemoryMiss.fits_at`), the walk stops there for the place the start's schedule reads as fitting
-        (`jumped`), its next split (`after`'s) left to ask past that place's miss; None where it walked every
-        split it reaches."""
-        resumed: list[int] = []
+        (`jumped`), its next split (`after`'s) left to ask past that place's miss, with the index that
+        missed; None where it walked every split it reaches."""
+        resumed: list[tuple[int, int]] = []
 
         def after(index: int) -> int | None:
             following = self.after(candidates, index)
             miss = self.misses.get((self.rung(), candidates[index]))
             computed = miss is not None and any(miss.fits_at(split) for split in candidates[index + 1:])
             if following is not None and not resumed and not all(self.gather(computed)):
-                resumed.append(following)
+                resumed.append((following, index))
                 return None
             return following
 
