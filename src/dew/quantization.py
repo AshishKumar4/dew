@@ -791,6 +791,11 @@ def deferred_packed(variables: Variables) -> Variables:
     return {**decoded, QUANTIZATION: unflatten_dict(rest)} if rest else decoded
 
 
+def _integer(index) -> bool:
+    """Whether `index` is an integer as NumPy's basic indexing reads one (a boolean is none)."""
+    return isinstance(index, int | np.integer) and not isinstance(index, bool | np.bool_)
+
+
 class PackedDecode:
     """A packed leaf's parameter, decoded on this host (`programs.on_host`: its CPU, or its first device where
     JAX runs no CPU) as it is read (`np.asarray`, an export's `dew.interop.streaming.HostArray`), its shape
@@ -849,15 +854,14 @@ class PackedDecode:
         rows: list[int] = []
         for at, index in enumerate(self.index):
             taken = index if isinstance(index, tuple) else (index,)
-            # An index with an array or a list in it is NumPy's advanced indexing, whose integers join its
-            # arrays and whose result's axes follow their own rule: applied whole to the decoded value.
-            if any(isinstance(each, list) or np.ndim(each) > 0 for each in taken
-                   if each is not Ellipsis and not isinstance(each, slice)):
+            # Only a basic index (integers, slices, None, Ellipsis) has its integer prefix peeled: an advanced
+            # one (an array, a list, a boolean, which Python counts an integer) joins its integers to its
+            # arrays, its result's axes by NumPy's own rule, so it is applied whole to the decoded value.
+            if not all(each is None or each is Ellipsis or isinstance(each, slice) or _integer(each)
+                       for each in taken):
                 return tuple(rows), self.index[at:]
             for place, each in enumerate(taken):
-                # A boolean (an int to Python) adds an axis, as NumPy reads it, left to the decoded value.
-                if (len(rows) == lead or not isinstance(each, int | np.integer)
-                        or isinstance(each, bool | np.bool_)):
+                if len(rows) == lead or not _integer(each):
                     return tuple(rows), (taken[place:], *self.index[at + 1:])
                 rows.append(int(each))
         return tuple(rows), ()

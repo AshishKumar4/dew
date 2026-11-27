@@ -841,9 +841,11 @@ def test_a_packed_bank_split_by_stage_over_an_explicit_axis_reads_its_rows():
     np.testing.assert_array_equal(np.asarray(kernel[1, :, :8]), whole[1, :, :8])
     assert [np.shape(decoded) for _, _, decoded in kernel.memo] == [(256, 64)]
     # An advanced index keeps NumPy's axes: its integers join its arrays, the index applied whole.
-    advanced = kernel[1, :, [0, 1]]
-    np.testing.assert_array_equal(np.asarray(advanced), whole[1, :, [0, 1]])
-    assert np.shape(np.asarray(advanced)) == advanced.shape == (2, 256)
+    for index in ((1, slice(None), [0, 1]), (1, slice(None), True)):
+        advanced = kernel[index]
+        np.testing.assert_array_equal(np.asarray(advanced), whole[index])
+        assert np.shape(np.asarray(advanced)) == advanced.shape == np.shape(whole[index])
+    assert np.shape(whole[1, :, [0, 1]]) == (2, 256)
 
 
 WINDOW_WITHOUT_CPU = """
