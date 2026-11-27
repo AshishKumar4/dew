@@ -491,9 +491,37 @@ def test_an_msa_index_branch_trains_by_its_kl_per_query_whatever_targets_the_rol
         return found, float(aux.metrics["indexer_kl"])
 
     (all_targets, kl), (one_target, kl_again) = branch(every), branch(one)
-    assert all_targets and kl == kl_again
+    assert kl == kl_again and any(leaf.any() for leaf in all_targets)
     for left, right in zip(all_targets, one_target, strict=True):
         np.testing.assert_array_equal(left, right)
+
+
+def test_an_msa_index_branchs_kl_pools_by_its_queries_across_a_split_step():
+    """A step split into parts of unequal query counts (one part's rows padded) pools the indexer's KL as one
+    term of its own mass: each part's KL total and query count beside its prediction's, which the step sums
+    leaf by leaf (`dew.training.transaction`), the whole batch's counts the parts' sum, so the pooled KL is
+    the whole's per query and no average of the parts' means (row 13705)."""
+    from test_mixers import tiny
+
+    from dew.objectives.routing import RoutedStatistics
+    from dew.registry import mixers
+
+    selected = mixers.build("block_sparse_attention", selection="msa", block=4, top_k=2, index_width=8)
+    model = tiny(mixer=selected, dtype="float32", max_seq_len=SEQ, vocab_size=VOCAB)
+    objective = LMObjective(model, SEQ, indexer=IndexerTraining("sparse", weight=1.0))
+    params = nn.unbox(objective.init(jax.random.key(0)))
+    tokens = np.random.default_rng(3).integers(1, VOCAB, size=(4, SEQ + 1))
+    rows = [packed_row(row) for row in tokens[:2]] + [packed_row(row[:5]) for row in tokens[2:]]
+
+    def statistics(part) -> RoutedStatistics:
+        stats, _ = objective.loss(params, packed_batch(part), step_at())
+        assert isinstance(stats, RoutedStatistics)
+        return stats
+
+    whole, full, padded = statistics(rows), statistics(rows[:2]), statistics(rows[2:])
+    (indexed,), (first,), (second,) = whole.auxiliary, full.auxiliary, padded.auxiliary
+    assert float(first.mass) > float(second.mass) > 0
+    assert float(indexed.mass) == float(first.mass) + float(second.mass)
 
 
 @pytest.mark.parametrize("phase, topk", [("warmup", None), ("sparse", 4)])

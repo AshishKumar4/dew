@@ -70,11 +70,17 @@ class Accumulation:
     keeps none."""
 
     def replays(self, other: Accumulation | None) -> bool:
-        """Whether this window's replay slots hold batches of the shapes `other`'s do, so a step
-        compiled for `other` reads it: a batch ramp's stage changes them, and a pooled mean,
-        which keeps no batch, replays none. A batch's few fields are compared leaf by leaf, without
+        """Whether this window's replay slots hold batches of the shapes `other`'s do, and its pooled
+        statistics the leaves `other`'s do, so a step compiled for `other` reads it: a batch ramp's stage
+        changes the batches, and a pooled mean, which keeps no batch, replays none; an objective whose
+        statistics gained a term (an indexer's KL beside its prediction, row 13705) pools more leaves than
+        a window an earlier Dew saved holds. A batch's few fields are compared leaf by leaf, without
         building a tree, as a ramped run's runner does each step."""
-        held, compiled = self.batches, None if other is None else other.batches
+        def laid(window: Accumulation | None) -> tuple:
+            return (None,) * 4 if window is None else (window.batches, window.statistics,
+                                                       window.batch_statistics, window.replayed_statistics)
+
+        held, compiled = laid(self), laid(other)
         return jax.tree.structure(held) == jax.tree.structure(compiled) and all(
             (mine.shape, mine.dtype) == (theirs.shape, theirs.dtype)
             for mine, theirs in zip(jax.tree.leaves(held), jax.tree.leaves(compiled), strict=True))
@@ -134,8 +140,9 @@ def kept_window(held: Accumulation | None, pending: Accumulation, read: bool) ->
     if held is None or held.replays(pending):
         return held is not None
     if read and held.fill is not None and (count := occupied(held)):
-        raise ValueError(f"the state's part-filled accumulation window ({count} in) holds batches of "
-                         f"other shapes than the step's, which it cannot replay")
+        raise ValueError(f"the state's part-filled accumulation window ({count} in) holds batches or "
+                         "statistics of other shapes than the step's, which it cannot replay or pool: resume "
+                         "from a step that closed its window, or with the Dew that wrote it")
     return False
 
 

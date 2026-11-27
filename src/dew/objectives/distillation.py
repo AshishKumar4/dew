@@ -139,7 +139,11 @@ class DistillationObjective(Objective[Loss, Effects], Generic[Loss, Effects]):
 
         `alpha` weights the KL against the student's own loss (MaxText's
         `distill_alpha`). `temperature` softens both distributions before the
-        KL and scales the KL by its square (`distill_temperature`).
+        KL and scales the KL by its square (`distill_temperature`). The
+        student's terms of their own mass, which train its architecture
+        rather than its predictions (a router's balance, an indexer's KL,
+        `RoutedStatistics`), keep their own weights beside the mix, whatever
+        `alpha`: only its prediction's loss is mixed with the KL.
 
         `features` names `(teacher layer, student layer)` pairs whose output
         states the feature term compares. `beta` weights that term

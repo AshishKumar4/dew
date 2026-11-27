@@ -718,3 +718,22 @@ def test_a_run_places_no_training_batch_while_it_evaluates():
 # --------------------------------------------------------------------------
 # Sharding invariants at every fsdp width
 # --------------------------------------------------------------------------
+
+def test_a_window_saved_with_other_statistics_is_rebuilt_empty_and_refused_part_filled():
+    """A window an earlier Dew saved, its statistics pooling fewer leaves than the step now traces (an
+    indexer's KL beside its prediction, row 13705), is no window the step reads (`Accumulation.replays`):
+    empty, it is replaced by the step's own; part filled, its resume is refused, its pooled sums no
+    statistics the step's could continue."""
+    from dew.state import Accumulation, kept_window
+
+    def window(statistics: int, fill: int) -> Accumulation:
+        pooled = tuple(jnp.zeros(()) for _ in range(statistics))
+        return Accumulation(gradient=None, mass=None, statistics=pooled, effects=(), qk_stats=None,
+                            batches={"x": jnp.zeros((2, 4))}, variables=None, attempts=None,
+                            fill=jnp.asarray(fill, jnp.int32))
+
+    traced = window(4, 0)
+    assert kept_window(window(4, 1), traced, read=True)
+    assert not kept_window(window(2, 0), traced, read=True)
+    with pytest.raises(ValueError):
+        kept_window(window(2, 1), traced, read=True)
