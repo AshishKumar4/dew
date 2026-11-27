@@ -170,10 +170,11 @@ class PhasePasses[L, E]:
         """What a run's steps compute beside its model, as a checkpoint records it and a resume holds it to
         (`dew.training.startup.computation_differs`): `objective`'s settings (`Objective.training_record`),
         the law a pass count drawn per microbatch follows (`SampledPasses`), whose change would draw
-        another schedule of passes from the same key and positions (row 10783), and the numerics its
-        programs run under (`numerics_record`), whatever its objective records for inference (row 13537)."""
+        another schedule of passes from the same key and positions (row 10783); a checkpoint records the
+        numerics its programs run under beside it (`numerics_record`, row 13537), which a resume compares
+        apart (`numerics_differs`)."""
         sampled = {} if self.sampled is None else {"sampled_passes": asdict(self.sampled)}
-        return {**objective.training_record(), **sampled, **numerics_record()}
+        return {**objective.training_record(), **sampled}
 
     def drawn_cap(self) -> int | None:
         """The cap of the pass count a run draws per microbatch, a batch's counted work's width

@@ -327,13 +327,13 @@ def laid_start(trainer, run, dataset, resume) -> Start:
         trainer.layout_choice = Choice(held=False, fits=False, device=None, streamed=None, refused=None,
                                        streams=resumed.host == STREAMED, resumed=True)
         said(trainer.layout_choice)
-        return trainer._started(resume, known)
+        return trainer._started(known=known)
     refused = refusal(trainer, stated=stated, ahead=trainer._compiler.ahead is not None)
     if refused is not None:
         trainer.layout_choice = Choice(held=False, fits=False, device=None, streamed=None, refused=refused,
                                        streams=False)
         said(trainer.layout_choice)
-        return trainer._started(resume, known)
+        return trainer._started(known=known)
     # Each fit chooses afresh, from the layout it was given (a refit's of a run that streamed among them).
     given = trainer._given_layout
     trainer._laid_out(given)
@@ -353,7 +353,7 @@ def laid_start(trainer, run, dataset, resume) -> Start:
     active = phases.objective_for(phases.at(first))
     rung = Rung.of(active, xla_defaults=False, narrow=True)
     try:
-        start = trainer._started(resume, known)
+        start = trainer._started(known=known)
         trainer._planned_unplaced(run, start, batch)
     except LayoutRefused:
         start = None
@@ -370,7 +370,7 @@ def laid_start(trainer, run, dataset, resume) -> Start:
         rung.put(active)
         trainer._compiler = devices_compiler.anew()
         trainer._compiler.unsearched_rung(active)
-        laid = trainer._started(resume, known)
+        laid = trainer._started(known=known)
         dtype = compute_dtype(trainer, laid)
         unpriced = None
         try:
@@ -417,4 +417,4 @@ def laid_start(trainer, run, dataset, resume) -> Start:
     trainer._laid_out(given)
     # The given layout's start, which its first compile takes the plan above over; or, its devices holding
     # none, its refusal, as a run that streams nothing refuses.
-    return start if start is not None else trainer._started(resume, known)
+    return start if start is not None else trainer._started(known=known)

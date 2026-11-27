@@ -473,6 +473,42 @@ def test_a_resume_under_another_effective_precision_is_refused_before_its_record
         assert int(run(3).train(Regression(), data, name="ambient").step) == 3
 
 
+def test_a_configured_resume_reads_its_saved_data_position_once(tmp_path, monkeypatch):
+    """A configured run reads the data position of the step it resumes once, before it replaces its record
+    (its admission, row 13708), and its fit's stream restores that reading: the step's saved position gone
+    from disk once the record is written (`RunConfig.save`), the run resumes all the same, and ends where the
+    same resume ends with its position in place."""
+    import shutil
+
+    from affine_run import dataset
+
+    from dew.checkpoints import Checkpoints
+
+    def run(steps: int) -> RunConfig:
+        return RunConfig(trainer=TrainerConfig(steps=steps, checkpoint_dir=str(tmp_path), eval_every=None,
+                                               checkpoint_every=None))
+
+    run(1).train(Regression(), dataset(), name="read")
+    shutil.copytree(tmp_path / "read", tmp_path / "kept")
+    save, removed = RunConfig.save, []
+
+    def saved_then_lost(config: RunConfig, directory: str) -> str:
+        written = save(config, directory)
+        if Path(directory).name == "read":
+            step = Path(Checkpoints(directory).path(1))
+            for held in [path for path in step.rglob("position") if path.is_dir()]:
+                shutil.rmtree(held)
+                removed.append(held)
+        return written
+
+    monkeypatch.setattr(RunConfig, "save", saved_then_lost)
+    lost = run(3).train(Regression(), dataset(), name="read")
+    assert removed
+    kept = run(3).train(Regression(), dataset(), name="kept")
+    for read, held in zip(jax.tree.leaves(lost.variables), jax.tree.leaves(kept.variables), strict=True):
+        np.testing.assert_array_equal(np.asarray(read), np.asarray(held))
+
+
 def test_a_launch_into_a_weights_only_directory_under_another_precision_keeps_its_record(tmp_path):
     """A configured run launched into a directory that holds a best checkpoint's weights alone (`Best`'s
     `weights_only`, ranked so its first evaluation wins and no resumable step is kept), whose products
