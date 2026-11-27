@@ -48,6 +48,7 @@ from dew.training._candidates import (
     Stepping,
     _shaped,
     candidate_for,
+    copies_narrow,
     forget,
     forget_program,
     lowered_for,
@@ -1404,7 +1405,8 @@ class StepCompiler[L, E]:
             self.objective, mesh, self._xla_defaults, self._narrow, self._ns_group,
             None if self._base_rung is None
             else self._base_rung[1], resumed, remat=self.remat, ahead=self.ahead,
-            provisional=provisional, stated_remat=stated, unplaced=unplaced, executables=self._executables)
+            provisional=provisional, stated_remat=stated, unplaced=unplaced, executables=self._executables,
+            copies=copies_narrow(settings, state))
         if search.provisional:
             # Its programs held until a plan is taken in its place, or its run abandons it, even where it
             # refuses (`Unplaced.release`, `dew.training.ahead.LaterPlans`).

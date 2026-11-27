@@ -1,0 +1,15 @@
+HloModule m, entry_computation_layout={(f32[2]{0})->f32[2]{0}}
+
+body {
+  p = f32[2]{0} parameter(0)
+  q = f32[2]{0} parameter(1)
+  s = f32[2]{0} sine(p), metadata={op_name="jit(f)/sin"}
+  n = f32[2]{0} negate(q), metadata={op_name="jit(f)/transpose(jvp(g))/neg"}
+  ROOT m = f32[2]{0} add(s, n)
+}
+
+ENTRY e {
+  a = f32[2]{0} parameter(0)
+  b = f32[2]{0} bitcast(a)
+  ROOT f = f32[2]{0} fusion(a, b), kind=kLoop, calls=body
+}

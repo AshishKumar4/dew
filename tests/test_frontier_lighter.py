@@ -79,13 +79,17 @@ def test_a_frontier_keeps_the_plan_its_search_admits_in_two_compiles(tmp_path, m
 
 @attending("xla")
 @pytest.mark.shared_setup("sm90_full_tiled_needs")
-def test_a_frontier_lists_the_lighter_rung_a_recorded_heavier_plan_passed_over(tmp_path, monkeypatch):
+@pytest.mark.parametrize("copies", ["on", "off"])
+def test_a_frontier_lists_the_lighter_rung_a_recorded_heavier_plan_passed_over(tmp_path, monkeypatch, copies):
     """The step in that room whose record names the heavier rung, all recomputed at its whole head (as a run
     stating 'full' records it, kept as this run's: a record an earlier run left before its tile fitted):
     its plan is that rung, its one compile, which fits, the run left there; and its frontier lists below it
     the lighter rungs that fit which no search asked, the tiled head recomputing nothing among them, which
-    `need_ahead` measures fitting (row 10817: the cheaper rung was compiled by no search and told no run)."""
+    `need_ahead` measures fitting (row 10817: the cheaper rung was compiled by no search and told no run).
+    Where no step copies (`narrow_copies` off), a rung and its copy-free form are one program, and the
+    frontier lists each once, the plan's own (recorded copy-free) never among them (row 14072)."""
     from dew import _cache
+    from dew.nn.kernels.generation import chosen
     from dew.training.rungs import keep_rung
 
     limit = room()
@@ -96,11 +100,19 @@ def test_a_frontier_lists_the_lighter_rung_a_recorded_heavier_plan_passed_over(t
     monkeypatch.setenv("DEW_RUNG_RECORDS", str(tmp_path / "rungs"))
     planned(limit)
     (own,) = (tmp_path / "rungs").glob("*.json")
+    # With copies off, the record copy-free: its own twin, one program with it, is no lighter rung.
+    if copies == "off":
+        heavier = {**record(heavier, "rung"), "narrow": False}
     keep_rung(own, record(_cache.read_kept(own), "rung record")["key"], heavier)
-    trainer, plan = planned(limit, frontier=True)
+    with chosen(narrow_copies=copies):
+        trainer, plan = planned(limit, frontier=True)
     probes = probed(plan)
     assert len(probes) == 1 and probes[0]["fits"] is True, probes
     assert held_at(trainer, plan) and plan["remat"] == record(heavier, "rung")["remat"]
     lighter = listed(plan["lighter"], "lighter", read=record, what="lighter")
     assert all(entry["fits"] is True for entry in lighter), lighter
     assert any(entry["remat"] is None and entry["head_tile"] is not None for entry in lighter), lighter
+    if copies == "off":
+        read = [repr([entry[name] for name in RUNG if name != "narrow"]) for entry in lighter]
+        own_program = repr([plan[name] for name in RUNG if name != "narrow"])
+        assert len(read) == len(set(read)) and own_program not in read, (plan, lighter)

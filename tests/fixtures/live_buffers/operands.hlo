@@ -1,0 +1,20 @@
+HloModule m, entry_computation_layout={(f32[2]{0}, f32[2]{0})->f32[2]{0}}
+
+inner {
+  p = f32[2]{0} parameter(0)
+  q = f32[2]{0} parameter(1)
+  ROOT m = f32[2]{0} multiply(p, q)
+}
+
+body {
+  a = f32[2]{0} parameter(0)
+  b = f32[2]{0} parameter(1)
+  n = f32[2]{0} negate(b), metadata={op_name="jit(f)/transpose(jvp(g))/neg"}
+  ROOT i = f32[2]{0} fusion(a, n), kind=kLoop, calls=inner
+}
+
+ENTRY e {
+  x = f32[2]{0} parameter(0)
+  y = f32[2]{0} parameter(1)
+  ROOT f = f32[2]{0} fusion(x, y), kind=kCustom, calls=body
+}

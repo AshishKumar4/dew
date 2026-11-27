@@ -1,0 +1,18 @@
+HloModule m, entry_computation_layout={(f32[2]{0}, f32[2]{0})->f32[2]{0}}
+
+body {
+  a = f32[2]{0} parameter(0)
+  b = f32[2]{0} parameter(1)
+  t = (f32[2]{0}, f32[2]{0}) tuple(a, b)
+  g0 = f32[2]{0} get-tuple-element(t), index=0
+  g1 = f32[2]{0} get-tuple-element(t), index=1
+  s = f32[2]{0} sine(g0), metadata={op_name="jit(f)/sin"}
+  n = f32[2]{0} negate(g1), metadata={op_name="jit(f)/transpose(jvp(g))/neg"}
+  ROOT r = f32[2]{0} add(s, n)
+}
+
+ENTRY e {
+  x = f32[2]{0} parameter(0)
+  y = f32[2]{0} parameter(1)
+  ROOT f = f32[2]{0} fusion(x, y), kind=kLoop, calls=body
+}
