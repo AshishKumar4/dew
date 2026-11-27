@@ -45,6 +45,7 @@ from dew.nn.kernels.templates.attention import (
     kept_value,
     kind_of,
     logit_scale,
+    moved_places,
 )
 from dew.nn.kernels.templates.attention_mosaic_program import score_places
 from dew.nn.kernels.templates.hooks import Hook, Side
@@ -179,26 +180,29 @@ def _parallax_kernels(query, second, key, second_key, value, spans: KeySpans, *,
     """`parallax`'s value on the template's kernels: the softmax's output and its dQ along `second / scale`,
     one forward and one backward of the call the module's docstring lays out (`jax.vjp` of the route). The
     backward takes its accurate products and D about each query's anchor from its split sums whatever the
-    call's form: D here is `τ`, the second product's mean, which a rounded output's (the fast
-    form's `rowsum(dO ⊙ O)`) moved by the second keys' rounding, not their spread (keys of 8192 and 8200 in
-    fp16 gave a mean of 8192). The cotangent takes the logit scale's inverse to its nearest power of two,
-    exactly, and the dQ the rest of it, so neither under- nor overflows where the result does not."""
+    call's form: D here is `τ`, the second product's mean, which a rounded output's (the fast form's
+    `rowsum(dO ⊙ O)`) moved by the second keys' rounding, not their spread (keys of 8192 and 8200 in fp16
+    gave a mean of 8192). The call's operands arrive in fp32 and narrow to the query's dtype in the
+    mainloops (`attention_route.attend`'s `operand_dtype`), so its dQ comes back unrounded: the cotangent
+    is the second query as given, and its scale leaves the fp32 dQ (`scale Σ a (t - τ) v`) before any
+    rounding, under- or overflowing nowhere the result does not."""
     width = query.shape[-1]
-    laid_query = jnp.concatenate([query, jnp.zeros((*query.shape[:-1], value.shape[-1]), query.dtype)], -1)
-    laid_key = jnp.concatenate([key, value], axis=-1)
-    laid_value = jnp.concatenate([second_key, value], axis=-1)
+    wide = jnp.float32
+    laid_query = jnp.concatenate([query, jnp.zeros((*query.shape[:-1], value.shape[-1]), query.dtype)],
+                                 -1).astype(wide)
+    laid_key = jnp.concatenate([key, value], axis=-1).astype(wide)
+    laid_value = jnp.concatenate([second_key, value], axis=-1).astype(wide)
 
     def attended(laid_query):
         return attention_route.attend(laid_query, laid_key, laid_value, spans, scale=scale, natural=natural,
-                                      accurate=True)
+                                      accurate=True, operand_dtype=query.dtype)
 
     out, pull = jax.vjp(attended, laid_query)
-    power = float(2.0 ** round(-math.log2(scale)))
-    cotangent = jnp.concatenate([(second * jnp.asarray(power, second.dtype)).astype(out.dtype),
+    cotangent = jnp.concatenate([second.astype(out.dtype),
                                  jnp.zeros((*out.shape[:-1], value.shape[-1]), out.dtype)], axis=-1)
     (moved,) = pull(cotangent)
-    softmax = out[..., second_key.shape[-1]:].astype(jnp.float32)
-    along = moved[..., width:].astype(jnp.float32) * jnp.float32(1.0 / (scale * power))
+    softmax = out[..., second_key.shape[-1]:].astype(wide)
+    along = moved[..., width:].astype(wide) / jnp.asarray(scale, wide)
     return (softmax - along).astype(query.dtype)
 
 
@@ -258,21 +262,19 @@ def _banded_spans(spans: KeySpans, combine: Banded, places: jax.Array | None) ->
         # Each run's keys within `[lo, hi)` of the query's index, empty where none.
         return jnp.maximum(start, jnp.clip(lo, 0, count)), jnp.minimum(end, jnp.clip(hi, 0, count))
 
-    # A band past every distance a query and a key of the call lie apart reads as that distance, so no edge
-    # passes int32's range.
-    reach = start.shape[1] + count
-    bands = tuple(min(band, reach) for band in bands)
+    # Each edge a place moved by a band, held at int32's ends rather than wrapping (`moved_places`), then
+    # clipped to the keys: a band however wide, about a place however far, selects the keys it holds.
     copies = []
     for p in range(len(bands) + 1):
         if p == 0:
-            sides = [within(place - bands[0], place + bands[0] + 1)]
+            sides = [within(moved_places(place, -bands[0]), moved_places(place, bands[0] + 1))]
         else:
             # Past band p - 1 and within band p: the keys before the query, then those after it; the last
-            # band's outer edges the keys' own, whatever the query's place (one past the keys, a rectangular
-            # call's).
-            before = place - bands[p] if p < len(bands) else jnp.zeros_like(place)
-            after = place + bands[p] + 1 if p < len(bands) else jnp.full_like(place, count)
-            sides = [within(before, place - bands[p - 1]), within(place + bands[p - 1] + 1, after)]
+            # band's outer edges the keys' own, whatever the query's place.
+            before = moved_places(place, -bands[p]) if p < len(bands) else jnp.zeros_like(place)
+            after = moved_places(place, bands[p] + 1) if p < len(bands) else jnp.full_like(place, count)
+            sides = [within(before, moved_places(place, -bands[p - 1])),
+                     within(moved_places(place, bands[p - 1] + 1), after)]
         lo = jnp.concatenate([side[0] for side in sides], axis=-1)
         hi = jnp.concatenate([side[1] for side in sides], axis=-1)
         copies.append((lo + p * count, hi + p * count, p * count))
@@ -294,7 +296,7 @@ def _copied_hooks(hooks: Hooks, products: int, count: int) -> Hooks:
         if kind_of(side) is Kind.BAND:
             raise ValueError("a band's parameters hold each query's keys about it, which a selected call's "
                              "copies of the keys do not")
-    if score_places(hooks)[1]:
+    if score_places(hooks, may=True)[1]:
         raise ValueError("a selected call's score hook reads no key's index: each copy's keys take indices "
                          "of their own")
     # A side along the keys once a copy, at the dtype the kernels compute it in (`kept_value`), so its

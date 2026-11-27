@@ -64,7 +64,7 @@ def packable(hooks: Hooks | None) -> bool:
         return False
     if merged.output_hook_refusal(hooks.output) is not None:
         return False
-    return not score_places(hooks)[0]
+    return not score_places(hooks, may=True)[0]
 
 
 def _packed_output_params(params: tuple[Side, ...], *, heads: int, kv_heads: int) -> tuple[Side, ...]:

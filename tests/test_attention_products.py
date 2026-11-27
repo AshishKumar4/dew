@@ -212,8 +212,24 @@ def test_a_selected_call_refuses_a_score_hook_reading_its_keys_indices():
     with pytest.raises(ValueError):
         attention_products.selected((operand,) * 2, (operand,) * 2, operand, spans, combine,
                                     hooked(lambda s, q, k: s - (q - k)))
+    # One that may read them, in a branch: refused alike.
+    with pytest.raises(ValueError):
+        attention_products.selected((operand,) * 2, (operand,) * 2, operand, spans, combine,
+                                    hooked(lambda s, q, k: jax.lax.cond(s[0, 0] > 0, lambda k: s + k,
+                                                                        lambda k: s - k, k)))
     attention_products.selected((operand,) * 2, (operand,) * 2, operand, spans, combine,
                                 hooked(lambda s, q, k: 30.0 * jnp.tanh(s / 30.0)))
+
+
+def test_a_banded_call_selects_by_a_querys_explicit_place_however_far():
+    """A query placed at 100 over two keys, a near band of 100: both keys lie within it (distances 100 and
+    99), so both are the near product's, none the far's, whatever the call's extent."""
+    spans = template.spans(1, 2, 1)
+    operand = jnp.zeros((1, 1, KV_HEADS, WIDTH), jnp.bfloat16)
+    keys = jnp.zeros((1, 2, KV_HEADS, WIDTH), jnp.bfloat16)
+    laid = attention_products.selected((operand,) * 2, (keys,) * 2, keys, spans,
+                                       attention_products.Banded((100,)), places=jnp.asarray([[100]]))[3]
+    np.testing.assert_array_equal(np.asarray(template.dense(laid))[0, 0], [True, True, False, False])
 
 
 def _parallax_reference(spans: template.KeySpans):
@@ -281,6 +297,20 @@ def test_a_banded_calls_16_bit_key_bias_sums_its_copies_gradients_before_it_roun
 
     _, pull = jax.vjp(attended, jnp.zeros((1, 1, 2), jnp.float16))
     assert np.isfinite(np.asarray(pull(dout)[0], np.float32)).all()
+
+
+def test_parallax_holds_a_second_query_past_its_dtypes_range_over_the_scale():
+    """Parallax in fp16 at a logit scale of 1/8, uniform logits, a second query of 16384 against second keys
+    of -2^-14 and 2^-14 (its products -1 and 1, their mean 0) and values -1 and 1: its weights `a (1 + τ -
+    t)` 1 and 0, its output -1 exactly, where the second query over the scale, 131072, passes fp16's
+    largest."""
+    spans = template.spans(2, 2, 1)
+    zeros = jnp.zeros((1, 2, 1, 8), jnp.float16)
+    second = zeros.at[..., 0].set(16384.0)
+    second_key = zeros.at[0, :, 0, 0].set(jnp.asarray([-(2.0**-14), 2.0**-14]))
+    value = jnp.broadcast_to(jnp.asarray([-1.0, 1.0], jnp.float16)[None, :, None, None], (1, 2, 1, 8))
+    out = attention_products.parallax(zeros, second, zeros, second_key, value, spans, scale=0.125)
+    np.testing.assert_array_equal(np.asarray(out, np.float32), -np.ones((1, 2, 1, 8), np.float32))
 
 
 def test_parallax_holds_its_second_products_mean_where_a_rounded_output_would_move_it():

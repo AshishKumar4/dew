@@ -286,8 +286,8 @@ def spans(queries: int, keys: int, batch: int, *, causal: bool = False, sliding_
         query_places, key_places = _widened(positions)
         ordered = _least_after(jnp.take_along_axis(key_places, order, axis=1),
                                None if key_ids is None else jnp.take_along_axis(key_ids, order, axis=1))
-        start, end = _narrowed(start, end, order, run_lo, run_hi, ordered, _moved(query_places, -before),
-                               _moved(query_places, after))
+        start, end = _narrowed(start, end, order, run_lo, run_hi, ordered,
+                               moved_places(query_places, -before), moved_places(query_places, after))
     elif sliding_window is not None and positions is None:
         # No two places of the call lie further apart than its queries and keys, so a wider window
         # keeps what that one does, and its bounds stay within int32.
@@ -379,7 +379,8 @@ def _read_runs(runs: jax.Array, start: jax.Array, end: jax.Array, keys: int, nar
     if windowed is not None:
         before, after = windowed
         query_places, key_places = _widened(positions)
-        by_places = [*by_places, (key_places, _moved(query_places, -before), _moved(query_places, after))]
+        by_places = [*by_places, (key_places, moved_places(query_places, -before),
+                                  moved_places(query_places, after))]
     start, end = _within_runs(runs, start, end, keys, by_places)
     place, own, block_groups = blocks
     if block_groups is None:
@@ -469,9 +470,9 @@ def _least_after(places: jax.Array, ids: jax.Array | None) -> jax.Array:
 
 def _widened(positions: tuple[jax.Array, jax.Array]) -> tuple[jax.Array, jax.Array]:
     """The queries' and keys' places in one integer dtype that holds both, in which a window's bounds move
-    (`_moved`): a bound past the narrower one's range is still a place the other may hold. A signed and an
-    unsigned dtype that no enabled integer dtype holds both of (int64 beside uint64; int32 beside uint32
-    without x64), whose promotion would leave integers or narrow one, are refused for one dtype."""
+    (`moved_places`): a bound past the narrower one's range is still a place the other may hold. A signed
+    and an unsigned dtype that no enabled integer dtype holds both of (int64 beside uint64; int32 beside
+    uint32 without x64), whose promotion would leave integers or narrow one, are refused for one dtype."""
     query_places, key_places = (jnp.asarray(places) for places in positions)
     ranges = [jnp.iinfo(places.dtype) for places in (query_places, key_places)]
     least, largest = min(int(bounds.min) for bounds in ranges), max(int(bounds.max) for bounds in ranges)
@@ -484,7 +485,7 @@ def _widened(positions: tuple[jax.Array, jax.Array]) -> tuple[jax.Array, jax.Arr
                      "integer dtype that holds both: pass them in one")
 
 
-def _moved(places: jax.Array, by: int) -> jax.Array:
+def moved_places(places: jax.Array, by: int) -> jax.Array:
     """`places` moved by `by`, exactly, in their own integer dtype, held at its least and largest rather
     than wrapping: a window's bound past either end of the dtype keeps every place on that side. The move
     runs on the places' distances from the dtype's least, unsigned, which hold any shift a window makes."""
