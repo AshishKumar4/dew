@@ -1369,7 +1369,7 @@ class Trainer(Generic[Loss, Effects]):
         # A preview is the tracker's, which rank 0 alone may hold: its ask is the pool's, so every rank
         # refuses it or none does, where one refusing alone would leave its peers at the next collective
         # (audit P02).
-        previewed = preview and bool(broadcast_from_process_zero(self.tracker is not None))
+        previewed = bool(broadcast_from_process_zero(preview and self.tracker is not None))
         self._preflight(loader, plateau, suites, previewed=previewed, stated=dataset,
                         loss=(self.checkpoints is not None or restore_best) and not selection)
         return FitPlan(

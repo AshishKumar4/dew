@@ -2224,11 +2224,12 @@ def test_a_pools_reads_after_its_first_agree_nothing_where_no_share_can_run_out_
 def test_a_preview_only_process_zeros_tracker_takes_is_refused_on_every_process(tmp_path):
     """A preview asked of a model that cannot sample, at a validation of batches, with a tracker on process
     0 alone and a checkpointer both share, is refused on both processes before either enters its
-    checkpoint's agreement, each with the model's own refusal, and both pass the agreement after (audit
-    P02: process 0 refused alone, its peer waiting in the checkpoint's)."""
+    checkpoint's agreement, each with the model's own refusal, whether both ask it or process 0 alone; the
+    same fit asking none trains on both; and both pass the agreement after (audit P02: process 0 refused
+    alone, its peer waiting in the checkpoint's)."""
     reports = run_pool("preview_refusal", tmp_path, 2, devices=4, timeout=300, script=PREVIEW_REFUSAL)
-    own = {"type": "ValueError", "phase": None, "named": None}
-    assert [report["refused"] for report in reports] == [own, own], reports
+    own = {"refused": {"type": "ValueError", "phase": None, "named": None}, "step": None}
+    assert [{"every": own, "zero": own, "none": {"refused": None, "step": 2}}] * 2 == reports, reports
 
 
 @pytest.mark.distributed
