@@ -43,6 +43,7 @@ from dew.nn import float_bits
 from dew.nn.derivatives import contracted
 from dew.nn.float_bits import exact_power2
 from dew.nn.precision import correctly_rounded_divide, power2, two_product, two_sum
+from dew.nn.programs import register_entrywise
 from dew.nn.sharding import varied_alike, varying as sharding_varying  # the union; `varying` types by it
 
 
@@ -229,7 +230,7 @@ def primitive(name: str, value: Callable, typed: Callable, batched: Callable | N
     mlir.register_lowering(made, mlir.lower_fun(_alike(value), multiple_results=several))
     if batched is None:
         batching.defbroadcasting(made)
-        made.elementwise = True
+        register_entrywise(made)
     else:
         batching.primitive_batchers[made] = batched
     MADE[made] = (value, several)

@@ -804,7 +804,7 @@ def _random() -> tuple:
 @functools.cache
 def _unrounded() -> frozenset:
     """Equations that select or order values without rounding them, or run programs whose own equations the
-    audits read (`reached`, through the gate's `equations`), as every call does (`Primitive.inlined_call`)
+    audits read (`reached`, through the gate's `equations`), as every call does (`programs.is_inlined_call`)
     and every operation that only moves entries (`dew.nn.programs.rearranges`), both read beside these: a
     float32 boundary value they carry past the boundaries stays the witnessed value, and only an equation
     that rounds past them must be float64."""
@@ -827,10 +827,11 @@ def _rounds(eqn) -> bool:
     import numpy as np
     from jax.extend import core
 
+    from dew.nn import programs
     from dew.nn.conv import _barrier_p
 
     primitive = eqn.primitive
-    if (primitive in _unrounded() or primitive.rearranges or primitive.inlined_call
+    if (primitive in _unrounded() or programs.rearranges(primitive) or programs.is_inlined_call(primitive)
             or primitive is _barrier_p):
         return False
     if primitive is jax.lax.convert_element_type_p:

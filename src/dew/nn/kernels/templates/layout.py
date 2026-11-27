@@ -12,7 +12,15 @@ import jax.extend.core as jax_core
 
 from dew.nn import programs
 from dew.nn.derivatives import KernelGlue, contracted, declared_derivative, declared_tangent
-from dew.nn.programs import called, cumulative, equations, own_derivative, purely_called, reduction
+from dew.nn.programs import (
+    called,
+    cumulative,
+    equations,
+    is_inlined_call,
+    own_derivative,
+    purely_called,
+    reduction,
+)
 
 
 class Untransposable(NotImplementedError):
@@ -262,7 +270,7 @@ def _axis_free(jaxpr: jax_core.Jaxpr, shape: tuple[int, ...] = ()) -> bool:
         nested = list(jax_core.jaxprs_in_params(eqn.params))
         if nested:
             # A call, or the custom derivative's own primal (its pullback's trace evaluates it).
-            if not eqn.primitive.inlined_call or not all(
+            if not is_inlined_call(eqn.primitive) or not all(
                     _axis_free(inner, shape) for inner in nested):
                 return False
         elif not (entrywise(eqn) or placed(eqn)):

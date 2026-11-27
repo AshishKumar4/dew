@@ -34,7 +34,16 @@ from dew.algebra.extract import Linear
 from dew.nn.derivatives import Activation, Algebra, KernelGlue, Surrogate, marked_call_p
 from dew.nn.kernels import generation
 from dew.nn.kernels.templates import report as kernel_report
-from dew.nn.programs import called, control_flow, inlined, live, with_bodies, with_bodies_of, with_equations
+from dew.nn.programs import (
+    called,
+    control_flow,
+    inlined,
+    is_inlined_call,
+    live,
+    with_bodies,
+    with_bodies_of,
+    with_equations,
+)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1115,14 +1124,14 @@ def _manual(params: Mapping) -> Iterator[None]:
 
 def _holds_regions(equation: jcore.JaxprEqn) -> bool:
     """Whether the pass rewrites `equation`'s bodies in place, each a region of its own (§1.2): a call's
-    program (`Primitive.inlined_call`, `dew.nn.programs.called`'s: a nested program, a checkpoint, a custom
+    program (`dew.nn.programs.is_inlined_call`, `called`'s: a nested program, a checkpoint, a custom
     derivative's or batching rule's primal call, its rules kept) and control flow's
     (`dew.nn.programs.control_flow`: a scan's, a loop's predicate and body, a conditional's branches; nothing
     moves across a body's boundary or a loop's carry). A marked span is read by its kind (`WITHIN`); a manual
     mesh's body in its own context (`_mapped`); any other holder of a program (a native kernel's) is an opaque
     leaf."""
     primitive = equation.primitive
-    return (primitive.inlined_call and primitive is not marked_call_p) or control_flow(primitive)
+    return (is_inlined_call(primitive) and primitive is not marked_call_p) or control_flow(primitive)
 
 
 def _within(jaxpr: jcore.Jaxpr, accurate: bool, saturation: Saturation, kernels: bool, *,

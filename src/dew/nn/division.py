@@ -16,7 +16,7 @@ from jax.interpreters import ad, batching, mlir
 from dew.nn.binades import over_denominator, stood_in
 from dew.nn.derivatives import Protected, bound_span, contracted
 from dew.nn.float_bits import exact_power2, float_bits, lowered_rounded, raw_fields
-from dew.nn.programs import UNROUNDED
+from dew.nn.programs import UNROUNDED, register_entrywise
 
 
 def software_divide(numerator: jax.typing.ArrayLike,
@@ -158,7 +158,8 @@ tangent is the division's, each quotient in it correctly rounded: `g / d` in the
 numerator `ct / d`. As `jnp.divide`'s, they divided as XLA does: by the divisor's rounded reciprocal where it
 is a constant or a broadcast on a CPU (openxla/xla#51148) and off IEEE on 30 to 50% of quotients on a GPU, so
 a quantizer's scale or a rate's gradient left the reference's by an ulp on a third of its entries (row
-5277). It is entrywise (`Primitive.elementwise`), which the analyses of a program's entries read."""
+5277). It is entrywise (`dew.nn.programs.register_entrywise`), which the analyses of a program's entries
+read."""
 correctly_rounded_divide_p.def_impl(software_divide)
 # Its result is typed as JAX types its own division's: the operands' broadcast shape, their dtype, and
 # their sharding and varying axes, which a mesh's Explicit axis carries in a value's type.
@@ -187,7 +188,7 @@ def triton_lowerings() -> None:
 
 
 batching.defbroadcasting(correctly_rounded_divide_p)
-correctly_rounded_divide_p.elementwise = True
+register_entrywise(correctly_rounded_divide_p)
 # It rounds the quotient to float32 whatever its operands' dtype: at a wider width it is the quotient.
 UNROUNDED[correctly_rounded_divide_p] = jnp.divide
 
