@@ -371,9 +371,10 @@ def _window_served(lhs, rhs, compute, precision, outputs: tuple):
         return rhs
     computed = jnp.dtype(lhs.dtype if compute is None else compute)
     asked = declared(computed, precision, outputs=outputs)
-    taken = (computed == jnp.dtype(jnp.bfloat16) and not asked.promoted and asked.refusal is None
-             and stated_algorithm(precision) is None and stated_algorithm(None) is None)
-    return rhs if taken else rhs.decoded()
+    from .templates.gemm import window as window_module
+    return rhs if (computed == jnp.dtype(jnp.bfloat16) and not asked.promoted and asked.refusal is None and
+                   stated_algorithm(precision) is stated_algorithm(None) is None) else window_module.admitted(
+                       rhs).decoded()
 
 
 def _packed_gemm(lhs, matrix: NvFp4 | TernaryWeights | Bf16Window, group_sizes, *, epilogue: Hook,

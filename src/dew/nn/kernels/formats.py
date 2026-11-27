@@ -13,7 +13,6 @@ from collections.abc import Sequence
 import jax
 import jax.numpy as jnp
 import numpy as np
-from jax.core import Tracer
 from jax.custom_derivatives import SymbolicZero
 from jax.typing import DTypeLike
 
@@ -734,8 +733,6 @@ class Bf16Window:
         """The matrix `[..., depth, width]` in `dtype`, each weight its stored bits again (a bit operation a
         weight, traced or not): its base and offset's exponent beside its sign and mantissa, a signed zero,
         or its group's escape."""
-        if not isinstance(self.form, Tracer):
-            self.checked()
         group = packed.WINDOW_GROUP
         words, meta = (jnp.asarray(plane, jnp.uint32) for plane in (self.words, self.meta))
         *lead, width, count = words.shape
