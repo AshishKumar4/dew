@@ -1289,8 +1289,10 @@ def _arguments(function: Callable[..., Configured], fields: Mapping[str, object]
     lacks, raises; a function taking `**kwargs` takes any field."""
     named, open_ended = parameters(function)
     # A saved record's field its class lost since, read without (`_records.saved_fields`), as `_declared`
-    # reads a dataclass's: a constructor taking `**kwargs` forwards only what its parameters take.
-    fields = _records.saved_fields(function, fields, named)
+    # reads a dataclass's: a constructor taking `**kwargs` forwards only what its parameters take. A
+    # function's record names no class, and none of its fields is retired.
+    if isinstance(function, type):
+        fields = _records.saved_fields(function, fields, named)
     unknown = [] if open_ended else sorted(set(fields) - set(named))
     missing = [name for name, (parameter, _) in named.items()
                if name not in fields and parameter.default is parameter.empty]

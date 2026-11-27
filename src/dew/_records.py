@@ -339,18 +339,16 @@ def reading_saved() -> Iterator[None]:
         _SAVED.reset(token)
 
 
-def saved_fields[V](member: type | Callable[..., object], fields: Mapping[str, V],
-                    accepted: Collection[str]) -> Mapping[str, V]:
-    """`fields`, a record of `member` (a class, or a function a record names), read as a saved record is
+def saved_fields[V](member: type, fields: Mapping[str, V], accepted: Collection[str]) -> Mapping[str, V]:
+    """`fields`, a record of the class `member`, read as a saved record is
     (`reading_saved`), without the fields `member` or a base lost since (`DECODED_REMOVED`, by each class's
     import path in `member`'s order of resolution) that its reader does not accept (`accepted`, the names the
     decoder takes for it: a subclass that records a retired name keeps it); `fields` itself outside a saved
     record's reading, or where it holds none."""
     if not _SAVED.get():
         return fields
-    kinds = member.__mro__ if isinstance(member, type) else (member,)
     removed = frozenset().union(*(DECODED_REMOVED.get(f"{kind.__module__}:{kind.__qualname__}", frozenset())
-                                  for kind in kinds)) - frozenset(accepted)
+                                  for kind in member.__mro__)) - frozenset(accepted)
     if removed.isdisjoint(fields):
         return fields
     return {name: value for name, value in fields.items() if name not in removed}
