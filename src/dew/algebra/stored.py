@@ -339,12 +339,13 @@ _WRITTEN = {written.constructor: (kind, written.names) for kind, written in term
 """Each operation's constructor by its name: its kind of operation and the field of it its name is
 (`terms.Written.names`)."""
 
+
 def _operated(name: str, values: list, primitive: Primitive) -> None:
     """That the parameters of `primitive` a term of constructor `name` over `values` reads are of its own
     operation (`terms.OPERATIONS`): its kind, and where the term names it (its second argument) its symbol
-    or monoid, a fused multiply-add's name the one it binds as (`rules.BOUND_AS`; `ValueError` otherwise). A derived walk's
-    rescale (`terms.RESCALE`), no program's operation, reads the parameters its declaration's exponent gives
-    it."""
+    or monoid, a fused multiply-add's name the one it binds as (`rules.BOUND_AS`; `ValueError` otherwise).
+    A derived walk's rescale (`terms.RESCALE`), no program's operation, reads the parameters its
+    declaration's exponent gives it."""
     kind, names = _WRITTEN[name]
     named = None if names is None else terms.text(values[1])
     if name == "binary" and named == terms.RESCALE:
