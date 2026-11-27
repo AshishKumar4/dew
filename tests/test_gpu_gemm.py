@@ -453,7 +453,8 @@ def test_the_gemm_kernels_run_on_this_gpu(part):
         *(Cell(f"the NVFP4 product's packed kernel holds every order: {name} {edge}",
                functools.partial(contracts_gemm.test_an_nvfp4_products_kernels_hold_every_order, edge,
                                  "packed"), name,
-               fault=("the NVFP4 packed decode's PTX form" if edge == next(iter(contracts_gemm.EDGES))
+               fault=("the NVFP4 packed decode compiled (its traced form, row 3733)"
+                      if edge == next(iter(contracts_gemm.EDGES))
                       else None),
                native={"launch": "nvfp4 packed"})
           for name in ("sm90", "sm80") for edge in contracts_gemm.EDGES),

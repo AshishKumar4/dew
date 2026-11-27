@@ -377,13 +377,13 @@ def _inlined(form: bits.BitForm, generation: str):
 @pytest.mark.parametrize("name", FORMS)
 @pytest.mark.parametrize("generation", ["sm80", "sm90"])
 def test_a_forms_ptx_compiles_for_the_gpu(generation, name):
-    """A form's PTX inlined in a Mosaic GPU kernel (`inline_forms.registers`, the product's path), lowered and
-    compiled by XLA for a compile-only GPU of `generation` (`tests/kernel_compile.py`): ptxas takes every
-    instruction PTX writes for a form (`FORMS` take them all). What a form's PTX computes on a GPU is held
-    where a kernel consumes it, never a unit test on a GPU (the owner's rule): the NVFP4 form in the packed
-    GEMM's mainloop, through tests/test_gpu_gemm.py's NVFP4 product cells (every order, sm80 and sm90, its
-    decode's PTX form a cell's fault) and its NVFP4 matrix (a training step with the matrix decoded in the
-    mainloop, check 1)."""
+    """A form's PTX inlined in a Mosaic GPU kernel (`inline_forms.registers`, a compiled epilogue's packing,
+    `gemm.quantized.encode_tile`), lowered and compiled by XLA for a compile-only GPU of `generation`
+    (`tests/kernel_compile.py`): ptxas takes every instruction PTX writes for a form (`FORMS` take them all).
+    What a form computes on a GPU is held where a kernel consumes it, never a unit test on a GPU (the owner's
+    rule): the NVFP4 form in the packed GEMM's mainloop, decoded by `traced` compiled (row 3733), through
+    tests/test_gpu_gemm.py's NVFP4 product cells (every order, sm80 and sm90) and its NVFP4 matrix (a
+    training step with the matrix decoded in the mainloop, check 1)."""
     from kernel_compile import lowered_for
 
     from dew.nn.kernels import generation as generations
