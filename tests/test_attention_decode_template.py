@@ -1789,7 +1789,8 @@ def test_a_decode_plan_prices_the_merge_its_walk_launches(finished, dtype):
     which alone priced fewer than it writes, its walk's units at the call's scale, the rows and columns it
     keeps, the dtype and heads it writes and its output hook alike (train 1402's K-F3 review); in bf16 and in
     fp32, whose walk stages its operands' bf16 parts and pads their 32 columns to 64, where its query's
-    dtype priced 32 (`attention_mosaic.staged_dtype`, train 1407's K-F3 review)."""
+    dtype priced 32 (`merge_launch_for`'s `staged`, the bound walk's, train 1407's and 1412's K-F3
+    reviews)."""
     width, slices = 32, 2
     tiles = attention_mosaic.Tiles(64, 64, 2, 1, family="wgmma")
     query = jnp.zeros((1, 1, 4, width), dtype)
@@ -1805,10 +1806,14 @@ def test_a_decode_plan_prices_the_merge_its_walk_launches(finished, dtype):
     with generation.assumed("sm90"), jax.default_matmul_precision("default"):
         target = generation.gpu_target()
         _, rows, row_spans, whole = attention_decode.planned(query, key, key, spans, hooks, finished=finished)
-        priced = attention_decode.merge_launch_for(rows, key, key, row_spans, whole, tiles, slices,
-                                                   scale=None, target=target, initial=None,
-                                                   finished=descriptor, deferred=False)
         stateless = dataclasses.replace(whole, initial=None, output=NO_HOOK)
+        # The dtype the split walk stages its operands at, its bound op's query's.
+        _, bound = attention_mosaic._forward_call(rows, key, key, row_spans, stateless, scale=None,
+                                                  natural=False, out_dtype=jnp.float32, masked=True,
+                                                  splits=slices, subtracted=True)
+        priced = attention_decode.merge_launch_for(rows, key, row_spans, whole, tiles, slices,
+                                                   staged=bound[0].dtype, scale=None, target=target,
+                                                   initial=None, finished=descriptor, deferred=False)
         with tuning.pinned({attention_mosaic.MosaicForward: tiles}):
             walked = jax.eval_shape(lambda rows, key: attention_mosaic.forward(
                 rows, key, key, row_spans, stateless, residuals=template.Kept.OUTPUT, out_dtype=jnp.float32,

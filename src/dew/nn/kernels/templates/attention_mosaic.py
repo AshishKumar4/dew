@@ -1541,19 +1541,6 @@ def certified(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpan
                                   tmem_columns=target.tmem_columns)
 
 
-def operand_parts(query, key, value) -> int:
-    """The bf16 parts each operand of a call enters its launch as (`product.stacked`): an fp32 call's
-    `product.bf16_part_count`, 1 for any other."""
-    fp32 = all(jnp.dtype(x.dtype) == jnp.dtype(jnp.float32) for x in (query, key, value))
-    return product.bf16_part_count(accurate=True) if fp32 else 1
-
-
-def staged_dtype(query, key, value):
-    """The dtype a call's launch stages its operands at, its family's and column unit's: bf16 where its
-    fp32 operands enter as parts (`operand_parts`), else the query's."""
-    return jnp.dtype(jnp.bfloat16) if operand_parts(query, key, value) > 1 else jnp.dtype(query.dtype)
-
-
 def _forward_call(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks | None, *,
                   scale: float | None, natural: bool, out_dtype=None, masked: bool = False,
                   splits: int = 1, table: jax.Array | None = None, sources: jax.Array | None = None,
@@ -1571,7 +1558,8 @@ def _forward_call(query: jax.Array, key: jax.Array, value: jax.Array, spans: Key
     released and hung the launch)."""
     hooks = Hooks() if hooks is None else hooks
     walked_initial(hooks.initial)
-    parts = operand_parts(query, key, value)
+    fp32 = all(jnp.dtype(x.dtype) == jnp.dtype(jnp.float32) for x in (query, key, value))
+    parts = product.bf16_part_count(accurate=True) if fp32 else 1
     if hooks.query.fn is not None and (parts > 1 or head_width(query.shape[3]) != query.shape[3]):
         # A query prologue its consumers cannot take where they load the query: an fp32 call's query enters as
         # program before the launch takes it.
