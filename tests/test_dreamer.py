@@ -900,6 +900,7 @@ def test_dreamer_filled_and_split_step_updates_as_the_real_windows_whole(dynamic
     past unit scale) updates parameters and slow critic EMA as `split=1` on the 6 real windows does,
     held to the float64 update by check 1."""
     from float64_replay import float64_replay
+    from arm_arithmetic import summed_as_run
     from rl_split_support import SplitAndWhole, nudged_tree
 
     from dew.averaging import ema_update
@@ -962,7 +963,9 @@ def test_dreamer_filled_and_split_step_updates_as_the_real_windows_whole(dynamic
     # toward their 5th and 95th percentiles at `return_rate`, so the percentiles' span is what the step
     # added to the seeded span's share it kept.
     variables, ema, real_batch = draw(0)
-    bounds = steps.stepped(1, real_batch, variables=variables, ema=ema).variables["returns"]
+    # In the arithmetic check 1 runs its arms in, which a step's first call compiles it under.
+    with summed_as_run():
+        bounds = steps.stepped(1, real_batch, variables=variables, ema=ema).variables["returns"]
     moving, seeded = objective.return_rate, float(seeded_returns["high"] - seeded_returns["low"])
     spread = (float(bounds["high"] - bounds["low"]) - (1 - moving) * seeded) / moving
     assert spread > 1, spread
