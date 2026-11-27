@@ -427,7 +427,8 @@ def selected_attention(query, key, value, selected, bounds, *, own=None, slots=N
     real keys alone where `key_valid` `[B, K]` marks them (a run spans a hole the validity hides): `query`
     `[B, Q, R * h, D]`, `key` and `value` `[B, K, G, D]` with `R` a multiple of `G` (a head's selection
     reads its group's keys), out `[B, Q, R * h, Dv]`, through the template's indexed form
-    (`scaled_dot_product_attention`'s `key_runs`). `options` are the call's other arguments. A call whose
+    (`scaled_dot_product_attention`'s `key_runs`). `options` are the call's other arguments, its `sinks` (a
+    head's `[R * h]`, or a query's own `[B, Q, R * h]`) laid at each selection's row. A call whose
     queries are its keys (`slots` None) states its causality to the kernel too; a cache call's runs alone
     end each query's keys."""
     rows, queries, heads, _ = query.shape
@@ -451,6 +452,11 @@ def selected_attention(query, key, value, selected, bounds, *, own=None, slots=N
     runs = selected_runs(selected.reshape(rows * groups, queries, -1), rowed_bounds, own=rowed_own,
                          slots=rowed(slots), causal=causal)
     key, value = (jnp.repeat(each, shared, axis=2) for each in (key, value))
+    if (sinks := options.get("sinks")) is not None:
+        # A head's sinks, or a query's own `[B, Q, R * h]`, at each selection's row and its heads, laid as its
+        # queries are (`batched`): `[B * R, Q, h]`.
+        laid = jnp.broadcast_to(sinks, (rows, queries, heads)) if sinks.ndim == 1 else sinks
+        options = {**options, "sinks": batched(laid[..., None], per)[..., 0]}
     out = scaled_dot_product_attention(batched(query, per), batched(key, 1), batched(value, 1),
                                        causal=causal and slots is None, key_runs=runs,
                                        key_valid=rowed(key_valid), implementation=implementation, **options)

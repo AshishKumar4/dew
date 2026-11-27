@@ -1986,3 +1986,19 @@ def test_stability_families_with_identical_structure_share_jitted_programs():
     spanned = next(FAMILIES[name] for name in TEMPLATE_FAMILIES
                    if _spans_key(FAMILIES[name].spans) != _spans_key(first_fam.spans))
     assert _mainloops(first_fam, {})["portable"] is not _mainloops(spanned, {})["portable"]
+
+
+@pytest.mark.gpu(reason="the ambient fp16 preset a GPU's product takes")
+def test_a_bf16_call_of_wide_logits_scaled_after_keeps_its_bf16_product():
+    """The reference path's bf16 call with wide logits scaled after (`wide_logits`, `scale_logits`) under an
+    ambient F16_F16_F32 preset: its logits' product takes jax.nn's bf16 preset for its own bf16 operands
+    (`attention.unscaled_scores`' `dtype`), so a query and key of 2^20 give finite logits and a finite
+    output, where read off the widened operands it took the ambient fp16 product, whose operands overflow."""
+    from dew.nn.attention import reference_attention
+
+    query = jnp.zeros((1, 2, 1, 8), jnp.bfloat16).at[..., 0].set(2.0 ** 20)
+    value = jnp.ones((1, 2, 1, 8), jnp.bfloat16)
+    with jax.default_matmul_precision("F16_F16_F32"):
+        out = reference_attention(query, query * 2.0 ** -40, value, dtype=jnp.bfloat16, wide_logits=True,
+                                  scale_logits=True)
+    assert np.isfinite(np.asarray(out, np.float32)).all()

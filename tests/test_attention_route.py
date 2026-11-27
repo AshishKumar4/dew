@@ -1166,6 +1166,39 @@ def test_an_a100_call_off_its_receipts_heads_takes_no_declared_cell():
     assert cell not in attention_kernels.DECLARED
 
 
+def test_a_call_split_over_a_mesh_takes_the_cell_of_each_devices_launch():
+    """An A100 bf16 causal call of two rows at 8192 tokens, width 128, 32/8, split over two devices' batch
+    axis: each device launches one row at 8192, a pair M-NA-44 timed, so it is the declared cell; the same
+    call on one device, two rows at 8192, a pair no receipt timed, is not (train 1345's F5: the call's whole
+    geometry was matched)."""
+    from flax import linen as nn
+    from jax.sharding import AbstractMesh, AxisType
+
+    from dew.mesh import DEFAULT_RULES
+    from dew.nn import attention_kernels
+    from dew.nn.attention import attention_case
+
+    query = jax.ShapeDtypeStruct((2, 8192, 32, 128), jnp.bfloat16)
+    key = jax.ShapeDtypeStruct((2, 8192, 8, 128), jnp.bfloat16)
+    mesh = AbstractMesh((2,), ("data",), axis_types=(AxisType.Explicit,))
+    with generation.assumed("sm80"):
+        whole = attention_case(query, key, causal=True).cell
+        with jax.sharding.use_abstract_mesh(mesh), nn.logical_axis_rules(DEFAULT_RULES):
+            split = attention_case(query, key, causal=True).cell
+    assert whole not in attention_kernels.DECLARED
+    assert split in attention_kernels.DECLARED
+
+
+@pytest.mark.parametrize("shape", [(16, 2, 8), (2, 3, 16, 2, 8)], ids=["unbatched", "two-batch-axes"])
+def test_a_reference_call_of_any_leading_axes_runs(shape):
+    """A reference call over an unbatched `[Q, H, D]` query or one of two leading batch axes: it runs (its
+    selector reads a device's launch of `[B, T, N, D]` calls alone, `AttentionCase.launch`), its output its
+    query's positions, heads and width."""
+    query = jnp.ones(shape, jnp.float32)
+    out = scaled_dot_product_attention(query, query, query, causal=True, implementation="reference")
+    assert out.shape[-3:] == shape[-3:]
+
+
 def _launches(fn, *operands) -> set[str]:
     """The kernels `fn`'s program launches, by the launches themselves: FlashAttention's FFI targets
     ('flash'), the template's Pallas launches ('template', `report.named`'s `attention_` kernels), and any

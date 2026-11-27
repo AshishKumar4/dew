@@ -204,6 +204,14 @@ class AttentionCase:
     template does not take it."""
     rows: int = 1
     """The call's rows, every leading axis of the query's `[B, T, N, D]` (a batch, its chunks)."""
+    launch: tuple[int, int, int] | None = None
+    """The rows, query heads and key heads one device's launch takes on a mesh that splits them
+    (`attention_parallel.launched`); None where it takes the call's own."""
+
+    @property
+    def launched(self) -> tuple[int, int, int]:
+        """The rows, query heads and key heads one device's launch takes (`launch`, else the call's)."""
+        return (self.rows, self.heads, self.kv_heads) if self.launch is None else self.launch
     quantized: str | None = None
     """Where a quantized model's rule owns the call's products and quantizes them
     (`attention_quantized.owner`; an adapter's or an input quantizer's interception owns its projections
@@ -729,17 +737,20 @@ class Timed:
             return False
         if case.documents is not None and not isinstance(self.documents, bool):
             return self.documents.holds(case)
+        # A receipt timed one device's launch: a call on a mesh at the rows and heads each device takes
+        # (`AttentionCase.launched`), not the call's whole (train 1345's F5).
+        rows, heads, kv_heads = case.launched
         return (self.shortest <= min(case.queries, case.keys) and max(case.queries, case.keys) <= self.longest
                 and (self.widths is None or case.head_dim in self.widths)
-                and (self.groups is None or case.heads // case.kv_heads in self.groups)
+                and (self.groups is None or heads // kv_heads in self.groups)
                 and (self.causal is None or case.causal == self.causal)
                 and (self.windows or case.window is None)
                 and (case.documents is None or self.documents is True)
-                and (self.rows is None or case.rows in self.rows)
-                and (self.heads is None or (case.heads, case.kv_heads) in self.heads)
+                and (self.rows is None or rows in self.rows)
+                and (self.heads is None or (heads, kv_heads) in self.heads)
                 and (self.dtypes is None or case.dtype.name in self.dtypes)
-                and (self.pairs is None or (case.queries == case.keys
-                                            and (case.rows, case.queries) in self.pairs)))
+                and (self.pairs is None
+                     or (case.queries == case.keys and (rows, case.queries) in self.pairs)))
 
 
 MEASURED: dict[tuple[str | None, CallKind], Timed] = {

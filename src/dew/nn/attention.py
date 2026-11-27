@@ -57,6 +57,7 @@ from .attention_masks import (
 from .attention_parallel import (
     check_rows,
     four_dimensional,
+    launched,
     on_attention_shards,
     pad_rows,
     sequence_parallel_attention,
@@ -609,6 +610,59 @@ class Products(NamedTuple):
     weighted: DTypeLike | None = None
 
 
+def scaled_operands(query: jax.Array, key: jax.Array, *, wide_logits: bool = False,
+                    scale_logits: bool = False,
+                    query_scale: float | None = None) -> tuple[jax.Array, jax.Array]:
+    """The query and key the reference path's logits are the product of (`reference_attention`), in their
+    common dtype: widened to fp32 under `wide_logits`, as they are under `scale_logits` (both scaled after,
+    `scaled_after`), else the query scaled first in its dtype, by 1/sqrt(D) or `query_scale`."""
+    dtype = query.dtype
+    if wide_logits:
+        return query.astype(at_least_fp32(dtype)), key.astype(at_least_fp32(dtype))
+    if scale_logits:
+        return query, key
+    if query_scale is None:
+        return query / jnp.sqrt(query.shape[-1]).astype(dtype), key
+    return query * jnp.asarray(query_scale, dtype), key
+
+
+def unscaled_scores(subscripts: str, query: jax.Array, key: jax.Array, *, precision, dtype,
+                    scale_logits: bool = False) -> jax.Array:
+    """The reference path's product of `scaled_operands`' query and key (`reference_attention`), `dtype`
+    the call's operands' own before `scaled_operands` widened any: at the scores' precision (`Products`),
+    its sums in the logits' dtype; under `scale_logits` jax.nn's fp32 sums at the dot algorithm it names for
+    `dtype`'s 16-bit operands (`_jax_nn_algorithm`, read off `dtype`, never the widened operands': a bf16
+    call's preset kept under wide logits too), never rounded to their dtype."""
+    products = precision if isinstance(precision, Products) else Products(precision, precision)
+    formed = at_least_fp32(dtype) if scale_logits else products.logits
+    algorithm = _jax_nn_algorithm(dtype, products.scores) if scale_logits else None
+    if algorithm is None:
+        return float32_einsum(subscripts, query, key, precision=products.scores,
+                              preferred_element_type=formed)
+    return jnp.einsum(subscripts, query, key, precision=algorithm, preferred_element_type=formed)
+
+
+def scaled_after(logits: jax.Array, width: int, *, wide_logits: bool = False, scale_logits: bool = False,
+                 query_scale: float | None = None) -> jax.Array:
+    """`unscaled_scores`' logits at the call's scale, where `scaled_operands` left it for after
+    (`wide_logits`, `scale_logits`): by 1/sqrt(`width`) or `query_scale`; as they are otherwise."""
+    if wide_logits or scale_logits:
+        return logits * (width ** -0.5 if query_scale is None else query_scale)
+    return logits
+
+
+def reference_scores(query: jax.Array, key: jax.Array, subscripts: str, *, precision=None,
+                     wide_logits: bool = False, scale_logits: bool = False) -> jax.Array:
+    """The reference path's logits of `query` and `key` (`reference_attention`), formed as it forms them,
+    operand scaling, product and scale after: a computation that trains toward the attention's own weights
+    reads its logits here (MSA's teacher, `block_sparse.msa_query_kls`)."""
+    dtype = query.dtype
+    query, key = scaled_operands(query, key, wide_logits=wide_logits, scale_logits=scale_logits)
+    logits = unscaled_scores(subscripts, query, key, precision=precision, dtype=dtype,
+                             scale_logits=scale_logits)
+    return scaled_after(logits, query.shape[-1], wide_logits=wide_logits, scale_logits=scale_logits)
+
+
 def reference_attention(query, key, value, *, mask=None, bias=None, sinks=None, softcap=None, dtype=None,
                         precision=None, force_fp32_for_softmax=True, dropout_rate=0.0, dropout_seed=None,
                         dropout_places=None, wide_logits=False, scale_logits=False, mask_fill=None,
@@ -658,7 +712,7 @@ def reference_attention(query, key, value, *, mask=None, bias=None, sinks=None, 
     2654), a row of no weight left 0; and `precision` its two products' apart (`Products`).
     """
     products = precision if isinstance(precision, Products) else Products(precision, precision)
-    scores_precision, values_precision = products.scores, products.values
+    values_precision = products.values
     if products.weighted is None:
         query, key, value = promote_dtype(query, key, value, dtype=dtype)
     else:
@@ -673,24 +727,9 @@ def reference_attention(query, key, value, *, mask=None, bias=None, sinks=None, 
                                    force_fp32_for_softmax=force_fp32_for_softmax, wide_logits=wide_logits,
                                    scale_logits=True, mask_fill=mask_fill)
         return _grouped_as_jax_nn(attend, query, key, value, mask, bias)
-    if wide_logits:
-        scaled_query, scoring = query.astype(at_least_fp32(dtype)), key.astype(at_least_fp32(dtype))
-    elif scale_logits:
-        scaled_query, scoring = query, key
-    elif query_scale is None:
-        scaled_query, scoring = query / jnp.sqrt(width).astype(dtype), key
-    else:
-        scaled_query, scoring = query * jnp.asarray(query_scale, dtype), key
-    # jax.nn's logits are its product's fp32 sums, never rounded to the operands' dtype, at the dot algorithm
-    # it names (`_jax_nn_algorithm`).
-    formed = at_least_fp32(dtype) if scale_logits else products.logits
-    algorithm = _jax_nn_algorithm(dtype, scores_precision) if scale_logits else None
-
-    def logits_of(subscripts: str, lhs: jax.Array, rhs: jax.Array) -> jax.Array:
-        if algorithm is None:
-            return float32_einsum(subscripts, lhs, rhs, precision=scores_precision,
-                                  preferred_element_type=formed)
-        return jnp.einsum(subscripts, lhs, rhs, precision=algorithm, preferred_element_type=formed)
+    scaled_query, scoring = scaled_operands(query, key, wide_logits=wide_logits, scale_logits=scale_logits,
+                                            query_scale=query_scale)
+    logits_of = functools.partial(unscaled_scores, precision=products, dtype=dtype, scale_logits=scale_logits)
 
     if skipped is not None:
         value, logits = _skipped_logits(logits_of, scaled_query, scoring, value, skipped)
@@ -705,8 +744,8 @@ def reference_attention(query, key, value, *, mask=None, bias=None, sinks=None, 
     else:
         grouped = scaled_query.reshape(*rows, length, kv_heads, heads // kv_heads, width)
         logits = logits_of('...tkgd,...skd->...kgts', grouped, scoring).reshape(*rows, heads, length, keys)
-    if wide_logits or scale_logits:
-        logits = logits * (width ** -0.5 if query_scale is None else query_scale)
+    logits = scaled_after(logits, width, wide_logits=wide_logits, scale_logits=scale_logits,
+                          query_scale=query_scale)
     if softcap is not None:
         logits = capped_logits(logits, softcap)
     if bias is not None:
@@ -1533,11 +1572,8 @@ def _attention_kernel(query, key, value, *, bias, sinks, implementation, dtype, 
     if implementation == 'reference' or (implementation == 'xla' and (
             sinks is not None or softcap is not None or dropout_seed is not None)):
         mask = combined_attention_mask(query.shape[-3], key.shape[-3], causal, sliding_window, masked)
-        # The accurate form's products are IEEE fp32 (`attention_route.FORMS`), never a GPU's TF32.
-        if generation.numerics().forms == "accurate":
-            precision = EXACT_FLOAT32
         return reference_attention(query, key, value, mask=mask, bias=bias, sinks=sinks, softcap=softcap,
-                                   dtype=dtype, precision=precision,
+                                   dtype=dtype, precision=score_precision(precision),
                                    force_fp32_for_softmax=force_fp32_for_softmax, wide_logits=wide_logits,
                                    scale_logits=scale_logits, mask_fill=mask_fill, dropout_rate=dropout_rate,
                                    dropout_seed=dropout_seed, dropout_places=dropout_places)
@@ -1567,6 +1603,15 @@ def _attention_kernel(query, key, value, *, bias, sinks, implementation, dtype, 
         return at_precision(precision, parameters=(3, 4))(fused)(query, key, value, bias, sinks)
     with configured_precision(precision):
         return fused(query, key, value, bias, sinks)
+
+
+def score_precision(precision: jax.lax.PrecisionLike) -> jax.lax.PrecisionLike:
+    """The precision the reference path forms a call's logits at, the call's `precision` stated: the
+    accurate form's IEEE fp32 (`attention_route.FORMS`), never a GPU's TF32 nor a narrowing preset, under
+    the run's accurate numerics; the stated one otherwise (JAX's configured one where None). A computation
+    that trains toward the attention's own weights reads its logits at it (MSA's teacher,
+    `block_sparse.msa_query_kls`)."""
+    return EXACT_FLOAT32 if generation.numerics().forms == "accurate" else precision
 
 
 def reference_only(query, dtype, precision, force_fp32_for_softmax, wide_logits: bool = False) -> bool:
@@ -1652,7 +1697,9 @@ def attention_case(query, key, *, dtype=None, precision=None, force_fp32_for_sof
         narrows=_xla_kernel_narrows(query),
         folds=folds(query, key, bias, mask, causal, sliding_window),
         splash_mask=False, shards=sequence_shards(), dropout=dropout, form=generation.numerics().forms,
-        quantized=quantized_rule(sinks is not None, dropout))
+        quantized=quantized_rule(sinks is not None, dropout),
+        # A device's launch on a mesh, `[B, T, N, D]` calls' (`on_attention_shards` splits those alone).
+        launch=launched(query, key) if query.ndim == 4 else None)
     # Splash's descriptor reads a concrete mask on the host, so it is built only where splash may run,
     # under a name that may choose it on a TPU (`TPU_BACKEND`); its tiling and every other requirement
     # read the case (`TPU_SUPPORTS`).
