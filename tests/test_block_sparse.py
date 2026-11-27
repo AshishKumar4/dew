@@ -734,8 +734,10 @@ def test_an_msa_decoder_selects_by_its_index_branch_and_trains_it_by_its_own_los
     assert named(params, "msa_indexer")
     _, sown = model.apply(params, tokens, mutable=[SELECTIONS, INDEXER_COLLECTION])
     assert named(sown, "scores") and named(sown, "visible") and named(sown, "budget")
-    config = {"mixer": {"fields": {"selection": "msa"}}}
+    # The gate asks the model's own config, its mixer typed, and of a hybrid's layer kind alike.
+    config = {"mixer": model.mixer}
     assert selection_margins.selects(config)
+    assert selection_margins.selects({"mixer": None, "kinds": {"sparse": {"mixer": model.mixer}}})
     captured = selection_margins.capture(model)(params, tokens)
     assert np.isfinite(selection_margins.margin(config, captured, "msa"))
     # Its indexer's loss per query, each layer's, where an objective training an indexer opens its

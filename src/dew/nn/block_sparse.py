@@ -32,7 +32,7 @@ from dew.nn.inspection import INDEXER_COLLECTION, QK
 from dew.nn.kv_cache import cached_validity
 from dew.nn.mixer_base import MixerContext
 from dew.nn.mixers.attention import AttentionMixer, CausalSelfAttention
-from dew.nn.mla import SELECTIONS, indexer_log_target
+from dew.nn.mla import indexer_log_target, sow_selection
 from dew.nn.precision import at_least_fp32, compensated_sum, float32_einsum
 from dew.nn.residuals import Residual
 from dew.nn.sparse_selection import (
@@ -270,7 +270,12 @@ def msa_selection(index_scores: jax.Array, *, block: int = 128, top_k: int = 16,
     github.com/dphnAI/sonar, models/minimax_m3/common/ops/index_topk.py: a page's score its tokens' maximum,
     the forced pages prioritized within `topk`)."""
     assert top_k >= 1, "a selection takes a block"
-    pooled, keep, forced = msa_candidates(index_scores, block=block, initial=initial, local=local)
+    return msa_selected(*msa_candidates(index_scores, block=block, initial=initial, local=local), top_k=top_k)
+
+
+def msa_selected(pooled: jax.Array, keep: jax.Array, forced: jax.Array, *, top_k: int) -> jax.Array:
+    """`msa_selection` of its candidates (`msa_candidates`): each query's forced blocks first, then the
+    `top_k` of the rest by their pooled scores, `[B, G, Q, top_k]`, -1 past those it holds."""
     blocks = pooled.shape[-1]
     # Ranked ahead of every other visible block within the one `top_k`, as M3's index kernels prioritize
     # them: the forced first (lower blocks first), then the rest's top by score (`top_k_selection`), the
@@ -556,10 +561,7 @@ class BlockSparseSelfAttention(CausalSelfAttention):
         valid = None if valid is None else jnp.broadcast_to(jnp.asarray(valid, bool), (rows, keys))
         chunks = moba_chunks(keys, self.block, segments=documents, valid=valid, slots=slots, rows=rows)
         gate, keep = moba_gate(query, key, chunks, self.block)
-        if not self.is_initializing():
-            visible = jnp.broadcast_to(keep[:, None], gate.shape)
-            self.sow(SELECTIONS, "selection", {"scores": gate, "visible": visible,
-                                               "budget": jnp.asarray(self.top_k - 1)})
+        sow_selection(self, gate, None, keep[:, None], self.top_k - 1)
         selected = moba_selection(gate, keep, self.top_k)
         return checkpoint_name(selected_attention(
             query, key, value, selected, window_runs(chunks.windows), own=chunks.own, slots=slots,
@@ -607,18 +609,16 @@ class BlockSparseSelfAttention(CausalSelfAttention):
                              "own: no cache, packed documents or hidden token")
         scores = MsaIndexer(groups=key.shape[2], width=self.index_width, dtype=self.ctx.dtype,
                             precision=self.ctx.precision, name="msa_indexer")(hidden)
-        selected = msa_selection(scores, block=self.block, top_k=self.top_k)
-        if not self.is_initializing():
-            # Its selection as the gate reads every one (`selection_margins`): each query's blocks by their
-            # pooled scores among those it takes by score, at the slots its forced own block leaves.
-            pooled, taken, _ = msa_candidates(scores, block=self.block)
-            self.sow(SELECTIONS, "selection", {"scores": pooled, "visible": taken,
-                                               "budget": jnp.asarray(min(self.top_k, pooled.shape[-1]) - 1)})
-            if self.is_mutable_collection(INDEXER_COLLECTION):
-                # Its indexer's loss per query, as an objective training an indexer reads it
-                # (`IndexerTraining`, `mla.indexer_kl`'s collection).
-                self.sow(INDEXER_COLLECTION, "kl", msa_query_kls(
-                    scores, query, key, selected, block=self.block, scale=query.shape[-1] ** -0.5))
+        pooled, taken, forced = msa_candidates(scores, block=self.block)
+        selected = msa_selected(pooled, taken, forced, top_k=self.top_k)
+        # Its selection as the gate reads every one (`selection_margins`): each query's blocks by their pooled
+        # scores among those it takes by score, at the slots its forced own block leaves.
+        sow_selection(self, pooled, None, taken, min(self.top_k, pooled.shape[-1]) - 1)
+        if not self.is_initializing() and self.is_mutable_collection(INDEXER_COLLECTION):
+            # Its indexer's loss per query, as an objective training an indexer reads it
+            # (`IndexerTraining`, `mla.indexer_kl`'s collection).
+            self.sow(INDEXER_COLLECTION, "kl", msa_query_kls(
+                scores, query, key, selected, block=self.block, scale=query.shape[-1] ** -0.5))
         return selected_attention(query, key, value, selected, block_runs(key.shape[1], self.block),
                                   dtype=self.ctx.dtype, precision=self.ctx.precision,
                                   force_fp32_for_softmax=self.ctx.force_fp32_for_softmax,

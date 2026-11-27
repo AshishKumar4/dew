@@ -132,13 +132,14 @@ agreements before their relu (`SparseIndexer.scores`), DeepSeek V4's each select
 def sow_selection(module: nn.Module, scores, agreements, visible, budget: int, **pooled: int) -> None:
     """Sow a top-`budget` selection under SELECTIONS as `selection`, for a caller that opens the
     collection: the `scores` `[B, S, T]` it ranks, its heads' `agreements` `[B, S, H, T]` before their
-    relu (`index_agreements`), the keys each query may take, `visible` (broadcast to the scores), and
-    the budget; with `pooled`, the candidate pool's `blocks` and `block_size` the scores rank their
-    blocks by too (`candidate_pool`). Never at initialization."""
+    relu (`index_agreements`; None for a selection ranking its scores as they are, MoBA's and MSA's), the
+    keys each query may take, `visible` (broadcast to the scores), and the budget; with `pooled`, the
+    candidate pool's `blocks` and `block_size` the scores rank their blocks by too (`candidate_pool`).
+    Never at initialization."""
     if module.is_initializing():
         return
-    record = {"scores": scores, "agreements": agreements,
-              "visible": jnp.broadcast_to(visible, scores.shape), "budget": jnp.asarray(budget)}
+    record = {"scores": scores, "visible": jnp.broadcast_to(visible, scores.shape),
+              "budget": jnp.asarray(budget), **({} if agreements is None else {"agreements": agreements})}
     module.sow(SELECTIONS, "selection",
                {**record, **{name: jnp.asarray(value) for name, value in pooled.items()}})
 

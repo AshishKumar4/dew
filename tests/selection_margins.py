@@ -48,9 +48,17 @@ def selects(config) -> bool:
     (`dew.nn.block_sparse`), Gemma 3n's gaussian top-k or a mixture's routing."""
     mixers = [config.get("mixer"), *(_read(kind, "mixer") for kind in config.get("kinds", {}).values())]
     sparsities = config.get("activation_sparsity_pattern", ())
-    indexed = any(_read(_read(mixer, "fields") or mixer, "index_topk")
-                  or _read(_read(mixer, "fields") or mixer, "selection") == "msa" for mixer in mixers)
+    indexed = any(_read(_fields(mixer), "index_topk") or _read(_fields(mixer), "selection") == "msa"
+                  for mixer in mixers)
     return bool(indexed or any(sparsities) or routes(config))
+
+
+def _fields(mixer):
+    """A mixer's fields, as a spec's dict holds them (`fields`) or as its typed config is them; an empty
+    mapping where there is no mixer."""
+    if mixer is None:
+        return {}
+    return _read(mixer, "fields") or mixer
 
 
 def _read(held, name: str):
@@ -218,7 +226,7 @@ def margin(config, captured, label: str, *, stable: bool = True) -> float:
     from zero, over the query's largest agreement (`indexer_margins`), where every selection compared
     breaks ties by index (`stable`); where one is torch's `topk`, which promises no tie order, a tie has
     none."""
-    fields = config.get("mixer", {}).get("fields", {})
+    fields = _fields(config.get("mixer"))
     sparsities = config.get("activation_sparsity_pattern", ())
     smallest, seen = np.inf, 0
     mixture = config.get("mixture") or {}
