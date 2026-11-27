@@ -158,7 +158,7 @@ def resume_admitted[LossT, EffectsT](trainer: "Trainer[LossT, EffectsT]", loader
     # The shares fit reads by, its layout placing the rows, the saved one's among them.
     with nn.logical_axis_rules(trainer.layout.axis_rules):
         data_resumed(loader, trainer._stream_partition(), position, resume=trainer.data_resume, step=step)
-    return read[0] if read else (None, ())
+    return read[0]
 
 
 def resumed_step[LossT, EffectsT](trainer: "Trainer[LossT, EffectsT]", resume: "Resume") -> int | None:
