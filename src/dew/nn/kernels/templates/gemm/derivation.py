@@ -416,10 +416,11 @@ def _shaped(layout, block_m: int, block_n: int, step: int, *, consumers: int, pr
     2-SM MMA) runs every tile on its pair."""
     multicast = consumers > 1 and rows >= block_m
     cluster = layout.cluster if layout.pairs_product or multicast else 1
-    # The columns a cluster's tile holds (`pricing.tile_columns`: a pair's products both CTAs'), and the row
-    # tiles of the rows the launch walks (`walked`), which its band reads.
+    # The column tiles a cluster's tiles walk (`pricing.tile_columns`: a pair's products both CTAs'; a width
+    # its launch rounds up to them), and the row tiles of the rows the launch walks (`walked`), which its
+    # band reads.
     columns = block_n * (cluster if layout.pairs_product else 1)
-    band = resources.band(multiprocessors * programs, block_m, columns, width // columns,
+    band = resources.band(multiprocessors * programs, block_m, columns, -(-width // columns),
                           row_tiles=-(-walked // (block_m * cluster)), grouped=grouped, cluster=cluster)
     return Tiles(block_m, block_n, step, 2, band, warpgroups=consumers, cluster=cluster, family=layout.name,
                  programs=programs)

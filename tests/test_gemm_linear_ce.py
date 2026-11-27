@@ -259,3 +259,30 @@ def test_linear_ce_rounds_bf16_logits_matches_head_law_and_ignores_unrelated_cho
         np.testing.assert_array_equal(np.asarray(got_loss), np.asarray(want_loss))
         np.testing.assert_array_equal(np.asarray(got_logz), np.asarray(want_logz))
 
+
+@pytest.mark.parametrize(("generation_name", "family", "shape"), [
+    ("sm90", "wgmma", (1, 131072, 4096)), ("sm100", "tcgen05.pair", (1, 896, 4096))],
+    ids=["one-consumer fallback", "B200 pair"])
+def test_a_linear_cross_entropys_band_reads_the_rows_and_columns_its_launch_walks(generation_name, family,
+                                                                                 shape):
+    """One row's linear cross-entropy (`derive_linear_ce`), its geometry held by `refused` to one tile shape:
+    its band (`resources.band`) reads the one row tile its launch walks, not the four of the rows its tiles
+    are searched at (a cooperative unit's 256), so it takes every column tile a wave reaches; on a B200
+    pair its column tiles are the pair's, its vocabulary rounded up to them (896 columns: 4 tiles of 256,
+    not 3). Theme 5874's review: a one-consumer 64 x 64 fallback had taken band 32 of 2048, and a pair's
+    remainder been dropped."""
+    m, width, _ = shape
+    cluster = 2 if family == "tcgen05.pair" else 1
+    side = 128 if cluster > 1 else 64
+
+    def refused(tile):
+        return tile.family != family or (tile.block_m, tile.block_n) != (side, side)
+
+    with generation.assumed(generation_name):
+        target = generation.gpu_target()
+        tile = linear_ce.derive_linear_ce(shape, jnp.bfloat16, target, refused=refused)
+    assert tile is not None and not refused(tile), tile
+    columns = -(-width // (tile.block_n * cluster))
+    reached = target.multiprocessors * tile.programs // cluster
+    assert tile.grid_block_n == 1 << (min(columns, reached).bit_length() - 1), tile
+    del m
