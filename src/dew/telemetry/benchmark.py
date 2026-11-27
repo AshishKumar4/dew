@@ -417,15 +417,15 @@ def tpu_ops(directory: str | Path, devices: Iterable[int], module: str, *, annot
     ops stating it, no host transfer. Where its ops state none, each is read as the instruction of the
     call's module it names (`instructions`, each instruction's opcode by name; an op's name the
     instruction's, or its HLO text, `%name = ...`, `_opcode_of`): one no instruction of the module names is
-    another's, refused (`AmbiguousCapture`), and a run of transfers alone (`TRANSFERS`: copies, sends,
-    receives, infeeds and outfeeds) times no kernel of the call's (`NoKernels`), never scored as its kernels'
-    time. A capture whose runs name no program, or not one program on every device, or where another
-    program's run overlaps the call's on a device, or an op inside it states another program, is refused
-    (`AmbiguousCapture`). A run its call did not enqueue is no run of the call's,
-    whatever its name, so none stands in for one the capture lacks; two runs the call enqueued on one
-    device, or another run overlapping the call's, are ambiguous (`AmbiguousCapture`). The call
-    ran on every one of `devices`, so a capture holding no run of it, or no op of its run, on any one of
-    them holds part of the call and is refused (`NoKernels`), never read as the whole."""
+    another's, refused (`AmbiguousCapture`), and a run of ops that move data alone (`trace.moves_only`:
+    copies, infeeds, outfeeds and collectives that reduce nothing, async or not) times no kernel of the
+    call's (`NoKernels`), never scored as its kernels' time. A capture whose runs name no program, or not
+    one program on every device, or where another program's run overlaps the call's on a device, or an op
+    inside it states another program, is refused (`AmbiguousCapture`). A run its call did not enqueue is no
+    run of the call's, whatever its name, so none stands in for one the capture lacks; two runs the call
+    enqueued on one device, or another run overlapping the call's, are ambiguous (`AmbiguousCapture`). The
+    call ran on every one of `devices`, so a capture holding no run of it, or no op of its run, on any one
+    of them holds part of the call and is refused (`NoKernels`), never read as the whole."""
     from dew.telemetry import trace
 
     # One read of the capture: its runs, its ops and the host's enqueues, each a view of it.
@@ -470,22 +470,17 @@ def tpu_ops(directory: str | Path, devices: Iterable[int], module: str, *, annot
             raise NoKernels(f"{module}'s run under {directory} holds no op on TPU {device} of the call's "
                             f"{sorted(runs)}")
         if not stated:
-            opcodes = [_opcode_of(op.name, instructions) for op in inside]
-            if None in opcodes:
-                unnamed = [op.name for op, opcode in zip(inside, opcodes, strict=True) if opcode is None]
+            named = [_opcode_of(op.name, instructions) for op in inside]
+            opcodes = [opcode for opcode in named if opcode is not None]
+            if len(opcodes) < len(named):
+                unnamed = [op.name for op, opcode in zip(inside, named, strict=True) if opcode is None]
                 raise AmbiguousCapture(f"{module}'s run under {directory} holds ops on TPU {device} no "
                                        f"instruction of its module names: {unnamed}")
-            if all(opcode in TRANSFERS for opcode in opcodes):
+            if all(trace.moves_only(opcode) for opcode in opcodes):
                 raise NoKernels(f"{module}'s run under {directory} holds transfers alone on TPU {device}: "
                                 f"{[op.name for op in inside]}")
         timed += [KernelTime(op.name, op.duration_ns / 1e6) for op in inside]
     return tuple(timed)
-
-
-TRANSFERS = frozenset({"copy", "copy-start", "copy-done", "send", "send-done", "recv", "recv-done", "infeed",
-                       "outfeed"})
-"""The opcodes of an HLO instruction that moves data and computes nothing: a run of these alone times no
-kernel of its call's (`tpu_ops`)."""
 
 
 def _opcode_of(op: str, instructions: Mapping[str, str]) -> str | None:

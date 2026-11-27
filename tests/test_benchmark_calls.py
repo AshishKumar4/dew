@@ -512,7 +512,8 @@ def _tpu_capture(directory, ops, runs, read=None, *, deferred: bool = False):
 
 OPCODES = {"fusion.1": "fusion", "custom-call.2": "custom-call", "fusion.4": "fusion", "fusion.5": "fusion",
            "fusion.9": "fusion", "copy-start": "copy-start", "copy-done": "copy-done", "fusion": "fusion",
-           "fusion.2": "fusion", "copy.3": "copy"}
+           "fusion.2": "fusion", "copy.3": "copy", "collective-permute.4": "collective-permute",
+           "all-gather-start.5": "all-gather-start", "all-reduce.6": "all-reduce"}
 """The opcodes of the instructions of the module the captures' calls run, by name (`tpu_ops`'
 `instructions`)."""
 
@@ -627,12 +628,18 @@ def test_a_tpu_call_is_timed_by_the_ops_inside_its_run_as_a_v5e_records_them(tmp
     # Each op's milliseconds its own picoseconds, as the capture states them.
     assert [(op.name, round(op.milliseconds * 1e9)) for op in read] == [
         (started, 13000), (done, 2000), (fused, 1425826000)]
-    # Its ops read as the instructions they name (their HLO text's): a run of its copies alone, async or
-    # not, times no kernel of the call's, and one holding an op no instruction of its module names (a label
-    # whose first word does is none) is another's.
-    copied = "%copy.3 = bf16[8192,4096]{1,0} copy(%x.1)"
+    # Its ops read as the instructions they name (their HLO text's): a run of ops that move data alone (its
+    # copies, async or not, or a collective that reduces nothing) times no kernel of the call's, and one
+    # holding an op no instruction of its module names (a label whose first word does is none) is another's.
+    def alone(text: str) -> list:
+        return [(0, text, 7.198568, 8.624394, None)]
+
     for name, inside, refusal in (("copies", [ops[1], ops[2]], NoKernels),
-                                  ("copy", [(0, copied, 7.198568, 8.624394, None)], NoKernels),
+                                  ("copy", alone("%copy.3 = bf16[8192,4096]{1,0} copy(%x.1)"), NoKernels),
+                                  ("permute", alone("%collective-permute.4 = f32[8] collective-permute(%x)"),
+                                   NoKernels),
+                                  ("gather", alone("%all-gather-start.5 = f32[16] all-gather-start(%x.1)"),
+                                   NoKernels),
                                   ("stray", [*ops[1:3], (0, "%fusion.7 = f32[8] fusion(%x.1)", 7.198568,
                                                          8.624394, None)], AmbiguousCapture),
                                   ("label", [*ops[1:3], (0, "fusion synchronization", 7.198568, 8.624394,
@@ -641,6 +648,11 @@ def test_a_tpu_call_is_timed_by_the_ops_inside_its_run_as_a_v5e_records_them(tmp
         _tpu_capture(refused, inside, runs)
         with pytest.raises(refusal):
             tpu_ops(refused, {0}, "jit_fs90_profiled_gemm", annotation=READ, instructions=OPCODES)
+    # A collective that reduces computes: its run the call's kernel time.
+    reduced = tmp_path / "reduced"
+    _tpu_capture(reduced, alone("%all-reduce.6 = f32[8] all-reduce(%x.1)"), runs)
+    assert [op.name for op in tpu_ops(reduced, {0}, "jit_fs90_profiled_gemm", annotation=READ,
+                                      instructions=OPCODES)] == ["%all-reduce.6 = f32[8] all-reduce(%x.1)"]
 
 
 def test_a_tpu_call_is_timed_as_the_compiled_program_its_module_names_and_any_other_call_refused():
