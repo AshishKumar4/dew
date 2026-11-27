@@ -642,6 +642,9 @@ class Certification:
 _CERTIFIED: dict[tuple, Certification] = {}
 """Each launch certified (`certified`), by its identity, config, device and product."""
 
+_COLLECTING: list[list[Certification]] = []
+"""The collectors open (`offered`), each taking every certification a launch's derivation asks for."""
+
 _UNCERTIFIED: dict[tuple, str] = {}
 """Each launch certification could not compile alone (`certified`), by its identity, config, device and
 product: why."""
@@ -957,6 +960,7 @@ def certified(op, arguments: tokamax.BoundArguments, config: Hashable) -> tuple[
         if held is None and key in _UNCERTIFIED:
             return None
     if held is not None:
+        _offer(held)
         if not held.refused:
             _progressed(key)
         return held.refused
@@ -1036,6 +1040,7 @@ def _kept_certification(key: tuple, op, config: Hashable, reverse: bool, kernels
     found = Certification(type(op).__name__, config, reverse, kernels, read, device)
     with _GUARD:
         _CERTIFIED[key] = found
+    _offer(found)
     if not found.refused:
         _progressed(key)
     return found
@@ -1136,6 +1141,28 @@ def certifications() -> tuple[Certification, ...]:
     """Each launch certified in this process (`certified`)."""
     with _GUARD:
         return tuple(_CERTIFIED.values())
+
+
+@contextlib.contextmanager
+def offered() -> Iterator[list[Certification]]:
+    """Each certification a launch's derivation asks for while within (`certified`), on any thread, in
+    order: one held in this process already again each time (a compile gate's case reads its own offers,
+    those an earlier case certified among them); none kept once it closes."""
+    found: list[Certification] = []
+    with _GUARD:
+        _COLLECTING.append(found)
+    try:
+        yield found
+    finally:
+        with _GUARD:
+            _COLLECTING[:] = [each for each in _COLLECTING if each is not found]
+
+
+def _offer(found: Certification) -> None:
+    """`found` asked for: taken by each collector open (`offered`)."""
+    with _GUARD:
+        for collecting in _COLLECTING:
+            collecting.append(found)
 
 
 def uncertified() -> dict[tuple, str]:
