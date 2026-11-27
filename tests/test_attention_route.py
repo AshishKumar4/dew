@@ -1189,6 +1189,16 @@ def test_a_call_split_over_a_mesh_takes_the_cell_of_each_devices_launch():
     assert split in attention_kernels.DECLARED
 
 
+@pytest.mark.parametrize("shape", [(16, 2, 8), (2, 3, 16, 2, 8)], ids=["unbatched", "two-batch-axes"])
+def test_a_reference_call_of_any_leading_axes_runs(shape):
+    """A reference call over an unbatched `[Q, H, D]` query or one of two leading batch axes: it runs (its
+    selector reads a device's launch of `[B, T, N, D]` calls alone, `AttentionCase.launch`), its output its
+    query's shape."""
+    query = jnp.ones(shape, jnp.float32)
+    out = scaled_dot_product_attention(query, query, query, causal=True, implementation="reference")
+    assert out.shape == shape
+
+
 def _launches(fn, *operands) -> set[str]:
     """The kernels `fn`'s program launches, by the launches themselves: FlashAttention's FFI targets
     ('flash'), the template's Pallas launches ('template', `report.named`'s `attention_` kernels), and any

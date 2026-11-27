@@ -75,7 +75,8 @@ def _drawn(positions: int, heads: int, kv_heads: int, dtype, width: int = 64, va
 
 
 def _pooled(cache: jax.Array, table: jax.Array, page: int) -> jax.Array:
-    """`[B, K, KV, D]` keys as pools `[KV, P, page, D]` holding each row's at the pages its `table` names."""
+    """`[B, K, KV, ...]` keys (or their per-key bounds, `[B, K, KV]`) as pools `[KV, P, page, ...]` holding
+    each row's at the pages its `table` names, a dense permutation of the pages."""
     rows, keys = cache.shape[:2]
     pages = jnp.moveaxis(cache.reshape(rows * keys // page, page, *cache.shape[2:]), 2, 0)
     return pages[:, jnp.argsort(table.reshape(-1))]
@@ -769,10 +770,7 @@ def test_a_decode_step_over_a_quantized_cache_is_on_par_interpreted(device, page
     table = jnp.asarray(np.random.default_rng(7).permutation(2 * per_row).reshape(2, per_row), jnp.int32)
 
     def pooled(rows):
-        # `[B, K, KV, ...]` as a pool `[KV, P, page, ...]` holding row `b`'s page `j` at `table[b, j]`.
-        held = jnp.moveaxis(rows.reshape(len(LENGTHS), per_row, page, *rows.shape[2:]), 3, 0)
-        pool = jnp.zeros((kv_heads, 2 * per_row, page, *rows.shape[3:]), rows.dtype)
-        return pool.at[:, table].set(held)
+        return _pooled(rows, table, page)
 
     def ours(query, k_codes, k_scale, v_codes, v_scale):
         scales = tuple(jnp.swapaxes(scale, 1, 2) for scale in (k_scale, v_scale))
@@ -1027,12 +1025,9 @@ def test_a_decode_step_given_its_caches_value_bounds_walks_as_one_given_none_int
     page = 4
     table = jnp.asarray(np.random.default_rng(page).permutation(2 * KEYS // page).reshape(2, KEYS // page),
                         jnp.int32)
-    order = jnp.argsort(table.reshape(-1))
 
     def pooled(cache):
-        # [B, K, ...] as pools [KV, P, page, ...] holding each row's keys at the pages its table names.
-        pages = jnp.moveaxis(cache.reshape(2 * KEYS // page, page, *cache.shape[2:]), 2, 0)
-        return pages[:, order]
+        return _pooled(cache, table, page)
 
     def attended(bounds):
         with generation.assumed("sm90"):

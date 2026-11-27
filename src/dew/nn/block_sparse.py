@@ -419,6 +419,9 @@ def infllm_selection(query: jax.Array, key: jax.Array, *, block: int, top_k: int
                               own - jnp.arange(local)[None, ::-1]], axis=-1)
     forced = jnp.broadcast_to(jnp.where(forced >= 0, forced, -1), (rows, groups, queries, initial + local))
     windows = (keys - kernel) // stride + 1 if keys >= kernel else 0
+    if top_k == 0:
+        # No pick is optional: the forced blocks alone, no score formed.
+        return forced
     if windows == 0:
         # No window holds `kernel` keys: the forced blocks alone.
         nothing = jnp.zeros((rows, groups, queries, blocks), bool)
