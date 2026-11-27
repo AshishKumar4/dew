@@ -482,15 +482,18 @@ class Dense(_LinearEnvelope, nn.Dense):
         axes = self.kernel_axes
         kernel = packed_matrix(self, 'kernel', lambda: self.param(
             'kernel', declared(self.kernel_init, axes), (width, self.features), self.param_dtype))
-        if isinstance(kernel, Bf16Window) and not _windowed(self):
-            # A window's weights are its kernel's bits again: a layer whose product is not the window's
-            # multiplies them as its kernel, promoted as any (its dtype not bfloat16, or its own
-            # `dot_general`'s: a float32 result).
-            kernel = kernel.decoded()
-        if isinstance(kernel, PACKED_FORMATS):
-            return self._packed(inputs, kernel)
         bias = (self.param('bias', declared(self.bias_init, None if axes is None else axes[-1:]),
                            (self.features,), self.param_dtype) if self.use_bias else None)
+        if isinstance(kernel, Bf16Window) and not _windowed(self, width, bias):
+            # A window's weights are its kernel's bits again: a layer whose product is not the window's
+            # multiplies them as its kernel, promoted as any (its dtype not bfloat16, its own
+            # `dot_general`'s: a float32 result, the run's recipe's, its bias stored fp32), once its format
+            # admits it (`window.admitted`, as the window's product and gemm's decode ask).
+            from dew.nn.kernels.templates.gemm.window import admitted
+
+            kernel = admitted(kernel).decoded()
+        if isinstance(kernel, PACKED_FORMATS):
+            return self._packed(inputs, kernel, bias)
         stored = bias
         inputs, kernel, bias = _promoted(self, inputs, kernel, bias)
         dimensions = (((inputs.ndim - 1,), (0,)), ((), ()))
@@ -502,7 +505,8 @@ class Dense(_LinearEnvelope, nn.Dense):
 
 
     @nn.nowrap
-    def _packed(self, inputs: Array, matrix: NvFp4 | TernaryWeights | Bf16Window) -> jax.Array:
+    def _packed(self, inputs: Array, matrix: NvFp4 | TernaryWeights | Bf16Window,
+                bias: Array | None) -> jax.Array:
         """The layer over its packed kernel (`packed_matrix`, a checkpoint's weight served as its codes):
         an NVFP4 matrix's product (`gemm.nvfp4_product`, row 8550: the inputs rounded to bfloat16, each code
         times its block's scale exact, the sums in fp32 and the matrix's tensor scale after) or a BitNet
@@ -523,9 +527,6 @@ class Dense(_LinearEnvelope, nn.Dense):
         if tuple(matrix.shape) != (width, self.features):
             raise ValueError(f"{self.name}'s packed kernel is {list(matrix.shape)}, its layer "
                              f"[{width}, {self.features}]")
-        bias = (self.param('bias', declared(self.bias_init, None if self.kernel_axes is None
-                                            else self.kernel_axes[-1:]), (self.features,), self.param_dtype)
-                if self.use_bias else None)
         dtype = self.dtype if self.dtype is not None else jnp.result_type(inputs)
         # The rows counted, not inferred: a packed matrix of no depth takes inputs of no width.
         rows = jnp.reshape(inputs, (math.prod(jnp.shape(inputs)[:-1]), width))
@@ -537,10 +538,9 @@ class Dense(_LinearEnvelope, nn.Dense):
             summed = ternary_weight_product(rows, frozen, out_dtype=jnp.float32)
         else:
             summed = nvfp4_product(rows, matrix, out_dtype=jnp.float32)
-        if bias is not None and isinstance(matrix, Bf16Window) and jnp.dtype(bias.dtype) != jnp.float32:
-            # A window's product as the layer's own (`_windowed`): a bias stored narrow is added to the
-            # product rounded to the layer's dtype (`_biased`), one stored fp32 rounded once with it
-            # (`_rounds_once`), as below.
+        if bias is not None and isinstance(matrix, Bf16Window):
+            # A window's product as the layer's own (`_windowed`, whose bias is stored narrow): added to the
+            # product rounded to the layer's dtype, as `_biased` adds it.
             out = biased(summed.astype(dtype), jnp.asarray(bias, dtype))
             return jnp.reshape(out, (*jnp.shape(inputs)[:-1], self.features))
         if bias is not None:
@@ -548,17 +548,22 @@ class Dense(_LinearEnvelope, nn.Dense):
         return jnp.reshape(summed.astype(dtype), (*jnp.shape(inputs)[:-1], self.features))
 
 
-def _windowed(layer: nn.Dense) -> bool:
-    """Whether `layer`'s product over a bfloat16 window is the window's (`gemm.window_product`: bfloat16
-    operands' exact products summed in fp32, as every precision level and a whole-product algorithm states
-    them, `precision.exact_products`, the layer's and the run's, which the window's dot reads; an algorithm
-    narrowing them, F16_F16_F32's, is the layer's own): its dtype bfloat16 under flax's own promotion
-    (`promote_dtype`), which rounds inputs, kernel and bias there, and its product Dense's own, no
-    `dot_general` or `dot_general_cls` of its own."""
+def _windowed(layer: nn.Dense, width: int, bias: Array | None) -> bool:
+    """Whether `layer`'s product over a `width`-deep bfloat16 window is the window's (`gemm.window_product`:
+    bfloat16 operands' exact products summed in fp32, as every precision level and a whole-product algorithm
+    states them, `precision.exact_products`, the layer's and the run's, which the window's dot reads; an
+    algorithm narrowing them, F16_F16_F32's, is the layer's own): its dtype bfloat16 under flax's own
+    promotion (`promote_dtype`), which rounds inputs, kernel and bias there; its product Dense's own, no
+    `dot_general` or `dot_general_cls` of its own; no low-precision recipe of the run's taking it in its
+    role (`projections.recipe_takes`, which a delayed-scaling one's amax history follows: the recipe's
+    product and its history's, row 13699); and its `bias` not stored fp32, which Dense adds to its product
+    summed in fp32 under the tangent its 16-bit products declare (`_widened`, row 13701)."""
     return (layer.dtype is not None and jnp.dtype(layer.dtype) == jnp.bfloat16
             and layer.promote_dtype is promote_dtype and layer.dot_general is None
             and layer.dot_general_cls is None
-            and all(exact_products(stated, jnp.bfloat16) for stated in (layer.precision, None)))
+            and all(exact_products(stated, jnp.bfloat16) for stated in (layer.precision, None))
+            and not projections.recipe_takes(width, layer.features)
+            and not (bias is not None and jnp.dtype(bias.dtype) == jnp.float32))
 
 
 def _members(init, batched: int, flat_shape):
