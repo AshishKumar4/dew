@@ -8,6 +8,7 @@ too, its faults (a wrong scale, a sixty-fourth off, a mask, a cap) refused. A GP
 the same checks in the native certificates' flow (tests/test_native_certificates.py)."""
 
 import jax
+import jax.numpy as jnp
 import numpy as np
 import pytest
 from attention_witness import (
@@ -16,11 +17,17 @@ from attention_witness import (
     assert_backward_witnessed,
     assert_equal_totals_held,
     assert_faults_refused,
+    assert_logit_past_its_maximum_held,
     assert_two_launches_held_to_their_own_d,
     assert_witnessed,
+    attention_lane,
+    exponents_of,
     launched,
     operands,
 )
+from interval_certificates import natural_exp, point, within
+
+from dew.nn.kernels.templates import attention as template, attention_algebra as algebra
 
 
 @pytest.mark.parametrize("form", FORMS)
@@ -99,10 +106,37 @@ def test_two_launches_are_held_to_their_own_refined_d(with_deterministic_ops):
     assert_two_launches_held_to_their_own_d(interpret=True)
 
 
+def test_two_launches_over_a_logit_past_its_stored_maximum_are_held(with_deterministic_ops):
+    """A row whose one visible key's recomputed logit passes the stored maximum by a rounding: its weight and
+    the dQ launch's own denominator past one, held (the fast backward's exponents unclamped)."""
+    assert_logit_past_its_maximum_held(interpret=True)
+
+
 def test_two_launches_of_the_forwards_own_denominator_are_held_by_their_schedule(with_deterministic_ops):
     """Two launches whose denominators equal the forward's to the bit, their D refined all the same, held."""
     assert_equal_totals_held(interpret=True)
 
 
+@pytest.mark.parametrize("accurate", [False, True], ids=["fast", "accurate"])
+def test_a_backward_128_wide_lies_in_its_enclosure(accurate):
+    """At width 128, whose scale `template.prescale` splits into a power of two the query takes and a scale
+    left (64's leaves none), the accurate form's raw maximum and its recompute in the prescaled units."""
+    assert_backward_witnessed(0, "causal", interpret=True, accurate=accurate, width=128)
+
+
 def test_each_backward_fault_is_refused_at_its_elements():
     assert_backward_faults_refused(interpret=True)
+
+
+def test_the_accurate_forwards_weight_lies_in_its_enclosure_at_its_differences_exact_product():
+    """The accurate forward's weight of a raw difference, its scale left whole (`algebra.natural_exp`, its
+    conversion compensated): at width 128, where the left scale is about the square root of two, a raw
+    difference of -52 (a zero product under a maximum of 52) weighs e^-73.539105..., 72 steps of the
+    weight's grid from e^ of their fp32 product, and the witness's forward weights hold it
+    (`exponents_of`' forward arguments, `interval_certificates.natural_exp`)."""
+    power, left = template.prescale(np.dtype(jnp.bfloat16), 128, None)
+    lane = attention_lane()
+    _, _, natural = exponents_of(point(np.zeros((1, 1))), np.asarray([52.0]), lane, natural=True, power=power,
+                                 left=left, softcap=None, sloped=True)
+    found = np.asarray(jax.jit(lambda x: algebra.natural_exp(x, left))(np.float32(-52.0)), np.float64)
+    assert within(found, natural_exp(natural.forward, lane))

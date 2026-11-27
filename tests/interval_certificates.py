@@ -26,6 +26,7 @@ from op_certificates import (
     above,
     below,
     exp2_rounded,
+    exp_rounded,
     grid_index,
     nearest,
     stepped,
@@ -137,6 +138,12 @@ class Lane:
     clamped: bool = False
     """Whether its log decays are clamped at its floor before their prefix is summed (`mainloop.Call.clamped`,
     `recurrence_witness.Exponents.of`)."""
+    exp_reach: int = 0
+    """`exp`'s reach: the most steps of the fp32 grid its result lies from its correctly rounded value
+    (`exp_reach`), an accurate backward's exponential's (`jnp.exp`, no approximation)."""
+    exp_flushes: bool = True
+    """Whether that `exp` gives zero where its correctly rounded value is a positive subnormal
+    (`exp_flushes`); a lane not measured may."""
     tanh_reach: int = 0
     """`tanh`'s reach: the most steps of the fp32 grid its result lies from its correctly rounded value
     (`tanh_reach`), a capped score's (Gemma 2's cap, `template.Capped`)."""
@@ -285,11 +292,32 @@ def exp2(x: Iv, lane: Lane) -> Iv:
     value (`op_certificates.exp2_rounded`, verified), at the least and greatest fp32 operands within `x`
     (round to nearest is monotone); zero where it may fall below the normal range (ex2's flush, or a
     scaling's last product rounding there)."""
-    lo = exp2_rounded(above(x.lo, FLOAT32), FLOAT32)
-    hi = exp2_rounded(below(x.hi, FLOAT32), FLOAT32)
-    for _ in range(lane.reach):
+    return _exponential(x, exp2_rounded, lane.reach)
+
+
+def exp(x: Iv, lane: Lane) -> Iv:
+    """`exp` of an fp32 value within `x`: within `lane.exp_reach` steps of the fp32 grid of its correctly
+    rounded value (`op_certificates.exp_rounded`, verified), as `exp2` is of its own; zero below the normal
+    range only where the lane's `exp` flushes there (`Lane.exp_flushes`), a subnormal weight else kept."""
+    return _exponential(x, exp_rounded, lane.exp_reach, flushes=lane.exp_flushes)
+
+
+def natural_exp(x: Iv, lane: Lane) -> Iv:
+    """`attention_algebra.natural_exp`'s `exp` of the exact value within `x`, no fp32 operand (its
+    compensated conversion keeps the product's residual): within exp2's reach and one step of its correctly
+    rounded value (its joined exponent within a quarter of the weight's ulp), as `exp2` is of its own."""
+    return _exponential(x, exp_rounded, lane.reach + 1, operands=False)
+
+
+def _exponential(x: Iv, rounded: Callable, reach: int, *, operands: bool = True, flushes: bool = True) -> Iv:
+    """An exponential's enclosure (`exp2`'s, `exp`'s, `natural_exp`'s): `rounded`, its correct rounding, at
+    the ends of `x` (its least and greatest fp32 operands where `operands`), each `reach` steps of the fp32
+    grid outward, and zero where its lower end falls below the normal range and it `flushes` there."""
+    lo, hi = (above(x.lo, FLOAT32), below(x.hi, FLOAT32)) if operands else (x.lo, x.hi)
+    lo, hi = rounded(lo, FLOAT32), rounded(hi, FLOAT32)
+    for _ in range(reach):
         lo, hi = stepped(lo, FLOAT32, -np.inf), stepped(hi, FLOAT32, np.inf)
-    return Iv(np.where(lo < 2.0 ** FLOAT32.emin, 0.0, lo), hi)
+    return Iv(np.where(flushes & (lo < 2.0 ** FLOAT32.emin), 0.0, lo), hi)
 
 
 def tanh_rounding(x) -> tuple[np.ndarray, np.ndarray]:
@@ -314,11 +342,11 @@ def tanh(x: Iv, lane: Lane) -> Iv:
 
 def _rounded_of(found: np.ndarray, x: np.ndarray, name: str, ranged: Callable,
                 exact: np.ndarray | None = None) -> None:
-    """Refuse a probe's results (`tanh_reach`'s, `exp2_reach`'s) that are no rounding of `name` at all, whose
-    steps from the correct one are no reach (a NaN's word read as a grid index lies two billion steps off, a
-    walk of them a timeout, not a verdict): one outside the function's range (`ranged`), and one non-finite
-    where the correctly rounded value `exact` is finite or another non-finite (where no `exact`, every
-    non-finite one: tanh's results are all finite)."""
+    """Refuse a probe's results (`tanh_reach`'s, `exp2_reach`'s, `exp_reach`'s) that are no rounding of `name`
+    at all, whose steps from the correct one are no reach (a NaN's word read as a grid index lies two billion
+    steps off, a walk of them a timeout, not a verdict): one outside the function's range (`ranged`), and one
+    non-finite where the correctly rounded value `exact` is finite or another non-finite (where no `exact`,
+    every non-finite one: tanh's results are all finite)."""
     finite = np.isfinite(found)
     wrong = ~finite if exact is None else (finite != np.isfinite(exact)) | (~finite & (found != exact))
     if (bad := np.flatnonzero(wrong | ~ranged(np.where(finite, found, 0.0)))).size:
@@ -374,15 +402,52 @@ def exp2_reach(native, low: float = -2.0, high: float = 2.0) -> int:
     finite, refuses the lane. In a GPU tier's prepare,
     whose arms give zeros and compute nothing (`reference_error.ahead_arm`), `native` is compiled at its
     operands and no reach is read: none, so a cell's later arms are prepared too (row 8497)."""
-    rng = np.random.default_rng(2084)
+    return _exponential_reach(native, low, high, exp2_rounded, "exp2", 2084)
+
+
+def exp_reach(native, low: float = -104.0, high: float = 0.0, *, flushes: bool = True) -> int:
+    """`exp2_reach`'s measurement of `native(x)`, an fp32 `exp` of fp32 operands, from `e^x` correctly rounded
+    (`op_certificates.exp_rounded`), over (`low`, `high`): by default the natural differences a row's
+    weights take, -104 to 0, through fp32's least normal (e^-87.34) and its subnormals to where every result
+    rounds to zero (e^-103.97, half the least subnormal). Where it may not flush (`flushes` False: a native
+    unapproximated `exp`, which keeps a subnormal weight), a zero for a positive subnormal is refused."""
+    return _exponential_reach(native, low, high, exp_rounded, "exp", 2085, flushes=flushes)
+
+
+def exp_flushes(native, low: float = -104.0, high: float = -87.0) -> bool:
+    """Whether `native(x)`, an fp32 `exp` of fp32 operands, gives zero where `e^x` correctly rounded is a
+    positive subnormal, over (`low`, `high`), fp32's subnormal results (`Lane.exp_flushes`). In a GPU tier's
+    prepare, whose arms compute nothing (`exp2_reach`'s), it may."""
+    probed = _probed(native, low, high, exp_rounded, "exp", 2086)
+    return probed is None or bool(np.any((probed[1] == 0) & (probed[2] > 0)))
+
+
+def _probed(native, low: float, high: float, rounded: Callable, name: str, seed: int) -> tuple | None:
+    """`native` at fp32 operands over (`low`, `high`), dense, whole and drawn from `seed`, beside `rounded`,
+    `name`'s correct rounding, there, each a result no rounding gives refused (`_rounded_of`): the operands,
+    the results and the rounded values; none in a GPU tier's prepare, whose arms compute nothing."""
+    rng = np.random.default_rng(seed)
     whole = np.arange(np.ceil(low), np.floor(high) + 1, dtype=np.float32)
     x = np.concatenate([np.linspace(low, high, 1 << 16, dtype=np.float32), whole,
                         rng.uniform(low, high, (1 << 16) - len(whole)).astype(np.float32)])
-    found, exact = np.asarray(native(x), np.float64), exp2_rounded(x, FLOAT32)
+    found, exact = np.asarray(native(x), np.float64), rounded(x, FLOAT32)
     if tier_wire.preparing():
+        return None
+    _rounded_of(found, x, name, lambda values: values >= 0.0, exact)
+    return x, found, exact
+
+
+def _exponential_reach(native, low: float, high: float, rounded: Callable, name: str, seed: int, *,
+                       flushes: bool = True) -> int:
+    """`exp2_reach`'s and `exp_reach`'s measurement: `native` against `rounded`, `name`'s correct rounding,
+    over (`low`, `high`) drawn from `seed` (`_probed`), a zero for a positive result refused where it may not
+    `flushes`."""
+    if (probed := _probed(native, low, high, rounded, name, seed)) is None:
         return 0
-    _rounded_of(found, x, "exp2", lambda values: values >= 0.0, exact)
+    x, found, exact = probed
     flushed = found == 0
+    if not flushes and (lost := flushed & (exact > 0)).any():
+        raise ArithmeticError(f"the lane's {name} flushes a subnormal result at {x[lost][:4]}")
     measured = ~flushed & np.isfinite(found)
     reach = int(np.max(np.abs(grid_index(found) - grid_index(exact))[measured], initial=0))
     # Each flushed result's enclosure's lower end, `reach` places below its exact value on the grid, in places
@@ -390,5 +455,5 @@ def exp2_reach(native, low: float = -2.0, high: float = 2.0) -> int:
     below_normal = grid_index(2.0 ** FLOAT32.emin) - grid_index(exact[flushed]) + reach
     normal = below_normal <= 0
     if np.any(normal):
-        raise ArithmeticError(f"the lane's exp2 flushes a normal result at {x[flushed][normal][:4]}")
+        raise ArithmeticError(f"the lane's {name} flushes a normal result at {x[flushed][normal][:4]}")
     return reach
