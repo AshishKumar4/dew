@@ -130,83 +130,94 @@ def _levels_above(query, key, value, g, weights, *, within):
     if top < WITHIN.bit_length():
         return within
     padded = -(-length // (1 << top)) * (1 << top)
+    rows, chunks = query.shape[0], padded // WITHIN
 
     def chunked(x):
         x = jnp.pad(x, [(0, 0), (0, padded - length), *[(0, 0)] * (x.ndim - 2)])
-        return x.reshape(x.shape[0], padded // WITHIN, WITHIN, *x.shape[2:])
+        return x.reshape(rows, chunks, WITHIN, *x.shape[2:])
 
-    def by_head(x):
-        # A head axis's value heads beside their key head's: `[..., G, E]`.
-        return x.reshape(*x.shape[:-1], groups, heads // groups)
+    def head_major(x):
+        # A chunked per-head array `[B, C, t, H, ...]` as `[B, G, C, E, t, ...]`: the products' batch axes
+        # (a key head, its chunks, a value head) ahead of their rows, so no level's read leaves its product's
+        # own layout (each level's transposes back to the tokens' were most of its training's launches).
+        x = x.reshape(rows, chunks, WITHIN, groups, heads // groups, *x.shape[4:])
+        return jnp.moveaxis(x, (3, 4), (1, 3))
 
     decays = chunked(g)
-    to_end, past = _half_decays(decays, to_end=True)
-    entered, crossed = _half_decays(decays, to_end=False)
-    written = scan.scaled_exp(chunked(value).astype(g.dtype), jnp.where(past, -jnp.inf, to_end)[..., None])
-    written = written.astype(value.dtype).reshape(*written.shape[:3], groups, -1, columns)
-    memory = jnp.einsum('bmtgk,bmtgep->bmgkep', chunked(key), written, preferred_element_type=jnp.float32)
-    # Each chunk's whole decay, -inf through a vanished token, and whether it holds one.
-    cut = crossed[:, :, -1]
-    chunk_whole = jnp.where(cut, -jnp.inf, entered[:, :, -1])
+    to_end, past = (head_major(x) for x in _half_decays(decays, to_end=True))
+    entered, crossed = (head_major(x) for x in _half_decays(decays, to_end=False))
+    keys = jnp.moveaxis(chunked(key), 3, 1)
+    queries = jnp.moveaxis(chunked(query), 3, 1)
+    written = scan.scaled_exp(head_major(chunked(value)).astype(g.dtype),
+                              jnp.where(past, -jnp.inf, to_end)[..., None]).astype(value.dtype)
+    # Each chunk's memory `[B, G, C, E, P, K]`, its product's own layout.
+    memory = jnp.einsum('bgcetp,bgctk->bgcepk', written, keys, preferred_element_type=jnp.float32)
+    # Each chunk's whole decay `[B, G, C, E]`, -inf through a vanished token, and whether it holds one.
+    cut = crossed[..., -1]
+    chunk_whole = jnp.where(cut, -jnp.inf, entered[..., -1])
     whole = chunk_whole
-    queries, chunk_weights = chunked(query), chunked(weights)
-    out = within
+    weights = head_major(chunked(weights))
+    # Every read summed into the within's reads, as fla's `b_o` sums them, in the reads' layout
+    # `[B, G, C, E, t, P]`, and laid back as the tokens' once.
+    out = head_major(chunked(within))
     for level in range(WITHIN.bit_length(), top + 1):
-        # The pyramid at the level's half blocks of `chunks` chunks: `memory` `[B, 2 n, G, K, E, P]`, `whole`
-        # `[B, 2 n, H]`.
-        chunks = 1 << (level - WITHIN.bit_length())
+        # The pyramid at the level's half blocks of `span` chunks: `memory` `[B, G, 2 n, E, P, K]`, `whole`
+        # `[B, G, 2 n, E]`.
+        span = 1 << (level - WITHIN.bit_length())
 
-        def halves(x, chunks=chunks):
-            return x.reshape(x.shape[0], -1, 2, chunks, *x.shape[2:])
+        def halves(x, span=span):
+            return x.reshape(rows, groups, -1, 2, span, *x.shape[3:])
 
         # Each right-half chunk's decay from the half's start to its own start, and whether a vanished
-        # token before it cuts it.
-        right, cuts = halves(chunk_whole)[:, :, 1], halves(cut)[:, :, 1]
+        # token before it cuts it: `[B, G, n, r, E]`.
+        right, cuts = halves(chunk_whole)[:, :, :, 1], halves(cut)[:, :, :, 1]
         # The sums before each chunk, shifted a chunk: no -inf less itself (NaN), no large sum less a term.
-        before = jnp.concatenate([jnp.zeros_like(right[:, :, :1]), jnp.cumsum(right, axis=2)[:, :, :-1]], 2)
-        severed = jnp.cumsum(cuts, axis=2) - cuts > 0
-        local, inside = halves(entered)[:, :, 1], halves(crossed)[:, :, 1]
+        before = jnp.concatenate([jnp.zeros_like(right[:, :, :, :1]),
+                                  jnp.cumsum(right, axis=3)[:, :, :, :-1]], 3)
+        severed = jnp.cumsum(cuts, axis=3) - cuts > 0
+        local, inside = halves(entered)[:, :, :, 1], halves(crossed)[:, :, :, 1]
         # A read through a vanished decay (a segment's reset), within its chunk or before it in its half,
         # discarded: its reader zeroed before its product and its read before its decay and after, as the
         # recurrence selects one out. Masked after the product alone, an overflowed reader's pullback was
         # `0 * inf` (dk, dv at a query of 2^127 weighed 2 severed by -1000), an overflowed read's decay's
         # derivative too (dg at 2^70 by 2^70).
-        reset = inside | severed[..., None, :]
+        reset = inside | severed[..., None]
         # A chunk whose every read is discarded (a reset before it, or its first token vanished): its held
         # memory zero, its decay's operands too, so no pullback meets an overflowed memory's `0 * inf`.
-        emptied = by_head(severed | inside[..., 0, :])[..., None, :, None]
-        left = memory[:, 0::2, None]
+        emptied = (severed | inside[..., 0])[..., None, None]
+        left = memory[:, :, 0::2, None]
         # An overflowed memory, reader or read alone is zeroed where its decay keeps no finite fp32 value
         # (`_dropped`), its value there every finite one's; a finite one decays as it is, its derivatives
         # those of its exact product: four live decays of -80 took an overflowed read of 2^70 by 2^70 to
         # NaN and a reader of 2^128 times its emptied memory too (train 1379's review), and zeroing a
         # finite read of 2^127 under four decays of -50 lost its decay's gradient 4.0e-11 (train 1398's).
-        spent = emptied | (~jnp.isfinite(left) & by_head(_dropped(before))[..., None, :, None])
-        start = by_head(before)[..., None, :, None]
-        held = scan.scaled_exp(jnp.where(spent, 0.0, left), jnp.where(spent, 0.0, start))
+        spent = emptied | (~jnp.isfinite(left) & _dropped(before)[..., None, None])
+        held = scan.scaled_exp(jnp.where(spent, 0.0, left), jnp.where(spent, 0.0, before[..., None, None]))
         held = jnp.where(spent, 0.0, held).astype(value.dtype)
-        weight = by_head(halves(chunk_weights[..., level])[:, :, 1])
-        readers = halves(queries)[:, :, 1][..., None, :].astype(g.dtype) * weight[..., None]
+        weight = halves(weights[..., level])[:, :, :, 1]
+        readers = halves(queries)[:, :, :, 1][:, :, :, :, None].astype(g.dtype) * weight[..., None]
         readers = readers.astype(query.dtype)
-        dropping = _dropped(before)[..., None, :] | _dropped(local)
-        unread = by_head(reset)[..., None] | (by_head(dropping)[..., None] & ~jnp.isfinite(readers))
+        dropping = _dropped(before)[..., None] | _dropped(local)
+        unread = reset[..., None] | (dropping[..., None] & ~jnp.isfinite(readers))
         readers = jnp.where(unread, 0.0, readers)
-        read = jnp.einsum('bnrtgek,bnrgkep->bnrtgep', readers, held, preferred_element_type=jnp.float32)
-        read = read.reshape(*read.shape[:4], heads, columns)
+        # `[B, G, n, r, E, t, P]`, the product's own layout.
+        read = jnp.einsum('bgnretk,bgnrepk->bgnretp', readers, held, preferred_element_type=jnp.float32)
         discarded = reset[..., None] | (_dropped(local)[..., None] & ~jnp.isfinite(read))
         decayed = scan.scaled_exp(jnp.where(discarded, 0.0, read),
                                   jnp.where(discarded, 0.0, local[..., None]))
         read = jnp.where(discarded, 0.0, decayed)
-        laid = jnp.stack([jnp.zeros_like(read), read], axis=2)
-        out = out + laid.reshape(laid.shape[0], -1, heads, columns)[:, :length]
+        out = out + jnp.stack([jnp.zeros_like(read), read], axis=3).reshape(out.shape)
         # The next level's half blocks: two of these joined, the left decayed across the right, zero where a
         # vanished token in the right cuts it (an overflowed left memory times its zero decay was NaN, a
         # level-8 read at token 128 of 2^70 by 2^70 cut by -1000 at token 64).
-        across = by_head(whole[:, 1::2])[:, :, :, None, :, None]
-        gone = jnp.isneginf(across) | (~jnp.isfinite(memory[:, 0::2]) & _dropped(across))
-        joined = scan.scaled_exp(jnp.where(gone, 0.0, memory[:, 0::2]), jnp.where(gone, 0.0, across))
-        memory, whole = jnp.where(gone, 0.0, joined) + memory[:, 1::2], whole[:, 0::2] + whole[:, 1::2]
-    return out
+        across = whole[:, :, 1::2, :, None, None]
+        gone = jnp.isneginf(across) | (~jnp.isfinite(memory[:, :, 0::2]) & _dropped(across))
+        joined = scan.scaled_exp(jnp.where(gone, 0.0, memory[:, :, 0::2]), jnp.where(gone, 0.0, across))
+        memory = jnp.where(gone, 0.0, joined) + memory[:, :, 1::2]
+        whole = whole[:, :, 0::2] + whole[:, :, 1::2]
+    # Back to the tokens' layout `[B, T, H, P]`, once.
+    out = jnp.moveaxis(out, (1, 3), (3, 4)).reshape(rows, padded, heads, columns)
+    return out[:, :length]
 
 
 def _dropped(exponent):
