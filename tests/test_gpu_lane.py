@@ -876,6 +876,43 @@ def test_a_green_dry_row_keeps_its_baseline_whatever_its_record_does(ci, monkeyp
         (set(), True) if taken else ({place}, False))
 
 
+@pytest.mark.parametrize("asked", ["tested", "another", "none", "refused"])
+def test_a_records_off_run_writes_the_baselines_the_stale_row_pass_asks_of_its_own_commit_alone(
+        ci, monkeypatch, tmp_path, cache_worker, asked):
+    """A run keeping no record (DEW_RECORDS off, ops queue/suspect.sh) writes its green dry prepare's baseline
+    only where the land queue's stale-row pass names the commit it tests (`run_keys.BASELINES`), keyed by that
+    commit, graded against the mainline it was given, an earlier one: a train's stale prepare row wrote none, so
+    main's baseline stood part-written once it published (row 13049). It writes nothing else, and nothing at all
+    where another commit or none is named (a suspect's comparisons); a baseline the Worker refuses leaves its row
+    stale."""
+    url, stored, seen = cache_worker
+    cached(monkeypatch, url)
+    monkeypatch.setenv(ci.RECORDS, "off")
+    (tmp_path / "tests/test_gpu_a.py").write_text("def test_a():\n    pass\n")
+    interpreter(tmp_path, "3.12")
+    commit(tmp_path, "the commit")
+    head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=tmp_path, capture_output=True, text=True,
+                          check=True).stdout.strip()
+    monkeypatch.setenv(ci.MAINLINE, "1" * 40)
+    if asked != "none":
+        monkeypatch.setenv(ci.run_keys.BASELINES, "2" * 40 if asked == "another" else head)
+    if asked == "refused":
+        seen.refusing.add("-baseline/")
+    before = set(stored)
+    out = tmp_path / "rows.json"
+    ci.tested("3.12", ["tests/test_gpu_a.py"], "", out, 60.0, "off", 5.0, "common", {},
+              variant=ci.prepares.variant("sm90", users=False),
+              judged=lambda rows: [{**each, "unprepared": ["a @ x"]} for each in rows])
+    [row] = json.loads(out.read_text())["rows"]
+    written = set(stored) - before
+    if asked == "tested":
+        assert written == {ci.records.baseline_key(head, "3.12", row["name"], ci.run_keys.device_class(False))}
+        assert row["exitCode"] == 0
+    else:
+        assert written == set()
+        assert (row["exitCode"], row.get("kind")) == ((1, ci.grading.STALE) if asked == "refused" else (0, None))
+
+
 def test_a_dry_prepares_records_publish_within_its_budget_a_stalled_baseline_leaving_its_row_stale(
         ci, monkeypatch, tmp_path, cache_worker):
     """A dry prepare's row publishes its records within its task's budget (`tested`'s `publish_by`, row

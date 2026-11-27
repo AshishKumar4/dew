@@ -199,6 +199,31 @@ def head_commit() -> str | None:
     return (found.stdout.strip() or None) if found.returncode == 0 else None
 
 
+BASELINES = "DEW_BASELINES"
+"""The commit a task's run with its records off (`ci.RECORDS`) writes its green dry prepares' baselines of
+(`baselines`), named only by the land queue's stale-row pass (ops queue/land.sh, suspect.sh --baselines), which
+runs on the very commit CI graded the rows CI left unrun, so a train that publishes has its baseline whole: its
+stale rows wrote none (row 13049). A suspect's comparisons name none, and read baselines alone: one written
+between two of their lookups would grade the same omission two ways. Written only where it is this checkout's
+commit, keyed by it; the rows are graded against the mainline as ever (`records.MAINLINE`)."""
+
+
+def baselines_asked() -> bool:
+    """Whether this run is told to write its commit's baselines with its records off (`BASELINES`)."""
+    return (given := os.environ.get(BASELINES)) is not None and given == head_commit()
+
+
+def baselines(python: str, rows: list[dict], network: bool = False, until: float | None = None) -> set[str]:
+    """Each green dry prepare's row of `rows` given its baseline at this commit (`baselined`), within `until`
+    where one is given: the rows whose baseline the store did not take, which stand stale (`ci.unbaselined`).
+    None without the store."""
+    token = os.environ.get("DEW_XLA_CACHE_TOKEN")
+    if not token or "DEW_XLA_CACHE_URL" not in os.environ:
+        return set()
+    held = device_class(network)
+    return {row_["name"] for row_ in rows if not baselined(python, row_["name"], held, token, row_, until)}
+
+
 def baselined(python: str, place: str, held: str, token: str, ran: Mapping,
               until: float | None = None) -> bool:
     """Whether a dry prepare's green row (`ran`) on class `held` has this commit's baseline (`baseline_key`)
@@ -409,7 +434,9 @@ def record(python: str, rows: list[dict], log: Path, common: str, network: bool 
     token = os.environ.get("DEW_XLA_CACHE_TOKEN")
     if not token or "DEW_XLA_CACHE_URL" not in os.environ:
         return set()
-    unnamed: set[str] = set()
+    # Each green dry prepare's baseline first, whatever of its admission to reuse below (record, key, epoch):
+    # a row is named the commit's own only once its baseline is written (`named_at_commit`).
+    unnamed = baselines(python, rows, network, until)
     # Each file's record in the process's log (followed.py's `recorded`): none for a file it never reached.
     executed = followed.recorded(log)
     held = device_class(network)
@@ -417,9 +444,6 @@ def record(python: str, rows: list[dict], log: Path, common: str, network: bool 
         recorded = {read for ran in executed.values() for read in ran["depends"] or ()}
         opened = opened | native_inputs(opened, recorded)
     for row_ in rows:
-        # A green dry prepare's baseline, whatever of its admission to reuse below (record, key, epoch).
-        if not baselined(python, row_["name"], held, token, row_, until):
-            unnamed.add(row_["name"])
         name = parsed_row(row_["name"])[1]
         # A test node's row (`file::test`) keeps its file's record, the one its process's log holds.
         file = grading.owning(name)
