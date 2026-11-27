@@ -266,6 +266,43 @@ class _Times:
         return tile + self.scale if self.added else tile * self.scale
 
 
+@dataclasses.dataclass(frozen=True)
+class _DerivedFromHooks(_HookedKernel):
+    """A hooked launch whose derivation reads its hooks, as a GEMM's reads their prologue
+    (`grouped_matmul._takes`), and whose hooks key as one string, as a GEMM's do
+    (`grouped_launch.GroupedLaunch.traced`)."""
+
+    name = "derived_from_hooks"
+
+    def _get_heuristics_config(self, ba):
+        return 2 if ba.arguments["hooks"].axes else 1
+
+    def traced(self, name, value):
+        if name == "hooks" and isinstance(value, _Hooks):
+            return f"{self.traced('prologue', value.epilogue)} over {value.axes}"
+        return super().traced(name, value)
+
+
+def test_a_stored_hooked_launch_is_kept_as_written_and_replaced_by_its_newer_timings(tmp_path, monkeypatch):
+    """A stored launch's hooks are their traced keys, which no derivation takes: storing another launch
+    keeps its entry as it was written, its derived config the one measured beside its timings (M-FS-106: a
+    stored GEMM's derivation re-run on its prologue's key crashed the tuner), and its own newer timings
+    replace it, one entry a launch."""
+    monkeypatch.setattr(_cache, "kernel_picks_path", lambda kind: str(tmp_path / f"{kind}.json"))
+    path = _cache.kernel_picks_path("gpu")
+    op = _DerivedFromHooks(prologue=_scaled_hook)
+    first, other = (op.keyed(op.bind(TILE, _Hooks(_scaled_hook, axes))) for axes in ((0,), ()))
+    tuning._store("gpu", [(first, tuning.Timings({1: _timed(2.0), 2: _timed(1.0)}))])
+    [written] = tuning._stored(path)
+    tuning._store("gpu", [(other, tuning.Timings({1: _timed(1.0)}))])
+    assert tuning._stored(path)[0] == written and len(tuning._stored(path)) == 2
+    tuning._store("gpu", [(first, tuning.Timings({2: _timed(0.5)}))])
+    read, _ = tuning._read(path)
+    assert len(tuning._stored(path)) == 2
+    assert {key: timings.fastest_config for (_, key), (_, timings) in read.items()} == {
+        first.autotuning_cache_key: 2, other.autotuning_cache_key: 1}
+
+
 def _hooks() -> list:
     """Hooks of every kind a launch holds: module-level functions, dataclasses of one and partials of them
     over numbers, arrays, lists and tuples and in either keyword order, closures over each, callable objects
