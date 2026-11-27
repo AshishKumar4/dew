@@ -33,7 +33,7 @@ import numpy as np
 from jax.core import ShapedArray
 from jax.extend import core as jcore
 
-from dew import parity
+from dew import _cache, parity
 from dew.algebra import _component_sharing, _generated, error, printed, rules
 from dew.algebra._generated import case_of
 from dew.nn import programs
@@ -167,14 +167,29 @@ class SurrogateBodies:
         key = _exact_key(fixed)
         return None if key is None else self._keyed.get(key)
 
+    def _held_by(self, emitted: ModuleType) -> None:
+        """Refuse a generated module whose tables are not this declaration's: each body's table holds
+        exactly its declared policies, targets and cases, so a call's one lookup finds a declared case's form
+        and nothing else (a stale module: generate it again)."""
+        bodies = [(case.name, case.forward) for _, case in self.cases]
+        bodies += [(case.tangent_name(inactive), form) for _, case in self.cases
+                   for inactive, form in case.tangents.items()]
+        for name, form in bodies:
+            declared = {(policy, target, case_of(operands)) for operands in form.cases.operands
+                        for policy in form.cases.policies for target in form.cases.targets}
+            if set(_generated.table(emitted, name)) != declared:
+                raise ValueError(f"the generated table of {name} is not its declaration's: run `python -m "
+                                 "dew.algebra.generate`")
+
     def assembled(self, emitted: ModuleType, *, policy: str = "default", target: str = "sm90"):
         """Opt into the generated module `emitted`'s cases, using the original surrogate rule's argument and
-        value dependency: a call whose case its table holds (`_generated.found`, one lookup) runs that form,
-        any other the written rule."""
+        value dependency: `emitted` held to the declaration once (`_held_by`), a call whose case its table
+        holds (`_generated.found`, one lookup) runs that form, any other the written rule."""
         from jax.custom_derivatives import SymbolicZero
 
         from dew.nn.derivatives import contracted, surrogate
 
+        self._held_by(emitted)
         fixed_at = sorted(self.nondiff_argnums)
 
         @functools.wraps(self.forward)
@@ -215,31 +230,44 @@ _BITS = (float, complex, np.float16, np.float32, np.float64, np.complex64, np.co
 """The number types `_exact_key` reads by their bytes: these exactly (by identity, never by a type's hash), a
 subclass keeping its own equality."""
 _PADDED = (np.longdouble, np.clongdouble)
-"""The number types whose bytes hold padding no value sets (x87's 80 bits in 16): read by each part's sign
-and its shortest exact digits instead, a NaN by its sign alone."""
+"""The number types whose bytes hold padding no value sets (x87's 80 bits in 16): read by each part's value
+bytes alone (`_value_bytes`)."""
+
+
+_LONG_BITS = (1 + np.finfo(np.longdouble).nexp + np.finfo(np.longdouble).nmant
+              + (np.finfo(np.longdouble).nmant == 63))
+"""The bits a long double's value sets: its sign, exponent and significand, x87's explicit integer bit among
+them (80 of x86's 128; every bit of a double or IEEE quad)."""
+
+
+def _value_bytes(part) -> bytes:
+    """A long double's bytes its value sets (`_LONG_BITS`, from the low end, as x86 lays them out), every
+    payload and sign among them, without the padding beyond, which no value sets."""
+    return np.asarray(part).tobytes()[:_LONG_BITS // 8]
 
 
 def _exact_key(value) -> Hashable | None:
     """`value` as a surrogate's static arguments key it, two values one key only where they are one: a float
     of `_BITS` by its type and bytes (`-0.0` no `0.0`, each NaN its own sign and payload), one of `_PADDED` by
-    its parts' signs and digits, a plain tuple by its parts, any other hashable value by its type and itself
-    (its own equality: a callable by identity, a subclass by its own). None where it is unhashable, which no
-    declared case is."""
+    its parts' value bytes, a plain tuple by its parts, any other hashable value by its type and itself
+    (its own equality: a callable by identity, a subclass by its own), each type by its identity
+    (`_cache.Same`). None where it is unhashable, which no declared case is."""
     kind = type(value)
+    held = _cache.Same(kind)  # The type by identity: a metaclass's hash or equality is no part of the key.
     if any(kind is number for number in _BITS):
-        return kind, np.asarray(value).tobytes()
+        return held, np.asarray(value).tobytes()
     if any(kind is number for number in _PADDED):
         parts = (value.real, value.imag) if kind is np.clongdouble else (value,)
-        return kind, tuple((bool(np.signbit(part)), repr(part)) for part in parts)
+        return held, tuple(_value_bytes(part) for part in parts)
     if kind is tuple:
         parts = tuple(_exact_key(part) for part in value)
-        return None if None in parts else (kind, parts)
+        return None if None in parts else (held, parts)
     try:
         hash(value)
     except TypeError:
         _log.debug("a surrogate's unhashable static argument %s keys no case: its written body runs", kind)
         return None
-    return kind, value
+    return held, value
 
 
 def _case_leaves(case: SurrogateCase, dynamic: tuple) -> tuple | None:

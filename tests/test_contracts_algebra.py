@@ -2,13 +2,15 @@
 contracts): every order finite wherever its float64 truth is a normal float32 and its plain float32 formula is
 finite."""
 
+import types
+
 import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
 from contract_support import EDGES, ORDER_SETS, assert_contract, normal_draw
 
-from dew.algebra import _generated, means, scan, windows
+from dew.algebra import _generated, format_cases, means, scan, windows
 
 
 class _Recorded:
@@ -265,8 +267,9 @@ def test_a_surrogate_case_keys_its_static_arguments_exactly():
 def test_a_surrogate_static_key_tells_apart_exactly_what_differs():
     """`generate._exact_key` keys two static arguments alike only where they are one: each sign of zero, each
     NaN's sign and payload, each number type (`1`, `1.0`, `True`), NumPy and bfloat16 scalars by type and
-    bits, nested plain tuples by their parts; an unhashable value has none, and a value of a class whose own
-    type is unhashable is keyed by its own hash. Two cases of one key are refused at the first lookup."""
+    bits, a long double's NaNs by their payloads, nested plain tuples by their parts; an unhashable value has
+    none, and a value of a class whose own type is unhashable is keyed by its own hash, its type by identity.
+    Two cases of one key, or of one body's name, are refused as they are declared."""
     from dew.algebra.generate import Cases, ComponentForm, SurrogateBodies, SurrogateCase, _exact_key
 
     def unhashable(*_):
@@ -281,16 +284,21 @@ def test_a_surrogate_static_key_tells_apart_exactly_what_differs():
     nan = np.float64("nan")
     payload = np.frombuffer(np.uint64(0x7FF8000000000001).tobytes(), np.float64)[0]
     bfloat16 = np.dtype(jnp.bfloat16).type
+    # Two long-double NaNs of one sign, their payloads apart (x87's significand's low bit, or a quad's).
+    quiet = np.longdouble("nan")
+    raw = bytearray(np.asarray(quiet).tobytes())
+    raw[0] ^= 1
+    other = np.frombuffer(bytes(raw), np.longdouble)[0]
+    odd = Odd()
     distinct = [0.0, -0.0, nan, -nan, payload, 1, 1.0, True, np.float32(1), np.float16(1), np.longdouble(1),
-                np.longdouble(-0.0), np.longdouble(0.0), np.complex64(1), bfloat16(1), bfloat16(-0.0),
-                (1, (2.0,)), (1, (-2.0,)), frozenset({1})]
+                np.longdouble(-0.0), np.longdouble(0.0), quiet, other, np.complex64(1), bfloat16(1),
+                bfloat16(-0.0), (1, (2.0,)), (1, (-2.0,)), frozenset({1}), odd, Odd()]
     keys = [_exact_key(value) for value in distinct]
-    assert None not in keys and len(set(keys)) == len(keys)
+    assert None not in keys and len(set(keys)) == len(keys)  # each hashed, as a dictionary's lookup hashes it
     assert _exact_key(float("nan")) == _exact_key(float("nan")) and _exact_key((0.0,)) == _exact_key((0.0,))
     assert _exact_key(np.longdouble(1) / 3) == _exact_key(np.longdouble(1) / 3)
     assert _exact_key([1]) is None and _exact_key(({1},)) is None
-    odd = Odd()
-    assert _exact_key(odd) == _exact_key(odd) != _exact_key(Odd())
+    assert {_exact_key(odd): "declared"}.get(_exact_key(odd)) == "declared"
 
     operand = jax.ShapeDtypeStruct((4,), jnp.float32)
     form = ComponentForm(lambda x: x, lambda x: x, Cases(((operand,),), lambda seed, operands: operands, 1))
@@ -302,3 +310,22 @@ def test_a_surrogate_static_key_tells_apart_exactly_what_differs():
     with pytest.raises(ValueError):
         SurrogateBodies(lambda x, shift: x, lambda *values: values[-2][0], (1,), symbolic_zeros=False,
                         cases=(((2.0,), case), ((3.0,), twin)))
+
+
+def test_a_generated_module_whose_tables_are_not_its_declarations_is_refused():
+    """A surrogate assembled over a generated module whose table lacks a declared case, or holds one no
+    longer declared, is refused (a stale module), never run by one lookup as if current."""
+    from dew.algebra import format_cases_derived
+
+    for change in ("missing", "extra"):
+        tables = {}
+        for _, case in format_cases.ROUNDED.cases:
+            for name in (case.name, *map(case.tangent_name, case.tangents)):
+                tables[_generated.table_name(name)] = dict(_generated.table(format_cases_derived, name))
+        rows = tables[_generated.table_name("rounded")]
+        if change == "missing":
+            rows.pop(next(iter(rows)))
+        else:
+            rows["default", "sm90", ((((3, 5), "float32"),))] = next(iter(rows.values()))
+        with pytest.raises(ValueError):
+            format_cases.ROUNDED.assembled(types.SimpleNamespace(**tables))

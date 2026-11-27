@@ -66,8 +66,10 @@ def _affine(x):
 AFFINE = declare(__name__, "affine", ComponentForm(_affine, _affine, float32_cases(((8,),))))
 """
 
-_COMMAND = "import sys; from dew.algebra import generate; generate.DECLARING = ('isolated.cases',); " \
-           "sys.exit(generate.main(sys.argv[1:]))"
+_COMMAND = ("import runpy; from dew.algebra import generate; generate.DECLARING = ('isolated.cases',); "
+            "runpy.run_module('dew.algebra.generate', run_name='__main__', alter_sys=True)")
+"""The command as `python -m dew.algebra.generate` runs it (its `__main__` handing over to the module the
+declaring modules register with), that module's `DECLARING` the isolated one alone."""
 
 
 def test_the_command_refuses_a_stale_module_and_generation_repairs_it(tmp_path, on_its_platform):
@@ -454,15 +456,20 @@ def test_a_partial_symbolic_zero_uses_its_generated_tangent_and_the_original_val
     declared = generate.SurrogateBodies(value, tangent, (), symbolic_zeros=True, cases=(((), case),))
     called = set()
     tables = {}
+    # Every declared case in the module double, the tangent's small one too: its fallback below is the
+    # forward's output tree's, never a missing row's.
     for name, component in ((case.name, forward), (case.tangent_name((1,)), active)):
-        operands = component.cases.operands[0]
-        _, body, _ = generate._component(component, operands, "default", "sm90", name)
-        loaded = printed.loaded(body.render("form"), "form")
+        rows = {}
+        for operands in component.cases.operands:
+            _, body, _ = generate._component(component, operands, "default", "sm90", name)
+            loaded = printed.loaded(body.render("form"), "form")
 
-        def form(*values, name=name, loaded=loaded):
-            called.add(name)
-            return loaded(*values)
-        tables[_generated.table_name(name)] = {("default", "sm90", _generated.case_of(operands)): form}
+            def form(*values, name=name, loaded=loaded):
+                called.add(name)
+                return loaded(*values)
+            rows |= {(policy, target, _generated.case_of(operands)): form
+                     for policy in component.cases.policies for target in component.cases.targets}
+        tables[_generated.table_name(name)] = rows
 
     composed = declared.assembled(types.SimpleNamespace(**tables))
     x = np.arange(8, dtype=np.float32)

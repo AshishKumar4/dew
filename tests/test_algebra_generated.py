@@ -193,6 +193,8 @@ def test_the_interpreted_ssd_backward_takes_its_generated_skip_pullback():
     declared cases at the call's own tile and run the generated bodies, on par with the written choice from
     the portable math (check 1)."""
     from ssd_support import mamba_ssd_draw, mamba_ssd_xla
+
+    gradients_of = ("x", "dt", "D")  # Both pullbacks' writes: x's terms, dt's through them, the skip's.
     from test_mamba_ssd import SKIPPED
     from test_recurrence_chunk import formed
 
@@ -200,12 +202,14 @@ def test_the_interpreted_ssd_backward_takes_its_generated_skip_pullback():
         def run(arrays):
             with generation.assumed("sm90", interpreted=True), generation.chosen(ssd="mosaic_gpu",
                                                                                  generated=kernel):
-                return mamba_ssd_xla(arrays, 16, jnp.bfloat16)["D"]
+                gradients = mamba_ssd_xla(arrays, 16, jnp.bfloat16)
+                return {name: gradients[name] for name in gradients_of}
         return formed("fast", run)
 
     def truth(arrays):
         with generation.chosen(ssd="xla"):
-            return mamba_ssd_xla(arrays, 16)["D"]
+            gradients = mamba_ssd_xla(arrays, 16)
+        return {name: gradients[name] for name in gradients_of}
 
     with generated.taken() as counts:
         assert_as_exact(jax.jit(skip_gradient("generated")), jax.jit(skip_gradient("written")),
