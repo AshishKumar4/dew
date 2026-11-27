@@ -949,6 +949,10 @@ class Held:
     buffer: int
     storage: int
     shape: tuple[int, ...] = ()
+    until: int | None = None
+    """For a residual, the position past the last at which the forward reads it (`LiveInterval.uses`):
+    where a rung recomputing it holds it until (`LiveProfile.peak`); its start's next where the forward
+    reads it nowhere."""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -961,9 +965,6 @@ class LiveProfile:
     a difference no such buffer enters."""
 
     held: tuple[Held, ...]
-    backward: int | None = None
-    """The position its backward makes its first buffer at: a residual a rung recomputes is held until there
-    (`peak`), as its forward's own uses hold it no later."""
 
     @staticmethod
     def of(intervals: Sequence[LiveInterval], rows: frozenset[tuple[int, int]]) -> LiveProfile | None:
@@ -979,13 +980,18 @@ class LiveProfile:
             return None
         backward = min((interval.start for interval in whole if backward_made(interval.op_name)),
                        default=None)
+
+        def until(interval: LiveInterval) -> int:
+            read = [position for position, op_name in interval.uses if forward_made(op_name)]
+            return max(read, default=interval.start) + 1
+
         return LiveProfile(tuple(
             Held(interval.bytes, interval.op_name, tuple(interval.names),
                  any(dimension is not None and dimension & rows for dimension in interval.dims),
                  interval.role != "workspace" and forward_made(interval.op_name) and backward is not None
                  and interval.start < backward < interval.end, interval.trace, interval.start,
-                 interval.end, interval.buffer, interval.storage, interval.shape)
-            for interval in whole), backward)
+                 interval.end, interval.buffer, interval.storage, interval.shape, until(interval))
+            for interval in whole))
 
     @functools.cached_property
     def _events(self) -> list[tuple[int, int, int]]:
@@ -1006,16 +1012,19 @@ class LiveProfile:
         trace once, at the most bytes of the buffers kept in it that are live there, a buffer a microbatch's
         rows scale at its share of `split` (rounded up), as the heap simulation counts the memory it occupies
         (a storage reused after it was freed held again where a buffer reusing it is live). A residual it
-        does not keep is held until the backward begins (`backward`), its forward's uses within that: a rung
-        recomputing it frees its span past them alone."""
+        does not keep is held through its forward's last read of it (`Held.until`): a rung recomputing it
+        frees its span past that alone, the forward making and reading it all the same."""
         held = self.held + tuple(added)
         keeps = [kept(buffer) for buffer in self.held] + [True] * len(added)
-        events: Iterable[tuple[int, int, int]] = self._events if not added else heapq.merge(
-            self._events, sorted(event for at, buffer in enumerate(added, len(self.held))
-                                 for event in ((buffer.start, 1, at), (buffer.end, 0, at))))
+        # A residual not kept ends where its forward last reads it, ahead of any end at that position.
+        cut = sorted((buffer.start + 1 if buffer.until is None else buffer.until, -1, index)
+                     for index, buffer in enumerate(self.held) if not keeps[index] and buffer.residual)
+        extra = sorted(event for at, buffer in enumerate(added, len(self.held))
+                       for event in ((buffer.start, 1, at), (buffer.end, 0, at)))
+        events: Iterable[tuple[int, int, int]] = (self._events if not added and not cut
+                                                  else heapq.merge(self._events, extra, cut))
         covering: dict[tuple[int, int], collections.Counter[int]] = {}
         live = most = 0
-        until: list[int] = []
 
         def moved(index: int, starts: bool) -> None:
             nonlocal live, most
@@ -1029,16 +1038,13 @@ class LiveProfile:
             live += max(sizes, default=0) - before
             most = max(most, live)
 
-        for position, starts, index in events:
-            if until and self.backward is not None and position >= self.backward:
-                for dropped in until:
-                    moved(dropped, starts=False)
-                until.clear()
-            if keeps[index]:
+        for _, starts, index in events:
+            if starts < 0:
+                moved(index, starts=False)
+            elif keeps[index]:
                 moved(index, bool(starts))
-            elif starts and held[index].residual and self.backward is not None:
+            elif starts and held[index].residual:
                 moved(index, starts=True)
-                until.append(index)
         return most
 
     def frees(self, dropped: Callable[[str, tuple[str, ...]], bool], split: int = 1) -> int:

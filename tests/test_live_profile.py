@@ -13,16 +13,16 @@ HEAD = f"jit(step)/jvp(Head)/{HEAD_SCOPE}/dot_general"
 
 
 def held(size, start, end, buffer, storage=None, *, scaled=False, residual=False, trace=0, op_name=FORWARD,
-         names=(), shape=()):
+         names=(), shape=(), until=None):
     stored = buffer if storage is None else storage
-    return Held(size, op_name, names, scaled, residual, trace, start, end, buffer, stored, shape)
+    return Held(size, op_name, names, scaled, residual, trace, start, end, buffer, stored, shape, until)
 
 
-def interval(size, start, end, buffer, *, trace=0, timeline=0, op_name=FORWARD):
+def interval(size, start, end, buffer, *, trace=0, timeline=0, op_name=FORWARD, uses=()):
     return LiveInterval(bytes=size, shape=(size,), dtype="u8", kind="temporary", instruction=f"i{buffer}",
                         op_name=op_name, source="", allocation=trace, trace=trace, timeline=timeline,
-                        whole=True, complete=True, start=start, end=end, buffer=buffer, storage=buffer,
-                        charged=True)
+                        uses=uses, whole=True, complete=True, start=start, end=end, buffer=buffer,
+                        storage=buffer, charged=True)
 
 
 def test_the_peak_is_the_most_the_schedule_holds_at_once():
@@ -83,15 +83,20 @@ def test_a_residual_is_a_forward_value_live_into_the_backward():
     assert profile.frees(lambda op_name, names: True) == 50 - 30
 
 
-def test_a_recomputed_residual_is_held_through_its_forwards_uses():
-    """A residual a rung recomputes is made by its forward all the same, and held until the backward begins
-    (`LiveProfile.backward`): where it shares the forward's peak with its scratch, dropping it frees none
-    of that peak, though it is alone in the backward."""
-    profile = LiveProfile((held(100, 0, 6, 0, residual=True), held(70, 1, 3, 1), held(10, 4, 5, 2,
-                                                                                         op_name=BACKWARD)),
-                          backward=4)
-    assert profile.most == 170
-    assert profile.frees(lambda op_name, names: True) == 0
+def test_a_recomputed_residual_is_held_through_its_forwards_last_read():
+    """A residual a rung recomputes is made by its forward all the same, and held until the forward last
+    reads it (`LiveInterval.uses`, `Held.until`): where it shares the forward's peak with its scratch,
+    dropping it frees none of that peak, though it is alone in the backward; read last before the scratch,
+    it frees its bytes there."""
+    def profile(read: int) -> LiveProfile:
+        found = LiveProfile.of((interval(100, 0, 6, 0, uses=((read, FORWARD), (5, BACKWARD))),
+                                interval(70, 1, 3, 1), interval(10, 4, 6, 2, op_name=BACKWARD)), frozenset())
+        assert found is not None
+        return found
+
+    assert profile(2).most == profile(0).most == 170
+    assert profile(2).frees(lambda op_name, names: True) == 0
+    assert profile(0).frees(lambda op_name, names: True) == 100
 
 
 def test_a_heaps_pages_hold_their_buffers_together_and_heaps_apart_read_no_profile():
