@@ -948,9 +948,10 @@ def test_a_pipelines_save_that_fails_leaves_the_earlier_one_whole(pipelines, tmp
     earlier save whole, byte for byte: its index and configs are published with its weights in one
     generation (`published_release`; train 1406's review: the configs were written before the weights,
     new ones beside old weights)."""
-    from dew.interop.pretrained import load_diffusion_source
+    from dew.interop.pretrained import PretrainedPipeline, load_diffusion_source
 
     source = load_diffusion_source(str(pipelines / "flux" / "pipeline"), dtype="float32", size=(16, 16))
+    assert isinstance(source, PretrainedPipeline), "a published pipeline loads as itself"
     target = tmp_path / "export"
     source.save(target)
     before = {path.relative_to(target): path.read_bytes() for path in target.rglob("*") if path.is_file()}
