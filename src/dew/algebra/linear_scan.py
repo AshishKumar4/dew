@@ -49,6 +49,7 @@ critical path summed along its chains, and the cheapest is the chunk's form, whi
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import functools
 import math
@@ -213,15 +214,18 @@ free = relation("free", Token)
 _MINUS_ONE = Token.scalar(Token.literal(-1.0))
 
 
+@functools.cache
 def _token_rules():
-    """The algebra's identities, freeness, and the affine forms (the module's account)."""
+    """The algebra's identities, freeness, and the affine forms (the module's account): built once, so a
+    saturation's e-graph declares them once a thread (`program.fresh_graph`)."""
     return ruleset(*_token_rule_list(), name="token_affine")
 
 
+@functools.cache
 def _coupled_rules():
     """`_token_rules`' and a pair's coupled form (`Affine.coupled`): its second state's decayed value plus a
     rank-one input reading the first state the token enters, its first's decayed value plus a scalar times
-    that second value, the very value the pair's second place holds."""
+    that second value, the very value the pair's second place holds. Built once, as `_token_rules`."""
     y, z, lam, a, b, c, s, t = vars_("y z lam a b c s t", Token)
     h, m = Token.state(), Token.second()
     found = []
@@ -351,8 +355,9 @@ def parts(update: Program, readout: Program, saturation: program.Saturation) -> 
     state through an equation whose algebra no constructor states."""
     atoms: list = []
     made, read = _translated(update, atoms), _translated(readout, atoms)
-    graph, stopped = _saturated(made, read, update, readout, saturation, _token_rules(), "a scan's token")
-    made, read = graph.extract(form_of(made)), graph.extract(form_of(read))
+    with _saturated(made, read, update, readout, saturation, _token_rules(), "a scan's token") as (
+            graph, stopped):
+        made, read = graph.extract(form_of(made)), graph.extract(form_of(read))
     erase = None
     if (erased := get_callable_args(made, Affine.erased_before)) is not None:
         base2, per_key, exponent, erase, correction, left, right = erased
@@ -387,20 +392,23 @@ def parts(update: Program, readout: Program, saturation: program.Saturation) -> 
                  reader_scale=reader_scale, across=across, before=before is not None, erase=erase)
 
 
+@contextlib.contextmanager
 def _saturated(made: Token, read: Token, update: Program, readout: Program, saturation: program.Saturation,
-               rules, name: str) -> tuple[EGraph, str]:
+               rules, name: str) -> Iterator[tuple[EGraph, str]]:
     """An e-graph of a token's update `made` and readout `read` saturated by `rules` within `saturation`'s
     limits for its size and the programs' longer chain, reported as `name`, and the refusal's note where a
-    limit stopped it short of its fixpoint."""
-    began, graph = time.perf_counter(), EGraph()
-    graph.register(made, read)
-    sized = program.node_count(graph)
-    limits = saturation.sized(sized, max(_chain(update), _chain(readout)))
-    saturated = program.run_within(graph, rules, limits, name)
-    kernel_report.record_rewrite(program.reported(graph, sized, saturated, began))
-    stopped = (f" (its saturation stopped at its limits, {limits[0]} nodes and {limits[1]} iterations, short "
-               f"of its fixpoint)" if saturated.limited else "")
-    return graph, stopped
+    limit stopped it short of its fixpoint: the saturation's own (`program.fresh_graph`, `rules` declared
+    once a thread), read within the block."""
+    began = time.perf_counter()
+    with program.fresh_graph(rules) as graph:
+        graph.register(made, read)
+        sized = program.node_count(graph)
+        limits = saturation.sized(sized, max(_chain(update), _chain(readout)))
+        saturated = program.run_within(graph, rules, limits, name)
+        kernel_report.record_rewrite(program.reported(graph, sized, saturated, began))
+        stopped = (f" (its saturation stopped at its limits, {limits[0]} nodes and {limits[1]} iterations, "
+                   f"short of its fixpoint)" if saturated.limited else "")
+        yield graph, stopped
 
 
 @dataclasses.dataclass(frozen=True)
@@ -435,14 +443,15 @@ def coupled_parts(update: Program, readout: Program, saturation: program.Saturat
     part free of the states."""
     atoms: list = []
     made, read = _translated(update, atoms, pair=True, outputs=2), _translated(readout, atoms, pair=True)
-    graph, stopped = _saturated(made, read, update, readout, saturation, _coupled_rules(),
-                                "a coupled scan's token")
-    args = get_callable_args(graph.extract(form_of(made)), Affine.coupled)
+    with _saturated(made, read, update, readout, saturation, _coupled_rules(), "a coupled scan's token") as (
+            graph, stopped):
+        made, read = graph.extract(form_of(made)), graph.extract(form_of(read))
+    args = get_callable_args(made, Affine.coupled)
     if args is None:
         raise Refused("a pair's update is not its second state decayed by a scalar plus a rank-one input "
                       "reading the first state the token enters, and its first decayed by a scalar plus a "
                       f"scalar times that second value{stopped}")
-    found = get_callable_args(graph.extract(form_of(read)), Affine.readout)
+    found = get_callable_args(read, Affine.readout)
     if found is None:
         raise Refused("a pair's readout is not its first state contracted with a vector over its keys plus a "
                       f"part free of the states{stopped}")
@@ -896,11 +905,12 @@ def columns_of(value: Chunk) -> i64: ...
 """A value's columns at the chunk's extents."""
 
 
-def _shapes(extents: Extents):
-    """Each value's shape (`rows_of`, `columns_of`) from its operands', as the e-graph grows."""
+def _shapes(token_count: int, key_count: int, value_count: int, apart: int, values_read: bool):
+    """Each value's shape (`rows_of`, `columns_of`) from its operands', as the e-graph grows, at a chunk's
+    extents (`Extents`: its tokens, keys and values, its readout's `apart` and `values_read`)."""
     a, b, t, d, e = vars_("a b t d e", Chunk)
     r, c = vars_("r c", i64)
-    tokens, keys, values = i64(extents.tokens), i64(extents.keys), i64(extents.values)
+    tokens, keys, values = i64(token_count), i64(key_count), i64(value_count)
 
     def fixed(made, rows, columns):
         return rule(eq(t).to(made)).then(set_(rows_of(t)).to(rows), set_(columns_of(t)).to(columns))
@@ -913,14 +923,22 @@ def _shapes(extents: Extents):
         for made in (a.rows(b), a.times(b), a.plus(b), a.minus(b), Chunk.solve(b, a),
                      Chunk.substituted(b, a))]
     found += [fixed(made, tokens, tokens)
-              for made in (*(Chunk.gram(a, b, apart, d) for apart in {0, 1, extents.apart}),
-                           Chunk.doubled(a))]
+              for made in (*(Chunk.gram(a, b, part, d) for part in {0, 1, apart}), Chunk.doubled(a))]
     found += [fixed(made, keys, values)
               for made in (Chunk.decayed(a, d), Chunk.written(a, b, d), a.state(), Chunk.columns(a, d))]
     found += [fixed(made, tokens, keys) for made in (Chunk.spread(a, b, e, d), Chunk.applied(a, b))]
     found.append(fixed(Chunk.weighed(a, b, d), tokens, values))
-    found.append(fixed(a.outputs(), tokens, keys if extents.values_read else values))
+    found.append(fixed(a.outputs(), tokens, keys if values_read else values))
     return ruleset(*found, name="chunk_shapes")
+
+
+@functools.cache
+def _chunk_rules(corrects: bool, scalar: bool, values_read: bool, apart: int, across: bool, before: bool,
+                 erased: bool, tokens: int, keys: int, values: int):
+    """A chunk's identities and its values' shapes (`_identities`, `_shapes`), built once for the facts that
+    define them, so a saturation's e-graph declares them once a thread (`program.fresh_graph`)."""
+    return (_identities(corrects, scalar, values_read, apart, across, before, erased)
+            | _shapes(tokens, keys, values, apart, values_read))
 
 
 def _leaves(extents: Extents) -> list:
@@ -950,31 +968,33 @@ def derive(extents: Extents, *, corrects: bool, schedule: cost.Schedule, precisi
     extracted by each node's work (`_work`; a solve, which
     no node computes until an identity rewrites it, costs past every form), and the extracted form priced
     exactly, its shared nodes once and its critical path along its chains (`_priced`)."""
-    began, graph = time.perf_counter(), EGraph()
+    began = time.perf_counter()
     values = Chunk.token("U")
     loop = Chunk.loop(values) if corrects else Chunk.plain(values)
     root = Chunk.pair(loop.outputs(), loop.state())
-    graph.register(root, *_leaves(extents))
-    sized = program.node_count(graph)
-    saturated = program.run_within(
-        graph, _identities(corrects, extents.decay_keys == 1, extents.values_read, extents.apart,
-                           extents.across, extents.before, extents.erased) | _shapes(extents),
-        saturation.sized(sized, _depth(root)), "a scan's chunk")
+    rules = _chunk_rules(corrects, extents.decay_keys == 1, extents.values_read, extents.apart,
+                         extents.across, extents.before, extents.erased, extents.tokens, extents.keys,
+                         extents.values)
+    with program.fresh_graph(rules) as graph:
+        graph.register(root, *_leaves(extents))
+        sized = program.node_count(graph)
+        saturated = program.run_within(graph, rules, saturation.sized(sized, _depth(root)), "a scan's chunk")
 
-    def marginal(egraph: EGraph, node) -> cost.Seconds:
-        if get_callable_args(node, Chunk.solve) is not None:
-            return cost.Seconds(Work(), schedule, math.inf)
-        return cost.Seconds(_work(node, extents, lambda child: _shape_of(egraph, child), precision), schedule)
+        def marginal(egraph: EGraph, node) -> cost.Seconds:
+            if get_callable_args(node, Chunk.solve) is not None:
+                return cost.Seconds(Work(), schedule, math.inf)
+            return cost.Seconds(_work(node, extents, lambda child: _shape_of(egraph, child), precision),
+                                schedule)
 
-    model = DagCostModel(marginal_cost=marginal, identity=cost.Seconds(Work(), schedule))
-    extracted, _ = extract.cheapest(graph, root, model, checked=checked)
-    # The pair of its two parts, or one algorithm that gives both (the token loop, where the target prices
-    # its steps past every other form's work), read by its projections.
-    parts = get_callable_args(extracted, Chunk.pair)
-    outputs, state = parts if parts is not None else (extracted.outputs(), extracted.state())
-    shape_of = functools.partial(_shape_of, graph)
-    price = cost.Seconds(_priced((outputs, state), extents, shape_of, precision), schedule)
-    kernel_report.record_rewrite(program.reported(graph, sized, saturated, began, price.value))
+        model = DagCostModel(marginal_cost=marginal, identity=cost.Seconds(Work(), schedule))
+        extracted, _ = extract.cheapest(graph, root, model, checked=checked)
+        # The pair of its two parts, or one algorithm that gives both (the token loop, where the target
+        # prices its steps past every other form's work), read by its projections.
+        parts = get_callable_args(extracted, Chunk.pair)
+        outputs, state = parts if parts is not None else (extracted.outputs(), extracted.state())
+        shape_of = functools.partial(_shape_of, graph)
+        price = cost.Seconds(_priced((outputs, state), extents, shape_of, precision), schedule)
+        kernel_report.record_rewrite(program.reported(graph, sized, saturated, began, price.value))
     return Form(outputs, state, price, extents.apart, extents.across, extents.before, extents.erased)
 
 

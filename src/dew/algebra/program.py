@@ -21,7 +21,7 @@ from typing import NamedTuple
 import jax
 import jax.numpy as jnp
 import numpy as np
-from egglog import DagCostModel, EGraph, Ruleset, Schedule, String, Vec, get_callable_args, i64, seq, set_
+from egglog import DagCostModel, EGraph, Schedule, String, Vec, get_callable_args, i64, seq, set_
 from jax._src import ad_util, api_util, config as jax_config
 from jax._src.interpreters import partial_eval
 from jax.core import ShapedArray, eval_jaxpr
@@ -855,7 +855,7 @@ class _Lease:
     id while it keys the graph, and the blocks it has served."""
 
     graph: EGraph
-    sets: tuple[Ruleset, ...]
+    sets: tuple[Schedule, ...]
     served: int = 0
 
 
@@ -871,9 +871,10 @@ _IDLE = _Idle()
 
 
 @contextlib.contextmanager
-def fresh_graph(*sets: Ruleset) -> Iterator[EGraph]:
+def fresh_graph(*sets: Schedule) -> Iterator[EGraph]:
     """An e-graph holding no term and no fact for one saturation (a derivation's, a window's, a carry's, a
-    price's, a recognition's), its rule sets `sets`, the ones the block runs, declared: an e-graph of this
+    price's, a recognition's, a scan's token or chunk), its rule sets `sets` (a set or sets combined), the
+    ones the block runs, declared: an e-graph of this
     thread's prepared with them, taken for the block (a block within it that asks for the same sets prepares
     its own), pushed and popped after it, so nothing a block adds reaches another. An e-graph made afresh
     for each saturation declared every rule of every set again, the most of a cold derivation's egglog
