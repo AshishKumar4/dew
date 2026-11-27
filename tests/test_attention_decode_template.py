@@ -30,6 +30,7 @@ from dew.nn.kernels.templates import (
     bundles,
     cost,
     emission,
+    merged,
     report,
 )
 from dew.nn.kernels.templates.hooks import Hook, Side
@@ -1751,3 +1752,36 @@ def test_softcap_and_windowed_decode_compile_spill_free(generation_name, case):
     with generation.assumed(generation_name):
         found = compile_mosaic_kernels([KernelCase(case, lambda: (call, operands))], generation_name)
     assert not (failed := mosaic_failures(found)), "\n".join(failed)
+
+
+@pytest.mark.parametrize("finished", [True, False], ids=["finished", "state"])
+def test_a_decode_plan_prices_its_merges_as_its_launch_merges(finished):
+    """An H100's step of four query heads over two key heads and 32768 keys, finished under an output gate (a
+    parameter of its output's layout) or unfinished and unhooked: its work list (`attention_decode.planned`)
+    the plan of its packed rows whose merges are priced with the step's own launch's signature (`plan`'s
+    `finished`), and on a fixed split of 13 its merge's price (`_merge_seconds`) the launch's own: a finished
+    step's its gate, unpacked, over its four heads writing bf16 (`merged_finished`), on Mosaic GPU, which
+    takes every hooked merge; an unfinished one's its fp32 state, no hook (`merged_split`) (train 1379's
+    K-F3)."""
+    query = jnp.zeros((1, 1, 4, 64), jnp.bfloat16)
+    key = jax.ShapeDtypeStruct((1, 32768, 2, 64), jnp.bfloat16)
+    spans = template.spans(1, 32768, 1, causal=False)
+    gate = jnp.ones((1, 1, 4, 64), jnp.bfloat16)
+    hooks = (template.Hooks(output=Hook(lambda out, gate: out * gate, (Side(gate, template.Kind.OUTPUT),)))
+             if finished else template.Hooks())
+    descriptor = (hooks.output, 4) if finished else None
+    with generation.assumed("sm90"):
+        target = generation.gpu_target()
+        work, rows, row_spans, whole = attention_decode.planned(query, key, key, spans, hooks,
+                                                                finished=finished)
+        assert work is not None
+        assert work["plain"] == attention_decode.plan(rows, key, key, row_spans, whole, scale=None,
+                                                      target=target, finished=descriptor)
+        config = work["plain"].config
+        charged = attention_decode._merge_seconds(rows, key, row_spans, config, 13, target=target,
+                                                  initial=None, finished=descriptor)
+        spec, padded, stacked, queries, width = attention_decode.merge_shapes(
+            rows, key, row_spans, config, 13, target=target)
+        signature = ({"output": hooks.output, "out_dtype": jnp.bfloat16, "out_heads": 4} if finished else {})
+        assert charged == merged.priced_launch(spec, padded, stacked, queries, width, target, **signature)
+        assert merged._uses_mosaic(target, hooks.output.fn) == finished
