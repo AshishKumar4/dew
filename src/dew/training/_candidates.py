@@ -29,6 +29,7 @@ from dew.distributed.placement import Placement, Validation, allocated_bytes, pl
 from dew.nn.kernels import tuning
 from dew.nn.kernels.generation import assumed, gpu_mesh
 from dew.nn.kernels.options import (
+    compiler_options,
     held_context,
     held_until_release,
     known_program_key,
@@ -494,7 +495,8 @@ def step_program[LossT, EffectsT](stepping: Stepping[LossT, EffectsT], shapes, c
 
 
 def lowered_for[LossT, EffectsT](stepping: Stepping[LossT, EffectsT], objective: Objective[LossT, EffectsT],
-                                 state: TrainState, batch: Batch, generation: str, narrow: bool
+                                 state: TrainState, batch: Batch, generation: str, narrow: bool,
+                                 xla_defaults: bool = False
                                  ) -> tuple[jax.stages.Lowered, jax.stages.CompilerOptions | None]:
     """The step `compile` builds first, traced as on a GPU of the CUDA `generation` and lowered for one
     (`dew.training._lowering`) on this process's devices. It traces on an abstract mesh of that GPU's
@@ -502,8 +504,10 @@ def lowered_for[LossT, EffectsT](stepping: Stepping[LossT, EffectsT], objective:
     objective at (`StepCompiler.at_base_rung`), its narrow copies where that rung keeps them (`narrow`), and
     the plan's first split: a run that does not fit splits its batch or recomputes more, no other kernel.
     A step whose state the host holds lowers its programs apart (`StepCompiler._lowered_host`). Beside it,
-    the XLA options its plan compiles it under (`step_options`, a compile's limit aside, `unlimited`): a
-    step's fingerprint is its program under them (`dew.training.ahead._fingerprint`)."""
+    the XLA options its plan compiles it under, a compile's limit aside (`unlimited`): the step's own
+    (`step_options`), or at a rung of XLA's defaults (`xla_defaults`) those its modules need alone
+    (`compiler_options`), as `FitSearch.compiled_options` chooses them; a step's fingerprint is its program
+    under them (`dew.training.ahead._fingerprint`)."""
     settings = stepping.settings
     mesh = gpu_mesh(settings.device_mesh, generation)
     with assumed(generation), stepping.traced_on(mesh) as schedule:
@@ -516,5 +520,6 @@ def lowered_for[LossT, EffectsT](stepping: Stepping[LossT, EffectsT], objective:
         # run's search sizes it over its placed ones (`StepCompiler`'s `gathered`).
         variables = candidate.prepared.variables
         gathered = layer_gathers(objective, variables, mesh.size)
-        options = step_options(objective, candidate.micro, variables, mesh, gathered)
+        options = (compiler_options() or None if xla_defaults
+                   else step_options(objective, candidate.micro, variables, mesh, gathered))
         return candidate.lowered, unlimited(options)
