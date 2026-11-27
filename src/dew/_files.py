@@ -27,7 +27,6 @@ import os
 import secrets
 import shutil
 import stat
-import unicodedata
 from collections.abc import Callable, Iterator, Mapping
 from pathlib import Path
 
@@ -241,7 +240,7 @@ def swapped(directory: Path, foreign: Callable[[Entries, Entries, Path], set[Pat
             raise FileExistsError(f"{directory} is no directory of its own, which an export replaces")
         return directory.stat()
 
-    if directory.name.casefold().startswith(PUBLISHING_LOCK):
+    if directory.name.startswith(PUBLISHING_LOCK):
         raise ValueError(f"{directory} is named as Dew's publishers' locks are: export under another name")
     working = Path(os.getcwd())
     if working == directory or directory in working.parents:
@@ -253,7 +252,6 @@ def swapped(directory: Path, foreign: Callable[[Entries, Entries, Path], set[Pat
     # A new tree's mode read before anything is written: a probe once the write is done could find no
     # inode left.
     made = _made_mode(directory.parent)
-    lock_path = _lock_path(directory)
     staging = _beside(directory, ".staging")
     os.mkdir(staging, 0o700)
     try:
@@ -267,7 +265,7 @@ def swapped(directory: Path, foreign: Callable[[Entries, Entries, Path], set[Pat
             yield staging
         finally:
             _STAGED.reset(staged)
-        with _publishing(lock_path):
+        with _publishing(directory):
             held_at = existing()
             written = _entries(staging)
             held = {} if held_at is None else _entries(directory)
@@ -437,46 +435,25 @@ no release takes (`swapped` refuses one)."""
 
 
 @contextlib.contextmanager
-def _publishing(lock_path: Path) -> Iterator[None]:
-    """Hold Dew's lock of a destination's publication, an exclusive `flock` of its own file beside it
-    (`lock_path`, `_lock_path`), so its publishers validate and replace it one at a time and one
-    destination's publication holds no other's. The file is opened for writing, which an exclusive lock
+def _publishing(directory: Path) -> Iterator[None]:
+    """Hold Dew's lock of `directory`'s publication, an exclusive `flock` of its own file beside it (named
+    by a digest of its name, `PUBLISHING_LOCK`), so its publishers validate and replace it one at a time and
+    one destination's publication holds no other's. The file is opened for writing, which an exclusive lock
     takes on every filesystem (NFS's among them), no link followed to it: an existing one as it is (a
     sticky folder refuses creating over another user's), else made exclusively, as every file Dew writes is,
     under the umask, and left in place, the one inode every publisher locks. Whoever the umask lets write
-    beside the release takes its lock; one it does not is refused opening it, not left waiting."""
-    lock = _lock_file(lock_path)
+    beside the release takes its lock; one it does not is refused opening it, not left waiting. The lock is
+    keyed by the destination's name as given, so publishers of one release name it alike: two spellings a
+    case-folding filesystem takes for one entry take two locks."""
+    # Keyed by the name as given: publishers of one release name it alike; two spellings a case-folding
+    # filesystem takes for one entry take two locks (row 13744).
+    name = PUBLISHING_LOCK + hashlib.sha256(os.fsencode(directory.name)).hexdigest()[:16]
+    lock = _lock_file(directory.parent / name)
     try:
         fcntl.flock(lock, fcntl.LOCK_EX)
         yield
     finally:
         os.close(lock)
-
-
-def _lock_path(directory: Path) -> Path:
-    """The lock file of `directory`'s publication (`_publishing`, `PUBLISHING_LOCK`), so publishers of one
-    release take one lock: named by a digest of its name, which a name as long as the filesystem allows fits;
-    in a folder that takes two spellings of a name for one entry (a case-folding or normalizing filesystem,
-    `_folds_names`), by the name itself, which that filesystem folds as it folds the release's, whatever its
-    rules (ext4's ignorable code points among them), two spellings of one release one lock and two releases
-    two (row 13744); a name too long for the prefix is refused there as the filesystem refuses it. Read
-    before a publication writes anything, as the folder's other probe is (`_made_mode`)."""
-    if _folds_names(directory.parent):
-        return directory.parent / (PUBLISHING_LOCK + directory.name)
-    return directory.parent / (PUBLISHING_LOCK + hashlib.sha256(os.fsencode(directory.name)).hexdigest()[:16])
-
-
-def _folds_names(folder: Path) -> bool:
-    """Whether `folder` takes two spellings of a name for one entry: a probe made in it under a name of a
-    lower-case letter and a composed `é` found by its upper-cased or its decomposed spelling (casefold
-    ext4's and NFS's, APFS's and HFS+'s), then removed."""
-    probe = _beside(folder / "probe", ".n\u00e9")
-    probe.mkdir()
-    try:
-        return any(os.path.lexists(folder / spelling)
-                   for spelling in (probe.name.upper(), unicodedata.normalize("NFD", probe.name)))
-    finally:
-        probe.rmdir()
 
 
 def _lock_file(path: Path) -> int:
