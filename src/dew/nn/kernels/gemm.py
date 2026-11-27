@@ -601,11 +601,14 @@ def _syrk_portable(operand: jax.Array, poly: jax.Array | None, *, transpose: boo
     return _poly_rows(operand)
 
 
-def _syrk_select(operand: jax.Array, *, has_poly: bool, transpose: bool,
+def _syrk_select(operand: jax.Array, coeffs: jax.Array | None = None, *, transpose: bool,
                  precision: PrecisionLike, out_dtype, interpret_on_cpu: bool, symmetric: bool = True) -> bool:
     """Run `SYRK` kernel selection once without emitting jaxpr equations, resolving committed operand
     placement first so CUDA-committed inputs under `default_device(cpu)` see their device (row 12026); a
-    polynomial admitted unnamed only where its caller states its operand `symmetric`, a Gram always."""
+    polynomial's (its `coeffs`) admitted unnamed only where its caller states its operand `symmetric`, a
+    Gram always; whole where its launch reads the operand and the coefficients whole (`launched_whole`,
+    train 1407's review)."""
+    has_poly = coeffs is not None
     from .templates import base
     from .templates.gemm import syrk as syrk_mod
 
@@ -615,7 +618,8 @@ def _syrk_select(operand: jax.Array, *, has_poly: bool, transpose: bool,
     op_dtype = jnp.dtype(operand.dtype)
     flat = jax.ShapeDtypeStruct((count, d0, d1), op_dtype)
     poly_spec = jax.ShapeDtypeStruct((3,), at_least_fp32(op_dtype)) if has_poly else None
-    with xla_products.committed_context((operand,)), xla_products.interpreted_context(interpret_on_cpu):
+    launched = (operand,) if coeffs is None else (operand, coeffs)
+    with xla_products.committed_context(launched), xla_products.interpreted_context(interpret_on_cpu):
         interpreting = xla_products.interpreted(interpret_on_cpu)
         call = base.call((syrk_mod.MOSAIC_SYRK,), flat, poly_spec, transpose=transpose,
                          out_dtype=out_dtype.name, interpret=interpreting)
@@ -623,7 +627,8 @@ def _syrk_select(operand: jax.Array, *, has_poly: bool, transpose: bool,
                     and syrk_mod.measured(generation.gpu_target(), flat.shape, op_dtype, transpose=transpose,
                                           out_dtype=out_dtype, polynomial=has_poly))
         case = SyrkCase(op_dtype, out_dtype, call, no_x64=not jax.config.jax_enable_x64,
-                        no_auto=launched_whole(operand), precision_ok=exact_products(precision, op_dtype),
+                        no_auto=launched_whole(*launched),
+                        precision_ok=exact_products(precision, op_dtype),
                         measured=admitted)
         return selection.select(SYRK, case).kernel == 'mosaic'
 
@@ -702,7 +707,7 @@ def symmetric_gram(x: jax.Array, *, transpose: bool = False, conjugate: bool = T
     if x.ndim < 2:
         raise ValueError(f"symmetric_gram expects at least 2D input, got {x.shape}")
     out = x.dtype if out_dtype is None else jnp.dtype(out_dtype)
-    if not _syrk_select(x, has_poly=False, transpose=transpose, precision=precision, out_dtype=out,
+    if not _syrk_select(x, transpose=transpose, precision=precision, out_dtype=out,
                         interpret_on_cpu=interpret_on_cpu):
         return _syrk_portable(x, None, transpose=transpose, conjugate=conjugate, precision=precision,
                               out_dtype=out)
@@ -755,7 +760,7 @@ def symmetric_polynomial(a: jax.Array, coeffs, *, precision: PrecisionLike = Non
         raise ValueError(f"symmetric_polynomial expects square [..., m, m], got {a.shape}")
     out = a.dtype if out_dtype is None else jnp.dtype(out_dtype)
     c = jnp.asarray(coeffs).reshape(3)
-    if not _syrk_select(a, has_poly=True, transpose=False, precision=precision, out_dtype=out,
+    if not _syrk_select(a, c, transpose=False, precision=precision, out_dtype=out,
                         interpret_on_cpu=interpret_on_cpu, symmetric=symmetric):
         return _syrk_portable(a, c, transpose=False, conjugate=False, precision=precision, out_dtype=out)
     return _symmetric_poly_vjp(a, c.astype(at_least_fp32(a.dtype)), precision, out, interpret_on_cpu)

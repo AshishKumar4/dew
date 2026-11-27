@@ -739,6 +739,34 @@ def test_a_packed_products_rescue_keeps_an_explicit_meshs_row_placement():
             np.testing.assert_array_equal(np.asarray(d_rows), want)
 
 
+@pytest.mark.mesh(devices=2)
+def test_a_named_ternary_launch_takes_whole_rows_and_words_beside_a_split_scale():
+    """A ternary product named Mosaic's (interpreted on this CPU) whose rows and codes are whole on two
+    devices and whose per-column scale alone an Explicit axis splits, jitted outside the mesh's context: its
+    launch reads the rows and the words (the scale multiplies its product after it, `factored`), so it
+    runs, each column its codes' product times its scale (train 1407's review: its admission read the
+    scale and refused the named launch)."""
+    from jax.sharding import AxisType, NamedSharding, PartitionSpec
+
+    mesh = jax.make_mesh((2,), ("data",), axis_types=(AxisType.Explicit,), devices=jax.devices()[:2])
+    rng = np.random.default_rng(14071)
+    values = rng.integers(-1, 2, (256, 64)).astype(np.float32)
+    scale = np.exp2(rng.integers(-4, 4, (64,))).astype(np.float32)
+    # Its codes the values (`of` rounds the weights over their columns' scales).
+    weights = formats.TernaryWeights.of(values * scale, scale=scale)
+    rows = rng.integers(-3, 4, (8, 256)).astype(np.float32)
+    whole = NamedSharding(mesh, PartitionSpec())
+    placed = dataclasses.replace(weights, words=jax.device_put(weights.words, whole),
+                                 scale=jax.device_put(jnp.asarray(weights.scale),
+                                                      NamedSharding(mesh, PartitionSpec("data"))))
+    product = jax.jit(functools.partial(gemm.ternary_weight_product, quantize_activations=False,
+                                        out_dtype=jnp.float32, interpret_on_cpu=True))
+    with generation.chosen(grouped_matmul="mosaic"):
+        got = product(jax.device_put(jnp.asarray(rows, jnp.bfloat16), whole), placed)
+    want = rows.astype(np.float64) @ (values.astype(np.float64) * scale)
+    np.testing.assert_array_equal(np.asarray(got, np.float64), want)
+
+
 def test_a_packed_products_rescue_keeps_a_subnormal_remainder():
     """Codes +1, -1 and +1 at a scale of 4 under cotangents 2**126, 2**126 and 2**-149: the first two
     cancel past fp32's largest and the remainder, 2**-147, is subnormal; the rescue rounds it in integers,
