@@ -32,7 +32,7 @@ import numpy as np
 from etils import epath
 
 from dew._coordination import agreed_reading, writes_weights
-from dew._files import Entries, is_uri, same_entries, swapped, write_atomically
+from dew._files import Entries, Replacements, is_uri, same_entries, swapped, write_atomically
 from dew.interop.release_record import RELEASE_FILE, Release
 from dew.interop.safetensors_io import (
     CONFIG_FILE,
@@ -102,20 +102,24 @@ def pooled_destination(destination: str | Path, *, publishes: bool, shared: bool
         agreed_reading(held.close)
 
 
-def replaced_entries(written: Entries, held: Entries) -> dict[Path, set[Path]]:
-    """Each file and folder a release writes, with the earlier entries it replaces (`swapped`'s
-    `replaces`): the same entry; and a shard of its weights, every shard of that stem the earlier tree held
-    in its folder, however the two shard them, so a resharded release keeps the access its earlier weights
-    allowed (train 1407's review: `model.safetensors` replaced by `model-00001-of-00002.safetensors`)."""
-    earlier: dict[tuple[Path, str], set[Path]] = {}
-    for entry, kind in held.items():
-        if kind == "file" and (stem := weight_stem(entry.name)) is not None:
-            earlier.setdefault((entry.parent, stem), set()).add(entry)
-    replaced = same_entries(written, held)
-    for entry, kind in written.items():
-        if kind == "file" and (stem := weight_stem(entry.name)) is not None:
-            replaced[entry] = replaced.get(entry, set()) | earlier.get((entry.parent, stem), set())
-    return replaced
+def replaced_entries(written: Entries, held: Entries) -> Replacements:
+    """A release's entries grouped with the earlier entries they replace (`swapped`'s `replaces`): the
+    shards of its weights of one stem in one folder with every shard of that stem the earlier tree held
+    there, however the two shard them, so a resharded release keeps the access its earlier weights allowed
+    (train 1407's review: `model.safetensors` replaced by `model-00001-of-00002.safetensors`); any other
+    entry with the same entry, as `same_entries` groups it."""
+    def stem_of(entries: Entries) -> dict[tuple[Path, str], list[Path]]:
+        grouped: dict[tuple[Path, str], list[Path]] = {}
+        for entry, kind in entries.items():
+            if kind == "file" and (stem := weight_stem(entry.name)) is not None:
+                grouped.setdefault((entry.parent, stem), []).append(entry)
+        return grouped
+
+    shards, earlier = stem_of(written), stem_of(held)
+    sharded = {entry for group in shards.values() for entry in group}
+    return [*[(entries, held_entries) for entries, held_entries in same_entries(written, held)
+              if entries[0] not in sharded],
+            *[(group, earlier.get(key, [])) for key, group in shards.items()]]
 
 
 def foreign_entries(written: Entries, held: Entries, directory: Path) -> set[Path]:

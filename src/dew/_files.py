@@ -25,7 +25,7 @@ import os
 import secrets
 import shutil
 import stat
-from collections.abc import Callable, Collection, Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from pathlib import Path
 
 from etils import epath
@@ -164,17 +164,22 @@ Entries = Mapping[Path, str]
 regular file), `"folder"`, `"link"` or `"special"` (a FIFO, a socket, a device)."""
 
 
-def same_entries(written: Entries, held: Entries) -> dict[Path, set[Path]]:
+Replacements = list[tuple[list[Path], list[Path]]]
+"""Groups of a new tree's entries, each with the earlier tree's entries they replace together (`swapped`'s
+`replaces`)."""
+
+
+def same_entries(written: Entries, held: Entries) -> Replacements:
     """Each file and folder `written` where `held` holds the same entry, of the same kind: the earlier entry
     it replaces (`swapped`'s `replaces`)."""
-    return {entry: {entry} for entry, kind in written.items()
-            if kind in ("file", "folder") and held.get(entry) == kind}
+    return [([entry], [entry]) for entry, kind in written.items()
+            if kind in ("file", "folder") and held.get(entry) == kind]
 
 
 @contextlib.contextmanager
 def swapped(directory: Path, foreign: Callable[[Entries, Entries, Path], set[Path]], *,
             exchange: Callable[[Path, Path], None] = exchange_directories,
-            replaces: Callable[[Entries, Entries], Mapping[Path, Collection[Path]]] = same_entries
+            replaces: Callable[[Entries, Entries], Replacements] = same_entries
             ) -> Iterator[Path]:
     """A sibling directory to write the whole of `directory` into, which replaces it when the block ends
     in one call, so a write that fails at any file leaves the one `directory` held whole and the one
@@ -252,11 +257,13 @@ def swapped(directory: Path, foreign: Callable[[Entries, Entries, Path], set[Pat
             # release's reshard of its weights) takes the access every one of them allowed, a private file
             # kept private, a new one its umask's (trains 1406 and 1407's reviews), while the staging is
             # still private; its own mode last, just before it is put in place.
-            for entry, earlier in replaces(written, held).items():
+            for entries, earlier in replaces(written, held):
                 if earlier:
+                    # The access every earlier entry allowed, read once for the group.
                     modes = (stat.S_IMODE((directory / each).lstat().st_mode) for each in earlier)
                     allowed = functools.reduce(operator.and_, modes)
-                    (staging / entry).chmod(allowed)
+                    for entry in entries:
+                        (staging / entry).chmod(allowed)
             staging.chmod(stat.S_IMODE(held_at.st_mode))
             if held:
                 exchange(staging, directory)
@@ -268,15 +275,25 @@ def swapped(directory: Path, foreign: Callable[[Entries, Entries, Path], set[Pat
 
 
 def _removed(tree: Path) -> None:
-    """Remove `tree`, a tree of this process's own (a staging, the earlier tree an exchange put there, or a
-    build another writer published before), every folder in it first made writable, as one whose mode an
-    earlier tree's restored read-only is not: no folder of a save left behind (train 1407's review). The
-    live tree is never walked."""
+    """Remove `tree`, a tree of a save's own (a staging, the earlier tree an exchange put there, or a build
+    another writer published before), as far as this process may: a folder whose read-only mode keeps an
+    entry in it (one an earlier tree's mode restored) made writable to remove it, where this process owns
+    it, and no other touched, nor any failure raised, so a cleanup neither fails a save already published
+    nor hides the error it unwinds from (train 1407's review). The live tree is never walked."""
     if not os.path.lexists(tree) or os.path.islink(tree):
         return
-    for here, _, _ in os.walk(tree, followlinks=False):
-        Path(here).chmod(0o700)
-    shutil.rmtree(tree, ignore_errors=True)
+
+    def retried(remove: Callable[[str], None], path: str, failure: BaseException) -> None:
+        folder = os.path.dirname(path)
+        if not isinstance(failure, PermissionError) or os.access(folder, os.W_OK | os.X_OK):
+            return
+        try:
+            os.chmod(folder, 0o700)
+            remove(path)
+        except OSError:
+            return
+
+    shutil.rmtree(tree, onexc=retried)
 
 
 def _made_mode(parent: Path) -> int:
