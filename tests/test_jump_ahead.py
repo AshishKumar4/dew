@@ -15,16 +15,17 @@ from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.objectives.lm import LMObjective
 from dew.training import MeshSpec, Trainer
 
-SEQ, ROWS, VOCAB, ROOMY = 512, 16, 8192, 2**36
+SEQ, ROWS, VOCAB, ROOMY = 512, 32, 32768, 2**36
 TEXT = {"text": (np.arange(ROWS * (SEQ + 1)).reshape(ROWS, SEQ + 1) * 7 % VOCAB).astype(np.int32)}
-"""A batch whose whole logits (8192 tokens by 8192 columns) and whose four layers' activations each weigh
-far more than the decoder's weights."""
+"""A batch whose whole logits (16384 tokens by 32768 columns, 2 GiB) and whose four layers' activations each
+weigh far more than the decoder's weights: a tile of the logits (a fused head's 4096 tokens at a time) frees
+most of them, and the remat its layers' share."""
 
 
 def decoder(limit: int, remat: str | None = None, tiled: bool = False) -> Trainer:
     """The decoder on a compile-only H100 whose allocator holds `limit` bytes, its step whole, recomputing
     as its model's `remat` states, its head tiled where `tiled`."""
-    model = CausalTransformer(vocab_size=VOCAB, emb_features=64, num_layers=4, num_heads=2, mlp_features=256,
+    model = CausalTransformer(vocab_size=VOCAB, emb_features=128, num_layers=4, num_heads=2, mlp_features=512,
                               max_seq_len=SEQ, **({} if remat is None else {"remat": remat}))
     trainer = Trainer(LMObjective(model, seq_len=SEQ), optax.sgd(1e-2), key=jax.random.key(0),
                       mesh=MeshSpec().build(gpus("sm90", limit=limit)), split=1)

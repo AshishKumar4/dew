@@ -58,13 +58,13 @@ def test_a_rung_frees_what_its_peak_falls_by_wherever_the_peak_then_stands():
     """A step whose peak is its layers' backward, its forward's activations live through it, and whose head
     peaks apart: a rung dropping the activations frees what the peak falls by to the head's, not the
     activations' bytes at the old peak, which `LiveSet.frees` reads where the compile states its profile
-    (the 4B decoder's peak moved from its layers' backward to its head); a backward's own temporaries are
-    never dropped."""
+    (the 4B decoder's peak moved from its layers' backward to its head); a rung drops residuals alone, never
+    the head's own values or a backward's temporaries."""
     profile = LiveProfile((held(50, 4, 10, 0, names=("mlp",), residual=True),
                            held(40, 6, 8, 1, op_name=BACKWARD), held(45, 1, 3, 2, op_name=HEAD)))
     assert profile.peak() == 90
     assert profile.frees(lambda op_name, names: "mlp" in names) == 90 - 45
-    assert profile.frees(lambda op_name, names: True) == 90 - 40
+    assert profile.frees(lambda op_name, names: True) == 90 - 45
     at_peak = LiveSet(0, 0, ((50, FORWARD, ("mlp",)), (40, BACKWARD, ())))
     assert at_peak.frees(lambda op_name, names: "mlp" in names) == 50
     profiled = LiveSet(0, 0, at_peak.made, profile)
