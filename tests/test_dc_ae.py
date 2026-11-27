@@ -301,16 +301,11 @@ def test_the_linear_attentions_sums_cancel_past_float32s_range_under_wide_cpu_ar
     np.testing.assert_array_equal(np.asarray(attended), np.full((1, 64, 1, 1), 2.0 ** 20, np.float32))
 
 
-@pytest.mark.parametrize("default", [
-    pytest.param("cpu", marks=pytest.mark.cpu),
-    pytest.param("gpu", marks=[pytest.mark.gpu, pytest.mark.compiles_at_run(
-        reason="an eager call, its programs compiled where it reaches them")])])
-def test_the_linear_attention_called_eagerly_on_cpu_operands_sums_where_they_lie(default):
+def linear_attention_sums_where_its_operands_lie(default: str) -> None:
     """Called eagerly (no jit) on operands committed to the CPU, DC-AE's linear attention takes the CPU's
-    whole sums under wide arithmetic whatever the process's default device, as its jitted call does there:
-    on the CPU lane, and on a GPU tier, whose default device is the accelerator the bug took (train 1393's
-    review: an accelerator-default process took the grouped sums; train 1403's F7, a scheduled tier to
-    protect it)."""
+    whole sums under wide arithmetic whatever the process's default device (`default`, the backend the
+    process runs), as its jitted call does there (train 1393's review: an accelerator-default process took
+    the grouped sums): the CPU lane's test below, and the GPU tier's (tests/test_gpu_dc_ae.py)."""
     assert jax.default_backend() == default
     from dew.nn.autoencoders.dc_ae import linear_attention
 
@@ -321,3 +316,10 @@ def test_the_linear_attention_called_eagerly_on_cpu_operands_sums_where_they_lie
     value[0, [0, 1, 4, 5], 0, 0] = (2.0 ** 27, 2.0 ** 27, -2.0 ** 27, -2.0 ** 26)
     attended = linear_attention(query, key, jax.device_put(jnp.asarray(value), cpu))
     np.testing.assert_array_equal(np.asarray(attended), np.full((1, 64, 1, 1), 2.0 ** 20, np.float32))
+
+
+@pytest.mark.cpu
+def test_the_linear_attention_called_eagerly_on_cpu_operands_sums_where_they_lie():
+    """On the CPU lane, DC-AE's eager linear attention sums where its operands lie
+    (`linear_attention_sums_where_its_operands_lie`)."""
+    linear_attention_sums_where_its_operands_lie("cpu")

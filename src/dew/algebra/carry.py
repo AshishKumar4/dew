@@ -209,15 +209,11 @@ def split(function: Callable, state, operands: Sequence, carried: Sequence[int],
     declared = {1 + index: bound for index, bound in (ranges or {}).items()}
     region = terms.region(closed, declared if state_range is None else {**declared, 0: state_range})
     first = len(closed.jaxpr.constvars)
-    graph = EGraph()
-    program.stated(graph, region)
-    _products(graph, region)
     reading = {first}
     for opaque in region.opaque:
         if any(term is not None and _reads(term, reading) for term in opaque.inputs):
             raise Refused(f"{opaque.equation.primitive.name}: an equation outside the language reads the "
                           "carried state")
-    graph.register(set_(reads(Term.leaf(i64(first)))).to(i64(1)))
     outputs = list(region.outputs)
     if any(output is None for output in outputs):
         raise Refused("a literal output of a carried function")
@@ -225,22 +221,28 @@ def split(function: Callable, state, operands: Sequence, carried: Sequence[int],
     sequential = Term.bundle(Vec[Term](*(roots[index] for index in carried)))
     emitted = [index for index in range(len(roots)) if index not in carried]
     others = Term.bundle(Vec[Term](*(roots[index] for index in emitted)) if emitted else Vec[Term].empty())
-    graph.register(sequential, others)
     facts = seq(rules.FACTS.saturate(), CARRYING.saturate())
-    # Its saturation recorded as a region's rewrite is (`program.reported`): the sets it admitted and fired.
-    began, sized = time.perf_counter(), program.node_count(graph)
     admitted = (CARRIED,) if rules.admits(CARRIED) else ()
-    saturated = program.saturate(graph, region, admitted, saturation, facts)
     schedule = cost.fused(cost.target())
     # The extractor oracle where it is on (`Passes.checked`), as every derivation's (`derive._derived`).
     checked = ALGEBRA.value.checked
-    carry_forms, carried_price = program.extracted(graph, sequential, _carry_priced(region, schedule),
-                                                   checked=checked)
-    emit_forms, _ = program.extracted(graph, others, cost.model(region, schedule), checked=checked)
-    # Recorded with its carry's price, its extraction's (each value it shares once): the work that reads the
-    # state in sequence and the rest, a chunk's; the emitted outputs, extracted apart, are none of it.
-    after = carried_price.sequential.value + carried_price.parallel.value
-    kernel_report.record_rewrite(program.reported(graph, sized, saturated, began, after))
+    # Its saturation's rule sets declared once a thread (`program.fresh_graph`).
+    with program.fresh_graph(rules.FACTS, CARRYING, CARRIED.ruleset) as graph:
+        program.stated(graph, region)
+        _products(graph, region)
+        graph.register(set_(reads(Term.leaf(i64(first)))).to(i64(1)))
+        graph.register(sequential, others)
+        # Its saturation recorded as a region's rewrite is (`program.reported`): the sets it admitted and
+        # fired.
+        began, sized = time.perf_counter(), program.node_count(graph)
+        saturated = program.saturate(graph, region, admitted, saturation, facts)
+        carry_forms, carried_price = program.extracted(graph, sequential, _carry_priced(region, schedule),
+                                                       checked=checked)
+        emit_forms, _ = program.extracted(graph, others, cost.model(region, schedule), checked=checked)
+        # Recorded with its carry's price, its extraction's (each value it shares once): the work that reads
+        # the state in sequence and the rest, a chunk's; the emitted outputs, extracted apart, are none of it.
+        after = carried_price.sequential.value + carried_price.parallel.value
+        kernel_report.record_rewrite(program.reported(graph, sized, saturated, began, after))
     prepared = list({terms.key(term): term for form in (*carry_forms, *emit_forms)
                      for term in _free(form, reading)}.values())
     # Each prepared value's products named by the forms that read it: an emitted output's a local readout's,

@@ -193,23 +193,50 @@ def test_naming_the_grouped_products_kernel_leaves_muons_symmetric_products_thei
     assert default and routes_of(grouped_matmul=other) == default
 
 
+@pytest.mark.mesh(devices=3)
+def test_a_named_syrk_polynomial_refuses_split_coefficients():
+    """A symmetric polynomial named Mosaic SYRK's (interpreted on this CPU) whose matrix is whole on three
+    devices and whose three coefficients an Explicit axis splits, jitted outside the mesh's context: its
+    launch would read the coefficients whole on every device, so the named kernel is refused
+    (`selection.KernelRefused`), as a split matrix is; with the coefficients whole too it runs (train
+    1407's review: its admission read the matrix alone)."""
+    from jax.sharding import AxisType, NamedSharding, PartitionSpec
+
+    from dew.nn.kernels import selection
+
+    mesh = jax.make_mesh((3,), ("x",), axis_types=(AxisType.Explicit,), devices=jax.devices()[:3])
+    rng = np.random.default_rng(14072)
+    draw = rng.normal(size=(64, 64)).astype(np.float32)
+    a = jnp.asarray((draw + draw.T) / 16, jnp.bfloat16)
+    coeffs = jnp.asarray([3.4445, -4.775, 2.0315], jnp.float32)
+    whole, split = NamedSharding(mesh, PartitionSpec()), NamedSharding(mesh, PartitionSpec("x"))
+    polynomial = jax.jit(lambda a, c: gemm.symmetric_polynomial(a, c, symmetric=True, interpret_on_cpu=True))
+    with generation.chosen(syrk="mosaic"):
+        with pytest.raises(selection.KernelRefused):
+            polynomial(jax.device_put(a, whole), jax.device_put(coeffs, split))
+        with generation.routes() as seen:
+            polynomial(jax.device_put(a, whole), jax.device_put(coeffs, whole))
+    assert any(route.kernel == "mosaic" for route in seen), seen
+
+
 def test_syrk_measured_gate_admits_whole_tile_ampere_and_hopper_grams_and_polynomials():
     """`M-NG-45-a100`, `M-NG-45b-gh200` and `M-NG-5` admit whole-tile `mma.sync`/`wgmma` symmetric Grams
     (1.52-1.98x XLA) and polynomials (1.17-1.96x) while keeping ragged shapes and unmeasured `sm100` on
     XLA."""
     bf16 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
+    coeffs = jax.ShapeDtypeStruct((3,), jnp.float32)
     for gpu in ("sm80", "sm90"):
         with generation.assumed(gpu):
-            assert gemm._syrk_select(bf16((28, 2560, 4096)), has_poly=False, transpose=False,
+            assert gemm._syrk_select(bf16((28, 2560, 4096)), transpose=False,
                                      precision=None, out_dtype=jnp.bfloat16, interpret_on_cpu=False)
-            assert not gemm._syrk_select(bf16((4, 150, 200)), has_poly=False, transpose=False,
+            assert not gemm._syrk_select(bf16((4, 150, 200)), transpose=False,
                                          precision=None, out_dtype=jnp.bfloat16, interpret_on_cpu=False)
-            assert gemm._syrk_select(bf16((28, 2560, 2560)), has_poly=True, transpose=False,
+            assert gemm._syrk_select(bf16((28, 2560, 2560)), coeffs, transpose=False,
                                      precision=None, out_dtype=jnp.bfloat16, interpret_on_cpu=False)
-            assert not gemm._syrk_select(bf16((4, 150, 150)), has_poly=True, transpose=False,
+            assert not gemm._syrk_select(bf16((4, 150, 150)), coeffs, transpose=False,
                                          precision=None, out_dtype=jnp.bfloat16, interpret_on_cpu=False)
     with generation.assumed("sm100"):
-        assert not gemm._syrk_select(bf16((28, 2560, 4096)), has_poly=False, transpose=False,
+        assert not gemm._syrk_select(bf16((28, 2560, 4096)), transpose=False,
                                      precision=None, out_dtype=jnp.bfloat16, interpret_on_cpu=False)
 
 

@@ -12,6 +12,7 @@ import contextlib
 import dataclasses
 import functools
 import math
+import threading
 import time
 import weakref
 from collections.abc import Callable, Collection, Hashable, Iterable, Iterator, Mapping, Sequence
@@ -20,7 +21,7 @@ from typing import NamedTuple
 import jax
 import jax.numpy as jnp
 import numpy as np
-from egglog import DagCostModel, EGraph, Schedule, String, Vec, get_callable_args, i64, set_
+from egglog import DagCostModel, EGraph, Ruleset, Schedule, String, Vec, get_callable_args, i64, seq, set_
 from jax._src import ad_util, api_util, config as jax_config
 from jax._src.interpreters import partial_eval
 from jax.core import ShapedArray, eval_jaxpr
@@ -815,18 +816,20 @@ def _region(closed: jcore.Jaxpr, *, accurate: bool, saturation: Saturation,
         return Rewrite(skeleton, {}, report)
     region = terms.region(closed, ranges)
     priced = cost.model(region, cost.fused(cost.target()))
-    graph, bundle, roots = graphed(region)
-    graph.push()
-    saturated = saturate(graph, region, firing, saturation, facts_settled=True)
-    nodes = node_count(graph)
-    # Cross-root sharing (`reuse`: `a / sqrt(v)` sharing a sibling `rsqrt(v)`) ties greedy per-class
-    # extraction (`sqrt` and `rsqrt` price alike per class); exact DAG extraction sees the shared node.
-    forms, after = extracted(graph, bundle, priced, exact=saturated.fired.get("reuse", 0) > 0)
-    changed = any(terms.key(form) != terms.key(root) for root, form in zip(roots, forms, strict=True))
-    graph.pop()
-    before = after
-    if changed:
-        _, before = extract.cheapest(graph, bundle, priced)
+    # Every admitted set declared, the ones that may fire run: one prepared graph a numerics' windows.
+    with fresh_graph(rules.FACTS, *(sets.ruleset for sets in admitted)) as graph:
+        bundle, roots = graphed(region, graph)
+        graph.push()
+        saturated = saturate(graph, region, firing, saturation, facts_settled=True)
+        nodes = node_count(graph)
+        # Cross-root sharing (`reuse`: `a / sqrt(v)` sharing a sibling `rsqrt(v)`) ties greedy per-class
+        # extraction (`sqrt` and `rsqrt` price alike per class); exact DAG extraction sees the shared node.
+        forms, after = extracted(graph, bundle, priced, exact=saturated.fired.get("reuse", 0) > 0)
+        changed = any(terms.key(form) != terms.key(root) for root, form in zip(roots, forms, strict=True))
+        graph.pop()
+        before = after
+        if changed:
+            _, before = extract.cheapest(graph, bundle, priced)
     picked = ({terms.key(root): form for root, form in zip(roots, forms, strict=True)}
               if changed and cost.cheaper(after, before) else {})
     # Every admitted set is reported, one that could not fire here (`rules.firing`) at no match.
@@ -836,16 +839,78 @@ def _region(closed: jcore.Jaxpr, *, accurate: bool, saturation: Saturation,
     return Rewrite(region, picked, report)
 
 
-def graphed(region: terms.Region) -> tuple[EGraph, terms.Term, list[terms.Term]]:
-    """An e-graph of `region`'s terms with the facts its rules read (each term's shape, which arithmetic
-    computes in its operands' dtype, which broadcasts lay along one axis, which literals are powers of two or
-    one, the primitives a stable rule writes), its roots bundled, the facts saturated."""
-    graph = EGraph()
+BLOCKS_HELD = 64
+"""The blocks a prepared e-graph serves (`fresh_graph`) before another is prepared in its place: egglog's pop
+keeps every run's report on the graph it returns to (its overall run report, which each push copies), so a
+graph serving blocks without end would hold every saturation's report and copy them all at each push."""
+IDLE_HELD = 8
+"""The prepared e-graphs a thread keeps between blocks (`fresh_graph`), its least recently returned dropped
+past them: rule sets registered at run time, or another numerics' admitted sets, key graphs no block may ask
+for again."""
+
+
+@dataclasses.dataclass
+class _Lease:
+    """A prepared e-graph (`fresh_graph`), the rule sets declared on it, held so no other object takes one's
+    id while it keys the graph, and the blocks it has served."""
+
+    graph: EGraph
+    sets: tuple[Ruleset, ...]
+    served: int = 0
+
+
+class _Idle(threading.local):
+    """A thread's prepared e-graphs between blocks (`fresh_graph`), by the rule sets declared on each, the
+    most recently returned last."""
+
+    def __init__(self):
+        self.leases: collections.OrderedDict[tuple[int, ...], _Lease] = collections.OrderedDict()
+
+
+_IDLE = _Idle()
+
+
+@contextlib.contextmanager
+def fresh_graph(*sets: Ruleset) -> Iterator[EGraph]:
+    """An e-graph holding no term and no fact for one saturation (a derivation's, a window's, a carry's, a
+    price's, a recognition's), its rule sets `sets`, the ones the block runs, declared: an e-graph of this
+    thread's prepared with them, taken for the block (a block within it that asks for the same sets prepares
+    its own), pushed and popped after it, so nothing a block adds reaches another. An e-graph made afresh
+    for each saturation declared every rule of every set again, the most of a cold derivation's egglog
+    seconds (PF03). A prepared graph serves `BLOCKS_HELD` blocks and waits between them among the thread's
+    `IDLE_HELD` latest; a block that raises drops it (a level of the block's may stand on it). A set the
+    block runs that `sets` does not name is declared within it and dropped with it. A block that pushes
+    pops what it pushed, and nothing holds the graph past the block."""
+    idle = _IDLE.leases
+    key = tuple(id(ruleset) for ruleset in sets)
+    lease = idle.pop(key, None)
+    if lease is None:
+        graph = EGraph()
+        if sets:
+            # Their rules declared, none run (a schedule's rule sets are declared as it is read).
+            graph.run(seq(*sets) * 0)
+        lease = _Lease(graph, sets)
+    lease.graph.push()
+    # A block that raises never returns it: the block's own state may stand on it still.
+    yield lease.graph
+    lease.graph.pop()
+    lease.served += 1
+    if lease.served < BLOCKS_HELD:
+        idle[key] = lease
+        while len(idle) > IDLE_HELD:
+            idle.popitem(last=False)
+
+
+def graphed(region: terms.Region, graph: EGraph) -> tuple[terms.Term, list[terms.Term]]:
+    """`region`'s terms in `graph` (a saturation's own, `fresh_graph`) with the facts its rules read (each
+    term's shape, which arithmetic computes in its operands' dtype, which broadcasts lay along one axis, which
+    literals are powers of two or one, the primitives a stable rule writes): its roots bundled and the roots,
+    the facts saturated."""
     roots = region.roots()
     bundle = terms.Term.bundle(Vec[terms.Term](*roots))
     stated(graph, region, bundle)
     graph.run(rules.FACTS.saturate())
-    return graph, bundle, roots
+    return bundle, roots
 
 
 def dtype_parameter(region: terms.Region, index: int, primitive, params):
@@ -1410,9 +1475,10 @@ def priced(closed: jcore.Jaxpr, target: generation.GpuTarget) -> cost.Seconds:
     gives an XLA program it does not rewrite (a fused GEMM's prologue sides, `fused_gemm.priced`); its
     `Seconds`, whose work no rate of `target` prices its schedule tells (`Schedule.unpriced`)."""
     region = terms.region(_read(closed))
-    graph, bundle, _ = graphed(region)
     schedule = cost.fused(target)
-    found = extract.cheapest(graph, bundle, cost.model(region, schedule))[1]
+    with fresh_graph(rules.FACTS) as graph:
+        bundle, _ = graphed(region, graph)
+        found = extract.cheapest(graph, bundle, cost.model(region, schedule))[1]
     launched = cost.Work(kernels=max(0.0, 1.0 - found.work.kernels))  # its outputs' fusion, at least one
     return found + cost.Seconds(launched, schedule)
 

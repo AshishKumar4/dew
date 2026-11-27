@@ -979,6 +979,12 @@ class Saturation:
 - Sets run in registry order, one iteration each, until no set changes the graph or a limit is reached.
 - The e-graph runs with one thread and is built in equation order, so the same input gives the same output in any
   process (§3).
+- Each saturation (a derivation's, a window's, a carry's, a price's, a recognition's) runs on an e-graph
+  holding no term or fact of another (`program.fresh_graph`): an e-graph of its thread's with the block's rule
+  sets declared, taken for the block (a block within it prepares its own), pushed and popped after it,
+  dropped where a block raises and after `BLOCKS_HELD` blocks (egglog's pop keeps each run's report on the
+  graph it returns to), the thread's `IDLE_HELD` latest kept between blocks. Declaring every rule of every
+  set on an e-graph made afresh for each was most of a cold derivation's egglog work (PF03).
 
 ### 6.7 The program pass
 
@@ -1338,11 +1344,11 @@ def derive_scan(declaration: Scan, *, saturation: Saturation, splits_held: int =
 
 ### 6.10 Marked regions and custom derivatives
 
-These live in `dew.nn.derivatives`, below `dew.algebra`, `surrogate` (row 3271's declaration) among them. What exists: the four kinds, `marked_call_p` with its transform rules and their prototype test,
+These live in `dew.nn.derivatives`, below `dew.algebra`, `surrogate` (row 3271's declaration) among them. What exists: the seven kinds, `marked_call_p` with its transform rules and their prototype test,
 `surrogate`, the precision transforms marked `Protected`, and the pass reading a marked call's kind
-(`program._within`, `program._opened`: a protected call an opaque leaf, a surrogate's and a kernel glue's body
-rewritten within its call, an Algebra span opened into the region around it, its call kept where no form
-lands), the declaring functions (`declared_derivative`, `declared_tangent`, `surrogate`), and the slop check
+(`program._within`, `program._opened`: a protected call, a kernel walk's step and a rare span's verdict opaque
+leaves, a surrogate's, a kernel glue's and an activation's body rewritten within its call (`program.WITHIN`),
+an Algebra span opened into the region around it, its call kept where no form lands), the declaring functions (`declared_derivative`, `declared_tangent`, `surrogate`), and the slop check
 (SLOP026): every custom derivative in `src/dew` is declared through them.
 
 ```python
@@ -1351,8 +1357,15 @@ class Surrogate: ...                  # a declared surrogate gradient's bodies
 class KernelGlue: ...                 # a kernel derivative's XLA around its launches
 class Algebra: ...                    # a derivative written only to restructure algebra: rewritten freely, and
                                       # retired once the engine derives its form
+class WalkStep: ...                   # a kernel walk's step index, which a count of its work by emission reads
+                                      # as one step; inlined, its index
+class Activation: ...                 # an activation's region (name, gated): it ends the pass's region, and a
+                                      # gated one a fusion replays as a matmul's epilogue (§1.2)
+class Rare: ...                       # the verdict a kernel's rare span runs by, which a count of its work
+                                      # reads as its common value; inlined, its value
 
-Kind = Protected | Surrogate | KernelGlue | Algebra
+Kind = Protected | Surrogate | KernelGlue | Algebra | WalkStep | Activation | Rare
+TangentKind = Protected | KernelGlue | Algebra   # what a tangent rule is declared as (`declared_tangent`)
 
 marked_call_p: jax.extend.core.Primitive   # a call: params call_jaxpr (a ClosedJaxpr) and kind (a Kind instance)
 

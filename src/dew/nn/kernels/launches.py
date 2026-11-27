@@ -6,6 +6,7 @@ operands an automatic mesh axis splits, where every device would run the whole b
 import contextlib
 import contextvars
 import functools
+import threading
 from collections.abc import Callable, Sequence
 
 import jax
@@ -52,14 +53,21 @@ def _register_mosaic_gpu(prim: jax_core.Primitive, value: Callable) -> None:
     _MOSAIC_GPU_REGISTERED.add(prim)
 
 
+_MOSAIC_GPU_REGISTERING = threading.Lock()
+
+
 def _register_mosaic_gpu_lowerings() -> None:
-    """Register Dew's primitive owners' Pallas Mosaic GPU lowerings on first `kernel` (rows 9795, 12330)."""
+    """Register Dew's primitive owners' Pallas Mosaic GPU lowerings on first `kernel` (rows 9795, 12330),
+    every one before any caller goes on to lower: the Pallas Mosaic GPU lowering cache keys a lowering by the
+    rules it reaches, by identity, and discards one whose rules changed as it lowered, so a kernel launched
+    on one thread while another installed a rule would read another registry (row 13752)."""
     from dew.algebra import scaled
     from dew.nn import division
 
-    _register_mosaic_gpu(division.correctly_rounded_divide_p, division.software_divide)
-    for made, (value, _) in scaled.MADE.items():
-        _register_mosaic_gpu(made, value)
+    with _MOSAIC_GPU_REGISTERING:
+        _register_mosaic_gpu(division.correctly_rounded_divide_p, division.software_divide)
+        for made, (value, _) in scaled.made().items():
+            _register_mosaic_gpu(made, value)
 
 
 def pallas_call(kernel: Callable, *, name: str, **params) -> Callable:

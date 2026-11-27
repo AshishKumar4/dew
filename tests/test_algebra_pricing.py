@@ -10,7 +10,7 @@ import numpy as np
 import pytest
 from reference_error import assert_as_exact
 from test_algebra import rows
-from test_algebra_program import two_products_summed
+from test_algebra_program import two_products_summed, written_price
 
 from dew import algebra
 from dew.algebra import cost, program, terms
@@ -66,9 +66,7 @@ def test_xlas_schedule_prices_each_kernel_its_parts_fixed_latency():
 
     def priced(fn, *shapes):
         region = terms.region(jax.make_jaxpr(fn)(*(jnp.ones(shape, jnp.bfloat16) for shape in shapes)))
-        graph, bundle, _ = program.graphed(region)
-        return graph.extract(bundle, include_cost=True, extractor="greedy-dag",
-                             cost_model=cost.model(region, schedule))[1].work
+        return written_price(region, schedule).work
 
     traced = priced(lambda a, b: jnp.sum(jnp.dot(a, b), axis=-1), (64, 64), (64, 64))
     assert traced.kernels == 2
@@ -92,9 +90,7 @@ def test_xlas_schedule_on_a_tpu_prices_what_its_kernels_keep_in_vmem(target_name
     def kept(fn, *shapes):
         with program.passes(target=target_name):
             region = terms.region(jax.make_jaxpr(fn)(*(jnp.ones(shape, jnp.float32) for shape in shapes)))
-            graph, bundle, _ = program.graphed(region)
-            return graph.extract(bundle, include_cost=True, extractor="greedy-dag",
-                                 cost_model=cost.model(region, cost.fused(tpu)))[1].work
+            return written_price(region, cost.fused(tpu)).work
 
     product, summed = kept(jnp.dot, (64, 128), (128, 256)), kept(lambda x: jnp.sum(x, axis=-1), (64, 128))
     assert product.kept_bytes == 4 * (64 * 128 + 128 * 256 + 2 * 64 * 256)
@@ -158,9 +154,7 @@ def test_a_derivatives_sum_is_priced_as_the_sum_it_computes(dtype):
         if (out := traced.jaxpr.eqns[-1]).primitive is add_jaxvals_p:
             assert terms.spoken_as(out) == ("add" if dtype == jnp.float32 else None)
         region = terms.region(traced)
-        graph, bundle, _ = program.graphed(region)
-        return graph.extract(bundle, include_cost=True, extractor="greedy-dag",
-                             cost_model=cost.model(region, cost.fused(generation.TARGETS["sm90"])))[1].work
+        return written_price(region, cost.fused(generation.TARGETS["sm90"])).work
 
     accumulated = priced(lambda x, y: add_jaxvals_p.bind(x * y, x))
     added = priced(lambda x, y: x * y + x)
@@ -179,9 +173,7 @@ def test_a_product_of_two_16_bit_formats_is_priced_at_the_dtype_jax_gives_it():
 
     a, b = jnp.ones((2, 3), jnp.bfloat16), jnp.ones((3, 4), jnp.float16)
     region = terms.region(jax.make_jaxpr(product)(a, b))
-    graph, bundle, _ = program.graphed(region)
-    work = graph.extract(bundle, include_cost=True, extractor="greedy-dag",
-                         cost_model=cost.model(region, cost.fused(generation.TARGETS["v5e"])))[1].work
+    work = written_price(region, cost.fused(generation.TARGETS["v5e"])).work
     made = jax.eval_shape(product, a, b).dtype.itemsize
     assert work.kept_bytes == 2 * (2 * 3 + 3 * 4) + 2 * made * (2 * 4)
 
@@ -260,10 +252,7 @@ def test_a_products_mode_prices_it():
 
         a, b = (jnp.ones((64, 64), dtype) for _ in range(2))
         region = terms.region(jax.make_jaxpr(contracted)(a, b))
-        graph, bundle, _ = program.graphed(region)
-        _, price = graph.extract(bundle, include_cost=True, extractor="greedy-dag",
-                                 cost_model=cost.model(region, cost.fused(cost.target("sm90"))))
-        return price.work
+        return written_price(region, cost.fused(cost.target("sm90"))).work
 
     half, tf32, highest = (product(None, jnp.bfloat16), product(jax.lax.Precision.DEFAULT, jnp.float32),
                            product(jax.lax.Precision.HIGHEST, jnp.float32))
@@ -290,10 +279,7 @@ def _priced(fn, *shapes, schedule=None):
     where none is given) and its traced program."""
     traced = jax.make_jaxpr(fn)(*(jnp.ones(shape, jnp.float32) for shape in shapes))
     region = terms.region(traced)
-    graph, bundle, _ = program.graphed(region)
-    _, price = graph.extract(bundle, include_cost=True, extractor="greedy-dag", cost_model=cost.model(
-        region, schedule or cost.fused(generation.TARGETS["sm90"])))
-    return price, traced
+    return written_price(region, schedule or cost.fused(generation.TARGETS["sm90"])), traced
 
 
 @pytest.mark.parametrize("name", ["power", "clamp", "exponential", "selection", "conversion", "reduction"])

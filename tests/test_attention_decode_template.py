@@ -1734,30 +1734,36 @@ def test_softcap_and_windowed_decode_compile_spill_free(generation_name, case):
     assert not (failed := mosaic_failures(found)), "\n".join(failed)
 
 
+@pytest.mark.parametrize("dtype", [jnp.bfloat16, jnp.float32], ids=["bf16", "fp32"])
 @pytest.mark.parametrize("finished", [True, False], ids=["finished", "state"])
-def test_a_decode_plan_prices_the_merge_its_walk_launches(finished):
+def test_a_decode_plan_prices_the_merge_its_walk_launches(finished, dtype):
     """An H100's step of four query heads over two key heads and 4096 keys, finished under an output gate (a
     parameter of its output's layout) or unfinished and unhooked, its walk pinned to a WGMMA tile and two
     slices, its values 32 wide: its priced merge (`merge_launch_for`, the launch `_merge_seconds` prices) the
     one its walk's own outputs make (`merged.merge_launch` of the types its pinned launch writes, as
     `attend` runs it): their operands' shapes, its columns its family's column unit's past `head_width`'s,
     which alone priced fewer than it writes, its walk's units at the call's scale, the rows and columns it
-    keeps, the dtype and heads it writes and its output hook alike (train 1402's K-F3 review)."""
+    keeps, the dtype and heads it writes and its output hook alike (train 1402's K-F3 review); in bf16 and in
+    fp32, whose walk stages its operands' bf16 parts and pads their 32 columns to 64, where its query's
+    dtype priced 32 (`attention_mosaic.staged_dtype`, train 1407's K-F3 review)."""
     width, slices = 32, 2
     tiles = attention_mosaic.Tiles(64, 64, 2, 1, family="wgmma")
-    query = jnp.zeros((1, 1, 4, width), jnp.bfloat16)
-    key = jax.ShapeDtypeStruct((1, 4096, 2, width), jnp.bfloat16)
+    query = jnp.zeros((1, 1, 4, width), dtype)
+    # Keys as arrays: an fp32 step's operands enter as their bf16 parts (`product.stacked`).
+    key = jnp.zeros((1, 4096, 2, width), dtype)
     spans = template.spans(1, 4096, 1, causal=False)
-    gate = jnp.ones((1, 1, 4, width), jnp.bfloat16)
+    gate = jnp.ones((1, 1, 4, width), dtype)
     hooks = (template.Hooks(output=Hook(lambda out, gate: out * gate, (Side(gate, template.Kind.OUTPUT),)))
              if finished else template.Hooks())
     descriptor = (hooks.output, 4) if finished else None
-    with generation.assumed("sm90"):
+    # An fp32 walk's parts are the default precision's alone (`MosaicForward.refusal`); the suite runs at
+    # HIGHEST.
+    with generation.assumed("sm90"), jax.default_matmul_precision("default"):
         target = generation.gpu_target()
         _, rows, row_spans, whole = attention_decode.planned(query, key, key, spans, hooks, finished=finished)
-        priced = attention_decode.merge_launch_for(rows, key, row_spans, whole, tiles, slices, scale=None,
-                                                   target=target, initial=None, finished=descriptor,
-                                                   deferred=False)
+        priced = attention_decode.merge_launch_for(rows, key, key, row_spans, whole, tiles, slices,
+                                                   scale=None, target=target, initial=None,
+                                                   finished=descriptor, deferred=False)
         stateless = dataclasses.replace(whole, initial=None, output=NO_HOOK)
         with tuning.pinned({attention_mosaic.MosaicForward: tiles}):
             walked = jax.eval_shape(lambda rows, key: attention_mosaic.forward(
