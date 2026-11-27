@@ -883,7 +883,7 @@ class PackedDecode:
         return jnp.asarray(np.asarray(self))
 
 
-def _decoding() -> contextlib.AbstractContextManager[object]:
+def _decoding() -> contextlib.AbstractContextManager[None]:
     """Where a packed leaf's host planes are decoded: this process's CPU, so no accelerator holds them; a
     process whose JAX runs no CPU backend (`JAX_PLATFORMS=cuda`) its default device, the decode the same
     integer arithmetic, exact on either (audit 2026-11-27 P03: the CPU asked for unconditionally there
