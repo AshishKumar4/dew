@@ -23,7 +23,6 @@ from __future__ import annotations
 import contextlib
 import dataclasses
 import json
-import re
 import tempfile
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from pathlib import Path, PurePath
@@ -43,6 +42,7 @@ from dew.interop.safetensors_io import (
     joined_tensors,
     save_sharded,
     tensor_specs,
+    weight_shard,
     weight_stem,
     write_file,
 )
@@ -123,23 +123,23 @@ def replaced_entries(written: Entries, held: Entries) -> Replacements:
             *[(group, earlier.get(key, [])) for key, group in shards.items()]]
 
 
+class ConcurrentRelease(FileExistsError):
+    """A release another save published while this one was written, under its shards' names: the first
+    kept, this one refused (`refused_entries`)."""
+
+
 def refused_entries(written: Entries, held: Entries, directory: Path) -> set[Path]:
     """What keeps a release from replacing the tree at `directory`, read under the publication lock
-    (`swapped`'s `foreign`): its foreign entries (`foreign_entries`); and raised, a shard of its weights
-    the earlier tree holds under the same name, which only a save that published while this one was
-    written names alike (each replacement's shards named apart, `save_sharded`), so a reader holding that
-    save's index never opens this one's shards under its names (train 1411's review)."""
+    (`swapped`'s `foreign`): its foreign entries (`foreign_entries`); and raised (`ConcurrentRelease`), a
+    shard of its weights the earlier tree holds under the same name, which only a save that published
+    while this one was written names alike (each replacement's shards named apart, `save_sharded`), so a
+    reader holding that save's index never opens this one's shards under its names (train 1411's review)."""
     shards = sorted(entry for entry, kind in written.items()
-                    if kind == "file" and held.get(entry) == "file" and _SHARD.search(entry.name)
-                    and weight_stem(entry.name) is not None)
+                    if kind == "file" and held.get(entry) == "file" and weight_shard(entry.name))
     if shards:
-        raise FileExistsError(f"{directory} was published by another save while this one was written, under "
-                              f"its shards' names {list(map(str, shards))}: save again")
+        raise ConcurrentRelease(f"{directory} was published by another save while this one was written, "
+                                f"under its shards' names {list(map(str, shards))}: save again")
     return foreign_entries(written, held, directory)
-
-
-_SHARD = re.compile(r"-\d{5}-of-\d{5}\.safetensors$")
-"""A weight shard's name's ending, `-00001-of-00002.safetensors`, beside its stem and any token."""
 
 
 def foreign_entries(written: Entries, held: Entries, directory: Path) -> set[Path]:

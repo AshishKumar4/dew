@@ -420,12 +420,21 @@ def weight_stem(name: str) -> str | None:
     return None
 
 
+def weight_shard(name: str) -> bool:
+    """Whether a directory's entry `name` is a shard of a stem's weights (`_shards`), not its single file or
+    its index."""
+    return any(_shards(stem).fullmatch(name) for stem in WEIGHT_STEMS)
+
+
+def _shards(stem: str) -> re.Pattern[str]:
+    """A weights stem's shards, named as `save_sharded` (`<stem>-<token>-00001-of-00002`) and transformers'
+    and diffusers' `save_pretrained` (`<stem>-00001-of-00002`) name them."""
+    return re.compile(rf"{re.escape(stem)}-(?:[0-9a-f]{{8}}-)?\d{{5}}-of-\d{{5}}\.safetensors")
+
+
 def _replaced(stem: str) -> re.Pattern[str]:
-    """The weight files an export under `stem` replaces: the single file, and shards named as
-    `save_sharded` (`<stem>-<token>-00001-of-00002`) and transformers' and diffusers'
-    `save_pretrained` (`<stem>-00001-of-00002`) name them."""
-    escaped = re.escape(stem)
-    return re.compile(rf"{escaped}\.safetensors|{escaped}-(?:[0-9a-f]{{8}}-)?\d{{5}}-of-\d{{5}}\.safetensors")
+    """The weight files an export under `stem` replaces: the single file, and its shards (`_shards`)."""
+    return re.compile(rf"{re.escape(stem)}\.safetensors|{_shards(stem).pattern}")
 
 
 def save_sharded(

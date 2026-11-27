@@ -601,17 +601,23 @@ def test_two_first_saves_written_together_publish_one_under_its_names(tmp_path):
     """Two saves to a destination not yet made, written together, both name their shards as their library
     does: the one that publishes first keeps them, and the other is refused rather than put in its place
     under the same names a reader holding the first's index opens (train 1411's review)."""
+    import os
+
     from dew._files import swapped
-    from dew.interop.releases import Placed, ReleasePlan, refused_entries
-    from dew.interop.safetensors_io import save_sharded
+    from dew.interop.releases import ConcurrentRelease, Placed, ReleasePlan, refused_entries
 
     weight = np.arange(4096, dtype=np.float32).reshape(64, 64)
     target = tmp_path / 'release'
-    first = ReleasePlan(Placed({'': ({'model_type': 'tiny'}, {'model.a': weight, 'model.b': weight + 1})}))
-    with pytest.raises(FileExistsError), swapped(target, refused_entries) as staging:
-        # Named while the destination holds nothing, then the other save publishes, then this one commits.
-        save_sharded({'model.a': weight * 2, 'model.b': weight * 3}, staging, max_shard_size=20000)
-        first.write(target, max_shard_size=20000)
+
+    def plan(scale):
+        return ReleasePlan(Placed({'': ({'model_type': 'tiny'}, {'model.a': weight * scale,
+                                                                 'model.b': weight + scale})}))
+
+    with pytest.raises(ConcurrentRelease), swapped(target, refused_entries) as staging:
+        # The same release's files, named while the destination holds nothing (its staging written in
+        # place), then the other save publishes, then this one commits.
+        plan(2).write(staging, max_shard_size=20000, fresh=True)
+        plan(1).write(target, max_shard_size=20000)
+    assert not os.path.lexists(staging)
     shards = sorted(path.name for path in target.glob('model-*.safetensors'))
     assert len(shards) > 1 and all(name.startswith('model-0') for name in shards), shards
-    assert not any(path.name.startswith('.release') for path in tmp_path.iterdir())
