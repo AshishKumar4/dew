@@ -4,6 +4,7 @@ forward's and a backward's programs read alike: the call's padding to a launch's
 and each tile's coordinates (`_Program`, `_Spans`, `_coords`), its hooks' parameters and state (`_Hooked`,
 `_param`)."""
 
+import contextlib
 import dataclasses
 import functools
 import math
@@ -17,6 +18,7 @@ import jax.extend.core as jax_core
 import jax.numpy as jnp
 import numpy as np
 from jax import lax
+from jax.core import ShapedArray
 from jax.experimental import pallas as pl
 
 from dew.nn.kernels import generation
@@ -1984,11 +1986,11 @@ def _pointwise_tiles(hook: Callable, kinds: tuple[Kind, ...], dtypes: tuple[str,
         tile = (POINTWISE_ROWS, columns)
         params = [jax.ShapeDtypeStruct(() if kind is Kind.HEAD else tile, kept)
                   for kind, kept in zip(kinds, dtypes, strict=True)]
-        try:
+        closed = None
+        with contextlib.suppress(TypeError, ValueError):  # a hook of a fixed width's traces at no other
             closed = jax.make_jaxpr(hook)(jax.ShapeDtypeStruct(tile, jnp.float32), *params)
-        except (TypeError, ValueError):
-            return None
-        held = all(np.ndim(const) == 0 for const in closed.consts) and _acts_by_entry(closed.jaxpr, tile)
+        held = (closed is not None and all(np.ndim(const) == 0 for const in closed.consts)
+                and _acts_by_entry(closed.jaxpr, tile))
         return closed if held else None
 
     full = traced(width)
@@ -2000,8 +2002,15 @@ def _pointwise_tiles(hook: Callable, kinds: tuple[Kind, ...], dtypes: tuple[str,
         if narrow is None or _encoded(narrow.jaxpr, narrow.consts) != _encoded(full.jaxpr, full.consts):
             return None
         columns //= 2
-    return tuple(jnp.dtype(var.aval.dtype).name for eqn in full.jaxpr.eqns for var in eqn.outvars
-                 if tuple(var.aval.shape) == (POINTWISE_ROWS, width))
+    return tuple(jnp.dtype(_aval(var).dtype).name for eqn in full.jaxpr.eqns for var in eqn.outvars
+                 if tuple(_aval(var).shape) == (POINTWISE_ROWS, width))
+
+
+def _aval(var) -> ShapedArray:
+    """A traced value's abstract value, an array's (every value an output hook's program makes)."""
+    aval = var.aval
+    assert isinstance(aval, ShapedArray), aval
+    return aval
 
 
 def _acts_by_entry(jaxpr: jax_core.Jaxpr, tile: tuple[int, int]) -> bool:
@@ -2030,13 +2039,13 @@ def _encoded(jaxpr: jax_core.Jaxpr, consts=()) -> tuple:
     results' dtypes; its constants' values. Two traces of one program at two widths encode alike."""
     names = {var: index for index, var in enumerate((*jaxpr.constvars, *jaxpr.invars))}
 
-    def operand(var):
+    def operand(var) -> tuple | int:
         if isinstance(var, jax_core.Literal):
-            return ("literal", repr(var.val), str(var.aval.dtype))
+            return ("literal", repr(var.val), str(_aval(var).dtype))
         return names[var]
 
     def parameter(value):
-        if isinstance(value, jax_core.ClosedJaxpr):
+        if isinstance(getattr(value, "jaxpr", None), jax_core.Jaxpr):
             return _encoded(value.jaxpr, value.consts)
         if isinstance(value, jax_core.Jaxpr):
             return _encoded(value)
@@ -2044,12 +2053,12 @@ def _encoded(jaxpr: jax_core.Jaxpr, consts=()) -> tuple:
             return tuple(parameter(each) for each in value)
         return repr(value)
 
-    encoded = [tuple(repr(np.asarray(const).tolist()) for const in consts)]
+    encoded: list[tuple] = [tuple(repr(np.asarray(const).tolist()) for const in consts)]
     for eqn in jaxpr.eqns:
         params = tuple(sorted((name, parameter(value)) for name, value in eqn.params.items()
                               if name != "shape"))
         encoded.append((eqn.primitive.name, tuple(operand(var) for var in eqn.invars), params,
-                        tuple(str(var.aval.dtype) for var in eqn.outvars)))
+                        tuple(str(_aval(var).dtype) for var in eqn.outvars)))
         names.update((var, len(names)) for var in eqn.outvars)
     encoded.append(tuple(operand(var) for var in jaxpr.outvars))
     return tuple(encoded)
