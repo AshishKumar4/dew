@@ -301,10 +301,12 @@ def _removed(tree: Path) -> None:
     it, and no other touched, nor any failure raised, so a cleanup neither fails a save already published
     nor hides the error it unwinds from (train 1407's review). The live tree is never walked.
 
-    Walked bottom-up through descriptors (`os.fwalk`, no link followed), each folder's entries removed, and
-    a removal its mode refuses retried, through the very descriptor the walk holds of that folder: a folder
-    or a link put in the tree's place meanwhile is neither changed nor followed (trains 1414 and 1423's
-    reviews). The root's own parent, the release's, is never changed."""
+    Walked through descriptors (`os.fwalk`, no link followed), top-down first, each folder of this
+    process's own given its owner's read, write and search through the descriptor the walk holds of it
+    before the walk looks up or descends into its entries (`_opened`: a `0400` build lists its entries but
+    reaches none, train 1430's review), then bottom-up, each folder's entries removed through the descriptor
+    held of it: a folder or a link put in the tree's place meanwhile is neither changed nor followed (trains
+    1414 and 1423's reviews). The root's own parent, the release's, is never changed."""
     if not os.path.lexists(tree) or os.path.islink(tree):
         return
     log = logging.getLogger(__name__)
@@ -313,6 +315,8 @@ def _removed(tree: Path) -> None:
         log.warning("could not read %s of a save's discarded tree: %s", error.filename, error)
 
     try:
+        for _, _, _, held in os.fwalk(tree, onerror=unread, follow_symlinks=False):
+            _opened(held, log)
         for _, folders, files, held in os.fwalk(tree, topdown=False, onerror=unread, follow_symlinks=False):
             for name in (*files, *folders):
                 _removed_in(held, name, log)
@@ -326,22 +330,24 @@ def _removed(tree: Path) -> None:
         log.warning("could not remove a save's discarded tree %s: %s", tree, left)
 
 
+def _opened(folder: int, log: logging.Logger) -> None:
+    """The folder the descriptor `folder` holds given its owner's read, write and search where this process
+    owns it and its mode withholds any (`_removed`); a folder of another's left as it is, a failure logged,
+    not raised."""
+    try:
+        held = os.fstat(folder)
+        if held.st_uid == os.geteuid() and held.st_mode & 0o700 != 0o700:
+            os.fchmod(folder, 0o700)
+    except OSError as kept:
+        log.warning("could not open a folder of a save's discarded tree to its owner: %s", kept)
+
+
 def _removed_in(folder: int, name: str, log: logging.Logger) -> None:
     """Remove the entry `name` of the folder the descriptor `folder` holds (a folder, emptied already, or
-    any other entry, a link not followed), its folder made writable to retry where its mode refuses the
-    removal and this process owns it; a failure logged, not raised."""
+    any other entry, a link not followed); a failure logged, not raised."""
     try:
         kind = os.stat(name, dir_fd=folder, follow_symlinks=False).st_mode
-        remove = os.rmdir if stat.S_ISDIR(kind) else os.unlink
-        try:
-            remove(name, dir_fd=folder)
-        except PermissionError:
-            held = os.fstat(folder)
-            # Only a folder of this process's own whose mode keeps the entry: no other touched.
-            if held.st_uid != os.geteuid() or held.st_mode & 0o300 == 0o300:
-                raise
-            os.fchmod(folder, 0o700)
-            remove(name, dir_fd=folder)
+        (os.rmdir if stat.S_ISDIR(kind) else os.unlink)(name, dir_fd=folder)
     except OSError as left:
         log.warning("could not remove %s from a save's discarded tree: %s", name, left)
 
@@ -438,15 +444,12 @@ def _keeps_folder_group(parent: Path) -> bool | None:
     egid = os.getegid()
     others = sorted(set(os.getgroups()) - {egid}) or ([egid + 1] if os.geteuid() == 0 else [])
     probe = _beside(parent / "probe", ".group")
-    before = parent.stat()
     probe.mkdir(0o700)
     try:
-        made, after = probe.stat(), parent.stat()
-        if (not made.st_mode & stat.S_ISGID and before.st_gid == after.st_gid != egid
-                and not (before.st_mode | after.st_mode) & stat.S_ISGID):
-            # Made in a folder that was not setgid throughout, of another group than the maker's: its
-            # group answers.
-            return made.st_gid == after.st_gid
+        # Read off the probe alone, setgid cleared, never off `parent`, whose group may change between any
+        # two reads of it (train 1430's review: two snapshots agreeing across a regrouping read a group the
+        # probe was never made under).
+        made = probe.stat()
         probe.chmod(0o700)
         if made.st_gid == egid:
             if not others:

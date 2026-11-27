@@ -294,6 +294,25 @@ def test_a_read_only_folder_replaced_leaves_no_tree_behind(tmp_path):
     assert left == ["release"], left
 
 
+def test_a_build_published_second_is_removed_whole_where_its_owner_cannot_search_it(tmp_path):
+    """A build that loses its publication to another writer, each folder of it readable to its owner but
+    not searchable (`0400`), a file and a folder in each, is removed whole: each folder is opened to its
+    owner before its entries are looked up (train 1430's review: the first lookup failed, and the build
+    was left beside the release)."""
+    directory = tmp_path / "published"
+    directory.mkdir()
+    (directory / "who").write_text("first")
+    built = tmp_path / "built"
+    (built / "inner").mkdir(parents=True)
+    (built / "who").write_text("second")
+    (built / "inner" / "weights").write_text("second")
+    (built / "inner").chmod(0o400)
+    built.chmod(0o400)
+    assert not published(built, directory)
+    assert not built.exists()
+    assert (directory / "who").read_text() == "first"
+
+
 def test_a_release_takes_the_group_of_the_tree_it_replaces_as_the_lock_finds_it(tmp_path):
     """A publisher that began against no tree, which another published while it wrote, publishes in the
     group and setgid inheritance of the tree it replaces as its publication lock finds it, every entry of
