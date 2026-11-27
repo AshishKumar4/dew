@@ -190,7 +190,9 @@ def indexer_log_target(query, key, keep, scale: float, *, dtype=None):
 
     zeros = jnp.zeros((batch, length, total), wide)
     (high, low), _ = jax.lax.scan(head, (zeros, zeros), (query, key))
-    return jnp.where(jnp.isfinite(peak), held + jnp.log(high + low), -jnp.inf)
+    # An allowed key's mass however its heads' logits gave it, a NaN's too (an invalid logit surfaces, never
+    # read as a hidden key's none).
+    return jnp.where(keep & seen, held + jnp.log(high + low), -jnp.inf)
 
 
 def indexer_target(query, key, keep, scale: float, *, dtype=None):

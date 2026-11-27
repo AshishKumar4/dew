@@ -453,11 +453,10 @@ def selected_attention(query, key, value, selected, bounds, *, own=None, slots=N
                          slots=rowed(slots), causal=causal)
     key, value = (jnp.repeat(each, shared, axis=2) for each in (key, value))
     if (sinks := options.get("sinks")) is not None:
-        # A head's sinks, or a query's own `[B, Q, R * h]`, at each selection's row and its heads: `[B * R,
-        # Q, h]`, a query's own for each row's heads.
+        # A head's sinks, or a query's own `[B, Q, R * h]`, at each selection's row and its heads, laid as its
+        # queries are (`batched`): `[B * R, Q, h]`.
         laid = jnp.broadcast_to(sinks, (rows, queries, heads)) if sinks.ndim == 1 else sinks
-        options = {**options, "sinks": laid.reshape(rows, queries, groups, per).transpose(0, 2, 1, 3).reshape(
-            rows * groups, queries, per)}
+        options = {**options, "sinks": batched(laid[..., None], per)[..., 0]}
     out = scaled_dot_product_attention(batched(query, per), batched(key, 1), batched(value, 1),
                                        causal=causal and slots is None, key_runs=runs,
                                        key_valid=rowed(key_valid), implementation=implementation, **options)

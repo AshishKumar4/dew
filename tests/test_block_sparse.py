@@ -417,6 +417,14 @@ def test_msas_indexer_loss_holds_a_token_its_branch_scores_far_below_the_attenti
     mass = np.exp(-110.0) / (1 + np.exp(-110.0))
     terms = np.asarray([(1 - mass) * np.log1p(-mass), mass * np.log(mass), mass * 2.0**126]) / 2
     assert_fp32_reduction_bound(np.asarray(found)[0, 1], terms.sum(), np.abs(terms).sum(), len(terms) + 2)
+    # The same mass against scores fp32's largest and least, a gap past fp32's range: its term 2 F e^-110,
+    # its weight and its score's shares met in their logarithms.
+    spanned = jnp.asarray([[[[0.0, -np.inf], [largest, -largest]], [[0.0, -np.inf], [0.0, 0.0]]]],
+                          jnp.float32)
+    found = block_sparse.msa_query_kls(spanned, rare, farther, jnp.zeros((1, 2, 2, 1), jnp.int32), block=2,
+                                       scale=1.0)
+    terms = np.asarray([(1 - mass) * np.log1p(-mass), mass * np.log(mass), mass * 2.0 * float(largest)]) / 2
+    assert_fp32_reduction_bound(np.asarray(found)[0, 1], terms.sum(), np.abs(terms).sum(), len(terms) + 2)
     # The first query selects its own token alone (the second is past it), scored fp32's least.
     hidden = jnp.asarray([[[[-largest, 0.0], [0.0, 0.0]]]], jnp.float32)
     assert np.asarray(loss(hidden))[0, 0] == 0.0
@@ -503,6 +511,11 @@ def test_infllm_attention_takes_each_rows_cut_at_its_real_keys():
     sinks = jnp.asarray([0.5, -1.0, 2.0, 0.0], jnp.float32)
     draw = _drawn(rows, queries, heads, groups, width)
 
+    def drawn(seed: int):
+        # Each row's own output's cotangent: the first's over its real queries.
+        query, key, value, dout = draw(seed)
+        return query, key, value, (dout[0, :real], dout[1])
+
     def ours(query, key, value):
         out = block_sparse.infllm_attention(query, key, value, key_valid=valid, sinks=sinks, **shape)
         return out[0, :real], out[1]
@@ -514,7 +527,7 @@ def test_infllm_attention_takes_each_rows_cut_at_its_real_keys():
                                              implementation="xla", **shape)
         return short[0], long[0]
 
-    assert_as_exact(jax.jit(with_gradients(ours)), jax.jit(with_gradients(alone)), draw,
+    assert_as_exact(jax.jit(with_gradients(ours)), jax.jit(with_gradients(alone)), drawn,
                     "InfLLM-V2's cut at each row's real keys", seeds=SEEDS)
 
 

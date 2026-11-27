@@ -315,7 +315,8 @@ def msa_query_kls(index_scores: jax.Array, query: jax.Array, key: jax.Array, sel
         shares = jnp.exp(logged - top)
         total = compensated_sum(shares, (shares.ndim - 1,))[..., None]
         log_target = jnp.where(total > 0, logged - top - jnp.log(jnp.where(total > 0, total, 1)), -jnp.inf)
-        taken = jnp.isfinite(log_target)
+        # A key of the teacher's mass, a NaN's too (a teacher's invalid logit surfaces, never read as none).
+        taken = keep & (log_target != -jnp.inf)
         target = jnp.exp(log_target)
         # KL = sum t log t + sum t (m - s) + log sum exp(s - m) over the selected keys alone, m their peak:
         # each gap m - s taken before its weight, none rounded away by a weighted mean, and one past fp32's
@@ -325,18 +326,29 @@ def msa_query_kls(index_scores: jax.Array, query: jax.Array, key: jax.Array, sel
         peak = jax.lax.stop_gradient(jnp.max(scores, axis=-1, keepdims=True))
         peak = jnp.where(jnp.isfinite(peak), peak, 0)
         spread = jnp.log(jnp.sum(jnp.where(keep, jnp.exp(scores - peak), 0), axis=-1))
-        # Each term at its share of the groups' mean, its weight and its gap met in their logarithms where
-        # the gap is finite and positive (the product in range however small the weight, divided by the
-        # groups there), and its peak's and score's shares apart where the gap passes fp32's range: no group's
-        # own KL past fp32's range is rounded before the mean.
+        # Each term at its share of the groups' mean, taken as its product and then divided where the
+        # product holds in fp32, its gap divided first where the product passes fp32's range, and its peak's
+        # and score's shares apart where the gap itself does: no group's own KL past fp32's range is rounded
+        # before the mean. A weight below fp32's least normal meets them in their logarithms instead, so a
+        # term its rounded weight would flush keeps its value (a teacher of logits 0 and -110 against scores 0
+        # and -2^126: 1.44e-10, train 1345's F2).
         held = jnp.where(taken, scores, 0)
         gap = peak - held
-        positive = taken & (gap > 0) & jnp.isfinite(gap)
-        logged_gap = jnp.log(jnp.where(positive, gap, 1))
-        # A gap of 0 (the peak's own key) its product, whose value is 0 and whose derivative is the weight's.
-        gaps = jnp.where(positive, jnp.exp(log_target + logged_gap - jnp.log(jnp.asarray(groups, wide))),
-                         jnp.where(taken & jnp.isfinite(gap), target * (gap / groups),
-                                   jnp.where(taken, target * (peak / groups) - target * (held / groups), 0)))
+        tiny = log_target < jnp.log(jnp.finfo(wide).tiny)
+        share = jnp.log(jnp.asarray(groups, wide))
+
+        def scaled(x):
+            # `target * x / groups` of a weight below fp32's least normal, met in their logarithms.
+            nonzero = x != 0
+            return jnp.where(nonzero, jnp.sign(x) * jnp.exp(
+                log_target + jnp.log(jnp.where(nonzero, jnp.abs(x), 1)) - share), 0)
+
+        product = target * gap
+        direct = jnp.where(jnp.isfinite(gap),
+                           jnp.where(jnp.isfinite(product), product / groups, target * (gap / groups)),
+                           target * (peak / groups) - target * (held / groups))
+        logged_terms = jnp.where(jnp.isfinite(gap), scaled(gap), scaled(peak) - scaled(held))
+        gaps = jnp.where(taken, jnp.where(tiny, logged_terms, direct), 0)
         entropy = jnp.where(taken, target * jnp.where(taken, log_target, 0) / groups, 0)
         divergence = compensated_sum(gaps, (gaps.ndim - 1,)) + spread / groups + compensated_sum(
             entropy, (entropy.ndim - 1,))
@@ -351,7 +363,8 @@ INFLLM_STRIDE = 16
 
 
 def infllm_selection(query: jax.Array, key: jax.Array, *, block: int, top_k: int = 64, kernel: int = 32,
-                     stride: int = INFLLM_STRIDE, initial: int = 1, local: int = 1) -> jax.Array:
+                     stride: int = INFLLM_STRIDE, initial: int = 1, local: int = 1,
+                     key_valid: jax.Array | None = None) -> jax.Array:
     """InfLLM-V2's selection (arXiv 2509.24663 §3.3): keys mean-pooled by a window of `kernel` every `stride`
     into compressed keys (eq. 4), each head's softmax of its query against the compressed keys whose window
     it reaches whole, at the attention's scale `D ** -0.5` (eq. 5, causal), summed over a GQA group's heads
@@ -375,7 +388,11 @@ def infllm_selection(query: jax.Array, key: jax.Array, *, block: int, top_k: int
         # No window holds `kernel` keys: the forced blocks alone.
         nothing = jnp.zeros((rows, groups, queries, blocks), bool)
         return top_k_selection(jnp.zeros(nothing.shape), nothing, top_k, forced=forced)
-    summed = jax.lax.reduce_window(key.astype(jnp.float32), 0.0, jax.lax.add, (1, kernel, 1, 1),
+    # A hidden key (`key_valid`) pooled as a zero, so no hidden token moves a pick.
+    pooled_keys = key.astype(jnp.float32)
+    if key_valid is not None:
+        pooled_keys = jnp.where(jnp.broadcast_to(key_valid, (rows, keys))[:, :, None, None], pooled_keys, 0.0)
+    summed = jax.lax.reduce_window(pooled_keys, 0.0, jax.lax.add, (1, kernel, 1, 1),
                                    (1, stride, 1, 1), "VALID")
     pooled = summed / kernel
     logits = jnp.einsum("bqghd,bwgd->bghqw", query.astype(jnp.float32), pooled) * width ** -0.5
@@ -424,19 +441,21 @@ def infllm_attention(query: jax.Array, key: jax.Array, value: jax.Array, *, bloc
         return scaled_dot_product_attention(query, key, value, causal=True, implementation=implementation,
                                             **numerics)
 
+    def sparse():
+        selected = infllm_selection(query, key, block=block, top_k=top_k, kernel=kernel, stride=stride,
+                                    initial=initial, local=local, key_valid=key_valid)
+        return selected_attention(query, key, value, selected, block_runs(keys, block),
+                                  implementation=implementation, **numerics)
+
     if keys < dense_below:
         return dense()
-    selected = infllm_selection(query, key, block=block, top_k=top_k, kernel=kernel, stride=stride,
-                                initial=initial, local=local)
-    sparse = selected_attention(query, key, value, selected, block_runs(keys, block),
-                                implementation=implementation, **numerics)
     if key_valid is None:
-        return sparse
-    # A row of fewer real keys than the cut attends densely, its branch its real keys' (train 1345's F3);
-    # the dense call runs where some row is such alone.
+        return sparse()
+    # A row of fewer real keys than the cut attends densely, its branch its real keys' (train 1345's F3): each
+    # branch runs where some row takes it alone.
     short = jnp.sum(jnp.broadcast_to(key_valid, (key.shape[0], keys)), axis=-1) < dense_below
-    return jax.lax.cond(jnp.any(short), lambda: jnp.where(short[:, None, None, None], dense(), sparse),
-                        lambda: sparse)
+    return jax.lax.cond(jnp.all(short), dense, lambda: jax.lax.cond(
+        jnp.any(short), lambda: jnp.where(short[:, None, None, None], dense(), sparse()), sparse))
 
 
 def masked_selection(mask: jax.Array, block_q: int, *, queries: int, most: int) -> jax.Array:
@@ -526,8 +545,9 @@ class BlockSparseSelfAttention(CausalSelfAttention):
     def _infllm(self, query, key, value, masking, append, sinks):
         """InfLLM-V2's attention over the call's own tokens (`infllm_attention`: dense below its cut, its
         selected blocks of `block`, `top_k` of them, past it), a row one document: its hidden tokens (a
-        right-padded row's, `_causal_implies_right_padding`) it reads as such, its cut taken at its real
-        keys' count; a packed row's documents or a cache's slots it refuses. `sinks` join both branches."""
+        right-padded row's, `_causal_implies_right_padding`) it reads as such, pooled as zeros and its cut
+        taken at its real keys' count; a packed row's documents or a cache's slots it refuses. `sinks` join
+        both branches."""
         if append is not None or masking.documents is not None:
             raise ValueError(f"{self.name}: InfLLM-V2's selection reads a row of one document's tokens, its "
                              "own: no cache or packed documents")
