@@ -1061,8 +1061,9 @@ def cp_async_violations(program: list[Event]) -> list[str]:
     not write whole (a slot never filled, or one part of it: each block it reads, exactly where its extent
     is known, within one landed copy's extent, `_holds`, so a read the parts' copies cover only together is
     refused, as no walk reads); and a scope's end with a copy pending into its allocations (its memory
-    another's next). Aliasing is read by locations (`Event.at`), coverage by extents (`Event.covers`): a
-    copy of a slot's first rows shares its slot's location but writes those rows alone."""
+    another's next). Coverage is read by extents (`Event.covers`), a pending copy's hazards by extents where
+    both events state theirs, else by alias locations (`Event.at`, `_shares`): a copy of a slot's first rows
+    shares its slot's location but writes those rows alone, and one of its last rows beside it no clash."""
     copied = {block[0] for event in program if event.kind == "cp_copy" for block in _each(event.at)}
     open_copies: list[Event] = []
     groups: list[list[Event]] = []
@@ -1071,7 +1072,7 @@ def cp_async_violations(program: list[Event]) -> list[str]:
     for index, event in enumerate(program):
         pending = [copy for group in groups for copy in group] + open_copies
         if event.kind == "cp_copy":
-            if clashing := [copy.at for copy in pending if _overlaps(copy.at, event.at)]:
+            if clashing := [copy.at for copy in pending if _shares(copy, event)]:
                 found.append(f"event {index}: a copy into {event.at} while copies into {clashing} are "
                              "pending")
             open_copies.append(event)
@@ -1082,7 +1083,7 @@ def cp_async_violations(program: list[Event]) -> list[str]:
             retired = max(0, len(groups) - int(event.argument))
             landed += [_touched(copy) for group in groups[:retired] for copy in group]
             del groups[:retired]
-        elif event.kind in ("read", "write") and any(_overlaps(copy.at, event.at) for copy in pending):
+        elif event.kind in ("read", "write") and any(_shares(copy, event) for copy in pending):
             found.append(f"event {index}: a {event.kind} of {event.at} while a copy into it is pending")
         elif (event.kind == "read" and {block[0] for block in _each(event.at)} & copied
               and not all(any(_holds(written, block) for written in landed)
@@ -1707,19 +1708,34 @@ def _overlaps(one: "tuple | frozenset[tuple]", other: "tuple | frozenset[tuple]"
         for mine, theirs in itertools.zip_longest(one[1:], other[1:]))
 
 
+def _span(item: "int | tuple[int, int]") -> tuple[int, int]:
+    """An extent's item (`_extent`) as the entries it spans: an index one, a range its own."""
+    return item if isinstance(item, tuple) else (item, item + 1)
+
+
 def _holds(outer: "tuple | frozenset[tuple]", inner: tuple) -> bool:
     """Whether the extent `outer` (`_extent`) holds all of the block `inner`, an extent too: one of its
-    blocks the same ref, each of its items spanning `inner`'s on that axis (an index one entry, a range its
-    entries), none past them (the rest whole)."""
-    def span(item) -> tuple[int, int]:
-        return item if isinstance(item, tuple) else (item, item + 1)
-
+    blocks the same ref, each of its items spanning `inner`'s on that axis, none past them (the rest
+    whole)."""
     def within(block: tuple) -> bool:
         return (block[0] == inner[0] and len(block) <= len(inner)
-                and all(span(mine)[0] <= span(theirs)[0] and span(theirs)[1] <= span(mine)[1]
+                and all(_span(mine)[0] <= _span(theirs)[0] and _span(theirs)[1] <= _span(mine)[1]
                         for mine, theirs in zip(block[1:], inner[1:], strict=False)))
 
     return any(within(block) for block in _each(outer))
+
+
+def _shares(copy: Event, event: Event) -> bool:
+    """Whether a pending `copy` and `event` (a copy, a read or a write) may touch one entry
+    (`cp_async_violations`): by the extents both state exactly (`Event.covers`), their spans meeting on every
+    axis both index (a slot's rows 0:8 and 8:16 apart); by their alias locations (`_overlaps`) where either
+    states none, a copy's empty one (none stated) among them."""
+    mine, theirs = copy.covers, event.covers
+    if not mine or not theirs:
+        return _overlaps(copy.at, event.at)
+    return any(one[0] == other[0] and all(_span(a)[0] < _span(b)[1] and _span(b)[0] < _span(a)[1]
+                                          for a, b in zip(one[1:], other[1:], strict=False))
+               for one in _each(mine) for other in _each(theirs))
 
 
 def _touched(event: Event) -> "tuple | frozenset[tuple]":
