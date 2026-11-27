@@ -97,20 +97,27 @@ def test_a_pick_measured_under_another_jax_is_not_read(tmp_path, monkeypatch):
         assert len(tuning._read(theirs)[0]) == 1
 
 
-def test_a_stored_entry_of_another_checkouts_timings_is_kept_beside_a_readable_one(tmp_path):
-    """A store holding a readable launch beside an entry whose timings are another checkout's, its arguments
-    no shape a key reads here (a rank-zero row operand): the readable launch read and the other kept as it
-    is (`_read`), its arguments never keyed."""
+@pytest.mark.parametrize(("readable", "listed"), [(False, False), (True, False), (True, True)],
+                         ids=["another-checkouts-timings", "readable-timings", "unhashable-argument"])
+def test_a_stored_entry_of_another_checkouts_arguments_is_kept_beside_a_readable_one(tmp_path, monkeypatch,
+                                                                                    readable, listed):
+    """A store holding a readable launch beside an entry whose arguments are no launch a key reads here (a
+    rank-zero row operand, or a list where its epsilon was), its timings another checkout's or readable, its
+    derived config its fastest: the readable launch read and the other kept as it is (`_read`), never keyed
+    past its refusal, and no gap read of it (`gaps`)."""
+    monkeypatch.setattr(_cache, "kernel_picks_path", lambda kind: str(tmp_path / f"{kind}.json"))
     ba, derived, _ = _norm_launch_and_two_configs()
     [entry] = json.loads(tuning.dumps_picks("gpu", [(ba, tuning.Timings({derived: _timed(1.0)}))]))["data"]
     row = next(name for name in entry["arguments"] if name in ba.op.ROWS)
-    other = {**entry, "arguments": {**entry["arguments"],
-                                    row: tuning.encoded(jax.ShapeDtypeStruct((), jnp.float32))},
-             "timings": "another checkout's"}
+    changed = {"epsilon": [1e-6]} if listed else {row: tuning.encoded(jax.ShapeDtypeStruct((), jnp.float32))}
+    other = {**entry, "arguments": {**entry["arguments"], **changed}}
+    if not readable:
+        other["timings"] = "another checkout's"
     path = tmp_path / "gpu.json"
     path.write_text(json.dumps({"device_kind": "gpu", "data": [entry, other]}))
     read, foreign = tuning._read(str(path))
     assert list(read) == [tuning._launch_key(tuning._launch(entry))] and foreign == [other]
+    assert tuning.gaps("gpu") == []
 
 
 def test_a_launch_whose_derived_config_lost_names_its_gap(tmp_path, monkeypatch):

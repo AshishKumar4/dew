@@ -1421,6 +1421,20 @@ def _keyed(timed) -> Keyed:
     return {_launch_key(ba): (ba, timings) for ba, timings in timed}
 
 
+def _stored_key(ba: tokamax.BoundArguments) -> tuple[tokamax.Op, Hashable]:
+    """A stored launch's key (`_launch_key`), hashed as the store's lookups hash it; `Unreadable` where its
+    arguments key as no launch of this checkout's: an operand its kernel's key here refuses (one of another
+    rank, a row operand of none) or a value no key holds (a list where a float was), as another checkout's
+    entry may hold. A fresh launch's key raises its own error (`_keyed`)."""
+    try:
+        key = _launch_key(ba)
+        hash(key)
+        return key
+    except (AttributeError, IndexError, TypeError, ValueError) as error:
+        raise Unreadable(f"{type(ba.op).__name__}'s stored arguments key as no launch of this checkout's: "
+                         f"{error}") from error
+
+
 def _launch_key(ba: tokamax.BoundArguments) -> tuple[tokamax.Op, Hashable]:
     """A launch's key in the picks store, a stored launch's and a fresh one's alike: its op and cache key,
     which binds its arguments to this checkout's signature of its kernel (ValueError where they do not)."""
@@ -1459,7 +1473,7 @@ def _partitioned(path: str) -> tuple[list[tuple[tuple, dict, tuple[tokamax.Bound
             # Its timings read before its key: an entry of another checkout's timings is another's, whatever
             # its arguments key as here.
             launch, timings = _launch(entry), _timings(entry.get("timings"))
-            ours.append((_launch_key(launch), entry, (launch, timings)))
+            ours.append((_stored_key(launch), entry, (launch, timings)))
         except Unreadable:
             foreign.append(entry)
     return ours, foreign
