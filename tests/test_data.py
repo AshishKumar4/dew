@@ -339,6 +339,23 @@ class _Spread:
         return [{"index": record["index"], "part": part} for part in range(record["index"] % 3)]
 
 
+def test_automatic_loading_samples_one_batch_where_it_could_choose_no_worker():
+    """Automatic loading reads a sample of batches to size its workers by (`Loading.resolved`), which its
+    read's explanation states it was sized from; where it would read in the process whatever the sample
+    measured (a run whose length nothing states, one CPU, `max_workers` 0) it
+    samples the one batch whose bytes size its read-ahead (row 13540: nine decoded at startup and made
+    again), where a run of a stated length on a host of CPUs samples `SAMPLED_BATCHES`."""
+    from dew.data.dataset import SAMPLED_BATCHES
+
+    chain = Pipeline(Memory(_Indexed(30))).repeat().batch(4)
+    one_cpu = Host(1, 2**34, worker_start=1.0)
+    for host, steps, most, sampled in ((TWO_CPUS, None, None, 1), (one_cpu, 10**6, None, 1),
+                                       (TWO_CPUS, 10**6, 0, 1), (TWO_CPUS, 10**6, None, SAMPLED_BATCHES)):
+        loading = Loading(workers="auto", host=host, max_workers=most)
+        explained = compile(chain, seed=5, steps=steps, loading=loading).explain()
+        assert f"from {sampled} sampled:" in explained, (host, steps, most, explained)
+
+
 def test_automatic_workers_read_each_run_length_as_a_read_in_none_does_within_their_bounds():
     """However a run states its length (its epochs, its steps), a chain that sets its threads alone, and
     a validation pass beside a training read, automatic workers read the records a read in no workers

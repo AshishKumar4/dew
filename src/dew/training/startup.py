@@ -177,7 +177,7 @@ def computation_differs[LossT, EffectsT](trainer: "Trainer[LossT, EffectsT]", ch
                                          step: int) -> list[str]:
     """Where the computation `checkpoints`' `step` trained and `trainer`'s differ (`differing_records`):
     their inference records and what their steps compute beside the model (`PhasePasses.training_record`,
-    a pass count's sampled law among it, row 10783)."""
+    a pass count's sampled law among it, row 10783), the numerics its programs ran under among it."""
     saved, now = checkpoints.training(step), trainer.phase_passes.training_record(trainer.objective)
     # A law the checkpoint records binds a run that draws none: a fixed-pass resume would stop drawing (a
     # checkpoint that records none, a fixed-pass run's, any run resumes).

@@ -1194,6 +1194,54 @@ def test_no_split_metric_or_summary_name_takes_the_summaries_namespace():
         Summary('summary/board', {'val/value': 1.0}, better='lower')
 
 
+def test_a_resume_under_other_numerics_is_refused_whatever_its_objective_records_for_inference(tmp_path):
+    """A trainer built directly over a directory whose run traced its programs under other numerics than
+    it runs under (`TrainerAdvanced.numerics`: its unpinned products at "default" not "highest", its outputs
+    in bfloat16, or none given, JAX's own; numerics at "default" under JAX's other precision), which change no
+    tree and no loss scale, refuses to resume, an
+    objective that records nothing for inference (no task) among them, as the run's training record holds
+    them (`PhasePasses.training_record`); the numerics that trained it resume (row 13537)."""
+    import dataclasses
+
+    from affine_run import Regression, dataset
+    from flax import linen as nn
+
+    from dew.nn.precision import DTYPE_PRESETS, Numerics
+    from dew.training import TrainerAdvanced
+
+    class Stated(Regression):
+        """The affine regression, its layer stating the float32 it computes in."""
+
+        def __init__(self):
+            super().__init__()
+            self.model = nn.Dense(2, dtype=jnp.float32, param_dtype=jnp.float32)
+
+    full = DTYPE_PRESETS["32-true"]
+
+    def trainer(numerics: Numerics | None, directory: str = "run") -> Trainer:
+        return Trainer(Stated(), optax.sgd(0.1), key=jax.random.key(0),
+                       checkpoints=Checkpoints(str(tmp_path / directory)),
+                       advanced=TrainerAdvanced(numerics=numerics))
+
+    assert Stated().inference_record() is None
+    trained = Numerics(full, matmul="highest")
+    trainer(trained).fit(dataset(), steps=1)
+    for other in (Numerics(full, matmul="default"),
+                  Numerics(dataclasses.replace(full, output="bfloat16"), matmul="highest"), None):
+        with pytest.raises(ValueError):
+            trainer(other).fit(dataset(), steps=2)
+    assert int(trainer(trained).fit(dataset(), steps=2).step) == 2
+    # Numerics at "default" leave JAX's own precision, the run's then: resumed under another, refused.
+    ambient = Numerics(full, matmul="default")
+    with jax.default_matmul_precision("highest"):
+        trainer(ambient, "ambient").fit(dataset(), steps=1)
+    with pytest.raises(ValueError), jax.default_matmul_precision("default"):
+        trainer(ambient, "ambient").fit(dataset(), steps=2)
+    # Under another spelling of the same precision ('float32' is 'highest'), it resumes.
+    with jax.default_matmul_precision("float32"):
+        assert int(trainer(ambient, "ambient").fit(dataset(), steps=2).step) == 2
+
+
 def test_a_resume_under_another_loss_setting_is_refused_as_a_fresh_run_beside_its_model_is(tmp_path):
     """A trainer built directly over a directory whose run trained another loss of the same model and
     objective class (its `z_loss`) refuses to resume, naming the setting (row 9020: it resumed, its
