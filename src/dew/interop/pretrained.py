@@ -230,12 +230,14 @@ class Pretrained:
     They are kept as the source stored them.
     """
     quantized_specs: Mapping[str, jax.ShapeDtypeStruct] = field(default_factory=dict, repr=False)
-    quantized_dtypes: Mapping[str, str] = field(default_factory=dict, repr=False)
-    """The dtype the load decoded each of `quantized_tensors` into (its param dtype as resolved), against
-    which an export tells a value left as loaded from one its training changed, whatever dtype the
-    export's tree hands it in (`codecs.source_quantization`'s `loaded`)."""
     """The stored tensors of each of `quantized_tensors` as the source's headers state them: the tensors
     an export writes the weight back as, known before any is encoded (`SourceQuantization.requantize`)."""
+    quantized_dtypes: Mapping[str, str | None] = field(default_factory=dict, repr=False)
+    """How the load holds each of `quantized_tensors`, every one recorded: the dtype it decoded the weight
+    into (its param dtype as resolved), or None for a bank it serves packed, undecoded, which an export
+    decodes exactly in float32 (`quantization.deferred_packed`). An export tells a value left as loaded
+    from one its training changed against it, whatever dtype its tree hands the value in
+    (`codecs.source_quantization`'s `loaded`)."""
     revision: str | None = None
     """The Hub commit the source resolved to, whatever branch or tag was requested.
 
@@ -1734,7 +1736,7 @@ def _source_config(name_or_dir: str | Path, directory: Path, commit: str | None,
 def _decoded(tensors: Mapping[str, unread.Stored], config: Mapping[str, object], param_dtype: str, *,
              media: bool) -> tuple[Mapping[str, unread.Stored], tuple[str, ...], str | None,
                                    dict[str, unread.Stored], decoders.Checked,
-                                   Mapping[str, jax.ShapeDtypeStruct], Mapping[str, str]]:
+                                   Mapping[str, jax.ShapeDtypeStruct], Mapping[str, str | None]]:
     """The tensors with a quantized source's weights decoded, and what `save`
     needs to write them back: the quantized names, the scales' dtype and the
     integer formats' grid; the spellings checked equal before a narrowing
@@ -2230,7 +2232,7 @@ class _Translated(NamedTuple):
     scale_dtype: str | None
     grid: dict[str, unread.Stored]
     stored: Mapping[str, jax.ShapeDtypeStruct]
-    decoded: Mapping[str, str]
+    decoded: Mapping[str, str | None]
 
 
 def _translated(config: Mapping[str, object],
@@ -2259,6 +2261,8 @@ def _translated(config: Mapping[str, object],
         assert codec is not None, "packed banks are a quantized source's"
         specs = tensor_specs(given)
         quantized_tensors = tuple(sorted((*quantized_tensors, *banks)))
+        # Served packed, undecoded: each recorded as such beside the decoded weights.
+        decoded = {**decoded, **dict.fromkeys(banks)}
         stored = {**stored, **{part: specs[part] for name in banks
                                for part in (name, *codec.partners(name)) if part in specs}}
         grid = {**grid, **{part: given[part] for name in banks for part in codec.grid(name) if part in given}}

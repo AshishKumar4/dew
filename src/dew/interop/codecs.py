@@ -1961,7 +1961,7 @@ def _decode_inkling2(tensors: Mapping[str, Stored], name: str) -> Stored:
 
 
 def _encode_inkling2(name: str, weight: np.ndarray, *, grid: Mapping[str, Stored] | None,
-                     loaded: Mapping[str, str]) -> dict[str, np.ndarray]:
+                     loaded: Mapping[str, str | None]) -> dict[str, np.ndarray]:
     """One expert bank `[experts, rows, columns]` written back as its release stored it, against the scales
     its source shipped (`grid`, as ModelOpt's encoder writes against its own, `_modelopt_encode`). A value
     equal to its stored code's decode as the load kept it (`_decode_inkling2`'s arithmetic, rounded to the
@@ -1976,16 +1976,17 @@ def _encode_inkling2(name: str, weight: np.ndarray, *, grid: Mapping[str, Stored
         raise ValueError(f"{name}: its load recorded no dtype it decoded the bank into, which a value left "
                          "as loaded is told apart in")
     given = np.asarray(weight)
-    kept_as = np.dtype(loaded[name])
-
-    # Both sides held exactly in the wider of the two dtypes (bfloat16's values are float32's), no copy
-    # where they match.
-    common = np.promote_types(kept_as, given.dtype)
+    # A bank served packed (None) reaches the export decoded exactly in float32 (`deferred_packed`).
+    kept_as = np.dtype(np.float32 if loaded[name] is None else loaded[name])
+    # Both sides held exactly in one dtype: float64 where either is, else float32, which holds bfloat16's,
+    # float16's and float32's values alike (NumPy joins no two 16-bit floats); no copy where they match.
+    common = np.dtype(np.float64 if np.float64 in (kept_as, given.dtype) else np.float32)
 
     def unchanged(decoded) -> np.ndarray:
-        # Each value as given against its code's decode as the load kept it.
+        # Each value as given against its code's decode as the load kept it, its sign a zero's among it.
         as_loaded = np.asarray(decoded, np.float32).astype(kept_as, copy=False).astype(common, copy=False)
-        return as_loaded == given.astype(common, copy=False)
+        held = given.astype(common, copy=False)
+        return (as_loaded == held) & (np.signbit(as_loaded) == np.signbit(held))
 
     if grid is not None and name + "_amax" in grid:
         scale, amax, denominator, original = _gridded(
@@ -2022,7 +2023,7 @@ def _encode_inkling2(name: str, weight: np.ndarray, *, grid: Mapping[str, Stored
 
 
 def inkling2_experts(grid: Mapping[str, Stored] | None = None,
-                     loaded: Mapping[str, str] | None = None) -> SourceQuantization:
+                     loaded: Mapping[str, str | None] | None = None) -> SourceQuantization:
     """Inkling 2's NVFP4 and MXFP8 expert banks (the section above), read as transformers dequantizes them
     and written back against the scales the source shipped (`grid`), each bank's values told apart from
     its load's in the dtype the load decoded it into (`loaded`, `_encode_inkling2`)."""
@@ -2047,7 +2048,7 @@ def quantization_record(config: Mapping[str, object]) -> Mapping[str, object] | 
 
 def source_quantization(config: Mapping[str, object], *, scale_dtype: str | None = None,
                         grid: Mapping[str, Stored] | None = None,
-                        loaded: Mapping[str, str] | None = None) -> SourceQuantization | None:
+                        loaded: Mapping[str, str | None] | None = None) -> SourceQuantization | None:
     """Return the format a config's `quantization_config` declares, or None.
 
     A wrapper may declare it on its text_config alone (`quantization_record`).

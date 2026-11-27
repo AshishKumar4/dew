@@ -288,7 +288,8 @@ def test_an_mxfp8_bank_held_in_bfloat16_writes_back_the_codes_it_was_loaded_from
     dtype the load decoded the bank into, whatever dtype the export hands it in: a code whose decode
     `2^-136` (E4M3's `2^-9` under E8M0's `2^-127`) a bfloat16 load holds as 0 writes back as the code it
     was loaded from, not as a fresh 0, from the bfloat16 tree and from that tree widened to float32 (train
-    1370's review F2, train 1379's P-F3), and a value its training changed takes its nearest code."""
+    1370's review F2, train 1379's P-F3; float16 too, train 1389's), and a value its training changed
+    takes its nearest code."""
     import ml_dtypes
 
     from dew.interop.codecs import inkling2_experts
@@ -303,7 +304,9 @@ def test_an_mxfp8_bank_held_in_bfloat16_writes_back_the_codes_it_was_loaded_from
     assert decoded[0, 0, 0] == np.float32(2.0 ** -136)
     held = decoded.astype(ml_dtypes.bfloat16)
     assert held[0, 0, 0] == 0
-    for tree in (held, held.astype(np.float32)):
+    # As loaded, widened to float32, and cast to float16, which NumPy joins with bfloat16 in no dtype of its
+    # own (train 1389's review: the comparison's dtype raised).
+    for tree in (held, held.astype(np.float32), held.astype(np.float16)):
         np.testing.assert_array_equal(codec.encode(name, tree)[name].view(np.uint8), codes.view(np.uint8))
     changed = held.copy()
     changed[0, 1, 0] = ml_dtypes.bfloat16(2.0)
@@ -312,20 +315,22 @@ def test_an_mxfp8_bank_held_in_bfloat16_writes_back_the_codes_it_was_loaded_from
     assert (written.view(np.uint8) != codes.view(np.uint8)).sum() == 1
 
 
-@pytest.mark.parametrize('widened', [False, True], ids=['bfloat16', 'widened to float32'])
-def test_a_bfloat16_load_of_quantized_banks_saves_them_as_stored(tmp_path, widened):
+@pytest.mark.parametrize('cast', [None, np.float32, np.float16], ids=['bfloat16', 'float32', 'float16'])
+def test_a_bfloat16_load_of_quantized_banks_saves_them_as_stored(tmp_path, cast):
     """The quantized release loaded in bfloat16 and saved from its tree as loaded, or from that tree
     widened to float32 (an export writes each leaf in the dtype it is handed), writes its expert banks back
     as it stored them, codes and scales bit for bit: each value told apart from its load's in the dtype the
-    load decoded it into (`Pretrained.quantized_dtypes`, train 1379's P-F3)."""
+    load decoded it into (`Pretrained.quantized_dtypes`, train 1379's P-F3). Cast to float16, which NumPy
+    joins with bfloat16 in no dtype, it saves its banks as their stored tensors (train 1389's review: the
+    comparison's dtype raised)."""
     from dew.interop.safetensors_io import read_file
 
     loaded = Pretrained.load(FIXTURES / 'inkling2-tiny-nvfp4', dtype='float32', param_dtype='bfloat16')
     assert loaded.quantized_dtypes and set(loaded.quantized_dtypes.values()) == {'bfloat16'}
-    def wide(leaf):
-        return np.asarray(leaf, np.float32) if jnp.issubdtype(leaf.dtype, jnp.floating) else leaf
+    def cast_to(leaf):
+        return np.asarray(leaf, cast) if jnp.issubdtype(leaf.dtype, jnp.floating) else leaf
 
-    variables = jax.tree.map(wide, loaded.variables) if widened else loaded.variables
+    variables = loaded.variables if cast is None else jax.tree.map(cast_to, loaded.variables)
     loaded.save(tmp_path, variables=variables)
     written = {name: value for file in tmp_path.glob('model*.safetensors')
                for name, value in read_file(file)[0].items()}
@@ -333,5 +338,35 @@ def test_a_bfloat16_load_of_quantized_banks_saves_them_as_stored(tmp_path, widen
     banks = [name for name in source if '.experts.' in name]
     assert banks
     for name in banks:
+        if cast is np.float16:
+            # Values float16 rounds are its own edits: the stored tensors' kind is what is kept.
+            assert (written[name].dtype, written[name].shape) == (source[name].dtype, source[name].shape)
+            continue
         held = (written[name].dtype, written[name].tobytes())
         assert held == (source[name].dtype, source[name].tobytes()), name
+
+
+def test_a_zero_whose_sign_training_flipped_takes_the_code_of_its_sign():
+    """A loaded `+0` an edit made `-0` is a change Inkling 2's writer writes: E4M3's `0x80` under a unit
+    MXFP8 scale and E2M1's nibble `0x8` under a unit NVFP4 group, not the stored positive zero, which a
+    comparison of values alone took as unchanged (train 1389's review)."""
+    import ml_dtypes
+
+    from dew.interop.codecs import inkling2_experts
+
+    mxfp8 = 'model.llm.layers.2.mlp.experts.down_proj'
+    stored = {mxfp8: np.zeros((1, 1, 32), ml_dtypes.float8_e4m3fn),
+              mxfp8 + '_scale': np.full((1, 1, 1), 127, np.uint8)}
+    signed = np.zeros((1, 1, 32), np.float32)
+    signed[0, 0, 0] = -0.0
+    written = inkling2_experts(stored, {mxfp8: 'float32'}).encode(mxfp8, signed)[mxfp8].view(np.uint8)
+    assert written[0, 0, 0] == 0x80 and (written[0, 0, 1:] == 0).all()
+    nvfp4 = 'model.llm.layers.2.mlp.experts.gate_up_proj'
+    stored = {nvfp4: np.zeros((1, 1, 8), np.uint8),
+              nvfp4 + '_scale': np.ones((1, 1, 1), ml_dtypes.float8_e4m3fn),
+              nvfp4 + '_amax': np.ones(1, np.float32),
+              nvfp4 + '_outer_scale_denominator': np.ones(1, np.float32)}
+    signed = np.zeros((1, 1, 16), np.float32)
+    signed[0, 0, 0] = -0.0
+    written = inkling2_experts(stored, {nvfp4: 'float32'}).encode(nvfp4, signed)[nvfp4]
+    assert written[0, 0, 0] == 0x08 and (written[0, 0, 1:] == 0).all()
