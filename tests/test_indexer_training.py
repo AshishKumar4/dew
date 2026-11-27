@@ -589,6 +589,8 @@ def test_an_index_branchs_kl_pools_by_its_queries_across_a_split_step():
     padded part's queries up)."""
     from rl_split_support import prepare_split_whole_steps
 
+    from dew.objectives.routing import RoutedStatistics
+
     objective = LMObjective(deepseek_stack(4), SEQ, indexer=IndexerTraining("sparse"))
     rate = 0.5
 
@@ -625,9 +627,12 @@ def test_an_index_branchs_kl_pools_by_its_queries_across_a_split_step():
 
     params, _, split_moved, _ = draw(0)
     # The parts' query masses as the split takes them, alternate rows: unequal.
-    full, padded = (objective.loss({"params": params}, packed_batch(packed(0)[start::2]), step_at())[0]
-                    for start in (0, 1))
-    assert float(full.auxiliary[0].mass) > float(padded.auxiliary[0].mass) > 0
+    def queries(start: int) -> float:
+        stats = objective.loss({"params": params}, packed_batch(packed(0)[start::2]), step_at())[0]
+        assert isinstance(stats, RoutedStatistics)
+        return float(stats.auxiliary[0].mass)
+
+    assert queries(0) > queries(1) > 0
     # The index branch moves, its KL's gradient reaching it through the split step.
     assert any(np.any(np.asarray(after) != np.asarray(before))
                for (path, after), before in zip(jax.tree_util.tree_leaves_with_path(split_moved),
