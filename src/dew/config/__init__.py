@@ -98,10 +98,9 @@ from dew.scores import Summary
 from dew.state import TrainState
 from dew.telemetry.profile import CaptureOptions
 from dew.telemetry.records import RunRecord, TrialFinished, packages_installed, tracker_json
-from dew.training._fit import FitArguments
+from dew.training._fit import FitArguments, validation_suites
 from dew.training.ahead import AheadOfTime, CompiledAhead, fit_plan
 from dew.training.budget import Pause
-from dew.training.cadence import Counted
 from dew.training.display import TrainingDisplay
 from dew.training.evaluation import EvalSuite, Split, episodic
 from dew.training.phase_passes import PassPolicy, SampledPasses
@@ -1492,8 +1491,11 @@ class RunConfig:
             cooldowns=trainer.cooldowns,
             # A run that names no metrics and validates no split has no suite to score.
             validation=validation if suites is None else suites or None, summaries=self.val_summaries)
-        if skipped is not None and lowering is None and _validates_batches(
-                dataset, validation, suites, metrics, eval_every):
+        # The splits `fit` validates, resolved as it resolves them (`validation_suites`).
+        validated = [] if skipped is None or lowering is not None else validation_suites(
+            dataset, validation if suites is None else suites or None, metrics if suites is None else (),
+            eval_every).values()
+        if any(not episodic(suite.data) for suite in validated):
             # A run that validates a batch split, where a preview samples (`Evaluation.run`; a split of
             # episodes previews none), records the preview it skips, and why.
             summary = {**(summary or {}), "preview": {"skipped": skipped}}
@@ -1921,15 +1923,3 @@ def _theta_rows(variables, passes: int):
 __all__ = ["DecoderRunConfig", "Diagnostics", "LowerTarget", "MetricConfig", "ObjectiveConfig", "Prepared",
            "Release", "RunConfig", "SourceOptions", "Suite", "TrainerConfig",
            "flag_selected"]
-
-
-def _validates_batches(dataset: Loader, validation: Mapping[str, Split] | None,
-                       suites: Mapping[str, EvalSuite] | None, metrics: Sequence[Metric],
-                       eval_every: int | str | Counted | None) -> bool:
-    """Whether a run validates a split of batches, as `fit` resolves its splits (`validation_suites`): the
-    compiled suites, else the splits given, else the data's own `val` where a pass is scheduled or metrics
-    score it; a split of episodes is no split of batches (`episodic`)."""
-    held = ([suite.data for suite in suites.values()] if suites is not None
-            else list(validation.values()) if validation is not None
-            else [dataset.val] if dataset.val is not None and (eval_every or metrics) else [])
-    return any(not episodic(split) for split in held)
