@@ -1782,15 +1782,19 @@ Agreed with the GEMM template's owner (2026-11-03):
   of its encoder, in the checkpoint, a load refusing words of another), the decoder's live registers per thread (which `resources.py` prices before a tile is admitted)
   and its issues by pipe (`BitForm.issues`). `BitForm.work` counts ALU operations and FMA-pipe integer
   multiply-adds separately (row 5386). The consumer's tests prove the form again.
-- The decoder is emitted inline at a matrix-operand hook the GEMM template adds (row 3621): `BitForm.ptx(i)`
-  writes output register `i` as one PTX block over the stored word (`$1`) into the register (`$0`), each step
-  as its pipe's instruction (`shr`, `shl` and `shf` on the ALU, `mul.lo` and `mul.hi` by a power of two on the
-  FMA pipe, `lop3` for a mask), for Mosaic GPU's or Triton's inline assembly (constraints `=r,r`, a register
-  a block). `BitForm.traced` computes the same registers in `jax.numpy` for the hook's portable path and the
-  interpreter, by the evaluator `proven` checks (`bits._run`). Both read one declaration of each step
-  (`BitStep`); the PTX is its emitter's (`bits._written`), held to the evaluator by the form's tests, which
-  compile it and run it on a GPU against `traced`. PTX fixes the
-  arithmetic, not the SASS: ptxas chooses the instructions, which the consumer's compile report shows.
+- A form has two emitters, both reading one declaration of each step (`BitStep`). `BitForm.traced` computes
+  its registers in `jax.numpy`, by the evaluator `proven` checks (`bits._run`), which a compiled kernel lowers
+  as the interpreter runs it. `BitForm.ptx_registers()` writes every output register as one PTX block over
+  the stored word (`$N`, N the outputs) into `$0` to `$N-1`, each step as its pipe's instruction (`shr`,
+  `shl` and `shf` on the ALU, `mul.lo` and `mul.hi` by a power of two on the FMA pipe, `lop3` for a mask),
+  for a kernel's inline assembly of several results (`inline_forms.registers`); each step is its emitter's
+  (`bits._written`). The form's tests compile the block through ptxas for sm80 and sm90; what it computes
+  on a GPU is held where a kernel consumes it, the epilogue's packing. PTX fixes the arithmetic, not the
+  SASS: ptxas chooses the instructions, which the consumer's compile report shows.
+- The NVFP4 packed GEMM's mainloop decodes at its matrix-operand hook (row 3621) by `traced`, compiled and
+  interpreted (row 3733): the inline PTX ran slower on both GPUs measured, output bits equal (1.138x at 64
+  rows and 1.069x at 4096 of a Llama-3-8B up projection on a GH200, M-FS-88; 1.006-1.037x on an A100,
+  M-EM-17). A compiled epilogue's packing encodes by the PTX (`gemm.quantized.encode_tile`, row 8547).
 - Scope: NVFP4 and MXFP4 on sm90 and sm80; FP8 on sm80, which has no FP8 MMA; FP8 and FP4 packing in the
   epilogue. FP8 on sm90 needs no decode: wgmma multiplies E4M3 and E5M2 from shared memory.
 - A form is taken only where it is bit-identical over its whole domain and timed no slower on the real GEMM.

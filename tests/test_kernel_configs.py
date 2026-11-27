@@ -1429,8 +1429,8 @@ def test_an_amperes_nvfp4_product_compiles_and_runs_its_packed_kernel(rows, name
     """An NVFP4 projection on a compile-only A100, its packed kernel named, or at a decode step's rows with no
     kernel named (`gemm.NVFP4_CELLS`' A100 decode cell, receipt W13-a100-4-M-NS-8b-a100: 2.6-3.6x the matrix
     decoded once a call): its program launches the template's packed product (`kernel_compile.Expected`, its
-    route evidence), which ptxas compiles, its E2M1 codes decoded by their form's PTX inline
-    (`inline_forms.registers`, row 3733), its E4M3 block scales by integer arithmetic
+    route evidence), which ptxas compiles, its E2M1 codes decoded by their form's traced reading
+    (`BitForm.traced`, row 3733), its E4M3 block scales by integer arithmetic
     (`bits.scales_decoded`) where their FP8 conversion took sm89's `cvt .e4m3x2` and an A100's ptxas
     refused the kernel (W8-a100, M-NS-8; row 3621)."""
     from kernel_compile import Expected, compile_mosaic_kernels, route_failures
