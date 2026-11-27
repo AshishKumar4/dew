@@ -363,13 +363,13 @@ def _gemm_refused(group_sizes, *, prologue, gather, scatter, compute, applied, l
 
 def _window_takes(lhs, compute, precision) -> bool:
     """Whether a `Bf16Window`'s product (`window_product`: its rows rounded to bf16, each product exact,
-    summed in fp32) is the product `gemm` is asked for: its products' dtype (`compute`, `lhs`'s where None)
-    bf16's, whole, as the call's precision and the run's state them (`precision.exact_products`: every
-    precision level and a whole-product algorithm; `dense._windowed`'s rule) (row 13686: an fp32 call's rows
-    of 1 + 2^-9 rounded to 1 where its kernel's product keeps them)."""
+    summed in fp32 at the default precision, no partial sums promoted) is the product `gemm` is asked for:
+    its products' dtype (`compute`, `lhs`'s where None) bf16's, at the default precision the call and the
+    run ask (above it, an fp32 output's partial sums are promoted, `templates.product.declared`; a stated
+    algorithm may narrow the operands) (row 13686: an fp32 call's rows of 1 + 2^-9 rounded to 1 where its
+    kernel's product keeps them)."""
     computed = jnp.dtype(lhs.dtype if compute is None else compute)
-    return (computed == jnp.dtype(jnp.bfloat16)
-            and all(exact_products(stated, jnp.bfloat16) for stated in (precision, None)))
+    return computed == jnp.dtype(jnp.bfloat16) and asks_default_precision(precision, configured=True)
 
 
 def _packed_gemm(lhs, matrix: NvFp4 | TernaryWeights | Bf16Window, group_sizes, *, epilogue: Hook,

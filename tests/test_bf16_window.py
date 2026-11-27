@@ -307,17 +307,22 @@ def test_a_bf16_dense_stating_a_narrowing_algorithm_served_its_window_computes_a
             assert outs[1] is outs[0]
 
 
-@pytest.mark.parametrize("compute", [jnp.float32, jnp.bfloat16], ids=["fp32 compute", "bf16 compute"])
-def test_gemm_over_a_window_computes_in_its_calls_dtype(compute):
-    """`gemm.gemm` over a bfloat16 window computes in its call's `compute` (row 13686): fp32 rows of
-    1 + 2^-9 under fp32 compute keep their low bit, as the decoded kernel's ordinary product does (the
-    window's own product rounds its rows to bf16); under bf16 compute it is the window's product, the
-    decoded kernel's at bf16 rows. Its kernel sixteenths of small integers, every sum exact."""
+@pytest.mark.parametrize(("compute", "precision"),
+                         [(jnp.float32, None), (jnp.bfloat16, None), (jnp.bfloat16, "highest")],
+                         ids=["fp32 compute", "bf16 compute", "bf16 compute above the default"])
+def test_gemm_over_a_window_computes_in_its_calls_dtype(compute, precision):
+    """`gemm.gemm` over a bfloat16 window computes in its call's `compute` at its call's precision (row
+    13686): fp32 rows of 1 + 2^-9 under fp32 compute keep their low bit, as the decoded kernel's ordinary
+    product does (the window's own product rounds its rows to bf16); under bf16 compute it is the window's
+    product, the decoded kernel's at bf16 rows; above the default precision the decoded kernel's ordinary
+    product, its fp32 output's partial sums promoted. Its kernel sixteenths of small integers, every sum
+    exact."""
     rng = np.random.default_rng(13686)
     kernel = jnp.asarray((rng.integers(-64, 64, (128, 64)) / 16.0).astype(jnp.bfloat16))
     x = jnp.full((8, 128), 1 + 2.0 ** -9, jnp.float32)
-    served = gemm.gemm(x, Bf16Window.of(kernel).checked(), None, out_dtype=jnp.float32, compute=compute)
-    decoded = gemm.gemm(x, kernel, None, out_dtype=jnp.float32, compute=compute)
+    with jax.default_matmul_precision(precision or "default"):
+        served = gemm.gemm(x, Bf16Window.of(kernel).checked(), None, out_dtype=jnp.float32, compute=compute)
+        decoded = gemm.gemm(x, kernel, None, out_dtype=jnp.float32, compute=compute)
     np.testing.assert_array_equal(np.asarray(served).view(np.uint32), np.asarray(decoded).view(np.uint32))
 
 
