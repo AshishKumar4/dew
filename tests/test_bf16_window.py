@@ -307,19 +307,36 @@ def test_a_bf16_dense_stating_a_narrowing_algorithm_served_its_window_computes_a
             assert outs[1] is outs[0]
 
 
-@pytest.mark.parametrize(("compute", "precision"),
-                         [(jnp.float32, None), (None, "highest"), (jnp.bfloat16, None)],
-                         ids=["fp32 compute", "highest precision", "bf16 compute"])
-def test_gemm_over_a_window_computes_what_its_call_asks(compute, precision):
-    """`gemm.gemm` over a bfloat16 window computes the product its call asks for (row 13686): fp32 rows of
-    1 + 2^-9 under fp32 compute, or at the highest precision, keep their low bit as the decoded kernel's
-    ordinary product does (the window's own product rounds its rows to bf16); under bf16 compute at the
-    default precision it is the window's product, which is the decoded kernel's at bf16 rows."""
-    kernel = jnp.asarray(_drawn((256, 64)))
-    finite = jnp.where(jnp.isfinite(kernel), kernel, 0).astype(jnp.bfloat16)
-    window = Bf16Window.of(finite).checked()
-    x = jnp.full((8, 256), 1 + 2.0 ** -9, jnp.float32)
-    with jax.default_matmul_precision(precision or "default"):
-        served = gemm.gemm(x, window, None, out_dtype=jnp.float32, compute=compute)
-        decoded = gemm.gemm(x, finite, None, out_dtype=jnp.float32, compute=compute)
+@pytest.mark.parametrize("compute", [jnp.float32, jnp.bfloat16], ids=["fp32 compute", "bf16 compute"])
+def test_gemm_over_a_window_computes_in_its_calls_dtype(compute):
+    """`gemm.gemm` over a bfloat16 window computes in its call's `compute` (row 13686): fp32 rows of
+    1 + 2^-9 under fp32 compute keep their low bit, as the decoded kernel's ordinary product does (the
+    window's own product rounds its rows to bf16); under bf16 compute it is the window's product, the
+    decoded kernel's at bf16 rows. Its kernel sixteenths of small integers, every sum exact."""
+    rng = np.random.default_rng(13686)
+    kernel = jnp.asarray((rng.integers(-64, 64, (128, 64)) / 16.0).astype(jnp.bfloat16))
+    x = jnp.full((8, 128), 1 + 2.0 ** -9, jnp.float32)
+    served = gemm.gemm(x, Bf16Window.of(kernel).checked(), None, out_dtype=jnp.float32, compute=compute)
+    decoded = gemm.gemm(x, kernel, None, out_dtype=jnp.float32, compute=compute)
     np.testing.assert_array_equal(np.asarray(served).view(np.uint32), np.asarray(decoded).view(np.uint32))
+
+
+def test_gemm_over_a_window_takes_its_calls_narrowing_algorithm():
+    """`gemm.gemm` over a bfloat16 window of bf16 rows stating an algorithm that narrows its operands
+    (`F16_F16_F32`: a row of 2^-30 is zero in fp16) computes what its decoded kernel's product computes
+    under it, or refuses alike where the backend runs no such algorithm (a CPU): the window multiplies its
+    operands whole, so the call's own product runs (row 13686)."""
+    kernel = np.zeros((128, 64), jnp.bfloat16)
+    kernel[0, 0] = 1.0
+    x = jnp.full((2, 128), 2.0 ** -30, jnp.bfloat16)
+    outs = []
+    for matrix in (jnp.asarray(kernel), Bf16Window.of(jnp.asarray(kernel)).checked()):
+        try:
+            outs.append(np.asarray(gemm.gemm(x, matrix, None, out_dtype=jnp.float32,
+                                             precision=jax.lax.DotAlgorithmPreset.F16_F16_F32)).view(np.uint32))
+        except ValueError as refused:
+            outs.append(type(refused))
+    if isinstance(outs[0], np.ndarray):
+        np.testing.assert_array_equal(outs[1], outs[0])
+    else:
+        assert outs[1] is outs[0], outs
