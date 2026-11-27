@@ -345,7 +345,7 @@ def msa_query_kls(index_scores: jax.Array, query: jax.Array, key: jax.Array, sel
             # rounds to 0 first and each takes one rounding, its derivative alike (between the halves). An
             # infinite `x` its own signed infinity where a half is 0 (its weight's slope 0 there), where the
             # product would be 0 * inf.
-            product = (half * x) * (half / groups)
+            product = ((half * x) * half) / groups
             return jnp.where(jnp.isinf(x) & (half == 0), jax.lax.stop_gradient(x), product)
 
         product = target * gap
