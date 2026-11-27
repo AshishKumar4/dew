@@ -16,7 +16,6 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-
 from egglog import String, i64
 from jax.extend import core as jcore
 
@@ -101,8 +100,7 @@ def _same(read, held) -> bool:
 
 def _entry():
     (entry,) = Path(stored.directory()).glob("*.json")
-    summed, _, body = entry.read_text().partition("\n")
-    return entry, summed, json.loads(body)
+    return entry, json.loads(entry.read_text().partition("\n")[2])
 
 
 def _written(entry, record):
@@ -156,7 +154,7 @@ def test_a_corrupt_entry_is_derived_afresh_and_counted(storing, corrupt):
     """An entry that fails to read, is not its own, or whose forms are not its region's, leaves its region as
     traced and is derived afresh past, then written whole again."""
     fresh = _derived("walk")
-    entry, summed, record = _entry()
+    entry, record = _entry()
     text = entry.read_text()
     if corrupt == "unreadable":
         entry.unlink()
@@ -207,9 +205,10 @@ def test_a_primitive_its_name_does_not_identify_keys_nothing():
     (`terms.OPERATIONS`), is no primitive a name states: a program holding it, at any depth, is not keyed."""
     own = jcore.Primitive("exp")
     own.def_abstract_eval(lambda operand: operand)
-    operand = np.ones(4, np.float32)
+    operand, taken = np.ones(4, np.float32), np.True_
+
     def branched(function):
-        return jax.make_jaxpr(lambda p, x: jax.lax.cond(p, function, jax.lax.neg, x))(True, operand)
+        return jax.make_jaxpr(lambda p, x: jax.lax.cond(p, function, jax.lax.neg, x))(taken, operand)
 
     assert stored.key(jax.make_jaxpr(own.bind)(operand), (), ()) is None
     assert stored.key(branched(own.bind), (), ()) is None

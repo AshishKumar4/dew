@@ -357,9 +357,9 @@ def integral(value) -> bool:
 
 def _listed(value) -> list:
     """`value`, read from JSON, where it is a list (`ValueError` otherwise)."""
-    if not isinstance(value, list):
-        raise ValueError(f"a {type(value).__name__} where a list is written")
-    return value
+    if isinstance(value, list):
+        return value
+    raise ValueError(f"a {type(value).__name__} where a list is written")
 
 
 def _extent(value) -> tuple[int, ...]:
@@ -439,7 +439,8 @@ def _primitive_name(primitive) -> str:
     return primitive.name
 
 
-def _primitive(name: str) -> Primitive:
+def _primitive(name) -> Primitive:
+    """A primitive read from JSON by its name (`_primitives`)."""
     if not isinstance(name, str):
         raise ValueError(f"a primitive named {name!r}")
     return _primitives()[name]

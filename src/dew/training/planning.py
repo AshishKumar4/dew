@@ -1122,7 +1122,7 @@ class FitSearch[LossT, EffectsT]:
         passes: list[JSON] = list(report.passes()[passed:])
         # Its stored derivations' lookups by outcome (`report.record_stored`): a miss, an entry that failed to
         # read or a derivation not stored is a cold derivation's seconds this plan's traces paid.
-        stored: dict[str, JSON] = dict(recorded.stored)
+        stored: dict[str, JSON] = {outcome: count for outcome, count in recorded.stored.items()}
         self.kernels = {"spills": spills, "refused": refused, "rewrites": rewrites, "passes": passes,
                         "stored": stored}
         if split is None:
