@@ -1997,8 +1997,8 @@ def _entrywise_hook(hook: Callable, kinds: tuple[Kind, ...], dtypes: tuple[str, 
     return closed if held else None
 
 
-def sliced_hook(hook: Callable, kinds: tuple[Kind, ...], dtypes: tuple[str, ...], tile: tuple[int, int]
-                ) -> Callable | None:
+def sliced_hook(hook: Callable | None, kinds: tuple[Kind, ...], dtypes: tuple[str, ...],
+                tile: tuple[int, int]) -> Callable | None:
     """An entrywise output hook (`entrywise_hook`) as its program at the whole `tile` computes it, replayed on
     any block of the tile's columns and its parameters' same columns (`_replayed`): its block of the
     whole tile's value, whatever the hook reads of the tile's shape. None where it is not entrywise."""
