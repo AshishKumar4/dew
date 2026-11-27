@@ -292,7 +292,21 @@ def rates(target: generation.GpuTarget, *, device: bool) -> Rates:
                  fused=rate(vector) if held is None else math.inf)
 
 
-def units(work: Work, at: Rates) -> tuple[list[float], tuple[float, ...]]:
+class UnitSeconds(NamedTuple):
+    """`units`' seconds on each unit, in its order."""
+
+    tensor: float
+    cuda: float
+    special: float
+    on_chip: float
+    device: float
+    integer: float
+    reductions: float
+    issue: float
+    unpriced: float
+
+
+def units(work: Work, at: Rates) -> tuple[UnitSeconds, tuple[float, ...]]:
     """`work`'s seconds on each unit at the rates `at` (`rates`'): the tensor cores (their 16-bit, TF32 and
     FP8 modes in turn), the CUDA cores (their instructions, operations and conversions; the adds fused into
     a multiply, `Work.fused_multiply_adds`, at their own rate; and the integer multiply-adds their FMA pipe
@@ -302,17 +316,20 @@ def units(work: Work, at: Rates) -> tuple[list[float], tuple[float, ...]]:
     units, the element-wise reductions into global memory, the issue slots every instruction of those units
     takes (`issued`) and the operations no rule prices (`Work.unpriced_operations`, at no rate); and, level
     by level, the work at a rate the target states none of, which no time prices (0 where one does)."""
-    grouped = (((work.flops, at.tensor), (work.tf32_flops, at.tf32), (work.fp8_flops, at.eight)),
-               ((work.operations + work.conversions, at.cuda), (work.fused_multiply_adds, at.fused),
-                (work.integer_multiply_adds, at.multiply_adds)),
-               ((work.exponentials, at.special),),
-               ((work.shared_bytes, at.shared), (work.kept_bytes, at.kept)),
-               ((work.device_bytes, at.device),), ((work.integer_operations, at.integer),),
-               ((work.global_reductions, at.reductions),), ((issued(work), at.issue),),
-               ((work.unpriced_operations, None),))
-    priced = [sum((amount / per_second for amount, per_second in unit if amount and per_second is not None),
-                  0.0) for unit in grouped]
-    unpriced = tuple(amount if per_second is None else 0.0 for unit in grouped for amount, per_second in unit)
+    grouped = {"tensor": ((work.flops, at.tensor), (work.tf32_flops, at.tf32), (work.fp8_flops, at.eight)),
+               "cuda": ((work.operations + work.conversions, at.cuda), (work.fused_multiply_adds, at.fused),
+                        (work.integer_multiply_adds, at.multiply_adds)),
+               "special": ((work.exponentials, at.special),),
+               "on_chip": ((work.shared_bytes, at.shared), (work.kept_bytes, at.kept)),
+               "device": ((work.device_bytes, at.device),),
+               "integer": ((work.integer_operations, at.integer),),
+               "reductions": ((work.global_reductions, at.reductions),), "issue": ((issued(work), at.issue),),
+               "unpriced": ((work.unpriced_operations, None),)}
+    priced = UnitSeconds(**{name: sum((amount / per_second for amount, per_second in unit
+                                       if amount and per_second is not None), 0.0)
+                            for name, unit in grouped.items()})
+    unpriced = tuple(amount if per_second is None else 0.0 for unit in grouped.values()
+                     for amount, per_second in unit)
     return priced, unpriced
 
 
@@ -469,7 +486,7 @@ def streamed(per_program_bytes: float, busiest: int, bandwidth: float, multiproc
 
 
 def launch_seconds(work: Work, programs: int, target: generation.GpuTarget, *,
-                   resident: int = 1, warps: float = 0.0) -> float:
+                   resident: int = 1, warps: float = 0.0, serial: bool = False) -> float:
     """One kernel launch's seconds on `target` for `programs` programs at `resident` programs per
     multiprocessor, each issuing over `warps` warps (`emission.warps_of`; 0 where unknown): the longer of
     the busiest multiprocessor's throughput work (`ceil(n / SMs)` programs sharing one multiprocessor's
@@ -479,14 +496,20 @@ def launch_seconds(work: Work, programs: int, target: generation.GpuTarget, *,
     6216, 10809, 10810). Its issue slots take a warp's issue interval (`Multiprocessor.issue_interval`) over
     the warps each scheduler holds, where fewer warps than that interval leave it idle between a warp's
     instructions (`latency_bound`: rows 5274, 4123): every resident program's warps where the multiprocessor's
-    programs hide each other's intervals (`Multiprocessor.programs_hide_issue`), else one program's."""
+    programs hide each other's intervals (`Multiprocessor.programs_hide_issue`), else one program's. A
+    `serial` launch's issued instructions wait on its products and its products on them, a step at a time,
+    so its tensor cores' seconds and its issue slots' add where another launch's take the longer: a GH200
+    ran the attention forward at B2 S8192 32/8 d128 causal at 1.930 ms on 64 x 128 tiles of two consumers,
+    2.143 on 64 x 64 of two and 2.311 on 64 x 64 of three (M-NA-41d), the order its longer-of price
+    inverted (NA41)."""
     count = max(programs, 1)
     shared = {unit: getattr(work, unit) / count for unit in (*ISSUED_UNITS, "device_bytes")}
     per_program = dataclasses.replace(work, **shared, kernels=0)
     per_sm = spread(count, target.multiprocessors or 1)
     waves = spread(count, wave(target.multiprocessors, resident))
     at = rates(target, device=False)
-    throughput = max(units(per_program, at)[0])
+    on_units = units(per_program, at)[0]
+    throughput = max(max(on_units), on_units.tensor + on_units.issue if serial else 0.0)
 
     multiprocessor = target.architecture.multiprocessor
     hiding = multiprocessor is None or multiprocessor.programs_hide_issue

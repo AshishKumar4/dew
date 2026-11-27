@@ -26,6 +26,7 @@ from dew.nn.kernels.templates import (
     cost,
     emission,
     mosaic,
+    mosaic_sm90,
     placed,
     product,
     report,
@@ -816,8 +817,17 @@ class MosaicForward(_Mainloop[Tiles]):
         if not (found := emission.launched_kernels(traced.jaxpr)):
             return None
         resident = self.resident(ba, config, target)
+        # Its walk's softmax waits on a step's logits' products and its values' product on the softmax
+        # (`cost.launch_seconds`' `serial`), where measured so: warpgroup MMA's products from shared memory
+        # (a GH200's forward, M-NA-41d; each of the three cells M-FS-99 timed faster at the tiles the sum
+        # moved it to). mma.sync's warps issue its products themselves, and the sum lost 9-39% at the tiles
+        # it moved an A100's forward to (M-FS-99).
+        query = ba.arguments["query"]
+        family = self._named(target.generation, query.dtype, query.shape[1]).get(config.family)
+        serial = isinstance(family, mosaic_sm90.WgmmaIssuer)
         return sum(cost.launch_seconds(launched.work, emission.launch_programs(kernel), target,
-                                       resident=resident, warps=launched.warps if issued else 0.0)
+                                       resident=resident, warps=launched.warps if issued else 0.0,
+                                       serial=serial)
                    for kernel, launched in found)
 
     def _choose_consumers(self, ba: tokamax.BoundArguments, candidates: list[Tiles], *,
