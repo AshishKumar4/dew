@@ -730,28 +730,24 @@ def window_planes(weights: jax.Array | np.ndarray, layout: packed.WindowLayout =
 def window_weights(words, meta, dtype=jnp.bfloat16,
                    layout: packed.WindowLayout = packed.WINDOW) -> jax.Array:
     """The `Bf16Window` codec's matrix `[..., depth, width]` in `dtype` from its planes at `layout`
-    (`window_planes`'), each weight its stored bits again, a bit operation a weight, traced or not."""
-    group = layout.group
+    (`window_planes`'), each weight its stored bits again, a bit operation a weight, traced or not, each
+    plane's words unpacked into its depths' order by shifts and reshapes alone (`WindowLayout.unpacked`).
+    It reads no index: a gather by the planes' staged orders, the decode before it, read an index a weight
+    beside two uint32 planes the matrix's size, and took an A100 0.75 ms for Qwen3-4B's gate and up
+    projections a call where their bfloat16 product took 0.078 (M-NG-49-a100's window-xla arm, row 13647;
+    M-NG-59 times this one)."""
     words, meta = (jnp.asarray(plane, jnp.uint32) for plane in (words, meta))
     *lead, width, count = words.shape
     groups = count // layout.words
-    depth = groups * group
-    grouped = words.reshape(*lead, width, groups, layout.words)
-    low = grouped[..., :layout.byte_words].reshape(*lead, width, depth // 4)
-    offsets = grouped[..., layout.byte_words:].reshape(*lead, width, depth // 8)
-    bytes_ = ((low[..., None] >> (8 * jnp.arange(4, dtype=jnp.uint32))) & 0xFF).reshape(
-        *lead, width, depth)
-    nibbles = ((offsets[..., None] >> (4 * jnp.arange(8, dtype=jnp.uint32))) & 0xF).reshape(
-        *lead, width, depth)
-    shape = (*lead, width, depth // group, group)
-    byte = bytes_[..., np.argsort(window_byte_rows(depth, layout))].reshape(shape)
-    offset = nibbles[..., np.argsort(window_nibble_rows(depth, layout))].reshape(shape)
-    words4 = meta.reshape(*lead, width, depth // group, layout.meta_words)
-    escapes = tuple(words4[..., half // 2, None] >> (16 * (half % 2)) & 0xFFFF
-                    for half in layout.escape_halves)
-    held = window_bits(byte, offset, words4[..., layout.base_word, None], escapes)
-    values = jax.lax.bitcast_convert_type(held.astype(jnp.uint16).reshape(*lead, width, depth),
-                                          jnp.bfloat16)
+    grouped_shape = (*lead, width, groups)
+    grouped = words.reshape(*grouped_shape, layout.words)
+    byte = layout.unpacked(grouped[..., :layout.byte_words], 8)
+    offset = layout.unpacked(grouped[..., layout.byte_words:], 4)
+    words4 = meta.reshape(*grouped_shape, layout.meta_words)
+    held = window_bits(byte, offset, words4[..., layout.base_word, None],
+                       tuple(words4[..., word, None] for word in layout.escape_words))
+    stored = held.astype(jnp.uint16).reshape(*lead, width, groups * layout.group)
+    values = jax.lax.bitcast_convert_type(stored, jnp.bfloat16)
     return jnp.swapaxes(values, -1, -2).astype(dtype)
 
 
@@ -811,18 +807,18 @@ class Bf16Window(_Packed):
         return window_weights(self.words, self.meta, dtype)
 
 
-def window_bits(byte: jax.Array, offset: jax.Array, base: jax.Array, escapes: tuple) -> jax.Array:
-    """Each `Bf16Window` weight's bfloat16 bits (in a uint32's low half) from its stored byte (sign and
-    mantissa, or an escape's index), its 4-bit offset and its group's base and four escapes' bits (each
+def window_bits(byte: jax.Array, offset: jax.Array, base: jax.Array, escape_words: tuple) -> jax.Array:
+    """Each `Bf16Window` weight's bfloat16 bits (a uint32's low 16 bits, its high half unread) from its
+    stored byte (sign and mantissa, or an escape's index), its 4-bit offset, its group's base and its group's
+    two escape words (`WindowLayout.escape_words`: escapes one to four, two a word, low half first; each
     broadcast against the weights): the one decode a matrix decoded whole (`Bf16Window.decoded`) and a
-    stage decoded a lane at a time (`packed`'s window lanes) read, in integer operations alone (a select of
-    the escapes, no gather)."""
-    sign, mantissa = byte >> 7, byte & 0x7F
-    coded = (sign << 15) | ((base + offset - 1) << 7) | mantissa
-    first, second, third, fourth = escapes
-    escaped = jnp.where(mantissa <= 2, jnp.where(mantissa == 1, first, second),
-                        jnp.where(mantissa == 3, third, fourth))
-    return jnp.where(offset > 0, coded, jnp.where(mantissa > 0, escaped, sign << 15))
+    stage decoded a lane at a time (`packed`'s window lanes) read, in integer operations alone (escape `i`
+    its word's half by a select and a shift, no gather)."""
+    mantissa, signed = byte & 0x7F, (byte & 0x80) << 8
+    coded = signed | ((base + offset - 1) << 7) | mantissa
+    low, high = escape_words
+    escaped = jnp.where(mantissa <= 2, low, high) >> (((mantissa - 1) & 1) << 4)
+    return jnp.where(offset > 0, coded, jnp.where(mantissa > 0, escaped, signed))
 
 
 PACKED_FORMATS = (NvFp4, TernaryWeights, Bf16Window)

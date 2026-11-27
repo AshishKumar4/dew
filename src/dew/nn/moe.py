@@ -50,7 +50,7 @@ from dew.mesh import (
 )
 from dew.nn.dense import Dense, amax_history, noted_amax, packed_matrix
 from dew.nn.derivatives import KernelGlue, Protected, contracted, declared_tangent, with_tangents_formed_at
-from dew.nn.kernels.templates.gemm import rows_gathered_wide
+from dew.nn.kernels.templates.gemm import launched_whole, rows_gathered_wide
 from dew.nn.kernels.templates.hooks import Hook, Side
 from dew.nn.residuals import Residual
 
@@ -859,7 +859,9 @@ def gated_experts(x: jax.Array | Gathered, gate: jax.Array | Layered, up: jax.Ar
         # Asked of every call, one whose pair runs apart among them, so the selector reports each grouped
         # MLP's route. A packed bank's matrices are its codes, of no product's shape a launch reads (`None`).
         # Asked of the calls the chain makes: its tokens and the gathered rows' indices, its group sizes, the
-        # down projection's scatter and the layer of a stack of layers (`_paired_call`'s).
+        # down projection's scatter and the layer of a stack of layers (`_paired_call`'s); whole where those
+        # launches read every operand whole as placed (`launched_whole`), which their shapes cannot say: the
+        # pair's streamed rows, scales and stacks (`_paired`), the down stack, the sizes and the scatter.
         tokens = x.tokens if isinstance(x, Gathered) else x
         fused = fuses_grouped(
             jax.ShapeDtypeStruct(tokens.shape, compute),
@@ -867,8 +869,8 @@ def gated_experts(x: jax.Array | Gathered, gate: jax.Array | Layered, up: jax.Ar
                                  jax.ShapeDtypeStruct(down_stack.shape, compute)),
             precision, hook, paired=paired is not None and down_layer is paired[-1],
             down_prologue=not isinstance(down_stack, formats.NvFp4) and not _recipe_takes_experts(down_stack),
-            group_sizes=group_sizes, gather=x.rows if isinstance(x, Gathered) else None, scatter=scatter,
-            layer=down_layer)
+            whole=launched_whole(paired, down_stack, group_sizes, scatter), group_sizes=group_sizes,
+            gather=x.rows if isinstance(x, Gathered) else None, scatter=scatter, layer=down_layer)
     # The selector fuses a pair alone, of a gated product with a hook (its `paired` and `hook` requirements).
     if paired is None or hook is None or not fused:
         gate_scale, up_scale, down_scale = scales or (None, None, None)

@@ -14,6 +14,7 @@ from reference_error import assert_as_exact, with_gradients
 
 from dew.nn.kernels import formats, gemm, generation, projections
 from dew.nn.kernels.templates import product
+from dew.nn.kernels.templates.gemm import quantized
 
 SEEDS = 8
 
@@ -177,19 +178,19 @@ def test_a_block_holding_an_infinity_takes_the_nan_scale_quantized_or_in_the_epi
     """A 32-column block of a product whose fp32 sum overflows in half its columns takes the NaN scale
     (`0xFF`), its finite values coded at a unit scale, and its row's finite block its own scale, alike
     whether `formats.MxFp8.quantized` quantizes the product or the GEMM's quantizing epilogue does
-    (`gemm.gemm_quantized(..., MxFp8)`), bit for bit (row 13164: the epilogue's 247 against the
+    (`quantized.gemm_quantized(..., MxFp8)`), bit for bit (row 13164: the epilogue's 247 against the
     quantizer's 118)."""
     x = jnp.zeros((16, 64), jnp.bfloat16).at[:, 1].set(1).at[0, 0].set(2.0 ** 127)
     w = jnp.zeros((64, 64), jnp.bfloat16).at[1, :].set(1).at[0, :16].set(4)
     product = jnp.dot(x, w, preferred_element_type=jnp.float32)
-    fused = gemm.gemm_quantized(x, w, minifloat=formats.MxFp8)
+    fused = quantized.gemm_quantized(x, w, minifloat=formats.MxFp8)
     assert isinstance(fused, formats.MxFp8)
-    quantized = formats.MxFp8.quantized(product)
+    coded = formats.MxFp8.quantized(product)
     def raw(array):
         return np.asarray(jax.lax.bitcast_convert_type(array, jnp.uint8))
 
-    scales = (raw(quantized.scales), raw(fused.scales))
-    codes = (raw(quantized.codes), raw(fused.codes))
+    scales = (raw(coded.scales), raw(fused.scales))
+    codes = (raw(coded.codes), raw(fused.codes))
     np.testing.assert_array_equal(scales[0], scales[1])
     np.testing.assert_array_equal(codes[0], codes[1])
     unit = np.asarray(jax.lax.bitcast_convert_type(jnp.ones((), jnp.float8_e4m3fn), jnp.uint8))
@@ -362,11 +363,11 @@ def test_an_mxfp8_sum_keeps_what_each_addition_rounds_away(policy):
 
 def test_a_nan_in_a_quantizing_epilogues_product_takes_the_nan_scale():
     """A NaN in a GEMM's rows reaches every column of its row's product, whose blocks the quantizing epilogue
-    (`gemm.gemm_quantized(..., MxFp8)`) scales NaN (`0xFF`), every other row's block its own scale, as the
-    quantizer scales the product (row 13164)."""
+    (`quantized.gemm_quantized(..., MxFp8)`) scales NaN (`0xFF`), every other row's block its own scale, as
+    the quantizer scales the product (row 13164)."""
     x = jnp.ones((16, 64), jnp.bfloat16).at[2, 7].set(jnp.nan)
     w = jnp.eye(64, dtype=jnp.bfloat16)
-    fused = gemm.gemm_quantized(x, w, minifloat=formats.MxFp8)
+    fused = quantized.gemm_quantized(x, w, minifloat=formats.MxFp8)
     assert isinstance(fused, formats.MxFp8)
     held = np.asarray(jax.lax.bitcast_convert_type(fused.scales, jnp.uint8))
     assert (held[2] == 0xFF).all() and (np.delete(held, 2, axis=0) != 0xFF).all()

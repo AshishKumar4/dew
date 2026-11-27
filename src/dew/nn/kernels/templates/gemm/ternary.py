@@ -16,8 +16,8 @@ from dew.nn import float_bits, precision
 from dew.nn.derivatives import KernelGlue, contracted, surrogate
 from dew.nn.kernels import gemm, generation, grouped_quantized, selection, xla_products
 from dew.nn.kernels.formats import TernaryWeights, scale_factor
+from dew.nn.kernels.templates.gemm import launched_whole
 from dew.nn.kernels.templates.gemm.factored import factored, int8_epilogue
-from dew.nn.sharding import automatic_axes
 
 TERNARY_WEIGHT_ROW = "ledger 1464"
 
@@ -88,7 +88,8 @@ def ternary_weight_product(lhs: jax.Array, weights: TernaryWeights, group_sizes:
                         None, None, None, out_dtype="float32", trans_rhs=False, interpret=interpret_on_cpu,
                         dense=dense, exact_sums=False)
     with xla_products.interpreted_context(interpret_on_cpu):
-        case = gemm.WordPackedCase(functools.partial(gemm._planned, launch, bound), not automatic_axes())
+        case = gemm.WordPackedCase(functools.partial(gemm._planned, launch, bound),
+                                   launched_whole(lhs, weights, group_sizes))
         mosaic = selection.select(TERNARY_WEIGHT, case).kernel == "mosaic"
     if mosaic:
         one = jnp.ones((), jnp.float32)

@@ -17,9 +17,8 @@ import jax.numpy as jnp
 from dew.nn.derivatives import contracted, surrogate
 from dew.nn.kernels import gemm, generation, grouped_matmul, selection, xla_products
 from dew.nn.kernels.templates import axes, mosaic, resources
-from dew.nn.kernels.templates.gemm import tiling
+from dew.nn.kernels.templates.gemm import launched_whole, tiling
 from dew.nn.precision import EXACT_FLOAT32
-from dew.nn.sharding import automatic_axes
 
 FP8_CODES_ROW = "ledger 8548"
 
@@ -214,7 +213,8 @@ def _converted(lhs: jax.Array, rhs: jax.Array, interpret: bool) -> jax.Array | N
                     jax.ShapeDtypeStruct((1, padded_width, padded_depth), rhs.dtype),
                     jax.ShapeDtypeStruct((1,), jnp.int32))
     with xla_products.interpreted_context(interpret):
-        case = gemm.WordPackedCase(functools.partial(gemm._planned, launch, planned), not automatic_axes())
+        case = gemm.WordPackedCase(functools.partial(gemm._planned, launch, planned),
+                                   launched_whole(lhs, rhs))
         if selection.select(FP8_CODES, case).kernel != "mosaic":
             return None
 

@@ -72,17 +72,17 @@ def test_a_window_codec_at_another_meta_layout_decodes_in_its_stages_and_reads_a
     decoded = np.asarray(formats.window_weights(words, meta, layout=moved))
     np.testing.assert_array_equal(decoded.view(np.uint16), drawn.view(np.uint16))
     desc = packed.weight_format("window", layout=moved)
-    per_step = desc.meta_columns(moved.step)
+    [deepest] = desc.steps
+    per_step = desc.meta_columns(deepest)
     assert per_step == 32
     halves = np.stack([meta & 0xFFFF, meta >> 16], axis=-1).astype(np.uint16).reshape(width, -1)
-    groups_a_step = moved.step // moved.group
-    blocks_a_step = groups_a_step * desc.blocks
-    for step in range(depth // moved.step):
+    blocks_a_step = deepest // moved.group * desc.blocks
+    for step in range(depth // deepest):
         blocks = [jnp.asarray(words[:, 16 * block:16 * (block + 1)])
                   for block in range(step * blocks_a_step, (step + 1) * blocks_a_step)]
         step_meta = jnp.asarray(halves[:, step * per_step:(step + 1) * per_step])
         for group, code, lane in packed.packed_lanes(blocks, desc, interpret=True, meta=step_meta):
-            at = step * moved.step + group * moved.group + 16 * code
+            at = step * deepest + group * moved.group + 16 * code
             held = drawn[at:at + 16].T
             np.testing.assert_array_equal(np.asarray(lane).view(np.uint16), held.view(np.uint16))
     # Its digest folds its meta's placement in, not its width alone: another eight-word layout's differs too.
@@ -139,14 +139,17 @@ def test_a_dense_served_its_window_is_its_kernels_product_and_its_kernel_comes_b
 
 
 def _two_steps(seed: int = 5387) -> np.ndarray:
-    """`_drawn`'s edges in a first 256-deep step and, in a second, a draw 2**-20 smaller (other bases) with
-    three weights of one group below its window (its escapes): a launch reading step zero's words or meta
-    again decodes the second wrong."""
-    second = _drawn((256, 64), seed + 1)
-    finite = np.isfinite(second.astype(np.float32))
-    second = np.where(finite, (second.astype(np.float32) * np.float32(2.0 ** -20)), 0.0).astype(jnp.bfloat16)
-    second[0:3, 5] = np.asarray(2.0 ** -50, jnp.bfloat16)
-    return np.concatenate([_drawn((256, 64), seed), second])
+    """`_drawn`'s edges in a first 256-deep step and, in a second, a draw 2**-20 smaller (other bases) whose
+    column 5 holds, in its first group, one weight setting its window and four distinct weights 30 to 35
+    binades below it (its four escapes, of signs and binades of their own): a launch reading step zero's
+    words or meta, or an escape's other slot, decodes the second wrong."""
+    scale = np.float32(2.0 ** -20)
+    second = _drawn((256, 64), seed + 1).astype(np.float32)
+    second = np.where(np.isfinite(second), second * scale, 0.0)
+    second[:128, 5] = 0.0
+    second[4, 5] = scale
+    second[0:4, 5] = scale * np.float32(2.0 ** -30) * np.asarray([1.0, -0.5, 0.1875, -0.0390625], np.float32)
+    return np.concatenate([_drawn((256, 64), seed), second.astype(jnp.bfloat16)])
 
 
 def _flipped(form: bytes) -> bytes:
@@ -227,7 +230,7 @@ def test_a_window_holds_a_group_of_the_least_normal_binades():
 
 
 def test_a_window_launch_takes_its_staged_matrix_and_refuses_its_rows_swapped():
-    """A window's launch reads its columns' meta halves beside its words (`gmm`'s `scales`): its staged
+    """A window's launch reads its columns' meta words beside its words (`gmm`'s `scales`): its staged
     matrix of a 256-deep step is taken, and a swapped call (its matrix the products' rows, which stream no
     columns' meta) is refused where the same call of a ternary matrix is taken (an H100's warpgroup MMA)."""
     from dew.nn.kernels.templates.gemm import packed, pricing, tiling
@@ -250,16 +253,16 @@ def test_a_window_launch_takes_its_staged_matrix_and_refuses_its_rows_swapped():
                 swapped()
 
 
+@pytest.mark.parametrize("tokens", [16, 4096], ids=["decode", "prefill"])
 @pytest.mark.parametrize("gpu", [pytest.param("sm80", marks=lowers("sm80")),
                                  pytest.param("sm90", marks=lowers("sm90"))])
-def test_a_window_product_compiles_spill_free(gpu: str):
+def test_a_window_product_compiles_spill_free(gpu: str, tokens: int):
     """A window's Mosaic launch, each stage decoded in place, compiles spill-free on a compile-only sm80
-    and sm90 at a Qwen3-4B projection's shape (row 5387)."""
+    and sm90 at a Qwen3-4B projection's shape, a decode step's rows and a prefill's (row 5387)."""
     if generation.compile_only_gpus(gpu):
-        rows = jax.ShapeDtypeStruct((4096, 2560), jnp.bfloat16)
+        rows = jax.ShapeDtypeStruct((tokens, 2560), jnp.bfloat16)
         sample = Bf16Window.of(np.ones((2560, 9728), jnp.bfloat16))
         spec = jax.tree.map(lambda a: jax.ShapeDtypeStruct(np.shape(a), np.asarray(a).dtype), sample)
-
         def compiled(a, w):
             return gemm.window_product(a, w, out_dtype=jnp.bfloat16)
 
@@ -484,15 +487,23 @@ def test_a_kernel_no_process_holds_whole_packs_where_its_columns_live(tmp_path):
     """A `[256, 256]` kernel split by its columns across two processes' devices, which no process holds
     whole: `bf16_windows` encodes each column's window where it lives, each process's planes its own
     columns' window, decoded its own columns' bits again (row 13702: it read the whole kernel on each
-    process, which JAX refuses for a value lying on other processes' devices)."""
+    process, which JAX refuses for a value lying on other processes' devices); times the identity's first
+    rows on an H100's selection, jitted outside the mesh's context, each device's output columns its own,
+    its weights bit for bit (XLA's decoded product, which partitions the planes), the Mosaic launch named
+    refused by their placement (row 13724: it would read them whole on every device), over Explicit axes
+    and over Auto ones."""
     from pathlib import Path
 
     from process_support import run_pool
 
     worker = Path(__file__).with_name("bf16_window_worker.py")
     for report in run_pool("width_split", tmp_path / "pool", 2, devices=2, script=worker):
-        assert report["planes"] and all(report["planes"]), report
-        assert report["decoded"] and all(report["decoded"]), report
+        for axes in ("Explicit", "Auto"):
+            placed = report[axes]
+            assert placed["planes"] and all(placed["planes"]), report
+            assert placed["decoded"] and all(placed["decoded"]), report
+            assert placed["owned"] and all(placed["owned"]), report
+            assert placed["refused"] == "sharding", report
     # On process 0's devices alone: every process windows it alike, process 1 holding none of its planes.
     reports = run_pool("one_rank", tmp_path / "one", 2, devices=2, script=worker)
     assert reports[0]["planes"] and all(reports[0]["planes"]) and reports[1]["planes"] == [], reports
