@@ -29,6 +29,7 @@ this yet: a checkpoint holding them loads its text decoder alone.
 
 from __future__ import annotations
 
+import re
 from collections.abc import Mapping
 from types import MappingProxyType
 
@@ -471,7 +472,7 @@ def _stacks(config: Mapping[str, object]) -> list[Stacked]:
             for site in 'kv':
                 conv = f'{stem}.attn.{site}_sconv'
                 stacks += [Stacked(f'{conv}.static_w', (f'{conv}.weight',),
-                                   (Reversed(0), Transposed((1, 0)), Split(1)), grid=(), spelled=True),
+                                   (Reversed(0), Transposed((1, 0)), Split(1)), grid=()),
                            Stacked(f'{conv}.weight_proj', (f'{conv}.weight_proj',),
                                    (Split(0, taps), Reversed(1), Inverted(Split(0, taps))), grid=())]
         if layer in routed:
@@ -511,7 +512,13 @@ def _unstored(config: Mapping[str, object]) -> dict[str, np.ndarray]:
     return {f'model.llm.layers.0.{site}_query': np.zeros((1, width), np.float32) for site in _sites(first)}
 
 
-_RESTACKED = Restacked(_stacks, _unstored)
+_PREPARED = re.compile(
+    r'model\.llm\.(output_query|layers\.\d+\.((attn|k|v|mlp)_query|attn\.[kv]_sconv\.weight_proj'
+    r'|controllers\.(attn|mlp|k|v)\.(query|input_down|message_down|forget|gain)'
+    r'|mlp\.experts\.\d+\.(gate|up|down)_proj\.weight))')
+"""The names `_ROUTES` read only as the parts of `_stacks` or `_unstored`, whatever the decoder's record."""
+
+_RESTACKED = Restacked(_stacks, _unstored, _PREPARED)
 """Inkling 2's release as `_ROUTES` read it and back, one declaration both ways."""
 
 

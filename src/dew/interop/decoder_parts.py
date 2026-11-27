@@ -1965,16 +1965,13 @@ class Stacked:
     the view itself the one part, where empty), in row-major order, each of the `shape` the record states
     where it states one (a part of another refused either way). A load splits the tensor into views of
     its parts (`split`) and an export stacks them back through each step's inverse (`stacked`), so the one
-    declaration is both directions. `spelled` marks parts the release also stores as they are elsewhere
-    (a static convolution's taps, where a dynamic one's are stacked), whose names no other tensor is
-    refused for (`Restacked.unprepare`)."""
+    declaration is both directions."""
 
     name: str
     parts: tuple[str, ...]
     view: tuple[Step, ...] = ()
     grid: tuple[int, ...] | None = None
     shape: tuple[int, ...] | None = None
-    spelled: bool = False
 
     def _shaped(self, shapes: Sequence[tuple[int, ...]]) -> None:
         """Refuse a part of another shape than the record states."""
@@ -2035,13 +2032,15 @@ class Restacked:
     """A release's tensors that its path map reads otherwise than they are stored, declared once for both
     directions by the decoder's record: `stacks` each such stored tensor as the `Stacked` view of the
     tensors the map reads, and `unstored` the tensors the map reads that the release stores none of, each
-    with the one value it holds. `prepare` splits each stack (one the release lacks refused) and adds the
+    with the one value it holds; `prepared` matches every name the map reads only as a part or unstored,
+    whatever the record. `prepare` splits each stack (one the release lacks refused) and adds the
     unstored tensors; `unprepare`, its exact inverse (`DecoderFamily.unprepare`), stacks each back from its
     parts (a part missing refused) and drops the unstored ones once they hold their value; every other
     tensor passes through both."""
 
     stacks: Callable[[Mapping[str, object]], Sequence[Stacked]]
     unstored: Callable[[Mapping[str, object]], Mapping[str, np.ndarray]]
+    prepared: re.Pattern[str]
 
     def prepare(self, tensors: Mapping[str, Stored],
                 config: Mapping[str, object] | None = None) -> dict[str, Stored]:
@@ -2072,8 +2071,7 @@ class Restacked:
                 raise ValueError(f"{name} holds {specs.get(name)}, not the value no read of the release "
                                  "reaches, which it stores none of")
         owner: dict[str, Stacked] = {}
-        stacks = self.stacks(config)
-        for stack in stacks:
+        for stack in self.stacks(config):
             if missing := [part for part in stack.parts if part not in specs]:
                 raise ValueError(f"{stack.name} stacks {missing}, which the tensors miss")
             for part in stack.parts:
@@ -2089,16 +2087,12 @@ class Restacked:
                 raise ValueError(f"two of the prepared tensors write back {name}")
             built[name] = (spec, build)
 
-        # A tensor passed through under a name spelled as a stack's or its parts' (their layer and expert
-        # numbers any), which the record stacks no tensor under, is no tensor of the release: refused, not
-        # written as it is.
-        spelling = re.compile("|".join(sorted({
-            re.sub(r"\d+", r"\\d+", re.escape(name))
-            for stack in stacks for name in (stack.name, *([] if stack.spelled else stack.parts))})))
+        # A tensor under a name only a stack's part takes (`prepared`), which the record stacks none of, is
+        # no tensor of the release: refused, not written as it is.
         if stray := sorted(name for name in specs if name not in owner and name not in unstored
-                           and stacks and spelling.fullmatch(name)):
-            raise ValueError(f"{stray} are spelled as the release's stacked tensors or their parts, which "
-                             "its record stacks none of")
+                           and self.prepared.fullmatch(name)):
+            raise ValueError(f"{stray} are named as the parts of the release's stacked tensors, which its "
+                             "record stacks none of")
         stacked: set[str] = set()
         for name, spec in specs.items():
             stack = owner.get(name)
