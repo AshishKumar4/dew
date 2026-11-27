@@ -780,7 +780,8 @@ def test_a_dry_prepares_baseline_is_mains_whatever_cut_main_made_of_it(ci, monke
             kind, _, place = key.partition("/")
             if place not in kept:
                 return None
-            found = shapes.get(kind, {"unprepared": kept[place]})
+            stored = kept[place]
+            found = shapes.get(kind, stored if isinstance(stored, dict) else {"unprepared": stored})
             return json.dumps(found).encode()
 
     monkeypatch.setenv("DEW_XLA_CACHE_URL", "http://cache")
@@ -809,6 +810,29 @@ def test_a_dry_prepares_baseline_is_mains_whatever_cut_main_made_of_it(ci, monke
     shapes["baseline"] = {}
     assert before("tests/test_gpu_a.py", "@prepare-sm90") == ci.prepares.UNREAD
     shapes.clear()
+    # A whole cut, one group's baseline by its cells' fields and the other's an older one's identities, is
+    # read with the two apart, and graded so: a cell whose node id holds " @ <cap> [" names no cap, and the
+    # older group's capped test still exempts its own.
+    wire = ci.tier_wire()
+    lookalike = ["tests/test_gpu_a.py::test_flow[p] @ " + wire.CAPPED + " [q", "a site", "c"]
+    older = f"tests/test_gpu_a.py::test_other @ {wire.CAPPED}"
+    saved = dict(kept)
+    kept["3.12:tests/test_gpu_a.py#1/2@prepare-sm90"] = {
+        "unprepared": [ci.prepares.identity(ci.prepares.record_of(tuple(lookalike)))],
+        "unprepared_cells": [lookalike]}
+    kept["3.12:tests/test_gpu_a.py#2/2@prepare-sm90"] = [older]
+    found = before("tests/test_gpu_a.py", "@prepare-sm90")
+    assert found == {tuple(lookalike), older}
+    reached = {"test": "tests/test_gpu_a.py::test_flow[p]", "where": "a site", "error": "e",
+               "cell": "q @ a site [c"}
+    other = {"test": "tests/test_gpu_a.py::test_other", "where": "x", "error": "e"}
+    [row] = ci.prepares.graded(
+        [{"name": "3.12:tests/test_gpu_a.py#@prepare-sm90", "exitCode": 0, "output": "ran"}],
+        {"tests/test_gpu_a.py": [reached, other]}, found, "sm90",
+        lambda named_: ci.grading.owning(ci.parsed_row(named_)[1]), ci.grading.STALE, wire.CAPPED)
+    assert row["new_unprepared"] == [ci.prepares.identity(reached)]
+    kept.clear()
+    kept.update(saved)
     monkeypatch.setattr(ci.run_keys, "head_commit", lambda: "a head")
 
     assert before("tests/test_gpu_a.py", "@prepare-sm90") == {

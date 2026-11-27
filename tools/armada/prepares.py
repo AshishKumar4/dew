@@ -13,7 +13,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Set as AbstractSet
 from pathlib import Path
 
 PREPARE = "prepare-"
@@ -354,7 +354,7 @@ def as_ran(row: dict, stale: str) -> dict:
             else row)
 
 
-def graded(rows: list[dict], unprepared: Mapping[str, list[dict]], before: set[Cell] | set[str] | str,
+def graded(rows: list[dict], unprepared: Mapping[str, list[dict]], before: AbstractSet[Cell | str] | str,
            generation: str,
            file_of: Callable[[str], str], stale: str, capped_at: str) -> list[dict]:
     """A dry prepare's `rows` (`file_of` a row's name its test file), each keeping the cells it left
@@ -386,7 +386,7 @@ def graded(rows: list[dict], unprepared: Mapping[str, list[dict]], before: set[C
         # Said once: a reused row's output holds its banner (`capped_banner`) already.
         if capped and (found.get("output") or "").startswith(head := capped_banner(capped)):
             found = {**found, "output": found["output"][len(head):].lstrip("\n")}
-        if isinstance(before, set):
+        if not isinstance(before, str):
             # Main's decision_laya prepare capped its five tests, which a run that reached them failed
             # alike at main's commit (2026-11-25): no run of main's says how they go. A baseline keeping its
             # cells by their fields gives main's capped ones so; an older one's identities are read back.
@@ -553,7 +553,7 @@ def listed_cuts(store, prefix: str, row_variant: str, until: float) -> dict[str,
     return cuts
 
 
-def before(ci, python: str, name: str, group: str, until: float) -> set[Cell] | set[str] | str:
+def before(ci, python: str, name: str, group: str, until: float) -> set[Cell | str] | str:
     """The cells main's own runs of file `name`'s prepare for `group`'s generation and process left unprepared
     (`identity`), whatever cut main's plan made of it: each of its rows' baselines main's commit keeps (this
     checkout's `mainline`, ci.py's `baseline_key`, listed under the file's place once; a green run's alone,
@@ -572,7 +572,7 @@ def before(ci, python: str, name: str, group: str, until: float) -> set[Cell] | 
     return BOOTSTRAP if found == PARTIAL else found
 
 
-def _before(ci, python: str, name: str, group: str, until: float) -> set[Cell] | set[str] | str:
+def _before(ci, python: str, name: str, group: str, until: float) -> set[Cell | str] | str:
     """`before`'s read of main's baselines, whatever commit this checkout is: `PARTIAL` where they were read
     and are not whole (a run named with no baseline, or no cut every group of which is listed), `UNREAD`
     where they could not be read."""
@@ -602,7 +602,7 @@ def _before(ci, python: str, name: str, group: str, until: float) -> set[Cell] |
             if count != "whole" and len(held_cuts) != int(count):
                 continue
             whole = True
-            found: set = set()
+            found: set[Cell | str] = set()
             for cut in held_cuts:
                 held_row = ci.row(python, name, ci.varied("" if cut == "whole" else cut.replace("-of-", "/"),
                                                           row_variant))
