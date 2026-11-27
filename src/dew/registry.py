@@ -850,8 +850,9 @@ def _rebuilt(annotation: Annotation, value: object, *, dtypes: bool, name: str =
         # Data a record holds as written, whatever it spells (a chat message's `{"function": ...}`).
         return configured(value)
     # An alias resolved first, so a bound member's alias (`type Predictor = functools.partial[...]`) reads
-    # as the partial it names.
-    annotation = resolve_alias(annotation)
+    # as the partial it names, and an Annotated's type read as the type, as its writer reads it
+    # (`_admits_partial`).
+    annotation = _resolved(annotation)
     if typing.get_origin(annotation) is functools.partial or annotation is functools.partial:
         return _bound(value, typing.get_args(annotation))
     if isinstance(annotation, type) and issubclass(annotation, Enum):
@@ -1190,17 +1191,54 @@ def _member(name: str, held: tuple[type, ...]) -> Callable[..., Configured]:
     raise ValueError(f"{name!r} names {', '.join(map(repr, found))}, not one {wanted}")
 
 
+def _resolved(annotation: Annotation) -> Annotation:
+    """`annotation` as a record is read against it: its aliases resolved and an Annotated's type taken, at
+    any depth of the two, the one normalization the reader (`_rebuilt`) and the writer (`_admits_partial`)
+    read a declaration by."""
+    held = resolve_alias(annotation)
+    while typing.get_origin(held) is typing.Annotated:
+        held = resolve_alias(typing.get_args(held)[0])
+    return held
+
+
 def _admits_partial(annotation: Annotation) -> bool:
     """Whether a field declaring `annotation` reads a bound member back from its class record (`_bound`),
-    flattened as its reader flattens it (`_rebuilt`): an alias resolved, an Annotated's type, and a union of
-    one member besides None that member, each at any depth."""
-    held = resolve_alias(annotation)
-    if typing.get_origin(held) is typing.Annotated:
-        return _admits_partial(typing.get_args(held)[0])
+    flattened as its reader flattens it (`_rebuilt`): an alias resolved, an Annotated's type (`_resolved`),
+    and a union of one member besides None that member, each at any depth."""
+    held = _resolved(annotation)
     if typing.get_origin(held) in (Union, types.UnionType):
         inner = [member for member in _union_members(held) if member is not type(None)]
         return len(inner) == 1 and _admits_partial(inner[0])
     return held is functools.partial or typing.get_origin(held) is functools.partial
+
+
+def _holds_partial(value: Configured) -> bool:
+    """Whether `value` is a partial or a container holding one at any depth."""
+    if isinstance(value, functools.partial):
+        return True
+    if isinstance(value, Mapping):
+        return any(_holds_partial(entry) for entry in value.values())
+    return isinstance(value, list | tuple) and any(_holds_partial(entry) for entry in value)
+
+
+def _unread_partial(value: Configured, annotation: Annotation) -> functools.partial | None:
+    """The first partial `value` holds, at any depth of its containers, whose place `annotation` declares
+    reads back no bound member (`_admits_partial`), each entry against its own type (`entry_types`; an
+    entry of no type it states takes none); None where every one reads back."""
+    if isinstance(value, functools.partial):
+        return None if _admits_partial(annotation) else value
+    if isinstance(value, Mapping):
+        values = list(value.values())
+    elif isinstance(value, list | tuple):
+        values = list(value)
+    else:
+        return None
+    try:
+        types_ = entry_types(annotation, len(values))
+    except ValueError:
+        types_ = [None] * len(values)
+    return next((found for entry, held in zip(values, types_, strict=True)
+                 if (found := _unread_partial(entry, held)) is not None), None)
 
 
 def _argument_type(member: type | Callable[..., Configured], name: str) -> Annotation:
@@ -2119,12 +2157,14 @@ class Bound(ABC):
         beside `defaults`. A recorded kind's as held (`argument_records`, at construction); another's each
         recorded as given, read against nothing until its member is built (a world model's views named
         alone, which its environment widens)."""
-        # A partial held where the member's argument reads none back is refused, as `to_record` refuses it
-        # under a field's annotation (train 1429's review): its record would read back as no partial.
+        # A partial held, at any depth of a container, where the member's argument reads none back is
+        # refused, as `to_record` refuses it under a field's annotation (train 1429's review): its record
+        # would read back as no partial. The rest written as held, read against nothing.
         for name, value in self.fields.items():
-            if isinstance(value, functools.partial) and not _admits_partial(_argument_type(self.member,
-                                                                                           name)):
-                raise Unrecordable(f"{self.name}'s {name} holds {value!r}, which its annotation reads back "
+            held = _holds_partial(value)
+            found = _unread_partial(value, _argument_type(self.member, name)) if held else None
+            if found is not None:
+                raise Unrecordable(f"{self.name}'s {name} holds {found!r}, which its annotation reads back "
                                    "as no bound member: declare it functools.partial[...]")
         with recording():
             # Each written as held, against no parameter's annotation, as the record held them before

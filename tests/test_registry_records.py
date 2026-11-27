@@ -681,21 +681,25 @@ def test_a_held_argument_partial_is_recorded_only_where_its_member_reads_one_bac
     from dew.nn.backbones.unet import Unet
     from dew.registry import ModelConfig, Unrecordable
 
-    held = ModelConfig(functools.partial(Unet, activation=functools.partial(cast_rounded, dtype="bfloat16")))
-    with pytest.raises(Unrecordable):
-        held.record()
+    rounded = functools.partial(cast_rounded, dtype="bfloat16")
+    for held in (ModelConfig(functools.partial(Unet, activation=rounded)),
+                 ModelConfig(functools.partial(Unet, feature_depths=(64, rounded)))):
+        with pytest.raises(Unrecordable):
+            held.record()
 
 
 type _MaybePredictor = _Predictor | None
+type _TaggedPredictor = typing.Annotated[functools.partial[JepaPredictor] | None, "tag"]
 
 
 def test_a_partial_under_a_nested_optional_alias_reads_back():
     """A partial under an Optional of an alias of an Optional of its partial alias reads back as the
-    partial it was, as its reader flattens the nesting (train 1429's review: the writer refused it)."""
+    partial it was, as its reader flattens the nesting, an Annotated alias's among them (train 1429's
+    review: the writer refused it; theme 73's: the reader kept an Annotated alias's record a dict)."""
     from dew.registry import to_record
 
     bound = functools.partial(JepaPredictor, num_layers=2)
-    for annotation in (_MaybePredictor, _MaybePredictor | None):
+    for annotation in (_MaybePredictor, _MaybePredictor | None, _TaggedPredictor):
         again = from_record(annotation, to_record(bound, annotation))
         assert isinstance(again, functools.partial)
         assert (again.func, again.keywords) == (JepaPredictor, {"num_layers": 2})
