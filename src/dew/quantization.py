@@ -97,7 +97,7 @@ from dew.nn.precision import (
     twice_scaled,
     uncontracted,
 )
-from dew.nn.sharding import abstract
+from dew.nn.sharding import abstract, explicit_spec
 
 if TYPE_CHECKING:
     from qwix import QArray, QtProvider, QuantizationProvider
@@ -791,16 +791,17 @@ def deferred_packed(variables: Variables) -> Variables:
 
 
 class PackedDecode:
-    """A packed leaf's parameter, decoded on the host's CPU as it is read (`np.asarray`, an export's
-    `dew.interop.streaming.HostArray`), its shape and dtype known before, and an index of it (a layer's or
-    an expert's row, a member's columns) a decode of it in turn: a packed bank (`NvFp4`) float32 by
+    """A packed leaf's parameter, decoded on the host's CPU (`_decoding`) as it is read (`np.asarray`, an
+    export's `dew.interop.streaming.HostArray`), its shape and dtype known before, and an index of it (a
+    layer's or an expert's row, a member's columns) a decode of it in turn: a packed bank (`NvFp4`) float32 by
     `packed_values`, a window (`Bf16Window`) bfloat16 once its format admits it, its planes read home first
     (`dew._coordination.read_home`: a pool's export reads a leaf spanning its processes together, each
     process its whole; one on a mesh of some of the pool's processes read whole where it lives and refused
-    where it does not, `read_home`). The last leaf
-    decoded is held in `memo`, which one tree's leaves share (`deferred_packed`), for its next index, a
-    bank's rows read one after another, and only it, released before the next is made: an export holds
-    one leaf's decode at a time, and none once its tree is released."""
+    where it does not, `read_home`). A row of its leading (stacked) axes is sliced from each plane before
+    it is decoded, so an export decodes the row it writes, not the bank (`_rows`). The last row decoded is
+    held in `memo`, which one tree's leaves share (`deferred_packed`), for its next index (a fused
+    projection's members, each its columns of one row), and only it, released before the next is made: an
+    export holds one row's decode at a time, and none once its tree is released."""
 
     def __init__(self, leaf, memo: list, index: tuple = ()):
         from dew.nn.kernels.formats import NvFp4
@@ -836,30 +837,75 @@ class PackedDecode:
                                            int(start), int(width)))
                 for start, width in zip(starts, widths, strict=True)]
 
-    def _whole(self) -> np.ndarray:
+    def _rows(self) -> tuple[tuple[int, ...], tuple]:
+        """Its index split in two: the integers that pick a row of the leaf's leading (stacked) axes, which
+        every plane of the packed leaf shares and is sliced by before it is decoded (a layer's or an
+        expert's row: audit 2026-11-27 CC04, the whole bank no longer decoded for one row), and the rest,
+        applied to that row's decode (a member's columns)."""
+        lead = len(self.leaf.shape) - 2
+        rows: list[int] = []
+        for at, index in enumerate(self.index):
+            taken = index if isinstance(index, tuple) else (index,)
+            # A boolean (an int to Python) adds an axis, as NumPy reads it, left to the decoded value.
+            whole = all(isinstance(each, int | np.integer) and not isinstance(each, bool | np.bool_)
+                        for each in taken)
+            if not whole or len(rows) + len(taken) > lead:
+                return tuple(rows), self.index[at:]
+            rows.extend(int(each) for each in taken)
+        return tuple(rows), ()
+
+    def _row(self, rows: tuple[int, ...]) -> np.ndarray:
         from dew._coordination import read_home
         from dew.nn.kernels.formats import NvFp4
 
-        if self.memo and self.memo[0][0] is self.leaf:
-            return self.memo[0][1]
-        # The last leaf's decode released before this one's is made.
+        if self.memo and self.memo[0][0] is self.leaf and self.memo[0][1] == rows:
+            return self.memo[0][2]
+        # The last row's decode released before this one's is made.
         self.memo.clear()
-        # Its planes home on this host, as host arrays the CPU decodes, a pool's shards read together.
-        home = jax.tree.map(read_home, self.leaf)
-        with jax.default_device(jax.local_devices(backend="cpu")[0]):
-            whole = np.asarray(packed_values(home) if isinstance(home, NvFp4) else home.admitted().decoded())
-        self.memo[:] = [(self.leaf, whole)]
-        return whole
+        # The row sliced from each plane where it lives, then read home on this host, a pool's shards
+        # read together: only that row's planes leave their devices, and only its decode is made.
+        home = jax.tree.map(lambda plane: read_home(_row_of(plane, rows)), self.leaf)
+        with _decoding():
+            decoded = np.asarray(packed_values(home) if isinstance(home, NvFp4)
+                                 else home.admitted().decoded())
+        self.memo[:] = [(self.leaf, rows, decoded)]
+        return decoded
 
     def __array__(self, dtype=None, copy=None) -> np.ndarray:
         del copy
-        value = self._whole()
-        for index in self.index:
+        rows, rest = self._rows()
+        value = self._row(rows)
+        for index in rest:
             value = value[index]
         return np.asarray(value, dtype)
 
     def __jax_array__(self) -> jax.Array:
         return jnp.asarray(np.asarray(self))
+
+
+def _row_of(plane, rows: tuple[int, ...]):
+    """`plane`'s row at `rows`, the indices of its leading stacked axes, sliced where the plane lies: placed
+    as the plane's own spec past those axes where an Explicit axis splits it (a stage-local store's bank on
+    its `stage` axis, `dew.training.stages.StageLocal`), whose gather JAX places only as it is told
+    (`out_sharding`; #4560's train review: the row's slice was refused)."""
+    if not rows:
+        return plane
+    placed = explicit_spec(plane) if isinstance(plane, jax.Array) else None
+    if placed is None:
+        return plane[rows]
+    past = jax.sharding.PartitionSpec(*tuple(placed.spec)[len(rows):])
+    return plane.at[rows].get(out_sharding=jax.sharding.NamedSharding(placed.mesh, past))
+
+
+def _decoding() -> contextlib.AbstractContextManager[None]:
+    """Where a packed leaf's host planes are decoded: this process's CPU, so no accelerator holds them; a
+    process whose JAX runs no CPU backend (`JAX_PLATFORMS=cuda`) its default device, the decode the same
+    integer arithmetic, exact on either (audit 2026-11-27 P03: the CPU asked for unconditionally there
+    crashed the export)."""
+    platforms = jax.config.jax_platforms
+    if platforms and "cpu" not in platforms.split(","):
+        return contextlib.nullcontext()
+    return jax.default_device(jax.local_devices(backend="cpu")[0])
 
 
 MOVING: contextvars.ContextVar[bool] = contextvars.ContextVar("dew.quantization.MOVING", default=False)

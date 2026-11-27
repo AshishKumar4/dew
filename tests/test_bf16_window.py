@@ -760,7 +760,8 @@ def test_a_stage_stacked_packed_leaf_reads_as_its_stored_layers_rows():
     """A packed bank stacked by stage, as a stage-local store holds a run's layers, read for an export
     (`quantization.deferred_packed`) and cut into its stored layers (`layer_names.array_rows`, which
     `stored_layers` cuts a stage-local run with), each row decoded as it is read, its values the bank's own
-    row's (train 1399's review: the deferred leaf had no reshape)."""
+    row's (train 1399's review: the deferred leaf had no reshape), the bank's row sliced before its decode,
+    which holds that row alone."""
     from dew.nn.backbones.layer_names import array_rows
     from dew.nn.kernels.formats import NvFp4
 
@@ -773,3 +774,82 @@ def test_a_stage_stacked_packed_leaf_reads_as_its_stored_layers_rows():
     assert [np.shape(row) for row in rows] == [(256, 64), (256, 64)]
     for index, row in enumerate(rows):
         np.testing.assert_array_equal(np.asarray(row), whole[index])
+        # The row alone decoded and held, its planes sliced first, never the bank whole (audit 2026-11-27
+        # CC04).
+        assert [np.shape(decoded) for _, _, decoded in leaf.memo] == [(256, 64)]
+    # A second bank of the same format through the same memo, then the first again: each its own row.
+    other = NvFp4.quantized(jnp.asarray(stacked[::-1].copy()))
+    two = quantization.deferred_packed({quantization.QUANTIZATION: {"a": {"kernel": bank},
+                                                                   "b": {"kernel": other}}})
+    first, second = two["params"]["a"]["kernel"], two["params"]["b"]["kernel"]
+    np.testing.assert_array_equal(np.asarray(second[0]), np.asarray(quantization.packed_values(other))[0])
+    np.testing.assert_array_equal(np.asarray(first[0]), whole[0])
+    # A boolean index adds an axis, as NumPy's does, taking the bank whole.
+    assert np.shape(np.asarray(first[True])) == (1, 2, 256, 64)
+
+
+@pytest.mark.cpu(reason="a mesh of four of the CPU lane's simulated devices, which a GPU lane holds one of")
+def test_a_packed_bank_split_by_stage_over_an_explicit_axis_reads_its_rows():
+    """A packed bank a stage-local store places on this host's simulated devices, its leading (stage) axis
+    split over an Explicit mesh axis as `StageLocal` places it and its last over another, read for an export
+    a row at a time: each row sliced where it lies, placed as the bank's own spec past the stage (its last
+    axis still split), and decoded to the bank's own row (#4560's train review: the row's slice, a gather of
+    an Explicit dimension, was refused for want of its placement)."""
+    from jax.sharding import AxisType, NamedSharding, PartitionSpec
+
+    from dew.nn.backbones.layer_names import array_rows
+    from dew.nn.kernels.formats import NvFp4
+
+    stacked = np.random.default_rng(4560).standard_normal((2, 256, 64)).astype(np.float32)
+    bank = NvFp4.quantized(jnp.asarray(stacked))
+    whole = np.asarray(quantization.packed_values(bank))
+    mesh = jax.make_mesh((2, 2), ("stage", "model"), axis_types=(AxisType.Explicit,) * 2,
+                         devices=jax.devices("cpu")[:4])
+
+    def placed(plane):
+        stage = ("stage",) if np.ndim(plane) and np.shape(plane)[0] == 2 else ()
+        last = (*(None,) * (np.ndim(plane) - len(stage) - 1), "model") if (
+            np.ndim(plane) > len(stage) and np.shape(plane)[-1] % 2 == 0) else ()
+        return jax.device_put(plane, NamedSharding(mesh, PartitionSpec(*stage, *last)))
+
+    split = jax.tree.map(placed, bank)
+    planes = [plane for plane in jax.tree.leaves(split) if plane.sharding.spec[:1] == ("stage",)]
+    assert planes
+    def spec(array):
+        held = tuple(array.sharding.spec)
+        return held + (None,) * (array.ndim - len(held))
+
+    for plane in planes:
+        # A row keeps the bank's placement past the stage: its last axis still split where it was.
+        assert spec(quantization._row_of(plane, (1,))) == spec(plane)[1:]
+    assert any("model" in spec(plane) for plane in planes)
+    tree = quantization.deferred_packed({quantization.QUANTIZATION: {"stages": {"kernel": split}}})
+    for index, row in enumerate(array_rows(("params", "stages", "kernel"), tree["params"]["stages"]["kernel"],
+                                           (2,))):
+        np.testing.assert_array_equal(np.asarray(row), whole[index])
+
+
+WINDOW_WITHOUT_CPU = """
+import jax, jax.numpy as jnp, numpy as np
+from dew import quantization
+kernel = (np.random.default_rng(13987).normal(size=(256, 256)) * 0.02).astype(jnp.bfloat16)
+held = quantization.bf16_windows({"params": {"kernel": jnp.asarray(kernel)}}, sites=[""])
+decoded = np.asarray(quantization.decoded_packed(held)["params"]["kernel"])
+print(jax.default_backend(), bool(np.array_equal(decoded.view(np.uint16), kernel.view(np.uint16))))
+"""
+
+
+@pytest.mark.gpu
+@pytest.mark.compiles_at_run(reason="a fresh process, whose JAX runs no CPU backend, compiles where it runs")
+def test_a_window_decodes_for_an_export_where_jax_runs_no_cpu():
+    """A window decoded for an export (`quantization.decoded_packed`, `Pretrained.save`'s) in a process whose
+    JAX runs no CPU backend (`JAX_PLATFORMS=cuda`) decodes on its device, bit for bit, rather than ask for a
+    CPU it does not have (audit 2026-11-27 P03)."""
+    import os
+    import subprocess
+    import sys
+
+    ran = subprocess.run([sys.executable, "-c", WINDOW_WITHOUT_CPU], capture_output=True, text=True,
+                         env={**os.environ, "JAX_PLATFORMS": "cuda"}, timeout=600)
+    assert ran.returncode == 0, ran.stderr[-2000:]
+    assert ran.stdout.split()[-2:] == ["gpu", "True"], ran.stdout
