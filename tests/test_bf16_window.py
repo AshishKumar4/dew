@@ -326,19 +326,24 @@ def test_gemm_over_a_window_computes_in_its_calls_dtype(compute, precision):
     np.testing.assert_array_equal(np.asarray(served).view(np.uint32), np.asarray(decoded).view(np.uint32))
 
 
-def test_gemm_over_a_window_takes_its_calls_narrowing_algorithm():
-    """`gemm.gemm` over a bfloat16 window of bf16 rows stating an algorithm that narrows its operands
-    (`F16_F16_F32`: a row of 2^-30 is zero in fp16) computes what its decoded kernel's product computes
-    under it, or refuses alike where the backend runs no such algorithm (a CPU): the window multiplies its
-    operands whole, so the call's own product runs (row 13686)."""
+@pytest.mark.parametrize(("stated", "run"), [(jax.lax.DotAlgorithmPreset.F16_F16_F32, None),
+                                             (jax.lax.Precision.DEFAULT, "F16_F16_F32")],
+                         ids=["stated by the call", "the run's, the call's the default"])
+def test_gemm_over_a_window_takes_its_calls_narrowing_algorithm(stated, run):
+    """`gemm.gemm` over a bfloat16 window of bf16 rows under an algorithm that narrows its operands
+    (`F16_F16_F32`: a row of 2^-30 is zero in fp16), stated by the call or by the run under the call's
+    default, computes what its decoded kernel's product computes there, or refuses alike where the backend
+    runs no such algorithm (a CPU): the window multiplies its operands whole, so the call's own product runs
+    (row 13686)."""
     kernel = np.zeros((128, 64), jnp.bfloat16)
     kernel[0, 0] = 1.0
     x = jnp.full((2, 128), 2.0 ** -30, jnp.bfloat16)
     outs = []
     for matrix in (jnp.asarray(kernel), Bf16Window.of(jnp.asarray(kernel)).checked()):
         try:
-            outs.append(np.asarray(gemm.gemm(x, matrix, None, out_dtype=jnp.float32,
-                                             precision=jax.lax.DotAlgorithmPreset.F16_F16_F32)).view(np.uint32))
+            with jax.default_matmul_precision(run):
+                outs.append(np.asarray(gemm.gemm(x, matrix, None, out_dtype=jnp.float32,
+                                                 precision=stated)).view(np.uint32))
         except ValueError as refused:
             outs.append(type(refused))
     if isinstance(outs[0], np.ndarray):

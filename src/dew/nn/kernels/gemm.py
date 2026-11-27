@@ -365,11 +365,13 @@ def _window_takes(lhs, compute, precision) -> bool:
     """Whether a `Bf16Window`'s product (`window_product`: its rows rounded to bf16, each product exact,
     summed in fp32 at the default precision, no partial sums promoted) is the product `gemm` is asked for:
     its products' dtype (`compute`, `lhs`'s where None) bf16's, at the default precision the call and the
-    run ask (above it, an fp32 output's partial sums are promoted, `templates.product.declared`; a stated
+    run each ask (above it, an fp32 output's partial sums are promoted, `templates.product.declared`; a stated
     algorithm may narrow the operands) (row 13686: an fp32 call's rows of 1 + 2^-9 rounded to 1 where its
     kernel's product keeps them)."""
     computed = jnp.dtype(lhs.dtype if compute is None else compute)
-    return computed == jnp.dtype(jnp.bfloat16) and asks_default_precision(precision, configured=True)
+    # The run's own precision too: the window's dot reads it where the call's states the default.
+    return computed == jnp.dtype(jnp.bfloat16) and all(
+        asks_default_precision(stated, configured=True) for stated in (precision, None))
 
 
 def _packed_gemm(lhs, matrix: NvFp4 | TernaryWeights | Bf16Window, group_sizes, *, epilogue: Hook,
