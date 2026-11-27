@@ -11,7 +11,7 @@ deleted; the rest records the design as its review left it on `feat/mma-sync-fam
 One complete mma.sync Family bundle (`templates/mosaic_sm80.Mma`): the one every template's Ampere-class
 mainloop runs on. This round: two consumer warpgroups, a collective cp.async pipeline, hooks, the kernel
 gradient (dW), one resource descriptor and one derived launch. It is measured on an A100 against the
-Pallas-Triton route (§8: no L4 is reachable, and an A10 joins where an approved window holds one).
+Pallas-Triton route (§8).
 
 Scope is sm80, sm86 and sm89, the parts whose copies are cp.async. On sm120 (consumer Blackwell) JAX picks the
 copy transport by compute capability, not by the MMA family (`pipeline.py:331`, `primitives.py:1088`): cp.async
@@ -204,14 +204,15 @@ Bible §8: no local tests. Each step goes to armada, then one GPU round for the 
   - test_grouped_gemm, test_kernel_configs (sm80/86/89 compile gates through ptxas), test_moe, test_recurrence;
   - the fork's pipeline test for collective cp.async.
 - GPU, one round:
-  - A100 (no L4 is reachable: Colab offers G4 alone and Lambda no L4; an A10 joins where an approved
-    window holds one): the GEMM GPU tier, the fork's collective pipeline test natively, time against Triton
+  - A100: the GEMM GPU tier, the fork's collective pipeline test natively, time against Triton
     (arms mosaic_gpu and triton), each arm's peak in a process of its own (`tools/peak_memory.measured`: a
     process-wide high-water holds every arm run before it), and a recurrence walk at one, two and four
     documents (workload timings);
   - H100: §3.3's ring against START/STEADY/STOP.
 - Done means: two warpgroups, hooks and dW hold check 1 natively on the A100. The time ratio to Triton is
   reported per row, and each row slower than 1.10x is profiled (ncu) as a template defect.
+- Coverage gap: this round's native results are the A100's alone (sm80); it has no A10 or L4 (sm86, sm89)
+  run, their kernels held in it by their compile gates through ptxas.
 
 ## 9. Alternatives rejected
 
