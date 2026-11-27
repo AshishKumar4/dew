@@ -2,13 +2,14 @@
 bodies take (`dew.algebra.generated`) run with the choice `generated` named "generated", at its component's
 declared cases, on par with the same site named "written", from its declaration's float64 truth.
 
-The sites are the templates' own functions, each its component's declared function: the selective scan's decay,
-readout and backward step lift (`recurrence_algebra.selective_decay`, `selective_read`, `selective_dx_scale`),
-the recurrence skip's pullback (`skipped_back`) and the derived split-KV merge (`attention_algebra.merge`); the
-token stage's declared function composes the written decay and update, so its site is called apart
-(`selective.token_stage`, `SITES`). Every cell asserts the generated body ran (`generated.taken`): a site that fell
-back to its written math would hold check 1 trivially. The cases are each component's declared ones
-(`dew.algebra.component_cases`), keyed by the generation they were generated for, the one this family names.
+The sites are the templates' own functions, each its component's declared function: the selective scan's
+decay, readout and backward step lift (`recurrence_algebra.selective_decay`, `selective_read`,
+`selective_dx_scale`), the recurrence skip's pullback (`skipped_back`) and the derived split-KV merge
+(`attention_algebra.merge`); the token stage's declared function composes the written decay and update, so its
+site is called apart (`selective.token_stage`, `SITES`). Every cell asserts the generated body ran
+(`generated.taken`): a site that fell back to its written math would hold check 1 trivially. The cases are
+each component's declared ones (`dew.algebra.component_cases`), keyed by the generation they were generated
+for, the one this family names.
 """
 
 import functools
