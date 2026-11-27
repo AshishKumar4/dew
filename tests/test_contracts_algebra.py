@@ -167,3 +167,58 @@ def test_a_normal_draw_is_read_where_a_gpu_parts_prepare_places_its_calls(dtype)
             for mine, theirs in zip(drawn, expected, strict=True):
                 bits = np.uint16 if mine.itemsize == 2 else np.uint32
                 np.testing.assert_array_equal(mine.view(bits), theirs.view(bits))
+
+
+def test_a_surrogate_case_keys_its_static_arguments_exactly():
+    """A generated surrogate case is keyed by its static arguments exactly (`generate._exact_key`): `-0.0`,
+    equal to `0.0` as a Python value, is no `0.0` case; a set, unhashable, is no `frozenset` case; a tuple
+    subclass equal only to itself is no case of another with its contents; and a list holding itself keys
+    none: each runs the written primal and tangent, which differ from the declared bodies'."""
+    from dew.algebra.generate import Cases, ComponentForm, SurrogateBodies, SurrogateCase
+
+    def written(x, shift):
+        return x + jnp.copysign(1.0, shift if isinstance(shift, float) else -1.0)
+
+    def written_tangent(shift, primals, tangents, value):
+        del primals, value
+        return tangents[0] * jnp.copysign(2.0, shift if isinstance(shift, float) else -1.0)
+
+    def cases(count):
+        operand = jax.ShapeDtypeStruct((4,), jnp.float32)
+        return Cases(((operand,) * count,), lambda seed, operands: operands, seeds=1, policies=("default",))
+
+    def declared_case(name):
+        return SurrogateCase(name, ComponentForm(lambda x: x + 1, lambda x: x + 1, cases(1)),
+                             {(): ComponentForm(lambda x, dx, value: dx, lambda x, dx, value: dx, cases(3))},
+                             output_tree=(jax.tree.structure(0),))
+
+    class Held(list):
+        """A list no pytree registry knows, which reaches the surrogate whole, holding itself."""
+
+    class Named(tuple):
+        """A tuple equal only to itself."""
+
+        __eq__ = object.__eq__
+        __hash__ = object.__hash__
+
+    cyclic = Held()
+    cyclic.append(cyclic)
+    named = Named((1,))
+    surrogate = SurrogateBodies(written, written_tangent, (1,), symbolic_zeros=False, cases={
+        (0.0,): declared_case("plus"), (frozenset({1}),): declared_case("member"),
+        (named,): declared_case("named")})
+
+    def emitted(name):
+        def body(*operands, policy, target):
+            del policy, target
+            return operands[0] + 1 if not name.endswith("_tangent") else operands[1]
+        return body
+
+    composed = surrogate.assembled(emitted)
+    x = jnp.zeros((4,), jnp.float32)
+    for shift, value, slope in ((0.0, 1.0, 1.0), (frozenset({1}), 1.0, 1.0), (named, 1.0, 1.0),
+                                (-0.0, -1.0, -2.0), ({1}, -1.0, -2.0), (Named((1,)), -1.0, -2.0),
+                                (cyclic, -1.0, -2.0)):
+        primal, tangent = jax.jvp(lambda arg, shift=shift: composed(arg, shift), (x,), (jnp.ones_like(x),))
+        np.testing.assert_array_equal(primal, np.full(4, value, np.float32))
+        np.testing.assert_array_equal(tangent, np.full(4, slope, np.float32))

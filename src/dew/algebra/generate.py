@@ -23,11 +23,12 @@ import importlib.util
 import itertools
 import logging
 import sys
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Hashable, Mapping, Sequence
 from pathlib import Path
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from jax.core import ShapedArray
 from jax.extend import core as jcore
 
@@ -124,13 +125,18 @@ class SurrogateBodies:
                 declare(module, case.tangent_name(inactive), form)
         return self
 
+    @functools.cached_property
+    def _keyed(self) -> dict[Hashable, SurrogateCase]:
+        """Each case by its static arguments' exact key (`_exact_key`)."""
+        keyed = {_exact_key(fixed): case for fixed, case in self.cases.items()}
+        if None in keyed:
+            raise ValueError("a surrogate case's static arguments must be hashable")
+        return keyed
+
     def _case(self, fixed: tuple) -> SurrogateCase | None:
-        # JAX permits written nondifferentiable arguments that cannot key a generated case.
-        try:
-            return self.cases.get(fixed)
-        except TypeError:
-            _log.debug("a surrogate's unhashable static arguments use its written body")
-            return None
+        # Static arguments of no exact key (an unhashable one) match no declared case: the written body runs.
+        key = _exact_key(fixed)
+        return None if key is None else self._keyed.get(key)
 
     def assembled(self, emitted: Callable[[str], Callable], *, policy: str = "default", target: str = "sm90"):
         """Opt into emitted cases using the original surrogate rule's argument and value dependency."""
@@ -169,6 +175,29 @@ class SurrogateBodies:
         return contracted("test_generated_rounded_bodies_keep_the_written_surrogate_law")(
             surrogate(forward, tangent, nondiff_argnums=self.nondiff_argnums,
                       symbolic_zeros=self.symbolic_zeros))
+
+
+_BITS = frozenset({float, complex, np.float16, np.float32, np.float64, np.complex64, np.complex128})
+"""The number types `_exact_key` reads by their bytes: these exactly, a subclass keeping its own equality."""
+
+
+def _exact_key(value) -> Hashable | None:
+    """`value` as a surrogate's static arguments key it, two values one key only where they are one: a float
+    of `_BITS` by its type and bytes (`-0.0` no `0.0`, each NaN its own sign and payload), a plain tuple by
+    its parts, any other hashable value by its type and itself (its own equality: a callable by identity, a
+    subclass by its own). None where it is unhashable, which no declared case is."""
+    kind = type(value)
+    if kind in _BITS:
+        return kind, np.asarray(value).tobytes()
+    if kind is tuple:
+        parts = tuple(_exact_key(part) for part in value)
+        return None if None in parts else (kind, parts)
+    try:
+        hash(value)
+    except TypeError:
+        _log.debug("a surrogate's unhashable static argument %s keys no case: its written body runs", kind)
+        return None
+    return kind, value
 
 
 def _case_leaves(case: SurrogateCase, dynamic: tuple) -> tuple | None:
