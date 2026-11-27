@@ -167,6 +167,10 @@ def gemm(lhs: jax.Array, rhs: jax.Array | NvFp4 | TernaryWeights | Bf16Window,
     gradient chained in one accumulator, each kernel gradient its own; no kernels joined, no output split (row
     6794, M-EM-59i); with no other part (`_gemm_refused`). `selected`, a caller's route of the forward
     (`side_by_side`'s), runs as found."""
+    if isinstance(rhs, Bf16Window) and not _window_takes(lhs, compute, precision):
+        # A window multiplies bf16 rows at the default precision alone (`window_product`): any other math
+        # the call asks of its weights is their decoded matrix's ordinary product's.
+        rhs = rhs.decoded()
     if isinstance(rhs, PACKED_FORMATS):
         return _packed_gemm(lhs, rhs, group_sizes, epilogue=epilogue, out_dtype=out_dtype, layer=layer,
                             gather=gather, scatter=scatter, interpret_on_cpu=interpret_on_cpu,
@@ -355,6 +359,15 @@ def _gemm_refused(group_sizes, *, prologue, gather, scatter, compute, applied, l
     if applied is not None and (prologue is None or (applied.shape, applied.dtype) != (lhs.shape, expected)):
         raise ValueError(f"a formed operand is a prologue's, of the rows' shape {lhs.shape} and dtype "
                          f"{expected}, not {applied.shape} {applied.dtype}")
+
+def _window_takes(lhs, compute, precision) -> bool:
+    """Whether a `Bf16Window`'s product (`window_product`: its rows rounded to bf16, each product exact,
+    summed in fp32 at the default precision) is the product `gemm` is asked for: its products' dtype
+    (`compute`, `lhs`'s where None) bf16's, at the default precision (row 13686: an fp32 call's rows of
+    1 + 2^-9 rounded to 1 where its kernel's product keeps them)."""
+    computed = jnp.dtype(lhs.dtype if compute is None else compute)
+    return computed == jnp.dtype(jnp.bfloat16) and asks_default_precision(precision, configured=True)
+
 
 def _packed_gemm(lhs, matrix: NvFp4 | TernaryWeights | Bf16Window, group_sizes, *, epilogue: Hook,
                  out_dtype, layer, gather, scatter, interpret_on_cpu: bool, refused: tuple) -> jax.Array:

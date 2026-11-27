@@ -305,3 +305,21 @@ def test_a_bf16_dense_stating_a_narrowing_algorithm_served_its_window_computes_a
             np.testing.assert_array_equal(outs[1], outs[0])
         else:
             assert outs[1] is outs[0]
+
+
+@pytest.mark.parametrize(("compute", "precision"),
+                         [(jnp.float32, None), (None, "highest"), (jnp.bfloat16, None)],
+                         ids=["fp32 compute", "highest precision", "bf16 compute"])
+def test_gemm_over_a_window_computes_what_its_call_asks(compute, precision):
+    """`gemm.gemm` over a bfloat16 window computes the product its call asks for (row 13686): fp32 rows of
+    1 + 2^-9 under fp32 compute, or at the highest precision, keep their low bit as the decoded kernel's
+    ordinary product does (the window's own product rounds its rows to bf16); under bf16 compute at the
+    default precision it is the window's product, which is the decoded kernel's at bf16 rows."""
+    kernel = jnp.asarray(_drawn((256, 64)))
+    finite = jnp.where(jnp.isfinite(kernel), kernel, 0).astype(jnp.bfloat16)
+    window = Bf16Window.of(finite).checked()
+    x = jnp.full((8, 256), 1 + 2.0 ** -9, jnp.float32)
+    with jax.default_matmul_precision(precision or "default"):
+        served = gemm.gemm(x, window, None, out_dtype=jnp.float32, compute=compute, interpret_on_cpu=True)
+        decoded = gemm.gemm(x, finite, None, out_dtype=jnp.float32, compute=compute, interpret_on_cpu=True)
+    np.testing.assert_array_equal(np.asarray(served).view(np.uint32), np.asarray(decoded).view(np.uint32))
