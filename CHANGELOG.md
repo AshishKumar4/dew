@@ -11,7 +11,8 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
   components are declared on their own (`dew.algebra.format_cases`). Add checked NVFP4 block decode and
   the recurrence skip's pullback; production dispatch is unchanged.
 - `generation.chosen(generated="generated")` runs the algebra's checked generated bodies in place of the
-  selective scan's decay, token stage, readout and step lift, the skip's pullback and the split-KV merge
+  selective scan's decay, token stage, readout, step lift and adjoint, the skip's and gated values'
+  pullbacks, the key memory decay and the split-KV merge
   where a call's case is declared, counting every fallback (`dew.algebra.generated.taken`); the default runs
   the written math, unchanged.
 - Add checked portable E4M3/E5M2 decoding and the selective scan readout; keep production dispatch

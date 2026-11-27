@@ -80,7 +80,7 @@ def test_each_generated_form_is_on_par_with_its_declaration(name, policy):
                                   "decode_e4m3", "decode_e5m2", "selective_read", "e8m0_exponents",
                                   "mxfp8_block_decode", "mxfp8_block_decode_bf16", "selective_token",
                                   "selective_dx_scale", "selective_state_tangent", "nvfp4_block_decode",
-                                  "skipped_back",
+                                  "skipped_back", "selective_lifted_adjoint",
                                   f"{guidance_cases.__name__}.guided",
                                   f"{guidance_cases.__name__}.guided_tangent"])
 @pytest.mark.parametrize("arm", ["written", "generated"])

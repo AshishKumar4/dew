@@ -581,6 +581,28 @@ def _selective_adjoint_draw(seed, operands):
     return cotangent, before, decay, written, step, value, b, dy, rate
 
 
+def _selective_lifted_adjoint(*operands):
+    """`recurrence_algebra.selective_adjoint` with its `dx_step` given, as the backward block calls it."""
+    *ends, dx_step = operands
+    return recurrence_algebra.selective_adjoint(*ends, dx_step=dx_step)
+
+
+def _selective_lifted_adjoint_truth(cotangent, before, decay, written, step, value, b, dy, rate, dx_step):
+    _, *rest = _selective_adjoint_truth(cotangent, before, decay, written, step, value, b, dy, rate)
+    return (dx_step * (cotangent * b), *rest)
+
+
+def _selective_lifted_adjoint_draw(seed, operands):
+    drawn = _selective_adjoint_draw(seed, operands[:-1])
+    step = drawn[4]
+    dx_step = step.copy()
+    if seed % 2:
+        # Subnormal steps lifted by 2^64 (`selective_dx_scale`): dx's factor normal, the others' subnormal.
+        step[2:10] = np.float32(2.0 ** -140) * np.arange(1, 9, dtype=np.float32)
+        dx_step[2:10] = step[2:10] * np.float32(2.0 ** 64)
+    return (*drawn, dx_step)
+
+
 def _kda_strict_band(bands):
     return recurrence_algebra.block_masked(bands, strict=True, scale=1.0)
 
@@ -656,6 +678,9 @@ SLIDING_VISIBILITY = declare(__name__, "sliding_visibility", ComponentForm(
 SELECTIVE_ADJOINT = declare(__name__, "selective_adjoint", ComponentForm(
     recurrence_algebra.selective_adjoint, _selective_adjoint_truth, dataclasses.replace(
         float32_cases(*[((n,),) * 8 + ((),) for n in (128, 256)]), draw=_selective_adjoint_draw)))
+SELECTIVE_LIFTED_ADJOINT = declare(__name__, "selective_lifted_adjoint", ComponentForm(
+    _selective_lifted_adjoint, _selective_lifted_adjoint_truth, dataclasses.replace(
+        float32_cases(*[((n,),) * 8 + ((), (n,)) for n in (128, 256)]), draw=_selective_lifted_adjoint_draw)))
 KDA_STRICT_BAND = declare(__name__, "kda_strict_band", ComponentForm(
     _kda_strict_band, _kda_band_truth, dataclasses.replace(
         float32_cases(((32, recurrence_algebra.SUB),), ((64, recurrence_algebra.SUB),)),

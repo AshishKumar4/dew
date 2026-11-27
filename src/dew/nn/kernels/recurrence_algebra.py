@@ -1115,6 +1115,8 @@ def key_memory_decay(entered, leaving) -> jax.Array:
     key's row of each: `sum(h dh)` over the value columns of the memory the chunk entered `entered` `[BK,
     BV]` and the gradient of the one it leaves `leaving`, `[BK]` fp32, the log decay's term on the chunk's
     last token (`key_memory_block`'s other)."""
+    if (generated := _generated_body("key_memory_decay", (entered, leaving))) is not None:
+        return generated(entered, leaving)
     return jnp.sum(entered.astype(jnp.float32) * leaving.astype(jnp.float32), axis=1)
 
 
@@ -1539,6 +1541,11 @@ def selective_adjoint(cotangent, before, decay, written, step, value, b, dy, rat
     a token's term its schedule sums. `exp(dt A)`'s derivative in `dt` is `A` times it, in `A` `dt` times
     it. Where `dx_step` is given (`selective_dx_scale`), it scales only `dx`'s `step` factor so per-state
     terms and `skip * dy` stay normal across the state sum (row 8722, base review b0601005b F6)."""
+    lifted = () if dx_step is None else (dx_step,)
+    operands = (cotangent, before, decay, written, step, value, b, dy, rate, *lifted)
+    name = "selective_lifted_adjoint" if lifted else "selective_adjoint"
+    if (generated := _generated_body(name, operands)) is not None:
+        return generated(*operands)
     through = cotangent * before * decay
     d_written = cotangent * b
     return (d_written * (step if dx_step is None else dx_step), d_written * value + through * rate,
@@ -1548,6 +1555,8 @@ def selective_adjoint(cotangent, before, decay, written, step, value, b, dy, rat
 def gated_values_back(u_grad, values, beta) -> tuple[jax.Array, jax.Array]:
     """The write gate's gradient on values gated, `u = v beta`, from `u_grad` `[..., V]`, fp32: the values'
     own, `du beta`, and beta's `[...]`, `sum(v du)` over the last axis's columns."""
+    if (generated := _generated_body("gdn_value_pullback", (u_grad, values, beta))) is not None:
+        return generated(u_grad, values, beta)
     return u_grad * beta[..., None], jnp.sum(u_grad * values, axis=-1)
 
 

@@ -165,7 +165,8 @@ AXES: dict[str, dict[str, tuple[str, ...]]] = {
     "generated": {
         "generation": ("sm90",),
         "site": ("selective_decay", "selective_read", "split_kv_merge", "selective_token",
-                 "selective_dx_scale", "skipped_back"),
+                 "selective_dx_scale", "skipped_back", "key_memory_decay", "gdn_value_pullback",
+                 "selective_adjoint", "selective_lifted_adjoint"),
     },
 }
 """Each family's axes and their values. Attention's: the GPU; the head width; 8 query heads over 8 key heads,
