@@ -459,7 +459,7 @@ def test_a_memorys_readout_is_recomputed_with_its_chunks(form):
 
     with recomputing((MEMORY_RESIDUALS[1],)):
         kept = [jnp.shape(aval) for aval, source in saved_residuals(total, *given, states)
-                if "argument" not in source]
+                if not source.startswith("from the argument")]
     assert LENGTH % CHUNK and not [shape for shape in kept if LENGTH in shape], kept
 
 
