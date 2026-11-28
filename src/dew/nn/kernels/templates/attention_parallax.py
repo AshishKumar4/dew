@@ -138,14 +138,6 @@ def _reach(below: jax.Array) -> jax.Array:
     return jnp.where(jnp.isfinite(below), reach, _NONE).astype(jnp.int32)
 
 
-def _normalized(x: jax.Array) -> tuple[jax.Array, jax.Array]:
-    """`x` `[..., D]` as a mantissa of at most 1 in magnitude and its row's power of two (`x = m 2^e`, `e`
-    int32 `[...]`, 0 for a row of zeros)."""
-    largest = jnp.max(_exponent(x), axis=-1)
-    power = jnp.where(largest > _ABSENT, largest, 0)
-    return power2(x, -power[..., None]), power
-
-
 def exp_scaled(z: jax.Array, exponent: jax.Array, power) -> jax.Array:
     """`z e^exponent 2^power` (`exponent` natural units, -inf a zero; `power` integral), rounded once where
     the whole is: the decay split as `2^k e^f` (`k` its whole powers of two, `f` in `[0, ln 2)` by
