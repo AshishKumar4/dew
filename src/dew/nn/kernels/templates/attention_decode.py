@@ -60,14 +60,18 @@ from dew.nn.kernels.templates.cost import Work
 from dew.nn.kernels.templates.hooks import NO_HOOK, Hook, Side
 
 
-def packable(hooks: Hooks | None) -> bool:
+def packable(hooks: Hooks | None, *, excluded: bool = True) -> bool:
     """Whether a call's query heads can become its rows (`packed`): no score parameter (a packed row's is
     its pair's, not its query's) and no dropout; a score hook reads each row's own query's place
     (`unpacked_places`), a softcap (the scaled logits alone), sinks (an initial state a head), and output
-    hooks admitted by `merged.output_hook_refusal` pack (row 5385)."""
+    hooks admitted by `merged.output_hook_refusal` pack (row 5385), but where the call reads a row of no
+    mass NaN (not `excluded`, `KeySpans.excluded`): a merge's finish fuses the hook before the row is read
+    (`_massless_read`)."""
     if hooks is None:
         return True
     if hooks.score.sides or hooks.drop is not None:
+        return False
+    if not excluded and hooks.output.fn is not None:
         return False
     return merged.output_hook_refusal(hooks.output) is None
 
@@ -96,13 +100,9 @@ def serves(query: jax.Array, key: jax.Array, hooks: Hooks | None, *, natural: bo
     its walk (`attention_mosaic.streams`): a decode step's, a speculative verify block's. Its walk derives a
     config wherever the template's forward takes the call (`plan`). A verify block of 4 to 16 drafts a row
     through the forward took 1.1 to 5.9 ms where the work list took 30 us to 1.36 ms on an H100, its query
-    heads read the keys once a key head (ET-VERIFY-h100). A call that reads a row of no mass NaN (not
-    `excluded`, `KeySpans.excluded`) under an output hook walks whole: a merge's finish fuses the hook before
-    its rows of no mass are read (`_massless_read`)."""
+    heads read the keys once a key head (ET-VERIFY-h100)."""
     heads, kv_heads = query.shape[2], key.shape[2]
-    if natural or heads % kv_heads or not packable(hooks):
-        return False
-    if not excluded and hooks is not None and hooks.output.fn is not None:
+    if natural or heads % kv_heads or not packable(hooks, excluded=excluded):
         return False
     batch, positions, _, width = query.shape
     rows = jax.ShapeDtypeStruct((batch, positions * (heads // kv_heads), kv_heads, width), query.dtype)
@@ -583,9 +583,10 @@ def _planned_step(query: jax.Array, key: jax.Array, value: jax.Array, spans: Key
     query, key, hooks = prologues_taken(query, key, hooks)
     if not finished and hooks.output.fn is not None:
         raise ValueError("an unfinished decode step returns a partial state and takes no output hook")
-    if not packable(hooks):
+    if not packable(hooks, excluded=spans.excluded):
         raise NotImplementedError("the template's decode packs no score parameter, unsupported output "
-                                  "parameter or dropout (`packable`)")
+                                  "parameter, dropout, or output hook of a call that reads a row of no mass "
+                                  "NaN (`packable`)")
     heads = query.shape[2]
     work, rows, row_spans, whole = planned(query, key, value, spans, hooks, scale=scale, table=table,
                                            sources=sources, scales=scales, in_key=in_key, finished=finished)

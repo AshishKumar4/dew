@@ -198,6 +198,23 @@ def test_a_decode_steps_start_of_its_first_key_reads_as_no_start_interpreted():
                                   np.asarray(attend(None), np.float32))
 
 
+def test_a_decode_step_that_reads_a_row_of_no_mass_nan_takes_no_output_hook():
+    """A decode step whose spans hide no key (`KeySpans.excluded` False: a row of no mass reads NaN) under an
+    output hook: the work list refuses it, directly (`attend`) and through the route (`serves`), so no
+    merge's fused hook reads such a row's zero before it is NaN; the same step masked, or hookless, it takes
+    (row 14116)."""
+    query, key, value, _ = _drawn(1, 8, 2, jnp.bfloat16)(0)
+    hooks = template.Hooks(output=Hook(lambda o: jnp.where(jnp.isnan(o), 7.0, o)))
+    unmasked = dataclasses.replace(template.spans(1, KEYS, 2), excluded=False)
+    with generation.assumed("sm90"):
+        target = generation.gpu_target()
+        with pytest.raises(NotImplementedError, match="row of no mass"):
+            attention_decode.attend(query, key, value, unmasked, hooks, interpret=True)
+        assert not attention_decode.serves(query, key, hooks, natural=False, target=target, excluded=False)
+        assert attention_decode.serves(query, key, hooks, natural=False, target=target)
+        assert attention_decode.serves(query, key, None, natural=False, target=target, excluded=False)
+
+
 @INTERPRETS
 def test_an_absorbed_mla_decode_step_of_576_wide_keys_and_512_wide_values_is_on_par_interpreted():
     """An absorbed MLA decode step (DeepSeek's: 16 query heads over one latent key head, its key the latent
