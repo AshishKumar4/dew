@@ -778,3 +778,88 @@ def test_an_aligned_segment_sum_sums_its_segments_over_a_checked_maps_devices():
     got = jax.jit(jax.shard_map(each_device, mesh=mesh, in_specs=(data, data, data), out_specs=whole,
                                 check_vma=True))(values, scales, tables)
     np.testing.assert_array_equal(np.asarray(got), np.asarray([[2.0 ** -38]], np.float32))
+
+
+def checked_total(a, b, w):
+    """A checked `shard_map`'s summed `aligned_sum([(a, b)])` times `w` over two devices, `a` held whole
+    beside `b` and `w` split between them."""
+    mesh = jax.sharding.Mesh(np.asarray(jax.devices()[:2]), ("data",))
+    split, whole = jax.sharding.PartitionSpec("data"), jax.sharding.PartitionSpec()
+
+    def local(a, b, w):
+        return jax.lax.psum(jnp.sum(aligned_sum([(a, b)]) * w), "data")
+
+    return jax.shard_map(local, mesh=mesh, in_specs=(whole, split, split), out_specs=whole,
+                         check_vma=True)(a, b, w)
+
+
+@pytest.mark.mesh(devices=2)
+def test_a_replicated_factors_cotangent_pools_its_digits_over_the_axis_before_it_rounds():
+    """The gradient of a checked `shard_map`'s summed `aligned_sum([(a, b)])` times `w` by a replicated `a`
+    beside `b` and `w` split over two devices (`checked_total`), `(1 - 2^-23)` and `1` on the first, `-1` and
+    `1` on the second (`w` `1 + 2^-23` and `1`): exactly `-2^-46`, the cotangent's terms' digits pooled over
+    the axis before the one rounding, where each device rounded first (`1` and `-1`) summed to 0 (train 1461's
+    review)."""
+    b = jnp.asarray([1 - 2.0 ** -23, -1.0], jnp.float32)
+    w = jnp.asarray([1 + 2.0 ** -23, 1.0], jnp.float32)
+    found = jax.jit(jax.grad(lambda a: checked_total(a, b, w)))(jnp.ones((1,), jnp.float32))
+    np.testing.assert_array_equal(np.asarray(found), np.asarray([-(2.0 ** -46)], np.float32))
+
+
+@pytest.mark.mesh(devices=2)
+def test_a_split_factors_cotangent_in_a_checked_shard_map_is_the_unsplit_calls():
+    """The gradient of a checked `shard_map`'s summed `aligned_sum([(a, b)])` times `w` by `b`, split over two
+    devices as `w` is beside a replicated `a` (`checked_total`): the unsplit call's bit for bit, no axis in
+    excess, its terms summed as they were."""
+    a = jnp.asarray([3.0], jnp.float32)
+    w = jnp.asarray([1 + 2.0 ** -23, -(2.0 ** 100)], jnp.float32)
+    b = jnp.asarray([1 - 2.0 ** -23, -1.0], jnp.float32)
+    found = jax.jit(jax.grad(lambda b: checked_total(a, b, w)))(b)
+    unsplit = jax.jit(jax.grad(lambda b: jnp.sum(aligned_sum([(a, b)]) * w)))(b)
+    np.testing.assert_array_equal(np.asarray(found), np.asarray(unsplit))
+
+
+@pytest.mark.mesh(devices=2)
+def test_a_replicated_factors_pooled_cotangent_is_differentiated_as_it_is_pooled():
+    """A replicated `a`'s cotangent (`aligned_cotangents`) of `aligned_sum([(a, b)])` at `w`, `b` and `w`
+    split over two devices in a checked `shard_map`, pooled over the axis (train 1461's review), and its
+    tangent along `b`: `[1]` beside `b = w = [1, 1]` gives `[2]`, and along `[1, 1]` `[2]`, its pooled sum
+    differentiated by its declared rule (train 1470's review: the pooled sum taken bare had no tangent, 0)."""
+    from dew.nn.aligned import aligned_cotangents
+
+    mesh = jax.sharding.Mesh(np.asarray(jax.devices()[:2]), ("data",))
+    split, whole = jax.sharding.PartitionSpec("data"), jax.sharding.PartitionSpec()
+
+    def local(a, b, w, along):
+        return jax.jvp(lambda b: aligned_cotangents([(a, b)], w)[0], (b,), (along,))
+
+    run = jax.shard_map(local, mesh=mesh, in_specs=(whole, split, split, split), out_specs=(whole, whole),
+                        check_vma=True)
+    ones = jnp.ones((2,), jnp.float32)
+    value, tangent = jax.jit(run)(jnp.ones((1,), jnp.float32), ones, ones, ones)
+    np.testing.assert_array_equal(np.asarray(value), np.asarray([2.0], np.float32))
+    np.testing.assert_array_equal(np.asarray(tangent), np.asarray([2.0], np.float32))
+
+
+@pytest.mark.mesh(devices=2)
+def test_a_pooled_cotangents_pullback_to_a_split_factor_beside_a_replicated_weight_is_split():
+    """The pullback along a split `b` of a replicated `a`'s pooled cotangent (`aligned_cotangents`) of
+    `aligned_sum([(a, b)])` at a replicated `w = [1]`, `b = [1, 1]` split over two devices in a checked
+    `shard_map`: the value `[2]`, and `b`'s cotangent of `[1]` each shard's own, `[1, 1]` split, as the
+    pooled sum's transpose gives a factor varying where its terms do not (train 1470's review: an invariant
+    cotangent handed to a varying accumulator was refused)."""
+    from dew.nn.aligned import aligned_cotangents
+
+    mesh = jax.sharding.Mesh(np.asarray(jax.devices()[:2]), ("data",))
+    split, whole = jax.sharding.PartitionSpec("data"), jax.sharding.PartitionSpec()
+
+    def local(a, b, w):
+        value, pullback = jax.vjp(lambda b: aligned_cotangents([(a, b)], w)[0], b)
+        return value, pullback(jnp.ones_like(value))[0]
+
+    run = jax.shard_map(local, mesh=mesh, in_specs=(whole, split, whole), out_specs=(whole, split),
+                        check_vma=True)
+    one = jnp.ones((1,), jnp.float32)
+    value, pulled = jax.jit(run)(one, jnp.ones((2,), jnp.float32), one)
+    np.testing.assert_array_equal(np.asarray(value), np.asarray([2.0], np.float32))
+    np.testing.assert_array_equal(np.asarray(pulled), np.asarray([1.0, 1.0], np.float32))
