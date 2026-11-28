@@ -1003,7 +1003,9 @@ class KernelOp(tokamax.Op):
             return found[1]
         key = self.traced(name, value)
         try:
-            refs = tuple(weakref.ref(leaf, lambda _, place=place: _TRACED.pop(place, None))
+            # The cache the callback drops its entry from bound as it is made: a leaf collected as the
+            # interpreter exits outlives the module's globals, `_TRACED` then None.
+            refs = tuple(weakref.ref(leaf, lambda _, place=place, held=_TRACED: held.pop(place, None))
                          for leaf in leaves)
         except TypeError:
             # A callable no weak reference holds: traced each time.
