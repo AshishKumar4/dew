@@ -356,8 +356,8 @@ def mosaic_rule(query, key, value, g, beta, state=None, *, tiles, starts=None,
         # recomputes them (`recomputed`). Each is named as the port names its own, so a rung that saves names
         # keeps them rather than replaying the forward's launches for them (`residuals.DELTA_RESIDUALS`).
         out, final, (inverse, kept) = chunk_forward.kept_forward(
-            *operands[:6], scale=scale, normed=normed, **dict(zip(_KEYED, operands[6:], strict=True)), **forms,
-            **run)
+            *operands[:6], scale=scale, normed=normed, **dict(zip(_KEYED, operands[6:], strict=True)),
+            **forms, **run)
         out, read = out if normed is not None else (out, None)
         kept = None if recomputed else checkpoint_name(kept, Residual.DELTA_MEMORY)
         return (out, final), (operands, (checkpoint_name(inverse, Residual.DELTA_INVERSE), kept,
