@@ -966,11 +966,8 @@ def fused_token(hooks: recurrence.Hooks, taps, *, heads: tuple[int, int, int], w
             held = jnp.where(fresh[:, None, None, None], jnp.zeros((), held.dtype), held)
             history = jnp.where(fresh[:, None, None], jnp.zeros((), history.dtype), history)
 
-        # The conv's weights split by heads only where shards hold heads apart: one shard's whole weights a
-        # map's slice of them, a copy a layer a step (row 14174's fused step on one H100).
-        channels = P(split) if shards > 1 else P()
         extras = {**({} if weight is None else {'weight': (weight(), P())}),
-                  **({} if conv_bias is None else {'conv_bias': (ordered(conv_bias, 0), channels)})}
+                  **({} if conv_bias is None else {'conv_bias': (ordered(conv_bias, 0), P(split))})}
 
         def local(token, history, taps, state, active, *values):
             given = dict(zip((*extras, *names), values, strict=True))
@@ -979,8 +976,7 @@ def fused_token(hooks: recurrence.Hooks, taps, *, heads: tuple[int, int, int], w
             assert moved is not None, 'a step with a conv moves its history'
             return out, moved, state
 
-        specs = (P(rows, split), P(rows, None, split), P(*channels, None), P(rows, split, None, None),
-                 P(rows),
+        specs = (P(rows, split), P(rows, None, split), P(split, None), P(rows, split, None, None), P(rows),
                  *(spec for _, spec in extras.values()),
                  *(P(rows, split, *(None,) * (x.ndim - 2)) for x in per_row.values()),
                  *(P(split) for _ in per_head))
