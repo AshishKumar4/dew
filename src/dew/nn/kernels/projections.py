@@ -537,9 +537,7 @@ def nvfp4_projection(x: jax.Array, w: jax.Array, group_blocks: jax.Array, *, out
 
 
 def _nvfp4_value(x, w, group_blocks, tensor_scale, out_dtype, interpret):
-    return nvfp4_block_product(NvFp4Block.quantized(x, tensor_scale),
-                               NvFp4Block.quantized(jnp.swapaxes(w, 1, 2)), group_blocks, out_dtype=out_dtype,
-                               interpret_on_cpu=interpret)
+    return _nvfp4_forward(x, w, group_blocks, tensor_scale, out_dtype, interpret)[0]
 
 
 def nvfp4_amax(x: jax.Array) -> jax.Array:
@@ -585,18 +583,29 @@ each product's contraction; NVFP4, E2M1 under an E4M3 scale every 16 of it and a
 
 
 def _nvfp4_forward(x, w, group_blocks, tensor_scale, out_dtype, interpret):
-    return _nvfp4_value(x, w, group_blocks, tensor_scale, out_dtype, interpret), (x, w, group_blocks)
+    """The NVFP4 projection's value and its residuals: the operands and the tensor scales its quantization
+    took of their own (`x`'s where no delayed scale was given, `w`'s), which its backward quantizes the
+    same tensors at again, each scale one reduction of its tensor a step, not one a quantization (row
+    14083)."""
+    rows, matrices = NvFp4Block.quantized(x, tensor_scale), NvFp4Block.quantized(jnp.swapaxes(w, 1, 2))
+    value = nvfp4_block_product(rows, matrices, group_blocks, out_dtype=out_dtype, interpret_on_cpu=interpret)
+    return value, (x, w, group_blocks, (rows.scale if tensor_scale is None else None, matrices.scale))
 
 
 def _nvfp4_backward(out_dtype, interpret, residuals, cotangent):
+    """The NVFP4 projection's gradients (`nvfp4_projection`'s surrogate). `residuals`, `_nvfp4_forward`'s,
+    or a chain's operands alone (`_chain_pulled`), whose tensor scales are their own here; the cotangent's
+    tensor scale taken once for both its quantizations (row 14083)."""
     del out_dtype
-    x, w, group_blocks = residuals
-    d_x = nvfp4_block_product(NvFp4Block.quantized(cotangent), NvFp4Block.quantized(w), group_blocks,
-                              out_dtype=x.dtype, interpret_on_cpu=interpret)
+    x, w, group_blocks, *held = residuals
+    x_scale, w_scale = held[0] if held else (None, None)
+    pulled = NvFp4Block.quantized(cotangent)
+    d_x = nvfp4_block_product(pulled, NvFp4Block.quantized(w, w_scale), group_blocks, out_dtype=x.dtype,
+                              interpret_on_cpu=interpret)
     sizes = (group_blocks * SCALE_DEPTH).astype(jnp.int32)
     # Each group's tokens quantized along the tokens (the kernel gradient's contraction), every 16 a scale,
     # the tensor scales applied: a 128-row group's blocks hold whole 16s.
-    rows, cotangents = (NvFp4Block.quantized(operand.T) for operand in (x, cotangent))
+    rows, cotangents = NvFp4Block.quantized(x.T, x_scale), NvFp4Block.quantized(cotangent.T, pulled.scale)
     # An FP4 backward's exact fp32 products: the decoded codes times their scales, held whole.
     d_w = gemm_t((rows.decoded() * rows.scale).T.astype(jnp.float32),
                  (cotangents.decoded() * cotangents.scale).T.astype(jnp.float32), sizes, out_dtype=w.dtype,
