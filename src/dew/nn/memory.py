@@ -209,10 +209,12 @@ class ResidualMemory(nn.Module):
     hidden: int | None = None
     activation: Literal["gelu", "silu", "relu"] = "gelu"
     norm: bool = True
-    bias: bool = True
-    epsilon: float = 1e-6
     dtype: Dtype | None = None
     precision: PrecisionLike = None
+    # After every field a caller may give by position, so `ResidualMemory(None, "gelu", True, None)` reads its
+    # fourth as its dtype (train 1484's review: a bias ahead of it read the dtype's None).
+    bias: bool = True
+    epsilon: float = 1e-6
 
     @nn.compact
     def __call__(self, x: jax.Array) -> jax.Array:

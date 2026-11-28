@@ -30,17 +30,22 @@ import jax.numpy as jnp
 from dew.nn import sharding
 from dew.nn.aligned import aligned_sum
 from dew.nn.inputs import sequence_blocks
+from dew.nn.norms import row_shift
 from dew.nn.precision import at_least_fp32
 from dew.nn.residuals import memory_chunks
 
 
 def layer_normed(x, eps: float):
-    """`x`'s LayerNorm over its last axis without an affine, `(x - mean x) / sqrt(var + eps)`: the plain
-    formula, fla's reference's and the token recurrence's, its derivatives autodiff's, so every order is
+    """`x`'s LayerNorm over its last axis without an affine, `(x - mean x) / sqrt(var + eps)`, its rows less
+    their shift first (`norms.row_shift`, Dew's layer norm's own, which the memory's general path reads:
+    train 1484's review, `[2^24, 2^24 + 2]` normalized unshifted to `[0, 1.15]` where it is `[-1, 1] / 1.41`
+    at an epsilon of one): the plain formula over the shifted rows, fla's reference's, its derivatives
+    autodiff's (the shift a constant, whose term a layer norm's invariance makes zero), so every order is
     finite wherever the plain formula's is (docs/design/testing.md, the derivative contract). A quotient by
     the root, not a product by `rsqrt`, whose derivative `rsqrt(v) / v` passes the range first (2^150 at
     `eps` 2^-100, its product with a zero NaN)."""
-    centered = x - jnp.mean(x, axis=-1, keepdims=True)
+    shifted = x - row_shift(x, -1)
+    centered = shifted - jnp.mean(shifted, axis=-1, keepdims=True)
     return centered / jnp.sqrt(jnp.mean(centered * centered, axis=-1, keepdims=True) + eps)
 
 

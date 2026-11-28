@@ -236,6 +236,36 @@ def test_a_mini_batched_memorys_error_takes_its_residual_first(bias):
         assert np.asarray(module.apply(params, x, call))[0, 0, 1] < 0
 
 
+@pytest.mark.parametrize("bias", [True, False])
+def test_a_mini_batched_memorys_layer_norm_reads_its_rows_less_their_mean(bias):
+    """A linear residual memory's layer norm reads its rows less their mean on its mini-batched kernel as on
+    the token path (`norms.row_shift`, Dew's layer norm's): one token whose memory reads `[2^24, 2^24 + 2]`
+    normalizes it, at an epsilon of one, to `[-1, 1] / sqrt(2)` on both, its branch symmetric (train 1484's
+    review: the kernel normalized it unshifted, its mean rounded to 2^24, to `[0, 2] / sqrt(3)`)."""
+    module = InContextMemory(network=ResidualMemory(hidden=None, norm=True, bias=bias, epsilon=1.0),
+                             slow=("norm",), project_query=False, project_key=False, output=False, chunk=1,
+                             learning_rate=Gate(value=0.0))
+    x = jnp.asarray([[[1.0, 0.0]]], jnp.float32)
+    params = jax.tree.map(jnp.zeros_like, module.init(jax.random.key(0), x))
+    params["params"]["head_0"]["down"]["kernel"] = jnp.asarray([[2.0**24, 2.0**24 + 2], [0.0, 0.0]],
+                                                               jnp.float32)
+    params["params"]["head_0"]["norm"]["scale"] = jnp.ones((2,), jnp.float32)
+    for call in (PLAIN_CALL, packed(np.ones((1, 1), np.int32))):
+        branch = np.asarray(module.apply(params, x, call))[0, 0] - np.asarray(x)[0, 0]
+        assert branch[0] == -branch[1] and branch[1] > 0.5, branch
+
+
+def test_a_residual_memory_built_by_position_reads_its_fields_as_given():
+    """`ResidualMemory(None, "gelu", True, dtype)` is a linear memory with its layer norm, its fourth field
+    its dtype and its bias at its default (train 1484's review: a bias field ahead of `dtype` took the
+    fourth, a None dropping the bias, a bfloat16 computing in float32)."""
+    params = ResidualMemory(None, "gelu", True, None).init(jax.random.key(0), jnp.ones((1, 4)))
+    assert set(params["params"]["down"]) == {"kernel", "bias"}
+    narrow = ResidualMemory(None, "gelu", True, jnp.bfloat16)
+    x = jnp.ones((1, 4), jnp.bfloat16)
+    assert narrow.apply(narrow.init(jax.random.key(0), x), x).dtype == jnp.bfloat16
+
+
 def test_packed_documents_read_as_each_alone():
     """Two documents packed in a row each start from the initial network, their chunks counted from
     their own first token: each reads, bit for bit, as the document alone."""
