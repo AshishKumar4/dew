@@ -480,10 +480,20 @@ def gate_law(gates: Gates, gate, log_a, bias, beta, *, exp, softplus_of, logisti
     return decay, None if beta is None else logistic_of(beta)
 
 
-def gated(gates: Gates, gate, log_a, bias, beta):
+def gated(gates: Gates, gate, log_a, bias, beta, valid=None):
     """The log decay and the write gate `gates` forms from its pre-activations, in their dtype (`gate_law`
     in XLA: its exp accurate, torch's softplus Dew's one). `log_a` broadcasts against `gate` as it is given
-    (a decay a key dimension's `[Hv, 1]`)."""
+    (a decay a key dimension's `[Hv, 1]`). Where `valid` marks a token or row absent (`gate`'s leading axes),
+    its gates are formed from zeros, its head's rate and bias among them, each in its own dtype, so no absent
+    one forms the rate's exponential (a rate of `exp(100)` beside an absent token's zero cotangent was NaN in
+    its gradient: trains 1473's and 1474's reviews); its caller keeps its memory."""
+    if valid is not None:
+        def kept(x, like):
+            present = jnp.reshape(valid, (*jnp.shape(valid), *(1,) * (jnp.ndim(like) - jnp.ndim(valid))))
+            return jnp.where(present, x, jnp.zeros((), x.dtype))
+
+        log_a, gate, bias = (kept(x, gate) for x in (log_a, gate, bias))
+        beta = None if beta is None else kept(beta, beta)
     return gate_law(gates, gate, log_a, bias, beta, exp=accurate_exp, softplus_of=softplus,
                     logistic_of=logistic)
 
@@ -654,24 +664,15 @@ def _prologue(hooks: Hooks, given: dict, work):
 def log_gates(hooks: Hooks, given: dict, work, valid=None):
     """The log decay and the write gate, each in `work`, from the operands `given` by name (`read`): the
     gates' (`gated`), a rated decay's (the rate times the write gate), or as given; None for a decay
-    or a write gate the hooks have not. Where `valid` marks a token or row absent (its leading axes'),
-    its gates are formed from zeros, its head's rate and bias among them, so no absent one forms the rate's
-    exponential (a rate of `exp(100)` beside an absent token's zero cotangent was NaN in its gradient:
-    train 1473's review); its caller keeps its memory."""
+    or a write gate the hooks have not, an absent token's or row's (`valid`) gates formed from zeros
+    (`gated`)."""
     if hooks.gates is not None:
         beta = given['beta'].astype(work) if hooks.gates.write == 'sigmoid' else None
         # A head's rate over each of its key dimensions' gates, in `work` as every gate operand.
         log_a = given['log_a'].astype(work)
         log_a = log_a[..., None] if hooks.decay == 'vector' else log_a
         gate, bias = given['gate'].astype(work), given['bias'].astype(work)
-        if valid is not None:
-            def kept(x, like):
-                present = jnp.reshape(valid, (*jnp.shape(valid), *(1,) * (like.ndim - jnp.ndim(valid))))
-                return jnp.where(present, x, jnp.zeros((), work))
-
-            log_a, gate, bias = (kept(x, gate) for x in (log_a, gate, bias))
-            beta = None if beta is None else kept(beta, beta)
-        return gated(hooks.gates, gate, log_a, bias, beta)
+        return gated(hooks.gates, gate, log_a, bias, beta, valid)
     if hooks.rated:
         beta = given['beta'].astype(work)
         return given['rate'].astype(work) * beta, beta
