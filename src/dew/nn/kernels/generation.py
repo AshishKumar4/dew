@@ -1744,14 +1744,16 @@ def symbolic_tangent(portable: Callable, operands, tangents, output):
 def _perturbed_tangent(portable: Callable, operands, live: Sequence[bool], moving, output=None):
     """`portable`'s tangent at `operands` along `moving`, the directions of the leaves `live` masks alone,
     the others held as constants: a zero direction would meet an infinite factor (inf * 0, NaN, where a
-    bias's own tangent was 1: rows 8757, 6740). With none live, `output`'s zeros, in its dtypes."""
+    bias's own tangent was 1: rows 8757, 6740). With none live, `output`'s symbolic zeros, in its dtypes:
+    an instantiated zero met the next infinite factor past the rule (a held group of
+    `scan._portable_pairs`, its pairs zero, through a `sqrt`: 0 * (0.5 / 0), NaN; train 1484's K-F2)."""
     import jax
     from jax.custom_derivatives import zero_from_primal
 
     from dew.nn import programs
 
     if not any(live):
-        return zero_from_primal(output)
+        return zero_from_primal(output, symbolic_zeros=True)
     perturbed, fill = programs.holes(operands, live)
     return jax.jvp(lambda *values: portable(*fill(values)), tuple(perturbed), tuple(moving))[1]
 

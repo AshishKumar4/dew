@@ -1944,8 +1944,9 @@ def test_portable_pair_groups_in_one_call_are_each_groups_own_pairs():
 def test_portable_pair_groups_take_each_groups_own_derivative():
     """A call of two groups differentiates each at its own factors (`scan._portable_pair_jvp`): the earlier
     blocks' row decay's cotangent sums two keys' products of 2^130 that cancel before it lands (zero, as one
-    group's call gives it, not two infinities), and a held group's tangent is zero beside an infinite key
-    (head review of row 14108)."""
+    group's call gives it, not two infinities), and a held group's tangent is a symbolic zero beside an
+    infinite key, which a `sqrt` of its crossed pair, zero, passes on as zero (an instantiated zero met
+    `0.5 / sqrt(0)` there, NaN: train 1484's K-F2; head review of row 14108)."""
     own = (jnp.ones((1, 2, 1), jnp.float32), jnp.asarray([[[np.inf], [1.0]]], jnp.float32),
            jnp.asarray([[[[1.0], [-0.0]], [[1.0], [1.0]]]], jnp.float32), None)
     rows = jnp.asarray([[[2.0 ** 100], [0.0]]], jnp.float32)
@@ -1963,7 +1964,7 @@ def test_portable_pair_groups_take_each_groups_own_derivative():
 
     @jax.jit
     def moved(direction):
-        return jax.jvp(lambda r: scan._portable_pairs(own, (r, keys, before, after))[0], (rows,),
+        return jax.jvp(lambda r: jnp.sqrt(scan._portable_pairs(own, (r, keys, before, after))[0]), (rows,),
                        (direction,))[1]
 
     np.testing.assert_array_equal(moved(jnp.ones_like(rows)), np.zeros((1, 2, 2), np.float32))
