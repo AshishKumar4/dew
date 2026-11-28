@@ -617,6 +617,10 @@ class Clocked:
     """Two warpgroups' round trip through a block's barriers (`templates.cost.chained`)."""
 
 
+UNCLOCKED = Clocked()
+"""A die no one measured at its clock: every latency None."""
+
+
 class Frozen(Mapping):
     """A mapping no one changes: its own copy of the items it is given, held behind a read-only view and
     pickled as a copy of them, so a cache may hold it as a value (`tuning.holdable`, which trusts this type
@@ -739,12 +743,17 @@ class GpuTarget:
     together (an H100's "PCIe Gen5: 128 GB/s" is 64e9 here, a GH200's 900 GB/s C2C 450e9). What a step that
     streams its parameters from the host moves them over (`dew.training.memory.streamed_seconds`); a part
     this states none of streams nothing priced (`host_link_rate`)."""
+    clocks: Clocked = dataclasses.field(init=False, repr=False, compare=False, hash=False, default=UNCLOCKED)
+    """The step latencies of this device's die at its clock (`clocked`, under the longest device-kind prefix
+    it starts with), resolved as the target is made, a price reading them on every walk; `UNCLOCKED` where
+    none was measured."""
 
     def __post_init__(self) -> None:
         # Its mappings its own and unchangeable, nested ones too (`Frozen`): a launch's cache holds a target
         # whole as its key does (`tuning.holdable`, which refuses what may change after it is held).
         for name in ("dense_peaks", "measured", "clocked", "host_links"):
             object.__setattr__(self, name, _frozen(getattr(self, name)))
+        object.__setattr__(self, "clocks", self._part(self.clocked) or UNCLOCKED)
 
     @property
     def architecture(self) -> Architecture:
@@ -860,11 +869,6 @@ class GpuTarget:
         """The part's measured `fact` (`Measured`'s field), else the `stated` one."""
         measured = None if self.part is None else getattr(self.part, fact)
         return stated if measured is None else measured
-
-    @property
-    def clocks(self) -> Clocked:
-        """The step latencies of this device's die at its clock (`clocked`); none where unmeasured."""
-        return self._part(self.clocked) or Clocked()
 
     @property
     def step_seconds(self) -> float | None:
