@@ -192,10 +192,11 @@ def computation_differs[LossT, EffectsT](trainer: "Trainer[LossT, EffectsT]", ch
     `numerics` is False (its run admitted them already, `refuse_other_computation`)."""
     training, now = checkpoints.training(step), trainer.phase_passes.training_record(trainer.objective)
     fields = ("numerics", "products")
-    # A law the checkpoint records binds a run that draws none: a fixed-pass resume would stop drawing (a
-    # checkpoint that records none, a fixed-pass run's, any run resumes).
-    dropped = (["training.sampled_passes"] if isinstance(training, dict) and "sampled_passes" in training
-               and "sampled_passes" not in now else [])
+    # A law or a phase's passes the checkpoint records binds a run that states none: a fixed-pass resume
+    # would stop drawing, an unphased or a sampled one run other passes in the phase it lands in (row 14126;
+    # a checkpoint that records none, an older one's, any run resumes).
+    dropped = [f"training.{field}" for field in ("sampled_passes", "phase_passes")
+               if isinstance(training, dict) and field in training and field not in now]
     # Its numerics compared as they computed (`numerics_differs`, where they are), the rest of its record as
     # it reads.
     saved = ({name: value for name, value in training.items() if name not in fields}

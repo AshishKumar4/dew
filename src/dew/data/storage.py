@@ -923,7 +923,7 @@ class Store:
         resolved = fs.resolve_path(path)
         if not isinstance(resolved, HfFileSystemResolvedRepositoryPath):
             raise ValueError(f"conditional HF publication needs a repository object URL: {self.url}")
-        api = HfApi(token=fs.token)
+        api = HfApi(endpoint=fs.endpoint, token=fs.token)
         parent = (
             version
             or api.repo_info(resolved.repo_id, repo_type=resolved.repo_type, revision=resolved.revision).sha
@@ -956,7 +956,7 @@ def _hub_commit(fs: HfFileSystem, path: str) -> tuple[str, str]:
         raise ValueError(f"a Hub object at a commit needs a repository file's URL: hf://{path}")
     from huggingface_hub import HfApi
 
-    version = (HfApi(token=fs.token)
+    version = (HfApi(endpoint=fs.endpoint, token=fs.token)
                .repo_info(resolved.repo_id, repo_type=resolved.repo_type, revision=resolved.revision).sha)
     if version is None:
         raise ValueError(f"Hub source hf://{path} did not resolve to a commit")
