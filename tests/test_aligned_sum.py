@@ -869,9 +869,9 @@ def test_a_pooled_cotangents_pullback_to_a_split_factor_beside_a_replicated_weig
 def test_a_split_factors_varied_cotangent_pulls_back_to_a_replicated_weight_exactly():
     """Reverse over reverse through a split `b`'s cotangent (`aligned_cotangents`) of `aligned_sum([(a, b)],
     0)` at a replicated `w`, in a checked `shard_map` over two devices, its terms `w a` replicated and varied
-    to `b`'s placement: pulled back to `w` along `[2^127, 2^127]` on one device and `[-2^127, -2^127]` on the
-    other, exactly 0, its transpose pooling the products' digits over the axis before its one rounding
-    (train 1473's review: a cast to vary outside the declared rule transposed to a float sum, inf - inf)."""
+    to `b`'s placement: pulled back to `w` along `[2^127, -2^127]` on each device, exactly 0, its transpose
+    pooling the products' digits over the axis before its one rounding (train 1473's review: a cast to vary
+    outside the declared rule transposed to an elementwise float sum over the devices, `[inf, -inf]`)."""
     from dew.nn.aligned import aligned_cotangents
 
     mesh = jax.sharding.Mesh(np.asarray(jax.devices()[:2]), ("data",))
@@ -883,7 +883,7 @@ def test_a_split_factors_varied_cotangent_pulls_back_to_a_replicated_weight_exac
 
     run = jax.shard_map(local, mesh=mesh, in_specs=(whole, split, whole, split), out_specs=whole,
                         check_vma=True)
-    along = jnp.asarray([2.0**127, 2.0**127, -(2.0**127), -(2.0**127)], jnp.float32)
+    along = jnp.asarray([2.0**127, -(2.0**127), 2.0**127, -(2.0**127)], jnp.float32)
     found = jax.jit(run)(jnp.ones((2,), jnp.float32), jnp.ones((4,), jnp.float32), jnp.ones((), jnp.float32),
                          along)
     np.testing.assert_array_equal(np.asarray(found), np.asarray(0.0, np.float32))
