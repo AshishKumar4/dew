@@ -699,14 +699,16 @@ def _contracted(spec: str, left: jax.Array, right: jax.Array) -> jax.Array:
     return float32_einsum(spec, left, right, precision=REFERENCE_PRECISION, preferred_element_type=left.dtype)
 
 
-def _on_rows(summed, power, coefficient, at, below, estimated, by, keys: int):
-    """A row's running `Σ_k term · by_k` (`dq`'s, `dr`'s) over its `keys`: this tile's terms landed at the
-    row's power (`_landing`, the least of its running one and this tile's, its headroom the whole walk's
-    keys': 64 tiles of `-2^122` each overflowed where one tile's 128 bounded it, train 1500's review), the
-    carried sum taken to it."""
-    fresh = jnp.minimum(power, _landing(estimated, by, -1, keys))
-    part = _contracted("bhgqk,bkhd->bhgqd", exp_scaled(coefficient, below, at + fresh[..., None]), by)
-    return power2(summed, (fresh - power)[..., None]) + part, fresh
+def _on_rows(summed, power, coefficient, at, below, estimated, by, tiles: int):
+    """A row's running `Σ_k term · by_k` (`dq`'s, `dr`'s) over its walk's `tiles`: this tile's terms landed
+    at its own power (`_landing` over its keys, so a small term keeps its size), their contraction and the
+    carried sum then taken to the row's power, the least of its running one and this tile's less the walk's
+    headroom (`(tiles - 1).bit_length()`): 64 tiles of `-2^122` each overflowed at one tile's (train 1500's
+    review)."""
+    landed = _landing(estimated, by, -1, estimated.shape[-1])
+    part = _contracted("bhgqk,bkhd->bhgqd", exp_scaled(coefficient, below, at + landed[..., None]), by)
+    fresh = jnp.minimum(power, landed - (tiles - 1).bit_length())
+    return power2(summed, (fresh - power)[..., None]) + power2(part, (fresh - landed)[..., None]), fresh
 
 
 def _on_keys(coefficient, at, below, estimated, by, scale: float = 1.0):
@@ -811,8 +813,7 @@ def derivative(query, second, key, second_key, value, spans: KeySpans, held: Mom
 
     def step(sums, index):
         (dq, dq_power), (dr, dr_power) = sums
-        logits, seconds, (keys, _), below, moved = moving(index)
-        raw_keys = jax.lax.dynamic_slice_in_dim(call.second_key, index * tile, tile, axis=1)
+        logits, seconds, (keys, raw_keys), below, moved = moving(index)
         seen, fraction, tau_power, delta, delta_power = paired(logits, seconds, moved)
         logit, common = _logit_coefficient(delta, delta_power, fraction, tau_power, row(against),
                                            row(against_power))
@@ -828,9 +829,9 @@ def derivative(query, second, key, second_key, value, spans: KeySpans, held: Mom
             jnp.where(seen & (coefficient != 0), reach + power + _exponent(coefficient), _NONE)
             for coefficient, power in terms)
         # Over the row's keys: `dq` and `dr`, each carried at its row's running power.
-        on_rows = (_on_rows(dq, dq_power, logit, common, below, logit_estimate, keys, call.key.shape[1]),
+        on_rows = (_on_rows(dq, dq_power, logit, common, below, logit_estimate, keys, tiles),
                    _on_rows(dr, dr_power, second_coefficient, delta_power, below, second_estimate, raw_keys,
-                            call.key.shape[1]))
+                            tiles))
         # Over the key's queries: `dk`, `dk2` and `dV`, each at its key's own power.
         on_keys = (_on_keys(logit, common, below, logit_estimate, queries, scale),
                    _on_keys(second_coefficient, delta_power, below, second_estimate, seconds_query),
@@ -941,9 +942,11 @@ def _dense_tangent(dtype: str, primals, tangents, value) -> jax.Array:
     # contraction, never a mean's and a weighted sum's products apart (`2^128` before `3 · 2^126` met it).
     weights = jnp.where(seen, tile.masses / over, 0.0)
     centred = weights * (jnp.sum(weights * dseconds, axis=-1, keepdims=True) - dseconds)
-    # The second products held at their rows' power `2^p` (`_called`): their direction's contraction taken
-    # back by `2^-p`, as the values' is by its own (train 1500's review: `[2^124, -2^124]` read half).
-    secondly = power2(_weighed(centred, values), -rows)
+    # The second products held at their rows' power `2^p` (`_called`): their centred direction taken back by
+    # `2^-p` before the values meet it, so its transpose restores the contraction's cotangent, never the
+    # output's (train 1500's review: `[2^124, -2^124]` read half; restored on the output, a cotangent of
+    # `2^127` overflowed before small values met it).
+    secondly = _weighed(power2(centred, -rows), values)
     return moved + _ungrouped(valued + secondly).astype(dtype)
 
 
