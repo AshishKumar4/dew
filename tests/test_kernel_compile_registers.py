@@ -328,6 +328,55 @@ def test_each_builds_run_of_a_case_is_held_to_the_gates_checks():
     assert [run["name"] for run in kc.failing_runs(unjudged)] == ["k under cuda13"]
 
 
+
+def test_a_spill_of_one_builds_run_alone_is_its_cases_spill():
+    """`kernel_compile.spills` reads every build's run of a case (`runs`): a case whose first run holds and
+    whose cuda13 run spills spills there alone, by that run's name, and one whose every run holds spills
+    nowhere (Train 1470's review: three checks read the first run's figures alone and missed a spill of
+    cuda13's)."""
+    clean = _run("k")
+    case = {**clean, "builds": {"cuda13": _run("k under cuda13", spilled=24, same="k")}}
+    assert kc.spills([case]) == {"k under cuda13": {"k"}}
+    assert kc.spills([{**clean, "builds": {"cuda13": _run("k under cuda13", same="k")}}]) == {}
+
+
+def test_another_builds_run_names_a_rejected_kernel_a_triton_one_and_one_of_no_ptx_apart():
+    """A build's judge (`kernel_compile._Rebuilt`) names each kernel it could not remake by why: a Mosaic
+    kernel whose PTX that build's ptxas rejects, with its report's tail (`rejected`), a failure of its run
+    naming the rejection and no retry of its case (`_undumped`); one of no PTX printed here (`unjudged`),
+    the retry's; and a Triton kernel, none of whose PTX Mosaic printed, its binary the compiling build's
+    (`unqualified`) (Train 1470's review: a rejection read as missing PTX and retried, and a cuda12 Triton
+    binary taken as cuda13's)."""
+    mosaic = assembled.Binary("k", "0123456789", 128, 0, "mosaic_gpu")
+    kernels = {"k": ("e" * 16, mosaic), "m": ("f" * 16, dataclasses.replace(mosaic, kernel="m")),
+               "t": (None, dataclasses.replace(mosaic, kernel="t", kind="triton"))}
+    kc.PTX["e" * 16] = "//\n.version 8.0\n.target sm_90a\n.address_size 64\nnot an instruction;\n"
+    judge = kc._Rebuilt("cuda12", "sm90")
+    try:
+        assert judge(kernels) == kernels
+    finally:
+        del kc.PTX["e" * 16]
+    k, m, t = (assembled.launch_name(name, mosaic.launch) for name in "kmt")
+    assert list(judge.rejected) == [k] and judge.rejected[k].strip()
+    assert (judge.unjudged, judge.unqualified) == ([m], [t])
+    run = {**_run("k under cuda12", build="cuda12"), "rejected": judge.rejected}
+    (failure,) = kc.mosaic_failures([run])
+    assert "ptxas rejects" in failure and not kc._undumped([run]) and kc._unjudged(run) == [failure]
+
+
+def test_a_ladder_steps_by_the_spill_roles_of_the_build_that_spilled():
+    """A kernel's report carries the roles its judged binary spilled in (`Report.spilled_in`, `reports`),
+    and a ladder reads them from its run's reports (`kernel_compile.spill_roles`), never from this process's
+    binaries, which another build's run did not spill in (Train 1470's review: a forked ladder stepped by the
+    host's clean roles where cuda13 alone spilled in its consumers)."""
+    judged = assembled.Binary("k", "0123456789", 128, 0, "mosaic_gpu", spilled_in=("consumers",))
+    (found,) = kc.reports({}, [judged])
+    assert found.spilled_in == ("consumers",)
+    run = {**_run("k under cuda13", spilled=24),
+           "binaries": [dataclasses.asdict(dataclasses.replace(judged, spilled_in=("producer",)))]}
+    run["kernels"] = [{**run["kernels"][0], "spilled_in": list(found.spilled_in)}]
+    assert kc.spill_roles([run]) == {"k": ("consumers",)}
+
 def test_a_certifications_ptx_is_the_one_its_own_compile_printed(tmp_path, monkeypatch):
     """PTX modules Mosaic dumped of one kernel's name and launch, each under a name of its compile's own
     numbering: a certification's bound to its own kernels' module, of the dumps its own compile wrote alone

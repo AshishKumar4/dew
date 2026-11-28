@@ -1414,12 +1414,16 @@ def _chained_operands(rows: int):
             *(rng.integers(-1, 2, (RELAYED, RELAYED)).astype(jnp.bfloat16) for _ in range(2)))
 
 
-@pytest.mark.parametrize(("rows", "m_warps"), [(16, 1), (32, 2)])
+CHAINED = ((16, 1), (32, 2))
+"""The chained products' rows and the warps along them (`_chained`): one warp, and two splitting the rows."""
+
+
+@pytest.mark.parametrize(("rows", "m_warps"), CHAINED)
 def test_an_accumulator_feeds_the_next_product_on_any_warp_split(rows, m_warps):
     """Register values read as mma.sync's left operands, an accumulator's among them, on warps that split
     its columns (one or two along its rows): lowered for an A100 on a CPU (each warp's columns relayed
     through the bound tile, where no register cast crosses warps); exact on a GPU
-    (`test_an_accumulator_feeds_the_next_product_on_a_gpu`)."""
+    (`an_accumulator_feeds_the_next_product_on_a_gpu`, a cell of `test_gpu_gemm`'s toolkit flow)."""
     if here() != "cpu":
         pytest.skip(f"lowers for an A100 on a CPU, not on this {here()}")
     a, b, c = _chained_operands(rows)
@@ -1430,9 +1434,7 @@ def test_an_accumulator_feeds_the_next_product_on_any_warp_split(rows, m_warps):
             lowering_platforms=("cuda",))
 
 
-@pytest.mark.gpu(reason="chained mma.sync products run on the device alone")
-@pytest.mark.parametrize(("rows", "m_warps"), [(16, 1), (32, 2)])
-def test_an_accumulator_feeds_the_next_product_on_a_gpu(rows, m_warps):
+def an_accumulator_feeds_the_next_product_on_a_gpu(rows, m_warps):
     """`test_an_accumulator_feeds_the_next_product_on_any_warp_split`'s products on a GPU: exactly
     `(a @ b) @ c`, its program compiled in a tier's prepare (`ahead_arm`)."""
     a, b, c = _chained_operands(rows)
@@ -1489,13 +1491,18 @@ def _bound_operands(m_warps: int):
     return family, (a, b, c), expected
 
 
-@pytest.mark.parametrize("m_warps", [1, 2, 4])
+BOUND_WARPS = (1, 2, 4)
+"""The warps along a bounded family's rows (`_bound_operands`)."""
+
+
+@pytest.mark.parametrize("m_warps", BOUND_WARPS)
 def test_mma_sync_products_within_a_row_bound_keep_the_accumulator_past_it(m_warps):
     """mma.sync's products by a family bounded at a tile's rows (`Issuer.bounded`: a ragged group's last tile)
     issue for the 16-row blocks before the bound alone, a nonzero accumulator, each row its own, kept in the
     rest: two run-time bounds in one trace (-1 keeping every row, 65 issuing all), and a constant one a family
     carries into one jitted helper at each bound (M-FS-56b; rows 7091, 12108, 12109), interpreted and lowered
-    for an A100 on a CPU; exact on a GPU (`test_mma_sync_products_within_a_row_bound_on_a_gpu`)."""
+    for an A100 on a CPU; exact on a GPU (`mma_sync_products_within_a_row_bound_on_a_gpu`, a cell of
+    `test_gpu_gemm`'s toolkit flow)."""
     if here() != "cpu":
         pytest.skip(f"interpreted and lowered on a CPU, not on this {here()}")
     family, (a, b, c), expected = _bound_operands(m_warps)
@@ -1511,9 +1518,7 @@ def test_mma_sync_products_within_a_row_bound_keep_the_accumulator_past_it(m_war
         run.trace(*shapes, family=family, interpret=False).lower(lowering_platforms=("cuda",))
 
 
-@pytest.mark.gpu(reason="bounded mma.sync products run on the device alone")
-@pytest.mark.parametrize("m_warps", [1, 2, 4])
-def test_mma_sync_products_within_a_row_bound_on_a_gpu(m_warps):
+def mma_sync_products_within_a_row_bound_on_a_gpu(m_warps):
     """`test_mma_sync_products_within_a_row_bound_keep_the_accumulator_past_it`'s products on a GPU: exact,
     each bound's program compiled in a tier's prepare (`ahead_arm`). Every bound's arm called before any is
     judged, so a GPU tier's prepare, whose arms give zeros, reaches each (row 10697: it stopped at the first
@@ -1568,33 +1573,29 @@ def _codes(dtype):
     return codes, np.ldexp(np.ones((CODES[0],), np.float32), rng.integers(-3, 4, (CODES[0],)))
 
 
-def _quantized(generation_name: str, dtype, scaled: bool) -> tuple[np.ndarray, np.ndarray, np.ndarray] | None:
+QUANTIZED = (jnp.int8, jnp.float8_e4m3fn)
+"""A quantized stage's code dtypes, each converted in registers on every GPU (`mosaic.converts`: FP8 by
+hardware from sm_89, by `bits.decoded` before)."""
+
+
+def _quantized(dtype, scaled: bool) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """`_codes` of `dtype` and the bf16 tile they convert into, `codes * scale` (each row's scale where
-    `scaled`); None where the generation converts no such codes in registers (FP8 on an A100), its
-    conversion refused, never assembled (`mosaic.converts`)."""
+    `scaled`)."""
     codes, scale = _codes(dtype)
-    with generation.assumed(generation_name):
-        converts = mosaic.converts(dtype)
-    if not converts:
-        with pytest.raises(ValueError), generation.assumed(generation_name):
-            _converted(codes, scale, generation_name=generation_name, interpret=INTERPRETED)
-        return None
     return codes, scale, np.asarray(codes, np.float32) * (np.asarray(scale)[:, None] if scaled else 1)
 
 
 @pytest.mark.parametrize("scaled", [True, False], ids=["scaled", "unscaled"])
-@pytest.mark.parametrize("dtype", [jnp.int8, jnp.float8_e4m3fn])
+@pytest.mark.parametrize("dtype", QUANTIZED)
 @pytest.mark.parametrize("generation_name", gate_generations())
 def test_a_quantized_stage_converts_into_the_tile_its_products_read(generation_name, dtype, scaled):
     """Int8 and e4m3 codes in shared memory converted into a bf16 tile, each row scaled in fp32: exactly
-    `codes * scale` interpreted on a CPU, and lowered and compiled for a GPU of the generation there; FP8
-    codes refused where the device converts none (an A100). Its native arm is a GPU's alone
-    (`test_a_quantized_stage_converts_natively_on_its_gpu`); a host no CPU runs none of it (row 9003)."""
+    `codes * scale` interpreted on a CPU, and lowered and compiled for a GPU of the generation there. Its
+    native arm is a GPU's alone (`a_quantized_stage_converts_natively`, a cell of `test_gpu_gemm`'s toolkit
+    flow); a host no CPU runs none of it (row 9003)."""
     if here() != "cpu":
         pytest.skip(f"converts interpreted on a CPU, not on this {here()}")
-    if (quantized := _quantized(generation_name, dtype, scaled)) is None:
-        return
-    codes, scale, expected = quantized
+    codes, scale, expected = _quantized(dtype, scaled)
     with generation.assumed(generation_name):
         converted = _converted(codes, scale, generation_name=generation_name, interpret=INTERPRETED,
                                scaled=scaled)
@@ -1611,19 +1612,13 @@ def test_a_quantized_stage_converts_into_the_tile_its_products_read(generation_n
     assert not mosaic_failures(found), mosaic_failures(found)
 
 
-@pytest.mark.gpu(reason="a quantized stage's native conversion runs on the device alone")
-@pytest.mark.parametrize("scaled", [True, False], ids=["scaled", "unscaled"])
-@pytest.mark.parametrize("dtype", [jnp.int8, jnp.float8_e4m3fn])
-@pytest.mark.parametrize("generation_name", gate_generations())
-def test_a_quantized_stage_converts_natively_on_its_gpu(generation_name, dtype, scaled):
+def a_quantized_stage_converts_natively(generation_name, dtype, scaled):
     """`test_a_quantized_stage_converts_into_the_tile_its_products_read`'s codes converted natively on a GPU
-    of the generation: exactly `codes * scale`, its program compiled in a tier's prepare (`ahead_arm`); FP8
-    codes refused where the device converts none (an A100); another host runs none of it."""
+    of the generation: exactly `codes * scale`, its program compiled in a tier's prepare (`ahead_arm`);
+    another GPU runs none of it, whose older generations' arms would share their labels with its own."""
     if here() != generation_name:
         pytest.skip(f"converts natively on a {generation_name} GPU, not on this {here()}")
-    if (quantized := _quantized(generation_name, dtype, scaled)) is None:
-        return
-    codes, scale, expected = quantized
+    codes, scale, expected = _quantized(dtype, scaled)
     native = jax.jit(functools.partial(_converted, generation_name=generation_name, interpret=False,
                                        scaled=scaled))
     converted = ahead_arm(native, f"a {jnp.dtype(dtype).name} stage: scaled {scaled}")(codes, scale)
