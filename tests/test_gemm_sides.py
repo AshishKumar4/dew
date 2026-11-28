@@ -13,7 +13,9 @@ from generation_support import generations
 from reference_error import assert_as_exact
 from test_gemm_template import DEPTH, ROUTED, ROWS, SEEDS, SIZES, WIDTH, _draw, biased_row, normed
 
-from dew.nn.kernels import gemm, generation
+from dew.nn.kernels import gemm, generation, grouped_matmul
+from dew.nn.kernels.templates.gemm.hooks import Hooks
+from dew.nn.kernels.templates.gemm.sides import LAUNCH_AXES
 from dew.nn.kernels.templates.hooks import Hook, Side
 
 
@@ -192,3 +194,64 @@ def test_a_hooked_product_of_no_rows_is_empty_with_zero_side_gradients(hooked, d
         for got, side in zip(d_hooks[name].sides, hook.sides, strict=True):
             assert got.value.shape == side.value.shape and got.value.dtype == side.value.dtype
             np.testing.assert_array_equal(np.asarray(got.value), np.zeros(side.value.shape, np.float32))
+
+
+SIDE_ORDERS = {"epilogue columns first": ("epilogue", ("columns", "rows")),
+               "prologue depth first": ("prologue", ("depth", "rows"))}
+"""A hook and its side's axes out of the launch's order (`sides.LAUNCH_AXES`)."""
+
+
+@pytest.mark.parametrize(("hook", "axes"), SIDE_ORDERS.values(), ids=SIDE_ORDERS)
+def test_a_side_out_of_its_launchs_order_takes_the_portable_route(hook, axes):
+    """A grouped product's hook adding a side of its tile's extents (`tile + side`, a square product's) on
+    an H100: a tile the Mosaic launch derives with the side in the launch's order (rows first) is no
+    legal tile of the call with the side on its columns (or depth) before its rows, a pin's as the
+    derivation's, since the launch loads a side's tile in its own tile's layout and its lowering takes no
+    transpose (Mosaic GPU's layout inference found none on wgmma, row 14207); so no Mosaic launch takes the
+    call, and its value and its gradients are bit for bit the plain formula's over small integers."""
+    rng = np.random.default_rng(14207)
+    extent, half = 64, 32
+    sizes = jnp.asarray([half, half], jnp.int32)
+    x = jnp.asarray(rng.integers(-3, 4, (extent, extent)), jnp.bfloat16)
+    w = jnp.asarray(rng.integers(-3, 4, (2, extent, extent)), jnp.bfloat16)
+    side = jnp.asarray(rng.integers(-3, 4, (extent, extent)),
+                       jnp.float32 if hook == "epilogue" else jnp.bfloat16)
+
+    def added(tile, held):
+        return tile + held
+
+    def product(x, w, side):
+        hooked = {hook: Hook(added, (Side(side, axes),))}
+        return jnp.sum(gemm.gemm(x, w, sizes, out_dtype=jnp.float32, **hooked))
+
+    def plain(x, w, side):
+        held = side.astype(jnp.float32)
+        rows = x.astype(jnp.float32) + (held if hook == "prologue" else 0)
+        matrices = w.astype(jnp.float32)
+        out = jnp.concatenate([rows[:half] @ matrices[0], rows[half:] @ matrices[1]])
+        return jnp.sum(out + (held if hook == "epilogue" else 0))
+
+    spec = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
+    held = (jax.ShapeDtypeStruct(side.shape, side.dtype),)
+    launch = grouped_matmul.MosaicGmm()
+
+    def bound(axes_of):
+        return launch.bind(spec((extent, extent)), spec((2, extent, extent)),
+                           jax.ShapeDtypeStruct((2,), jnp.int32),
+                           *((held, ()) if hook == "prologue" else ((), held)), out_dtype="float32",
+                           trans_rhs=False, interpret=False,
+                           hooks=Hooks(**{hook: added, f"{hook}_axes": (axes_of,)}))
+
+    with generation.assumed("sm90"), generation.routes() as routes:
+        target = generation.gpu_target()
+        tile = launch.derived(bound(LAUNCH_AXES[hook]), target)
+        assert tile is not None
+        assert not launch.legal(bound(axes), tile, target), tile
+        jax.make_jaxpr(product)(x, w, side)
+    taken = {route.kernel for route in routes if route.choice == generation.Choice.GROUPED_MATMUL}
+    assert "mosaic" not in taken, routes
+    with generation.assumed("sm90"):
+        got = jax.jit(jax.value_and_grad(product, (0, 1, 2)))(x, w, side)
+    want = jax.value_and_grad(plain, (0, 1, 2))(x, w, side)
+    for dew, plain_value in zip(jax.tree.leaves(got), jax.tree.leaves(want), strict=True):
+        np.testing.assert_array_equal(np.asarray(dew, np.float32), np.asarray(plain_value, np.float32))

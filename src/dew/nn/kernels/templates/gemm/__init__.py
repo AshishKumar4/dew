@@ -118,3 +118,27 @@ def launched_whole(*operands) -> bool:
         elif isinstance(operand, jax.Array) and not operand.sharding.is_fully_replicated:
             return False
     return True
+
+
+def as_groups(matrix: jax.Array) -> jax.Array:
+    """`matrix` as a launch reads its matrices, `[groups, depth, width]` (each transposed where its call
+    transposes them): a dense product's one matrix its one group, a bank of groups and a stack of dense
+    layers' matrices as they are, and a stack of layers' banks (`gemm`'s `layer`) every layer's groups along
+    one axis. Formed inside a launch's derivative, never before it: what the derivative keeps of a weight
+    is the weight as its caller holds it, which a scan over a model's layers forwards from its stacked
+    weights, where it stacked a grouped copy of each layer's weight every step (row 14192: 6.6 GiB of a
+    cold Qwen3.5-4B start's peak on a GH200)."""
+    if matrix.ndim == 2:
+        return matrix[None]
+    if matrix.ndim == 3:
+        return matrix
+    # Every layer's groups by their count, not inferred: a stack of no depth or width holds no elements.
+    layers, groups, *rest = matrix.shape
+    return matrix.reshape(layers * groups, *rest)
+
+
+def as_given(gradient: jax.Array, matrix: jax.Array) -> jax.Array:
+    """A kernel gradient of `as_groups(matrix)` in `matrix`'s own shape."""
+    if matrix.ndim == 2:
+        return jnp.squeeze(gradient, 0)
+    return gradient if matrix.ndim == 3 else gradient.reshape(matrix.shape)

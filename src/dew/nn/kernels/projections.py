@@ -40,6 +40,7 @@ from dew.nn.kernels.gemm import (
     nvfp4_block_product,
 )
 from dew.nn.kernels.templates import axes
+from dew.nn.kernels.templates.gemm import as_given, as_groups
 from dew.nn.kernels.templates.hooks import Hook, Side
 from dew.nn.kernels.templates.product import MXFP8 as MX_BLOCKS, NVFP4 as NVFP4_BLOCKS, SCALE_DEPTH, declared
 from dew.nn.precision import EXACT_FLOAT32, at_least_fp32, biased, biased_value
@@ -56,14 +57,15 @@ from dew.nn.sharding import (
 
 def blockwise_fp8_projection(x: jax.Array, w: jax.Array, group_blocks: jax.Array, *, out_dtype,
                              interpret_on_cpu: bool = False) -> jax.Array:
-    """Each group's rows of `x` (`[rows, depth]`) times its matrix of `w` (`[groups, depth, width]`) in
-    DeepSeek-V3's blockwise FP8 recipe (row 2513): `x` quantized to E4M3 a 1 x 128 tile at a time along the
-    depth and `w` a 128 x 128 block at a time (power-of-two scales, `rows_quantized`, `blocks_quantized`),
-    their product `blockwise_fp8_product`. Its gradients are the recipe's own FP8 products: the input's the
-    cotangent quantized 1 x 128 along the width times the blocks transposed, the matrices' the rows and the
-    cotangent each quantized 1 x 128 along the rows (`blockwise_fp8_kernel_gradient`), a surrogate of the
-    quantized product's derivative (straight through each rounding). Group `g` holds `group_blocks[g]` whole
-    128-row blocks, in order: `rows` is 128 times their sum (a recipe pads each group's rows)."""
+    """Each group's rows of `x` (`[rows, depth]`) times its matrix of `w` (`[groups, depth, width]`, or one
+    group's `[depth, width]`, `as_groups`) in DeepSeek-V3's blockwise FP8 recipe (row 2513): `x` quantized to
+    E4M3 a 1 x 128 tile at a time along the depth and `w` a 128 x 128 block at a time (power-of-two scales,
+    `rows_quantized`, `blocks_quantized`), their product `blockwise_fp8_product`. Its gradients are the
+    recipe's own FP8 products: the input's the cotangent quantized 1 x 128 along the width times the blocks
+    transposed, the matrices' the rows and the cotangent each quantized 1 x 128 along the rows
+    (`blockwise_fp8_kernel_gradient`), a surrogate of the quantized product's derivative (straight through
+    each rounding). Group `g` holds `group_blocks[g]` whole 128-row blocks, in order: `rows` is 128 times
+    their sum (a recipe pads each group's rows)."""
     return _blockwise_projection(x, w, group_blocks, jnp.dtype(out_dtype), interpret_on_cpu)
 
 
@@ -131,8 +133,7 @@ def recipe_projection(rows: jax.Array, matrix: jax.Array, group_sizes: jax.Array
     if along is not None:
         return _projected_apart(rows, matrix, group_sizes, out_dtype=out_dtype, bias=bias, along=along,
                                 tensor_scale=tensor_scale)
-    stacked = matrix if matrix.ndim == 3 else matrix[None]
-    groups, count = stacked.shape[0], rows.shape[0]
+    groups, count = (1 if matrix.ndim == 2 else matrix.shape[0]), rows.shape[0]
     sizes = (jnp.full((1,), count, jnp.int32) if group_sizes is None
              else jnp.asarray(group_sizes, jnp.int32))
     # Each row's group (`groups` past their sum) and its place in its group's padded run of whole blocks.
@@ -150,7 +151,8 @@ def recipe_projection(rows: jax.Array, matrix: jax.Array, group_sizes: jax.Array
     # `_biased`): one rounding of the whole.
     summed_dtype = out_dtype if bias is None else jnp.float32
     scaled = {} if tensor_scale is None else {"tensor_scale": jnp.asarray(tensor_scale, jnp.float32)}
-    product = taken.projection(laid, stacked, group_blocks, out_dtype=summed_dtype, **scaled)
+    # The matrix as held, grouped inside the recipe's derivative (`as_groups`, row 14192).
+    product = taken.projection(laid, matrix, group_blocks, out_dtype=summed_dtype, **scaled)
     out = product.at[place].get(mode="fill", fill_value=0)
     if bias is not None:
         out = jnp.where((group < groups)[:, None], out + bias[held_group].astype(jnp.float32), out)
@@ -211,9 +213,9 @@ def recipe_chain(rows: jax.Array, up: jax.Array, down: jax.Array, activation: Ca
     count = rows.shape[0]
     laid = jnp.pad(rows, ((0, -count % SCALE_DEPTH), (0, 0)))
     # Its padding zero rows the backward keeps out of every gradient (`_chain_pulled`'s live rows).
-    return _chained(chained, laid, up[None], down[None], activation, out_dtype=out_dtype,
-                    gate=None if gate is None else gate[None], live=count, interpret=False,
-                    tensor_scales=tensor_scales, names=names)[:count]
+    # The matrices as held, each grouped inside the chain's derivative (`as_groups`, row 14192).
+    return _chained(chained, laid, up, down, activation, out_dtype=out_dtype, gate=gate, live=count,
+                    interpret=False, tensor_scales=tensor_scales, names=names)[:count]
 
 
 def _projected_apart(rows, matrix, group_sizes, *, out_dtype, bias, along, tensor_scale=None) -> jax.Array:
@@ -293,8 +295,9 @@ def blocks_quantized(w: jax.Array, *, k_major: bool = False) -> tuple[jax.Array,
 
 def _quantized_rows_product(rows, rows_scales, w, sizes, out_dtype, interpret) -> jax.Array:
     """A blockwise FP8 projection of rows already quantized (E4M3 codes and their 1 x 128 scales, `[depth /
-    128, rows]`) by `w`: the one statement a projection, a chain's gate and its down projection read."""
-    blocks, scales = blocks_quantized(w, k_major=True)
+    128, rows]`) by `w` (grouped, `as_groups`): the one statement a projection, a chain's gate and its down
+    projection read."""
+    blocks, scales = blocks_quantized(as_groups(w), k_major=True)
     return blockwise_fp8_product(rows, blocks, sizes, rows_scales, scales, out_dtype=out_dtype,
                                  interpret_on_cpu=interpret)
 
@@ -313,14 +316,14 @@ def _projection_backward(out_dtype, interpret, residuals, cotangent):
     x, w, group_blocks = residuals
     sizes = (group_blocks * SCALE_DEPTH).astype(jnp.int32)
     dy, dy_scales = rows_quantized(cotangent)
-    blocks, blocks_scales = blocks_quantized(w)
+    blocks, blocks_scales = blocks_quantized(as_groups(w))
     d_x = blockwise_fp8_product(dy, blocks, sizes, dy_scales.T, jnp.swapaxes(blocks_scales, 1, 2),
                                 out_dtype=x.dtype, interpret_on_cpu=interpret)
     rows_t, rows_t_scales = rows_quantized(x.T)
     dy_t, dy_t_scales = rows_quantized(cotangent.T)
     d_w = blockwise_fp8_kernel_gradient(rows_t, dy_t, group_blocks, rows_t_scales.T, dy_t_scales.T,
                                         out_dtype=w.dtype, interpret_on_cpu=interpret)
-    return (*with_gradients_formed(d_x, d_w), None)
+    return (*with_gradients_formed(d_x, as_given(d_w, w)), None)
 
 # The recipe's gradient (`blockwise_fp8_projection`): a derivative of Dew's choosing (`Surrogate`).
 _blockwise_projection = contracted("test_a_blockwise_fp8_projection_holds_every_reverse_order")(
@@ -341,7 +344,7 @@ def _chain_value(x, w_ins, w_down, group_blocks, tensor_scales, activation, out_
     sizes = (group_blocks * SCALE_DEPTH).astype(jnp.int32)
     rows, rows_scales = rows_quantized(x)
     *gate, w_up = w_ins
-    up, up_scales = blocks_quantized(w_up, k_major=True)
+    up, up_scales = blocks_quantized(as_groups(w_up), k_major=True)
     # A gate's product stored rounded, the up product's epilogue reading it as a tile beside its own sum:
     # one accumulator a launch (two exact sums, each a running total and a step's partial, take a Hopper
     # consumer's 336 registers at FP8's least 128 columns; row 12689).
@@ -483,20 +486,21 @@ def _chained(recipe: str, x, w_up, w_down, activation, *, out_dtype, gate, live:
 
 def mxfp8_projection(x: jax.Array, w: jax.Array, group_blocks: jax.Array, *, out_dtype,
                      interpret_on_cpu: bool = False) -> jax.Array:
-    """Each group's rows of `x` (`[rows, depth]`) times its matrix of `w` (`[groups, depth, width]`) in the
-    MXFP8 recipe (row 2513; OCP MX, arXiv 2506.08027: E4M3 every tensor, a power-of-two scale every 32 of each
-    product's contraction): `x` quantized along the depth and `w` along it too, their product
-    `mxfp8_product`. Its gradients are the recipe's own MX products, a surrogate of the quantized product's
-    derivative (straight through each rounding): the input's the cotangent quantized along the width times
-    `w` quantized along it (`mxfp8_product`); the matrices' each group's rows and cotangent quantized along
-    its tokens, their decoded values (exact in bfloat16) contracted over the group's rows in fp32 (`gemm_t`).
-    Group `g` holds `group_blocks[g]` whole 128-row blocks, in order: `rows` is 128 times their sum."""
+    """Each group's rows of `x` (`[rows, depth]`) times its matrix of `w` (`[groups, depth, width]`, or one
+    group's `[depth, width]`, `as_groups`) in the MXFP8 recipe (row 2513; OCP MX, arXiv 2506.08027: E4M3 every
+    tensor, a power-of-two scale every 32 of each product's contraction): `x` quantized along the depth and
+    `w` along it too, their product `mxfp8_product`. Its gradients are the recipe's own MX products, a
+    surrogate of the quantized product's derivative (straight through each rounding): the input's the
+    cotangent quantized along the width times `w` quantized along it (`mxfp8_product`); the matrices' each
+    group's rows and cotangent quantized along its tokens, their decoded values (exact in bfloat16) contracted
+    over the group's rows in fp32 (`gemm_t`). Group `g` holds `group_blocks[g]` whole 128-row blocks, in
+    order: `rows` is 128 times their sum."""
     return _mx_projection(x, w, group_blocks, jnp.dtype(out_dtype), interpret_on_cpu)
 
 
 def _mx_value(x, w, group_blocks, out_dtype, interpret):
-    return mxfp8_product(MxFp8.quantized(x), MxFp8.quantized(jnp.swapaxes(w, 1, 2)), group_blocks,
-                         out_dtype=out_dtype, interpret_on_cpu=interpret)
+    return mxfp8_product(MxFp8.quantized(x), MxFp8.quantized(jnp.swapaxes(as_groups(w), 1, 2)),
+                         group_blocks, out_dtype=out_dtype, interpret_on_cpu=interpret)
 
 
 def _mx_forward(x, w, group_blocks, out_dtype, interpret):
@@ -506,8 +510,8 @@ def _mx_forward(x, w, group_blocks, out_dtype, interpret):
 def _mx_backward(out_dtype, interpret, residuals, cotangent):
     del out_dtype
     x, w, group_blocks = residuals
-    d_x = mxfp8_product(MxFp8.quantized(cotangent), MxFp8.quantized(w), group_blocks, out_dtype=x.dtype,
-                        interpret_on_cpu=interpret)
+    d_x = mxfp8_product(MxFp8.quantized(cotangent), MxFp8.quantized(as_groups(w)), group_blocks,
+                        out_dtype=x.dtype, interpret_on_cpu=interpret)
     sizes = (group_blocks * SCALE_DEPTH).astype(jnp.int32)
     # Each group's tokens quantized along the tokens (the kernel gradient's contraction), every 32 of them a
     # scale: a 128-row group's blocks hold whole 32s.
@@ -515,7 +519,7 @@ def _mx_backward(out_dtype, interpret, residuals, cotangent):
     cotangents = MxFp8.quantized(cotangent.T).decoded().T.astype(jnp.bfloat16)
     d_w = gemm_t(rows, cotangents, sizes, out_dtype=w.dtype, precision=jax.lax.Precision.DEFAULT,
                  interpret_on_cpu=interpret)
-    return (*with_gradients_formed(d_x, d_w), None)
+    return (*with_gradients_formed(d_x, as_given(d_w, w)), None)
 
 # The MXFP8 recipe's gradient (`mxfp8_projection`): a derivative of Dew's choosing (`Surrogate`).
 _mx_projection = contracted("test_an_mxfp8_projection_holds_every_reverse_order")(
@@ -524,15 +528,16 @@ _mx_projection = contracted("test_an_mxfp8_projection_holds_every_reverse_order"
 
 def nvfp4_projection(x: jax.Array, w: jax.Array, group_blocks: jax.Array, *, out_dtype,
                      tensor_scale: jax.Array | None = None, interpret_on_cpu: bool = False) -> jax.Array:
-    """Each group's rows of `x` (`[rows, depth]`) times its matrix of `w` (`[groups, depth, width]`) in the
-    NVFP4 recipe (row 2513: E2M1 every tensor, an E4M3 scale every 16 of each product's contraction under a
-    tensor scale): `x` and `w` quantized along the depth, their product `nvfp4_block_product`. Its gradients
-    are the recipe's own NVFP4 products, a surrogate of the quantized product's derivative (straight through
-    each rounding), as `mxfp8_projection`'s: the input's the cotangent and `w` quantized along the width;
-    the matrices' each group's rows and cotangent quantized along its tokens, their decoded values contracted
-    over the group's rows in fp32 (`gemm_t`). Group `g` holds `group_blocks[g]` whole 128-row blocks.
-    `tensor_scale`, `x`'s tensor scale in place of its own (a delayed-scaling recipe's, row 12721); the
-    matrices' and the gradients' operands their own, each exactly as known when it is quantized."""
+    """Each group's rows of `x` (`[rows, depth]`) times its matrix of `w` (`[groups, depth, width]`, or one
+    group's `[depth, width]`, `as_groups`) in the NVFP4 recipe (row 2513: E2M1 every tensor, an E4M3 scale
+    every 16 of each product's contraction under a tensor scale): `x` and `w` quantized along the depth, their
+    product `nvfp4_block_product`. Its gradients are the recipe's own NVFP4 products, a surrogate of the
+    quantized product's derivative (straight through each rounding), as `mxfp8_projection`'s: the input's the
+    cotangent and `w` quantized along the width; the matrices' each group's rows and cotangent quantized along
+    its tokens, their decoded values contracted over the group's rows in fp32 (`gemm_t`). Group `g` holds
+    `group_blocks[g]` whole 128-row blocks. `tensor_scale`, `x`'s tensor scale in place of its own (a
+    delayed-scaling recipe's, row 12721); the matrices' and the gradients' operands their own, each exactly as
+    known when it is quantized."""
     return _nvfp4_projection(x, w, group_blocks, tensor_scale, jnp.dtype(out_dtype), interpret_on_cpu)
 
 
@@ -587,7 +592,8 @@ def _nvfp4_forward(x, w, group_blocks, tensor_scale, out_dtype, interpret):
     took of their own (`x`'s where no delayed scale was given, `w`'s), which its backward quantizes the
     same tensors at again, each scale one reduction of its tensor a step, not one a quantization (row
     14083)."""
-    rows, matrices = NvFp4Block.quantized(x, tensor_scale), NvFp4Block.quantized(jnp.swapaxes(w, 1, 2))
+    rows = NvFp4Block.quantized(x, tensor_scale)
+    matrices = NvFp4Block.quantized(jnp.swapaxes(as_groups(w), 1, 2))
     value = nvfp4_block_product(rows, matrices, group_blocks, out_dtype=out_dtype, interpret_on_cpu=interpret)
     return value, (x, w, group_blocks, (rows.scale if tensor_scale is None else None, matrices.scale))
 
@@ -600,8 +606,8 @@ def _nvfp4_backward(out_dtype, interpret, residuals, cotangent):
     x, w, group_blocks, *held = residuals
     x_scale, w_scale = held[0] if held else (None, None)
     pulled = NvFp4Block.quantized(cotangent)
-    d_x = nvfp4_block_product(pulled, NvFp4Block.quantized(w, w_scale), group_blocks, out_dtype=x.dtype,
-                              interpret_on_cpu=interpret)
+    d_x = nvfp4_block_product(pulled, NvFp4Block.quantized(as_groups(w), w_scale), group_blocks,
+                              out_dtype=x.dtype, interpret_on_cpu=interpret)
     sizes = (group_blocks * SCALE_DEPTH).astype(jnp.int32)
     # Each group's tokens quantized along the tokens (the kernel gradient's contraction), every 16 a scale,
     # the tensor scales applied: a 128-row group's blocks hold whole 16s.
@@ -610,7 +616,7 @@ def _nvfp4_backward(out_dtype, interpret, residuals, cotangent):
     d_w = gemm_t((rows.decoded() * rows.scale).T.astype(jnp.float32),
                  (cotangents.decoded() * cotangents.scale).T.astype(jnp.float32), sizes, out_dtype=w.dtype,
                  precision=EXACT_FLOAT32, interpret_on_cpu=interpret)
-    return (*with_gradients_formed(d_x, d_w), None, None)
+    return (*with_gradients_formed(d_x, as_given(d_w, w)), None, None)
 
 # The NVFP4 recipe's gradient (`nvfp4_projection`): a derivative of Dew's choosing (`Surrogate`); its tensor
 # scale a constant of the step (a delayed recipe's, its history's), no gradient through it.
@@ -629,7 +635,7 @@ def _nvfp4_chain_value(x, w_ins, w_down, group_blocks, tensor_scales, activation
 
     rows_scale, hidden_scale = tensor_scales
     rows = NvFp4Block.quantized(x, rows_scale)
-    *gate, up = (NvFp4Block.quantized(jnp.swapaxes(matrix, 1, 2)) for matrix in w_ins)
+    *gate, up = (NvFp4Block.quantized(jnp.swapaxes(as_groups(matrix), 1, 2)) for matrix in w_ins)
     gated = tuple(nvfp4_block_product(rows, matrix, group_blocks, out_dtype=out_dtype,
                                       interpret_on_cpu=interpret) for matrix in gate)
     product, codes, scales = nvfp4_block_finished(
@@ -641,8 +647,8 @@ def _nvfp4_chain_value(x, w_ins, w_down, group_blocks, tensor_scales, activation
         out_forms=(None, quantized.Form(2, packed=True), quantized.Form(NVFP4_BLOCKS.depth, transposed=True)),
         dense=True, interpret_on_cpu=interpret)
     hidden = NvFp4Block.packed(codes, scales.T, hidden_scale)
-    out = nvfp4_block_product(hidden, NvFp4Block.quantized(jnp.swapaxes(w_down, 1, 2)), group_blocks,
-                              out_dtype=out_dtype, interpret_on_cpu=interpret)
+    down = NvFp4Block.quantized(jnp.swapaxes(as_groups(w_down), 1, 2))
+    out = nvfp4_block_product(hidden, down, group_blocks, out_dtype=out_dtype, interpret_on_cpu=interpret)
     return out, (*gated, product)
 
 
@@ -721,11 +727,12 @@ def dot_general(xla, path: tuple | None = None):
             # `o_a_proj`, a `DenseGeneral` over its groups; spec alignment SA20261119pm F36).
             rows, matrices, count, shape = grouped_rows(lhs, rhs, dimension_numbers)
             # One member is the dense product it is, probed and run as one: the dense product's cells, not
-            # one group's (head review of 0099a4701 F3).
-            matrix, sizes = ((matrices[0], None) if matrices.shape[0] == 1
-                             else (matrices, jnp.full((matrices.shape[0],), count, jnp.int32)))
-            if launched(rows, matrix, out_dtype, precision):
-                return added(gemm(rows, matrix, sizes, out_dtype=out_dtype, precision=precision).reshape(
+            # one group's (head review of 0099a4701 F3), its bank of one handed on as held (row 14192).
+            one = matrices.shape[0] == 1
+            probed = jax.ShapeDtypeStruct(matrices.shape[1:], matrices.dtype) if one else matrices
+            sizes = None if one else jnp.full((matrices.shape[0],), count, jnp.int32)
+            if launched(rows, probed, out_dtype, precision):
+                return added(gemm(rows, matrices, sizes, out_dtype=out_dtype, precision=precision).reshape(
                     shape))
         taken = _in_layer_product(xla, dimension_numbers, precision, preferred_element_type, **kwargs)
         return taken(lhs, (rhs,) if bias is None else (rhs, bias))
@@ -839,11 +846,9 @@ def recipe_general(lhs: jax.Array, rhs: jax.Array, dimension_numbers, out_dtype,
     if recipe_role() is None or lhs.size == 0 or rhs.size == 0:
         return None
     rows, matrices, count, shape = grouped_rows(lhs, rhs, dimension_numbers)
-    groups = matrices.shape[0]
     batched = bool(dimension_numbers[1][0])
-    sizes = jnp.full((groups,), count, jnp.int32) if batched else None
-    out = recipe_projection(rows, matrices if batched else matrices[0], sizes, out_dtype=out_dtype,
-                            tensor_scale=tensor_scale)
+    sizes = jnp.full((matrices.shape[0],), count, jnp.int32) if batched else None
+    out = recipe_projection(rows, matrices, sizes, out_dtype=out_dtype, tensor_scale=tensor_scale)
     return None if out is None else out.reshape(shape)
 
 
@@ -851,9 +856,12 @@ def grouped_rows(lhs: jax.Array, rhs: jax.Array, dimension_numbers
                  ) -> tuple[jax.Array, jax.Array, int, tuple]:
     """A layer's product (`jax.lax.dot_general`'s `dimension_numbers`) laid out as a grouped GEMM's operands:
     its rows `[groups * count, depth]` (each batch member's free rows, `count` a member, in turn), its
-    matrices `[groups, depth, width]` (a member's kernel each; one group where it batches none), the rows a
-    group, and the result's shape in `dot_general`'s order (batch, `lhs`'s free axes, `rhs`'s): Appendix C
-    row 4's batch axes as uniform groups, the one layout the recipe's and the template's products read."""
+    matrices `[groups, depth, width]` (a member's kernel each), or a product batching none its one matrix
+    `[depth, width]`, the rows a group, and the result's shape in `dot_general`'s order (batch, `lhs`'s free
+    axes, `rhs`'s): Appendix C row 4's batch axes as uniform groups, the one layout the recipe's and the
+    template's products read. A kernel already so laid out is its matrices as it is, no copy of it made, which
+    a scan over a model's layers then forwards from its stacked weights to the products' derivatives (row
+    14192)."""
     (contracted, against), (batched, batched_rhs) = (tuple(map(tuple, pair)) for pair in dimension_numbers)
     free = [axis for axis in range(lhs.ndim) if axis not in contracted + batched]
     free_rhs = [axis for axis in range(rhs.ndim) if axis not in against + batched_rhs]
@@ -861,12 +869,16 @@ def grouped_rows(lhs: jax.Array, rhs: jax.Array, dimension_numbers
     count = math.prod(lhs.shape[axis] for axis in free)
     depth, width = extents(lhs.shape, rhs.shape, dimension_numbers)
     rows = jnp.transpose(lhs, (*batched, *free, *contracted)).reshape(groups * count, depth)
-    matrices = jnp.transpose(rhs, (*batched_rhs, *against, *free_rhs)).reshape(groups, depth, width)
+    order = (*batched_rhs, *against, *free_rhs)
+    laid = rhs if order == tuple(range(rhs.ndim)) else jnp.transpose(rhs, order)
+    held = (groups, depth, width) if batched else (depth, width)
+    matrices = laid if laid.shape == held else laid.reshape(held)
     shape = (*(lhs.shape[axis] for axis in (*batched, *free)), *(rhs.shape[axis] for axis in free_rhs))
     return rows, matrices, count, shape
 
 
-def launched(rows: jax.Array, matrix: jax.Array, out_dtype, precision: PrecisionLike) -> bool:
+def launched(rows: jax.Array, matrix: jax.Array | jax.ShapeDtypeStruct, out_dtype,
+             precision: PrecisionLike) -> bool:
     """Whether a launch takes any of the product `rows @ matrix`'s products on the call's target
     (`grouped_matmul.GROUPED`), `matrix` one `[depth, width]` (a dense product) or `[groups, depth, width]`
     (a batched one's uniform groups of rows, `grouped_rows`): its forward, its input gradient or its kernel

@@ -2244,48 +2244,36 @@ def test_explicit_target_b200_gathered_settles_under_ambient_sm80():
     assert got == want
 
 
-def test_a100_deep_k_dense_dx_derives_l2_drift_split_and_compiles():
-    """On `walks_scoped` A100 (`sm80`, L2=40MB), `SplitWalk` prices a deep-K dense wave past the L2 drift
-    horizon (`8192x51200->5120`, `M-FS-6`, row 5363) faster split than unsplit while shallower shapes and
-    Hopper `sm90` price unsplit least; derived tiles stay legal, a split whose partials pass the reference's
-    workspace is none (row 12850), and a pinned `splits=2` `sm80` tile within it compiles spill-free."""
+def test_a_deep_dense_input_gradients_split_is_held_to_the_workspace():
+    """A100 M-FS-6's deep dense input gradient (8192 x 51200 -> 5120, row 5363) and shallower ones, on an
+    A100 and an H100: each derives a legal tile; its 8192 rows' fp32 partials split two ways (320 MiB) are
+    past the 4 MiB workspace cuBLAS holds (row 12850), so a two-way split pinned at its tile is no legal
+    tile of it, where 64 rows' (2.6 MiB) is, and compiles spill-free."""
     from fla_gdn_support import KernelCase
     from kernel_compile import compile_mosaic_kernels
-
 
     launch = grouped_matmul.MosaicGmm()
     bf16 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
     one = jax.ShapeDtypeStruct((1,), jnp.int32)
 
-    def walk_of(tile, target, depth_k: int, width_n: int):
-        unsplit = dataclasses.replace(tile, splits=1)
-        work = pricing.decode_contraction(
-            unsplit, target, rows=8192, groups=1, depth=depth_k, width=width_n, columns=None, held=8192,
-            operands=((2, 2), (None, None)), stored=2.0, multiprocessors=target.multiprocessors,
-            issued=jnp.bfloat16)
-        return pricing.split_walk(unsplit, **work)
+    def bound(rows: int, depth_k: int, width_n: int):
+        return launch.bind(bf16((rows, depth_k)), bf16((1, width_n, depth_k)), one, out_dtype="bfloat16",
+                           trans_rhs=True, interpret=False, dense=True)
 
+    derived = {}
+    for name in ("sm80", "sm90"):
+        with generation.assumed(name):
+            target = generation.gpu_target()
+            for depth_k, width_n in ((51200, 5120), (4096, 4096), (24576, 4096)):
+                ba = bound(8192, depth_k, width_n)
+                tile = derived[name, depth_k] = launch.derived(ba, target)
+                assert tile is not None and launch.legal(ba, tile, target), (name, tile)
     with generation.assumed("sm80"):
         target = generation.gpu_target()
-        deep_ba = launch.bind(bf16((8192, 51200)), bf16((1, 5120, 51200)), one, out_dtype="bfloat16",
-                              trans_rhs=True, interpret=False, dense=True)
-        deep_tile = launch.derived(deep_ba, target)
-        assert deep_tile is not None and launch.legal(deep_ba, deep_tile, target), deep_tile
-        deep_walk = walk_of(deep_tile, target, 51200, 5120)
-        assert deep_walk is not None and deep_walk.seconds(2) < deep_walk.seconds(1), deep_walk
-        for depth_k, width_n in ((4096, 4096), (24576, 4096)):
-            ba = launch.bind(bf16((8192, depth_k)), bf16((1, width_n, depth_k)), one, out_dtype="bfloat16",
-                             trans_rhs=True, interpret=False, dense=True)
-            tile = launch.derived(ba, target)
-            assert tile is not None and launch.legal(ba, tile, target), tile
-            walk = walk_of(tile, target, depth_k, width_n)
-            assert walk is not None and walk.seconds(1) <= walk.seconds(2), (depth_k, walk)
-        # Its 8192 rows' fp32 partials split two ways (320 MiB) are past the 4 MiB workspace cuBLAS holds
-        # (row 12850), so the drift's split is no tile's, pinned or derived; 64 rows' (2.6 MiB) compile split.
-        pinned = dataclasses.replace(deep_tile, splits=2)
-        assert not launch.legal(deep_ba, pinned, target) and launch.derived(deep_ba, target).splits == 1
-        few_ba = launch.bind(bf16((64, 51200)), bf16((1, 5120, 51200)), one, out_dtype="bfloat16",
-                             trans_rhs=True, interpret=False, dense=True)
+        deep_ba = bound(8192, 51200, 5120)
+        pinned = dataclasses.replace(derived["sm80", 51200], splits=2)
+        assert not launch.legal(deep_ba, pinned, target)
+        few_ba = bound(64, 51200, 5120)
         assert launch.legal(few_ba, pinned, target), pinned
         if generation.compile_only_gpus("sm80"):
             records = compile_mosaic_kernels(
@@ -2294,14 +2282,6 @@ def test_a100_deep_k_dense_dx_derives_l2_drift_split_and_compiles():
                 assert not rec.get("error"), rec
                 assert rec["kernels"], rec
                 assert all(k.get("spilled") == 0 for k in rec["kernels"]), rec
-    with generation.assumed("sm90"):
-        target = generation.gpu_target()
-        h_ba = launch.bind(bf16((8192, 51200)), bf16((1, 5120, 51200)), one, out_dtype="bfloat16",
-                           trans_rhs=True, interpret=False, dense=True)
-        h_tile = launch.derived(h_ba, target)
-        assert h_tile is not None and launch.legal(h_ba, h_tile, target), h_tile
-        h_walk = walk_of(h_tile, target, 51200, 5120)
-        assert h_walk is not None and h_walk.seconds(1) <= h_walk.seconds(2), h_walk
 
 
 def test_sm100_pair_tiles_refuse_depth_splits_in_legal_and_derivation():

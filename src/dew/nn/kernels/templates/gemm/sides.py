@@ -16,6 +16,14 @@ LAUNCH_AXES = {'prologue': ('rows', 'depth'), 'epilogue': ('rows', 'columns')}
 reads at its tile's group (`axes.GROUPS`) and XLA's program at each row (`axes.at_rows`)."""
 
 
+def in_launch_order(axes: tuple, hook: str) -> bool:
+    """Whether a `hook`'s side on `axes` names the launch axes it follows in the order the launch lays its
+    tile (`LAUNCH_AXES[hook]`: a prologue's rows before its depth, an epilogue's rows before its columns), so
+    a GPU launch reads its tile as it reads its own (`hooks.sides_in_order`)."""
+    named = [axis for axis in axes if axis in LAUNCH_AXES[hook]]
+    return named == sorted(named, key=LAUNCH_AXES[hook].index)
+
+
 def split(sides: tuple[Side, ...], hook: str, group_sizes: jax.Array | None) -> tuple[tuple, tuple]:
     """A hook's side operands' arrays and their axes (`hooks.Side`), each checked: one axis per dimension,
     each a launch axis the hook's operands follow, `groups` beside no rows (one value a group of the call's,
