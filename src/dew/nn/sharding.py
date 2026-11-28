@@ -984,9 +984,7 @@ def summed_like(cotangent, like):
     exponent's was; train 1398's review). One transpose's reduction for every declared rule that broadcasts
     an operand (`dew.algebra.scan`'s, `dew.nn.kernels.titans`'; train 1430's review)."""
     summing = jnp.promote_types(jnp.promote_types(cotangent.dtype, like.dtype), jnp.float32)
-    extra = cotangent.ndim - like.ndim
-    axes = (*range(extra), *(extra + axis for axis, size in enumerate(like.shape)
-                              if size == 1 and cotangent.shape[extra + axis] != 1))
+    axes = broadcast_axes(like.shape, cotangent.shape)
     total = summed_to(jnp.sum(cotangent.astype(summing), axis=axes).reshape(like.shape), like)
     placed = explicit_placement(jax.typeof(like))
     return total if placed is None else jax.sharding.reshard(total, placed)
