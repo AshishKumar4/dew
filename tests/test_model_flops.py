@@ -118,8 +118,8 @@ def test_a_traced_program_counts_its_products_convolutions_scans_and_branches():
     matrix product's, a strided convolution's of its output's elements by its kernel's taps and inputs, a
     scan's body times its length, a branch's costliest arm, a platform choice's the branch an accelerator
     runs, a gradient's backward products beside its forward's, a while loop doing no product nothing (an
-    empty convolution in it none); a while loop doing one, or drawing one from the host, and a linear solve,
-    whose run programs a trace does not tell, are refused."""
+    empty convolution in it none); a while loop doing one, drawing one from the host or binding a primitive no
+    fact states beside a key, and a linear solve, whose run programs a trace does not tell, are refused."""
     def shaped(*shape):
         return jax.ShapeDtypeStruct(shape, jnp.float32)
 
@@ -175,6 +175,20 @@ def test_a_traced_program_counts_its_products_convolutions_scans_and_branches():
 
     with pytest.raises(MissingFlopsCount):
         traced_flops(called_back, shaped(2, 2))
+
+    # A primitive no fact states, given a PRNG key beside the value it multiplies, is refused in a loop too:
+    # what JAX states of its own key operations is read by their identity, never off a key operand (81f's
+    # review).
+    from test_program_facts import named
+
+    keyed = named("keyed_product", lambda x, key: x @ x, operands=2)
+
+    def keyed_loop(x):
+        key = jax.random.key(0)
+        return jax.lax.while_loop(lambda c: jnp.sum(c) < 9, lambda c: keyed.bind(c, key), x)
+
+    with pytest.raises(MissingFlopsCount):
+        traced_flops(keyed_loop, shaped(2, 2))
 
     def empty(x, kernel):
         def body(c):

@@ -30,7 +30,6 @@ from .programs import (
     opaque,
     platform_branch,
     positionwise,
-    prng_operation,
     rearranges,
     reduction,
     scan_body,
@@ -329,13 +328,14 @@ def _program_flops(program: jaxpr_core.Jaxpr) -> float:
 
 
 def _productless(equation: jaxpr_core.JaxprEqn) -> bool:
-    """Whether `equation` does no product, by what JAX states of its primitive and values
-    (`dew.nn.programs`): an entrywise or positionwise operation, one on PRNG keys (`prng_operation`), one
-    that moves entries, a reduction, a cumulative one, a scatter, or one that makes its value from no operand
-    (`generated`: an `iota`, never a host callback that reads none, 81f's review)."""
+    """Whether `equation` does no product, by what JAX states of its primitive (`dew.nn.programs`, each by
+    its identity, never by its operands' types or count: 81f's review): an entrywise or positionwise
+    operation (JAX's operations on PRNG keys among them), one that moves entries, a reduction, a cumulative
+    one, a scatter, or one that makes its value from no operand (`generated`: an `iota`, never a host
+    callback that reads none)."""
     primitive = equation.primitive
-    return (positionwise(primitive) or prng_operation(equation) or rearranges(primitive)
-            or reduction(primitive) or cumulative(primitive) or scatter(primitive) or generated(primitive))
+    return (positionwise(primitive) or rearranges(primitive) or reduction(primitive) or cumulative(primitive)
+            or scatter(primitive) or generated(primitive))
 
 
 def _grouped_flops(equation: jaxpr_core.JaxprEqn) -> float:

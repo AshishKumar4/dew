@@ -31,7 +31,6 @@ from jax._src import (
 )
 from jax._src.interpreters import partial_eval
 from jax._src.lax import lax as jax_lax_internal
-from jax._src.lax.control_flow import conditionals as jax_conditionals
 from jax._src.literals import TypedNdArray
 from jax._src.pallas.mpmd import mpmd_map_p
 from jax.core import ShapedArray, Tracer
@@ -491,7 +490,6 @@ _LAX = jax.lax
 _EXTENDED = jax_primitives
 _XLA_METADATA = jax_xla_metadata
 _LAX_INTERNAL = jax_lax_internal
-_CONDITIONALS = jax_conditionals
 
 _KINDS: dict[str, tuple[tuple[ModuleType, tuple[str, ...]], ...]] = {
     # A call JAX lowers to its program in the caller (`called`): a `jit`'s, an evaluated jaxpr's, a
@@ -522,7 +520,7 @@ _KINDS: dict[str, tuple[tuple[ModuleType, tuple[str, ...]], ...]] = {
     "positionwise": (
         (_LAX, ("bitcast_convert_type_p", "polynomial_p", "stage_p")),
         (_EXTENDED, ("random_bits_p", "random_clone_p", "random_fold_in_p", "random_seed_p", "random_split_p",
-                     "random_unwrap_p")),
+                     "random_unwrap_p", "random_wrap_p")),
         # The identity `jax.experimental.xla_metadata.set_xla_metadata` tags a value with, which JAX
         # defines in its private module alone and batches as a vectorized operation (train 1368's review).
         (_XLA_METADATA, ("xla_metadata_value_p",))),
@@ -536,10 +534,10 @@ _KINDS: dict[str, tuple[tuple[ModuleType, tuple[str, ...]], ...]] = {
     "scatter": ((_LAX, ("scatter_add_p", "scatter_max_p", "scatter_min_p", "scatter_mul_p", "scatter_p",
                         "scatter_sub_p")),),
     # A value made from no operand: a counting sequence, a device's place along a mesh axis, an ordering
-    # token, an unwritten buffer, the index of the platform a program is lowered for (`platform_dependent`'s
-    # choice), the last two defined in JAX's private modules alone.
-    "generated": ((_LAX, ("axis_index_p", "create_token_p", "iota_p")), (_LAX_INTERNAL, ("empty_p",)),
-                  (_CONDITIONALS, ("platform_index_p",))),
+    # token, the index of the platform a program is lowered for (`platform_dependent`'s choice), and an
+    # unwritten buffer, which JAX defines in its private module alone.
+    "generated": ((_LAX, ("axis_index_p", "create_token_p", "iota_p")), (_EXTENDED, ("platform_index_p",)),
+                  (_LAX_INTERNAL, ("empty_p",))),
 }
 """Each kind of operation the analyses of a program read, by the JAX primitives of it, named where JAX's
 public modules export them (`jax.lax`, `jax.extend.core.primitives`), or where JAX defines one it exports
@@ -702,17 +700,6 @@ def positionwise(primitive: jcore.Primitive) -> bool:
     keys are such (a key's data extends its shape, and `random_bits` takes the shape it fills past the
     keys'), which are entrywise over a key array's positions and not over a value's."""
     return entrywise(primitive) or _is("positionwise", primitive)
-
-
-def prng_operation(equation: jcore.JaxprEqn) -> bool:
-    """Whether `equation` is a primitive operation on PRNG keys (`jax.dtypes.prng_key`), not a call,
-    kernel or control flow: wrapping or unwrapping key data, seeding, splitting, folding in or drawing
-    bits, none of which does a product."""
-    if opaque(equation) or bodies(equation):
-        return False
-    return any(isinstance(var.aval, ShapedArray)
-               and jnp.issubdtype(var.aval.dtype, jax.dtypes.prng_key)
-               for var in (*equation.invars, *equation.outvars))
 
 
 def rearranges(primitive: jcore.Primitive) -> bool:
