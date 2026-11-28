@@ -190,22 +190,8 @@ def _levels_above(query, key, value, g, weights, *, within):
         # A chunk whose every read is discarded (a reset before it, or its first token vanished): its held
         # memory zero, its decay's operands too, so no pullback meets an overflowed memory's `0 * inf`.
         emptied = (severed | inside[..., 0])[..., None, None]
-        left = memory[:, :, 0::2, None]
-        rows_nan, nan_keyed, inf_keyed = (x[:, :, 0::2, None] for x in poisoned)
-        # A NaN input's NaN-ness is carried apart from the numbers (`poisoned`, `_chunk_memories`): the held
-        # memory's rows a live NaN input reaches and a NaN decay before the chunk, their numbers zero in every
-        # product and decay (a pullback's zero cotangent times a NaN operand was NaN across a reset: train
-        # 1450's review), the read's NaN set once after them. An overflowed memory, reader or read alone (an
-        # infinity, or a NaN its products form from finite operands) is zeroed where its decay keeps no finite
-        # fp32 value (`_dropped`), its value there every finite one's; a finite one decays as it is
-        # (`scan.scaled_exp`, its decay's derivative the cotangent times its decayed value, as the plain
-        # formula's): four live decays of -80 took an overflowed read of 2^70 by 2^70 to NaN and a reader of
-        # 2^128 times its emptied memory too (train 1379's review).
-        held_nan = (rows_nan | jnp.isnan(before)[..., None]) & ~emptied[..., 0]
-        spent = (emptied | held_nan[..., None]
-                 | (~jnp.isfinite(left) & prefix_spent[..., None, None]))
-        held = scan.scaled_exp(jnp.where(spent, 0.0, left), jnp.where(spent, 0.0, before[..., None, None]))
-        held = jnp.where(spent, 0.0, held).astype(value.dtype)
+        _, nan_keyed, inf_keyed = (x[:, :, 0::2, None] for x in poisoned)
+        held, held_nan = _held_memory(memory, poisoned, before, emptied, prefix_spent, value.dtype)
         weight = halves(weights[..., level])[:, :, :, 1]
         nan_query, infinite_query, zero_query = (halves(x)[:, :, :, 1][:, :, :, :, None] for x in query_facts)
         reader_nan = (nan_query | jnp.isnan(weight) | (infinite_query & (weight == 0))
@@ -220,14 +206,7 @@ def _levels_above(query, key, value, g, weights, *, within):
         keyed = (nan_keyed | (inf_keyed & ~prefix_spent)) & ~emptied[..., 0, 0]
         # A NaN decay within the chunk before the reader, the reader's or the held memory's NaN-ness.
         read_nan = reader_nan[..., None] | held_nan[..., None, :] | jnp.isnan(local)[..., None]
-        # A keyed or NaN read no operand of its decay (its finite keys' dot may overflow); its NaN set after.
-        discarded = (reset[..., None] | keyed[..., None, None] | read_nan
-                     | (local_spent[..., None] & ~jnp.isfinite(read)))
-        decayed = scan.scaled_exp(jnp.where(discarded, 0.0, read),
-                                  jnp.where(discarded, 0.0, local[..., None]))
-        kept_nan = (((keyed[..., None, None] & ~(local_spent[..., None] & ~read_nan)) | read_nan)
-                    & ~reset[..., None])
-        read = jnp.where(kept_nan, jnp.nan, jnp.where(discarded, 0.0, decayed))
+        read = _read_decayed(read, local, local_spent, reset, keyed, read_nan)
         out = out + jnp.stack([jnp.zeros_like(read), read], axis=3).reshape(out.shape)
         memory, poisoned = _joined(memory, poisoned, whole[:, :, 1::2, :, None, None])
         # A span's vanished token dominates a NaN gate in it: summed alone, `NaN + -inf` was NaN, the reset
@@ -237,6 +216,38 @@ def _levels_above(query, key, value, g, weights, *, within):
     # Back to the tokens' layout `[B, T, H, P]`, once.
     out = jnp.moveaxis(out, (1, 3), (3, 4)).reshape(rows, padded, heads, columns)
     return out[:, :length]
+
+
+def _held_memory(memory, poisoned, before, emptied, prefix_spent, dtype):
+    """A level's held memories, the left halves' `memory` decayed by `before` to each chunk of the right ones,
+    in `dtype`, and their rows' NaN-ness `[..., P]`. A NaN input's NaN-ness is carried apart from the numbers
+    (`poisoned`, `_chunk_memories`): the held memory's rows a live NaN input reaches and a NaN decay before
+    the chunk, their numbers zero in every product and decay (a pullback's zero cotangent times a NaN operand
+    was NaN across a reset: train 1450's review), the read's NaN set once after them. An overflowed memory
+    alone (an infinity, or a NaN its products form from finite operands) is zeroed where its decay keeps no
+    finite fp32 value (`prefix_spent`, `_dropped`), and an `emptied` chunk's (every read of it discarded); a
+    finite one decays as it is (`scan.scaled_exp`, its decay's derivative the cotangent times its decayed
+    value, as the plain formula's): four live decays of -80 took an overflowed read of 2^70 by 2^70 to NaN
+    (train 1379's review)."""
+    left = memory[:, :, 0::2, None]
+    rows_nan = poisoned[0][:, :, 0::2, None]
+    held_nan = (rows_nan | jnp.isnan(before)[..., None]) & ~emptied[..., 0]
+    spent = emptied | held_nan[..., None] | (~jnp.isfinite(left) & prefix_spent[..., None, None])
+    held = scan.scaled_exp(jnp.where(spent, 0.0, left), jnp.where(spent, 0.0, before[..., None, None]))
+    return jnp.where(spent, 0.0, held).astype(dtype), held_nan
+
+
+def _read_decayed(read, local, local_spent, reset, keyed, read_nan):
+    """The reads `read` decayed by `local` within their chunk: a reset's zero; a keyed (a non-finite key's)
+    or NaN read (`read_nan`) no operand of its decay (its finite keys' dot may overflow), its NaN set after;
+    an overflowed read zero where its decay keeps no finite fp32 value (`local_spent`), as a reader of 2^128
+    times its emptied memory was NaN (train 1379's review)."""
+    discarded = (reset[..., None] | keyed[..., None, None] | read_nan
+                 | (local_spent[..., None] & ~jnp.isfinite(read)))
+    decayed = scan.scaled_exp(jnp.where(discarded, 0.0, read), jnp.where(discarded, 0.0, local[..., None]))
+    kept_nan = (((keyed[..., None, None] & ~(local_spent[..., None] & ~read_nan)) | read_nan)
+                & ~reset[..., None])
+    return jnp.where(kept_nan, jnp.nan, jnp.where(discarded, 0.0, decayed))
 
 
 def _chunk_memories(values, keys, to_end, past):
