@@ -376,10 +376,10 @@ def chunk(hooks: recurrence.Hooks, operands: Chunk, *, chunk_size: int = CHUNK_S
                                  chunk_size=chunk_size, work=work, dtype=dtype, readout=readout, apart=apart,
                                  normed=hooks.output is not None and stride == 1)
         if hooks.output is not None and stride == 1:
-            # The normed output, which the out projection's pullback reads, named as the recurrence's as the op
-            # returns it, outside the kernels' custom rules (the read before the norm named within them): a
-            # rung keeping the recurrence's output keeps it rather than replaying every launch of the forward
-            # for it (test_lowering's remat rung: 19 launches where 15 ran unrematted, 18 named within).
+            # The normed output, which the out projection's pullback reads, named as the recurrence's where
+            # the op returns it, outside the kernels' custom rules (the read before the norm named within
+            # them): a rung keeping the recurrence's output keeps it rather than replaying every launch of the
+            # forward for it (test_lowering's remat rung: 19 launches where 15 ran unrematted, 18 within).
             return recurrence_output(out), final
     # A token's output its last laid token's (`_laid`); the epilogue in work, the output rounded once.
     out = out[:, stride - 1::stride]

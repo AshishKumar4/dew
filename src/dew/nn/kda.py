@@ -236,6 +236,10 @@ class KimiDeltaAttention(nn.Module):
         # (`_chunk_hooks`), as the decode token does.
         normed = not self.is_initializing()
         chunked = S > 1 or forked
+        # The epilogue's gate, weight and output dtype, the sequence's either path's.
+        hooks = self._chunk_hooks(projected.dtype, normed)
+        sides = {'z': gate, 'weight': self.o_norm.variables['params']['weight']} if normed else {}
+        normed_dtype = (self.o_norm.dtype or projected.dtype) if normed else None
 
         def scan(convolved, *, starts, valid, held, forked=None):
             query, key, value = (split(part) for part in convolved)
@@ -245,13 +249,12 @@ class KimiDeltaAttention(nn.Module):
             # documents from its table (`held_scan`, `Chunk.loads`), its padded tokens keeping the memory
             # (`Chunk.valid`). The layer's decay its own (`_decay`), its write gate the op's.
             loads, stores, table = (None, None, 0) if forked is None else forked
-            sides = {'z': gate, 'weight': self.o_norm.variables['params']['weight']} if normed else {}
-            return chunk(self._chunk_hooks(projected.dtype, normed), Chunk(
+            return chunk(hooks, Chunk(
                 query, key, value, log_decay=g, beta=beta, state=held, starts=starts,
                 firsts=tokens.firsts if forked is None else None,
                 loads=loads, stores=stores, held=table, valid=tokens.valid if forked is None else valid,
                 **sides), chunk_size=self.chunk_size, max_segments=tokens.max_segments,
-                dtype=(self.o_norm.dtype or projected.dtype) if normed else None)
+                dtype=normed_dtype)
 
         # The decode state is GatedDeltaNet's pair, here in fp32 (`cache_spec`). The conv
         # normalises the queries and keys (`l2norm`) and rounds once, to the
@@ -266,13 +269,11 @@ class KimiDeltaAttention(nn.Module):
             rule = functools.partial(chunk_gated_delta_rule, max_segments=tokens.max_segments,
                                      **self.declared)
             # Each shard's rule gates and norms its output in its epilogue, as the unsplit op does.
-            epilogue = ({'norm': self._chunk_hooks(projected.dtype, normed).output, 'z': gate,
-                         'weight': self.o_norm.variables['params']['weight'],
-                         'normed_dtype': self.o_norm.dtype or projected.dtype} if normed else {})
             out = sequence_delta_rule(projected, taps, g, beta, tokens, valid, shards=shards,
                                       key_heads=self.num_heads, widths=(self.head_dim,) * 3, parts=heads,
-                                      dtype=projected.dtype if ported else wide, rule=rule,
-                                      chunk_size=self.chunk_size, **epilogue)
+                                      conv_dtype=projected.dtype if ported else wide, rule=rule,
+                                      chunk_size=self.chunk_size, output=hooks.output, dtype=normed_dtype,
+                                      **sides)
         else:
             out = held_scan(self, projected, taps, None, scan,
                             (self.num_heads, self.head_dim, self.head_dim), decode=decode, coordinates=tokens,
