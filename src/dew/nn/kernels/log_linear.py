@@ -36,6 +36,7 @@ import numpy as np
 from jax.custom_derivatives import SymbolicZero
 
 from dew.algebra import scan
+from dew.nn import float_bits
 from dew.nn.derivatives import Protected, contracted, declared_tangent
 from dew.nn.kernels import generation, recurrence, selection
 from dew.nn.kernels.recurrence_chunk import Chunk, chunk
@@ -226,10 +227,10 @@ def _levels_above(query, key, value, g, weights, *, within):
 
 def _read(readers, held):
     """Each reader's read of its chunk's held memory, `[B, G, n, r, E, t, P]` (the product's own layout): the
-    plain product (`_product`), its transposes each term a zero factor annihilates, so an overflowed reader
+    plain product (`_product`), its derivatives each term a zero factor annihilates, so an overflowed reader
     (an infinite one its finite query and weight formed) meets another output's zero cotangent as zero, not
     `inf * 0` (train 1455's review), its finite channels' partials kept (train 1466's)."""
-    return _product('bgnretk,bgnrepk->bgnretp', False, readers, held)
+    return _product('bgnretk,bgnrepk->bgnretp', False, None, readers, held)
 
 
 def _transposed_spec(spec: str, side: int) -> str:
@@ -240,41 +241,55 @@ def _transposed_spec(spec: str, side: int) -> str:
     return f"{out},{y}->{x}" if side == 0 else f"{x},{out}->{y}"
 
 
-def _product_value(spec: str, guarded: bool, a, b):
-    """`spec`'s product of `a` and `b` summed in fp32: plain, or where `guarded` each term a zero factor
-    annihilates whatever the other (a transpose's: a cotangent's zero against an infinite operand none, not
-    `inf * 0`): the product of the finite parts, and where an operand holds an infinity (formed apart, where
-    any does), each sum's infinite terms' signs counted, `+inf` where a positive one is, `-inf` where a
-    negative one is, NaN where both."""
-    plain = functools.partial(jnp.einsum, spec, preferred_element_type=jnp.float32)
+def _signs(x):
+    """`x`'s stored signs, `(positive, negative, NaN)` masks: a value's sign bit and nonzero stored word (a
+    subnormal a flushing comparison reads as zero is no zero)."""
+    stored = ~float_bits.stored_zero(x) & ~jnp.isnan(x)
+    return stored & ~jnp.signbit(x), stored & jnp.signbit(x), jnp.isnan(x)
+
+
+def _product_value(spec: str, guarded: bool, placement, a, b):
+    """`spec`'s product of `a` and `b` summed in fp32, placed by `placement` where an Explicit mesh splits
+    an axis it contracts (a transpose's, its operand's placement: `out_sharding`, as JAX's own dot transposes
+    it): plain, or where `guarded`, each term a zero factor annihilates whatever the other (a derivative's: a
+    cotangent's or a direction's zero against an infinite or NaN operand none): the product of the finite
+    parts, and where an operand holds a non-finite entry (formed apart, where any does: an unmapped call's
+    predicate; under `vmap` the predicate is batched and both branches are staged beside a select), each
+    sum's surviving infinite terms' signs counted from the stored bits, `+inf` where a positive one is,
+    `-inf` where a negative one is, NaN where both or where a NaN meets a nonzero factor."""
+    plain = functools.partial(jnp.einsum, spec, preferred_element_type=jnp.float32, out_sharding=placement)
     if not guarded:
         return plain(a, b)
-    finite = plain(*(jnp.where(jnp.isinf(x), jnp.zeros((), x.dtype), x) for x in (a, b)))
+    finite = plain(*(jnp.where(jnp.isfinite(x), x, jnp.zeros((), x.dtype)) for x in (a, b)))
 
-    def infinite():
+    def nonfinite():
         def counted(*pairs):
             return functools.reduce(jnp.add, [plain(x.astype(a.dtype), y.astype(b.dtype)) for x, y in pairs])
 
-        a_up, a_down, b_up, b_down = a == np.inf, a == -np.inf, b == np.inf, b == -np.inf
-        a_pos, a_neg = jnp.isfinite(a) & (a > 0), jnp.isfinite(a) & (a < 0)
-        rising = counted((a_up, b > 0), (a_down, b < 0), (a_pos, b_up), (a_neg, b_down))
-        falling = counted((a_up, b < 0), (a_down, b > 0), (a_pos, b_down), (a_neg, b_up))
+        (a_pos, a_neg, a_nan), (b_pos, b_neg, b_nan) = _signs(a), _signs(b)
+        a_up, a_down = a_pos & jnp.isinf(a), a_neg & jnp.isinf(a)
+        b_up, b_down = b_pos & jnp.isinf(b), b_neg & jnp.isinf(b)
+        rising = counted((a_up, b_pos), (a_down, b_neg), (a_pos & ~a_up, b_up), (a_neg & ~a_down, b_down))
+        falling = counted((a_up, b_neg), (a_down, b_pos), (a_pos & ~a_up, b_down), (a_neg & ~a_down, b_up))
+        poisoned = counted((a_nan, b_pos | b_neg | b_nan), (a_pos | a_neg, b_nan))
         signed = jnp.where(rising > 0, np.inf, 0.0) + jnp.where(falling > 0, -np.inf, 0.0)
-        return signed.astype(finite.dtype)
+        return jnp.where(poisoned > 0, np.nan, signed).astype(finite.dtype)
 
-    unbounded = jnp.any(jnp.isinf(a)) | jnp.any(jnp.isinf(b))
-    return finite + jax.lax.cond(unbounded, infinite, lambda: jnp.zeros_like(finite))
+    unbounded = jnp.any(~jnp.isfinite(a)) | jnp.any(~jnp.isfinite(b))
+    return finite + jax.lax.cond(unbounded, nonfinite, lambda: jnp.zeros_like(finite))
 
 
-def _product_tangent(spec: str, guarded: bool, primals, tangents):
-    """`_product`'s value and tangent, bilinear: each moving operand's product with the other held, a linear
-    map whose transposes are the transposed products, guarded (`_product_value`), each summed as its operand
-    is placed and varies and in its dtype (`sharding.summed_like`), the map's own derivative its products'
-    (`generation.linear_map`'s `traced_tangent`): every order a guarded product."""
+def _product_tangent(spec: str, guarded: bool, placement, primals, tangents):
+    """`_product`'s value and tangent, bilinear: each moving operand's product with the other held, guarded
+    (a zero direction annihilating an infinite operand: the surviving finite channel's tangent, train 1466's
+    review), a linear map whose transposes are the transposed products, guarded and placed as their operand
+    (`_product_value`), each summed as its operand varies and in its dtype (`sharding.summed_like`), the map's
+    own derivative its products' (`generation.linear_map`'s `traced_tangent`): every order a guarded
+    product."""
     from dew.nn import sharding
 
     a, b = primals
-    out = _product(spec, guarded, a, b)
+    out = _product(spec, guarded, placement, a, b)
     live = tuple(side for side, part in enumerate(tangents) if not isinstance(part, SymbolicZero))
     if not live:
         return out, SymbolicZero(jax.typeof(out).to_tangent_aval())
@@ -282,18 +297,19 @@ def _product_tangent(spec: str, guarded: bool, primals, tangents):
 
     def applied(held, moving):
         a, b = held
-        terms = [_product(spec, guarded, *((direction, b) if side == 0 else (a, direction)))
+        terms = [_product(spec, True, placement, *((direction, b) if side == 0 else (a, direction)))
                  for side, direction in zip(live, moving, strict=True)]
         return functools.reduce(jnp.add, terms)
 
     def transposed(held, cotangent):
         def pulled(side):
-            other = held[1 - side]
+            other, aval = held[1 - side], types[side]
             operands = (cotangent, other) if side == 0 else (other, cotangent)
-            typed = jax.ShapeDtypeStruct(types[side].shape, types[side].dtype, sharding=types[side].sharding,
-                                         manual_axis_type=types[side].mat)
-            return sharding.summed_like(_product(_transposed_spec(spec, side), True, *operands),
-                                        typed).astype(typed.dtype)
+            typed = jax.ShapeDtypeStruct(aval.shape, aval.dtype, sharding=aval.sharding,
+                                         manual_axis_type=aval.mat)
+            placed = sharding.explicit_placement(aval)
+            product = _product(_transposed_spec(spec, side), True, placed, *operands)
+            return sharding.summed_like(product, typed).astype(typed.dtype)
         return tuple(pulled(side) for side in live)
 
     return out, generation.linear_map(applied, transposed, (a, b), tuple(tangents[side] for side in live),
@@ -301,7 +317,7 @@ def _product_tangent(spec: str, guarded: bool, primals, tangents):
 
 
 _product = contracted("test_a_guarded_product_holds_every_order")(
-    declared_tangent(Protected(), _product_value, _product_tangent, nondiff_argnums=(0, 1),
+    declared_tangent(Protected(), _product_value, _product_tangent, nondiff_argnums=(0, 1, 2),
                      symbolic_zeros=True))
 
 

@@ -407,20 +407,75 @@ def test_scaled_exps_tangent_of_a_complex_value_is_its_decayed_value():
 
 @pytest.mark.parametrize("edge", sorted(EDGES))
 def test_a_guarded_product_holds_every_order(edge):
-    """`log_linear._product`, a product of two operands summed in fp32, its transposes each term a zero factor
-    annihilates (`_product_value`'s guarded form), its derivatives declared (each order a product again):
-    every order finite wherever float64 is a normal float32 and the plain product's is, at operands scaled to
-    the edge."""
+    """`log_linear._product`, a product of two operands summed in fp32, its derivatives' terms each a zero
+    factor annihilates (`_product_value`'s guarded form), declared (each order a product again): every order
+    finite wherever float64 is a normal float32 and the plain product's is, at operands scaled to the edge,
+    the truth an unrestricted einsum's in float64."""
     from dew.nn.kernels import log_linear
 
     a, b, seeded, along_a, along_b = normal_draw(1466, (2, 3, 4), (2, 5, 4), (2, 3, 5), (2, 3, 4), (2, 5, 4),
                                                  scale=EDGES[edge])
 
     def product(a, b):
-        return log_linear._product('btk,bpk->btp', False, a, b)
+        return log_linear._product('btk,bpk->btp', False, None, a, b)
 
-    assert_contract(product, (a, b), (along_a, along_b), seeded, f"a guarded product {edge}",
-                    plain_fn=lambda a, b: jnp.einsum('btk,bpk->btp', a, b))
+    def einsum(a, b):
+        return jnp.einsum('btk,bpk->btp', a, b)
+
+    assert_contract(product, (a, b), (along_a, along_b), seeded, f"a guarded product {edge}", plain_fn=einsum,
+                    truth_fn=einsum)
+
+
+@pytest.mark.parametrize(("a", "b", "expected"), [
+    ([np.nan, 1.0], [0.0, 1.0], 1.0), ([np.inf, 0.0], [2.0 ** -127, 0.0], np.inf),
+    ([np.inf, 1.0], [-1.0, 0.0], -np.inf), ([np.inf, -np.inf], [1.0, 1.0], np.nan),
+    ([np.inf, 1.0], [0.0, 3.0], 3.0)],
+    ids=["a NaN beside a zero", "an infinity beside a subnormal", "an infinity beside a negative one",
+         "infinities of both signs", "an infinity beside a zero"])
+def test_a_guarded_products_terms_survive_as_their_stored_factors_say(a, b, expected):
+    """`log_linear._product`'s guarded form of one row's two terms: a term a stored zero factor annihilates
+    none (a NaN's or an infinity's beside a zero), one beside a stored nonzero factor survives with its sign
+    (a subnormal a flushing comparison reads as zero among them), infinities of both signs NaN (train 1466's
+    head review)."""
+    from dew.nn.kernels import log_linear
+
+    found = log_linear._product('tk,pk->tp', True, None, jnp.asarray([a], jnp.float32),
+                                jnp.asarray([b], jnp.float32))
+    np.testing.assert_array_equal(np.asarray(found), np.asarray([[expected]], np.float32))
+
+
+def test_a_plain_products_tangent_along_a_zero_direction_keeps_its_finite_channel():
+    """The tangent of `log_linear._product`'s plain form at `(inf, 2) . (1, 1)` along `(0, 1)` in its second
+    operand: 2, the direction's zero annihilating the infinite channel, where the plain tangent's `inf * 0`
+    was NaN (train 1466's head review)."""
+    from dew.nn.kernels import log_linear
+
+    a = jnp.asarray([[np.inf, 2.0]], jnp.float32)
+    _, found = jax.jvp(lambda b: log_linear._product('tk,pk->tp', False, None, a, b),
+                       (jnp.ones((1, 2), jnp.float32),), (jnp.asarray([[0.0, 1.0]], jnp.float32),))
+    assert found[0, 0] == 2, found
+
+
+@pytest.mark.mesh(devices=2)
+def test_a_guarded_products_transpose_contracts_an_explicitly_split_axis():
+    """The gradient by a replicated unit `a` `[1, 1, 1]` of `log_linear._product`'s `btk,bpk->btp` with a unit
+    `b` `[1, 2, 1]` its `p` split over two Explicit devices, summed: `[[[2]]]`, replicated, the transpose's
+    contraction over the split axis placed as `a` is (`out_sharding`, as JAX's own dot transposes it), where
+    the contraction was refused (train 1466's head review)."""
+    from jax.sharding import AxisType, NamedSharding, PartitionSpec as P
+
+    from dew.nn.kernels import log_linear
+
+    mesh = jax.make_mesh((2,), ("value",), axis_types=(AxisType.Explicit,), devices=jax.devices()[:2])
+    with jax.set_mesh(mesh):
+        a = jax.device_put(np.ones((1, 1, 1), np.float32), NamedSharding(mesh, P()))
+        b = jax.device_put(np.ones((1, 2, 1), np.float32), NamedSharding(mesh, P(None, "value", None)))
+        def total(a):
+            return jnp.sum(log_linear._product('btk,bpk->btp', False, None, a, b))
+
+        found = jax.jit(jax.grad(total))(a)
+    assert found.sharding.spec == P(), found.sharding
+    np.testing.assert_array_equal(np.asarray(found), np.full((1, 1, 1), 2.0, np.float32))
 
 
 def test_a_decayed_value_times_a_zero_factor_is_zero_and_its_derivative_by_it_finite():
