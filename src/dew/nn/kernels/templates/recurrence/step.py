@@ -12,6 +12,8 @@ columns. The arithmetic is `recurrence.step_reference`'s, fp32 throughout, the h
 (`recurrence.step`'s `linear_tangent`).
 """
 
+import contextlib
+import contextvars
 import dataclasses
 import functools
 
@@ -118,24 +120,47 @@ def _joining(halves: int, block: "_Block") -> tuple:
             plgpu.Barrier(num_arrivals=halves, num_barriers=3))
 
 
+_DONATED: contextvars.ContextVar[bool] = contextvars.ContextVar("dew_donated_state", default=False)
+"""Whether the program tracing a step owns and donates the state it steps (`donated_state`)."""
+
+
+@contextlib.contextmanager
+def donated_state():
+    """Within it the program being traced owns the recurrent states it steps and donates them (a serving
+    step's cache, `dew.inference.serving_kernel`): each step updates its state in place, one operand its
+    launch reads and writes (`jax.new_ref`), so the donated buffer is the next state's. Returned as an output
+    of its own, the launch wrote the next state apart, which the donated cache then copied back, 4 MiB a
+    layer a step (row 14174: an LM_HYBRID B8 decode's 12). Outside it, a caller that keeps its state (a
+    state not donated, which an in-place update would have XLA copy first) takes the state's own output."""
+    token = _DONATED.set(True)
+    try:
+        yield
+    finally:
+        _DONATED.reset(token)
+
+
 def step(hooks: recurrence.Hooks, operands: recurrence.Step, *, dtype, family: mosaic.Family,
          interpret: bool = False):
     """`recurrence.step`'s launch on Mosaic GPU: `(output [rows, Hv, Dv], the moved history or None,
     state')`, the state as it is held, an idle row's (`Step.active`) as it came and its output zeros, its
-    program's warpgroups and residency planned for its grid on the target (`_plan`)."""
+    program's warpgroups and residency planned for its grid on the target (`_plan`); the state updated in
+    place where the tracing program donates it (`donated_state`) and it varies over no manual axis (a
+    checked `shard_map`'s state keeps its manual axes' type, which a launch takes in no ref)."""
     rows, value_heads, key_width, value_width = operands.state.shape
     block = _block(value_width)
     programs = rows * (value_heads // block.heads) * (value_width // block.columns)
     target = generation.interpreted_target() if interpret else generation.gpu_target()
+    in_place = _DONATED.get() and jax.typeof(operands.state).manual_axis_type == jax.sharding.ManualAxisType()
     return _launched(hooks, operands, dtype=dtype, family=family, plan=_plan(key_width, programs, target),
-                     interpret=interpret)
+                     interpret=interpret, in_place=in_place)
 
 
-@tuning.lowered_once(("hooks", "dtype", "family", "plan", "interpret"))
+@tuning.lowered_once(("hooks", "dtype", "family", "plan", "interpret", "in_place"))
 def _launched(hooks: recurrence.Hooks, operands: recurrence.Step, *, dtype, family: mosaic.Family,
-              plan: tuple[int, int], interpret: bool):
-    """`step`'s launch at `plan`, its warpgroups and residency (`_plan`). Lowered once a configuration
-    (`tuning.lowered_once`), as a model's layers' identical steps share it."""
+              plan: tuple[int, int], interpret: bool, in_place: bool):
+    """`step`'s launch at `plan`, its warpgroups and residency (`_plan`), its state an operand it reads and
+    writes where `in_place`, else an output of its own. Lowered once a configuration (`tuning.lowered_once`),
+    as a model's layers' identical steps share it."""
     given = recurrence.read(hooks, operands)
     state = given['state']
     # A row's entry a head, `[rows, Hv]`, as the token's step takes its write gate and scalar decay (a key
@@ -159,7 +184,9 @@ def _launched(hooks: recurrence.Hooks, operands: recurrence.Step, *, dtype, fami
     def entry(active_ref, *refs):
         inputs = dict(zip(names, refs[:len(names)], strict=True))
         moving = 1 if hooks.conv is not None else 0
-        state_out, *rest = refs[len(names):]
+        rest = list(refs[len(names):])
+        # In place, the state's ref the launch reads; else its own output.
+        state_out = inputs['state'] if in_place else rest.pop(0)
         moved, (out_ref, vectors, exchanged) = rest[:moving], rest[moving:moving + 3]
         joining = rest[moving + 3:]
         partials, joined = joining if joining else (None, None)
@@ -170,7 +197,7 @@ def _launched(hooks: recurrence.Hooks, operands: recurrence.Step, *, dtype, fami
 
     history = ((jax.ShapeDtypeStruct(given['held'].shape, given['held'].dtype),) if hooks.conv is not None
                else ())
-    out_type = (jax.ShapeDtypeStruct(state.shape, state.dtype), *history,
+    out_type = (*(() if in_place else (jax.ShapeDtypeStruct(state.shape, state.dtype),)), *history,
                 jax.ShapeDtypeStruct((rows, value_heads, value_width), out_dtype))
     launched = mosaic.kernel(entry, out_type=out_type,
                              grid=(rows, value_heads // block.heads, value_width // block.columns),
@@ -180,8 +207,12 @@ def _launched(hooks: recurrence.Hooks, operands: recurrence.Step, *, dtype, fami
                              scratch=(plgpu.SMEM((block.heads, 3 + hooks.own_weight, key_width), jnp.float32),
                                       plgpu.SMEM((halves, 2, scan.THREADS // scan.WARP), jnp.float32),
                                       *_joining(halves, block)))
-    state_out, *moved, out = launched(active, *given.values())
-    return out, moved[0] if moved else None, state_out
+    if not in_place:
+        state_out, *moved, out = launched(active, *given.values())
+        return out, moved[0] if moved else None, state_out
+    given['state'] = jax.new_ref(state)
+    *moved, out = launched(active, *given.values())
+    return out, moved[0] if moved else None, jax.freeze(given['state'])
 
 
 @dataclasses.dataclass(frozen=True)
@@ -305,9 +336,11 @@ def _program(hooks, inputs, active_ref, state_out, moved, out_ref, scratch, *, b
 
     @pl.when(active_ref[token.row] == 0)
     def _():
-        start, span = halves.keys(key_width)
-        _walked_keys(span, lambda k: token.tile(state_ref, start + k),
-                     lambda k, tile: token.stored(state_out, tile, start + k))
+        if state_out is not state_ref:
+            # An idle row's state as it came, where the next is an output of its own (in place, untouched).
+            start, span = halves.keys(key_width)
+            _walked_keys(span, lambda k: token.tile(state_ref, start + k),
+                         lambda k, tile: token.stored(state_out, tile, start + k))
         zeros = jnp.zeros((block.heads, block.columns), jnp.float32)
         halves.first(lambda: token.stored(out_ref, zeros))
         if conv is not None:

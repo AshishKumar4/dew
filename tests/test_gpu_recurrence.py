@@ -69,6 +69,7 @@ from dew.nn.inputs import AttentionMetadata, MixerCall
 from dew.nn.kda import KimiDeltaAttention
 from dew.nn.kernels import generation
 from dew.nn.kernels.selection import KernelRefused
+from dew.nn.kernels.templates.recurrence.step import donated_state
 from dew.nn.linear import GatedDeltaNet, decode_gated_delta_rule, recurrent_gated_delta_rule
 from dew.training import MeshSpec
 
@@ -187,6 +188,20 @@ def the_decode_kernel_leaves_an_idle_row_alone():
     got, got_state = jax.jit(decode_gated_delta_rule)(*operands, active)
     np.testing.assert_array_equal(np.asarray(got)[~IDLE_ROWS], 0)
     np.testing.assert_array_equal(np.asarray(got_state)[~IDLE_ROWS], np.asarray(operands[-1])[~IDLE_ROWS])
+
+
+def the_donated_decode_kernel_steps_in_place_as_apart():
+    """The step kernel (`decode_gated_delta_rule`) in a program that donates its state (`donated_state`: its
+    launch reads and writes the state in place), at Qwen3.5-0.8B's 16 heads 128 wide with idle rows beside
+    drawing ones, gives the output and state bits of the same step whose next state is an output of its own:
+    an idle row's state untouched, a drawing row's stepped alike (row 14174)."""
+    *operands, active = _idle_draw(0)
+    apart = jax.tree.map(np.asarray, jax.jit(decode_gated_delta_rule)(*operands, active))
+    with donated_state():
+        stepped = jax.jit(decode_gated_delta_rule, donate_argnums=(5,))
+        in_place = jax.tree.map(np.asarray, stepped(*operands[:5], jnp.array(operands[5]), active))
+    for got, want in zip(in_place, apart, strict=True):
+        np.testing.assert_array_equal(got, want)
 
 
 def the_decode_kernels_drawing_rows_step_beside_idle_ones_as_with_none():
@@ -421,6 +436,9 @@ def decode_cells() -> list[Cell]:
         # distinguishes is dropped).
         Cell("the decode kernel leaves an idle row alone", the_decode_kernel_leaves_an_idle_row_alone,
              native={"launch": "decode step", "rows": "idle"}, at_run=BITWISE),
+        Cell("the donated decode kernel steps in place as apart",
+             the_donated_decode_kernel_steps_in_place_as_apart, native={"launch": "decode step", "rows": "donated"},
+             at_run=BITWISE),
         Cell("the decode kernel's drawing rows step beside idle ones as with none",
              the_decode_kernels_drawing_rows_step_beside_idle_ones_as_with_none,
              native={"launch": "decode step", "rows": "drawing"}),
