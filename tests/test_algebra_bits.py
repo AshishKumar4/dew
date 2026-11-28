@@ -608,7 +608,8 @@ def test_a_one_operand_lop3_reads_its_immediate_as_both_other_operands():
 def seeded_as_computed() -> None:
     """`tools/superoptimize_bits.seed` against its references, in the tool's own environment (run by
     test_the_bit_tracer_seeds_a_booleans_not_and_refuses_an_arithmetic_shift_by_a_value): a boolean's NOT,
-    held as 0 or 1, is its other value on every word; an arithmetic shift by a value is refused."""
+    held as 0 or 1, is its other value on every word, and a word's conversion to a boolean whether it is not
+    0; an arithmetic shift by a value, and a conversion through a byte, are refused."""
     from tools import superoptimize_bits
 
     words = np.array([0, 1, 5, 0x80000000, 0xFFFFFFFF], np.uint32)
@@ -619,18 +620,27 @@ def seeded_as_computed() -> None:
     def shifted_by_its_low_bits(words):
         return (words.astype(jnp.int32) >> (words & 7).astype(jnp.int32)).astype(jnp.uint32)
 
-    [seeded] = superoptimize_bits.seed(nonzero).decoded(words)
-    np.testing.assert_array_equal(seeded, np.asarray(nonzero(jnp.asarray(words))))
-    with pytest.raises(ValueError):
-        superoptimize_bits.seed(shifted_by_its_low_bits)
+    def held(words):
+        return words.astype(jnp.bool_).astype(jnp.uint32)
+
+    def through_a_byte(words):
+        return words.astype(jnp.uint8).astype(jnp.uint32)
+
+    for reference in (nonzero, held):
+        [seeded] = superoptimize_bits.seed(reference).decoded(words)
+        np.testing.assert_array_equal(seeded, np.asarray(reference(jnp.asarray(words))))
+    for refused in (shifted_by_its_low_bits, through_a_byte):
+        with pytest.raises(ValueError):
+            superoptimize_bits.seed(refused)
 
 
 def test_the_bit_tracer_seeds_a_booleans_not_and_refuses_an_arithmetic_shift_by_a_value():
     """The nonlinear search's tracer (`tools/superoptimize_bits.seed`, §7.3), run in a fresh interpreter under
     its own PEP 723 environment (its Z3, no dependency of Dew's, layered by `uv run --with`): a boolean's NOT
-    seeds its other value (it seeded the word's complement, 0 and 1 to 0xffffffff and 0xfffffffe), and an
-    arithmetic shift by a value, which no step of the vocabulary states, is refused (it seeded a left
-    shift)."""
+    seeds its other value (it seeded the word's complement, 0 and 1 to 0xffffffff and 0xfffffffe), a word
+    converted to a boolean whether it is not 0, and an arithmetic shift by a value and a conversion through a
+    byte, which no step of the vocabulary states, are refused (each seeded another function: a left shift,
+    the word itself)."""
     from release_support import ROOT, under_release
 
     from tools import check_tool_types
