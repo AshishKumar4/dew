@@ -27,17 +27,11 @@ import functools
 import jax
 import jax.numpy as jnp
 
-from jax.ad_checkpoint import checkpoint_name
-
 from dew.nn import sharding
 from dew.nn.aligned import aligned_sum
 from dew.nn.inputs import sequence_blocks
 from dew.nn.precision import at_least_fp32
-from dew.nn.residuals import MEMORY_RESIDUALS, RECOMPUTED
-
-CARRY, CHUNK = MEMORY_RESIDUALS
-"""The in-context memory's remat names (`dew.nn.memory.CARRY`, `CHUNK`): a mini-batch's entering state, and
-its outputs with the state it leaves."""
+from dew.nn.residuals import memory_chunks
 
 
 def layer_normed(x, eps: float):
@@ -74,36 +68,11 @@ def mini_batches(chunk: int, keys, *operands, valid=None):
     return (*map(batched, (keys, *operands)), batched(real))
 
 
-def absent_zeroed(valid, *operands) -> tuple:
-    """`operands` (`[B, H, T, ...]`) zero at the tokens `valid` (`[B, T]`) marks absent, as they are where it
-    is None, so an absent token's operands meet no product: a caller's padding (an in-context memory's
-    compacted rows' tails, `dew.nn.memory`) holds any value, whose overflow met its zero cotangent as
-    NaN."""
-    if valid is None:
-        return operands
-    present = jnp.asarray(valid, bool)[:, None]
-    return tuple(jnp.where(present.reshape(*present.shape, *(1,) * (x.ndim - 3)), x, jnp.zeros((), x.dtype))
-                 for x in operands)
-
-
 def real_gradients(k, v, readout, real, weight, bias, eps: float):
     """Each real token's inner gradient at its `readout` (`inner_gradient`), an absent one's zero, its
     readout zero before the LayerNorm sees it (an entering bias of 2^127 overflowed its variance, NaN)."""
     live, zeros = real[..., None], jnp.zeros_like(readout)
     return jnp.where(live, inner_gradient(k, v, jnp.where(live, readout, zeros), weight, bias, eps), zeros)
-
-
-def walked_batches(mini_batch, states, batches):
-    """`mini_batch(entering, at)` over `batches` in turn (`lax.scan`) from `states`, with the in-context
-    memory's remat seams (`dew.nn.memory`'s chunks'): each mini-batch's entering state named `CARRY`, its
-    leaving state and outputs `CHUNK`, and where the run's remat recomputes the chunks (`RECOMPUTED`) each
-    mini-batch recomputed from the state it entered with."""
-    def named(entering, at):
-        return checkpoint_name(mini_batch(checkpoint_name(entering, CARRY), at), CHUNK)
-
-    if CHUNK in RECOMPUTED.get():
-        named = jax.checkpoint(named, prevent_cse=False)
-    return jax.lax.scan(named, states, batches)
 
 
 def read_out(walked, queries, weight, bias, eps: float, dtype):
@@ -112,7 +81,9 @@ def read_out(walked, queries, weight, bias, eps: float, dtype):
     loss's affine, the memory's residual around its input (Dew's `ResidualMemory`, the TTT paper's Sec
     2.7)."""
     out = jnp.moveaxis(walked.reshape(-1, *walked.shape[2:]), 0, 2)[:, :, :queries.shape[2]]
-    return jnp.moveaxis(queries + layer_normed(out, eps) * weight + bias, 1, 2).astype(dtype)
+    # The affine whole before the residual, as the memory's norm applies it (`ResidualMemory`): `q + (LN w +
+    # c)`, where `(q + LN w) + c` lost the query to an affine its bias cancels.
+    return jnp.moveaxis(queries + (layer_normed(out, eps) * weight + bias), 1, 2).astype(dtype)
 
 
 def placed_alike(affine, *operands):
@@ -138,7 +109,7 @@ def placed_alike(affine, *operands):
     return tuple(placed_as(x, heads) for x in affine), tuple(placed_as(x, rows, heads) for x in operands)
 
 
-def prepared_operands(query, key, value, weight, bias, gates, state, shapes, scale=None):
+def prepared_operands(query, key, value, weight, bias, gates, state, shapes, scale=None, valid=None):
     """A mini-batched memory's operands (`titans`, `ttt.ttt_linear`) in `at_least_fp32` of their dtype, heads
     before tokens (`[B, H, T, D]`; `gates` each `[B, H, T]`), the inner loss's affine `[H, 1, D]` and the
     entering states (zeros `[B, H, *shape]` of each of `shapes` where `state` is None), placed alike, the
@@ -146,11 +117,18 @@ def prepared_operands(query, key, value, weight, bias, gates, state, shapes, sca
     every operand writing them varies (a checked `shard_map`'s manual axes), as every step's states are, the
     queries, which read them alone, apart (a state left as it entered, replicated beside queries split, was
     typed split: train 1455's review); `(q, k, v, affine, gates, states)`, the queries times `scale` where
-    given. One preparation for both memories (train 1439's review)."""
+    given. A token `valid` (`[B, T]`) marks absent zero in every operand before any product (its scale's
+    among them: an absent query of inf times its zero cotangent was NaN in the scale's gradient), and the
+    states typed as the mask varies too (one device's tokens absent, the other's live). One preparation for
+    both memories (train 1439's review)."""
     work = at_least_fp32(jnp.result_type(query, key, value))
+    present = None if valid is None else jnp.asarray(valid, bool)
 
     def heads(x):
-        return jnp.moveaxis(jnp.asarray(x, work), 2, 1)
+        x = jnp.asarray(x, work)
+        if present is not None:
+            x = jnp.where(present.reshape(*present.shape, *(1,) * (x.ndim - 2)), x, jnp.zeros((), work))
+        return jnp.moveaxis(x, 2, 1)
 
     q, k, v = heads(query), heads(key), heads(value)
     q = q if scale is None else q * scale
@@ -160,7 +138,8 @@ def prepared_operands(query, key, value, weight, bias, gates, state, shapes, sca
               else tuple(jnp.asarray(x, work) for x in state))
     affine, (k, q, v, *rest) = placed_alike(affine, k, q, v, *gates, *states)
     gates, states = tuple(rest[:len(gates)]), tuple(rest[len(gates):])
-    states = tuple(sharding.varying_like(x, k, v, *gates, *affine, *states) for x in states)
+    masks = () if present is None else (present,)
+    states = tuple(sharding.varying_like(x, k, v, *gates, *affine, *states, *masks) for x in states)
     return q, k, v, affine, gates, states
 
 
@@ -178,16 +157,15 @@ def titans(query, key, value, weight, bias, theta, alpha, eta, state=None, *, ch
     from fla's reference, which pads it and gives its last padded slot the last real token's gates
     (fla/ops/titans/naive.py:332-342 at 413ad2c), decaying the state again (one real token at `alpha` 1/2 in
     a mini-batch of two keeps a quarter of the memory where the recurrence keeps half). A token `valid`
-    (`[B, T]`) marks absent is none: its operands zero (`absent_zeroed`), its readout what the walk reads,
-    the state as it was. `coefficient` is the write's factor before its rate, `coefficient theta k u` (2,
-    the squared loss's gradient; 1 where the caller's loss is half of it, as the in-context memory's), one
+    (`[B, T]`) marks absent is none: its operands zero (`prepared_operands`), its readout what the walk
+    reads, the state as it was. `coefficient` is the write's factor before its rate, `coefficient theta k u`
+    (2, the squared loss's gradient; 1 where the caller's loss is half of it, as the in-context memory's), one
     factor of the exact product, so no rate is halved or doubled first."""
     dtype = jnp.result_type(query, key, value)
     # Titans' memory and momentum each `[D, Dv]`.
     shapes = ((key.shape[-1], value.shape[-1]),) * 2
     q, k, v, (weight, bias), (theta, alpha, eta), states = prepared_operands(
-        query, key, value, weight, bias, (theta, alpha, eta), state, shapes)
-    q, k, v, theta, alpha, eta = absent_zeroed(valid, q, k, v, theta, alpha, eta)
+        query, key, value, weight, bias, (theta, alpha, eta), state, shapes, valid=valid)
 
     def mini_batch(pair, at):
         q, k, v, theta, alpha, eta, real = at
@@ -214,5 +192,5 @@ def titans(query, key, value, weight, bias, theta, alpha, eta, state=None, *, ch
         return jax.lax.scan(token, pair, tokens)
 
     keys, *rest = mini_batches(chunk, k, q, v, theta, alpha, eta, valid=valid)
-    final, out = walked_batches(mini_batch, states, (rest[0], keys, *rest[1:]))
+    final, out = memory_chunks(mini_batch, states, (rest[0], keys, *rest[1:]))
     return read_out(out, q, weight, bias, eps, dtype), final

@@ -38,7 +38,7 @@ def _half_gradient(k, v, readout, weight, bias, eps: float):
 
 def _read_out(q, out, weight, bias, eps: float):
     """Each query plus its readout's LayerNorm under the affine: the memory's residual around its input."""
-    return q + _layer_normed(out, eps) * weight + bias
+    return q + (_layer_normed(out, eps) * weight + bias)
 
 
 def _tokens_first(work, *xs):
@@ -391,33 +391,73 @@ def test_titans_write_coefficient_is_one_factor_of_its_product():
 
 
 @pytest.mark.parametrize('form', sorted(FORMS))
-def test_a_memorys_mini_batches_hold_the_in_context_memorys_remat_seams(form):
-    """Each mini-batched memory names its mini-batches' entering states `CARRY` and their outputs and leaving
-    states `CHUNK` (`titans.walked_batches`, as `dew.nn.memory`'s chunks), and where the run's remat
-    recomputes the chunks its gradients are the stored run's bit for bit."""
-    from dew.nn.kernels.titans import CARRY, CHUNK
-    from dew.nn.residuals import recomputing
+def test_a_memorys_mini_batches_are_recomputed_where_the_rung_recomputes_the_chunks(form):
+    """Each mini-batched memory's residuals for its gradient (`jax.ad_checkpoint.saved_residuals`) fewer where
+    the run's rung recomputes the memory's chunks (`residuals.memory_chunks`, as `dew.nn.memory`'s), each
+    mini-batch recomputed from the state it entered with, its gradients the stored run's bit for bit."""
+    from jax.ad_checkpoint import saved_residuals
+
+    from dew.nn.residuals import MEMORY_RESIDUALS, recomputing
 
     *given, states, cotangent = operands(form, jnp.float32)(1)
     memory = functools.partial(FORMS[form][0], chunk=CHUNK)
-    run = jax.jit(with_gradients(memory))
 
-    def names(jaxpr) -> set:
-        found = {eqn.params['name'] for eqn in jaxpr.eqns if eqn.primitive.name == 'name'}
-        for eqn in jaxpr.eqns:
-            for param in eqn.params.values():
-                for inner in param if isinstance(param, (tuple, list)) else (param,):
-                    inner = getattr(inner, 'jaxpr', inner)
-                    if hasattr(inner, 'eqns'):
-                        found |= names(inner)
-        return found
+    def total(*arguments):
+        return sum(jnp.sum(x) for x in jax.tree.leaves(memory(*arguments)))
 
-    assert {CARRY, CHUNK} <= names(jax.make_jaxpr(memory)(*given, states).jaxpr)
-    stored = run(*given, states, cotangent)
-    with recomputing((CHUNK,)):
-        recomputed = jax.jit(with_gradients(memory))(*given, states, cotangent)
+    def saved():
+        return sum(np.prod(aval.shape) for aval, _ in saved_residuals(total, *given, states))
+
+    stored, stored_bytes = jax.jit(with_gradients(memory))(*given, states, cotangent), saved()
+    with recomputing((MEMORY_RESIDUALS[1],)):
+        recomputed, recomputed_bytes = jax.jit(with_gradients(memory))(*given, states, cotangent), saved()
+    assert recomputed_bytes < stored_bytes, (recomputed_bytes, stored_bytes)
     for found, expected in zip(jax.tree.leaves(recomputed), jax.tree.leaves(stored), strict=True):
         np.testing.assert_array_equal(np.asarray(found), np.asarray(expected))
+
+
+def test_a_memorys_residual_survives_an_affine_its_bias_cancels():
+    """Titans over one fp32 token, its query `e0` reading a memory whose first row is `(1, -1)` (its readout
+    `(1, -1)`, normed to itself at `eps` 2^-30), no key, value or rates, an affine weight of 2^100 and bias
+    `(-2^100, 2^100)`: its output `e0` exactly, the affine whole before the query's residual
+    (`ResidualMemory`'s `q + (LN w + c)`), where `(q + LN w) + c` lost the query to the bias's cancellation (a
+    head review)."""
+    query = _pair((1.0, 0.0))
+    zero = jnp.zeros_like(query)
+    entering = jnp.zeros((1, 1, 2, 2), jnp.float32).at[0, 0, 0].set(jnp.asarray([1.0, -1.0]))
+    large = 2.0 ** 100
+    affine = (jnp.full((1, 2), large, jnp.float32), jnp.asarray([[-large, large]], jnp.float32))
+    out, _ = titans(query, zero, zero, *affine, *(jnp.zeros((1, 1, 1)) for _ in range(3)),
+                    state=(entering, jnp.zeros_like(entering)), chunk=1, eps=2.0 ** -30)
+    np.testing.assert_array_equal(np.asarray(out), np.asarray(query))
+
+
+def test_a_ttt_tokens_absent_slot_leaves_its_live_gradients_the_one_slot_calls():
+    """TTT-Linear over two tokens, the second absent (`valid`) with an infinite query, beside the entering
+    bias `[-A, -A, -A, 15 2^124]` (`A` 2^127) of `test_ttts_padded_token_leaves_a_real_ones_output_and_state`:
+    the live output's gradients by the entering states and the query scale finite and the one-slot call's bit
+    for bit, the absent query zeroed before its scale and its readout (the bias kept) zeroed before the
+    LayerNorm, where either met its zero cotangent as NaN (a head review)."""
+    a = 2.0 ** 127
+    offset = jnp.asarray([-a, -a, -a, 15 * 2.0 ** 124], jnp.float32).reshape(1, 1, 1, 4)
+    memory = jnp.zeros((1, 1, 4, 4), jnp.float32).at[0, 0, 0].set(-offset[0, 0, 0])
+    unit_e0 = jnp.zeros((1, 1, 1, 4), jnp.float32).at[..., 0].set(1.0)
+    affine = (jnp.ones((1, 4)), jnp.zeros((1, 4)))
+
+    def live(memory, offset, scale, query, key, value, rate, valid):
+        out, _ = ttt_linear(query, key, value, *affine, rate, state=(memory, offset), chunk=2, scale=scale,
+                            valid=valid)
+        return jnp.sum(out[:, :1])
+
+    two = (jnp.concatenate([unit_e0, jnp.full_like(unit_e0, np.inf)], axis=1),
+           *(jnp.concatenate([unit_e0, unit_e0], axis=1) for _ in range(2)), jnp.full((1, 2, 1), 0.1),
+           jnp.asarray([[True, False]]))
+    one = (unit_e0, unit_e0, unit_e0, jnp.full((1, 1, 1), 0.1), None)
+    gradient = jax.jit(jax.grad(live, argnums=(0, 1, 2)))
+    found = gradient(memory, offset, jnp.float32(1.0), *two)
+    expected = gradient(memory, offset, jnp.float32(1.0), *one)
+    for leaf, alone in zip(found, expected, strict=True):
+        np.testing.assert_array_equal(np.asarray(leaf), np.asarray(alone))
 
 
 def test_titans_partial_mini_batch_leaves_the_state_its_last_token_does():
@@ -534,22 +574,25 @@ def test_the_mini_batches_run_in_a_checked_shard_map_whatever_varies(form, split
     final state the device's call's shape and dtype and finite, and every operand's gradient finite, its
     scans' carries typed as every operand varies (`sharding.varying_like`), where an invariant carry was
     refused (train 1403's review), and one typed as the tokens and gates alone beside an affine or a state
-    leaf that varies (a head review). Its values are the oracle test's. An odd seed's, whose entering states
-    are not zero (a zero leaf doubled is no leaf that varies)."""
+    leaf that varies (a head review), or beside a token mask that varies alone (one device's tokens live, the
+    other's absent: a head review). Its values are the oracle test's. An odd seed's, whose entering states are
+    not zero (a zero leaf doubled is no leaf that varies)."""
     *given, _ = operands(form, jnp.float32)(1)
     tokens, affine, gates, states = tuple(given[:3]), tuple(given[3:5]), tuple(given[5:-1]), given[-1]
 
     def on(device):
-        """The device's operands, `(tokens, affine, gates, state)`."""
+        """The device's operands, `(tokens, affine, gates, state, valid)`."""
         if split.startswith('rows'):
             rows = slice(device, device + 1)
             state = None if split == 'rows' else tuple(s[:1] for s in states)
-            return tuple(x[rows] for x in tokens), affine, tuple(x[rows] for x in gates), state
+            return tuple(x[rows] for x in tokens), affine, tuple(x[rows] for x in gates), state, None
         if split == 'affine':
-            return tokens, tuple(x * (1 + device) for x in affine), gates, None
+            return tokens, tuple(x * (1 + device) for x in affine), gates, None, None
         if split == 'the query':
-            return (tokens[0] * (1 + device), *tokens[1:]), affine, gates, None
-        return tokens, affine, gates, (states[0], states[1] * (1 + device))
+            return (tokens[0] * (1 + device), *tokens[1:]), affine, gates, None, None
+        if split == 'the mask':
+            return tokens, affine, gates, None, np.full(tokens[0].shape[:2], device == 0)
+        return tokens, affine, gates, (states[0], states[1] * (1 + device)), None
 
     each = [on(device) for device in range(2)]
     leaves, structure = jax.tree.flatten(each[0])
@@ -557,8 +600,8 @@ def test_the_mini_batches_run_in_a_checked_shard_map_whatever_varies(form, split
     args = [jnp.stack(pair) if vary else pair[0]
             for pair, vary in zip(zip(*(jax.tree.leaves(e) for e in each), strict=True), varies, strict=True)]
 
-    def call(tokens, affine, gates, state):
-        return FORMS[form][0](*tokens, *affine, *gates, state=state, chunk=CHUNK)
+    def call(tokens, affine, gates, state, valid):
+        return FORMS[form][0](*tokens, *affine, *gates, state=state, chunk=CHUNK, valid=valid)
 
     def local(*leaves):
         mine = [x[0] if vary else x for x, vary in zip(leaves, varies, strict=True)]
@@ -575,5 +618,7 @@ def test_the_mini_batches_run_in_a_checked_shard_map_whatever_varies(form, split
     def total(*leaves):
         return sum(jnp.sum(x) for x in jax.tree.leaves(mapped(*leaves)))
 
-    gradients = jax.jit(jax.grad(total, argnums=tuple(range(len(args)))))(*args)
+    # Every float operand's gradient (a token mask has none).
+    floats = tuple(index for index, x in enumerate(args) if jnp.issubdtype(jnp.result_type(x), jnp.inexact))
+    gradients = jax.jit(jax.grad(total, argnums=floats))(*args)
     assert all(np.isfinite(np.asarray(x)).all() for x in (*jax.tree.leaves(found), *gradients))

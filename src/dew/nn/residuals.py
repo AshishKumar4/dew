@@ -94,3 +94,20 @@ def recomputing(names: tuple[str, ...]):
         yield
     finally:
         RECOMPUTED.reset(token)
+
+
+def memory_chunks(body, carry, xs):
+    """`body(carry, x) -> (carry, outputs)` over `xs` in turn (`lax.scan`) with an in-context memory's remat
+    seams (`MEMORY_RESIDUALS`): each chunk's entering carry named its carry (`Residual.MEMORY_CARRY`), the
+    carry it leaves with its outputs its chunk's own values (`Residual.MEMORY_CHUNK`), and where the run's
+    rung recomputes the chunks (`RECOMPUTED`, read at the call) each chunk recomputed from the carry it
+    entered with. One driver for every memory's chunks (`dew.nn.memory`'s, the mini-batched kernels',
+    `dew.nn.kernels.titans`)."""
+    import jax
+    from jax.ad_checkpoint import checkpoint_name
+
+    def named(carry, x):
+        return checkpoint_name(body(checkpoint_name(carry, Residual.MEMORY_CARRY), x), Residual.MEMORY_CHUNK)
+
+    step = jax.checkpoint(named, prevent_cse=False) if Residual.MEMORY_CHUNK in RECOMPUTED.get() else named
+    return jax.lax.scan(step, carry, xs)
