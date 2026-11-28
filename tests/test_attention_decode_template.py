@@ -1403,7 +1403,7 @@ def test_a_split_decode_steps_price_includes_the_native_merges_bytes_and_span(pa
                                merge=params.get("merge"))
     paths = [cost.path(launch, target) for launch in (*walk_launches, merge)]
     assert min(paths) > 0.0
-    assert cost.chained(priced, target) == pytest.approx(sum(paths))
+    assert cost.chained(priced, target) == sum(paths)
 
 
 @INTERPRETS

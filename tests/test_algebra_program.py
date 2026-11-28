@@ -1231,6 +1231,17 @@ def test_a_template_walks_chain_is_priced_at_its_parts_measured_latencies():
                                "the cold copy's seconds", roundings=8)
 
 
+def test_a_priced_path_waits_beside_a_staged_copy_none_of_it_hidden():
+    """A path of seconds already priced (`Chain.seconds`: launches one after another, each at its own rings)
+    followed by a tile copy waited through a ring of three stages costs its seconds plus the copy's third:
+    the ring hides what of a copy a step outlasts, never a priced launch's time (the k01-71 review)."""
+    target = generation.gpu_target("NVIDIA GH200 480GB")
+    copied, per_byte = target.copy_latency
+    priced = kernel_cost.Chain(seconds=2e-6).then(kernel_cost.Chain(copies=1, copy_bytes=32768, stages=3))
+    waited = kernel_cost.chained(kernel_cost.Work(chains=(priced,)), target)
+    assert waited == (1 * copied + 32768 * per_byte + 0.0) / 3 + 2e-6
+
+
 def test_a_rings_stages_hide_a_tile_copy_its_steps_outlast():
     """A step's tile copy through a ring of S stages is waited on only past what S - 1 steps ahead hide: a
     step of C seconds takes max(C, (L + C) / S) for a copy of L seconds, so a 4-stage ring hides a copy of

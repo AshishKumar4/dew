@@ -414,7 +414,8 @@ def path(work: Work, target: generation.GpuTarget) -> float:
 
 def chained(work: Work, target: generation.GpuTarget) -> float:
     """The longest of `work`'s paths (`Work.chains`) at `target`'s part's latencies: a path's events waited
-    one after another, C, and its copies, L, waited past what its ring hides, max(C, (L + C) / stages); an
+    one after another, C, and its copies, L, waited past what its ring hides, max(C, (L + C) / stages), and
+    its seconds already priced after them; an
     event the part measured no latency of priced by none (`GpuTarget.product_latency`, `barrier_seconds`,
     `copy_latency`, `kernel_step_seconds`)."""
     step = target.kernel_step_seconds or 0.0
@@ -424,8 +425,11 @@ def chained(work: Work, target: generation.GpuTarget) -> float:
 
     def seconds(chain: Chain) -> float:
         waited = (chain.span * step + chain.products * fixed + chain.columns * per_column
-                  + chain.barriers * barrier + chain.seconds)
-        return max(waited, (chain.copies * copied + chain.copy_bytes * per_byte + waited) / chain.stages)
+                  + chain.barriers * barrier)
+        # Seconds already priced (`Chain.seconds`: launches one after another, each at its own rings) wait
+        # beside the ring's overlap, none of them hidden by it.
+        return (max(waited, (chain.copies * copied + chain.copy_bytes * per_byte + waited) / chain.stages)
+                + chain.seconds)
 
     return max(map(seconds, work.chains), default=0.0)
 
