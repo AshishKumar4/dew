@@ -125,6 +125,29 @@ def test_the_chunk_parallel_memory_is_the_token_by_token_one(name):
                     truth_fn=written(module, dtype=jnp.float64))
 
 
+@pytest.mark.parametrize(("name", "kernel"), [("ttt_linear", "ttt_linear"), ("titans_linear", "titans")])
+def test_a_linear_residual_memory_of_one_document_runs_its_mini_batched_kernel(monkeypatch, name, kernel):
+    """TTT-Linear's and Titans' linear memories run a call of rows of one document on their mini-batched
+    kernels (`dew.nn.kernels.ttt.ttt_linear`, `dew.nn.kernels.titans.titans`), once a call over its heads,
+    and a packed call on the token path, which reaches neither."""
+    from dew.nn.kernels import titans, ttt
+
+    owner = ttt if kernel == "ttt_linear" else titans
+    original, called = getattr(owner, kernel), []
+
+    def reached(*args, **kwargs):
+        called.append(kernel)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(owner, kernel, reached)
+    module = layer(name)
+    x, params = drawn(module)(0)
+    module.apply(params, x)
+    assert called == [kernel]
+    module.apply(params, x, packed(np.ones((ROWS, LENGTH), np.int32)))
+    assert called == [kernel]
+
+
 PADDED = ((np.arange(LENGTH)[None] >= np.asarray([0, 1, 3, 0, 5, 2, 0, 7])[:, None])
           & (np.arange(LENGTH)[None] < np.asarray([12, 12, 12, 10, 12, 12, 8, 12])[:, None]))
 """Each row's real tokens: rows left-padded by 1 to 7 tokens, two right-padded by 2 and 4, three whole."""
