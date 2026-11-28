@@ -216,11 +216,44 @@ def _reduction(shape: tuple[int, ...], axis, laid) -> tuple[Callable, int]:
     return reduced, math.prod(shape[a] for a in axes)
 
 
+def _packed(terms, spec) -> tuple[list, list]:
+    """`terms` and their `spec` with every two or more terms of one factor alike in type (shape, dtype,
+    placement, variation) and summed over no axis stacked as one term summed over the axis they are stacked
+    on, kept off (its `laid` the term's own shape): the same exact sum, whose digits `_exact_sum` then forms
+    once for each stack where it formed them once a term (a softmax tangent's six limbs, theme 89). A term
+    with an axis, a laid one or a product stays as it was."""
+    alike: dict = {}
+    for index, (term, (axis, laid)) in enumerate(zip(terms, spec, strict=True)):
+        if len(term) == 1 and axis is None and laid is None:
+            alike.setdefault(jax.typeof(term[0]), []).append(index)
+    stacks = [indices for indices in alike.values() if len(indices) > 1]
+    if not stacks:
+        return list(terms), list(spec)
+    stacked = {indices[0]: indices for indices in stacks}
+    taken = {index for indices in stacks for index in indices}
+    packed_terms, packed_spec = [], []
+    for index, (term, entry) in enumerate(zip(terms, spec, strict=True)):
+        if index in stacked:
+            factors = [terms[at][0] for at in stacked[index]]
+            shape = factors[0].shape
+            packed_terms.append((jnp.stack(factors),))
+            packed_spec.append(((0,), ((1, *shape), shape)))
+        elif index not in taken:
+            packed_terms.append(term)
+            packed_spec.append(entry)
+    return packed_terms, packed_spec
+
+
 def _exact_sum(terms, spec, dtype, segments: tuple | None = None) -> jax.Array:
     """The sum `_aligned_terms` states, exact: every product exact (`_product`), summed as whole digits and
     rounded once to nearest, ties to even (`_nearest`); IEEE's non-finite sums and signed zeros (row 8757).
     With `segments` (`aligned_segment_sum`'s table, count and axes), each product's rows summed into theirs
-    (`_segmented`)."""
+    (`_segmented`); without, and outside a kernel's body (whose lowering stacks no arrays), terms of one
+    factor alike stacked as one (`_packed`)."""
+    from dew.nn.kernels.launches import interpreting
+
+    if segments is None and interpreting() is None:
+        terms, spec = _packed(terms, spec)
     reduction = _reduction if segments is None else _segmented(*segments)
     axes = () if segments is None else segments[2]
     limits = jnp.finfo(dtype)

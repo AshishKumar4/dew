@@ -758,6 +758,20 @@ def test_a_softmax_tangents_second_derivative_in_its_probabilities_is_finite_nea
     assert np.all(np.isfinite(found)), found
 
 
+def test_a_softmax_tangents_derivative_in_its_probabilities_alone_keeps_a_negative_zero():
+    """`categorical.softmax_tangent`'s derivative in its probabilities alone, at `[0.5, 0.5]` along `[1, -1]`,
+    its direction held at `[+0, +0]`: the second entry's change is the mean's limbs' alone, each a -0, whose
+    exact sum is IEEE's -0 (theme 89's head review: the six limbs stacked as one term ahead of the aligned
+    sum's derivative made the entry's still limbs +0 terms, and the change +0)."""
+    from dew.nn import categorical
+
+    probability = jnp.asarray([[0.5, 0.5]], jnp.float32)
+    moving = jnp.zeros((1, 2), jnp.float32)
+    _, change = jax.jvp(lambda p: categorical.softmax_tangent(p, moving), (probability,),
+                        (jnp.asarray([[1.0, -1.0]], jnp.float32),))
+    second = np.asarray(change)[0, 1]
+    assert second == 0 and np.signbit(second), change
+
 @pytest.mark.parametrize("softmax", ["expert", "categorical"])
 def test_a_softmaxs_derivative_whose_weighted_sum_cancels_is_exact_whatever_its_mass(softmax):
     """A softmax's tangent and pullback at three equal logits, whose rounded probabilities' mass is not one
