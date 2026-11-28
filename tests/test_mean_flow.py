@@ -10,7 +10,7 @@ import jax.numpy as jnp
 import numpy as np
 from arm_arithmetic import ahead_on_the_host
 from float64_replay import float64_replay
-from model_support import attending
+from model_support import attending, under_kernels
 from reference_error import as_given, assert_as_exact, widened
 
 from dew.diffusion import presets
@@ -121,9 +121,9 @@ Triton's kernel and for cuDNN's on an A100 and a GH200 alike (node receipts UB-M
 
 def meanflow_case(kernel: str):
     """The site of a MeanFlow step through the fused attention `kernel`: `(dew, reference, truth, draw)`,
-    the step through `kernel` and through xla, both in bf16, and the xla step's program replayed in float64
-    (`float64_replay`), each the step's loss and every parameter's gradient as a function of a draw's
-    weights, images and the step's raw key, which draws the step's times and noise.
+    the step through `kernel` and through xla, both in bf16, and the xla step's program, its products XLA's
+    dots, replayed in float64 (`float64_replay`), each the step's loss and every parameter's gradient as a
+    function of a draw's weights, images and the step's raw key, which draws the step's times and noise.
 
     A draw's weights are the model's own initializers' at the draw's key, each matrix that initializes to
     zero drawn as a lecun-normal matrix of its shape: adaLN-Zero's modulation and output start at zero,
@@ -171,8 +171,11 @@ def meanflow_case(kernel: str):
             return jax.value_and_grad(loss_of)(params)
         return run
 
+    # The truth's products XLA's dots: a GPU's template GEMM (an sm90's grouped product's Mosaic launch, as
+    # its Dense layers' backward reaches it) is a launch whose body the replay does not open (row 13298).
     return (attending(kernel)(stepped(xla)), attending("xla")(stepped(xla)),
-            attending("xla")(float64_replay(stepped(xla), compiled=True)), draw)
+            under_kernels(attention="xla", grouped_matmul="xla")(float64_replay(stepped(xla), compiled=True)),
+            draw)
 
 
 def agrees_with_xla(kernel: str) -> None:
