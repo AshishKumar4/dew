@@ -1540,7 +1540,7 @@ def _qualified(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth_fn, 
             else:
                 # A site its prepare did not reach sizes and runs unprepared, recorded before its sizing
                 # compiles (a sizing that fails reaches no verdict to record it, `truths_ahead.running`).
-                store.unprepared(f"{label}: its prepare did not reach this site")
+                store.unprepared(f"{label}: its prepare did not reach this site", site=label)
         # An accuracy claim's bound sized too (`arm_forms._bounded`), Dew paired with the reference as written
         # (`_written_twin`; a store's, its prepare's twin at the sizing draws' shapes), the larger declared.
         pairs = {False: arms}

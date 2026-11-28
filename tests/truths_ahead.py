@@ -212,13 +212,13 @@ class CompiledTruths:
         stored = json.loads(site.read_text())
         return stored.get("at_run") if stored["stamp"] == self.stamp else None
 
-    def unprepared(self, why: str, record: str = UNPREPARED) -> None:
+    def unprepared(self, why: str, record: str = UNPREPARED, *, site: str) -> None:
         """Records in the store that its test ran a site, or an arm, unprepared (`unprepared`), where in its
-        file this process stands; under `AT_RUN`, that its run compiled it on its GPU as its prepare
-        declared."""
+        file this process stands, and which (`site`: its Check 1 label, an arm's role beside it); under
+        `AT_RUN`, that its run compiled it on its GPU as its prepare declared."""
         test = os.environ.get("PYTEST_CURRENT_TEST", "").rsplit(" (", 1)[0]
         unprepared(self.directory, test, [(frame.filename, frame.lineno) for frame in inspect.stack(0)], why,
-                   record)
+                   record, site=site)
 
     def device(self):
         """A device of the ones the store's programs compute on, whose platform picks a branch its platform
@@ -596,7 +596,7 @@ def reading() -> tuple[CompiledTruths, str] | None:
     if store is None or store.prepare or label is None:
         return None
     if not store.holds(label):
-        store.unprepared(f"{label}: its prepare did not reach this site")
+        store.unprepared(f"{label}: its prepare did not reach this site", site=label)
         return None
     return store, label
 
@@ -629,25 +629,26 @@ def running() -> tuple[CompiledTruths, str] | None:
     GPU, their float64 on its FP64 units, as a site outside a part does, named (`AT_RUN`)."""
     ran = reading()
     if ran is not None and (why := ran[0].at_run(ran[1])) is not None:
-        ran[0].unprepared(f"{ran[1]}: its truths: {why}", AT_RUN)
+        ran[0].unprepared(f"{ran[1]}: its truths: {why}", AT_RUN, site=ran[1])
         return None
     return ran
 
 
 def unprepared(directory: Path, test: str, frames: Sequence[tuple[str, int]], why: str,
-               record: str = UNPREPARED, cell: str | None = None) -> None:
+               record: str = UNPREPARED, cell: str | None = None, *, site: str | None = None) -> None:
     """The writer of a test's record that it ran unprepared (`UNPREPARED`, in its store `directory`),
     compiling a site or an arm on its devices with every site judged: its node id and each reason it gives,
     where (`frames`, innermost first, `(file, line)`: the first of the test's own file, else the test's file)
-    and why (`reasoned`), and the site that line is, its source text (`site`), which an edit above it does
-    not move as it moves its line (prepares.py's `knowing`). Under `tier_wire.DEFERRED`, a GPU flow's cell
+    and why (`reasoned`), and which site it is (`site`: its Check 1 label, an arm's role beside it, else the
+    source text of that line), which an edit above it does not move as it moves its line, nor share with
+    another site of one opening line (prepares.py's `knowing`). Under `tier_wire.DEFERRED`, a GPU flow's cell
     its prepare deferred to its run (`gpu_flow.run_cells`), which its run's store still serves, and which the
     run names unprepared (tests/conftest.py's `compiled_ahead`); `cell` its label, so the flow's cells
     deferred at one line are each their own."""
     # The test's file as CI's grading reads a node id (`tools/armada/grading.py`'s `owning`).
     path = Path(load("grading", "tools/armada").owning(test))
     lines = [(file, line) for file, line in frames if Path(file).name == path.name]
-    site = linecache.getline(lines[0][0], lines[0][1]).strip() if lines else ""
+    site = site or (linecache.getline(lines[0][0], lines[0][1]).strip() if lines else "")
     reasoned(directory / record, test, f"{path}:{lines[0][1]}" if lines else str(path), why, cell,
              site=site or None)
 

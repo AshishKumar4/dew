@@ -348,17 +348,18 @@ def _stored_arm(store: CompiledTruths, label: str, given_fn, arm, role: str, *, 
         return arm
     named_role = arm_role(role, given_fn, label)
     if named_role is None:
-        store.unprepared(f"{label}: its {role} arm has no statement of what it computes")
+        store.unprepared(f"{label}: its {role} arm has no statement of what it computes",
+                         site=f"{label} [{role}]")
         return _library_checked(arm, given_fn, f"{label}: its {role} arm")
     at_run = store.at_run(_unlowered_arm(armed(label, written), named_role)) or store.at_run(
         armed(label, written))
     if at_run is not None:
         # Compiled on its GPU in the run, as its prepare stated (`_compile_arms`).
-        store.unprepared(f"{label}: its {role} arm: {at_run}", AT_RUN)
+        store.unprepared(f"{label}: its {role} arm: {at_run}", AT_RUN, site=f"{label} [{role}]")
         return _library_checked(arm, given_fn, f"{label}: its {role} arm")
     if not store.holds(armed(label, written)):
         store.unprepared(f"{label}: its {role} arm ran unprepared: its prepare wrote the site's truths and "
-                         "compiled none of its arms")
+                         "compiled none of its arms", site=f"{label} [{role}]")
         return _library_checked(arm, given_fn, f"{label}: its {role} arm")
     return _ahead_arm(given_fn, arm, functools.partial(store.ran, armed(label, written)), named_role)
 
@@ -542,7 +543,7 @@ def stored_call(fn: Callable, label: str, inputs, *, host: bool, unprepared: Cal
     store = COMPILED.get()
     role = arm_role("dew", fn, label)
     if role is None:
-        store.unprepared(f"{label}: its arm has no statement of what it computes")
+        store.unprepared(f"{label}: its arm has no statement of what it computes", site=f"{label} [dew]")
         return unprepared(*inputs)
     # Its placement is its program's too: a host's arm and a device's of one function are two programs.
     role = f"{role} on the host" if host else role
@@ -562,6 +563,6 @@ def stored_call(fn: Callable, label: str, inputs, *, host: bool, unprepared: Cal
         store.arms[armed(label)] = (name, shapes, held[name]["launches"])
         return store.arm_again(armed(label), name)
     if not store.holds(armed(label)):
-        store.unprepared(f"{label}: its prepare did not reach this arm")
+        store.unprepared(f"{label}: its prepare did not reach this arm", site=f"{label} [{role}]")
         return unprepared(*inputs)
     return store.ran(armed(label), role, inputs)
