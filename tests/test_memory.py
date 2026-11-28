@@ -148,25 +148,19 @@ def test_a_mini_batched_memory_under_a_method_interceptor_reads_the_intercepted_
 
 
 @pytest.mark.parametrize("name", ["ttt_linear", "titans_linear"])
-def test_a_mini_batched_memory_under_a_direct_qwix_provider_takes_the_general_path(name):
-    """A direct Qwix provider on (`qwix.quantize_model`, whose rules may name a head's `down`, a product the
-    mini-batched kernels never form) keeps a call of one document on the general path, as a method
-    interceptor does: under a provider whose rule names no module of it, the call reads, bit for bit, as
-    under an interceptor that passes every call through (train 1484's review: the kernel took the call, its
-    products beyond every rule's reach)."""
+def test_a_mini_batched_memory_under_a_direct_qwix_rule_reaches_its_heads_products(name):
+    """A direct Qwix provider's rule on a head's `down` products (`qwix.quantize_model`, a module path
+    `head_0/down` and its `dot_general`, quantizing nothing) meets them on a call of one document, which a
+    linear residual memory's mini-batched kernel would otherwise take, its products beyond every rule's
+    reach: the general path runs, and the provider has no rule unused (train 1484's review: the kernel took
+    the call and left the rule unused)."""
     qwix = pytest.importorskip("qwix")
 
     module = layer(name)
     x, params = drawn(module)(0)
-    provider = qwix.QtProvider([qwix.QtRule(module_path="no module", weight_qtype=jnp.int8)])
-    provided = qwix.quantize_model(module, provider).apply(params, x)
-
-    def passing(next_fun, args, kwargs, context):
-        return next_fun(*args, **kwargs)
-
-    with nn.intercept_methods(passing):
-        general = module.apply(params, x)
-    np.testing.assert_array_equal(np.asarray(provided), np.asarray(general))
+    provider = qwix.QtProvider([qwix.QtRule(module_path=".*head_0/down", op_names=("dot_general",))])
+    qwix.quantize_model(module, provider).apply(params, x)
+    assert provider.get_unused_rules() == []
 
 
 PADDED = ((np.arange(LENGTH)[None] >= np.asarray([0, 1, 3, 0, 5, 2, 0, 7])[:, None])
