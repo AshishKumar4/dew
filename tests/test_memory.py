@@ -290,22 +290,42 @@ def test_a_mini_batched_memorys_layer_norm_reads_its_rows_less_their_mean(bias):
         assert branch[0] == -branch[1] and branch[1] > 0.5, branch
 
 
-def test_a_mini_batched_ttt_memory_keeps_the_steps_below_its_entering_states_last_place():
-    """Four tokens of one mini-batch, each stepping a TTT-Linear memory and bias whose entries are 2^25 by
-    about 0.98, less than half their last place: the memory holds their sum apart from the state the
-    mini-batch entered, as its general path holds a chunk's steps, so the last token reads `2^25 -+ 4` and
-    its readout's layer norm `[1, -1]` on its mini-batched kernel as on its general path (79g's review: the
-    kernel stepped the rounded state token by token, every step rounded away, and read `[1, 0]`)."""
-    module = linear_residual_memory(bias=True, epsilon=1e-6, chunk=4, rate=2.0**-10)
+@pytest.mark.parametrize("bias", [True, False], ids=["ttt", "titans"])
+def test_a_one_document_memory_keeps_the_steps_below_its_entering_states_last_place(bias):
+    """Four tokens of one mini-batch, each stepping a linear memory (TTT-Linear's with its bias, Titans'
+    without) whose entries are 2^25 by about 0.98, less than half their last place: the memory holds their
+    sum apart from the state the mini-batch entered, as its general path holds a chunk's steps, so the last
+    token reads `2^25 -+ 4` and its readout's layer norm `[1, -1]` on its mini-batched kernel (TTT-Linear's;
+    Titans' form takes the general path) as on its general path (79g's review: the kernels stepped the
+    rounded state token by token, every step rounded away, and read `[1, 0]`)."""
+    module = linear_residual_memory(bias=bias, epsilon=1e-6, chunk=4, rate=2.0**-10)
     x = jnp.asarray([[[1.0, 0.0]] * 4], jnp.float32)
     params = jax.tree.map(jnp.zeros_like, module.init(jax.random.key(0), x))
     memory = params["params"]["head_0"]
     memory["down"]["kernel"] = jnp.asarray([[2.0**25, 2.0**25], [0.0, 0.0]], jnp.float32)
-    memory["down"]["bias"] = jnp.asarray([2.0**25, 2.0**25], jnp.float32)
+    if bias:
+        memory["down"]["bias"] = jnp.asarray([2.0**25, 2.0**25], jnp.float32)
     memory["norm"]["scale"] = jnp.ones((2,), jnp.float32)
     params["params"]["v_proj"]["kernel"] = jnp.asarray([[2.0, -1.0], [0.0, 0.0]], jnp.float32)
     for route in mini_batched_and_general(module, params, x):
         assert route[0, -1, 0] > 1.99 and route[0, -1, 1] < -0.99, route[0, -1]
+
+
+@pytest.mark.parametrize("bias", [True, False], ids=["ttt", "titans"])
+def test_a_one_document_memorys_inner_pullback_takes_its_scale_into_its_inverse_root(bias):
+    """One token at a zero memory whose error is `2^50` under an epsilon of `2^100` and a norm scale of
+    `2^100`: the inner loss's pullback through the layer norm is `2^50 (2^100 / 2^50)`, the scale taken into
+    the inverse root as Dew's layer norm (flax's) takes it, so a rate of `2^-100` writes a unit step (to the
+    memory's row and, TTT-Linear's, its bias) and the token's readout `[-2, 2]` (Titans' `[-1, 1]`) reads
+    `2^51` (`2^50`) on the memory's mini-batched kernel as on its general path (79g's review: the kernel's
+    pullback multiplied the error by the scale first, `2^150`, which overflowed)."""
+    module = linear_residual_memory(bias=bias, epsilon=2.0**100, chunk=1, rate=2.0**-100)
+    x = jnp.asarray([[[1.0, 0.0]]], jnp.float32)
+    params = jax.tree.map(jnp.zeros_like, module.init(jax.random.key(0), x))
+    params["params"]["head_0"]["norm"]["scale"] = jnp.full((2,), 2.0**100, jnp.float32)
+    params["params"]["v_proj"]["kernel"] = jnp.asarray([[-(2.0**50), 2.0**50], [0.0, 0.0]], jnp.float32)
+    for route in mini_batched_and_general(module, params, x):
+        assert route[0, 0, 1] == np.float32(2.0**51 if bias else 2.0**50), route[0, 0]
 
 
 @pytest.mark.parametrize("bias", [True, False], ids=["ttt", "titans"])
