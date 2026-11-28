@@ -911,10 +911,14 @@ def _grouped(product: Callable[..., jax.Array], operands: tuple,
     rows: its rows' ragged axis one it keeps or contracts (JAX's ragged non-contracting and contracting
     modes). None where that axis is a batch axis (its ragged-batch mode), a batched dot whatever its sizes,
     which it reads not at all (`jax.lax.ragged_dot_general`; train 1478's review of row 14112: two [2, 1, 1]
-    operands of 2s and 3s batched on their ragged axis are two 6s at sizes of no groups, not zeros)."""
+    operands of 2s and 3s batched on their ragged axis are two 6s at sizes of no groups, not zeros). Its
+    dimension numbers read at any depth of the program (`programs.equations`: a product jitted or wrapped);
+    a product that binds no ragged dot is refused."""
     traced = jax.make_jaxpr(functools.partial(product, preferred_element_type=preferred_element_type))(*operands)
-    numbers = next(equation.params["ragged_dot_dimension_numbers"] for equation in traced.eqns
-                   if "ragged_dot_dimension_numbers" in equation.params)
+    numbers = next((equation.params["ragged_dot_dimension_numbers"] for equation in equations(traced.jaxpr)
+                    if "ragged_dot_dimension_numbers" in equation.params), None)
+    if numbers is None:
+        raise ValueError(f"precision.ragged multiplies a ragged dot, and {product!r} binds none")
     (ragged_axis,) = numbers.lhs_ragged_dimensions
     _, (batch_axes, _) = numbers.dot_dimension_numbers
     return None if ragged_axis in batch_axes else traced
