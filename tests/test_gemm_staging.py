@@ -95,11 +95,7 @@ def test_sm120_output_staging_admits_three_stage_128x256_and_compiles():
         specs = (bf16((256, 128)), bf16((128, 256)))
         cases = []
         for tag, arm in (("sm120_staging_64x1", arm_64x1), ("sm120_staging_32x2", arm_32x2)):
-            def compiled(x, w, arm=arm):
-                with generation.chosen(grouped_matmul="mosaic"), tuning.pinned(
-                        {grouped_matmul.MosaicGmm: arm}):
-                    return gemm.gemm(x, w, None, out_dtype=jnp.bfloat16)
-            cases.append(KernelCase(tag, lambda c=compiled: (c, specs)))
+            cases.append(KernelCase(tag, lambda arm=arm: (functools.partial(_pinned_product, arm), specs)))
         with generation.assumed("sm120"):
             records = compile_mosaic_kernels(cases, "sm120")
         for rec in records:
@@ -225,11 +221,13 @@ def test_a_pinned_sm120_tile_whose_balanced_tail_merges_its_partials_lowers():
 
     bf16 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
     arm = tiling.Tiles(128, 160, 64, 2, 8, warpgroups=2, family="mma.sync.fed")
-
-    def compiled(x, w):
-        with generation.chosen(grouped_matmul="mosaic"), tuning.pinned({grouped_matmul.MosaicGmm: arm}):
-            return gemm.gemm(x, w, None, out_dtype=jnp.bfloat16)
-
     mesh = generation.gpu_mesh(Mesh(np.array(jax.devices()[:1]), ("data",)), "sm120")
     with generation.assumed("sm120"), jax.sharding.use_abstract_mesh(mesh):
-        jax.jit(compiled).trace(bf16((8192, 9216)), bf16((9216, 2560))).lower(lowering_platforms=("cuda",))
+        jax.jit(functools.partial(_pinned_product, arm)).trace(bf16((8192, 9216)), bf16((9216, 2560))).lower(
+            lowering_platforms=("cuda",))
+
+
+def _pinned_product(arm: tiling.Tiles, x, w):
+    """`x @ w` in bf16 through the template's dense launch pinned at `arm`."""
+    with generation.chosen(grouped_matmul="mosaic"), tuning.pinned({grouped_matmul.MosaicGmm: arm}):
+        return gemm.gemm(x, w, None, out_dtype=jnp.bfloat16)
