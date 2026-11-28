@@ -34,18 +34,11 @@ def _softmax(s: np.ndarray, shape) -> tuple:
     return tuple(jnp.asarray(value, jnp.float32) for value in (s, m, t))
 
 
-def _folded(seed: int, operands) -> tuple:
-    """Logits near a thousand, a row's spread of eight, with their rows' maximum and total: a softmax's."""
-    rng = np.random.default_rng(seed)
-    shape = operands[0].shape
-    return _softmax((1000.0 - rng.uniform(0.0, 8.0, shape)).astype(np.float32), shape)
-
-
 def _folded_spread(spread: float, centre: float = 1000.0):
-    """`_folded`'s logits at `centre`, a row's spread `spread`: eighty, a row's exponentials across 35
-    decades, its least near float32's least normal (wide ranges); a thousandth, a row's logits a few ulps
-    apart (near-equal operands, `s - m` cancelling); or near zero, the total's logarithm as large as a
-    logit."""
+    """Logits at `centre`, a row's spread `spread`, with their rows' maximum and total: a softmax's. Eight
+    near a thousand (`_folded`, the declaration's own); eighty, a row's exponentials across 35 decades, its
+    least near float32's least normal (wide ranges); a thousandth, a row's logits a few ulps apart
+    (near-equal operands, `s - m` cancelling); or near zero, the total's logarithm as large as a logit."""
     def drawn(seed: int, operands) -> tuple:
         rng = np.random.default_rng(seed)
         shape = operands[0].shape
@@ -53,14 +46,21 @@ def _folded_spread(spread: float, centre: float = 1000.0):
     return drawn
 
 
-def _folded_one_key(seed: int, operands) -> tuple:
-    """`_folded`'s logits with each row's mass on one key, the rest two hundred below it (their exponentials
-    zero): a row of one key."""
-    rng = np.random.default_rng(seed)
-    shape = operands[0].shape
-    s = np.full(shape, 800.0, np.float32)
-    s[np.arange(shape[0]), rng.integers(0, shape[1], shape[0])] = 1000.0
-    return _softmax(s, shape)
+_folded = _folded_spread(8.0)
+"""Logits near a thousand, a row's spread of eight, with their rows' maximum and total: a softmax's."""
+
+
+def _folded_one_key(others: float):
+    """Logits with each row's mass on one key at a thousand, every other key at `others`: `-inf`, a masked
+    key (its exponential exactly zero, a row of one key); or eight hundred, a finite logit whose exponential
+    underflows (a row whose other keys underflow)."""
+    def drawn(seed: int, operands) -> tuple:
+        rng = np.random.default_rng(seed)
+        shape = operands[0].shape
+        s = np.full(shape, others, np.float32)
+        s[np.arange(shape[0]), rng.integers(0, shape[1], shape[0])] = 1000.0
+        return _softmax(s, shape)
+    return drawn
 
 
 def normalized_values_product(exponentials, totals, cotangent):
@@ -106,7 +106,8 @@ def _struct(*shape: int) -> jax.ShapeDtypeStruct:
 declare(__name__, "lse_folded_probabilities", StableForm(lse_folded_probabilities, Cases(
     ((_struct(ROWS, KEYS),) * 3,), _folded, seeds=16, families={
         "wide ranges": _folded_spread(80.0), "near-equal operands": _folded_spread(1e-3),
-        "logits near zero": _folded_spread(8.0, centre=0.0), "one-key rows": _folded_one_key})))
+        "logits near zero": _folded_spread(8.0, centre=0.0), "one-key rows": _folded_one_key(-np.inf),
+        "underflowing rows": _folded_one_key(800.0)})))
 declare(__name__, "normalized_values_product", StableForm(normalized_values_product, Cases(
     ((_struct(KEYS, KEYS), _struct(KEYS), _struct(KEYS, WIDTH)),), _causal, seeds=16, families={
         "wide ranges": _causal_drawn(rows=(-3.0, 3.0)), "near-equal operands": _causal_drawn(spread=1e-3),
