@@ -4,7 +4,6 @@ its own bytes; a hook laid at the whole width keeps the whole-width finish; each
 (check 1)."""
 
 import dataclasses
-import traceback
 
 import jax
 import jax.extend.core
@@ -250,12 +249,11 @@ def test_an_epilogue_program_holds_no_device_array_its_hook_captured():
         assert not any(isinstance(value, jax.Array) for value in (*kept.consts, *literals))
 
 
-def _centred(traced: list[tuple[tuple[int, ...], bool]]):
+def _centred(traced: list[tuple[int, ...]]):
     """A gate less its row's mean (`out - mean(out)`, no entrywise program), each trace recording in
-    `traced` the shape it traced at and whether its program's tracing
-    (`attention_mosaic_program.output_program`) made it."""
+    `traced` the shape it traced at."""
     def centred(out, gate):
-        traced.append((out.shape, any(frame.name == "output_program" for frame in traceback.extract_stack())))
+        traced.append(out.shape)
         return _gate(out, gate) - jnp.mean(out, axis=-1, keepdims=True)
 
     return centred
@@ -275,6 +273,32 @@ class _Derived:
 
         doubled.defvjp(lambda x: (x * 2.0, None), lambda _, g: (g * self.box.bias,))
         return doubled(out)
+
+
+@pytest.mark.parametrize(("first", "second"), [(("sm90", False), ("sm80", False)),
+                                               (("sm90", True), ("sm90", False))],
+                         ids=["two targets", "interpreted and native"])
+def test_a_hooks_key_in_one_call_is_each_contexts_own(first, second):
+    """A hook that reads what it is traced for (the GPU, `generation.gpu_target`, and the platform its code is
+    chosen for, `generation.backend`), keyed twice within one kernel call (`tuning.one_call`) under two
+    assumptions, two GPUs or one GPU interpreted and native: each its own program's key
+    (`attention.hook_program`), where a call's table held by the hook's arguments alone gave the second the
+    first's (reviews of b949a0077a and a1e87e70dd: a GH200's forward priced as the canonical H100, natively,
+    beside its interpreted launch)."""
+    def scaled(out):
+        sm90 = generation.gpu_target().generation == "sm90"
+        return out * (2.0 if sm90 else 3.0) * (5.0 if generation.backend() == "gpu" else 7.0)
+
+    @tuning.one_call
+    def keyed():
+        keys = []
+        for target, interpreted in (first, second):
+            with generation.assumed(target, interpreted=interpreted):
+                keys.append(template.hook_program("output_mod", scaled, (), ()))
+        return keys
+
+    one, other = keyed()
+    assert one != other
 
 
 def test_an_epilogue_program_with_a_deferred_rule_is_never_held():
@@ -316,15 +340,11 @@ def test_a_calls_pricing_and_launch_trace_its_hook_once():
     1461's review)."""
     queries, width = 128, 64
     traced = []
-
-    def gated(out, gate):
-        traced.append(out.shape)
-        return _gate(out, gate) - jnp.mean(out, axis=-1, keepdims=True)
-
+    centred = _centred(traced)
     spans = template.spans(queries, queries, 1, causal=True)
 
     def ours(query, key, value, gate):
-        hooks = template.Hooks(output=Hook(gated, (Side(gate, template.Kind.OUTPUT),)))
+        hooks = template.Hooks(output=Hook(centred, (Side(gate, template.Kind.OUTPUT),)))
         with generation.assumed("sm90", interpreted=True), tuning.pinned(
                 {attention_mosaic.MosaicForward: UNSPLIT["sm90"]}):
             return attention_mosaic.forward(query, key, value, spans, hooks, interpret=True)
@@ -336,14 +356,13 @@ def test_a_calls_pricing_and_launch_trace_its_hook_once():
 @INTERPRETS
 def test_a_whole_width_epilogue_replays_its_hooks_one_program():
     """A hook that reads its row whole (`_centred`) in a pinned H100 launch 64 wide, finished whole: traced
-    at its launch's tile by its program's tracing alone (`output_program`), its epilogue replaying that
+    at its launch's tile once, by its program's tracing (`output_program`), its epilogue replaying that
     program (`BlockPlan.whole`), where the epilogue traced the hook again (train 1444's review)."""
     queries, width = 128, 64
     traced = []
     spans = template.spans(queries, queries, 1, causal=True)
     jax.jit(_pinned(_centred(traced), UNSPLIT["sm90"], spans)).lower(*_wide(queries, width)(0))
-    at_tile = [made for shape, made in traced if shape == (64, width)]
-    assert at_tile and all(at_tile), traced
+    assert traced.count((64, width)) == 1, traced
 
 
 def test_an_output_hooks_literal_array_is_no_entrywise_program():
