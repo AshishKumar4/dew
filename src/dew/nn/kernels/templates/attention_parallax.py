@@ -581,8 +581,10 @@ def _padded(x: jax.Array, tile: int, wide) -> jax.Array:
     return jnp.pad(x.astype(wide), ((0, 0), (0, pad), (0, 0), (0, 0)))
 
 
-def _called(query, second, key, second_key, value, spans: KeySpans, scale: float, tile: int) -> _Call:
-    """A call's operands as its walks read them (`_Call`), its keys padded to whole tiles of `tile`."""
+def _called(query, second, key, second_key, value, spans: KeySpans, scale: float, tile: int,
+            powers: jax.Array | None = None) -> _Call:
+    """A call's operands as its walks read them (`_Call`), its keys padded to whole tiles of `tile`, its rows'
+    powers bounded over every pair (`second_powers`) where its forward has not (`powers`)."""
     kv_heads = key.shape[2]
     # Every operand's dtype: a float64 second product's keys rounded to fp32 tie where they differ (train
     # 1478's K-F1: `[2^24, 2^24 + 1]` read 0 where 0.5 is).
@@ -593,7 +595,7 @@ def _called(query, second, key, second_key, value, spans: KeySpans, scale: float
     raw = _grouped(second.astype(wide), kv_heads)
     second_key = _padded(second_key, tile, wide)
     query, key = _grouped(prescaled_query.astype(wide), kv_heads), _padded(key, tile, wide)
-    powers = second_powers(_row_bounds(raw, second_key, spans, tile))
+    powers = second_powers(_row_bounds(raw, second_key, spans, tile)) if powers is None else powers
     return _Call(query, power2(raw, powers[..., None]), key, second_key, _padded(value, tile, wide), powers,
                  left, spans)
 
@@ -620,11 +622,11 @@ def _tile(call: _Call, start, width: int) -> tuple[jax.Array, jax.Array, jax.Arr
 
 
 def walk(query, second, key, second_key, value, spans: KeySpans, *, scale: float,
-         tile: int = KEY_TILE) -> tuple[jax.Array, Moments]:
+         tile: int = KEY_TILE) -> tuple[jax.Array, tuple[Moments, jax.Array]]:
     """Parallax's forward (module docstring): its output `[B, Q, H, Dv]` in the query's dtype and each
-    row's moments (`Moments`, the derivative's residuals), a key tile of `tile` at a time over every query,
-    each tile's moments merged into the rows' (`merged`), the first tile's the walk's start (its carry typed
-    as its steps make it, `_tiled`)."""
+    row's moments (`Moments`) and powers (`second_powers`), the derivative's residuals, a key tile of `tile`
+    at a time over every query, each tile's moments merged into the rows' (`merged`), the first tile's the
+    walk's start (its carry typed as its steps make it, `_tiled`)."""
     call = _called(query, second, key, second_key, value, spans, scale, tile)
 
     def own(index) -> Moments:
@@ -635,7 +637,7 @@ def walk(query, second, key, second_key, value, spans: KeySpans, *, scale: float
         return merged(held, own(index), call.powers), None
 
     found, _ = jax.lax.scan(step, own(0), jnp.arange(1, call.key.shape[1] // tile))
-    return _output(found, query.dtype), found
+    return _output(found, query.dtype), (found, call.powers)
 
 
 def _output(found: Moments, dtype) -> jax.Array:
@@ -648,19 +650,18 @@ def _output(found: Moments, dtype) -> jax.Array:
     return _ungrouped(power2(difference, common)).astype(dtype)
 
 
-def _landing(estimate: jax.Array, operand: jax.Array, axis: int | tuple[int, int]) -> jax.Array:
+def _landing(estimate: jax.Array, operand: jax.Array, axis: int | tuple[int, int], summed: int) -> jax.Array:
     """The power of two `2^L` a contraction's terms land at before their products with `operand`'s rows
     (`[B, Hk, G, Q, D]` over keys, or `[B, T, Hk, D]` over queries): `estimate` `[B, Hk, G, Q, T]` each
     term's power of two (`_NONE` none), the largest term's product with its operand's largest entry
-    `2^(HELD - log2 n)`, `n` the terms summed; int32, over `axis` of the estimates (-1 a row's keys, (2,
-    3) a key's queries)."""
+    `2^(HELD - log2 n)`, `n` the `summed` terms the landed sum holds (a row's every key over its walk's
+    tiles, a key's every query); int32, over `axis` of the estimates (-1 a row's keys, (2, 3) a key's
+    queries)."""
     largest = jnp.max(_exponent(operand), axis=-1)
     if axis == -1:
         paired = estimate + jnp.moveaxis(largest, 1, -1)[:, :, None, None]
-        summed = estimate.shape[-1]
     else:
         paired = estimate + largest[..., None]
-        summed = estimate.shape[2] * estimate.shape[3]
     live = estimate > _NONE
     # Over no term (a key's of no query, `Q = 0`) `_NONE`.
     reached = jnp.max(jnp.where(live, paired, _NONE), axis=axis, initial=_NONE)
@@ -698,10 +699,12 @@ def _contracted(spec: str, left: jax.Array, right: jax.Array) -> jax.Array:
     return float32_einsum(spec, left, right, precision=REFERENCE_PRECISION, preferred_element_type=left.dtype)
 
 
-def _on_rows(summed, power, coefficient, at, below, estimated, by):
-    """A row's running `Σ_k term · by_k` (`dq`'s, `dr`'s): this tile's terms landed at the row's power
-    (`_landing`, the least of its running one and this tile's), the carried sum taken to it."""
-    fresh = jnp.minimum(power, _landing(estimated, by, -1))
+def _on_rows(summed, power, coefficient, at, below, estimated, by, keys: int):
+    """A row's running `Σ_k term · by_k` (`dq`'s, `dr`'s) over its `keys`: this tile's terms landed at the
+    row's power (`_landing`, the least of its running one and this tile's, its headroom the whole walk's
+    keys': 64 tiles of `-2^122` each overflowed where one tile's 128 bounded it, train 1500's review), the
+    carried sum taken to it."""
+    fresh = jnp.minimum(power, _landing(estimated, by, -1, keys))
     part = _contracted("bhgqk,bkhd->bhgqd", exp_scaled(coefficient, below, at + fresh[..., None]), by)
     return power2(summed, (fresh - power)[..., None]) + part, fresh
 
@@ -710,7 +713,7 @@ def _on_keys(coefficient, at, below, estimated, by, scale: float = 1.0):
     """A key's `Σ_q term · by_q` (`dk`'s, `dk2`'s, `dV`'s): its terms landed at the key's own power
     (`_landing`), their sum times `scale`'s mantissa while landed, then taken back by that power with
     `scale`'s own power of two (`_scaled`)."""
-    power = _landing(estimated, by, (2, 3))
+    power = _landing(estimated, by, (2, 3), estimated.shape[2] * estimated.shape[3])
     terms = exp_scaled(coefficient, below, at + power[:, :, None, None])
     return _scaled(_contracted("bhgqk,bhgqd->bkhd", terms, by), scale,
                    -jnp.moveaxis(power, 1, -1)[..., None])
@@ -745,21 +748,21 @@ def _summed_rows(terms: Callable, seed: jax.Array, tiles: int) -> tuple[jax.Arra
 
 
 def derivative(query, second, key, second_key, value, spans: KeySpans, held: Moments, dout: jax.Array, *,
-               scale: float, tile: int = KEY_TILE) -> tuple[jax.Array, ...]:
+               scale: float, tile: int = KEY_TILE, powers: jax.Array | None = None) -> tuple[jax.Array, ...]:
     """Parallax's derivative (module docstring) from the forward's moments `held` and the output's cotangent
     `dout`: the cotangents of the query, the second query, the keys, the second keys and the values, a key
     tile at a time over every query. Each term's coefficient formed with its power of two (`δ`'s, `δ τ`'s
     and `g · C`'s summed at their common power, so terms that cancel do before either lands), then landed
     with its decay at its contraction's power (`_landing`: a row's for `dq` and `dr`, a key's for `dk`,
-    `dk2` and `dV`), multiplied by its operand and the scale, and taken back by that power."""
-    call = _called(query, second, key, second_key, value, spans, scale, tile)
+    `dk2` and `dV`), multiplied by its operand and the scale, and taken back by that power. The rows'
+    `powers` the forward's (`walk`), where given, not bounded again."""
+    call = _called(query, second, key, second_key, value, spans, scale, tile, powers)
     kv_heads = key.shape[2]
     wide = call.query.dtype
     g = _grouped(dout.astype(wide), kv_heads)
     over = jnp.where(held.total > 0, held.total, 1.0)
     level = jnp.where(jnp.isfinite(held.m), held.m, 0.0)
     queries, seconds_query = _grouped(query.astype(wide), kv_heads), _grouped(second.astype(wide), kv_heads)
-    raw_second_key = _padded(second_key, tile, wide)
     # The cotangent's products with the values held at its row's power over the pairs it sees
     # (`_row_bounds`): no operand scaled alone (a cotangent `[2^127, 2^-100]` over values `(0, 2^100)` keeps
     # `g · v = 1`, train 1423's review).
@@ -809,7 +812,7 @@ def derivative(query, second, key, second_key, value, spans: KeySpans, held: Mom
     def step(sums, index):
         (dq, dq_power), (dr, dr_power) = sums
         logits, seconds, (keys, _), below, moved = moving(index)
-        raw_keys = jax.lax.dynamic_slice_in_dim(raw_second_key, index * tile, tile, axis=1)
+        raw_keys = jax.lax.dynamic_slice_in_dim(call.second_key, index * tile, tile, axis=1)
         seen, fraction, tau_power, delta, delta_power = paired(logits, seconds, moved)
         logit, common = _logit_coefficient(delta, delta_power, fraction, tau_power, row(against),
                                            row(against_power))
@@ -825,8 +828,9 @@ def derivative(query, second, key, second_key, value, spans: KeySpans, held: Mom
             jnp.where(seen & (coefficient != 0), reach + power + _exponent(coefficient), _NONE)
             for coefficient, power in terms)
         # Over the row's keys: `dq` and `dr`, each carried at its row's running power.
-        on_rows = (_on_rows(dq, dq_power, logit, common, below, logit_estimate, keys),
-                   _on_rows(dr, dr_power, second_coefficient, delta_power, below, second_estimate, raw_keys))
+        on_rows = (_on_rows(dq, dq_power, logit, common, below, logit_estimate, keys, call.key.shape[1]),
+                   _on_rows(dr, dr_power, second_coefficient, delta_power, below, second_estimate, raw_keys,
+                            call.key.shape[1]))
         # Over the key's queries: `dk`, `dk2` and `dV`, each at its key's own power.
         on_keys = (_on_keys(logit, common, below, logit_estimate, queries, scale),
                    _on_keys(second_coefficient, delta_power, below, second_estimate, seconds_query),
@@ -864,7 +868,9 @@ def attend(query: jax.Array, second: jax.Array, key: jax.Array, second_key: jax.
 
     def backward(saved, operands, dout):
         query, second, key, second_key, value, spans = operands
-        grads = derivative(query, second, key, second_key, value, spans, saved, dout, scale=scale)
+        held, powers = saved
+        grads = derivative(query, second, key, second_key, value, spans, held, dout, scale=scale,
+                           powers=powers)
         primals = (query, second, key, second_key, value)
         return (*(grad.astype(primal.dtype) for grad, primal in zip(grads, primals, strict=True)),
                 zero_from_primal(spans))
@@ -935,7 +941,9 @@ def _dense_tangent(dtype: str, primals, tangents, value) -> jax.Array:
     # contraction, never a mean's and a weighted sum's products apart (`2^128` before `3 · 2^126` met it).
     weights = jnp.where(seen, tile.masses / over, 0.0)
     centred = weights * (jnp.sum(weights * dseconds, axis=-1, keepdims=True) - dseconds)
-    secondly = _weighed(centred, values)
+    # The second products held at their rows' power `2^p` (`_called`): their direction's contraction taken
+    # back by `2^-p`, as the values' is by its own (train 1500's review: `[2^124, -2^124]` read half).
+    secondly = power2(_weighed(centred, values), -rows)
     return moved + _ungrouped(valued + secondly).astype(dtype)
 
 
