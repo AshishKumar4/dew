@@ -235,8 +235,8 @@ def test_a_dies_step_latencies_are_its_parts_at_its_clock_and_a_parts_memory_its
     reading them: an A100-SXM4's 40 GB and 80 GB parts alike (one GA100 at one 1410 MHz boost), its PCIe
     part, of another power limit, none; a part's memory its own (`GpuTarget.measured`): the 40 GB part's
     stream, which its 80 GB part does not read. A Workstation RTX PRO 6000, of another clock and power than
-    the Server Edition measured, reads none of its latencies, nor a GH200 an H100 SXM's (row 14183: each was
-    carried to every part of its generation)."""
+    the Server Edition measured, reads none of its latencies, and a GH200 its own, not an H100 SXM's (row
+    14183: each was carried to every part of its generation)."""
     def facts(kind):
         target = generation.gpu_target(kind)
         return (target.step_seconds, target.kernel_step_seconds, target.product_latency,
@@ -249,8 +249,10 @@ def test_a_dies_step_latencies_are_its_parts_at_its_clock_and_a_parts_memory_its
     server, workstation = (facts(f"NVIDIA RTX PRO 6000 Blackwell {edition} Edition")
                            for edition in ("Server", "Workstation"))
     assert None not in server[0] and workstation[0] == (None,) * 4
-    assert generation.gpu_target("NVIDIA GH200 480GB").kernel_step_seconds is None
-    assert generation.gpu_target("NVIDIA H100 80GB HBM3").kernel_step_seconds is not None
+    # A GH200 its own (M-FS-114), never the H100 SXM's of another power limit.
+    gh200, h100 = (generation.gpu_target(kind).kernel_step_seconds
+                   for kind in ("NVIDIA GH200 480GB", "NVIDIA H100 80GB HBM3"))
+    assert None not in (gh200, h100) and gh200 != h100
 
 
 @pytest.mark.parametrize("tpu", ["v5e", "v6e"])
