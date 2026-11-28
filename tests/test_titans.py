@@ -458,7 +458,7 @@ def test_a_memorys_readout_is_recomputed_with_its_chunks(form):
         return sum(jnp.sum(x) for x in jax.tree.leaves(memory(*arguments)))
 
     with recomputing((MEMORY_RESIDUALS[1],)):
-        kept = [aval.shape for aval, source in saved_residuals(total, *given, states)
+        kept = [jnp.shape(aval) for aval, source in saved_residuals(total, *given, states)
                 if "argument" not in source]
     assert LENGTH % CHUNK and not [shape for shape in kept if LENGTH in shape], kept
 
