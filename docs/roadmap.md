@@ -8,9 +8,9 @@ This page is generated from the maintainers' findings ledger as each change land
 
 ## Kernels and performance
 
-- GEMM cells at parity: the template the default on every NVIDIA cell. [1295, 153, 2109, 5623, 5634, 5666, 13557, 13562, 13588, 13592, 13734, 13740, 13743, 13751, 14207, 14208]
+- GEMM cells at parity: the template the default on every NVIDIA cell. [1295, 153, 2109, 5623, 5634, 5666, 13557, 13562, 13588, 13592, 13734, 13740, 13743, 13751, 14208]
 - One recurrence algebra, the template for every form and product, and port retirement. [2076, 3426, 3427]
-- Family toolkit: resources derived and checked against ptxas, one planner, one traversal. [2987, 6010, 14179, 14181, 14184, 14187, 14188, 14189, 14190, 14206, 14210]
+- Family toolkit: resources derived and checked against ptxas, one planner, one traversal. [2987, 6010, 14179, 14181, 14187, 14188, 14189, 14190, 14210]
 - The kernel challenge's lessons in the templates. [5271]
 - 4B Real-Token MFU Breakthrough from Existing Profiles. [11941, 11942]
 - Cached and block visibility on the template's spans. [245]
@@ -29,7 +29,7 @@ This page is generated from the maintainers' findings ledger as each change land
 - Log-linear bf16 training backward regression. [13750]
 - Log-linear NaN across live spans. [13991]
 - A per-key decay's recurrence walk traced the portable pairs once per sub-chunk block. [14081]
-- Memory Planner Miss-Driven ≤2-Step Search, Fast XLA Sizing & Cold-Compile Elimination. [14220, 14222]
+- Memory Planner Miss-Driven ≤2-Step Search, Fast XLA Sizing & Cold-Compile Elimination. [14220]
 - Model consumers fused through the template's hooks. [1376, 3422, 3428, 822, 14084]
 - Further attention variants. [1461, 1462, 1463, 1465, 1317, 1466]
 - Native TPU GEMM dispatch. [1560]
