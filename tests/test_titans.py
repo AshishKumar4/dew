@@ -5,7 +5,6 @@ float64 (check 1), the recurrence this file's own (its inner gradient the inner 
 of either module's)."""
 
 import functools
-import typing
 
 import jax
 import jax.numpy as jnp
@@ -398,6 +397,7 @@ def test_a_memorys_mini_batches_are_recomputed_where_the_rung_recomputes_the_chu
     each mini-batch recomputed from the state it entered with (XLA fuses the recomputation its own way, so
     its gradients round apart from the stored run's)."""
     from jax._src.ad_checkpoint import saved_residuals
+    from jax._src.core import ShapedArray
 
     from dew.nn.residuals import MEMORY_RESIDUALS, recomputing
 
@@ -408,9 +408,11 @@ def test_a_memorys_mini_batches_are_recomputed_where_the_rung_recomputes_the_chu
         return sum(jnp.sum(x) for x in jax.tree.leaves(memory(*arguments)))
 
     def saved():
-        found = saved_residuals(total, *given, states)
-        avals = (typing.cast(jax.core.ShapedArray, aval) for aval, _ in found)
-        return sum(aval.size * aval.dtype.itemsize for aval in avals)
+        found = 0
+        for aval, _ in saved_residuals(total, *given, states):
+            assert isinstance(aval, ShapedArray), aval
+            found += aval.size * aval.dtype.itemsize
+        return found
 
     stored_bytes = saved()
     with recomputing((MEMORY_RESIDUALS[1],)):
