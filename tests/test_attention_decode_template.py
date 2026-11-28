@@ -181,6 +181,24 @@ def test_a_decode_step_through_the_template_is_on_par_interpreted(call, hook, dt
 
 
 @INTERPRETS
+def test_a_decode_steps_start_of_its_first_key_reads_as_no_start_interpreted():
+    """A decode step through the template as an H100 runs it from each row's first key (`starts` 0, a row
+    holding one document, `AttentionMixer._attended`'s own start) reads bit for bit as the step of no start:
+    a step whose kernel takes a start runs the start as given, no branch on whether it narrows (row 6107; a
+    start past 0, `STARTS`, on par in `test_a_decode_step_through_the_template_is_on_par_interpreted`)."""
+    lengths = jnp.asarray(LENGTHS, jnp.int32)
+    query, key, value, _ = _drawn(1, 8, 2, jnp.bfloat16)(0)
+
+    def attend(starts):
+        with generation.assumed("sm90"):
+            return attention_decode.attend(query, key, value, template.spans(1, KEYS, 2, lengths=lengths,
+                                                                             starts=starts), interpret=True)
+
+    np.testing.assert_array_equal(np.asarray(attend(jnp.zeros(2, jnp.int32)), np.float32),
+                                  np.asarray(attend(None), np.float32))
+
+
+@INTERPRETS
 def test_an_absorbed_mla_decode_step_of_576_wide_keys_and_512_wide_values_is_on_par_interpreted():
     """An absorbed MLA decode step (DeepSeek's: 16 query heads over one latent key head, its key the latent
     512 and rotary 64, its value the latent 512; kernel-templates.md §A row 25) through the template as an

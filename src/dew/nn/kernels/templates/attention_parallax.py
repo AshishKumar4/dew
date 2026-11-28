@@ -81,7 +81,7 @@ from jax.custom_derivatives import zero_from_primal
 from dew.algebra import means
 from dew.algebra.windows import Units
 from dew.nn.derivatives import KernelGlue, Protected, contracted, declared_tangent, surrogate
-from dew.nn.float_bits import raised_exactly
+from dew.nn.float_bits import binade_of, raised_exactly
 from dew.nn.kernels import generation
 from dew.nn.kernels.templates.attention import REFERENCE_PRECISION, KeySpans, dense, logit_scale, prescaled
 from dew.nn.precision import accurate_exp, float32_einsum, ln2_remainder, power2, two_sum
@@ -156,7 +156,7 @@ def exp_scaled(z: jax.Array, exponent: jax.Array, power) -> jax.Array:
     its bits (`raised_exactly`), so a subnormal is no operand a flushing multiply reads (XLA's CPU), and
     halves only `|z| >= 1` against `e^f`'s overflow: halving `2^-149` first read it 0, which `2^149` then
     raised to 0, not 1 (train 1478's K-F2). Its derivative along `z` the halved form's, along the exponent
-    the exact value's (`_exp_scaled_tangent`), the value the exact one's (`_exact`)."""
+    the normalized form's (`_exp_scaled_tangent`), the value the exact one's (`_exact`)."""
     exponent = jnp.broadcast_to(exponent, jnp.shape(z))
     return _exp_scaled(z, exponent, jnp.broadcast_to(jnp.asarray(power, jnp.float32), jnp.shape(z)))
 
@@ -196,18 +196,42 @@ def _halved(z: jax.Array, exponent: jax.Array, power: jax.Array) -> jax.Array:
     return jnp.where(finite, _decayed(z * 0.5, accurate_exp(fraction), power + whole + 1.0), 0.0)
 
 
+def _significand(z: jax.Array) -> tuple[jax.Array, jax.Array]:
+    """`z` as `m 2^k`: `k` its binade, held (0 for zero, an infinity or a NaN), and `m` its significand,
+    within `[1, 2)` in magnitude, exact (a tiny fp32 `z`'s read from its bits, `raised_exactly`, which no
+    flushing multiply reads), its derivative `2^-k`'s."""
+    held = jax.lax.stop_gradient(z)
+    finite = jnp.isfinite(held)
+    if jnp.dtype(z.dtype) == jnp.float32:
+        binade = binade_of(held)
+        k = jnp.where(finite & (binade > -1024), binade, 0)
+        exact = jnp.where(k < 0, raised_exactly(held, -k), power2(held, -k))
+    else:
+        k = jnp.where(finite & (held != 0), jnp.frexp(held)[1] - 1, 0)
+        exact = power2(held, -k)
+    scaled = power2(z, -k)
+    return jnp.where(finite, scaled + jax.lax.stop_gradient(exact - scaled), z), k
+
+
+def _normalized(z: jax.Array, exponent: jax.Array, power: jax.Array) -> jax.Array:
+    """`exp_scaled` of `z`'s significand, its binade among the powers (`_significand`), every power applied
+    at once: its derivative along the exponent, which JAX takes of it, the direction met by the significand
+    and `e^f` alone before the powers (`2^120 · 2^-120` along `2^100` is `2^100`, `2^-149 · 2^149` along 1
+    is 1, where the halved form's derivative overflowed and flushed, train 1489's F2)."""
+    finite, whole, fraction = _decay_parts(exponent)
+    significand, binade = _significand(z)
+    return jnp.where(finite, _decayed(significand, accurate_exp(fraction), power + whole + binade), 0.0)
+
+
 def _exp_scaled_tangent(primals, tangents):
     """`exp_scaled`'s tangent beside the rule's own value, so a higher order meets the rule again: along `z`
-    the halved form's, JAX's derivative of it, every power applied to the direction at once; along the
-    exponent the value itself times the direction, `z e^exponent 2^power` formed exact before it meets it, so
-    `2^-149 · 2^149` along a unit direction is 1 and `2^120 · 2^-120` along `2^100` is `2^100`, where the
-    halved form's derivative there flushed to 0 and overflowed (train 1489's F2). Both linear in the
-    tangents, so reverse mode transposes them."""
+    the halved form's (`_halved`), along the exponent the normalized form's (`_normalized`), each JAX's own
+    derivative, so linear in its direction and transposed by JAX."""
     z, exponent, power = primals
     along_z, along_exponent, _ = tangents
-    value = _exp_scaled(*primals)
     _, moved = jax.jvp(lambda z: _halved(z, exponent, power), (z,), (along_z,))
-    return value, moved + value * along_exponent
+    _, decayed = jax.jvp(lambda exponent: _normalized(z, exponent, power), (exponent,), (along_exponent,))
+    return _exp_scaled(*primals), moved + decayed
 
 
 _exp_scaled = contracted("test_parallax_holds_every_order")(

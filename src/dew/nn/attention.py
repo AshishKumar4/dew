@@ -475,7 +475,8 @@ def template_attention(query, key, value, causal: bool, sliding_window, *, sinks
     parameter (FoX's); sinks are the softmax's initial state. A
     `fill` (`mask_fill`) is every hidden key's logit, a score hook after the rest (`template.Filled`), the
     call walking every key; a call that hides no key, a fill's among them, reads a row of no mass NaN, as
-    jax.nn's softmax does (`KeySpans.excluded`). On
+    jax.nn's softmax does (`KeySpans.excluded`); a -inf fill's call is the masked walk's, its rows that see
+    no key NaN past it (`_filled`). On
     a mesh it runs per shard (`on_attention_shards`), as the decode kernel does: the key heads repeat until
     the tensor axes split them, the sinks split with their heads, and the ids, lengths, starts, groups,
     validity and places with
@@ -523,9 +524,9 @@ def template_attention(query, key, value, causal: bool, sliding_window, *, sinks
         if fill is not None:
             score_mod, params = template.Filled.over(spans, fill, score_mod, params)
             spans = template.spans(queries, keys, batch)
-        # The reference path's exclusion (`reference_attention`'s `excluded`): a masked call of no fill reads
-        # a row of no mass zero; a call that hides no key, a fill's among them, NaN, as jax.nn's softmax does
-        # (row 14116).
+        # The reference path's exclusion (`reference_attention`'s `excluded`): a masked call reads a row of
+        # no mass zero; one that hides no key, a finite fill's among them, NaN, as jax.nn's softmax does (row
+        # 14116).
         spans = dataclasses.replace(spans, excluded=spans.form != "full")
         hooks = template.Hooks(
             score=Hook(score_mod, params),
@@ -1705,10 +1706,7 @@ def attention_kernel(query, key, value, dtype=None, precision=None,
 
     if mask_fill is None:
         return _read_nothing(ran(), live)
-    if resolved == 'reference' or (resolved == 'template' and mask_fill == -jnp.inf):
-        # The template weighs a -inf fill itself (`template.Filled`), a row of no mass, a visible key's bias's
-        # among them, NaN as the reference's jax.nn softmax reads it, where its masked walk read it zero (row
-        # 14116).
+    if resolved == 'reference':
         return ran(fill=mask_fill)
     # The template weighs the fill itself where it takes the call (`template.Filled`), else the reference.
     templated = ATTENTION.kernel('template').refused(attention_case(query, key, named='template', **facts))

@@ -98,8 +98,9 @@ class KeySpans:
     excluded: bool = dataclasses.field(default=True, metadata={"static": True})
     """Whether a row of no mass (its every logit -inf) reads zero, Dew's exclusion, a template call's by
     default (a score hook that masks a row's every key empties it); where not, a call whose spans hide no key
-    ('full': the dispatch's call of no mask or of a fill, `dew.nn.attention.template_attention`), NaN, as the
-    reference path's jax.nn softmax reads it (`attention_algebra.Forward.massless_nan`, row 14116)."""
+    ('full': the dispatch's call of no mask or of a finite fill, `dew.nn.attention.template_attention`), NaN,
+    as the reference path's jax.nn softmax reads it (`attention_algebra.Forward.massless_nan`, row
+    14116)."""
 
     def __post_init__(self):
         if not self.excluded and self.form != "full":

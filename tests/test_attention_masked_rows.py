@@ -280,30 +280,6 @@ def test_a_row_of_no_mass_reads_as_the_reference_path_on_every_mainloop(mainloop
                                       err_msg=f"{mainloop} {name}")
 
 
-def test_a_causal_minus_inf_fill_reads_a_row_of_no_mass_as_the_reference_path():
-    """A causal call under a mask fill of -inf (`mask_fill`) through the dispatch's template route, its first
-    query's one key's bias -inf and its third's hiding one of its keys (each row's mass a power of two): the
-    first row reads NaN, its derivatives NaN, as the reference path's jax.nn softmax over the fill reads it,
-    every other entry the reference's bit for bit, where the masked walk the dispatch ran it on read the row
-    zero (row 14116)."""
-    bias = np.zeros((1, 1, 4, 4), np.float32)
-    bias[..., 0, 0] = bias[..., 2, 1] = -np.inf
-    operands = (jnp.zeros((1, 4, 1, 8), jnp.float32), jnp.zeros((1, 4, 1, 8), jnp.float32),
-                jnp.ones((1, 4, 1, 8), jnp.float32), jnp.asarray(bias))
-
-    def attended(implementation):
-        def attend(query, key, value, bias):
-            return scaled_dot_product_attention(query, key, value, bias=bias, causal=True, mask_fill=-np.inf,
-                                                implementation=implementation)
-        out, pull = jax.vjp(attend, *operands)
-        return out, *pull(jnp.ones_like(out))
-
-    found, expected = attended("template"), attended("reference")
-    assert np.isnan(np.asarray(expected[0])[0, 0]).all()
-    for name, mine, theirs in zip(("output", "query", "key", "value", "bias"), found, expected, strict=True):
-        np.testing.assert_array_equal(np.asarray(mine), np.asarray(theirs), err_msg=name)
-
-
 @pytest.mark.parametrize("implementation", ["reference", "template"])
 def test_a_filled_row_that_sees_no_key_reads_nan(implementation):
     """A packed call under a mask fill of -inf (`mask_fill`, a written program's `where(mask, logits, -inf)`),

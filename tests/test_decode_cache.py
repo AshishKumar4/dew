@@ -12,6 +12,7 @@ from dew.nn.attention import scaled_dot_product_attention
 from dew.nn.attention_masks import causal_attention_mask
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.inputs import AttentionMetadata, MixerCall
+from dew.nn.kernels import generation
 from dew.nn.kv_cache import KVCache, KVSpec, cached_validity, open_kv_cache
 from dew.nn.linear import GatedDeltaNet
 from dew.nn.mla import MultiHeadLatentAttention
@@ -122,3 +123,38 @@ def test_a_packed_prompts_continuation_reads_its_last_document_alone(kind):
     other = continued(jax.random.randint(jax.random.key(3), (1, 4), 0, PACKED_VOCAB))
     for ours, theirs in zip(first, other, strict=True):
         assert ours.tobytes() == theirs.tobytes()
+
+
+def _kernels_branched(jaxpr) -> tuple[int, int]:
+    """How many Pallas kernels `jaxpr` stages, its inner programs' among them, and how many of those sit in
+    a `cond`'s branches."""
+    staged = branched = 0
+    for eqn in jaxpr.eqns:
+        staged += eqn.primitive.name == "pallas_call"
+        for param in eqn.params.values():
+            for inner in param if isinstance(param, (tuple, list)) else (param,):
+                inner = getattr(inner, "jaxpr", inner)
+                if hasattr(inner, "eqns"):
+                    found, within = _kernels_branched(inner)
+                    staged += found
+                    branched += found if eqn.primitive.name == "cond" else within
+    return staged, branched
+
+
+@pytest.mark.parametrize("layout", [KVCache(), KVCache(page_size=4)], ids=["compact", "paged"])
+def test_a_decode_step_whose_kernel_takes_its_start_stages_it_unbranched(layout):
+    """A decode step over a cache that keeps its keys' documents, so each row reads from its own document's
+    first key (`_decode_masks`), on an H100's route, whose decode kernel takes a start: the step stages
+    that kernel on no branch of whether a start narrows, where the branch staged it twice a layer and the
+    host waited on its predicate each layer of each step (57% of a GH200's decode samples, row 6107)."""
+    model = CausalTransformer(vocab_size=37, **TINY_DECODER, kv_cache=layout)
+    ids = jnp.zeros((2, 6), jnp.int32)
+    with generation.assumed("sm90"):
+        params = model.init(jax.random.key(0), ids)
+        cache = model.init(jax.random.key(0), ids[:, :1], decode=True)["cache"]
+        _, state = model.apply({**params, "cache": cache}, ids, decode=True, mutable=["cache"])
+        step = jax.make_jaxpr(lambda params, state, token: model.apply(
+            {**params, **state}, token, decode=True, mutable=["cache"]))(params, state, ids[:, :1])
+    staged, branched = _kernels_branched(step.jaxpr)
+    assert staged and not branched, (staged, branched)
+

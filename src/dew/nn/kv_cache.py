@@ -54,7 +54,7 @@ from dew.nn.fake_quant import E4M3_MAX
 from dew.nn.host_memory import fetched, fetched_at, on_host, placed_like, stored_at
 from dew.nn.kernels import decode_attention, generation
 from dew.nn.kernels.generation import INHERENT, Choice, backend
-from dew.nn.kernels.selection import Kernel, Op, Requirement, select
+from dew.nn.kernels.selection import Kernel, Op, Requirement, decided, select
 from dew.nn.kernels.templates.hooks import Hook
 from dew.nn.precision import EXACT_FLOAT32, at_least_fp32, declares_fp32_products, divided, float32_einsum
 from dew.nn.protocols import computes_in
@@ -1109,13 +1109,15 @@ class KVStore:
 
     def paged_kernel(
         self, query: jax.Array, *, softcap: float | None, arithmetic: bool, named: str,
-        windowed: bool = False, sinks: bool = False,
+        windowed: bool = False, sinks: bool = False, published: bool = True,
     ) -> PagedKernel | None:
         """The paged kernel the selector gives a decode step's query over this pool (`PAGED`, over its one
-        `case`), reported as the step's route, which `decode` runs; None where no paged kernel takes it and
-        the layer reads the gathered rows itself."""
-        kernel = select(PAGED, self.case(query, softcap=softcap, arithmetic=arithmetic, named=named,
-                                         windowed=windowed, sinks=sinks)).kernel
+        `case`), reported as the step's route, which `decode` runs, unless `published` (a step's kernel read
+        ahead of it, `selection.decided`); None where no paged kernel takes it and the layer reads the
+        gathered rows itself."""
+        case = self.case(query, softcap=softcap, arithmetic=arithmetic, named=named, windowed=windowed,
+                         sinks=sinks)
+        kernel = (select if published else decided)(PAGED, case).kernel
         return kernel if _is_paged_kernel(kernel) else None
 
     def _value_width(self) -> int:
