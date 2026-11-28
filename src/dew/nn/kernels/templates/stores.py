@@ -244,7 +244,7 @@ def staged(smem, value: jax.Array, ref, place: tuple, *, write: Callable = writt
     elif not narrowed:
         # Every chunk's rows start a tensor copy at an aligned shared address, packed or not (row 14182: an
         # ordinary 32-column bf16 chunk of a grouped tile started its copy 64 bytes into a row).
-        _aligned_ladder(width * jax.dtypes.itemsize_bits(smem.dtype) // 8, first, ladder)
+        _aligned_ladder(width * jax.dtypes.itemsize_bits(smem.dtype) // 8, first, stored, ladder)
         if divisor > 1 and (ladder[1] if len(ladder) > 1 else 1) == 1 and ref.shape[-1] % width:
             # A rung of one row is one contiguous run, which Mosaic GPU copies by a linear bulk copy clamped
             # at the whole tensor's end, not its row's (`launch_context.async_copy`): a last chunk past the
@@ -300,36 +300,44 @@ def rungs(most: int, least: int = 1) -> list[int]:
     return found
 
 
-def row_starts_aligned(row_bytes: int, first: int | None, least: int = 1, most: int = 1) -> bool:
+def row_starts_aligned(row_bytes: int, first: int | None, least: int = 1, most: int = 1,
+                       stored: int | None = None) -> bool:
     """Whether every copy of a chunk's row ladder (`store_rows`, its `rungs`) from row `first` (None where
-    known only as it runs, a grouped tile's group) starts its shared source where Mosaic GPU's copy of it
-    takes it: a rung of rows a bulk tensor copy, at a `copies.SHARED_ALIGNMENT`-byte address (the CUDA
-    Programming Guide's asynchronous copies, Tables 26 and 28; a store from another faults on an RTX PRO
-    6000, M-FS-115); a one-row rung a linear bulk copy (`launch_context.async_copy`), at a
-    `copies.ROW_BYTES`-byte one (PTX `cp.async.bulk`). Each rung starts at `first` plus the larger rungs
-    taken, a multiple of twice it rows (the largest at `first` alone), so its starts are aligned where
-    `first`'s is and, below the largest, twice its rows are; from an unknown first row, where its rows are
-    whole units (row 14182: a grouped tile's 32-column bf16 chunk started a tensor copy 64 bytes into a row).
-    A derivation reads it to derive no tile whose store a trace refuses (`_aligned_ladder`)."""
+    known only as it runs, a grouped tile's group) starts its shared source at a `copies.SHARED_ALIGNMENT`-
+    byte address: a bulk tensor copy's (the CUDA Programming Guide's asynchronous copies, Tables 26 and 28;
+    a store from another faults on an RTX PRO 6000, M-FS-115), every rung held to it, a one-row rung too
+    (Mosaic GPU copies one linearly only where its source is unswizzled and contiguous, which a ladder's
+    staging does not state). With `stored`, the rows known as it traces, the copies its bits take (each rung
+    at `first` plus the larger rungs taken); else every count's, a rung below the largest starting at
+    `first` plus a multiple of twice its rows. From an unknown first row, only where its rows are whole units
+    (row 14182: a grouped tile's 32-column bf16 chunk started a copy 64 bytes into a row). A derivation reads
+    it to derive no tile whose store a trace refuses (`_aligned_ladder`, `staging_refusal`)."""
+    unit = copies.SHARED_ALIGNMENT
+    if row_bytes % unit == 0:
+        return True
+    if first is None:
+        return False
     ladder = rungs(most, least)
-    for rung in ladder:
-        unit = copies.ROW_BYTES if rung == 1 else copies.SHARED_ALIGNMENT
-        if first is None:
-            if row_bytes % unit:
-                return False
-        elif first * row_bytes % unit or (rung < ladder[0] and 2 * rung * row_bytes % unit):
-            return False
-    return True
+    if stored is not None:
+        starts, at = [], first
+        for rung in ladder:
+            if stored & rung:
+                starts.append(at)
+                at += rung
+        return all(start * row_bytes % unit == 0 for start in starts)
+    return first * row_bytes % unit == 0 and all(2 * rung * row_bytes % unit == 0 for rung in ladder[1:])
 
 
-def _aligned_ladder(row_bytes: int, first, ladder: list) -> None:
+def _aligned_ladder(row_bytes: int, first, stored, ladder: list) -> None:
     """Refuse a chunk's row ladder (`store_rows`, its rungs `ladder`'s first two) whose copies may start a
-    shared row where its copy does not take it (`row_starts_aligned`), from `first`."""
+    shared row at no aligned address (`row_starts_aligned`), from `first` for `stored` rows, each where
+    known as it traces."""
     most = ladder[0] if ladder else 1
     least = ladder[1] if len(ladder) > 1 else 1
-    if not row_starts_aligned(row_bytes, first if isinstance(first, int) else None, least, most):
+    if not row_starts_aligned(row_bytes, first if isinstance(first, int) else None, least, most,
+                              stored if isinstance(stored, int) else None):
         raise ValueError(f"a chunk's {row_bytes}-byte rows copied from row {first} in rungs of {least} to "
-                         f"{most} start a bulk copy at a shared address it does not take")
+                         f"{most} start a tensor copy at no {copies.SHARED_ALIGNMENT}-byte shared address")
 
 
 def transposed_rows(smem, value: jax.Array, o_gmem, row_start, column, *, write: Callable = written) -> None:
