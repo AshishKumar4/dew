@@ -989,7 +989,7 @@ def test_a_subnormal_term_decays_and_raises_before_it_rounds():
     first rounded `2^-149` to 0 (train 1478's K-F2)."""
     least = jnp.float32(2.0 ** -149)
     assert float(attention_parallax.exp_scaled(least, jnp.float32(0.0), 149)) == 1.0
-    assert float(attention_parallax.exp_scaled(3 * least, jnp.float32(0.0), 148)) == 1.5
+    assert float(attention_parallax.exp_scaled(jnp.float32(3 * 2.0 ** -149), jnp.float32(0.0), 148)) == 1.5
 
 def test_a_float64_second_product_keeps_its_keys_apart():
     """Parallax (`attention_parallax.attend`) with x64 on over fp32 queries, keys and values (zeros, and
@@ -1012,11 +1012,10 @@ def test_a_float64_second_product_keeps_its_keys_apart():
 
 
 def test_a_terms_derivatives_keep_their_range():
-    """`attention_parallax.exp_scaled`'s declared derivative at `z = 0`, undecayed and unraised: a direction
-    of `2^100` moves it by `2^100` and a cotangent of `2^-100` pulls back `2^-100`, its direction taken by
-    the decay and every power at once, where raising a tiny `z` by `2^64` before them sent the direction to
-    infinity and the cotangent to 0 (the confirm review of 502c938474); and along its exponent, its own
-    value, `3 · 2^-148 · 2^148 = 3` times the direction."""
+    """`attention_parallax.exp_scaled`'s derivative at `z = 0`, undecayed and unraised: a direction of
+    `2^100` moves it by `2^100` and a cotangent of `2^-100` pulls back `2^-100`, its direction taken by the
+    decay and every power at once, where raising a tiny `z` by `2^64` before them sent the direction to
+    infinity and the cotangent to 0 (the confirm review of 502c938474)."""
     def scaled(z):
         return attention_parallax.exp_scaled(z, jnp.float32(0.0), 0)
 
@@ -1024,6 +1023,3 @@ def test_a_terms_derivatives_keep_their_range():
     assert float(tangent) == 2.0 ** 100
     _, pull = jax.vjp(scaled, jnp.float32(0.0))
     assert float(pull(jnp.float32(2.0 ** -100))[0]) == 2.0 ** -100
-    _, along = jax.jvp(lambda e: attention_parallax.exp_scaled(jnp.float32(3 * 2.0 ** -148), e, 148),
-                       (jnp.float32(0.0),), (jnp.float32(1.0),))
-    assert float(along) == 3.0

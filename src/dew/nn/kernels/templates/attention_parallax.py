@@ -76,11 +76,11 @@ from typing import NamedTuple
 import jax
 import jax.numpy as jnp
 import numpy as np
-from jax.custom_derivatives import SymbolicZero, zero_from_primal
+from jax.custom_derivatives import zero_from_primal
 
 from dew.algebra import means
 from dew.algebra.windows import Units
-from dew.nn.derivatives import KernelGlue, Protected, contracted, declared_tangent, surrogate
+from dew.nn.derivatives import KernelGlue, contracted, surrogate
 from dew.nn.float_bits import raised_exactly
 from dew.nn.kernels import generation
 from dew.nn.kernels.templates.attention import REFERENCE_PRECISION, KeySpans, dense, logit_scale, prescaled
@@ -152,62 +152,36 @@ def exp_scaled(z: jax.Array, exponent: jax.Array, power) -> jax.Array:
     `precision.ln2_remainder`), `z e^f` formed, and every power, `k` and `power` together, applied at once
     (`precision.power2`), so no factor's partial product leaves fp32 before the rest brings it back: a
     weight of `e^-128` against `2^126` keeps `2^-58`, and `2^127` decayed by `e^-256` then raised by
-    `2^254`, `2^-115`, where applying the power after the decay read 0. A tiny fp32 `z` is raised from its
-    bits first (`raised_exactly`), so a subnormal is no operand a flushing multiply reads (XLA's CPU), and
-    only `|z| >= 1` is halved against `e^f`'s overflow: halving `2^-149` first read it 0, which `2^149` then
-    raised to 0, not 1 (train 1478's K-F2). Differentiable at every order by its declared rule
-    (`_exp_scaled_tangent`): along `z` the same decay and powers taken at once, along the exponent its own
-    value."""
+    `2^254`, `2^-115`, where applying the power after the decay read 0. Its value takes a tiny fp32 `z` from
+    its bits (`raised_exactly`), so a subnormal is no operand a flushing multiply reads (XLA's CPU), and
+    halves only `|z| >= 1` against `e^f`'s overflow: halving `2^-149` first read it 0, which `2^149` then
+    raised to 0, not 1 (train 1478's K-F2). Differentiable at every order as the halved form's arithmetic
+    (`_decayed`), its directions taken by the decay and every power at once."""
     exponent = jnp.broadcast_to(exponent, jnp.shape(z))
-    return _exp_scaled(z, exponent, jnp.broadcast_to(jnp.asarray(power, jnp.float32), jnp.shape(z)))
-
-
-def _decay_parts(exponent: jax.Array) -> tuple[jax.Array, jax.Array, jax.Array]:
-    """`exponent`'s finite entries, its whole powers of two `k` and its remainder `f` (`exp_scaled`). The
-    fraction 0 past `2^16` whole powers (no fp32 value survives them), as it is within them."""
     finite = jnp.isfinite(exponent)
     decay = jnp.where(finite, exponent, 0.0)
     whole = jax.lax.stop_gradient(jnp.floor(decay * (1.0 / np.log(2.0))))
-    return finite, whole, jnp.where(jnp.abs(whole) < 2.0 ** 16, ln2_remainder(decay, whole), 0.0)
-
-
-def _held_powers(powers: jax.Array) -> jax.Array:
-    """The powers together, decay's and `power`, held within `±400` after they meet, never apart (a decay of
-    -9744 beside a power of 13862 is `2^-195`, where either held alone read infinity)."""
-    return jnp.clip(powers, -400.0, 400.0).astype(jnp.int32)
-
-
-def _exp_scaled_value(z: jax.Array, exponent: jax.Array, power: jax.Array) -> jax.Array:
-    """`exp_scaled`'s value."""
-    finite, whole, fraction = _decay_parts(exponent)
+    # The fraction 0 past `2^16` whole powers (no fp32 value survives them), as it is within them; and the
+    # powers together, decay's and `power`, held within `±400` after they meet, never apart (a decay of
+    # -9744 beside a power of 13862 is `2^-195`, where either held alone read infinity).
+    fraction = jnp.where(jnp.abs(whole) < 2.0 ** 16, ln2_remainder(decay, whole), 0.0)
+    scale = accurate_exp(fraction)
+    powers = jnp.asarray(power, jnp.float32) + whole
+    decayed = jnp.where(finite, _decayed(z * 0.5, scale, powers + 1), 0.0)
+    held = jax.lax.stop_gradient(z)
     up = 0.0
-    if jnp.dtype(z.dtype) == jnp.float32:
-        tiny = jnp.abs(z) < 2.0 ** -100
-        z, up = jnp.where(tiny, raised_exactly(z, jnp.int32(64)), z), jnp.where(tiny, 64.0, 0.0)
-    big = jnp.abs(z) >= 1
-    lifted = jnp.where(big, z * 0.5, z) * accurate_exp(fraction)
-    return jnp.where(finite, power2(lifted, _held_powers(power + whole + jnp.where(big, 1.0, 0.0) - up)), 0.0)
+    if jnp.dtype(held.dtype) == jnp.float32:
+        tiny = jnp.abs(held) < 2.0 ** -100
+        held, up = jnp.where(tiny, raised_exactly(held, jnp.int32(64)), held), jnp.where(tiny, 64.0, 0.0)
+    big = jnp.abs(held) >= 1
+    exact = jnp.where(finite, _decayed(jnp.where(big, held * 0.5, held), jax.lax.stop_gradient(scale),
+                                       jax.lax.stop_gradient(powers) + jnp.where(big, 1.0, 0.0) - up), 0.0)
+    return decayed + jax.lax.stop_gradient(exact - decayed)
 
 
-def _exp_scaled_tangent(primals, tangents):
-    """`exp_scaled`'s tangent: along `z`, its direction halved, taken by `e^f` and every power at once, a
-    linear map of the direction whatever its size (`2^100` stays finite, a cotangent of `2^-100` nonzero);
-    along the exponent, the rule's own value times its direction, so a higher order meets the rule again."""
-    z, exponent, power = primals
-    direction, along, _ = tangents
-    value = _exp_scaled(z, exponent, power)
-    finite, whole, fraction = _decay_parts(exponent)
-    tangent = jnp.zeros_like(value)
-    if not isinstance(direction, SymbolicZero):
-        moved = power2((direction * 0.5) * accurate_exp(fraction), _held_powers(power + whole + 1.0))
-        tangent = tangent + jnp.where(finite, moved, 0.0)
-    if not isinstance(along, SymbolicZero):
-        tangent = tangent + jnp.where(finite, value * along, 0.0)
-    return value, tangent
-
-
-_exp_scaled = contracted("test_parallax_holds_every_order")(
-    declared_tangent(Protected(), _exp_scaled_value, _exp_scaled_tangent, symbolic_zeros=True))
+def _decayed(lifted: jax.Array, scale: jax.Array, powers: jax.Array) -> jax.Array:
+    """`lifted · scale · 2^powers`, the powers applied at once within `±400` (`exp_scaled`)."""
+    return power2(lifted * scale, jnp.clip(powers, -400.0, 400.0).astype(jnp.int32))
 
 
 def _pair_bound(left: jax.Array, right: jax.Array) -> jax.Array:
