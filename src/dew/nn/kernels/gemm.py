@@ -1171,13 +1171,10 @@ def nvfp4_product(lhs: jax.Array, matrix: NvFp4, group_sizes: jax.Array | None =
 
 def _packed_finish(launch, bound, bank: NvFp4, count: int, *, dense: bool, interpret_on_cpu: bool):
     """The packed product finished in its launch's epilogue (`factored`'s `finished`, row 13743): the tensor
-    scale (its tile's columns') and the owed 2^8 (`factored.owed_native`), on CUDA alone, whose float32 keeps
-    the subnormals it rounds to. None for a decode's rows (its receipts' cells, `NVFP4_DECODE_ROWS`, the rows
-    a swapped launch takes, fewer than a role's), interpreted, on a TPU (each a platform whose float32
-    flushes the subnormals `factored`'s own rounding keeps), or a placed scale. Where the call is placed
-    elsewhere when it runs (its operands committed to a GPU host's CPU), its finish is `factored`'s own
-    there (`owed_exactly`), never the hooked launch interpreted (the review of row 13743's restack: a column
-    scale of 2^-127 times 256 flushed to zero on the CPU)."""
+    scale (its tile's columns') and the owed 2^8 (`factored.owed_native`), CUDA's alone. None for a decode's
+    rows (`NVFP4_DECODE_ROWS`, a swapped launch's), interpreted or on a TPU (whose float32 flushes the
+    subnormals `factored`'s rounding keeps), or a placed scale; a call its operands place on the CPU when it
+    runs finishes there by `owed_exactly` (its review: 2^-127 times 256 flushed to zero there)."""
     if (xla_products.interpreted(interpret_on_cpu) or generation.tpu(generation.gpu_target())
             or count <= NVFP4_DECODE_ROWS or not launched_whole(bank.scale)):
         return None
@@ -1201,16 +1198,13 @@ def _packed_finish(launch, bound, bank: NvFp4, count: int, *, dense: bool, inter
         def owed(product):
             return owed_exactly(product, per_row(factor, groups, product.shape[0]), raised)
 
-        def kernel(rows, words, scales, sizes, gather, first, side, *, interpret: bool):
-            # The hooked launch CUDA's alone; placed on the CPU when it runs (its operands committed to a GPU
-            # host's CPU), the plain launch interpreted and `factored`'s own exact finish after it.
-            operands = (rows, words, scales, sizes, gather, first)
+        def kernel(*operands, interpret: bool):  # interpreted on the CPU: the plain launch, the exact finish
             if not interpret:
-                return _packed_launch(launch, *operands, side, interpret=False, dense=dense, hooks=hooks)
-            return owed(_packed_launch(launch, *operands, interpret=True, dense=dense))
+                return _packed_launch(launch, *operands, interpret=False, dense=dense, hooks=hooks)
+            return owed(_packed_launch(launch, *operands[:-1], interpret=True, dense=dense))
 
-        def portable(rows, words, scales, sizes, gather, first, _):
-            return owed(_packed_portable(rows, words, scales, sizes, gather, first))
+        def portable(*operands):
+            return owed(_packed_portable(*operands[:-1]))
 
         return xla_products.dispatched(kernel, portable, interpret_on_cpu, rows, words, scales, sizes, gather,
                                        first, side_of(factor))
