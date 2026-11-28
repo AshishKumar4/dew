@@ -2,6 +2,7 @@
 counted from its body, as each warpgroup runs it."""
 
 import contextlib
+import functools
 import math
 
 import jax
@@ -1746,28 +1747,42 @@ def test_a_launchs_l2_traffic_is_the_reads_every_path_makes_at_its_buffers_packe
     assert _l2_bytes(thrice, jnp.float4_e2m1fn, 1024) == 512
 
 
-def test_a_walks_end_trips_add_no_reads_past_a_steady_trips():
-    """A walk whose first and last trips each read the row three times and whose steady trip reads it as its
-    data decides counts its reads as every trip makes them, an end reading more than a steady trip adding
-    none, so a walk of one trip, both its ends at once, counts no reread it may not make: its one read before
-    the walk and the walk's none, no L2 traffic past its row and output (Train 1508's F1)."""
-    def body(row, out, staged, barrier):
-        _read(row, staged, barrier)
-        trips = staged[0].astype(jnp.int32)
+def test_a_walk_whose_trips_read_their_place_counts_no_reads():
+    """A walk whose trips copy its row as their place decides counts none of their reads, as a bound every
+    trip makes holds none of them: one trip may be its first and its last at once (Train 1508's F1). Its first
+    and last trips copying the row three times and its steady trip as its data decides, or every trip but one
+    both first and last copying it twice, a walk of one trip makes no reread, and the launch's one read
+    before the walk none past its row and output."""
+    def walked(step_reads):
+        def body(row, out, staged, barrier):
+            _read(row, staged, barrier)
+            trips = staged[0].astype(jnp.int32)
 
-        def step(index, carry):
-            mosaic.step_index(index)
-            def thrice():
-                _read(row, staged, barrier, times=3)
+            def step(index, carry):
+                mosaic.step_index(index)
+                step_reads(index, trips, functools.partial(_read, row, staged, barrier), staged)
+                return carry
 
-            def inner():
-                lax.cond(index + 1 < trips, lambda: lax.cond(staged[1] > 0, thrice, lambda: None), thrice)
+            lax.fori_loop(0, trips, step, 0)
+            _stored(staged, out)
 
-            lax.cond(index == 0, thrice, inner)
-            return carry
+        return body
 
-        lax.fori_loop(0, trips, step, 0)
-        _stored(staged, out)
+    def ends(index, trips, read, staged):
+        def thrice():
+            read(times=3)
 
-    work = emission.launch_work(_row_kernel(body), Stated(steps=1, bytes_accessed=0))
-    assert work.l2_bytes == 0
+        def inner():
+            lax.cond(index + 1 < trips, lambda: lax.cond(staged[1] > 0, thrice, lambda: None), thrice)
+
+        lax.cond(index == 0, thrice, inner)
+
+    def apart(index, trips, read, staged):
+        def twice():
+            read(times=2)
+
+        lax.cond(index != 0, twice, lambda: lax.cond(index + 1 < trips, twice, lambda: None))
+
+    for step_reads in (ends, apart):
+        work = emission.launch_work(_row_kernel(walked(step_reads)), Stated(steps=1, bytes_accessed=0))
+        assert work.l2_bytes == 0, step_reads.__name__

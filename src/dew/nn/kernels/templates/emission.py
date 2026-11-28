@@ -348,6 +348,12 @@ _PRODUCTS = frozenset({gpu.wgmma_ref_p, gpu.tcgen05_mma_p})
 _COPIES = frozenset({gpu.copy_gmem_to_smem_p, gpu.copy_smem_to_gmem_p})
 """Copies between device and shared memory (`_copied`)."""
 
+def _unread(work: Work) -> Work:
+    """`work` with no copies' reads counted (`Work.device_reads`): a trip's that no bound every trip makes
+    holds (`_Counting.loop`)."""
+    return dataclasses.replace(work, device_reads=0.0)
+
+
 def _folded(equation, operands: list) -> list:
     """`equation` over its concrete integer and boolean scalar operands, each admitted at its atom's dtype
     (`programs.admitted`), as its primitive computes it on the GPU (`programs.scalar_folded`): a width's wrap,
@@ -933,19 +939,20 @@ class _Counting:
         # other trips' places.
         steady = trip("steady", 0)
         odd = trip("steady", 1) if "parity" in consulted else steady
+        # Its reads a bound every trip makes (`Work.device_reads`): a trip that read its place or parity reads
+        # as they decide, one trip may be every place at once, so such a loop's trips count none.
+        unread = bool(consulted)
         self.fixed = self.fixed + steady.fixed
-        self.walks.extend(steady.walks)
-        found = _Loop(_mean([steady.loops[-1].work, odd.loops[-1].work]), steady.loops[-1].marks)
+        self.walks.extend(_unread(walk) if unread else walk for walk in steady.walks)
+        work = _mean([steady.loops[-1].work, odd.loops[-1].work])
+        found = _Loop(_unread(work) if unread else work, steady.loops[-1].marks)
         self.ended(found, walks=True)
         if ranged is not None and found.marks and not self.loops:
-            # The first and last trips each take their own work in place of a steady one's; its reads a bound
-            # every trip makes, so an end reading more than a steady trip adds none (one trip may be both
-            # ends: `Work.device_reads`).
+            # The first and last trips each take their own work in place of a steady one's.
             for at in _PLACES[1:]:
                 taken = (_mean([trip(at, parity).loops[-1].work for parity in (0, 1)]) if "at" in consulted
                          else found.work)
-                ended = taken + repeated(found.work, -1)
-                self.fixed += dataclasses.replace(ended, device_reads=min(ended.device_reads, 0.0))
+                self.fixed = self.fixed + (_unread(taken) if unread else taken) + repeated(found.work, -1)
 
     def warps(self, equation, values: list, given: list[bool]) -> None:
         """A warpgroup's warps each running its role (`plgpu.warp_map`'s `mpmd_map`: tcgen05's load and
