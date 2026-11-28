@@ -9,7 +9,7 @@ reaches shared memory."""
 import dataclasses
 import functools
 from collections.abc import Callable
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import jax
 from jax import numpy as jnp
@@ -18,7 +18,10 @@ from jax.experimental.mosaic.gpu import utils as mgpu_utils
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
 from dew.algebra import bits
-from dew.nn.kernels.templates import cost, product as product_formats, resources
+from dew.nn.kernels.templates import product as product_formats, resources
+
+if TYPE_CHECKING:
+    from dew.nn.kernels.templates.cost import Work
 
 NVFP4_GROUP = 128
 """Dew: the depths an NVFP4 matrix's staged order groups (`nvfp4_staged_depth`): a group's sixteen word rows
@@ -487,7 +490,7 @@ def rows_decoded(words, scales, interpret: bool, *, layout=None, fmt: str | None
     return jnp.concatenate([lane for _, _, lane in stream], axis=1)
 
 
-def nvfp4_decode_work() -> cost.Work:
+def nvfp4_decode_work() -> "Work":
     """A staged NVFP4 value's decode (`lanes`), in the one cost vocabulary (`templates.cost.Work`): its
     word's share of `bits.NVFP4_BFLOAT16_FORM`'s issues (eight codes a word) and its block's share of
     `bits.E4M3_SCALE_FORM`'s (one scale a `product.NVFP4.depth` values), each pipe's (row 14106). The fp32

@@ -116,10 +116,10 @@ def decode_seconds(tiles: "Tiles", decoded: tuple, rates: unit_cost.Rates) -> fl
     elements = (tiles.block_m * tiles.block_k, tiles.block_n * tiles.block_k)
     seconds = 0.0
     for count, form in zip(elements, decoded, strict=True):
-        if form is None or Decoded(*form).work is None:
+        stage = None if form is None else Decoded(*form)
+        if stage is None or stage.work is None:
             continue
-        _, copies, work = Decoded(*form)
-        priced, _ = unit_cost.units(unit_cost.repeated(work, count * copies), rates)
+        priced, _ = unit_cost.units(unit_cost.repeated(stage.work, count * stage.copies), rates)
         seconds = max(seconds, *priced)
     return seconds
 

@@ -1812,9 +1812,10 @@ def test_a_grouped_nvfp4_product_of_no_depth_is_zero(generation_name):
 
 def test_a_packed_steps_price_counts_its_decodes_integer_pipes():
     """A step whose NVFP4 operand its consumers decode (`pricing.step_seconds`, the form's work in its
-    `Decoded`, row 14106): where the decode's integer issues outlast its products (a swapped decode's 16
-    token columns against its 128 decoded rows), the step is priced above its products' and shared bytes';
-    where the products outlast them (128 columns), at those alone, the decode's pipes beside them."""
+    `Decoded`, row 14106): where the decode's integer issues outlast its products and shared bytes (a
+    swapped decode of 8 tokens against its 128 decoded rows a step, an H100's ALU at 64 lanes a clock), the
+    step is priced above those; where the products outlast them (128 columns), at those alone, the decode's
+    pipes beside them."""
     from dew.nn.kernels.templates.gemm import packed, pricing
 
     h100, work = generation.gpu_target("sm90"), packed.nvfp4_decode_work()
@@ -1822,6 +1823,6 @@ def test_a_packed_steps_price_counts_its_decodes_integer_pipes():
     def priced(tiles, form):
         return pricing.step_seconds(tiles, h100, (0.5, 2), (form, None), issued=jnp.bfloat16)
 
-    narrow, wide = (tiling.Tiles(128, columns, 64, 2, 1, family="wgmma") for columns in (16, 128))
+    narrow, wide = (tiling.Tiles(128, columns, 64, 2, 1, family="wgmma") for columns in (8, 128))
     assert priced(narrow, pricing.Decoded(0, 1, work)) > priced(narrow, pricing.Decoded(0, 1))
     assert priced(wide, pricing.Decoded(0, 1, work)) == priced(wide, pricing.Decoded(0, 1))

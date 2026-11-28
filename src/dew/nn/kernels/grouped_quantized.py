@@ -17,7 +17,7 @@ from . import generation
 from .formats import Bf16Window, TernaryWeights
 from .grouped_launch import INTERPRETED
 from .grouped_matmul import MosaicGmm, MosaicTgmm, _beside, _stored_dtypes
-from .templates.gemm import packed, pricing, tiling
+from .templates.gemm import packed, tiling
 from .templates.gemm.hooks import NO_HOOKS, Hooks
 from .templates.product import NVFP4, SCALE_DEPTH
 
@@ -106,6 +106,8 @@ class MosaicPackedGmm(MosaicGmm):
         # whatever the bank's size, an empty one's too).
         stored = 0.5 + jnp.dtype(kernel.scales.dtype).itemsize / NVFP4.depth
         rows, stage = jnp.dtype(tokens.dtype).itemsize, jnp.dtype(kernel.dtype).itemsize
+        from .templates.gemm import pricing
+
         # Each value's decode priced on the pipes its bit forms issue on (row 14106).
         work = packed.nvfp4_decode_work()
         if tile.swapped:
