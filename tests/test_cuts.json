@@ -28,7 +28,7 @@
 "tests/test_algebra_derive.py::test_chunked_moments_balanced_quotient_direction_jvp[2-merge]",
 "tests/test_algebra_derive.py::test_chunked_moments_balances_unequal_scales_value_gradients_and_explicit_sharding",
 "tests/test_algebra_derive.py::test_chunked_moments_contract_broadcasts_promotes_scans_and_rejects_empty",
-"tests/test_algebra_derive.py::test_chunked_moments_handles_narrow_float16_and_bfloat16_inputs[merge-float16]",
+"tests/test_algebra_derive.py::test_chunked_moments_handles_narrow_float16_and_bfloat16_inputs[walk-float16]",
 "tests/test_algebra_derive.py::test_chunked_moments_move_value_cotangents_along_weights[2-walk]",
 "tests/test_algebra_derive.py::test_chunked_moments_preserve_the_large_mean_cotangent[1-walk]",
 "tests/test_algebra_derive.py::test_chunked_moments_preserves_extreme_anchors[zero-prefix-walk]",
@@ -40,7 +40,7 @@
 "tests/test_algebra_derive.py::test_the_derived_walk_computes_the_declared_function[products-walked]",
 "tests/test_algebra_derive.py::test_weighted_moments_exclude_nonfinite_zero_weight_samples_without_losing_finite_directions[direct]",
 "tests/test_algebra_derive.py::test_weighted_moments_exclude_nonfinite_zero_weight_samples_without_losing_finite_directions[walk]",
-"tests/test_algebra_derive.py::test_weighted_moments_keep_the_direction_when_dividing_first_would_flush[walk]",
+"tests/test_algebra_derive.py::test_weighted_moments_keep_subnormal_mass_in_their_mean_variance_and_pullback[walk-vmapped]",
 "tests/test_algebra_derive.py::test_zero_mass_scaled_covariance_ad"
 ],
 "tests/test_algebra_fusion.py": [
@@ -485,10 +485,10 @@
 "tests/test_attention_mosaic_compile.py::test_the_forward_compiles_spill_free_as_its_model_decides[sm100-64-SPLIT-bfloat16-none]",
 "tests/test_attention_mosaic_compile.py::test_the_forward_compiles_spill_free_as_its_model_decides[sm120-128-NONE-bfloat16-band-bias]",
 "tests/test_attention_mosaic_compile.py::test_the_forward_compiles_spill_free_as_its_model_decides[sm120-128-NONE-bfloat16-row-indexed]",
-"tests/test_attention_mosaic_compile.py::test_the_forward_compiles_spill_free_as_its_model_decides[sm120-128-NONE-bfloat16-tile-bias]",
-"tests/test_attention_mosaic_compile.py::test_the_forward_compiles_spill_free_as_its_model_decides[sm120-128-SPLIT-bfloat16-alibi]",
-"tests/test_attention_mosaic_compile.py::test_the_forward_compiles_spill_free_as_its_model_decides[sm120-128-SPLIT-bfloat16-row-indexed]",
-"tests/test_attention_mosaic_compile.py::test_the_forward_compiles_spill_free_as_its_model_decides[sm120-128-SPLIT-bfloat16-tile-bias]",
+"tests/test_attention_mosaic_compile.py::test_the_forward_compiles_spill_free_as_its_model_decides[sm120-128-NONE-float16-dropout]",
+"tests/test_attention_mosaic_compile.py::test_the_forward_compiles_spill_free_as_its_model_decides[sm120-128-SPLIT-bfloat16-band-bias]",
+"tests/test_attention_mosaic_compile.py::test_the_forward_compiles_spill_free_as_its_model_decides[sm120-128-SPLIT-bfloat16-sinks]",
+"tests/test_attention_mosaic_compile.py::test_the_forward_compiles_spill_free_as_its_model_decides[sm120-128-SPLIT-float16-dropout]",
 "tests/test_attention_mosaic_compile.py::test_the_forward_compiles_spill_free_as_its_model_decides[sm120-256-OUTPUT-bfloat16-none]",
 "tests/test_attention_mosaic_compile.py::test_the_forward_compiles_spill_free_as_its_model_decides[sm120-64-NONE-bfloat16-none]",
 "tests/test_attention_mosaic_compile.py::test_the_forward_compiles_spill_free_as_its_model_decides[sm120-64-SPLIT-bfloat16-none]",
@@ -1835,7 +1835,7 @@
 "tests/test_forked_calls.py::test_rows_over_forks_score_and_train_as_the_rows_laid_out_whole[mixture]"
 ],
 "tests/test_fp8_base.py": [
-"tests/test_fp8_base.py::test_lora_packs_the_frozen_base_once_in_place_of_its_kernels_and_training_moves_neither"
+"tests/test_fp8_base.py::test_a_process_sharing_its_gpu_measures_no_site"
 ],
 "tests/test_fp8_preset.py": [
 "tests/test_fp8_preset.py::test_a_grouped_output_projection_takes_the_recipe_group_by_group",
@@ -2909,8 +2909,8 @@
 "tests/test_moe_exchange.py::test_decoder_exchange_retains_logits_and_expert_bias_observations[True]"
 ],
 "tests/test_moe_precision.py": [
-"tests/test_moe_precision.py::test_a_projection_differentiates_the_same_law_in_every_direction[rows-4-2-float32-float32-float32]",
-"tests/test_moe_precision.py::test_a_projection_rounds_whole_contractions_once[rows-4-2-random-float32-float32]",
+"tests/test_moe_precision.py::test_a_projection_rounds_whole_contractions_once[columns-1-1-random-float32-bfloat16]",
+"tests/test_moe_precision.py::test_a_projection_rounds_whole_contractions_once[rows-4-2-random-float64-float64]",
 "tests/test_moe_precision.py::test_both_dispatches_take_the_same_adam_steps_in_bf16[pallas-8-1-False-False-None-geglu]",
 "tests/test_moe_precision.py::test_both_dispatches_take_the_same_adam_steps_in_bf16[xla-4-2-False-False-None-swiglu]",
 "tests/test_moe_precision.py::test_the_pallas_kernels_hold_the_contract_on_one_device[bfloat16-fewer-rows]"
