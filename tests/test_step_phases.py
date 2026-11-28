@@ -19,7 +19,7 @@ from test_data_mixtures import READ, Indexed, assert_same, checkpointed_trainer,
 from dew.batch import PHASE, VALID_ROWS, Phase
 from dew.data import Memory, Phase as DataPhase, Steps, mix, phases
 from dew.data.compile import compile
-from dew.data.dataset import Closeable, DataPartition
+from dew.data.dataset import Checkpointable, Closeable, DataPartition
 from dew.data.pipeline import Pipeline
 from dew.mesh import LayoutRefused
 from dew.objectives.base import Aux, Objective
@@ -257,6 +257,73 @@ def test_phases_that_read_a_corpus_alone_continue_it_across_their_boundary(read_
     assert first and second
     assert first + second == KEPT[:len(first) + len(second)]
     resumes_as_read(loader, whole, (2, 3, 4, 6))
+
+
+def test_phases_reading_two_unnamed_grain_corpora_of_one_length_read_each_its_own():
+    """Two phases on the step clock each reading its own unnamed Grain corpus, of one length and alike in
+    every stated field, read streamed: each phase its own records, the two no shared corpus (row 14119:
+    keyed alike by their fingerprints, the second read as continuing the first and refused)."""
+    import grain.python as grain
+
+    from dew.data import from_grain
+
+    def corpus(tag: int):
+        held = [{"id": np.int32(1000 * tag + index), "length": np.int32(4)} for index in range(48)]
+        return from_grain(grain.MapDataset.source(held)).map(Tokens()).repeat().batch(tokens=64)
+
+    loader = compile(phases(DataPhase(corpus(1), Steps(2)), DataPhase(corpus(2))), read="streamed",
+                     loading=READ)
+    batches, stream = read(loader, 4)
+    assert isinstance(stream, Closeable)
+    stream.close()
+    assert {id_ // 1000 for ids, phase in batches[:2] for id_ in ids} == {1}
+    assert {id_ // 1000 for ids, phase in batches[2:] for id_ in ids} == {2}
+
+
+def reused_unnamed_phases(appended: bool = False):
+    """Three phases on the step clock, the first and the last reading one unnamed Grain corpus of 48 rows
+    (ids 1000 on), alone and repeated, the middle another corpus (ids 2000 on), each batched by 64 tokens:
+    the first to step 2, the middle to step 4; `appended`, the third to step 6 and a fourth reading another
+    unnamed Grain corpus alike in every stated field (ids 3000 on)."""
+    import grain.python as grain
+
+    from dew.data import from_grain
+
+    def unnamed(first: int):
+        held = [{"id": np.int32(first + index), "length": np.int32(4)} for index in range(48)]
+        return from_grain(grain.MapDataset.source(held)).map(Tokens()).repeat().batch(tokens=64)
+
+    reused = unnamed(1000)
+    head = (DataPhase(reused, Steps(2)), DataPhase(member(2, endless=True).batch(tokens=64), Steps(4)))
+    if not appended:
+        return phases(*head, DataPhase(reused))
+    return phases(*head, DataPhase(reused, Steps(6)), DataPhase(unnamed(3000)))
+
+
+@pytest.mark.parametrize("appended", [False, True], ids=["as-saved", "phase-appended"])
+def test_a_position_main_saved_of_one_unnamed_corpus_two_phases_read_resumes_it(appended):
+    """A read of three phases whose first and last read one unnamed Grain corpus, saved at step 3 (in the
+    middle phase) by main at 51ef7d0cae, its cursor keyed by the corpus's content: resumed, as saved or with
+    a phase appended reading another unnamed corpus alike in every stated field, it reads on as the read
+    never stopped, the third phase continuing the corpus at its ninth record (1008), where keying it by its
+    place in the process, or moving its key for the later corpus, read it again from its start (train
+    1484's P-F2; its review)."""
+    saved = (Path(__file__).parent / "fixtures" / "step_phases" / "reused_unnamed_at_3.json").read_bytes()
+    loader = compile(reused_unnamed_phases(appended), read="streamed", loading=READ)
+    whole, stream = read(loader, 8 if appended else 6)
+    assert isinstance(stream, Closeable)
+    stream.close()
+    if appended:
+        # The appended phase its own corpus, apart from the one the first and third share.
+        assert {id_ // 1000 for ids, phase in whole if phase.index == 3 for id_ in ids} == {3}
+    resumed = loader.train(DataPartition())
+    assert isinstance(resumed, Checkpointable)
+    resumed.set_state(saved)
+    rest, _ = read(loader, len(whole) - 3, resumed)
+    assert isinstance(resumed, Closeable)
+    resumed.close()
+    assert rest == whole[3:]
+    assert next(ids for ids, phase in rest if phase.index == 2)[0] == 1008
 
 
 def test_phases_that_share_a_corpus_otherwise_than_as_one_member_each_are_refused():
