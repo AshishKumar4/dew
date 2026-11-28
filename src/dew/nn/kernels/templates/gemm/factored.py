@@ -19,7 +19,7 @@ from dew.nn import float_bits, precision
 from dew.nn.derivatives import KernelGlue, contracted, declared_tangent
 from dew.nn.kernels import generation
 from dew.nn.kernels.templates import axes as side_axes
-from dew.nn.sharding import explicit_placement, explicit_spec, summed_to, varying_like
+from dew.nn.sharding import explicit_placement, explicit_spec, summed_to, unbroadcast, varying_like
 
 
 def factored(run: Callable, operands: tuple, factor: jax.Array, rows: jax.Array, *, wide: Callable,
@@ -576,8 +576,8 @@ class _Transpose:
             for cotangent, index in slots:
                 held, like = (scales[index], cotangents[index]) if cotangent else (cotangents[index],
                                                                                     scales[index])
-                terms.append(_placed_like(generation.unbroadcast(owed_exactly(product, held, self.raised),
-                                                                 jnp.shape(like)), like))
+                terms.append(_placed_like(unbroadcast(owed_exactly(product, held, self.raised),
+                                                      jnp.shape(like)), like))
             return tuple(terms)
 
         # Its joint derivative in the moving tangents and the residuals the declared pair sum's own
