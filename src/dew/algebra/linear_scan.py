@@ -35,7 +35,9 @@ tokens in turn. Each identity holds of every chunk, its side condition a fact of
   `gamma_last h_in + sum_t (B_t * exp(G_last - G_t)) U_t^T`, its decays the exponentials of its exponents'
   prefix sums `G` (`gamma = exp(G)`, and each pair's `exp(G_i - G_j)` inside `gram`);
 - `solve`: a unit lower-triangular solve is the given values plus the inverse's strictly lower part applied
-  (its inverse by doubling, `doubled`), or a forward substitution (`substituted`), the two side by side;
+  (its inverse by doubling, `doubled`), or a forward substitution (`substituted`), the two side by side; a
+  substitution of values that read the entering state (`stateful`) is priced past every form, its row walk
+  over the state no equation of the program's language and so no carry split's (`scan`'s);
 - `linear`: a solve of a difference whose second part is a product with the entering state is the
   difference of two solves, the second a solve of the product's left operand, so a solve reads no state.
 
@@ -80,6 +82,7 @@ from egglog import (
     ruleset,
     set_,
     union,
+    var,
     vars_,
 )
 from jax.extend import core as jcore
@@ -905,6 +908,34 @@ def columns_of(value: Chunk) -> i64: ...
 """A value's columns at the chunk's extents."""
 
 
+@function(merge=lambda old, new: old)
+def stateful(value: Chunk) -> i64: ...
+"""1 where a value reads the chunk's entering state (`Chunk.entering`, a token loop's), in any of its
+forms."""
+
+
+READING = (Chunk.entering, Chunk.loop, Chunk.plain)
+"""The constructors that read the chunk's entering state themselves (`reads_state`, `stateful`): the state,
+and a token loop's, which walks it."""
+
+
+@functools.cache
+def _stateful():
+    """Which values read the entering state (`stateful`): a constructor of `READING`'s, and any value of the
+    language (`CONSTRUCTORS`, each by its declared signature, `terms.pattern_of`) any of whose operands reads
+    it. Run after saturation, so it adds no fact a saturation's limits count, for extraction alone
+    (`derive`)."""
+    t = var("t", Chunk)
+    marked = []
+    for index, constructor in enumerate(CONSTRUCTORS):
+        made, operands = terms.pattern_of(Chunk, constructor, f"s{index}")
+        if constructor in READING:
+            marked.append(rule(eq(t).to(made)).then(set_(stateful(t)).to(i64(1))))
+        marked += [rule(eq(t).to(made), eq(stateful(operand)).to(i64(1))).then(set_(stateful(t)).to(i64(1)))
+                   for operand in operands]
+    return ruleset(*marked, name="chunk_stateful")
+
+
 def _shapes(token_count: int, key_count: int, value_count: int, apart: int, values_read: bool):
     """Each value's shape (`rows_of`, `columns_of`) from its operands', as the e-graph grows, at a chunk's
     extents (`Extents`: its tokens, keys and values, its readout's `apart` and `values_read`)."""
@@ -976,13 +1007,22 @@ def derive(extents: Extents, *, corrects: bool, schedule: cost.Schedule, precisi
     rules = _chunk_rules(corrects, extents.decay_keys == 1, extents.values_read, extents.apart,
                          extents.across, extents.before, extents.erased, extents.tokens, extents.keys,
                          extents.values)
-    with program.fresh_graph(rules) as graph:
+    with program.fresh_graph(rules, _stateful()) as graph:
         graph.register(root, *_leaves(extents))
         sized = program.node_count(graph)
         saturated = program.run_within(graph, rules, saturation.sized(sized, _depth(root)), "a scan's chunk")
+        # The saturation's own rows, before the facts extraction reads (`stateful`) are added.
+        nodes = program.node_count(graph)
+        graph.run(_stateful().saturate())
 
         def marginal(egraph: EGraph, node) -> cost.Seconds:
             if get_callable_args(node, Chunk.solve) is not None:
+                return cost.Seconds(Work(), schedule, math.inf)
+            # A forward substitution whose given values read the entering state walks its rows over the
+            # state, which no equation of the program's language computes, so no carry split takes it
+            # (`carry.split`): the `linear` identity's two solves are its form, the state's a product.
+            substituted = get_callable_args(node, Chunk.substituted)
+            if substituted is not None and egraph.lookup_function_value(stateful(substituted[1])) is not None:
                 return cost.Seconds(Work(), schedule, math.inf)
             return cost.Seconds(_work(node, extents, lambda child: _shape_of(egraph, child), precision),
                                 schedule)
@@ -995,7 +1035,8 @@ def derive(extents: Extents, *, corrects: bool, schedule: cost.Schedule, precisi
         outputs, state = parts if parts is not None else (extracted.outputs(), extracted.state())
         shape_of = functools.partial(_shape_of, graph)
         price = cost.Seconds(_priced((outputs, state), extents, shape_of, precision), schedule)
-        kernel_report.record_rewrite(program.reported(graph, sized, saturated, began, price.value))
+        kernel_report.record_rewrite(program.reported(graph, sized, saturated, began, price.value,
+                                                      nodes=nodes))
     return Form(outputs, state, price, extents.apart, extents.across, extents.before, extents.erased)
 
 
@@ -1145,9 +1186,9 @@ def looped(roots: tuple[Chunk, ...]) -> bool:
 
 
 def reads_state(node: Chunk) -> bool:
-    """Whether `node` reads the entering state."""
+    """Whether `node` reads the entering state (`READING`)."""
     return any(get_callable_args(each, constructor) is not None for each in _nodes((node,))
-               for constructor in (Chunk.entering, Chunk.loop, Chunk.plain))
+               for constructor in READING)
 
 
 def prepared(roots: tuple[Chunk, ...]) -> list[Chunk]:

@@ -1,8 +1,8 @@
 """Focused native-image repair oracles under the diffusers-pipelines cohort (tools/reference_releases.py).
 
 Each walk is recorded in float32, the reference, and in float64 (`.fp64`), the truth: the
-schedulers' walks with their modules' float32 read as float64
-(`diffusers_wan_reference.float64_scheduler`), the UNet widened (`_dew_torch.precision.float64`).
+schedulers' walks their classes' independent oracles' (tools/float64_schedulers.py), the UNet
+widened (`_dew_torch.precision.float64`).
 
 Run in the isolated reference environment on CPU:
   python tools/native_diffusion_edges_reference.py generate OUTPUT
@@ -11,7 +11,6 @@ No model or source downloads. The reload command executes actual source pipeline
 """
 import argparse
 import json
-import sys
 from pathlib import Path
 from typing import Any
 
@@ -24,8 +23,9 @@ from diffusers.schedulers.scheduling_ddim import DDIMScheduler
 from diffusers.schedulers.scheduling_dpmsolver_multistep import DPMSolverMultistepScheduler
 from diffusers.schedulers.scheduling_euler_discrete import EulerDiscreteScheduler
 from diffusers.schedulers.scheduling_pndm import PNDMScheduler
-from diffusers_wan_reference import float64_scheduler
+from float64_schedulers import oracle_of
 from reference_releases import require
+from scheduler_cases import Case, calls
 
 from _dew_torch.precision import float64, float64_twin
 
@@ -46,18 +46,13 @@ def generate(root):
     initial = torch.randn((256, 3), generator=torch.Generator().manual_seed(61), dtype=torch.float64) * 8
     arrays = {"initial": initial.to(torch.float32).numpy()}
 
-    def walked(cls: Any, options: dict[str, Any], dtype):
-        """Four steps of a scheduler `cls` (Diffusers' schedulers share this surface but type none of it)."""
-        scheduler = cls(**common, **options)
+    def walked(scheduler, cls, dtype) -> np.ndarray:
+        """Four steps of `scheduler`, the Diffusers class `cls` or its float64 oracle
+        (tools/float64_schedulers.py), whose surfaces are alike but typed apart: the walk the scheduler
+        cases take (`scheduler_cases.calls`), its model the oracle's."""
         scheduler.set_timesteps(4)
         x = torch.from_numpy(arrays["initial"]).to(dtype) * scheduler.init_noise_sigma
-        trajectory = []
-        for time in scheduler.timesteps:
-            model_input = scheduler.scale_model_input(x, time)
-            prediction = torch.sin(model_input) * 0.07 + time.to(dtype) * 0.001
-            x = scheduler.step(prediction, time, x).prev_sample
-            trajectory.append(x.numpy().copy())
-        return scheduler, np.stack(trajectory)
+        return np.stack([call.after.numpy().copy() for call in calls(scheduler, Case(cls.__name__), x)])
 
     walks: list[tuple[str, Any, dict[str, Any]]] = [
         ("ddim-linspace", DDIMScheduler, dict(timestep_spacing="linspace", clip_sample=False, set_alpha_to_one=False)),
@@ -67,7 +62,8 @@ def generate(root):
         ("dpm-karras", DPMSolverMultistepScheduler, dict(use_karras_sigmas=True)),
     ]
     for name, cls, options in walks:
-        scheduler, trajectory = walked(cls, options, torch.float32)
+        scheduler = cls(**common, **options)
+        trajectory = walked(scheduler, cls, torch.float32)
         scheduler.save_pretrained(root / name)
         config = json.loads((root / name / "scheduler_config.json").read_text())
         arrays[name + ".config"] = np.asarray(json.dumps(config))
@@ -77,10 +73,10 @@ def generate(root):
             arrays[name + ".sigmas"] = scheduler.sigmas.numpy()
         arrays[name + ".trajectory"] = trajectory
         arrays[name + ".final"] = trajectory[-1]
-        with float64_scheduler(sys.modules[cls.__module__]):
-            scheduler, trajectory = walked(cls, options, torch.float64)
-        arrays[name + ".betas.fp64"] = scheduler.betas.numpy()
-        arrays[name + ".final.fp64"] = trajectory[-1]
+        # Its truth the class's independent oracle, its tables its own in float64.
+        oracle = oracle_of(cls(**common, **options))
+        arrays[name + ".final.fp64"] = walked(oracle, cls, torch.float64)[-1]
+        arrays[name + ".betas.fp64"] = oracle.betas.numpy()
     np.savez_compressed(root / "schedulers.npz", allow_pickle=False, **arrays)
     torch.manual_seed(173)
     # Diffusers types each per-block tuple as a 1-tuple (`tuple[int]`); these are its config's values.

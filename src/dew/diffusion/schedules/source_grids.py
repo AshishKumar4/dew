@@ -25,7 +25,7 @@ import numpy as np
 from dew import _records
 from dew._records import JSON
 from dew.diffusion.process import Process
-from dew.diffusion.schedules.common import GeneralizedNoiseScheduler, NoiseScheduler, ancestral_variance
+from dew.diffusion.schedules.common import GeneralizedNoiseScheduler, NoiseScheduler, ancestral_step
 from dew.diffusion.schedules.cosine import cosine_beta_schedule
 from dew.diffusion.schedules.discrete import DiscreteNoiseScheduler
 from dew.diffusion.schedules.flow import RectifiedFlow, static_shift
@@ -521,8 +521,8 @@ def _stage_grid(policy: SourcePolicy, betas: np.ndarray, steps: int) -> tuple[np
     levels = np.asarray(sigmas, np.float64)
     following = levels[1:]
     if policy.kind == "KDPM2AncestralDiscrete":
-        up = np.sqrt(ancestral_variance(levels[:-1], following))
-        targets = np.sqrt(np.maximum(following ** 2 - up ** 2, 0.0))
+        # The level the solver steps down to, as it computes it (`ancestral_step`).
+        targets, _ = ancestral_step(levels[:-1], following)
     else:
         targets = following
     with np.errstate(divide="ignore"):

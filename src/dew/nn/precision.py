@@ -2050,14 +2050,38 @@ def summed_once(values: Sequence[jax.Array], products: Sequence[tuple[jax.Array,
     return _summed_once(tuple(values), tuple(products))
 
 
+def _carried(residual: jax.Array) -> jax.Array:
+    """A product's rounding `summed_once` carries, none where its split passed the float's range: the
+    product's own rounding is then the plain sum's."""
+    return jnp.where(jnp.isfinite(residual), residual, jnp.zeros_like(residual))
+
+
+def ordered_two_sum(left: jax.Array, right: jax.Array) -> tuple[jax.Array, jax.Array]:
+    """`left + right` rounded, and exactly what the rounding dropped, by the larger operand first (Dekker's
+    FastTwoSum over the pair ordered by magnitude): where the sum is finite, `total - big` is no larger than
+    the smaller operand and never passes the range, where TwoSum's `total - left` may (-3 2^103 + FLT_MAX:
+    train 1407's and 1419's P0s, the residual kept, not dropped as NaN or zero)."""
+    with rounding_alone():
+        left, right = uncontracted(left, right)
+        if jnp.iscomplexobj(left) or jnp.iscomplexobj(right):
+            # A complex sum's parts each ordered on its own: the modulus orders neither (train 1423's P0).
+            real, real_dropped = ordered_two_sum(jnp.real(left), jnp.real(right))
+            imaginary, imaginary_dropped = ordered_two_sum(jnp.imag(left), jnp.imag(right))
+            return jax.lax.complex(real, imaginary), jax.lax.complex(real_dropped, imaginary_dropped)
+        larger = jnp.abs(left) >= jnp.abs(right)
+        big, small = jnp.where(larger, left, right), jnp.where(larger, right, left)
+        total = left + right
+        return total, small - (total - big)
+
+
 def _summed_once_value(values, products):
     total, carried = values[0], jnp.zeros_like(values[0])
     for left, right in products:
         product, lost = two_product(left, right, bit_split=True)
-        total, dropped = two_sum(total, product)
-        carried = carried + (lost + dropped)
+        total, dropped = ordered_two_sum(total, product)
+        carried = carried + (_carried(lost) + dropped)
     for value in values[1:]:
-        total, dropped = two_sum(total, value)
+        total, dropped = ordered_two_sum(total, value)
         carried = carried + dropped
     # Each sum's rounded half the plain running sum, which reads an infinity as `jnp.sum` does.
     return compensated_total((total, carried), total)

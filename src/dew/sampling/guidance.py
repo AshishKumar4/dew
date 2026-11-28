@@ -40,6 +40,7 @@ from typing import Any, Protocol, runtime_checkable
 import jax
 import jax.numpy as jnp
 from flax import linen as nn, struct
+from jax import lax
 
 from dew.batch import Variables
 from dew.diffusion.process import Denoiser
@@ -246,26 +247,38 @@ class CFG:
         object.__setattr__(self, "interval", _interval(self.interval))
         object.__setattr__(self, "rescale", float(self.rescale))
 
-    def _guided(self, denoise: Denoiser, scale: jax.Array) -> Predict:
+    def _guided(self, denoise: Denoiser, scale: jax.Array, inside: jax.Array) -> Predict:
         def guided(x, t):
             (output, unconditional), sown = denoise.raw_both_observed(x, t)
             combined = guide(output, unconditional, scale)
             if self.rescale:
-                axes = tuple(range(1, combined.ndim))
-                deviation = jnp.std(output, axis=axes, keepdims=True, ddof=1)
-                guided_deviation = jnp.std(combined, axis=axes, keepdims=True, ddof=1)
-                rescaled = combined * (deviation / guided_deviation)
-                combined = self.rescale * rescaled + (1.0 - self.rescale) * combined
+                # Rescaled on the steps that guide alone: one outside the interval is the conditional output
+                # as it is, its deviations never formed, whose quotient and square root a constant output
+                # makes 0 / 0 and its derivative infinite (row 14128); one inside rescales at any scale, a
+                # unit one too.
+                guided_ = combined
+                combined = lax.cond(jnp.asarray(inside), lambda: self._rescaled(output, guided_),
+                                    lambda: guided_)
             return denoise.observed(denoise.convert(x, t, combined), sown)
 
         return guided
+
+    def _rescaled(self, output: jax.Array, combined: jax.Array) -> jax.Array:
+        """`combined` rescaled to `output`'s per-sample standard deviation, mixed with itself at weight
+        `rescale` (Lin et al. 2023, section 3.4)."""
+        axes = tuple(range(1, combined.ndim))
+        deviation = jnp.std(output, axis=axes, keepdims=True, ddof=1)
+        guided_deviation = jnp.std(combined, axis=axes, keepdims=True, ddof=1)
+        rescaled = combined * (deviation / guided_deviation)
+        return self.rescale * rescaled + (1.0 - self.rescale) * combined
 
     def modules(self) -> tuple[nn.Module, ...]:
         return ()
 
     def walk(self, denoise: Denoiser, steps: int | jax.Array) -> Walk:
-        scales = _scales(self.scale, self.interval, steps)
-        return Walk.stateless(lambda index: self._guided(denoise, scales(index)))
+        inside = _inside(self.interval, steps)
+        return Walk.stateless(lambda index: self._guided(denoise, jnp.where(inside(index), self.scale, 1.0),
+                                                         inside(index)))
 
 
 @struct.dataclass

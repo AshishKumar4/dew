@@ -167,14 +167,44 @@ def outside_suite(environ: Mapping[str, str]) -> dict[str, str]:
     return {**{name: value for name, value in environ.items() if name not in suite}, "JAX_PLATFORMS": "cpu"}
 
 
+def _flag_spans(flags: str) -> list[tuple[str, str]]:
+    """`flags` (an XLA_FLAGS value) as XLA reads it (xla/parse_flags_from_env.cc's `ParseArgvFromString`):
+    each flag its name and its whole span as written, a quoted value (`--name="a b"` or `'a b'`, a backslash
+    escaping within double quotes) whole with its quotes, an unquoted one to the next whitespace; read up to
+    the first span that is no flag, as XLA gives up there, the rest kept as one span of no name."""
+    spans, at, end = [], 0, len(flags)
+    while at < end and flags[at].isspace():
+        at += 1
+    while at < end and flags[at] == "-":
+        start = at
+        while at < end and flags[at].isascii() and (flags[at] in "-_" or flags[at].isalnum()):
+            at += 1
+        name = flags[start:at]
+        if at + 1 < end and flags[at] == "=" and flags[at + 1] in "'\"":
+            quote, at = flags[at + 1], at + 2
+            while at < end and flags[at] != quote:
+                at += 2 if quote == '"' and flags[at] == "\\" and at + 1 < end else 1
+            at = min(at + 1, end)
+        else:
+            while at < end and not flags[at].isspace():
+                at += 1
+        spans.append((name, flags[start:at]))
+        while at < end and flags[at].isspace():
+            at += 1
+    if at < end:
+        spans.append(("", flags[at:]))
+    return spans
+
+
 def _each_once(flags: str) -> str:
     """XLA's flags `flags` with each flag named once, its last value: a process configured again (a second
     `configured`, or a child of a process that was) states each flag it sets once, not again beside the
-    inherited one."""
+    inherited one. Each flag is read whole as XLA reads it (`_flag_spans`), a quoted value holding spaces
+    one flag."""
     named: dict[str, str] = {}
-    for flag in flags.split():
-        named.pop(flag.partition("=")[0], None)
-        named[flag.partition("=")[0]] = flag
+    for name, span in _flag_spans(flags):
+        named.pop(name or span, None)
+        named[name or span] = span
     return " ".join(named.values())
 
 

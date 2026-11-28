@@ -219,34 +219,37 @@ PIPELINE_SEEDS = {"prompts": 8, "walk": 8}
 """Check 1's declared seeds for the pipeline's prompt encoding and its walk, sized by `seeds_for` on
 armada."""
 def source_pipelines(source):
-    """Diffusers' own `ZImagePipeline` the fixture saved, loaded in float32 and widened to float64,
-    the scheduler's tables and float32 pins widened with it (`float64_scheduler`)."""
+    """Diffusers' own `ZImagePipeline` the fixture saved, loaded in float32 and widened to float64, its
+    own float32 pins widened with it (`widened_pipeline`) and its scheduler the class's independent float64
+    oracle (tools/float64_schedulers.py)."""
     import torch
     from diffusers import ZImagePipeline
+    from tool_support import scheduler_oracles
 
     from _dew_torch.precision import float64
 
     def loaded(dtype):
         return ZImagePipeline.from_pretrained(source / "pipeline", torch_dtype=dtype, local_files_only=True)
 
+    oracle_of = scheduler_oracles().oracle_of
     narrow = loaded(torch.float32)
-    with float64(), widened_schedulers():
+    with float64(), widened_pipeline():
         wide = loaded(torch.float64)
+    wide.scheduler = oracle_of(wide.scheduler)
     for pipe in (narrow, wide):
         pipe.set_progress_bar_config(disable=True)
     return narrow, wide
 
 
 @contextlib.contextmanager
-def widened_schedulers():
-    """The pipeline's and its FlowMatch scheduler's float32 pins widened (`float64_scheduler`): the
-    scheduler forms its shifted sigmas, timesteps and steps in float32 otherwise."""
+def widened_pipeline():
+    """The pipeline module's own float32 pins widened (`float64_module`): its call casts its latents to
+    float32 otherwise."""
     from diffusers.pipelines.z_image import pipeline_z_image
-    from diffusers.schedulers import scheduling_flow_match_euler_discrete
 
-    from tools.diffusers_wan_reference import float64_scheduler
+    from tools.diffusers_wan_reference import float64_module
 
-    with float64_scheduler(pipeline_z_image), float64_scheduler(scheduling_flow_match_euler_discrete):
+    with float64_module(pipeline_z_image):
         yield
 
 
@@ -254,7 +257,7 @@ def widened_call(pipe, run):
     """`run(pipe)` with the source's float32 pins widened, as its float64 truth runs."""
     from _dew_torch.precision import float64
 
-    with float64(), widened_schedulers():
+    with float64(), widened_pipeline():
         return run(pipe)
 
 

@@ -56,7 +56,8 @@ class Export:
         # A task that publishes its own released layout (a decision run's) writes it; any other
         # run writes its model in the source layout its family reads, both at the step pinned here.
         # A pool sharing the destination publishes it from its first process (`export_run`).
-        export_run(SavedRun.pinned(self.run, self.step, self.trust), Path(self.destination), ema=self.ema)
+        # The destination as given: a store's URI (`gs://...`) taken as a path loses its `//` (row 14124).
+        export_run(SavedRun.pinned(self.run, self.step, self.trust), self.destination, ema=self.ema)
         emit(f"exported {self.run} to {self.destination}")
         return 0
 

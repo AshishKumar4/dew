@@ -2042,6 +2042,18 @@ def test_a_sum_of_products_rounded_once_keeps_its_residuals_apart_from_its_runni
     overflowing = jax.jit(lambda values: summed_once(tuple(values)))(
         jnp.asarray([largest, big, big, -largest], jnp.float32))
     assert float(overflowing) == 2.0 ** 103
+    # Of -3U/2, M and -(M - U) (U = 2^104) it is -U/2: the first sum lands at M - U from an operand of the
+    # other sign, where TwoSum's `total - left` overflows; the larger operand first, its residual -U/2 is
+    # exact and kept (train 1419's P0).
+    unit = np.float32(2.0 ** 104)
+    near = jax.jit(lambda values: summed_once(tuple(values)))(
+        jnp.asarray([-1.5 * unit, largest, -(largest - unit)], jnp.float32))
+    assert float(near) == -(2.0 ** 103)
+    # A complex sum's parts each kept: of 2^25, 1 + 2^26 i and -2^25 - 2^26 i it is 1, the real part's
+    # residual, where ordering the terms by modulus dropped it (train 1423's P0).
+    parts = jax.jit(lambda values: summed_once(tuple(values)))(
+        jnp.asarray([2.0 ** 25, 1 + 2.0 ** 26 * 1j, -(2.0 ** 25) - 2.0 ** 26 * 1j], jnp.complex64))
+    assert complex(parts) == 1 + 0j
     t = np.float32(1 + 2.0 ** -12)
 
     @jax.jit
