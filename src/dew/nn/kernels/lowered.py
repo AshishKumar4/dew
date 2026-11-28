@@ -404,7 +404,7 @@ def _kernel_call(kind: str | None, target: str, operation: ir.Operation) -> Kern
     if kind == "mosaic_tpu":
         config = json.loads(ir.StringAttr(attributes["backend_config"]).value)["custom_call_config"]
         return KernelCall(kind, ir.StringAttr(attributes["kernel_name"]).value, config["body"].encode(), "",
-                          config.get("cost_estimate", {}).get("flops"))
+                          config.get("cost_estimate", {}).get("flops"), None, _model_flops(attributes))
     # Another's (an FFI kernel's) launch its frontend attribute's (`instrumentation.LAUNCH`).
     return KernelCall(kind, target, b"", "", None, caller=_frontend(attributes).get(LAUNCH))
 

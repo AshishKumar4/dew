@@ -17,7 +17,7 @@ from reference_error import ahead_arm
 
 from dew.nn import precision, programs
 from dew.nn.kernels import generation
-from dew.nn.kernels.templates import cost, emission, mosaic, swizzling
+from dew.nn.kernels.templates import cost, emission, mosaic, mosaic_sm100, swizzling
 from dew.nn.kernels.templates.cost import Stated, Work
 
 _ROW = jax.ShapeDtypeStruct((128,), jnp.float32)
@@ -559,6 +559,67 @@ def test_an_async_smem_to_tmem_copy_charges_shared_bytes_from_its_source_without
     assert sliced_work.shared_bytes == 128 * 64 * 2 and sliced_work.device_bytes == 0
     assert packed_work.shared_bytes == 128 * 64 // 2 and packed_work.device_bytes == 0
 
+
+
+def test_a_prefetch_a_global_ref_and_a_scales_copy_are_priced_as_what_they_move():
+    """A GEMM body's prefetch into the L2 (`plgpu.async_prefetch`) moves no bytes a unit counts, the copies
+    after it reading them; a global allocation's ref (`pl.get_global`, a flag's semaphore) moves none
+    itself; and a block-scaled product's scales copied into tensor memory (`plgpu.async_copy_scales_to_tmem`)
+    read their shared tile's bytes, a 128-row tile's four one-byte e8m0 scales a row 512 (row 14181's
+    launches)."""
+    def body(out_gmem, scales, tensor_scales):
+        plgpu.async_prefetch(out_gmem)
+        pl.get_global(plgpu.SemaphoreType.REGULAR)
+        plgpu.async_copy_scales_to_tmem(scales, tensor_scales)
+
+    tile = mosaic_sm100.scale_tiles(128, 4)
+    launch = plgpu.kernel(body, out_type=_ROW, num_threads=1, thread_name="wg",
+                          scratch_types=[plgpu.SMEM(tile, jnp.float8_e8m0fnu),
+                                         plgpu.TMEM(mosaic_sm100.scale_memory(tile, 1), jnp.float8_e8m0fnu,
+                                                    layout=plgpu.TMEMLayout.SCALES_LAYOUT)])
+    work = emission.emitted(jax.make_jaxpr(launch)(), 1, "wg").roles[0].fixed
+    assert (work.shared_bytes, work.device_bytes, work.device_reads) == (128 * 4, 0, 0)
+
+
+def test_a_high_level_operation_counts_its_expansion_with_its_literal_operands_values():
+    """A high-level operation (`generation.linear_map`, a `HiPrim`) counts the program JAX lowers it to
+    (`programs.high_expansion`, the one expansion the FLOP count reads too), a literal operand its value: a
+    map doubling a 128-wide row over a literal three trips counts three trips' multiplies, 384, where its
+    operand's type alone would leave the trips its data's (Train 1512's review)."""
+    def doubled(trips, moving):
+        return lax.fori_loop(0, trips, lambda step, value: value * 2.0, moving)
+
+    jaxpr = jax.make_jaxpr(lambda row: generation.linear_map(doubled, doubled, 3, row))(_ROW).jaxpr
+    assert emission.emitted(jaxpr, 1, None).roles[0].fixed.operations == 3 * 128
+
+
+def test_a_high_level_operations_constant_is_its_expansions_hoisted_out_of_a_walk():
+    """A high-level operation's expansion counts with the constants it closes over (its expansion's own,
+    `programs.high_expansion`): a map scaling a 128-wide row by the exponentials of a constant gain inside a
+    walk computes them once outside it, as the compiler hoists them, none a step (Train 1512's review)."""
+    gain = jnp.arange(128.0)
+
+    def scaled(residuals, moving):
+        return moving * jnp.exp(gain)
+
+    def walked(row, trips):
+        def step(index, row):
+            mosaic.step_index(index)
+            return generation.linear_map(scaled, scaled, None, row)
+
+        return lax.fori_loop(0, trips, step, row)
+
+    (role, _) = _emitted(walked, _ROW, _TRIPS).roles
+    assert (role.step(_exponentials), role.fixed.exponentials) == (0, 128)
+
+
+def test_a_semaphore_or_a_barrier_stores_no_bytes():
+    """A launch's semaphores and barriers (extended dtypes of no data: a GEMM's tail flags, `pl.get_global`)
+    store no bytes beside its data's (`cost.stored`), so a launch holding them states and footprints its data
+    alone (row 14181's launches)."""
+    row = jax.ShapeDtypeStruct((128,), jnp.float32)
+    flags = plgpu.SemaphoreType.REGULAR((4,)).get_ref_aval()
+    assert cost.stored(row, flags, plgpu.Barrier().get_ref_aval()) == cost.stored(row) == 512
 
 
 def test_a_walks_serial_loops_compose_their_paths_before_their_mean():
@@ -1745,6 +1806,33 @@ def test_a_launchs_l2_traffic_is_the_reads_every_path_makes_at_its_buffers_packe
 
     assert _l2_bytes(guarded(_read)) == _l2_bytes(guarded(looped)) == 512
     assert _l2_bytes(thrice, jnp.float4_e2m1fn, 1024) == 512
+
+
+def test_a_copy_its_predicate_or_a_loops_unproven_trip_guards_counts_no_read():
+    """A copy guarded by its own predicate reads where the predicate holds, surely only where it is known
+    true; a loop no walk marks, its trips its data's, may take none: so neither counts a read (Train 1512's
+    review). Three reads of a 512-byte row past its row and output each count none so guarded, the launch's
+    one read before them none past its row and output, and a predicate known true counts its three."""
+    def predicated(predicate):
+        def body(row, out, staged, barrier):
+            _read(row, staged, barrier)
+            for _ in range(3):
+                # A false predicate skips the copy and its arrival alike, so its wait is the predicate's too.
+                flag = predicate(staged)
+                plgpu.copy_gmem_to_smem(row, staged, barrier, predicate=flag)
+                pl.when(flag)(functools.partial(plgpu.barrier_wait, barrier))
+            _stored(staged, out)
+
+        return body
+
+    def looped(row, out, staged, barrier):
+        _read(row, staged, barrier)
+        trips = staged[0].astype(jnp.int32)
+        lax.fori_loop(0, trips, lambda step, carry: (_read(row, staged, barrier, times=3), carry)[1], 0)
+        _stored(staged, out)
+
+    assert _l2_bytes(predicated(lambda staged: staged[0] > 0)) == _l2_bytes(looped) == 0
+    assert _l2_bytes(predicated(lambda staged: True)) == 1024
 
 
 def test_a_walk_whose_trips_read_their_place_counts_no_reads():
