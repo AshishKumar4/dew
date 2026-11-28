@@ -9,4 +9,5 @@ ENTRY e {
   e = f32[4]{0} tanh(d)
   ROOT r = f32[4]{0} add(e, c)
   z = f32[0]{0} constant({})
+  t = (f32[4]{0}, f32[4]{0}) tuple(a, b)
 }

@@ -16,16 +16,19 @@ HEAD = f"jit(step)/jvp(Head)/{HEAD_SCOPE}/dot_general"
 
 
 def held(size, start, end, buffer, storage=None, *, scaled=False, residual=False, trace=0, op_name=FORWARD,
-         names=(), shape=(), until=None):
+         names=(), shape=(), until=None, stack=None):
     stored = buffer if storage is None else storage
-    return Held(size, op_name, names, scaled, residual, trace, start, end, buffer, stored, shape, until)
+    return Held(size, op_name, names, scaled, residual, trace, start, end, buffer, stored, shape, until,
+                stack)
 
 
-def interval(size, start, end, buffer, *, trace=0, timeline=0, op_name=FORWARD, uses=()):
+def interval(size, start, end, buffer, *, trace=0, timeline=0, op_name=FORWARD, uses=(), storage=None,
+             names=(), stack=None, filling=False):
     return LiveInterval(bytes=size, shape=(size,), dtype="u8", kind="temporary", instruction=f"i{buffer}",
-                        op_name=op_name, source="", allocation=trace, trace=trace, timeline=timeline,
-                        uses=uses, whole=True, complete=True, start=start, end=end, buffer=buffer,
-                        storage=buffer, charged=True)
+                        op_name=op_name, source="", names=names, stack=stack, filling=filling,
+                        allocation=trace, trace=trace,
+                        timeline=timeline, uses=uses, whole=True, complete=True, start=start, end=end,
+                        buffer=buffer, storage=buffer if storage is None else storage, charged=True)
 
 
 def test_the_peak_is_the_most_the_schedule_holds_at_once():
@@ -164,6 +167,61 @@ START = rung()
 def tiled(held: int):
     """A head policy whose tile holds `held` bytes whatever the logits and tile."""
     return lambda whole, tile, fused, itemsize: held
+
+
+def test_a_stack_a_place_recomputes_is_built_nowhere_where_the_forward_reads_it_nowhere():
+    """A scan's stack is one stack in each buffer holding it (`Held.stack`): the zeros its loop fills (40
+    bytes over 0-4), each step's write into them in place (3-8) and the loop's value the backward reads
+    (7-14), of which only the last is a residual. A place recomputing it builds none of them where the
+    forward reads the stack nowhere past its loop, so the forward loop's peak beside its scratch (70) goes
+    with it, the jump's price (`priced`) and the remat order's (`LiveSet.frees`) alike (row 12463: a cold 4B
+    start's remat places priced at 37.8 GiB of its 180.2 GiB miss, its forward loop holding 167 GiB of its
+    stacks' in-loop values); where any op but the backward's reads it past its loop, the loop builds it all
+    the same (review of row 12463)."""
+
+    def profile(*read: tuple[int, str]) -> LiveProfile:
+        loop = (7, 1)
+        found = LiveProfile.of((
+            interval(40, 0, 4, 0, stack=loop, filling=True),
+            interval(40, 3, 8, 1, storage=0, stack=loop, filling=True),
+            interval(40, 7, 14, 2, storage=0, names=("mlp",), stack=loop, uses=(*read, (11, BACKWARD))),
+            interval(30, 2, 9, 3), interval(50, 10, 13, 4, op_name=BACKWARD)), frozenset())
+        assert found is not None
+        return found
+
+    unread = profile()
+    assert [buffer.residual for buffer in unread.held] == [False, False, True, False, False]
+    assert unread.most == 90
+    assert unread.frees(lambda op_name, names: "mlp" in names) == 90 - 50
+    assert priced(rung((Remat(),)), START, unread, 0, None) == 90 - 50
+    assert LiveSet(0, 0, (), unread).frees(lambda op_name, names: "mlp" in names) == 90 - 50
+    # A place keeping the stack keeps every buffer of it.
+    assert unread.frees(lambda op_name, names: False) == 0
+    # Read past its loop by the forward, before the backward's start or after it, or by the update, it is
+    # built all the same, the place freeing the residual's span past its forward's reads alone (the peak
+    # then the forward loop's, 70); read by an op no phase is told of, it is held whole.
+    update = f"jit(step)/{UPDATE_SCOPE}/mul"
+    assert [profile(read).frees(lambda op_name, names: "mlp" in names)
+            for read in ((9, FORWARD), (12, FORWARD), (12, update), (12, ""))] == [90 - 70] * 3 + [0]
+    # Its zeros made before an early backward buffer and live past it, a residual its loop alone reads,
+    # neither ask for the stack nor drop it: a place dropping the zeros' name and keeping the output's
+    # keeps it whole (review of row 12463).
+    def early(zeros: tuple[str, ...], scratch: tuple[int, int, int], later: int) -> LiveProfile:
+        found = LiveProfile.of((
+            interval(40, 0, 4, 0, names=zeros, stack=(7, 1), filling=True),
+            interval(40, 3, 8, 1, storage=0, stack=(7, 1), filling=True),
+            interval(40, 7, 14, 2, storage=0, names=("mlp",), stack=(7, 1), uses=((11, BACKWARD),)),
+            interval(scratch[0], scratch[1], scratch[2], 3), interval(1, 1, 13, 4, op_name=BACKWARD),
+            interval(later, 10, 13, 5, op_name=BACKWARD)), frozenset())
+        assert found is not None and found.held[0].residual
+        return found
+
+    unread = early((), (30, 2, 9), 50)
+    assert unread.frees(lambda op_name, names: "mlp" in names) == unread.most - 51
+    # Its zeros held whole beside the scratch they meet before the stack's first write (71), not cut where
+    # their name is dropped (review of row 12463: 61).
+    saved = early(("attn",), (30, 2, 3), 20)
+    assert saved.most == 71 and saved.frees(lambda op_name, names: "attn" in names) == 0
 
 
 def test_a_whole_heads_tile_frees_its_logits_and_holds_its_tile_where_they_were():
