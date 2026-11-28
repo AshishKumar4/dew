@@ -224,6 +224,20 @@ seams: "nvfp4-cells": {
 	}
 }
 
+seams: "blockwise-cells": {
+	kind:    "declared-set"
+	purpose: "each cell runs a blockwise FP8 product's template walk on a receipt that timed that product, its rows and matrices exactly, faster than XLA's arm of the same arithmetic"
+	paths:   ["src/dew/nn/kernels/grouped_cells.py"]
+	entries: "BLOCKWISE_CELLS"
+	declared: {
+		"(sm90, Blockwise(8192, 7168, 2048, 256, 128))":  "DeepSeek-V3's routed gate and up at 8192 tokens on a GH200, 0.030x XLA's arm (M-NG-38c-gh200)"
+		"(sm90, Blockwise(32768, 7168, 2048, 256, 128))": "DeepSeek-V3's routed gate and up at 32768 tokens on a GH200, 0.020-0.021x XLA's arm (M-NG-38c-gh200)"
+		"(sm90, Blockwise(8192, 2048, 7168, 256, 128))":  "DeepSeek-V3's routed down at 8192 tokens on a GH200, 0.034-0.035x XLA's arm (M-NG-38c-gh200)"
+		"(sm90, Blockwise(32768, 2048, 7168, 256, 128))": "DeepSeek-V3's routed down at 32768 tokens on a GH200, 0.024-0.025x XLA's arm (M-NG-38c-gh200)"
+		"(sm90, Blockwise(8192, 2048, 768, 128, 128))":   "Qwen3-30B-A3B's routed gate at 8192 tokens on a GH200, 0.037-0.038x XLA's arm (M-NG-38c-gh200)"
+	}
+}
+
 seams: "norm-cells": {
 	kind:    "declared-set"
 	purpose: "each cell routes the RMS norm to its fused kernel on a receipt that shows it faster than XLA's"

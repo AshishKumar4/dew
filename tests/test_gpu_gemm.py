@@ -7,8 +7,9 @@ one process (`gpu_flow`), each cell its own file's property:
   check 1, on an H100 (test_gemm_template).
 - CUTLASS runs the grouped projection as exactly as XLA wherever it is chosen, over every grouping that
   routes a row (test_grouped_gemm).
-- The blockwise FP8 kernel gradient (rows contiguous, step scales) holds check 1 on an H100
-  (test_gemm_blockwise).
+- The blockwise FP8 kernel gradient (rows contiguous, step scales) holds check 1 on an H100, and the
+  products a receipt timed (a routed gate's forward and its input gradient's launch) hold check 1 unnamed
+  at their own extents (test_gemm_blockwise).
 - The template takes gpt-oss's 2880-wide projection, its ragged stores' one-row rungs, as exactly as XLA's
   (test_grouped_gemm; row 4474).
 - A ring streams tiles of their own trip counts, consumers feeding their own ring split a step, and every
@@ -241,6 +242,11 @@ def _scale_edge_cells() -> tuple[Cell, ...]:
         Cell("a blockwise FP8 product at large finite scales is finite",
              gemm_blockwise.a_blockwise_fp8_product_at_large_finite_scales_is_finite, "sm90",
              at_run=EXACT_OVERFLOW, native={"launch": "blockwise fp8 gmm", "pass": "step scaling"}),
+        *(Cell(f"a blockwise FP8 receipt cell holds check 1 unnamed ({name})",
+               functools.partial(gemm_blockwise.a_receipt_cells_blockwise_product_holds_check_1_unnamed,
+                                 name),
+               "sm90", mosaic=True, native={"launch": "blockwise fp8 gmm", "pass": f"receipt cell, {name}"})
+          for name in gemm_blockwise.RECEIPT_CELLS),
         *(Cell(f"an E5M2 blockwise {name} at fp32's largest is finite ({edge})",
                functools.partial(witness, edge), "sm90", at_run=EXACT_OVERFLOW,
                native={"launch": launch, "pass": f"e5m2 step scaling, {edge}"})
