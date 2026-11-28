@@ -172,9 +172,17 @@ class NvFp4(_Packed):
     def decoded(self) -> jax.Array:
         """Its values over `bits.NVFP4_OWED` and the tensor scale, exactly, in bfloat16 (`[..., depth,
         width]`): each code times its block's scale over 2^8, as the mainloop's stage decode forms it."""
+        from dew.nn.sharding import explicit_spec
+
         owed = bits.scales_decoded(jax.lax.bitcast_convert_type(jnp.swapaxes(self.scales, -1, -2), jnp.uint8)
                                    ) * jnp.float32(1 / bits.NVFP4_OWED)
-        return (self.codes() * jnp.repeat(owed, 16, axis=-2)).astype(jnp.bfloat16)
+        codes = self.codes()
+        # Each block's scale over its depths; a split depth's placement stated (JAX asks it of a repeat along
+        # a split axis), any other JAX keeps itself (row 14097).
+        placed = explicit_spec(codes)
+        deep = placed if placed is not None and placed.spec[-2] is not None else None
+        return (codes * jnp.repeat(owed, formats_of.NVFP4.depth, axis=-2, out_sharding=deep)
+                ).astype(jnp.bfloat16)
 
     @property
     def dtype(self) -> jnp.dtype:
