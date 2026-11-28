@@ -701,9 +701,13 @@ def range_safe(product: Callable[[jax.Array, jax.Array], jax.Array], query: jax.
     a power below 1, its query taken by that power of two first and the product by the rest after, as the
     template takes it, so a logit the scale keeps finite never overflows first (train 1373's F2: Q 2^127
     against K -4 at width 16 has the logit -2^127, its raw product -2^129), however it overflowed: in the sum,
-    or where `product`'s dot narrows its operands (an fp32 query of 65536 under F16_F16_F32). A raw NaN or
-    infinity the prescaled product keeps is its own (a NaN key's, an infinite one's). The prescaled products
-    are formed only where some raw one is not finite (`lax.cond`).
+    or where `product`'s dot narrows its operands (an fp32 query of 65536 under F16_F16_F32), the power split
+    between the query and the key as their logits need (`_prescale_splits`). A logit the power cannot hold
+    is the template's too: an operand past the narrowing's range by more than the scale's power (a query of
+    `2^18` at width 16 under F16_F16_F32) reads infinite, as jax.nn's form and the template's `prescale`
+    read it (Main's ruling, train 1461's review). A raw NaN or infinity the prescaled product keeps is its
+    own (a NaN key's, an infinite one's). The prescaled products are formed only where some raw one is not
+    finite (`lax.cond`).
 
     Its tangent each bilinear term's own logits so formed, through this form again, so every forward order
     meets the rule (a zero query moving along `2^127` against a key of -4 forms -2^127, and a key's tangent
@@ -724,7 +728,14 @@ def range_safe(product: Callable[[jax.Array, jax.Array], jax.Array], query: jax.
         return product(query, key) * scale
 
     def prescaled(query, key):
-        return product(query * jnp.asarray(power, query.dtype), key) * (scale / power)
+        # The power split between the operands by their headroom (`_prescale_split`): an operand a
+        # narrowing dot makes infinite, either or both (a query of -1, 65536 or 131072 against a key of
+        # 65536 under F16_F16_F32, train 1461's reviews).
+        def split(on_query, on_key):
+            return product(query * on_query, key * on_key) * (scale / power)
+
+        splits = _prescale_splits(power, query, key)
+        return _settled([functools.partial(split, *shares) for shares in splits])
 
     def safe(query, key):
         raw = product(query, key) * scale
@@ -749,7 +760,9 @@ def range_safe(product: Callable[[jax.Array, jax.Array], jax.Array], query: jax.
             return value, jnp.zeros_like(value)
 
         def apply(residuals, moving):
-            # Each live direction in its operand's place, the other operand as it is.
+            # Each live direction in its operand's place, the other operand as it is, each term through the
+            # rule, so every higher order meets it (its terms summed after their scale: a raw sum before it
+            # differentiated plainly at the next order, train 1461's review's P2 left so, row 14102).
             terms = [rule(*(direction if place == index else operand
                             for place, operand in enumerate(residuals)))
                      for index, direction in zip(live, moving, strict=True)]
@@ -809,14 +822,61 @@ def _range_safe_pullback(product: Callable, query: jax.Array, key: jax.Array, ta
 
         def common():
             # A raw row's `2 · 2^127` beside a recovered row's `-2^127`: every row at the common power.
-            whole = jax.vjp(product, query * scaled, key)[1](taken)
-            last = (whole[0], whole[1] / jnp.asarray(power, whole[1].dtype))
+            # The split the forward takes (`_prescale_split`): an operand's cotangent the other's share left
+            # after its product.
+            def arm(on_query, on_key):
+                pulled = jax.vjp(product, query * on_query, key * on_key)[1](taken)
+                return (pulled[0] / on_key.astype(pulled[0].dtype),
+                        pulled[1] / on_query.astype(pulled[1].dtype))
+
+            splits = _prescale_splits(power, query, key)
+            last = _settled([functools.partial(arm, *shares) for shares in splits])
             return tuple(jnp.where(jnp.isfinite(entry), entry, other)
                          for entry, other in zip(settled, last, strict=True))
 
         return jax.lax.cond(_finite(settled), lambda: settled, common)
 
     return jax.lax.cond(_finite(raw), lambda: raw, recovered)
+
+
+def _prescale_splits(power: float, query: jax.Array, key: jax.Array
+                     ) -> list[tuple[jax.Array, jax.Array]]:
+    """A prescale `power` (a power of two below 1) split between a product's query and key, each share a
+    power of two in its operand's dtype, in the order a range-safe form takes them where the one before
+    leaves a logit non-finite (`_settled`): first by the operands' headroom, their largest entries' exponents
+    brought as near each other as the power allows (a query of 65536 against a key of 131072 at 1/8 halves
+    the query and quarters the key, both 32768); then every split of the power's exponent, all on the key
+    to all on the query (a power of at least `2^-5` for widths to 1024: at most six), for a logit whose own
+    operands the whole call's headroom misjudges (a batch's query of -1 against a key of 65536 beside
+    another's -131072 against 1, train 1461's reviews). The forward and its pullback take the same."""
+    def exponent(operand):
+        largest = jax.lax.stop_gradient(jnp.max(jnp.abs(operand), initial=0))
+        return jnp.frexp(jnp.where(jnp.isfinite(largest) & (largest > 0), largest, 1))[1]
+
+    def shares(on_query):
+        return (jnp.ldexp(jnp.ones((), query.dtype), -on_query),
+                jnp.ldexp(jnp.ones((), key.dtype), on_query - total))
+
+    total = -int(np.frexp(power)[1] - 1)
+    headroom = jnp.clip((total + exponent(query) - exponent(key) + 1) // 2, 0, total)
+    return [shares(headroom), *(shares(jnp.int32(on_query)) for on_query in range(total + 1))]
+
+
+def _settled[T](candidates: list[Callable[[], T]]) -> T:
+    """The first of `candidates` (each a function of no argument, an array or a tuple of them), each entry
+    it leaves non-finite taken from the next, which is formed only where one is (`lax.cond`)."""
+    def finite(value) -> jax.Array:
+        return _finite(jax.tree.leaves(value))
+
+    def taken(value, candidate):
+        return jax.tree.map(lambda entry, other: jnp.where(jnp.isfinite(entry), entry, other), value,
+                            candidate())
+
+    value = candidates[0]()
+    for candidate in candidates[1:]:
+        value = jax.lax.cond(finite(value), lambda value=value: value,
+                             lambda value=value, candidate=candidate: taken(value, candidate))
+    return value
 
 
 def _rows_reached(product: Callable, query: jax.Array, key: jax.Array, finite: jax.Array

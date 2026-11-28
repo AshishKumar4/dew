@@ -2312,6 +2312,69 @@ def test_a_raw_logits_key_cotangent_keeps_a_small_querys_bits_beside_a_recovered
     np.testing.assert_array_equal(np.asarray(dkey)[0, 0, 0], np.float32((1.0 + 2.0 ** -23) / 4))
 
 
+def test_a_logit_its_narrowed_key_overflows_takes_the_prescaled_key():
+    """The same narrowing product with its operands' roles swapped: a query of -1 against a key of 65536,
+    the logit -16384 and its cotangents the query's `1/4 · 65536` and the key's `-1/4`, the key taken by
+    the scale's quarter first where the prescaled query's product still overflows (`attention.range_safe`),
+    where only the query was prescaled and the logit and the query's cotangent read infinite (train 1461's
+    review)."""
+    from dew.nn.attention import range_safe
+
+    width = 16
+    query = jnp.zeros((1, 1, width), jnp.float32).at[0, 0, 0].set(-1.0)
+    key = jnp.zeros((1, 1, width), jnp.float32).at[0, 0, 0].set(65536.0)
+    logits, pull = jax.vjp(lambda query, key: range_safe(_fp16_narrowed, query, key, jnp.float32, None),
+                           query, key)
+    np.testing.assert_array_equal(np.asarray(logits)[0, 0, 0], -16384.0)
+    dquery, dkey = pull(jnp.ones_like(logits))
+    np.testing.assert_array_equal(np.asarray(dquery)[0, 0], np.eye(1, width)[0] * 16384.0)
+    np.testing.assert_array_equal(np.asarray(dkey)[0, 0], np.eye(1, width)[0] * -0.25)
+
+
+@pytest.mark.parametrize(("width", "magnitudes", "cotangents"),
+                         [(16, (65536.0, 65536.0), (16384.0, 16384.0)),
+                          (64, (65536.0, 131072.0), (16384.0, 8192.0))], ids=["even", "uneven"])
+def test_a_logit_both_narrowed_operands_overflow_splits_the_prescale(width, magnitudes, cotangents):
+    """The same narrowing product with a query and a key both past fp16's largest: the logit `2^30` and
+    the operands' cotangents the scale times the other's, the prescale split between them by their headroom
+    (`attention._prescale_split`: at width 64 and 1/8, a half on the query of 65536 and a quarter on the
+    key of 131072, both 32768), where either one-sided prescale, or fixed splits of it, left an operand
+    narrowed to infinity and read +inf (train 1461's reviews)."""
+    from dew.nn.attention import range_safe
+
+    query = jnp.zeros((1, 1, width), jnp.float32).at[0, 0, 0].set(magnitudes[0])
+    key = jnp.zeros((1, 1, width), jnp.float32).at[0, 0, 0].set(magnitudes[1])
+    logits, pull = jax.vjp(lambda query, key: range_safe(_fp16_narrowed, query, key, jnp.float32, None),
+                           query, key)
+    np.testing.assert_array_equal(np.asarray(logits)[0, 0, 0], 2.0 ** 30)
+    dquery, dkey = pull(jnp.ones_like(logits))
+    np.testing.assert_array_equal(np.asarray(dquery)[0, 0], np.eye(1, width)[0] * cotangents[0])
+    np.testing.assert_array_equal(np.asarray(dkey)[0, 0], np.eye(1, width)[0] * cotangents[1])
+
+
+@pytest.mark.parametrize(("width", "queries", "keys", "logits", "cotangents"), [
+    (16, (-1.0, -131072.0), (65536.0, 1.0), (-16384.0, -32768.0), ((16384.0, 0.25), (-0.25, -32768.0))),
+    (64, (131072.0, 262144.0), (65536.0, 1.0), (2.0 ** 30, 32768.0), ((8192.0, 0.125), (16384.0, 32768.0))),
+], ids=["one-sided", "uneven"])
+def test_each_batchs_narrowed_logit_takes_its_own_prescale(width, queries, keys, logits, cotangents):
+    """The same narrowing product over two batch items whose operands need different splits of the
+    prescale: each item's logit and cotangents its own, a logit the whole call's headroom split leaves
+    infinite taken by the split of the power's exponent that holds it (`attention._prescale_splits`: at
+    width 64 and 1/8, a quarter on the first item's query of 131072 and a half on its key of 65536), where
+    the call's one split, or a few fixed ones, left an item's operand narrowed to infinity (train 1461's
+    reviews)."""
+    from dew.nn.attention import range_safe
+
+    query = jnp.zeros((2, 1, width), jnp.float32).at[:, 0, 0].set(jnp.asarray(queries))
+    key = jnp.zeros((2, 1, width), jnp.float32).at[:, 0, 0].set(jnp.asarray(keys))
+    found, pull = jax.vjp(lambda query, key: range_safe(_fp16_narrowed, query, key, jnp.float32, None),
+                          query, key)
+    np.testing.assert_array_equal(np.asarray(found)[:, 0, 0], logits)
+    dquery, dkey = pull(jnp.ones_like(found))
+    np.testing.assert_array_equal(np.asarray(dquery)[:, 0, 0], cotangents[0])
+    np.testing.assert_array_equal(np.asarray(dkey)[:, 0, 0], cotangents[1])
+
+
 def test_a_raw_rows_key_cotangent_keeps_its_bits_beside_a_narrowed_row():
     """jax.nn's form at width 16 in fp32 over a product whose dot narrows its operands to fp16: queries of
     65536 (narrowed to infinity, its logit recovered) and `(1 + 2^-10) 2^-14` (raw) against one key of -1,

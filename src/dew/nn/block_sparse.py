@@ -693,15 +693,18 @@ class BlockSparseSelfAttention(CausalSelfAttention):
                    "wide_logits": self.ctx.wide_logits, "softcap": self.ctx.attn_logit_softcap,
                    "scale_logits": True, "range_safe": True}
         prepared = indexed_call(query, key, value, selected, bounds, **options)
+        if self.is_initializing() or not self.is_mutable_collection(INDEXER_COLLECTION):
+            # No teacher reads the route: the call decides it at its dispatch alone, never traced ahead
+            # (train 1461's review).
+            return indexed_attention(prepared)
         route = indexed_route(prepared)
-        if not self.is_initializing() and self.is_mutable_collection(INDEXER_COLLECTION):
-            # Its indexer's loss per query, as an objective training an indexer reads it
-            # (`IndexerTraining`, `mla.indexer_kl`'s collection).
-            teacher = msa_scores(self.ctx.dtype, self.ctx.precision, wide_logits=self.ctx.wide_logits,
-                                 route=attention_implementation(route.kernel))
-            self.sow(INDEXER_COLLECTION, "kl", msa_query_kls(
-                scores, query, key, selected, block=self.block, scale=query.shape[-1] ** -0.5,
-                teacher=teacher))
+        # Its indexer's loss per query, as an objective training an indexer reads it
+        # (`IndexerTraining`, `mla.indexer_kl`'s collection).
+        teacher = msa_scores(self.ctx.dtype, self.ctx.precision, wide_logits=self.ctx.wide_logits,
+                             route=attention_implementation(route.kernel))
+        self.sow(INDEXER_COLLECTION, "kl", msa_query_kls(
+            scores, query, key, selected, block=self.block, scale=query.shape[-1] ** -0.5,
+            teacher=teacher))
         # jax.nn's form (`scale_logits`), the one every route forms its logits in, on its decided route.
         return indexed_attention(prepared, route=route)
 
