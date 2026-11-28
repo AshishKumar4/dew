@@ -165,7 +165,11 @@ def test_a_mini_batched_memorys_gradients_are_the_token_paths(name):
         return *draw(seed), np.where(PADDED[..., None], cotangent, 0).astype(np.float32)
 
     def run(memory, call):
-        return jax.jit(with_gradients(lambda x, params: memory.apply(params, x, call)))
+        def real(x, params):
+            # Each real token's readout; a padding token's is neither path's to state.
+            return jnp.where(valid[..., None], memory.apply(params, x, call), 0)
+
+        return jax.jit(with_gradients(real))
 
     assert_as_exact(run(module, by_mask), run(module, by_tokens), draw_with_cotangent, f"{name} gradients",
                     seeds=MEMORY_SEEDS, truth_fn=run(layer(name, dtype=jnp.float64), by_tokens))
@@ -256,29 +260,41 @@ def test_a_cached_prefill_starts_each_packed_document_afresh(name):
                     truth_fn=written(module, dtype=jnp.float64, segments=segments))
 
 
-@pytest.mark.parametrize(("network", "dtype", "slow"), [
-    (ResidualMemory(hidden=4 * FEATURES), None, ()), (ResidualMemory(hidden=None), jnp.bfloat16, ("norm",))])
-def test_a_zero_step_reads_the_initial_network(network, dtype, slow):
-    """With no step, every token reads the initial network over its query at the layer's dtype, as that
-    network computes it over the queries, on par against float64 (check 1): the update adds exact zeros. A
-    bfloat16 linear residual memory, which its mini-batched kernel would read in float32, reads it in
-    bfloat16 (a head review)."""
-    module = InContextMemory(network=network, heads=HEADS, head_features=FEATURES, slow=slow, dtype=dtype,
-                             learning_rate=Gate(value=0.0), output=False, chunk=CHUNK)
+def test_a_zero_step_reads_the_initial_network():
+    """With no step, every token reads the initial network over its query, as that network computes
+    it over the queries, on par against float64 (check 1): the update adds exact zeros."""
+    module = InContextMemory(network=ResidualMemory(hidden=4 * FEATURES), heads=HEADS,
+                             head_features=FEATURES, learning_rate=Gate(value=0.0), output=False,
+                             chunk=CHUNK)
 
-    def initial_at(at):
-        def initial(x, params):
-            computed = at or x.dtype
-            kernel = params["params"]["q_proj"]["kernel"].astype(computed)
-            queries = (x.astype(computed) @ kernel).reshape(-1, LENGTH, HEADS, FEATURES)
-            at_dtype = network.clone(dtype=computed)
-            heads = [at_dtype.apply({"params": params["params"][f"head_{h}"]}, queries[:, :, h])
-                     for h in range(HEADS)]
-            return jnp.stack(heads, axis=2).reshape(-1, LENGTH, HEADS * FEATURES)
-        return initial
+    def initial(x, params):
+        kernel = params["params"]["q_proj"]["kernel"].astype(x.dtype)
+        queries = (x @ kernel).reshape(-1, LENGTH, HEADS, FEATURES)
+        network = ResidualMemory(hidden=4 * FEATURES, dtype=x.dtype)
+        heads = [network.apply({"params": params["params"][f"head_{h}"]}, queries[:, :, h])
+                 for h in range(HEADS)]
+        return jnp.stack(heads, axis=2).reshape(-1, LENGTH, HEADS * FEATURES)
 
-    assert_as_exact(applied(module), jax.jit(initial_at(dtype)), drawn(module), "zero-step memory",
-                    seeds=MEMORY_SEEDS, truth_fn=initial_at(None))
+    assert_as_exact(applied(module), jax.jit(initial), drawn(module), "zero-step memory", seeds=MEMORY_SEEDS,
+                    truth_fn=initial)
+
+
+def test_a_bfloat16_linear_residual_memory_reads_its_state_rounded_to_its_dtype():
+    """A bfloat16 linear residual memory reads its network at bfloat16, its state rounded to it, as the
+    general path does, never the mini-batched kernel's float32 (a head review): at no step, a query
+    `[1, 0]` over a kernel whose first row `[1 + 2^-9, 1 - 2^-10]` rounds to `[1, 1]` normalizes a zero
+    branch, so the token reads its query `[1, 0]` exactly, where that row unrounded normalizes to
+    `[0.82, -0.82]`."""
+    module = InContextMemory(network=ResidualMemory(hidden=None), slow=("norm",), dtype=jnp.bfloat16,
+                             project_query=False, project_key=False, project_value=False, output=False,
+                             learning_rate=Gate(value=0.0), chunk=1)
+    x = jnp.asarray([[[1.0, 0.0]]], jnp.float32)
+    params = module.init(jax.random.key(0), x)
+    head = params["params"]["head_0"]
+    head["down"]["kernel"] = jnp.asarray([[1 + 2.0**-9, 1 - 2.0**-10], [0.0, 0.0]], jnp.float32)
+    head["down"]["bias"] = jnp.zeros((2,), jnp.float32)
+    np.testing.assert_array_equal(np.asarray(module.apply(params, x), np.float32),
+                                  np.asarray([[[1.0, 0.0]]], np.float32))
 
 
 def test_an_orthogonalized_step_follows_the_paper_with_muons_iteration():
