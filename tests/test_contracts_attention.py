@@ -310,3 +310,30 @@ def test_a_giant_heads_clip_holds_every_order(taken):
         assert_contract(lambda x: clipped(x, 8.0, 1e-6), (x * scale,), (direction * scale,), cotangent,
                         f"a head's clip {edge}", plain_fn=plain, taking=ORDER_SETS[taken])
 
+
+
+def plain_scores(query, key):
+    """jax.nn's form written plainly: the queries' products with the keys, then 1/sqrt(D)."""
+    return jnp.einsum("bqd,bkd->bqk", query, key) * query.shape[-1] ** -0.5
+
+
+@pytest.mark.parametrize("edge", EDGES)
+def test_jax_nns_range_safe_form_holds_every_order(edge):
+    """jax.nn's form range-safe as the template takes it (`attention.range_safe`, the reference path's and
+    MSA's teacher's logits: the query's power of two before its products, a declared tangent at the whole
+    scale): every order runs, finite wherever float64 is a normal float32 and the plain formula is, at
+    queries and keys whose products near float32's ends."""
+    from dew.nn.attention import reference_scores
+
+    shape = (1, 8, 16)
+
+    def inputs(seed: int, scale: float) -> tuple:
+        return (normal_draw([13731, seed], shape, shape, scale=scale),
+                normal_draw([13732, seed], shape, shape, scale=scale),
+                normal_draw([13733, seed], (1, 8, 8))[0])
+
+    def scores(query, key):
+        return reference_scores(query, key, "bqd,bkd->bqk", scale_logits=True)
+
+    assert_drawn_contract(scores, inputs, EDGES[edge], f"jax.nn's range-safe form {edge}",
+                          truth_fn=plain_scores, plain_fn=plain_scores)

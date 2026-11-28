@@ -1684,9 +1684,13 @@ def routed(choice: Choice, *, kernel: str, preferred: str | None = None, refusal
 def published(found: Route) -> Route:
     """`found`, a dispatch that runs, reported: every `routes` block open records it, and a call off its
     preferred kernel is logged once a process for each kernel and refusal at INFO, naming both and the
-    refusal's reason; one that runs the preferred kernel logs nothing."""
+    refusal's reason; one that runs the preferred kernel logs nothing. A draw's dispatch (`drawing`) is none
+    of the run's: reported nowhere, whoever publishes it (`selection.select`, a route decided ahead of its
+    dispatch, `dew.nn.attention.dispatched_route`; train 1440's review)."""
     from dew import _cache
 
+    if draws():
+        return found
     choice, kernel, preferred, refusal, generation = (found.choice, found.kernel, found.preferred,
                                                       found.refusal, found.target)
     for collected in _cache.KERNEL_ROUTES.value:

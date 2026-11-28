@@ -13,17 +13,18 @@ read, and `sparse_latent_attention` attends it without that mask.
 import dataclasses
 import functools
 from collections.abc import Callable
+from typing import NamedTuple
 
 import jax
 import jax.numpy as jnp
 from jax.sharding import PartitionSpec as P
 
 from dew.mesh import logical_spec
-from dew.nn.attention import AttentionImpl, scaled_dot_product_attention
+from dew.nn.attention import AttentionImpl, dispatched_route, scaled_dot_product_attention
 from dew.nn.derivatives import KernelGlue, contracted
 from dew.nn.inputs import sequence_blocks
 from dew.nn.kernels import generation
-from dew.nn.kernels.generation import INHERENT, Choice, backend
+from dew.nn.kernels.generation import INHERENT, Choice, Route, backend
 from dew.nn.kernels.selection import Kernel, Op, Requirement, select
 from dew.nn.precision import accumulated, at_least_fp32, exact_products, float32_einsum
 from dew.nn.scatter import DROPPED
@@ -419,18 +420,22 @@ def selected_runs(selected, bounds, *, own=None, slots=None, causal: bool = True
     return jax.lax.stop_gradient(runs)
 
 
-def selected_attention(query, key, value, selected, bounds, *, own=None, slots=None, key_valid=None,
-                       causal: bool = True, implementation: AttentionImpl = 'auto', **options):
-    """Attention whose each query reads the entries its selection names (`selected` `[B, R, Q, S]`, a
-    selection a GQA group's or a query head's, `selected_runs` over `bounds`) and its `own` run `[B, Q, 2]`
-    where given, each of the `R` selections a row of the call's batch (the key runs are a row's), the call's
-    real keys alone where `key_valid` `[B, K]` marks them (a run spans a hole the validity hides): `query`
-    `[B, Q, R * h, D]`, `key` and `value` `[B, K, G, D]` with `R` a multiple of `G` (a head's selection
-    reads its group's keys), out `[B, Q, R * h, Dv]`, through the template's indexed form
-    (`scaled_dot_product_attention`'s `key_runs`). `options` are the call's other arguments, its `sinks` (a
-    head's `[R * h]`, or a query's own `[B, Q, R * h]`) laid at each selection's row. A call whose
-    queries are its keys (`slots` None) states its causality to the kernel too; a cache call's runs alone
-    end each query's keys."""
+class IndexedCall(NamedTuple):
+    """`selected_attention`'s one call of the template's indexed form (`indexed_call`): its query, keys and
+    values a selection a row (`[B * R, S, h, D]`), its keyword arguments (`key_runs` among them) and its
+    output's layout back, `[B, Q, R * h, Dv]`."""
+
+    query: jax.Array
+    key: jax.Array
+    value: jax.Array
+    call: dict
+    laid: Callable[[jax.Array], jax.Array]
+
+
+def indexed_call(query, key, value, selected, bounds, *, own=None, slots=None, key_valid=None,
+                 causal: bool = True, **options) -> IndexedCall:
+    """`selected_attention`'s call prepared once (`IndexedCall`), for a caller reading its route ahead of
+    its dispatch (`indexed_route`, `indexed_attention`; MSA's teacher)."""
     rows, queries, heads, _ = query.shape
     groups = selected.shape[1]
     per = heads // groups
@@ -455,10 +460,45 @@ def selected_attention(query, key, value, selected, bounds, *, own=None, slots=N
     if (sinks := options.get("sinks")) is not None:
         # A head's sinks, or a query's own `[B, Q, R * h]`, at each selection's row and its heads, laid as its
         # queries are (`batched`): `[B * R, Q, h]`.
-        laid = jnp.broadcast_to(sinks, (rows, queries, heads)) if sinks.ndim == 1 else sinks
-        options = {**options, "sinks": batched(laid[..., None], per)[..., 0]}
-    out = scaled_dot_product_attention(batched(query, per), batched(key, 1), batched(value, 1),
-                                       causal=causal and slots is None, key_runs=runs,
-                                       key_valid=rowed(key_valid), implementation=implementation, **options)
-    out = out.reshape(rows, groups, queries, per, -1).transpose(0, 2, 1, 3, 4)
-    return out.reshape(rows, queries, heads, -1)
+        spread = jnp.broadcast_to(sinks, (rows, queries, heads)) if sinks.ndim == 1 else sinks
+        options = {**options, "sinks": batched(spread[..., None], per)[..., 0]}
+    call = dict(causal=causal and slots is None, key_runs=runs, key_valid=rowed(key_valid), **options)
+
+    def laid(out):
+        out = out.reshape(rows, groups, queries, per, -1).transpose(0, 2, 1, 3, 4)
+        return out.reshape(rows, queries, heads, -1)
+
+    return IndexedCall(batched(query, per), batched(key, 1), batched(value, 1), call, laid)
+
+
+def selected_attention(query, key, value, selected, bounds, *, own=None, slots=None, key_valid=None,
+                       causal: bool = True, implementation: AttentionImpl = 'auto', **options):
+    """Attention whose each query reads the entries its selection names (`selected` `[B, R, Q, S]`, a
+    selection a GQA group's or a query head's, `selected_runs` over `bounds`) and its `own` run `[B, Q, 2]`
+    where given, each of the `R` selections a row of the call's batch (the key runs are a row's), the call's
+    real keys alone where `key_valid` `[B, K]` marks them (a run spans a hole the validity hides): `query`
+    `[B, Q, R * h, D]`, `key` and `value` `[B, K, G, D]` with `R` a multiple of `G` (a head's selection
+    reads its group's keys), out `[B, Q, R * h, Dv]`, through the template's indexed form
+    (`scaled_dot_product_attention`'s `key_runs`). `options` are the call's other arguments, its `sinks` (a
+    head's `[R * h]`, or a query's own `[B, Q, R * h]`) laid at each selection's row. A call whose
+    queries are its keys (`slots` None) states its causality to the kernel too; a cache call's runs alone
+    end each query's keys."""
+    return indexed_attention(indexed_call(query, key, value, selected, bounds, own=own, slots=slots,
+                                          key_valid=key_valid, causal=causal, **options), implementation)
+
+
+def indexed_attention(prepared: IndexedCall, implementation: AttentionImpl = 'auto', *,
+                      route: Route | None = None) -> jax.Array:
+    """A prepared indexed call (`indexed_call`) dispatched on `implementation`, or on its decided `route`
+    as it is (`indexed_route`), its route reported there: `[B, Q, R * h, Dv]`."""
+    return prepared.laid(scaled_dot_product_attention(prepared.query, prepared.key, prepared.value,
+                                                      implementation=implementation, route=route,
+                                                      **prepared.call))
+
+
+def indexed_route(prepared: IndexedCall) -> Route:
+    """The route a prepared indexed call takes under 'auto', decided where its dispatch decides it, at a
+    sequence exchange's instance's geometry (`attention.dispatched_route`), reported nowhere: what a caller
+    runs it on (`indexed_attention`'s `route`, which reports it) and hands to a computation beside it
+    (MSA's teacher, `block_sparse.msa_scores`), one decision whole (train 1430's review)."""
+    return dispatched_route(prepared.query, prepared.key, prepared.value, **prepared.call)

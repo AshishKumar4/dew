@@ -226,6 +226,13 @@ class AttentionCase:
     0.4961). jax.nn's xla attention forms its products through dot_general, which the rule quantizes as it
     does the reference path's, so it takes them where a call or a run names it. None where no rule owns
     them."""
+    range_safe: bool = False
+    """Whether the call asks its logits range-safe, each one its scale keeps finite never overflowing in its
+    product first (`attention.range_safe`: MSA's attention, whose teacher reads the route it takes): the
+    template, its query prescaled before its products, and the reference path take it; every kernel
+    forming its raw products whole (flash, triton, cuDNN, splash, jax.nn's xla attention, the 'inference'
+    routes) hands it on (`_RANGE_SAFE`: Q 2^127 against K -4 at width 16 has the logit -2^127, its raw
+    product -2^129, train 1373's F2)."""
     separable_bias: bool = False
     """Whether the call's bias is a query's term plus a key's (`attention.SeparableBias`, FoX's) or a band of
     keys about each query (`attention.BandBias`, Inkling 2's relative one), which the template reads as its
@@ -317,6 +324,11 @@ weighs its own (`AttentionCase.query_sinks`), however named."""
 _FAST = _Need('form', lambda case: case.form == "fast", "no accurate form", row=INHERENT)
 _FAST_HANDOFF = _Need('form', lambda case: case.form == "fast", "no accurate form", row=INHERENT,
                       kind='handoff')
+
+_RANGE_SAFE = _Need('range_safe', lambda case: not case.range_safe,
+                    "its raw products formed whole can overflow a logit its scale keeps finite "
+                    "(`AttentionCase.range_safe`)", row=INHERENT, kind='handoff')
+"""A kernel forming its raw products whole hands a range-safe call on (`AttentionCase.range_safe`)."""
 
 FLASH_SUPPORTS = (
     _FAST,
@@ -806,16 +818,21 @@ FLASH_BACKWARD = (
 """What FlashAttention's backward refuses beyond its forward (`FLASH_SUPPORTS`): a call whose derivative
 another kernel takes (`FLASH_INFERENCE`'s, the template's) takes none of these."""
 
-FLASH = Kernel[AttentionCase]('flash', (*FLASH_SUPPORTS, *FLASH_BACKWARD), reverse_only=True)
-CUDNN = Kernel[AttentionCase]('cudnn', (_FAST, *CUDNN_SUPPORTS), reverse_only=True)
-XLA = Kernel[AttentionCase]('xla', (_FAST_HANDOFF, *XLA_SUPPORTS), generic=True)
-INFERENCE = Kernel[AttentionCase]('inference', (_FAST, *TEMPLATE_SUPPORTS, _Need(
+FLASH = Kernel[AttentionCase]('flash', (_RANGE_SAFE, *FLASH_SUPPORTS, *FLASH_BACKWARD), reverse_only=True)
+CUDNN_NEEDS = (_RANGE_SAFE, _FAST, *CUDNN_SUPPORTS)
+"""What cuDNN's attention takes, either selector's (`ATTENTION`'s, `DECODE`'s): its raw products formed
+whole, the fast form's alone."""
+
+CUDNN = Kernel[AttentionCase]('cudnn', CUDNN_NEEDS, reverse_only=True)
+XLA = Kernel[AttentionCase]('xla', (_RANGE_SAFE, _FAST_HANDOFF, *XLA_SUPPORTS), generic=True)
+INFERENCE = Kernel[AttentionCase]('inference', (_RANGE_SAFE, _FAST, *TEMPLATE_SUPPORTS, _Need(
     'spans_only', lambda case: not case.spans_only,
     "the call's visibility is spans alone, which a differentiated call's xla attention would build "
     "densely: the template takes it", row=INHERENT), _FITS))
 """The template for a call no derivative is taken of and xla's attention for one differentiated."""
 
-FLASH_INFERENCE = Kernel[AttentionCase]('flash_inference', (*FLASH_SUPPORTS, *TEMPLATE_SUPPORTS))
+FLASH_INFERENCE = Kernel[AttentionCase]('flash_inference', (_RANGE_SAFE, *FLASH_SUPPORTS,
+                                                             *TEMPLATE_SUPPORTS))
 """FlashAttention for a call no derivative is taken of and the template for one differentiated, its forward
 and derivatives the template's: where FlashAttention's forward holds check 1 and its backward does not (an
 A100's, M-NA-44). Its backward's refusals (`FLASH_BACKWARD`: deterministic ops) are not its own, the
@@ -1000,9 +1017,9 @@ def _cudnn_loads() -> bool:
 
 ATTENTION = Op[AttentionCase](Choice.ATTENTION, (
     FLASH,
-    Kernel[AttentionCase]('triton', TRITON_SUPPORTS, reverse_only=True),
+    Kernel[AttentionCase]('triton', (_RANGE_SAFE, *TRITON_SUPPORTS), reverse_only=True),
     CUDNN,
-    Kernel[AttentionCase]('tpu', TPU_SUPPORTS, reverse_only=True),
+    Kernel[AttentionCase]('tpu', (_RANGE_SAFE, *TPU_SUPPORTS), reverse_only=True),
     XLA,
     Kernel[AttentionCase]('reference', (), generic=True),
     Kernel[AttentionCase]('template', TEMPLATE_SUPPORTS),
@@ -1042,9 +1059,10 @@ _FP32_DECODE = ("jax.nn's xla attention measured faster than the decode kernel a
                 "decode at every fp32 decode shape timed, its products IEEE fp32 as theirs (`highest`; wall "
                 "a step over 50 steps in one loop, interleaved rounds, 1 to 128 rows over 4096 and 32768 "
                 "keys, 32 or 16 query heads over 8, 128 or 64 wide): {}")
-DECODE_XLA = Kernel[AttentionCase]('xla', (_FAST_HANDOFF, *XLA_SUPPORTS), generic=True)
-"""A decode step's xla attention (the folded attention, `folded_attention`), the fast form's alone, as
-attention's xla kernel (`XLA`)."""
+DECODE_XLA = XLA
+"""A decode step's xla attention (the folded attention, `folded_attention`): attention's xla kernel (`XLA`),
+its needs its own, so a range-safe step is handed on as a whole call is (`_RANGE_SAFE`: its unscaled
+products formed first read a query of `2^127` against a key of 4 as infinity; train 1440's review)."""
 
 DECODE_DECLARED: dict[tuple[str | None, CallKind], tuple[Kernel[AttentionCase], str]] = {
     ('sm80', CallKind.of(jnp.float32, decode=True)): (DECODE_XLA, _FP32_DECODE.format(
@@ -1065,7 +1083,7 @@ to 65 against 35.6, ET-DFP32-h100-pcie)."""
 
 DECODE = Op[AttentionCase](Choice.DECODE, (
     Kernel[AttentionCase]('decode', (_FAST, _WHOLE_PRODUCTS, _HEAD_SINKS, *decode_attention.SUPPORTS)),
-    Kernel[AttentionCase]('cudnn', (_FAST, *CUDNN_SUPPORTS, decode_attention.PRODUCTS), reverse_only=True),
+    Kernel[AttentionCase]('cudnn', (*CUDNN_NEEDS, decode_attention.PRODUCTS), reverse_only=True),
     DECODE_XLA,
     Kernel[AttentionCase]('template', (*TEMPLATE_SUPPORTS, decode_attention.PRODUCTS)),
     Kernel[AttentionCase]('reference', (), generic=True),

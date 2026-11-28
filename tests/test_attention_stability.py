@@ -2002,3 +2002,367 @@ def test_a_bf16_call_of_wide_logits_scaled_after_keeps_its_bf16_product():
         out = reference_attention(query, query * 2.0 ** -40, value, dtype=jnp.bfloat16, wide_logits=True,
                                   scale_logits=True)
     assert np.isfinite(np.asarray(out, np.float32)).all()
+
+
+def test_a_reference_call_weighs_a_hidden_key_nothing_beside_a_visible_one_at_fp32s_least():
+    """The reference path's default fill (`mask_fill` None, `excluded`) over a causal row whose one visible
+    key's logit is fp32's least (a query of 1 against a key of fp32's least, width 1): that key takes the
+    whole weight and the hidden one none, its output the visible key's value, where a hidden key filled at
+    fp32's least tied it and took half; a visible key whose score is NaN reads NaN, not an empty row's zero;
+    a row whose one visible key's bias is -inf has no mass and reads exactly zero, as the template's guarded
+    reduction weighs it; and a row that sees no key (an invalid first key) reads exactly zero, its gradients
+    finite, alone and over two query heads sharing a key head in jax.nn's form (its grouped product) (train
+    1368's F2)."""
+    from dew.nn.attention import scaled_dot_product_attention
+
+    least = float(np.finfo(np.float32).min)
+    query = jnp.ones((1, 2, 1, 1), jnp.float32)
+    key = jnp.asarray([[[[least]], [[0.0]]]], jnp.float32)
+    value = jnp.asarray([[[[3.0]], [[5.0]]]], jnp.float32)
+    out = scaled_dot_product_attention(query, key, value, causal=True, implementation="reference")
+    np.testing.assert_array_equal(np.asarray(out)[0, 0], [[3.0]])
+
+    unknown = key.at[0, 0].set(np.nan)
+    out = scaled_dot_product_attention(query, unknown, value, causal=True, implementation="reference")
+    assert np.isnan(np.asarray(out)[0, 0]).all()
+
+    massless = jnp.asarray([[[[-np.inf, 0.0], [0.0, 0.0]]]], jnp.float32)
+    out = scaled_dot_product_attention(query, key * 0, value, bias=massless, causal=True,
+                                       implementation="reference")
+    np.testing.assert_array_equal(np.asarray(out)[0, :, 0], [[0.0], [4.0]])
+
+    valid = jnp.asarray([[False, True]])
+    for heads, scale_logits in ((1, False), (2, True)):
+        def attended(query, scale_logits=scale_logits):
+            return scaled_dot_product_attention(query, key * 0, value, causal=True, key_valid=valid,
+                                                implementation="reference", scale_logits=scale_logits)
+
+        out, pull = jax.vjp(attended, jnp.ones((1, 2, heads, 1), jnp.float32))
+        np.testing.assert_array_equal(np.asarray(out)[0, 0], [[0.0]] * heads)
+        np.testing.assert_array_equal(np.asarray(out)[0, 1], [[5.0]] * heads)
+        assert np.isfinite(np.asarray(pull(jnp.ones_like(out))[0])).all()
+
+
+@pytest.mark.parametrize(("implementation", "wide"), [("reference", False), ("reference", True),
+                                                     ("template", False)],
+                         ids=["reference", "reference-wide", "template"])
+def test_jax_nns_form_keeps_a_scaled_logit_whose_raw_product_overflows(implementation, wide):
+    """jax.nn's form (`scale_logits`: the logits' products, then the scale) at width 16 on MSA's routes
+    (`sparse_selection.indexed_route`'s preference): a first query of 2^127 against its one visible key of
+    -4 has the finite logit -2^127, whose raw product, -2^129, passes fp32's largest; the reference path
+    (the query taken by its scale's power of two before its products as the template takes it,
+    `attention.range_safe`), its operands widened first too (`wide_logits`), and the template read that
+    key's value whole, where the raw product's -inf read the row as empty or NaN; and MSA's teacher forms
+    that logit (`block_sparse.msa_scores`, train 1373's F2)."""
+    from dew.nn import block_sparse
+    from dew.nn.attention import scaled_dot_product_attention
+
+    width = 16
+    query = jnp.zeros((1, 2, 1, width), jnp.float32).at[0, 0, 0, 0].set(2.0 ** 127)
+    key = jnp.zeros((1, 2, 1, width), jnp.float32).at[0, 0, 0, 0].set(-4.0)
+    value = jnp.asarray([[[[3.0] * width], [[5.0] * width]]], jnp.float32)
+    out = scaled_dot_product_attention(query, key, value, causal=True, implementation=implementation,
+                                       scale_logits=True, wide_logits=wide)
+    np.testing.assert_array_equal(np.asarray(out)[0, 0, 0], 3.0)
+    logits = block_sparse.msa_scores(jnp.float32, None, wide_logits=wide)(
+        query[:, :, 0], key[:, :, 0], jnp.ones((1, query.shape[1], key.shape[1]), bool))
+    np.testing.assert_array_equal(np.asarray(logits)[0, 0, 0], -(2.0 ** 127))
+
+
+@pytest.mark.parametrize("row", [None, 0, 1], ids=["alone", "beside-a-large-row", "in-a-large-row"])
+@pytest.mark.parametrize("implementation", ["reference", "xla"])
+def test_jax_nns_form_keeps_a_query_cotangent_the_scale_keeps_finite(implementation, row):
+    """jax.nn's form's derivative at width 16: a second query of 0 over keys of 2^127 and 0 (their first
+    entries) and values of 8 and 0, a unit cotangent on its output's first entry: its weights a half each,
+    their logits' cotangents 2 and -2, its query's cotangent `2 x 2^127 / 4 = 2^126`, the scale taken on the
+    cotangent before its product with the keys, finite, as jax.nn's own derivative takes it (the reference
+    path's a declared tangent, `attention.range_safe`), its query alone or an 8 where the keys hold 0 in its
+    own row or the first's, where the query's power taken after the product overflowed it."""
+    from dew.nn.attention import scaled_dot_product_attention
+
+    width = 16
+    key = jnp.zeros((1, 2, 1, width), jnp.float32).at[0, 0, 0, 0].set(2.0 ** 127)
+    value = jnp.zeros((1, 2, 1, width), jnp.float32).at[0, 0, 0, 0].set(8.0)
+    cotangent = jnp.zeros((1, 2, 1, width), jnp.float32).at[0, 1, 0, 0].set(1.0)
+    query = jnp.zeros((1, 2, 1, width), jnp.float32)
+    if row is not None:
+        query = query.at[0, row, 0, 1].set(8.0)
+
+    def attended(query):
+        return scaled_dot_product_attention(query, key, value, causal=True, implementation=implementation,
+                                            scale_logits=True)
+
+    _, pull = jax.vjp(attended, query)
+    (found,) = pull(cotangent)
+    expected = np.zeros((1, 2, 1, width), np.float32)
+    expected[0, 1, 0, 0] = 2.0 ** 126
+    np.testing.assert_array_equal(np.asarray(found), expected)
+
+
+def test_jax_nns_form_takes_each_head_alone_beside_a_large_one():
+    """Two bf16 query heads over one key head at width 16 in jax.nn's form: head 0's fifteen entries of
+    `(1 + 2^-7) 2^-126` against a key's 2^126 in those entries, beside head 1's 8 in the last entry: head 0's
+    logits in the teacher's form (`attention.reference_scores`) and its attention's output (the reference
+    path's) are the call of head 0 alone's to the bit, one policy a call's every head and route takes
+    (`attention.range_safe`, the template's), whatever its neighbour holds."""
+    from dew.nn.attention import reference_scores, scaled_dot_product_attention
+
+    width = 16
+    tiny = (1.0 + 2.0 ** -7) * 2.0 ** -126
+    query = jnp.zeros((1, 1, 2, width), jnp.bfloat16).at[0, 0, 0, :15].set(tiny).at[0, 0, 1, 15].set(8.0)
+    key = jnp.zeros((1, 2, 1, width), jnp.bfloat16).at[0, 0, 0, :15].set(2.0 ** 126)
+    value = jnp.asarray([[[[3.0] * width], [[5.0] * width]]], jnp.bfloat16)
+
+    def teacher(query):
+        heads = query.shape[2]
+        return reference_scores(query, jnp.repeat(key, heads, axis=2), '...qhd,...khd->...hqk',
+                                scale_logits=True)
+
+    np.testing.assert_array_equal(np.asarray(teacher(query))[:, :1], np.asarray(teacher(query[:, :, :1])))
+    both = scaled_dot_product_attention(query, key, value, implementation="reference", scale_logits=True)
+    alone = scaled_dot_product_attention(query[:, :, :1], key, value, implementation="reference",
+                                         scale_logits=True)
+    np.testing.assert_array_equal(np.asarray(both[:, :, :1], np.float32), np.asarray(alone, np.float32))
+
+
+def test_jax_nns_form_keeps_a_query_tangent_the_scale_keeps_finite():
+    """jax.nn's form's forward-mode derivative at width 16 (`attention.range_safe`): a query of 2^127 against
+    a key of -4 in one entry, moving along itself with the key held, has the logit -2^127 and the tangent
+    -2^127, its direction taken by the scale's power of two before its product, where a tangent of the raw
+    products first, -2^129, read -inf."""
+    from dew.nn.attention import reference_scores
+
+    width = 16
+    query = jnp.zeros((1, 1, width), jnp.float32).at[0, 0, 0].set(2.0 ** 127)
+    key = jnp.zeros((1, 1, width), jnp.float32).at[0, 0, 0].set(-4.0)
+
+    def scores(query):
+        return reference_scores(query, key, "bqd,bkd->bqk", scale_logits=True)
+
+    value, tangent = jax.jvp(scores, (query,), (query,))
+    np.testing.assert_array_equal(np.asarray(value)[0, 0, 0], -(2.0 ** 127))
+    np.testing.assert_array_equal(np.asarray(tangent)[0, 0, 0], -(2.0 ** 127))
+
+
+def test_jax_nns_form_differentiates_its_scaled_pullback_at_every_order():
+    """jax.nn's form's mixed derivative at width 16 (`attention.range_safe`): zero queries and keys, a score
+    cotangent of 2, the query's cotangent `2 k / 4` moved along a key of `2^127` in one entry reads `2^126`,
+    every order differentiating the pullback that takes the scale before its products (`traced`), where the
+    primal's pullback formed `2^128` before the query's quarter."""
+    from dew.nn.attention import reference_scores
+
+    width = 16
+    zeros = jnp.zeros((1, 1, width), jnp.float32)
+
+    def query_cotangent(key):
+        def scores(query):
+            return reference_scores(query, key, "bqd,bkd->bqk", scale_logits=True)
+
+        _, pull = jax.vjp(scores, zeros)
+        return pull(jnp.full((1, 1, 1), 2.0, jnp.float32))[0]
+
+    _, moved = jax.jvp(query_cotangent, (zeros,), (zeros.at[0, 0, 0].set(2.0 ** 127),))
+    np.testing.assert_array_equal(np.asarray(moved)[0, 0, 0], 2.0 ** 126)
+
+
+def test_jax_nns_form_keeps_a_small_querys_bits_against_a_large_key():
+    """jax.nn's form at width 16 in bf16 on the reference path: a query entry of `(1 + 2^-7) 2^-126` against a
+    key's `2^126` has the logit `(1 + 2^-7) / 4`, which no product of them can overflow, so its row is
+    jax.nn's own arithmetic (`attention.range_safe`), its low bit kept, where its query taken by the scale's
+    power of two first, `2^-128` in bf16, lost it."""
+    from dew.nn.attention import reference_scores
+
+    width = 16
+    query = jnp.zeros((1, 1, width), jnp.bfloat16).at[0, 0, 0].set((1.0 + 2.0 ** -7) * 2.0 ** -126)
+    key = jnp.zeros((1, 1, width), jnp.bfloat16).at[0, 0, 0].set(2.0 ** 126)
+    logits = reference_scores(query, key, "bqd,bkd->bqk", scale_logits=True)
+    np.testing.assert_array_equal(np.asarray(logits)[0, 0, 0], np.float32((1.0 + 2.0 ** -7) / 4))
+
+
+@pytest.mark.parametrize("hidden", ["nan", "infinite column"])
+def test_a_hidden_non_finite_key_leaves_a_visible_logits_range_guard_on(hidden):
+    """jax.nn's form at width 16 on the reference path, causal: a first query of 2^127 against its one
+    visible key of -4 (the finite logit -2^127) beside a future key of NaNs, or of zeros and `+inf` in the
+    last entry, where the query's 0 meets it, finite values: the row reads its visible key's value whole,
+    each logit its raw product's or, where that is not finite, the prescaled one's (`attention.range_safe`),
+    where a bound of the row's magnitudes read a NaN maximum or `0 · inf` and left the visible product
+    overflowing; a visible NaN score is the product's own and propagates."""
+    from dew.nn.attention import scaled_dot_product_attention
+
+    width = 16
+    future = (jnp.full((width,), np.nan, jnp.float32) if hidden == "nan"
+              else jnp.zeros((width,), jnp.float32).at[-1].set(np.inf))
+    query = jnp.zeros((1, 2, 1, width), jnp.float32).at[0, 0, 0, 0].set(2.0 ** 127)
+    key = jnp.zeros((1, 2, 1, width), jnp.float32).at[0, 0, 0, 0].set(-4.0).at[0, 1, 0].set(future)
+    value = jnp.asarray([[[[3.0] * width], [[5.0] * width]]], jnp.float32)
+    out = scaled_dot_product_attention(query, key, value, causal=True, implementation="reference",
+                                       scale_logits=True)
+    np.testing.assert_array_equal(np.asarray(out)[0, 0, 0], 3.0)
+
+
+def test_jax_nns_range_guard_keeps_fp32_under_a_narrowing_ambient_preset():
+    """jax.nn's form at width 16 in fp32 with `precision='highest'` on a CPU under the ambient preset
+    `F16_F16_F32`: Q 2^127 against K -4 reads the logit -2^127, its range guard reading its products alone
+    (`attention.range_safe`), where a bound's dot took the ambient float16 algorithm, which XLA's CPU
+    compiler has no kernel for."""
+    from dew.nn.attention import reference_scores
+
+    width = 16
+    query = jnp.zeros((1, 1, width), jnp.float32).at[0, 0, 0].set(2.0 ** 127)
+    key = jnp.zeros((1, 1, width), jnp.float32).at[0, 0, 0].set(-4.0)
+    with jax.default_matmul_precision("F16_F16_F32"):
+        logits = reference_scores(query, key, "bqd,bkd->bqk", precision=jax.lax.Precision.HIGHEST,
+                                  scale_logits=True)
+    np.testing.assert_array_equal(np.asarray(logits)[0, 0, 0], -(2.0 ** 127))
+
+
+def test_a_small_querys_bits_survive_a_large_entry_meeting_a_small_key_column():
+    """jax.nn's form at width 16 in bf16 on the reference path: a query of `(1 + 2^-7) 2^-126` in its first
+    entry and 8 in its last, against a key of `2^126` in its first and 0 in its last: its logit
+    `(1 + 2^-7) / 4`, its raw product finite, so jax.nn's own (`attention.range_safe`), where a bound of
+    unrelated entries' maxima took its query by a quarter first and lost its low bit."""
+    from dew.nn.attention import reference_scores
+
+    width = 16
+    tiny = (1.0 + 2.0 ** -7) * 2.0 ** -126
+    query = jnp.zeros((1, 1, width), jnp.bfloat16).at[0, 0, 0].set(tiny).at[0, 0, -1].set(8.0)
+    key = jnp.zeros((1, 1, width), jnp.bfloat16).at[0, 0, 0].set(2.0 ** 126)
+    logits = reference_scores(query, key, "bqd,bkd->bqk", scale_logits=True)
+    np.testing.assert_array_equal(np.asarray(logits)[0, 0, 0], np.float32((1.0 + 2.0 ** -7) / 4))
+
+
+def test_a_small_querys_bits_survive_another_key_heads_large_column():
+    """jax.nn's form at width 16 in bf16 over two heads as the reference path pairs them
+    (`'...qhd,...khd->...hqk'`): head 0's query `(1 + 2^-7) 2^-126` in its first entry and 8 in its last
+    against its key's `2^126` and 0, head 1's key `2^126` in its last entry: head 0's logit
+    `(1 + 2^-7) / 4`, its raw product finite (`attention.range_safe`), where a bound over every head's
+    keys took head 1's last column and prescaled head 0, losing its low bit."""
+    from dew.nn.attention import reference_scores
+
+    width = 16
+    tiny = (1.0 + 2.0 ** -7) * 2.0 ** -126
+    query = jnp.zeros((1, 1, 2, width), jnp.bfloat16).at[0, 0, 0, 0].set(tiny).at[0, 0, 0, -1].set(8.0)
+    key = jnp.zeros((1, 1, 2, width), jnp.bfloat16).at[0, 0, 0, 0].set(2.0 ** 126).at[0, 0, 1, -1].set(
+        2.0 ** 126)
+    logits = reference_scores(query, key, "...qhd,...khd->...hqk", scale_logits=True)
+    np.testing.assert_array_equal(np.asarray(logits)[0, 0, 0, 0], np.float32((1.0 + 2.0 ** -7) / 4))
+
+
+def test_a_small_logit_keeps_its_bits_beside_a_large_finite_one():
+    """jax.nn's form at width 16 in bf16: a query of `(1 + 2^-7) 2^-126` and `2^127` in its first two
+    entries against keys `[2^126, 0]` and `[0, 1.5]`: both raw products finite, so its logits
+    `(1 + 2^-7) / 4` and `1.5 · 2^125` are jax.nn's own (`attention.range_safe`), where a row's bound of
+    three quarters of fp32's largest prescaled the row and lost the first's low bit (train 1368's
+    review)."""
+    from dew.nn.attention import reference_scores
+
+    width = 16
+    query = jnp.zeros((1, 1, width), jnp.bfloat16).at[0, 0, 0].set((1.0 + 2.0 ** -7) * 2.0 ** -126).at[
+        0, 0, 1].set(2.0 ** 127)
+    key = jnp.zeros((1, 2, width), jnp.bfloat16).at[0, 0, 0].set(2.0 ** 126).at[0, 1, 1].set(1.5)
+    logits = reference_scores(query, key, "bqd,bkd->bqk", scale_logits=True)
+    np.testing.assert_array_equal(np.asarray(logits)[0, 0], np.float32([(1.0 + 2.0 ** -7) / 4,
+                                                                        1.5 * 2.0 ** 125]))
+
+
+def _fp16_narrowed(query, key, subscripts: str = "bqd,bkd->bqk"):
+    """`subscripts`' product of fp32 operands narrowed to fp16 first, as an `F16_F16_F32` preset's dot takes
+    them on a GPU (XLA's CPU compiler has no float16 dot)."""
+    return jnp.einsum(subscripts, query.astype(jnp.float16).astype(jnp.float32),
+                      key.astype(jnp.float16).astype(jnp.float32), precision=jax.lax.Precision.HIGHEST)
+
+
+def test_a_logit_its_narrowed_operands_overflow_takes_the_prescaled_product():
+    """jax.nn's form at width 16 in fp32 over a product whose dot narrows its operands to fp16 (as an
+    `F16_F16_F32` preset's dot takes them on a GPU): a query of 65536 against a key of -1, the logit
+    -16384, its raw product -inf (65536 past fp16's largest), so the query taken by its scale's quarter
+    first (`attention.range_safe`), 16384 within fp16, where a bound of the fp32 products left it raw and
+    the logit read -inf; and its cotangents pulled back through that prescaled query (train 1368's
+    review)."""
+    from dew.nn.attention import range_safe
+
+    width = 16
+    query = jnp.zeros((1, 1, width), jnp.float32).at[0, 0, 0].set(65536.0)
+    key = jnp.zeros((1, 1, width), jnp.float32).at[0, 0, 0].set(-1.0)
+    logits, pull = jax.vjp(lambda query, key: range_safe(_fp16_narrowed, query, key,
+                                                         jnp.float32, None), query, key)
+    np.testing.assert_array_equal(np.asarray(logits)[0, 0, 0], -16384.0)
+    # Its cotangents through the prescaled query too: the key's `1/4 · 65536`, where the raw query's
+    # pullback read `1/4 · float16(65536) = inf`.
+    dquery, dkey = pull(jnp.ones_like(logits))
+    np.testing.assert_array_equal(np.asarray(dkey)[0, 0], np.eye(1, width)[0] * 16384.0)
+    np.testing.assert_array_equal(np.asarray(dquery)[0, 0], np.eye(1, width)[0] * -0.25)
+
+
+def test_a_raw_logits_key_cotangent_keeps_a_small_querys_bits_beside_a_recovered_one():
+    """jax.nn's form at width 16 in fp32: a query of `(1 + 2^-23) 2^-126` and 8 against keys `[2^126, 0]`
+    and `[0, -2^126]`, the first logit raw and the second recovered (-2^127, its raw product overflowing),
+    under logit cotangents `[2^126, 0]`: the first key's cotangent `(1 + 2^-23) / 4` in its first entry,
+    the raw product's pullback where it is finite (`attention.range_safe`), where pulling the whole row
+    back through the prescaled query rounded its tiny entry and read 1/4 (train 1368's review)."""
+    from dew.nn.attention import reference_scores
+
+    width = 16
+    query = jnp.zeros((1, 1, width), jnp.float32).at[0, 0, 0].set((1.0 + 2.0 ** -23) * 2.0 ** -126).at[
+        0, 0, 1].set(8.0)
+    key = jnp.zeros((1, 2, width), jnp.float32).at[0, 0, 0].set(2.0 ** 126).at[0, 1, 1].set(-(2.0 ** 126))
+    logits, pull = jax.vjp(lambda key: reference_scores(query, key, "bqd,bkd->bqk", scale_logits=True), key)
+    np.testing.assert_array_equal(np.asarray(logits)[0, 0, 1], -(2.0 ** 127))
+    (dkey,) = pull(jnp.zeros_like(logits).at[0, 0, 0].set(2.0 ** 126))
+    np.testing.assert_array_equal(np.asarray(dkey)[0, 0, 0], np.float32((1.0 + 2.0 ** -23) / 4))
+
+
+def test_a_raw_rows_key_cotangent_keeps_its_bits_beside_a_narrowed_row():
+    """jax.nn's form at width 16 in fp32 over a product whose dot narrows its operands to fp16: queries of
+    65536 (narrowed to infinity, its logit recovered) and `(1 + 2^-10) 2^-14` (raw) against one key of -1,
+    under logit cotangents `2^-16` and `-2^14`: the key's cotangent `1/4 - (1 + 2^-10) / 4 = -2^-12`, each
+    query row pulled back through its own arm (`attention.range_safe`), where the prescaled pullback of
+    both rows quartered the raw row's query below fp16's normals and read 0 (train 1368's review)."""
+    from dew.nn.attention import range_safe
+
+    width = 16
+    query = jnp.zeros((1, 2, width), jnp.float32).at[0, 0, 0].set(65536.0).at[0, 1, 0].set(
+        (1.0 + 2.0 ** -10) * 2.0 ** -14)
+    key = jnp.zeros((1, 1, width), jnp.float32).at[0, 0, 0].set(-1.0)
+    _, pull = jax.vjp(lambda key: range_safe(_fp16_narrowed, query, key, jnp.float32, None),
+                      key)
+    (dkey,) = pull(jnp.asarray([[[2.0 ** -16], [-(2.0 ** 14)]]], jnp.float32))
+    np.testing.assert_array_equal(np.asarray(dkey)[0, 0, 0], -(2.0 ** -12))
+
+
+def test_a_key_cotangent_past_fp32_in_its_split_sum_takes_the_common_power():
+    """jax.nn's form at width 16 in fp32 under the explicit `BF16_BF16_F32` preset: queries of `2^127` (raw)
+    and fp32's largest (narrowed to bf16's infinity, its logit recovered) against one key of -1, under
+    logit cotangents 8 and -2: the key's cotangent `2^127`, its entry taken through the prescaled query at
+    the common power (`attention.range_safe`), where the split's raw row alone formed `2 · 2^127` and read
+    inf before the recovered row's `-2^127` met it (train 1368's review)."""
+    from dew.nn.attention import reference_scores
+
+    width = 16
+    query = jnp.zeros((1, 2, width), jnp.float32).at[0, 0, 0].set(2.0 ** 127).at[0, 1, 0].set(
+        np.finfo(np.float32).max)
+    key = jnp.zeros((1, 1, width), jnp.float32).at[0, 0, 0].set(-1.0)
+    _, pull = jax.vjp(lambda key: reference_scores(query, key, "bqd,bkd->bqk", scale_logits=True,
+                                                   precision=jax.lax.DotAlgorithmPreset.BF16_BF16_F32), key)
+    (dkey,) = pull(jnp.asarray([[[8.0], [-2.0]]], jnp.float32))
+    np.testing.assert_array_equal(np.asarray(dkey)[0, 0, 0], 2.0 ** 127)
+
+
+def test_a_broadcast_querys_recovered_cotangent_keeps_its_shape():
+    """jax.nn's form at width 16 over `'...qd,...kd->...qk'` with a query `[1, 1, 16]` of 65536 (narrowed to
+    fp16's infinity, its logits recovered) against keys `[2, 1, 16]` of -1: its cotangents under unit logit
+    cotangents the query's shape, `2 · (-1/4)`, and each key's 16384 (`attention.range_safe`'s split
+    pullback, its rows any of their broadcast copies), where the split broadcast the query to two rows and
+    its pullback's branches disagreed in shape (train 1416's review)."""
+    from dew.nn.attention import range_safe
+
+    subscripts = "...qd,...kd->...qk"
+    width = 16
+    query = jnp.zeros((1, 1, width), jnp.float32).at[0, 0, 0].set(65536.0)
+    key = jnp.zeros((2, 1, width), jnp.float32).at[:, 0, 0].set(-1.0)
+    logits, pull = jax.vjp(lambda query, key: range_safe(
+        lambda q, k: _fp16_narrowed(q, k, subscripts), query, key, jnp.float32, None), query, key)
+    dquery, dkey = pull(jnp.ones_like(logits))
+    assert dquery.shape == query.shape
+    np.testing.assert_array_equal(np.asarray(dquery)[0, 0], np.eye(1, width)[0] * -0.5)
+    np.testing.assert_array_equal(np.asarray(dkey)[:, 0, 0], [16384.0, 16384.0])

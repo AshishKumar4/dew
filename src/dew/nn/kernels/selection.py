@@ -276,9 +276,8 @@ def select[C](op: Op[C], case: C, named: str | None = None, *, preference: tuple
     for the target raises (`Unlowerable`)."""
     from . import generation
 
-    route = decided(op, case, named, preference=preference)
-    # A draw's dispatch is none of the run's (`generation.drawing`): reported nowhere.
-    return route if generation.draws() else generation.published(route)
+    # A draw's dispatch is none of the run's (`generation.drawing`): reported nowhere (`published`).
+    return generation.published(decided(op, case, named, preference=preference))
 
 
 def decided[C](op: Op[C], case: C, named: str | None = None, *, preference: tuple[str, ...] = ()) -> Route:
