@@ -57,7 +57,16 @@ class LiveBuffer:
     a recomputation frees none of; empty otherwise. `dims` holds, for each of its dimensions, the (argument,
     axis) pairs it descends from, each argument by its flat index among the call's (`args_info`'s leaves),
     through the dimension maps of the ops that made it (`provenance`): empty where its size descends from
-    none, None where an op on its path states no map (a custom call stating no `output_dims`).
+    none, None where an op on its path states no map (a custom call stating no `output_dims`). `stack` is,
+    for a buffer of a scan's stack, the loop writing it and the state element it is (the while's instruction
+    id and the element's index), where the loop writes the element a row a step and its body and condition
+    read it nowhere else (`_stacked`): each buffer of the element's own values XLA's alias analysis holds
+    together (`BufferAssignmentProto.buffer_aliases`), the zeros before the loop, the loop's state, each
+    step's write and the loop's output, is that one stack, which a step that saves none of its rows never
+    builds; None
+    otherwise. `filling` says whether it is one of the values its loop fills the stack through, read by
+    nothing but its loop (the zeros, the loop's state, each step's write), beside the loop's output, the
+    value what reads the stack past the loop reads.
     """
 
     bytes: int
@@ -71,6 +80,8 @@ class LiveBuffer:
     parameter: int | None = None
     role: str = ""
     dims: tuple[frozenset[tuple[int, int]] | None, ...] = ()
+    stack: tuple[int, int] | None = None
+    filling: bool = False
 
 
 UNPLACED = -1
@@ -89,9 +100,10 @@ class LiveInterval(LiveBuffer):
     whose events its trace's repeat: a heap's pages share one, their buffers live together at each position,
     and traces of different timelines order their positions apart. `whole` says whether that
     simulation's schedule is the whole module's (XLA:GPU's), a while body's buffers within its loop's span, or
-    one computation's. `complete` says whether every buffer its allocation is assigned lies in one of its
-    simulations: XLA places some in an allocation unsimulated (temporary heaps reused, or combined), so a
-    planner needing all of an allocation's buffers over one schedule reads it first. `start` is its first
+    one computation's. `complete` says whether every array buffer its allocation is assigned lies in one of
+    its simulations (a tuple's index table, no array, aside): XLA places some in an allocation unsimulated
+    (temporary heaps reused, or combined), so a planner needing all of an allocation's buffers over one
+    schedule reads it first. `start` is its first
     position among that simulation's events, `end` the position after its last (the simulation's length for
     one never freed); `buffer` its logical buffer's id; `storage` the logical buffer whose memory it lies in,
     as first allocated: its own where it was allocated, else the one the buffer it shares lies in (XLA's
@@ -175,11 +187,13 @@ class Assignment:
         # Each logical buffer's other positions, as XLA's must-alias analysis states them: a loop state's
         # buffer's among them, at the while's output.
         self.aliases: dict[int, list[Any]] = {}
-        # Each instruction's users with the operand slot each reads it in (`used`), built where an interval
-        # is read.
+        # Each instruction's users with the operand slot each reads it in (`readers`), built where an interval
+        # or a loop's stack is read.
         self.uses: dict[int, list[tuple[Any, int]]] | None = None
         # Each computation's parameter ids by number (`parameter`), built where a fusion is walked into.
         self.bound: dict[tuple[int, int], int] | None = None
+        # Each loop element's reading (`_Loops`), built where a buffer is described and kept.
+        self.loops: _Loops | None = None
         for alias in self.proto.buffer_aliases:
             self.aliases.setdefault(alias.source_buffer_id, []).append(alias.location)
         self.types = hlo.pool().FindEnumTypeByName("xla.PrimitiveType")
@@ -214,8 +228,13 @@ class Assignment:
         for simulated in self.proto.heap_simulator_traces:
             traced.setdefault(simulated.buffer_allocation_index, set()).update(
                 step.buffer_id for step in simulated.events)
-        complete = {allocation: set(sizes) <= traced.get(allocation, set())
-                    for allocation, sizes in assigned.items()}
+        # A tuple's index table is no array (`described`), which XLA may place in an allocation past its
+        # simulated heap (sm90's gemm fusions' tuples: rows 14089 and 14091's sm90 twins): an allocation is
+        # complete where each array it is assigned is simulated.
+        table = self.types.values_by_name["TUPLE"].number
+        complete = {allocation.index: {each.logical_buffer_id for each in allocation.assigned
+                                       if each.element_type != table}
+                    <= traced.get(allocation.index, set()) for allocation in self.proto.buffer_allocations}
         found = []
         # A heap's pages each copy one trace's events: the first trace of each sequence of events names it.
         timelines: dict[tuple, int] = {}
@@ -262,14 +281,7 @@ class Assignment:
         position, as the fused ops reading the operand slots it takes the value in: through views, tuple
         slots and nested fusions, a nested fusion's result its caller's where its root passes the value
         on; "" where a path reaches no name, a read no phase is told of (trains 1406 and 1427)."""
-        uses = self.uses
-        if uses is None:
-            # Each instruction's users across the module, with the operand slot each reads it in, built
-            # where an interval is read and kept.
-            uses = self.uses = {}
-            for instruction in self.instructions.values():
-                for slot, operand in enumerate(instruction.operand_ids):
-                    uses.setdefault(operand, []).append((instruction, slot))
+        uses = self.readers()
         buffer = self.buffers[buffer_id]
         made = buffer.defined_at.instruction_id
         found: set[tuple[int, str]] = set()
@@ -289,6 +301,16 @@ class Assignment:
             for user, slot in users:
                 found.update(self.read_by(user, slot, within, inside, ran, reading))
         return tuple(sorted(found))
+
+    def readers(self):
+        """Each instruction's users across the module by its id, with the operand slot each reads it in,
+        built once and kept."""
+        if self.uses is None:
+            self.uses = {}
+            for instruction in self.instructions.values():
+                for slot, operand in enumerate(instruction.operand_ids):
+                    self.uses.setdefault(operand, []).append((instruction, slot))
+        return self.uses
 
     def read_by(self, user, slot: int, within: tuple[int, ...], inside: tuple[int, ...],
                 ran: Mapping[tuple[str, str], int], reading: list) -> list[tuple[int, str]]:
@@ -381,13 +403,15 @@ class Assignment:
         metadata = instruction.metadata
         # The defining instruction's name, where it names the element defined (`_names_output`): a tuple
         # call's names its result alone, an unknown call's none of its elements.
-        named = (instruction.frontend_attributes.map.get("checkpoint_name")
-                 if _names_output(instruction, index) else None)
-        # A loop's state element: the row its body writes into it, named and scoped as that row (`_looped`).
-        row = None if named else _looped(instruction, index, self.aliases.get(buffer.id, ()),
-                                         self.instructions, self.computations)
-        if row is not None:
-            named = row.name
+        own = (instruction.frontend_attributes.map.get("checkpoint_name")
+               if _names_output(instruction, index) else None)
+        # A loop's state element: the row its body writes into it, named and scoped as that row, and the
+        # stack it is where the loop writes it alone (`_Loops.row`).
+        if self.loops is None:
+            self.loops = _Loops(_Module(self.instructions, self.computations, self.readers()))
+        row = self.loops.row(instruction, index, self.aliases.get(buffer.id, ()))
+        named = own or (None if row is None else row.name)
+        scoped = None if own else row
         made, within, getter = _maker(instruction, index, self.instructions, self.computations)
         if not named and getter is not None:
             named = getter.frontend_attributes.map.get("checkpoint_name")
@@ -396,7 +420,7 @@ class Assignment:
         # A stack's op is the row its loop writes, which its rung's scope names, however the stack is
         # assigned (row 12463: read as the loop's or its initializer's, a scanned decoder's stacks lay in no
         # rung's scope, so no remat was priced to drop them; train 1474's P-F3).
-        op_name = ((row.scope if row is not None else "") or metadata.op_name or made.metadata.op_name)
+        op_name = ((scoped.scope if scoped is not None else "") or metadata.op_name or made.metadata.op_name)
         return {"bytes": buffer.size, "shape": tuple(shape.dimensions),
                 "dtype": self.types.values_by_number[shape.element_type].name.lower(), "kind": kind,
                 "instruction": instruction.name, "op_name": op_name,
@@ -404,7 +428,9 @@ class Assignment:
                 "names": tuple(named.split(",")) if named else (),
                 "parameter": self.parameters.get(allocation),
                 "role": _role(made, within),
-                "dims": tuple(None for _ in shape.dimensions) if dims is None else tuple(dims)}
+                "dims": tuple(None for _ in shape.dimensions) if dims is None else tuple(dims),
+                "stack": None if row is None else row.stack,
+                "filling": row is not None and row.filling}
 
 
 def _charged(events, assigned: dict[int, int], kinds: dict[str, int]) -> set[int]:
@@ -502,32 +528,80 @@ def _role(maker, index: tuple[int, ...]) -> str:
     return "workspace" if _cublas(maker) and last > 0 and index == (last,) else ""
 
 
+class _Module(NamedTuple):
+    """A compiled module's instructions and computations by id, and each instruction's readers with the
+    operand slot each reads it in (`Assignment.readers`): what a loop's state is read through."""
+
+    instructions: Mapping[int, Any]
+    computations: Mapping[int, Any]
+    readers: Mapping[int, list[tuple[Any, int]]]
+
+
 class _Row(NamedTuple):
-    """The value a loop's body writes into a state element (`_looped`): its checkpoint name and the op that
-    names or makes it, the scope a remat rung reads it by."""
+    """The value a loop's body writes into a state element (`_Loops.row`): its checkpoint name and the op
+    that names or makes it, the scope a remat rung reads it by, the stack the element is
+    (`LiveBuffer.stack`) where the loop writes it a row a step and reads it nowhere else, and whether the
+    buffer is one its loop fills it through (`LiveBuffer.filling`)."""
 
     name: str | None
     scope: str
+    stack: tuple[int, int] | None
+    filling: bool
 
 
-def _looped(instruction, index: tuple[int, ...], locations, instructions, computations) -> _Row | None:
-    """The row a loop's body writes into the state element a buffer holds, named and scoped as that row
-    (`_value_named`): the buffer defined at the loop itself (its state's value past the loop, which XLA
-    assigns apart from its initial element's), where the loop is stated to run, or at an instruction one of
-    the loop's elements aliases (its `locations`: a scan's stack broadcast before the loop); None where it
-    holds none (row 12463: a scanned decoder's stacks, read unnamed and in no rung's scope)."""
-    written = None
-    if instruction.opcode == "while" and len(index) == 1:
-        written = _loop_named(instruction, index[0], instructions, computations, ran=True)
-    for location in () if written is not None else locations:
-        loop = instructions[location.instruction_id]
-        if loop.opcode == "while" and len(location.shape_index) == 1:
-            written = _loop_named(loop, location.shape_index[0], instructions, computations)
-            if written is not None:
-                break
-    if written is None:
-        return None
-    return _Row(*_value_named(written, instructions, computations))
+class _Written(NamedTuple):
+    """What a loop's body writes into a state element (`_loop_named`): the value, and, where it is the row
+    of a scan's stack the loop fills alone (`_stacked`), the positions (an instruction's id and the index
+    in its output) defining the stack's values its loop fills it through, read by nothing but the loop:
+    the zeros it starts from, the body's and condition's state and each step's write; empty otherwise."""
+
+    value: Any
+    filling: frozenset[tuple[int, tuple[int, ...]]] = frozenset()
+
+
+class _Loops:
+    """A module's loop state elements as its buffers are read (`row`), each element's reading made once and
+    kept: what its body writes into it (`_loop_named`), named and scoped (`_value_named`)."""
+
+    def __init__(self, module: _Module):
+        self.module = module
+        self.written: dict[tuple[int, int, bool], tuple[_Written, str | None, str] | None] = {}
+
+    def row(self, instruction, index: tuple[int, ...], locations) -> _Row | None:
+        """The row a loop's body writes into the state element a buffer holds, named and scoped as that row,
+        with the stack the element is: the buffer defined at the loop itself (its state's value past the
+        loop, which XLA assigns apart from its initial element's), where the loop is stated to run, or at an
+        instruction one of the loop's elements aliases (its `locations`: a scan's stack broadcast before the
+        loop, each step's write into it); None where it holds none (row 12463: a scanned decoder's stacks,
+        read unnamed and in no rung's scope). Named as the first loop's element it is read as; a stack only
+        of an element whose own value the buffer is (the loop's output, or a value it fills it through,
+        `_Written.filling`), whichever of the loops its alias set holds that is: XLA's alias set can hold
+        other values beside them (a conditional returning one scan's stack from one branch and another's,
+        or another array, from the other; review of row 12463)."""
+        loops = ([(instruction, index[0], True)] if instruction.opcode == "while" and len(index) == 1
+                 else [])
+        loops += [(self.module.instructions[location.instruction_id], location.shape_index[0], False)
+                  for location in locations if len(location.shape_index) == 1]
+        named: tuple[_Written, str | None, str] | None = None
+        for loop, element, ran in loops:
+            if loop.opcode != "while" or (found := self.loop_named(loop, element, ran=ran)) is None:
+                continue
+            named = named or found
+            written = found[0]
+            output = loop.id == instruction.id and ran
+            if written.filling and (output or (instruction.id, index) in written.filling):
+                return _Row(found[1], found[2], (loop.id, element), filling=not output)
+        return None if named is None else _Row(named[1], named[2], None, filling=False)
+
+    def loop_named(self, loop, element: int, *, ran: bool) -> tuple[_Written, str | None, str] | None:
+        """`_loop_named`'s reading of `loop`'s `element`, with its value's name and scope (`_value_named`),
+        made once; None where it reads none."""
+        key = (loop.id, element, ran)
+        if key not in self.written:
+            written = _loop_named(loop, element, self.module, ran=ran)
+            self.written[key] = None if written is None else (
+                written, *_value_named(written.value, self.module.instructions, self.module.computations))
+        return self.written[key]
 
 
 class _Trips(NamedTuple):
@@ -558,7 +632,7 @@ def _annotation(loop) -> _Trips | None:
                   None if counter is None else int(counter.get("tuple_index", 0)))
 
 
-def _loop_named(loop, element: int, instructions, computations, *, ran: bool = False):
+def _loop_named(loop, element: int, module: _Module, *, ran: bool = False) -> _Written | None:
     """What while `loop`'s body writes into the whole of its state's `element`: the body's element where it
     is named (the state element is that value); else the row a scan writes into its stacked output each step
     (`_stacked`); None for any other element, a write into part of a buffer naming none of it. With `ran`,
@@ -568,16 +642,16 @@ def _loop_named(loop, element: int, instructions, computations, *, ran: bool = F
     if ran and (trips is None or trips.steps <= 0):
         return None
     # XLA's while names its body first, its condition second.
-    root = instructions[computations[loop.called_computation_ids[0]].root_id]
+    root = module.instructions[module.computations[loop.called_computation_ids[0]].root_id]
     if root.opcode != "tuple" or element >= len(root.operand_ids):
         return None
-    written = instructions[root.operand_ids[element]]
+    written = module.instructions[root.operand_ids[element]]
     if written.frontend_attributes.map.get("checkpoint_name"):
-        return written
-    return None if trips is None else _stacked(loop, element, written, trips, instructions, computations)
+        return _Written(written)
+    return None if trips is None else _stacked(loop, element, written, trips, module)
 
 
-def _stacked(loop, element: int, written, trips: _Trips, instructions, computations):
+def _stacked(loop, element: int, written, trips: _Trips, module: _Module) -> _Written | None:
     """The row a scan writes into its stacked output each step, state `element` of while `loop`, `written`
     the body's value for it: XLA keeps a loop's state in its initial elements' buffers, so a scan's stack is
     the buffer its broadcast fills, which carries no name, while each step's dynamic-update-slice writes the
@@ -586,7 +660,10 @@ def _stacked(loop, element: int, written, trips: _Trips, instructions, computati
     fills the element at the loop's start; the body writes one whole row into the element's own state at the
     induction variable i or at n - 1 - i, itself, fused or not, run asynchronously or not (XLA:GPU's async
     fusion: an async-done of an async-start whose computation is the fusion); XLA's trip count annotation
-    (WhileLoopBackendConfig) states i runs from 0 by 1 over n steps, n the stack's rows. None otherwise."""
+    (WhileLoopBackendConfig) states i runs from 0 by 1 over n steps, n the stack's rows. Its values the loop
+    fills it through (`_Written.filling`), where besides nothing reads them but the loop (`_written_alone`,
+    `_started_alone`). None otherwise."""
+    instructions, computations = module.instructions, module.computations
     # Each caller the write is made in, outermost first, with what its called computation holds: an
     # async-start's, then a fusion's.
     callers: list[tuple[Any, frozenset[int]]] = []
@@ -594,14 +671,19 @@ def _stacked(loop, element: int, written, trips: _Trips, instructions, computati
     # decoder's stack its fusion's update viewed as the state's shape (row 12463: a cold 4B start's 167 GiB of
     # stacked residuals read unnamed, no rung's recomputation priced to free them).
     put = _bitcast_of(written, instructions)
+    # The positions the write's value is defined at on its way out: each async call's and fusion's, the
+    # write's own.
+    writes: set[tuple[int, tuple[int, ...]]] = {(put.id, ())}
     if put.opcode == "async-done":
         put = instructions[put.operand_ids[0]]
         if put.opcode != "async-start":
             return None
+        writes.add((put.id, (1,)))
     while put.opcode in ("async-start", "fusion"):
         computation = computations[put.called_computation_ids[0]]
         callers.append((put, frozenset(instruction.id for instruction in computation.instructions)))
         put = instructions[computation.root_id]
+        writes.add((put.id, ()))
     if put.opcode != "dynamic-update-slice" or not put.shape.dimensions:
         return None
     steps, counter = trips.steps, trips.counter
@@ -653,7 +735,92 @@ def _stacked(loop, element: int, written, trips: _Trips, instructions, computati
                                                 computations):
         return None
     # What the row is, through the bitcasts, reshapes and copies on its way.
-    return _laid_out(outside(_laid_out(update, instructions)), instructions)
+    row_value = _laid_out(outside(_laid_out(update, instructions)), instructions)
+    zeros = _started_alone(loop, element, module)
+    if zeros is None or not _written_alone(loop, element, written, put, module):
+        return _Written(row_value)
+    states = {(each.id, (element,)) for index in loop.called_computation_ids[:2]
+              for each in computations[index].instructions if each.opcode == "parameter"}
+    return _Written(row_value, frozenset({*writes, *states, zeros}))
+
+
+def _started_alone(loop, element: int, module: _Module) -> tuple[int, tuple[int, ...]] | None:
+    """The position defining the value while `loop`'s state `element` starts from (its initial tuple's
+    element, through bitcasts; a getter's at its producer's output), where nothing but the loop reads it:
+    its producer read through getters alone, each getter of that output and the value through its bitcasts
+    read as the tuple's element alone, and the tuple by the loop alone. None where anything else reads it
+    (a metric of the zeros, review of row 12463)."""
+    initial = module.instructions[loop.operand_ids[0]]
+    if [(reader.id, slot) for reader, slot in module.readers.get(initial.id, ())] != [(loop.id, 0)]:
+        return None
+    value = _bitcast_of(module.instructions[initial.operand_ids[element]], module.instructions)
+    ends = {(initial.id, element)}
+    if value.opcode != "get-tuple-element":
+        return (value.id, ()) if _flows_to(value, ends, module, inward=False) else None
+    # The producer's outputs read through getters alone: a reader of the whole tuple (a call taking it) may
+    # read the zeros besides (review of row 12463).
+    readers = [reader for reader, _ in module.readers.get(value.operand_ids[0], ())]
+    if any(reader.opcode != "get-tuple-element" for reader in readers) or not all(
+            _flows_to(getter, ends, module, inward=False)
+            for getter in readers if getter.tuple_index == value.tuple_index):
+        return None
+    return value.operand_ids[0], (value.tuple_index,)
+
+
+def _written_alone(loop, element: int, written, put, module: _Module) -> bool:
+    """Whether while `loop` reads its state's `element` only to write it: in its body, the element's state
+    reaches no reader but `put`'s target operand (`_stacked`'s dynamic-update-slice), through bitcasts and
+    into the fusions and async calls passing it on as their parameters; `written`, the body's value for it,
+    reaches none but the body's result at the element; its condition reads it nowhere. Then the loop's
+    steps need none of the element's rows: a scan's stack, held for what reads it past the loop alone
+    (row 12463: a scanned decoder's forward held 167 GiB of its stacks' in-loop values, which a step that
+    saves none of their rows never builds)."""
+    body, condition = (module.computations[index] for index in loop.called_computation_ids[:2])
+    for computation, ends in ((body, {(put.id, 0)}), (condition, set())):
+        # XLA's while body and condition each take the loop's state as their one parameter.
+        [state] = [each for each in computation.instructions if each.opcode == "parameter"]
+        for reader, _ in module.readers.get(state.id, ()):
+            # The state read whole (a call taking the tuple) is read past any element's write.
+            if reader.opcode != "get-tuple-element" or (reader.tuple_index == element
+                                                         and not _flows_to(reader, ends, module)):
+                return False
+    # The write's own result, through the bitcasts viewing it, is the body's result at the element alone.
+    return _flows_to(_bitcast_of(written, module.instructions), {(body.root_id, element)}, module,
+                     inward=False)
+
+
+def _flows_to(value, ends: set[tuple[int, int]], module: _Module, *, inward: bool = True) -> bool:
+    """Whether every reader of `value` reads it as one of `ends` (an instruction's id and the operand slot
+    it reads it in) or passes it on to one: through bitcasts, each moving no byte, and, `inward`, into the
+    computation of a fusion or an async call taking it, as its parameter at its slot, which that
+    computation returns nowhere (a fusion returning its operand passes it to what reads its result)."""
+    passing = [value.id]
+    seen: set[int] = set()
+    returned: set[int] = set()
+    while passing:
+        if (at := passing.pop()) in seen:
+            continue
+        if at in returned:
+            return False
+        seen.add(at)
+        for reader, slot in module.readers.get(at, ()):
+            if (reader.id, slot) in ends:
+                continue
+            if reader.opcode == "bitcast":
+                passing.append(reader.id)
+            elif inward and reader.opcode in ("fusion", "async-start"):
+                # An async call's operands are its start's output too: read through it by its own done
+                # alone, no update between them (review of row 12463).
+                if reader.opcode == "async-start" and [
+                        user.opcode for user, _ in module.readers.get(reader.id, ())] != ["async-done"]:
+                    return False
+                called = module.computations[reader.called_computation_ids[0]]
+                returned.add(called.root_id)
+                passing.append(next(each.id for each in called.instructions
+                                    if each.opcode == "parameter" and each.parameter_number == slot))
+            else:
+                return False
+    return True
 
 
 def _value_named(instruction, instructions, computations) -> tuple[str | None, str]:

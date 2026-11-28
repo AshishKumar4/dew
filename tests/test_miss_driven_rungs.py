@@ -162,7 +162,7 @@ def test_a_jumped_rung_fitting_at_a_split_its_walk_passed_over_is_admitted_there
     2, and whose place misses at 2 and, its forecast reading no split fitting, at 8: the place fits at 4,
     a split its walk passed over, and the search admits it there rather than refusing (train 1387's P0)."""
     from dew.training.memory import MemoryMiss
-    from dew.training.planning import FitSearch
+    from dew.training.planning import FitSearch, Jump
 
     model = models.build("causal_transformer", vocab_size=32, emb_features=16, num_layers=1, num_heads=2,
                          mlp_features=32, max_seq_len=8)
@@ -185,13 +185,15 @@ def test_a_jumped_rung_fitting_at_a_split_its_walk_passed_over_is_admitted_there
             self.at(places[0])
             self.place = self.rung()
             self.at(start)
-            return places[0], list(candidates).index(2)
+            return Jump(places[0], list(candidates).index(2), freed=10, short=10)
 
     search = Scripted(lower=None, options=lambda candidate: None, objective=LMObjective(model, seq_len=8),
                       mesh=MeshSpec().build(jax.devices()[:1]), xla_defaults=False, narrow=False,
                       ns_group=None, base=None, resumed=None, gather=lambda mine: [mine])
     assert search.searched([1, 2, 4, 8], 0) == 4
     assert search.rung() == search.place
+    # Its predicted split's miss recorded, though a split past it fit (review of row 12463).
+    assert search.jump["missed_by"] == 10
 
 
 def test_a_miss_reads_its_next_split_and_whether_it_fits_as_every_process_does():

@@ -20,7 +20,10 @@
 import collections
 from typing import Any
 
+import jax
+import jax.numpy as jnp
 from google.protobuf.message import Message
+from jax import ad_checkpoint
 
 from dew.telemetry import hlo
 from dew.training.live_buffers import Assignment, provenance
@@ -78,3 +81,15 @@ def temporaries(buffers) -> collections.Counter:
     """`buffers`' temporaries by their instruction and size."""
     return collections.Counter((buffer.instruction, buffer.bytes) for buffer in buffers
                                if buffer.kind == "temporary")
+
+
+def scanned_hidden(xs, w):
+    """A scan over the rows `xs` whose body saves its named residual "hidden", tanh(x @ w), alone, summing
+    sin of it into its carry: its gradient's stack of that residual is a loop state element its body writes
+    a row a step."""
+    def body(carry, x):
+        hidden = ad_checkpoint.checkpoint_name(jnp.tanh(x @ w), "hidden")
+        return carry + jnp.sum(jnp.sin(hidden)), None
+
+    saved = jax.checkpoint(body, policy=jax.checkpoint_policies.save_only_these_names("hidden"))
+    return jax.lax.scan(saved, 0.0, xs)[0]

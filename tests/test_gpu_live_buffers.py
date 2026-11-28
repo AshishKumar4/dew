@@ -16,15 +16,17 @@
 # (the JAX fork's audit of 2026-11-26, its C01/C02).
 """A GPU compile's buffers read from its buffer assignment (`dew.training.live_buffers`): XLA:GPU's heap
 simulation, which XLA:CPU keeps none of, its scanned stacks, and a compile-only twin's probe of the device's
-own compile."""
+own compile. Each compiles its program anew (`dew._cache.uncached`): an XLA:GPU executable JAX's persistent
+cache loads states no buffer assignment, so a test served one by the GPU tier's shared cache read none
+(rows 14089-14091)."""
 import jax
 import jax.experimental.topologies as topologies
 import jax.numpy as jnp
 import pytest
-from jax import ad_checkpoint
 from jax.sharding import PartitionSpec
-from live_buffers_support import counted, temporaries
+from live_buffers_support import counted, scanned_hidden, temporaries
 
+from dew._cache import uncached
 from dew.training.live_buffers import live_intervals, peak_live
 
 pytestmark = pytest.mark.gpu(reason="XLA:GPU's buffer assignment: its heap simulation and early exit")
@@ -43,7 +45,8 @@ def test_a_compiles_intervals_hold_its_peak_buffers_at_each_allocations_peak():
         return x.sum(), x
 
     tile = jax.ShapeDtypeStruct((256, 256), jnp.float32)
-    compiled = jax.jit(jax.grad(step, has_aux=True)).lower(tile, tile).compile()
+    with uncached():
+        compiled = jax.jit(jax.grad(step, has_aux=True)).lower(tile, tile).compile()
     intervals, live = live_intervals(compiled), peak_live(compiled)
     assert intervals and all(each.complete for each in intervals)
     peaked = []
@@ -58,17 +61,10 @@ def test_a_scans_stacked_residual_is_named_by_what_its_body_writes():
     """A scan saves each step's named residual into a stacked output, a loop state element whose buffer is
     the zeros a broadcast makes (row 13304): that buffer, live at the gradient's peak, is named by the
     residual the body writes into it."""
-    def step(xs, w):
-        def body(carry, x):
-            hidden = ad_checkpoint.checkpoint_name(jnp.tanh(x @ w), "hidden")
-            return carry + jnp.sum(jnp.sin(hidden)), None
-
-        saved = jax.checkpoint(body, policy=jax.checkpoint_policies.save_only_these_names("hidden"))
-        return jax.lax.scan(saved, 0.0, xs)[0]
-
     rows = jax.ShapeDtypeStruct((16, 512, 256), jnp.float32)
     weight = jax.ShapeDtypeStruct((256, 256), jnp.float32)
-    live = peak_live(jax.jit(jax.grad(step, argnums=1)).lower(rows, weight).compile())
+    with uncached():
+        live = peak_live(jax.jit(jax.grad(scanned_hidden, argnums=1)).lower(rows, weight).compile())
     assert live is not None
     stacked = [buffer for buffer in live if buffer.shape == (16, 512, 256)]
     assert ("hidden",) in {buffer.names for buffer in stacked}, stacked
@@ -86,10 +82,11 @@ def test_a_probe_on_the_devices_twin_states_the_devices_own_compile():
     def tiles(sharding) -> list[jax.ShapeDtypeStruct]:
         return [jax.ShapeDtypeStruct((256, 256), jnp.float32, sharding=sharding)] * 2
 
-    probe = jax.jit(_step).lower(*tiles(twin)).compile(
-        {"xla_gpu_experimental_early_exit": "EARLY_EXIT_POINT_AFTER_BUFFER_ASSIGNMENT"})
     attached = jax.sharding.NamedSharding(jax.sharding.Mesh(devices, ("x",)), PartitionSpec())
-    whole = jax.jit(_step).lower(*tiles(attached)).compile()
+    with uncached():
+        probe = jax.jit(_step).lower(*tiles(twin)).compile(
+            {"xla_gpu_experimental_early_exit": "EARLY_EXIT_POINT_AFTER_BUFFER_ASSIGNMENT"})
+        whole = jax.jit(_step).lower(*tiles(attached)).compile()
     assert probe.memory_analysis().temp_size_in_bytes == whole.memory_analysis().temp_size_in_bytes
     assert peak_live(whole) is not None
     assert peak_live(probe) == peak_live(whole)
