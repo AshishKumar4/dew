@@ -4,7 +4,6 @@ kernels' names, which a tile's producer registers are kept by. Light at import: 
 type (a selector's launch, `grouped_matmul`) reads no toolkit module until a tile is made."""
 
 import dataclasses
-import math
 from typing import ClassVar
 
 import jax
@@ -145,13 +144,13 @@ class Tiles:
         """Why the output staging this tile states (`staging`) holds no chunk of the call's outputs of
         `dtypes` (or `stores.Output`s, a packed one's chunk its own, `stores.staging_refusal`'s `packed`) on
         `family` (its issuer as the tile specializes it), None where it does or states none: a
-        chunk slices its accumulator at whole fragments (`ACCUMULATOR_COLUMNS`) and whole atoms of the issuer
-        (`mosaic.Issuer.atom_columns`: two row warps of mma.sync tile 16 columns), and divides the tile and
+        chunk slices its accumulator in whole slices of the issuer's (`mosaic.Issuer.sliced_columns`: two row
+        warps of mma.sync tile 16 columns), and divides the tile and
         the issuer's pieces in whole TMA rows of each dtype (`stores.staging_refusal`, the one owner of
         those)."""
         if self.staging is None:
             return None
-        unit = math.lcm(ACCUMULATOR_COLUMNS, family.atom_columns)
+        unit = family.sliced_columns
         if self.staging[0] % unit:
             return f"a stated chunk of {self.staging[0]} columns slices the accumulator's {unit}-column atoms"
         columns, piece = self.issued(family)
@@ -164,12 +163,6 @@ class Tiles:
         return next((refusal for output in outputs if (refusal := stores.staging_refusal(
             columns, (output.dtype,), self.staging, piece=piece,
             packed=(output,) if output.divisor > 1 or output.transposed else ())) is not None), None)
-
-
-ACCUMULATOR_COLUMNS = 8
-"""The columns an MMA accumulator's register fragment holds together (mma.sync's n8, a warpgroup MMA's
-8-column tiles): a staged chunk slices the accumulator at whole fragments, so an fp32 chunk of 4 columns,
-whole TMA stores, is still none (`Tiles.staging_refusal`)."""
 
 
 CONSUMERS = 2
