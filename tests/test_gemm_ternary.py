@@ -425,7 +425,7 @@ def test_an_eager_ternary_pullback_of_explicitly_split_rows_runs_outside_its_mes
                                                                        "trailing", "scalar"])
 @pytest.mark.mesh(devices=2)
 def test_a_broadcasts_transpose_sums_a_split_cotangent_keeping_its_placement(shape, in_context):
-    """`generation.unbroadcast` of a `[8, 16, 64]` cotangent an Explicit axis splits by its leading rows, back
+    """`sharding.unbroadcast` of a `[8, 16, 64]` cotangent an Explicit axis splits by its leading rows, back
     to an operand's `shape` broadcast to it (a rank-changing `[1, 64]` under a batch axis, a widened `[8, 1,
     64]`, a trailing `[64]`, a scalar), jitted under its mesh or outside its context: the sum JAX's own
     broadcast pullback gives of the plain cotangent, exactly over small integers, its placement the split
@@ -433,7 +433,7 @@ def test_a_broadcasts_transpose_sums_a_split_cotangent_keeping_its_placement(sha
     the split cotangent)."""
     from jax.sharding import AxisType, NamedSharding, PartitionSpec
 
-    from dew.nn.kernels import generation
+    from dew.nn import sharding
 
     rng = np.random.default_rng(14373)
     cotangent = rng.integers(-3, 4, (8, 16, 64)).astype(np.float32)
@@ -442,7 +442,7 @@ def test_a_broadcasts_transpose_sums_a_split_cotangent_keeping_its_placement(sha
     mesh = jax.make_mesh((2,), ("data",), axis_types=(AxisType.Explicit,), devices=jax.devices()[:2])
     split = jax.device_put(cotangent, NamedSharding(mesh, PartitionSpec("data")))
     with jax.set_mesh(mesh) if in_context else contextlib.nullcontext():
-        summed = jax.jit(lambda each: generation.unbroadcast(each, shape))(split)
+        summed = jax.jit(lambda each: sharding.unbroadcast(each, shape))(split)
     assert summed.shape == shape
     np.testing.assert_array_equal(np.asarray(summed), np.asarray(plain))
     if len(shape) == 3:
