@@ -245,7 +245,7 @@
 "tests/test_attention_decode_template.py::test_softcap_and_windowed_decode_compile_spill_free[sm90-softcap-d64-decode]"
 ],
 "tests/test_attention_derived.py": [
-"tests/test_attention_derived.py::test_sm90_roofline_forward_and_fused_backward_compile_spill_free[128]",
+"tests/test_attention_derived.py::test_slices_merged_at_once_are_on_par_with_their_fold[causal]",
 "tests/test_attention_derived.py::test_staged_logits_is_skipped_when_unstaged_already_fits_shared_memory_at_same_residency",
 "tests/test_attention_derived.py::test_the_derived_forward_is_on_par_with_xlas[natural-causal-walked]"
 ],
@@ -734,7 +734,7 @@
 "tests/test_attention_triton.py::test_a_triton_launchs_shared_memory_is_what_triton_allocates[a100-tile-step-128x64]",
 "tests/test_attention_triton.py::test_a_triton_launchs_shared_memory_is_what_triton_allocates[b200-bf16-forward-32x32]",
 "tests/test_attention_triton.py::test_a_triton_launchs_shared_memory_is_what_triton_allocates[b200-fp32-forward-64x128]",
-"tests/test_attention_triton.py::test_a_triton_launchs_shared_memory_is_what_triton_allocates[b200-temperature-step-64x64]",
+"tests/test_attention_triton.py::test_a_triton_launchs_shared_memory_is_what_triton_allocates[b200-temperature-forward-64x128]",
 "tests/test_attention_triton.py::test_a_triton_launchs_shared_memory_is_what_triton_allocates[h100-fp32-forward-64x64]",
 "tests/test_attention_triton.py::test_a_triton_launchs_shared_memory_is_what_triton_allocates[rtx5090-bf16-forward-64x64]",
 "tests/test_attention_triton.py::test_an_fp32_training_step_at_its_own_configs_compiles_within_an_a100s_block[64]",
@@ -1924,8 +1924,8 @@
 "tests/test_gemm_nvfp4.py::test_a_stack_of_nvfp4_banks_is_read_at_its_layer_as_that_layers_bank[xla-gathered-rows]",
 "tests/test_gemm_nvfp4.py::test_an_nvfp4_operand_at_a_given_tensor_scale_is_the_rule_at_that_scale",
 "tests/test_gemm_nvfp4.py::test_an_nvfp4_products_gathered_gradient_sums_its_routes_before_it_rounds",
-"tests/test_gemm_nvfp4.py::test_an_nvfp4_products_input_gradient_keeps_its_cotangents_precision",
-"tests/test_gemm_nvfp4.py::test_gemm_quantize_epilogue_lowers_inline_ptx[sm80]",
+"tests/test_gemm_nvfp4.py::test_an_nvfp4_products_packed_kernel_is_its_decoded_product[sm90]",
+"tests/test_gemm_nvfp4.py::test_an_nvfp4_rows_gradient_keeps_a_cancelling_pairs_rounding_residual[packed]",
 "tests/test_gemm_nvfp4.py::test_ternary_weights_checkpoint_restore_verifies_form_and_scale"
 ],
 "tests/test_gemm_nvfp4_chain.py": [
@@ -3321,8 +3321,8 @@
 ],
 "tests/test_recurrence_forked_gate.py": [
 "tests/test_recurrence_forked_gate.py::test_a_forked_calls_walks_keep_its_table_spilling_none[sm100-kimi-linear-kda-True]",
-"tests/test_recurrence_forked_gate.py::test_a_forked_calls_walks_keep_its_table_spilling_none[sm100-minimax-text-01-lightning-True]",
-"tests/test_recurrence_forked_gate.py::test_a_forked_calls_walks_keep_its_table_spilling_none[sm80-kimi-linear-kda-False]",
+"tests/test_recurrence_forked_gate.py::test_a_forked_calls_walks_keep_its_table_spilling_none[sm100-nemotron-h-4b-ssd-False]",
+"tests/test_recurrence_forked_gate.py::test_a_forked_calls_walks_keep_its_table_spilling_none[sm80-a write gate-False]",
 "tests/test_recurrence_forked_gate.py::test_a_forked_calls_walks_keep_its_table_spilling_none[sm80-nemotron-h-4b-ssd-True]",
 "tests/test_recurrence_forked_gate.py::test_a_forked_calls_walks_keep_its_table_spilling_none[sm90-kimi-linear-kda-False]",
 "tests/test_recurrence_forked_gate.py::test_a_forked_calls_walks_keep_its_table_spilling_none[sm90-nemotron-h-4b-ssd-False]"
