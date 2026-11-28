@@ -227,12 +227,10 @@ def scaled_exactly(product: jax.Array, factor: jax.Array) -> jax.Array:
 def owed_exactly(product: jax.Array, factor: jax.Array, raised: int) -> jax.Array:
     """`product * factor * 2**raised` (`raised` a whole exponent of at least 0, an owed power of two's: an
     NVFP4 decode's, `bits.NVFP4_OWED`) in fp32 rounded once, however large or small the factor, the result
-    or the power (`_scaled_value`): natively the factor and the power one multiplier only where the power is
-    a float32's (`raised` at most 127) and their product finite, else the product times the factor rounded
-    once before the power; past 127, or where the platform flushes subnormals, rounded once in integer
-    arithmetic (`lowered_product`; train 1403's review: an NVFP4 column's tensor scale of 2**122 under its
-    decode's 2**8 overflowed a folded multiplier; train 1450's: 2**128 overflowed the power itself). Its
-    derivative is the plain product's, each perturbed operand's term alone."""
+    or the power: natively by `owed_native`'s fold, where the platform flushes subnormals in integer
+    arithmetic (`lowered_product`, `_scaled_value`; train 1403's review: an NVFP4 column's tensor scale of
+    2**122 under its decode's 2**8 overflowed a folded multiplier; train 1450's: 2**128 overflowed the power
+    itself). Its derivative is the plain product's, each perturbed operand's term alone."""
     return _scaled(raised, product, factor)
 
 
