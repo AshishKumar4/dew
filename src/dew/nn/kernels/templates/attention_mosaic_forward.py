@@ -787,7 +787,7 @@ def _prepared(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpan
     weights = query.dtype if scales is not None else value.dtype
     spec, taken = folded_form(spans.form, spans.keys, ids=spans.query_ids is not None, dtype=query.dtype,
                               width=query.shape[3], scale=scale, natural=natural, score_mod=hooks.score.fn,
-                              subtracted=subtracted,
+                              subtracted=subtracted, excluded=spans.excluded,
                               # A quantized model's codes and values, each at most 127, sum far within fp32.
                               headroom=scaled and hooks.rounds is None and algebra.headroom(weights),
                               initial=hooks.initial is not None,
@@ -1579,12 +1579,9 @@ def _stored_walk(program: _Program, spec: algebra.Forward, state: algebra.Partia
     row, head, first = place
     stored, row_smem = rows
     if program.splits == 1:
-        # A whole walk's rows of no mass NaN where the call reads them so (`algebra.nan_massless`), its
-        # padding rows' queries formed in the rows' layout as its status forms them (`_status_stored`); a split
+        # A whole walk's rows of no mass NaN where the call reads them so (`algebra.nan_massless`); a split
         # walk's slices are finished by their merge.
-        queries = (family.as_row(first + family.iota(state.total.shape, 0))
-                   if spec.massless_nan and spec.queries is not None else None)
-        state = algebra.nan_massless(spec, state, queries)
+        state = algebra.nan_massless(spec, state)
     if not training or trained is None:
         # The output's view formed where it is stored, its block's indices read afresh (`_Block.afresh`), as
         # its rows' are: formed before the walk, its query block's base was held across it (a B200's scaled

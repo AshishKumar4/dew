@@ -95,13 +95,23 @@ class KeySpans:
     then `[B, Q // per_span]`: a key head's packed rows of one position (`attention_decode.packed`), or a
     call's every query where lengths and starts alone bound its keys (`spans`), which a program reads by
     position (`per_query` repeats them)."""
+    excluded: bool = dataclasses.field(default=True, metadata={"static": True})
+    """Whether a row of no mass (its every logit -inf) reads zero, Dew's exclusion, a template call's by
+    default (a score hook that masks a row's every key empties it); where not, a call whose spans hide no key
+    ('full': the dispatch's call of no mask or of a fill, `dew.nn.attention.template_attention`), NaN, as the
+    reference path's jax.nn softmax reads it (`attention_algebra.Forward.massless_nan`, row 14116)."""
+
+    def __post_init__(self):
+        if not self.excluded and self.form != "full":
+            raise ValueError("only a call whose spans hide no key reads a row of no mass NaN: a hidden key's "
+                             "walk is skipped where jax.nn's NaN weights reach it")
 
     def per_query(self) -> "KeySpans":
         """These spans an interval a query (`per_span` 1)."""
         if self.per_span == 1:
             return self
         start, end = (jnp.repeat(bound, self.per_span, axis=1) for bound in (self.start, self.end))
-        return KeySpans(start, end, self.query_ids, self.key_ids, self.keys, self.form)
+        return dataclasses.replace(self, start=start, end=end, per_span=1)
 
 
 def within(keys: jax.Array, start: jax.Array, end: jax.Array,
@@ -347,7 +357,8 @@ def _by_row(spans: KeySpans, causal: bool, *narrowings) -> KeySpans:
     queries = spans.start.shape[1]
     if spans.form != "spans" or queries <= 1 or causal or any(x is not None for x in narrowings):
         return spans
-    return KeySpans(spans.start[:, :1], spans.end[:, :1], None, None, spans.keys, spans.form, queries)
+    return dataclasses.replace(spans, start=spans.start[:, :1], end=spans.end[:, :1], query_ids=None,
+                               key_ids=None, per_span=queries)
 
 
 def _grouped(start: jax.Array, end: jax.Array, place: jax.Array, own: jax.Array,
@@ -1391,8 +1402,9 @@ def reference(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpan
     logits, the softmax from `hooks.initial` in fp32 (or the wider of the inputs' and the state's dtypes),
     the probabilities rounded to the values' dtype for their product, the output normalized in fp32 and
     `output_mod` applied before it rounds to the query's dtype. A query that sees no key and starts from
-    no state gives zeros; one of a call whose spans hide no key that weighs none of its keys (every logit
-    -inf) gives NaN, as jax.nn's softmax does, its denominator NaN. With `residuals`, also each query's
+    no state gives zeros where its spans exclude it (`KeySpans.excluded`); elsewhere one that weighs none of
+    its keys (every logit -inf, or none it sees) gives NaN, as jax.nn's softmax does, its denominator NaN.
+    With `residuals`, also each query's
     running maximum `m` and denominator `total` `[B, H, Q]` (natural log, unnormalized), in the softmax's
     dtype, a query that sees no key and starts from no state holding 0 for both; a softmax resumed from them
     (`Initial`) starts such a query from `m = -inf`. No hooks where `hooks` is None. `rounded_to`, where
@@ -1423,10 +1435,10 @@ def reference(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpan
     p = jnp.exp(logits - safe[..., None])
     carried = jnp.where(jnp.isfinite(m0), jnp.exp(m0 - safe), 0)
     total = total0 * carried + jnp.sum(p, axis=-1)
-    # An unmasked call's row of no mass reads NaN, its value and its derivative, as jax.nn's softmax reads it
-    # (`attention_algebra.Forward.massless_nan`, row 14116): its sums over a NaN, which no other row's
-    # derivative meets.
-    massless = (total == 0) if spans.form == "full" and spans.keys > 0 and hooks.initial is None else None
+    # A row of no mass of a call its spans do not exclude (`KeySpans.excluded`) reads NaN, its value and its
+    # derivative, as jax.nn's softmax reads it (`attention_algebra.Forward.massless_nan`, row 14116): its
+    # sums over a NaN, which no other row's derivative meets.
+    massless = (total == 0) if not spans.excluded and spans.keys > 0 and hooks.initial is None else None
 
     def valued(weights: jax.Array, *, bound: float | None = None) -> jax.Array:
         # The weights narrowed to the values' dtype times the values, a query group's over its key head.

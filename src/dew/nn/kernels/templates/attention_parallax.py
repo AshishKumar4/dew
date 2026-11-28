@@ -81,7 +81,7 @@ from jax.custom_derivatives import zero_from_primal
 from dew.algebra import means
 from dew.algebra.windows import Units
 from dew.nn.derivatives import KernelGlue, Protected, contracted, declared_tangent, surrogate
-from dew.nn.float_bits import binade_of, raised_exactly
+from dew.nn.float_bits import raised_exactly
 from dew.nn.kernels import generation
 from dew.nn.kernels.templates.attention import REFERENCE_PRECISION, KeySpans, dense, logit_scale, prescaled
 from dew.nn.precision import accurate_exp, float32_einsum, ln2_remainder, power2, two_sum
@@ -155,8 +155,8 @@ def exp_scaled(z: jax.Array, exponent: jax.Array, power) -> jax.Array:
     `2^254`, `2^-115`, where applying the power after the decay read 0. Its value takes a tiny fp32 `z` from
     its bits (`raised_exactly`), so a subnormal is no operand a flushing multiply reads (XLA's CPU), and
     halves only `|z| >= 1` against `e^f`'s overflow: halving `2^-149` first read it 0, which `2^149` then
-    raised to 0, not 1 (train 1478's K-F2). Its derivative a linear map applying the decay and every power
-    to its direction or cotangent at once (`_exp_scaled_tangent`), the value the exact one's (`_exact`)."""
+    raised to 0, not 1 (train 1478's K-F2). Its derivative along `z` the halved form's, along the exponent
+    the exact value's (`_exp_scaled_tangent`), the value the exact one's (`_exact`)."""
     exponent = jnp.broadcast_to(exponent, jnp.shape(z))
     return _exp_scaled(z, exponent, jnp.broadcast_to(jnp.asarray(power, jnp.float32), jnp.shape(z)))
 
@@ -189,56 +189,25 @@ def _exact(z: jax.Array, exponent: jax.Array, power: jax.Array) -> jax.Array:
                                       power + whole + jnp.where(big, 1.0, 0.0) - up), 0.0)
 
 
-def _split(x: jax.Array) -> tuple[jax.Array, jax.Array]:
-    """`x` as `m 2^k`: `k` its binade (0 for zero), `m` within `[1, 2)` in magnitude, its derivative `2^-k`;
-    an fp32 `x`'s `m` read from its bits (`raised_exactly`), so a subnormal one is no operand a flushing
-    multiply reads (XLA's CPU); an infinity or NaN as it is, `k` 0."""
-    held = jax.lax.stop_gradient(x)
-    finite = jnp.isfinite(held)
-    if jnp.dtype(x.dtype) == jnp.float32:
-        binade = binade_of(held)
-        k = jnp.where(finite & (binade > -1024), binade, 0)
-        exact = jnp.where(k < 0, raised_exactly(held, -k), power2(held, -k))
-    else:
-        k = jnp.where(finite & (held != 0), jnp.frexp(held)[1] - 1, 0)
-        exact = power2(held, -k)
-    scaled = power2(x, -k)
-    return jnp.where(finite, scaled + jax.lax.stop_gradient(exact - scaled), x), k
-
-
-def _times(z: jax.Array, t: jax.Array, exponent: jax.Array, power: jax.Array) -> jax.Array:
-    """`z t e^exponent 2^power`, the product's two binades applied with `power` at once (`_split`,
-    `exp_scaled`), so neither factor's product leaves fp32 before the decay and the powers bring it back:
-    `2^120 · 2^100` lowered by `2^-120`, `2^100`, where formed first it overflowed."""
-    (z_m, z_k), (t_m, t_k) = _split(z), _split(t)
-    return exp_scaled(z_m * t_m, exponent, power + (z_k + t_k).astype(power.dtype))
-
-
-def _moved(primals: tuple, moving: tuple) -> jax.Array:
-    """`exp_scaled`'s tangent, linear in `moving` (`dz`, `de`): `dz e^exponent 2^power + z de e^exponent
-    2^power`, each term its powers applied with its rounding (`exp_scaled`, `_times`)."""
-    z, exponent, power = primals
-    along_z, along_exponent = moving
-    return exp_scaled(along_z, exponent, power) + _times(z, along_exponent, exponent, power)
-
-
-def _pulled(primals: tuple, cotangent: jax.Array) -> tuple[jax.Array, jax.Array]:
-    """`_moved`'s transpose: a cotangent `g`'s `g e^exponent 2^power` along `z` and `g z e^exponent 2^power`
-    along the exponent, alike."""
-    z, exponent, power = primals
-    return exp_scaled(cotangent, exponent, power), _times(z, cotangent, exponent, power)
+def _halved(z: jax.Array, exponent: jax.Array, power: jax.Array) -> jax.Array:
+    """`exp_scaled` in its halved form, `z / 2` taken by `e^f` and every power at once: its derivative along
+    `z`, which JAX takes of it."""
+    finite, whole, fraction = _decay_parts(exponent)
+    return jnp.where(finite, _decayed(z * 0.5, accurate_exp(fraction), power + whole + 1.0), 0.0)
 
 
 def _exp_scaled_tangent(primals, tangents):
-    """`exp_scaled`'s tangent: a linear map whose transpose is declared (`_moved`, `_pulled`), each term's
-    direction or cotangent met by the decay and every power before it rounds, beside the rule's own value, so
-    a higher order meets the rule again: a direction along the exponent at `2^-149 · 2^149` is 1 and at
-    `2^120 · 2^-120` by `2^100` is `2^100`, where the halved form's derivative read 0 and infinity (train
-    1489's F2)."""
+    """`exp_scaled`'s tangent beside the rule's own value, so a higher order meets the rule again: along `z`
+    the halved form's, JAX's derivative of it, every power applied to the direction at once; along the
+    exponent the value itself times the direction, `z e^exponent 2^power` formed exact before it meets it, so
+    `2^-149 · 2^149` along a unit direction is 1 and `2^120 · 2^-120` along `2^100` is `2^100`, where the
+    halved form's derivative there flushed to 0 and overflowed (train 1489's F2). Both linear in the
+    tangents, so reverse mode transposes them."""
     z, exponent, power = primals
     along_z, along_exponent, _ = tangents
-    return _exp_scaled(*primals), generation.linear_map(_moved, _pulled, (z, exponent, power),
-                                                        (along_z, along_exponent))
+    value = _exp_scaled(*primals)
+    _, moved = jax.jvp(lambda z: _halved(z, exponent, power), (z,), (along_z,))
+    return value, moved + value * along_exponent
 
 
 _exp_scaled = contracted("test_parallax_holds_every_order")(

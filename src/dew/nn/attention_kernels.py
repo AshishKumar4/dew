@@ -1099,6 +1099,21 @@ ahead of the reference path,
 whose scores are whole, where every kernel before it refuses the call."""
 
 
+def keeps_reference_rows(kernel: str, *, masked: bool, filled: bool) -> bool:
+    """Whether every arm of the attention kernel named `kernel`, its forward and its derivatives, reads each
+    row of a call as the call's reference path does (`reference_attention`): a row of no mass (its every
+    logit -inf) NaN where that reads it NaN and zero where it excludes it (row 14116), for a call that hides
+    keys (`masked`) or fills them (`filled`, `mask_fill`) or neither. The reference path and the template
+    (its spans' exclusion, `KeySpans.excluded`) for every call; xla's attention and the inference route (the
+    template's forward, xla's derivatives) for a call of no mask and no fill, jax.nn's softmax op for op,
+    whose finite mask fill weighs a hidden key where the reference excludes it or fills it -inf; no other:
+    FlashAttention and cuDNN read such a row zero, Triton's kernel and Splash take no bias. The one statement
+    a rewrite onto a kernel reads (`dew.algebra.recognize`)."""
+    if kernel in ('reference', 'template'):
+        return True
+    return kernel in ('xla', 'inference') and not masked and not filled
+
+
 def reverse_only(kernel: str) -> bool:
     """Whether the attention kernel named `kernel`, either selector's (`ATTENTION`, `DECODE`), defines its
     reverse-mode derivative alone (`Kernel.reverse_only`)."""

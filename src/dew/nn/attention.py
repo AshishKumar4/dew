@@ -474,7 +474,8 @@ def template_attention(query, key, value, causal: bool, sliding_window, *, sinks
     tile at a time and its gradient the tiles' pulled cotangents, a `SeparableBias` a query and a key
     parameter (FoX's); sinks are the softmax's initial state. A
     `fill` (`mask_fill`) is every hidden key's logit, a score hook after the rest (`template.Filled`), the
-    call walking every key. On
+    call walking every key; a call that hides no key, a fill's among them, reads a row of no mass NaN, as
+    jax.nn's softmax does (`KeySpans.excluded`). On
     a mesh it runs per shard (`on_attention_shards`), as the decode kernel does: the key heads repeat until
     the tensor axes split them, the sinks split with their heads, and the ids, lengths, starts, groups,
     validity and places with
@@ -522,6 +523,10 @@ def template_attention(query, key, value, causal: bool, sliding_window, *, sinks
         if fill is not None:
             score_mod, params = template.Filled.over(spans, fill, score_mod, params)
             spans = template.spans(queries, keys, batch)
+        # The reference path's exclusion (`reference_attention`'s `excluded`): a masked call of no fill reads
+        # a row of no mass zero; a call that hides no key, a fill's among them, NaN, as jax.nn's softmax does
+        # (row 14116).
+        spans = dataclasses.replace(spans, excluded=spans.form != "full")
         hooks = template.Hooks(
             score=Hook(score_mod, params),
             initial=None if sinks is None else template.sinks(sinks, batch, queries, value.shape[-1]),
@@ -1700,7 +1705,10 @@ def attention_kernel(query, key, value, dtype=None, precision=None,
 
     if mask_fill is None:
         return _read_nothing(ran(), live)
-    if resolved == 'reference':
+    if resolved == 'reference' or (resolved == 'template' and mask_fill == -jnp.inf):
+        # The template weighs a -inf fill itself (`template.Filled`), a row of no mass, a visible key's bias's
+        # among them, NaN as the reference's jax.nn softmax reads it, where its masked walk read it zero (row
+        # 14116).
         return ran(fill=mask_fill)
     # The template weighs the fill itself where it takes the call (`template.Filled`), else the reference.
     templated = ATTENTION.kernel('template').refused(attention_case(query, key, named='template', **facts))

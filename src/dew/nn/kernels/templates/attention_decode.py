@@ -126,14 +126,14 @@ def packed(query: jax.Array, spans: KeySpans, kv_heads: int, initial: Initial | 
     if spans.form == "full":
         # A full call's rows see every key still: a full call of G rows a position, its launches priced so.
         start, end = (jnp.repeat(x, group, axis=1) for x in (spans.start, spans.end))
-        spans = KeySpans(start, end, None, spans.key_ids, spans.keys, "full")
+        spans = KeySpans(start, end, None, spans.key_ids, spans.keys, "full", excluded=spans.excluded)
     elif spans.query_ids is None and spans.start.ndim == 2:
         spans = KeySpans(spans.start, spans.end, None, spans.key_ids, spans.keys, "spans",
-                         spans.per_span * group)
+                         spans.per_span * group, spans.excluded)
     else:
         start, end = (jnp.repeat(x, group, axis=1) for x in (spans.start, spans.end))
         query_ids = None if spans.query_ids is None else jnp.repeat(spans.query_ids, group, axis=1)
-        spans = KeySpans(start, end, query_ids, spans.key_ids, spans.keys, "spans")
+        spans = KeySpans(start, end, query_ids, spans.key_ids, spans.keys, "spans", excluded=spans.excluded)
     if initial is not None:
         def heads_rows(x):
             # [B, H, T, ...] as [B, KV, T·G, ...].

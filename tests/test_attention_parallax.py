@@ -1002,9 +1002,9 @@ def test_a_subnormal_term_decays_and_raises_before_it_rounds():
 def test_exp_scaleds_derivative_meets_its_powers_before_it_rounds():
     """`attention_parallax.exp_scaled`'s derivative along its exponent, forward and reverse: at `2^-149 ·
     2^149` (a value of 1) a unit direction is 1 and a cotangent of `2^-100` pulls back `2^-100`, and at
-    `2^120 · 2^-120` a direction of `2^100` is `2^100`, the direction met by the value's binades and the
-    powers at once, where the halved form's derivative flushed the first to 0 and overflowed the second to
-    infinity (train 1489's F2)."""
+    `2^120 · 2^-120` a direction of `2^100` is `2^100`, the exact value times the direction, where the
+    halved form's derivative flushed the first to 0 and overflowed the second to infinity (train 1489's
+    F2)."""
     def along_exponent(z, power, direction):
         return jax.jvp(lambda e: attention_parallax.exp_scaled(z, e, power), (jnp.float32(0.0),),
                        (jnp.float32(direction),))[1]

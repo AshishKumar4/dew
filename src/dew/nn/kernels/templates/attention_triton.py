@@ -310,8 +310,7 @@ def _forward_kernel(*refs, spec: algebra.Forward, score_kinds: tuple[Kind, ...],
         # A walk's outputs in `form` (`program.finished`): the normalized output, its maximum and
         # denominator, and a training walk's (`Kept.SPLIT`) anchors and split sums.
         return program.finished(form, carry, rows=rows, resumed=resumed, training=training,
-                                queries=first_query + jnp.arange(block_q), output_mod=output_mod,
-                                output_params=output_params)
+                                output_mod=output_mod, output_params=output_params)
 
     walked = walk(spec)
     if maxima_ref is not None:
@@ -357,6 +356,8 @@ class TritonForward(AttentionLaunch, Template[Tiles]):
     largest: DTypeLike | None = None
     """The dtype whose largest its output is within, held there (`algebra.largest_of`, derived where the
     call's hooks are known, `_forward_call`); None where its output may pass it."""
+    excluded: bool = True
+    """Whether its spans exclude a row of no mass, which then reads zero, else NaN (`KeySpans.excluded`)."""
 
     def launched_ops(self, dtype) -> tuple["TritonForward", ...]:
         """The ops a call of values `dtype` launches (`_fwd`): this op, and where it walks unscaled and the
@@ -452,7 +453,8 @@ class TritonForward(AttentionLaunch, Template[Tiles]):
         spec = algebra.Forward(self.form, keys if self.keys is None else self.keys, ids, scale,
                                self.score_mod, self.natural, headroom, initial,
                                compensated=algebra.compensates(value.dtype), prescale=power,
-                               largest=self.largest, narrowed=algebra.narrowed_of(query.dtype))
+                               largest=self.largest, narrowed=algebra.narrowed_of(query.dtype),
+                               excluded=self.excluded)
         kernel = functools.partial(
             _forward_kernel, score_kinds=self.score_kinds, output_kinds=self.output_kinds, initial=initial,
             residuals=residuals, output_mod=self.output_mod, block_k=block_k, interpret=interpret)
@@ -765,7 +767,7 @@ def _forward_call(query: jax.Array, key: jax.Array, value: jax.Array, spans: Key
                        output_width=call.value.shape[-1],
                        scale=query.shape[3] ** -0.5 if scale is None else scale, form=spans.form,
                        keys=spans.keys, natural=natural,
-                       largest=algebra.largest_of(value.dtype, hooks))
+                       largest=algebra.largest_of(value.dtype, hooks), excluded=spans.excluded)
     return op, (call.query, call.key, call.value, call.start, call.end, call.query_ids, call.key_ids,
                 call.score_params, call.output_params, m0, total0, acc0), call.queries
 

@@ -172,8 +172,7 @@ def forward(spec: algebra.Forward, query: jax.Array, key: jax.Array, value: jax.
         def finished(form: algebra.Forward, carry):
             # A walk's outputs in `form` (`attention_program.finished`), as the Triton mainloop's.
             out, *kept = attention_program.finished(form, carry, anchor_rows, resumed, training=residuals,
-                                                    queries=rows, output_mod=output_mod,
-                                                    output_params=out_params)
+                                                    output_mod=output_mod, output_params=out_params)
             return (out.astype(query.dtype), *kept) if residuals else out.astype(query.dtype)
 
         return algebra.walked(spec, walk, finished)
@@ -253,7 +252,7 @@ def xla_mainloop(config: Tiles, query: jax.Array, key: jax.Array, value: jax.Arr
                            units=sums_units(hooks.drop, headroom=headroom,
                                                     initial=hooks.initial is not None),
                            largest=algebra.largest_of(value.dtype, hooks),
-                           narrowed=algebra.narrowed_of(query.dtype))
+                           narrowed=algebra.narrowed_of(query.dtype), excluded=spans.excluded)
     # A quantized call's weights round at each row's maximum, which its training walk finds first
     # (`attention_program.walk`), its residuals let go where the call keeps none.
     if not residuals and hooks.rounds is None:

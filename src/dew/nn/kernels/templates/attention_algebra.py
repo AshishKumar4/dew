@@ -138,6 +138,8 @@ class Forward:
     registered: bool = False
     """Whether its output is finished in a kernel's registers, a tile at once (a Mosaic forward's), where
     its narrowing settles the overflow midpoint alone (`midpoint_settled`)."""
+    excluded: bool = True
+    """Whether a row of no mass reads zero, its spans' exclusion (`KeySpans.excluded`, `massless_nan`)."""
 
     @property
     def reach(self) -> float:
@@ -201,12 +203,12 @@ class Forward:
 
     @property
     def massless_nan(self) -> bool:
-        """Whether a row that sees keys but weighs none (its every logit -inf: a bias's, a fill's) reads NaN,
-        as jax.nn's softmax reads it: a call whose spans hide no key (form 'full', of keys) and that starts
-        from no state, the reference path's unmasked call (`reference_attention`, none of its rows excluded;
-        row 14116). A masked call's such row reads zero (`guarded`), as the reference path's excluded rows
-        do, and a padding row past the call's `queries` sees no key (`nan_massless`)."""
-        return self.form == "full" and self.keys > 0 and not self.initial
+        """Whether a row of no mass (its every logit -inf: a bias's, a fill's, or no key it sees) reads NaN,
+        as jax.nn's softmax reads it: a call its spans do not exclude (`KeySpans.excluded`: the dispatch's
+        call of no mask or of a fill, `reference_attention`'s rows it excludes none of; row 14116), of keys
+        and from no state. An excluded call's such row reads zero (`guarded`), a template call's by default
+        (`nan_massless`)."""
+        return not self.excluded and self.keys > 0 and not self.initial
 
     def power(self, x: jax.Array) -> jax.Array:
         """The exponential the logits are in, a key's weight and the factor a softmax state takes from one
@@ -520,20 +522,16 @@ def no_keys(total: jax.Array) -> jax.Array:
                              total.dtype)
 
 
-def nan_massless(spec: Forward, state: Partial, rows: jax.Array | None = None) -> Partial:
+def nan_massless(spec: Forward, state: Partial) -> Partial:
     """A whole walk's `state` as its finish takes it: where the call reads a row of no mass NaN
     (`Forward.massless_nan`), each such row's total NaN, so its output, its residual denominator and every
-    weight its backward recomputes over that denominator are NaN as jax.nn's are (`inverse`, `output_of`),
-    a padded call's padding rows (at or past its `queries`, their query `rows`, the last axis' own where
-    None) left as they are. Its walk's rewalk test reads the walk's state before it (`reached`). A split
-    walk's slices are no whole walk: their merge finishes the row."""
+    weight its backward recomputes over that denominator are NaN as jax.nn's are (`inverse`, `output_of`,
+    `attention_gradient.dq_finish`); a padding row's sliced off with the call's. Its walk's rewalk test reads
+    the walk's state before it (`reached`). A split walk's slices are no whole walk: their merge finishes the
+    row."""
     if not spec.massless_nan:
         return state
-    empty = no_keys(state.total)
-    if spec.queries is not None:
-        rows = jax.lax.broadcasted_iota(jnp.int32, empty.shape, empty.ndim - 1) if rows is None else rows
-        empty = empty & (rows < spec.queries)
-    return state._replace(total=jnp.where(empty, jnp.nan, state.total))
+    return state._replace(total=jnp.where(no_keys(state.total), jnp.nan, state.total))
 
 
 def empty(rows: int, width: int, *, scaled: bool = False) -> Partial:
@@ -1995,7 +1993,7 @@ def settled_store(spec: Forward, out: jax.Array, acc: jax.Array, divisor: jax.Ar
 def inverse(total: jax.Array) -> jax.Array:
     """Each query's `1 / total`, zero where it saw nothing (`means.holding` on flushing lanes, `total > 0`
     in non-flushing GPU kernels where `stop_gradient` does not lower, row 10849), NaN where its total is
-    (an unmasked call's row of no mass, `nan_massless`)."""
+    (a row of no mass its spans do not exclude, `nan_massless`)."""
     held = bodies.subnormals(lambda *, flushing: means.holding(total) if flushing else total > 0,
                              total.dtype)
     return jnp.where(held, 1.0 / jnp.where(held, total, 1.0), _unheld(total))
