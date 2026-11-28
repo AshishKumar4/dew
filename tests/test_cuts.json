@@ -10,9 +10,6 @@
 "tests/test_aggregation.py::test_a_prefill_flown_a_window_at_a_time_writes_the_replay_one_pass_writes[False]",
 "tests/test_aggregation.py::test_an_agent_trained_to_imitate_labels_learns_the_labels_not_the_actions_taken"
 ],
-"tests/test_ahead_certification.py": [
-"tests/test_ahead_certification.py::test_a_steps_planner_certifies_its_launches_beside_the_trace_that_reaches_them"
-],
 "tests/test_algebra_bounds.py": [
 "tests/test_algebra_bounds.py::test_every_bound_stated_from_a_floor_holds_every_output_its_operands_reach[over a logistic and a constant-float16--3-7]",
 "tests/test_algebra_bounds.py::test_every_bound_stated_from_a_floor_holds_every_output_its_operands_reach[over an exponential-bfloat16-0-2]",
@@ -1502,9 +1499,6 @@
 "tests/test_decoder_remat.py::test_remat_prefills_and_appends_the_same_cache[False-dense]",
 "tests/test_decoder_remat.py::test_remat_prefills_and_appends_the_same_cache[True-dense]"
 ],
-"tests/test_decoding_strategies.py": [
-"tests/test_decoding_strategies.py::test_an_undefined_distribution_raises_instead_of_returning_a_token"
-],
 "tests/test_deepest_rings.py": [
 "tests/test_deepest_rings.py::test_a_launch_at_its_deepest_ring_compiles_within_its_resources[attention backward 64-sm80]",
 "tests/test_deepest_rings.py::test_a_launch_at_its_deepest_ring_compiles_within_its_resources[attention backward 64-sm86]",
@@ -1803,9 +1797,6 @@
 ],
 "tests/test_flight.py": [
 "tests/test_flight.py::test_a_step_pays_passes_ends_and_finishes_as_the_race_rules"
-],
-"tests/test_flow_cells.py": [
-"tests/test_flow_cells.py::test_the_model_widths_recurrence_cells_programs_fit_a_part_of_an_a100"
 ],
 "tests/test_flow_grpo.py": [
 "tests/test_flow_grpo.py::test_a_transitions_density_keeps_a_residual_whose_square_overflows",
@@ -2552,9 +2543,6 @@
 ],
 "tests/test_live_bridge.py": [
 "tests/test_live_bridge.py::test_a_page_s_restarts_are_admitted_as_its_cells_are_and_end_with_it"
-],
-"tests/test_llama4.py": [
-"tests/test_llama4.py::test_a_paged_cache_draws_what_the_dense_cache_draws[paged]"
 ],
 "tests/test_lm_objective.py": [
 "tests/test_lm_objective.py::test_evaluation_correctness_is_the_same_full_forward_argmax",
@@ -3335,6 +3323,14 @@
 "tests/test_recurrence_chunk.py::test_the_chunked_op_is_as_exact_as_the_recurrence_token_by_token[Hooks(conv=None, l2norm=False, scale=None, decay='vector', gates=None, delta=False, write_gate=True, rated=False, skip=True, output=None, write_bound=None, unit_queries=False, unit_reads=False, decay_bound=None, reads='after', own_weight=False, ranks=1, turns=0, erase='tied', value_decay=False, substeps=1, coupled=None)-one sequence]",
 "tests/test_recurrence_chunk.py::test_the_portable_maths_products_state_ieee_float32_as_a_gpu_runs_them[Hooks(conv=None, l2norm=False, scale=0.25, decay='scalar', gates=None, delta=True, write_gate=False, rated=False, skip=False, output=None, write_bound=1.0, unit_queries=False, unit_reads=False, decay_bound=None, reads='after', own_weight=False, ranks=1, turns=0, erase='tied', value_decay=False, substeps=1, coupled=None)]",
 "tests/test_recurrence_chunk.py::test_turned_gradient_p0_regressions_f1_f2_f3"
+],
+"tests/test_recurrence_forked_gate.py": [
+"tests/test_recurrence_forked_gate.py::test_a_forked_calls_walks_keep_its_table_spilling_none[sm100-kimi-linear-kda-True]",
+"tests/test_recurrence_forked_gate.py::test_a_forked_calls_walks_keep_its_table_spilling_none[sm100-minimax-text-01-lightning-True]",
+"tests/test_recurrence_forked_gate.py::test_a_forked_calls_walks_keep_its_table_spilling_none[sm80-kimi-linear-kda-False]",
+"tests/test_recurrence_forked_gate.py::test_a_forked_calls_walks_keep_its_table_spilling_none[sm80-nemotron-h-4b-ssd-True]",
+"tests/test_recurrence_forked_gate.py::test_a_forked_calls_walks_keep_its_table_spilling_none[sm90-kimi-linear-kda-False]",
+"tests/test_recurrence_forked_gate.py::test_a_forked_calls_walks_keep_its_table_spilling_none[sm90-nemotron-h-4b-ssd-False]"
 ],
 "tests/test_recurrence_mosaic.py": [
 "tests/test_recurrence_mosaic.py::test_a_forked_calls_walks_keep_its_table_spilling_none[sm100-a write gate-True]",
@@ -4224,9 +4220,6 @@
 "tests/test_tier2_parts.py::test_ernies_router_divides_by_its_clamped_sum_where_its_bias_picks_a_faint_expert",
 "tests/test_tier2_parts.py::test_one_load_of_local_remote_code_probes_it_once[alone]",
 "tests/test_tier2_parts.py::test_one_load_of_local_remote_code_probes_it_once[release]"
-],
-"tests/test_tokens_embedded.py": [
-"tests/test_tokens_embedded.py::test_a_request_holding_an_id_outside_its_models_table_is_refused_by_a_task_and_a_server"
 ],
 "tests/test_tools.py": [
 "tests/test_tools.py::test_layout_parity_anchors_a_model_on_the_references_own_sample[dense_sft]",
