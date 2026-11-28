@@ -1047,11 +1047,11 @@ TARGETS = {target.generation: target for target in (
               # lane reduction's 142.7 ns (its two rounds 142.72 and 142.61). A GH200's, its own power
               # limit's: on XLA's path a one-element loop's iteration, 3.00 us (M-FS-114-gh200's second
               # round, 1.2% from the line; its first's 3.07 us 1.7%), in-kernel a dependent lane
-              # reduction's 153.7 ns (its two rounds 153.69 and 153.75), its clock locked at 1.98 GHz and
-              # running at 1.83; its products 20.6 ns and 1.156 ns a column over N 64 to 256 and a barrier
-              # round trip 85.0 ns, its clock locked at 1.98 GHz (1.83 GHz at its end;
-              # FS-4123-LATENCIES2-gh200, M-FS-19, two rounds within 0.5%; its first rounds, unlocked:
-              # products 12.9 ns and 1.194 ns a column, a barrier 80.1 ns).
+              # reduction's 153.7 ns (its two rounds 153.69 and 153.75), its graphics clock locked at 1.98
+              # GHz, its SM clock sampled at 1.83 before and after the rounds; its products 20.6 ns and
+              # 1.156 ns a column over N 64 to 256 and a barrier round trip 85.0 ns, its clock locked at
+              # 1.98 GHz (1.83 GHz at its end; FS-4123-LATENCIES2-gh200, M-FS-19, two rounds within 0.5%;
+              # its first rounds, unlocked: products 12.9 ns and 1.194 ns a column, a barrier 80.1 ns).
               clocked={'NVIDIA H100 80GB HBM3': Clocked(step=4.93e-6, kernel_step=142.7e-9),
                        'NVIDIA GH200 480GB': Clocked(step=3.00e-6, kernel_step=153.7e-9,
                                                      product=(20.6e-9, 1.156e-9), barrier=85.0e-9)},

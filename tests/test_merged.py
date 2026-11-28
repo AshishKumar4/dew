@@ -14,7 +14,7 @@ import pytest
 from attention_oracle import plain_merged
 from generation_support import COMPILES_ON_CPU
 from kernel_compile import compile_kernels
-from reference_error import FEWEST_SEEDS, as_given, assert_as_exact, dew_path
+from reference_error import FEWEST_SEEDS, as_given, assert_as_exact, assert_computes_the_oracle, dew_path
 
 from dew.algebra import windows
 from dew.nn import programs
@@ -712,7 +712,7 @@ def test_a_gh200s_triton_merge_prices_its_slots_at_its_own_step():
     us): its waited path grows by its slots' at the GH200's own in-kernel step (`_triton_slot_steps`, three
     steps a slot, `GpuTarget.kernel_step_seconds`: M-FS-114's, no longer the H100's it borrowed), priced
     beside its copies' path, never dropped (Train 1493's review: with no step of its own the GH200 priced
-    its merge's slots by none)."""
+    its merge's slots by none); a chunk's padded slots priced as its others."""
     target = generation.gpu_target("NVIDIA GH200 480GB")
     assert target.kernel_step_seconds is not None
 
@@ -723,7 +723,11 @@ def test_a_gh200s_triton_merge_prices_its_slots_at_its_own_step():
 
     # Eight slots more, each a step of each of its three passes (`means.merged_state_chunked`'s joining,
     # placing and summing), each step the GH200's.
-    assert waited(16) - waited(8) == pytest.approx(8 * 3 * target.kernel_step_seconds, rel=2 ** -40)
+    eight = np.float64(8 * 3 * target.kernel_step_seconds)
+    assert_computes_the_oracle(np.float64(waited(16) - waited(8)), eight, "eight slots' steps", roundings=8)
+    # Nine slices take a chunk of sixteen slots (`windows.chunk_width`), padded slots priced alike: the same
+    # slot-bound wait as sixteen.
+    assert waited(9) == waited(16)
 
 
 def test_a_padded_merges_launch_work_counts_common_passes_unmasked_bytes_and_span():
