@@ -443,7 +443,7 @@ class NotTheLibrary(AssertionError):
 def library_checked(executable: jax.stages.Compiled, mark: tuple[str, str], label: str) -> None:
     """`executable`, a library arm's (`library_arm`'s `mark`, its call and the platform that makes it) as it
     runs, read by its instructions as XLA's own schema reads them
-    (`dew.telemetry.instrumentation.hlo_instructions`) where it runs on that platform (its outputs'
+    (`dew.telemetry.instrumentation.hlo_instructions`) where it runs on that platform (its placements'
     devices', not the process's default: a GPU host's CPU-placed call runs on its CPU): it calls the
     library's call (cuBLASLt's `__cublas$lt$matmul`) and runs no dot of XLA's own, fused or not, so no lane
     flag or fusion choice gives it another GEMM; refused otherwise, naming what it calls. Checked on the
@@ -463,9 +463,11 @@ def library_checked(executable: jax.stages.Compiled, mark: tuple[str, str], labe
 
 
 def _platform(executable: jax.stages.Compiled) -> str:
-    """The platform `executable` runs on, its outputs' devices' ('gpu' for CUDA's and ROCm's)."""
-    sharding = jax.tree.leaves(executable.output_shardings)[0]
-    platform = next(iter(sharding.device_set)).platform
+    """The platform `executable` runs on (`telemetry.compiles.executable_platform`), 'gpu' for CUDA's and
+    ROCm's, as a library arm's mark names it."""
+    from dew.telemetry.compiles import executable_platform
+
+    platform = executable_platform(executable)
     return "gpu" if platform in ("cuda", "rocm") else platform
 
 
