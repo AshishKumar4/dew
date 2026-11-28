@@ -459,12 +459,17 @@ class Ring:
         row by its address (a 128-byte-aligned row swizzled as the pattern's row it lies at), so it lands as
         its tile's row."""
         rows, smem = piece.shape[0], self.smem
-        cells = piece_cells(self.block, smem.dtype, swizzling.swizzle_of(smem), rows)
-        if cells is None or not isinstance(smem, state_types.TransformedRef):
+        swizzle = swizzling.swizzle_of(smem)
+        cells = piece_cells(self.block, smem.dtype, swizzle, rows)
+        if cells is None:
             return [(piece, smem.at[slot, pl.ds(start, rows)])]
-        unswizzled = next(transform for transform in smem.transforms
-                          if isinstance(transform, plgpu_core.UnswizzleRef))
-        physical, width = state_types.TransformedRef(smem.ref, (unswizzled,)), cells[0]
+        # Copied whole, the piece would make one arrival of the copies its barrier counts (`piece_copies`),
+        # and slice its slot's tiles.
+        if (physical := _physical(smem)) is None:
+            raise NotImplementedError(f"a piece of {rows} rows copied into a slot staged at {swizzle} bytes "
+                                      f"is copied a tile's row at a time, which a ref that states no staging "
+                                      f"(JAX 0.12.1's) gives no physical view to address")
+        width = cells[0]
         return [(piece.at[pl.ds(row, 1), pl.ds(column * width, width)],
                  physical.at[slot, (start + row) // swizzling.TILE_ROWS, column,
                              pl.ds((start + row) % swizzling.TILE_ROWS, 1)])
@@ -486,6 +491,17 @@ class Ring:
     def release(self, turn: Turn) -> None:
         """A consumer's release of `turn`'s slot, whose reads (and MMAs) are done."""
         plgpu.barrier_arrive(self.consumed.at[opaque(turn.slot)])
+
+
+def _physical(smem) -> state_types.TransformedRef | None:
+    """`smem`'s rows as they lie (`Ring.parts`): unswizzled through the staging the ref states itself (JAX
+    0.12.0's), over its base, the physical buffer, its tiles not undone; None for a ref that states none (JAX
+    0.12.1's, its staging noted apart, `swizzling.staging_of`), which gives no physical view to address."""
+    if not isinstance(smem, state_types.TransformedRef):
+        return None
+    unswizzled = next((transform for transform in smem.transforms
+                       if isinstance(transform, plgpu_core.UnswizzleRef)), None)
+    return None if unswizzled is None else state_types.TransformedRef(smem.ref, (unswizzled,))
 
 
 def piece_cells(block: tuple, dtype, swizzle: int | None, rows: int

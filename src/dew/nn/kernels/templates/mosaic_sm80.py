@@ -234,8 +234,8 @@ def _streamed(pipeline: "Pipeline", copier: "_Contiguous | _Gathered", trips, bo
         return lax.cond(trips > 0, functools.partial(walk.run, body), lambda carried: jax.tree.map(
             lambda value, aval: lax.convert_element_type(value, aval.dtype), carried, typed), carry)
 
-    return pl.run_scoped(scoped, *_ring(pipeline, trips if known else None),
-                         collective_axes="wg" if pipeline.consumers > 1 else ())
+    return swizzling.run_scoped(scoped, *_ring(pipeline, trips if known else None),
+                                collective_axes="wg" if pipeline.consumers > 1 else ())
 
 
 @dataclasses.dataclass(frozen=True)
@@ -440,11 +440,13 @@ def swizzled(shape: tuple[int, ...], dtype) -> tuple:
 
 def _depth_granule(ref, axis: int, instruction: int) -> int:
     """The depth slice a ref's staging allows: one MMA, or a whole swizzle along its tiled columns (no
-    narrower slice of a swizzled tile lowers, FS-NARROW-LOWER1)."""
-    if not isinstance(ref, state_types.TransformedRef):
+    narrower slice of a swizzled tile lowers, FS-NARROW-LOWER1), its staging and views as it reads them
+    (`swizzling.staging_of`: JAX 0.12.1's refs state none of their staging as they trace)."""
+    transforms = swizzling.staging_of(ref)
+    if not transforms:
         return instruction
     transposed = sum(isinstance(transform, state_types.TransposeTransform)
-                     and transform.permutation == (1, 0) for transform in ref.transforms) % 2
+                     and transform.permutation == (1, 0) for transform in transforms) % 2
     if axis != (0 if transposed else 1):
         return instruction
     return max(instruction, swizzling.swizzle_columns(ref.dtype, swizzling.swizzle_of(ref)))
@@ -1128,8 +1130,8 @@ class CpAsync(mosaic.Family[Pipeline, Streams, jax.Array]):
     def program_scoped(self, body, *allocations, streams):
         # Collective where its pipelines (`streams`, one or a tree of them) run on two consumers; a tree of
         # one-consumer and two-consumer pipelines is refused here, before its scope opens.
-        return pl.run_scoped(lambda *refs: body(*refs, streams=streams), *allocations,
-                             **_collective(_consumers(streams)))
+        return swizzling.run_scoped(lambda *refs: body(*refs, streams=streams), *allocations,
+                                    **_collective(_consumers(streams)))
 
     def roles(self, consumers: int, producer: int | None = None) -> handoffs.Schedule:
         _most(self, consumers)
@@ -1211,7 +1213,7 @@ class CpAsync(mosaic.Family[Pipeline, Streams, jax.Array]):
                     stores.swizzled_rows_out(smem, ref, *place[:4], swizzle=swizzle)
 
             if consumers == 1:
-                pl.run_scoped(copied, staging[output])
+                swizzling.run_scoped(copied, staging[output])
             else:
                 copied(opened[-1][output].at[index])
             if not interpret:
@@ -1227,7 +1229,7 @@ class CpAsync(mosaic.Family[Pipeline, Streams, jax.Array]):
                 finish(index, tile, accumulators, store, active=active)
                 opened.pop()
 
-            pl.run_scoped(staged, *staging, collective_axes="wg")
+            swizzling.run_scoped(staged, *staging, collective_axes="wg")
 
         def walking(counter, active, steps, views):
             del counter, active

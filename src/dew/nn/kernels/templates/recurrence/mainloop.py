@@ -1977,7 +1977,7 @@ def sequence_walk(call: Call, memory: Operand, name: str, entering: tuple, walke
                 family.stored(list(state), [out(role, i) for i in range(slices)], smem=smem)
 
             if landing(role) is None:
-                pl.run_scoped(store, plgpu.SMEM((call.block, bv), jnp.float32))
+                swizzling.run_scoped(store, plgpu.SMEM((call.block, bv), jnp.float32))
             else:
                 store(landing(role))
 
