@@ -128,7 +128,8 @@ def test_a_gpu_tier_part_runs_its_files_gpu_marked_tests_alone(tmp_path, phase):
     if phase != "cpu lane":
         environ[tier_wire.TRUTHS] = str(tmp_path / "truths")
     if phase == "prepare":
-        environ[tier_wire.PREPARE] = "1"
+        # As a dry prepare runs a part on a CPU host (prepares.py's `run`): the one GPU its part will see.
+        environ.update({tier_wire.PREPARE: "1", "CUDA_VISIBLE_DEVICES": "0"})
     done = subprocess.run([sys.executable, "-m", "pytest", "-q", "-rs", "-p", "conftest", "-p",
                            "no:cacheprovider", str(site)], cwd=tmp_path, env=environ, capture_output=True,
                           text=True)
