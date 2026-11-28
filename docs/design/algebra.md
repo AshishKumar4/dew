@@ -346,7 +346,11 @@ fitted to them, and a rule set ships only with measured receipts.
   over one `fusion.Index` a body, through `fusion.regions` (each product region as the pass finds it, before `fused_program` sets aside those an
   attention or recurrence region holds), `fusion.fewer` (every region of fewer of its stages, the region itself
   not among them, in the order the pass weighs them, one walk with it), `fusion.analyzed` (the analysis the pass
-  weighs a region by) and `fusion.product_form` (a product's form). A
+  weighs a region by) and `fusion.product_form` (a product's form), and reads the pass's own choice through
+  `fusion.decided` (its decision of a region) and `fusion.taken` (the region of a product it selects, before a
+  recognized attention's hold and its written call's type check) and the bodies it weighs regions in through
+  `program.fused_bodies` (each body it rewrites as a region of its own, as it reads it, weighed in the
+  context it weighs it in, a manual mesh's), never a copy of their rules. A
   region's written program, Dew's call traced over its inputs' types, is traced once a process for the region's
   identity in the context a kernel is chosen in (`fusion.choice_context`: the state a trace reads,
   `dew.nn.kernels.options.trace_context`, XLA's deterministic-ops flag among it, complete by default: a value it leaves

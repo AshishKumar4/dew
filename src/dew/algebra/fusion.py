@@ -471,6 +471,23 @@ def analyzed(index: Index, region: Region):
         return fused_gemm.analysis(_replayed(index.jaxpr, region, fused_gemm), *inputs)
 
 
+def decided(index: Index, region: Region) -> RegionDecision:
+    """`region` of `index`'s body as `fused_program` decides it (`_takes`, held for its structure in the
+    context a kernel is chosen in, `_decided`): whether it is fused, and whether the region without its
+    prologue or without its epilogue could be (`RegionDecision`). A caller weighing a region's variants
+    itself (`regions`, `fewer`, `analyzed`) reads the pass's rule by it, never a copy of it."""
+    return _decided(_identity(index.jaxpr, region), lambda: _takes(index, region))
+
+
+def taken(index: Index, region: Region) -> Region | None:
+    """The region of `region`'s product `fused_program` selects to fuse (`_taken`): `region`, or the region of
+    most stages of fewer that the pass's decisions reach (`decided`), None where none is taken. A selection,
+    not a written region: `fused_program` sets aside first a region an attention or recurrence region
+    `recognize` writes holds an equation of (`regions`), and writes no selected region whose call's traced
+    types differ from the program's (`_traced`, `_unwritten`)."""
+    return _taken(index, region, lambda found: decided(index, found))
+
+
 def _regions(index: Index) -> list[Region]:
     """Each product of `jaxpr` (`product_form`), its prologue (`_prologue`) and the elementwise equations
     after it that read its values, each of the product's shape over operands that follow its tiles

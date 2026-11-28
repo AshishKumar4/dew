@@ -1034,3 +1034,114 @@ def test_a_regions_variants_are_each_weighed_alone():
             assert (weighed.epilogue is not None) == (max(found.places) > product), found
         epilogue_alone = fusion.analyzed(index, variants[0])
     assert epilogue_alone.fused_seconds > 0 and epilogue_alone.unfused_seconds > 0, epilogue_alone
+
+
+def test_a_search_reads_the_passs_decision_and_the_region_it_fuses():
+    """A projection times a scalar array, on an H100 whose call names the template: the pass's decision of its
+    region (`fusion.decided`) fuses it not, the template refusing the epilogue, its launch the template's,
+    and the region the pass fuses (`fusion.taken`) is the product alone, as `fused_program` writes it
+    (test_a_product_whose_epilogue_the_template_refuses_is_fused_without_it): the seams a whole-layer search
+    reads the pass's choice by."""
+    from dew.algebra import fusion
+
+    shapes = (jax.ShapeDtypeStruct((256, 512), jnp.bfloat16), jax.ShapeDtypeStruct((512, 256), jnp.bfloat16),
+              jax.ShapeDtypeStruct((), jnp.bfloat16))
+    program = jax.make_jaxpr(scaled_by_an_array)(*shapes).jaxpr
+    index = fusion.Index(program)
+    (region,) = fusion.regions(index)
+    (product,) = (place for place in region.places if fusion.product_form(program.eqns[place]))
+    with generation.assumed("sm90"), generation.chosen(grouped_matmul="mosaic"):
+        whole = fusion.decided(index, region)
+        fused = fusion.taken(index, region)
+    assert not whole.taken and whole.launched, whole
+    assert fused is not None and fused.places == (product,), fused
+
+
+def products_in_bodies(x, w):
+    """A product in each body the pass weighs regions in (the program's own, a call's, each branch of a
+    conditional, a kernel derivative's glue, a call's within an Algebra span), and in each it weighs none in
+    (a protected span's and a rare span's, opaque leaves; an Algebra span's own math, opened into the
+    program's windows and closed again where no form lands across it)."""
+    from dew.nn.derivatives import Algebra, KernelGlue, Protected, Rare, marked
+
+    weighed = [jax.jit(lambda x, w: x @ w + 1)(x, w),
+               jax.lax.cond(x[0, 0] > 0, lambda: x @ w, lambda: (x @ w) * 2),
+               marked(KernelGlue(), lambda x, w: (x @ w) - 1)(x, w),
+               marked(Algebra(), lambda x, w: jax.jit(lambda x, w: (x @ w) * 3)(x, w))(x, w)]
+    unweighed = [marked(Protected(), lambda x, w: (x @ w) * 4)(x, w),
+                 marked(Rare(), lambda x, w: (x @ w) * 5)(x, w),
+                 marked(Algebra(), lambda x, w: (x @ w) * 6)(x, w)]
+    return functools.reduce(jnp.add, [x @ w, *weighed, *unweighed])
+
+
+def test_the_bodies_a_search_weighs_are_those_the_pass_fuses_products_in():
+    """Each body the pass weighs product regions in (`program.fused_bodies`), by its path: the program's own,
+    the call's, each branch's, the kernel glue's and the call's within the Algebra span, one product each, and
+    on an H100 whose call names the template the pass writes each of those products as the template's
+    launch and leaves a product only those of the protected, rare and opened Algebra spans, in none."""
+    from dew.algebra import fusion, program
+    from dew.nn import derivatives, programs
+
+    shapes = (jax.ShapeDtypeStruct((256, 512), jnp.bfloat16), jax.ShapeDtypeStruct((512, 256), jnp.bfloat16))
+    traced = jax.make_jaxpr(products_in_bodies)(*shapes).jaxpr
+    found = program.fused_bodies(traced, lambda path, body: (path, body, sum(
+        fusion.product_form(equation) is not None for equation in body.eqns)))
+    (root,) = (body for path, body, _ in found if not path)
+
+    def named(path) -> tuple[str, ...]:
+        kind = [type(root.eqns[place].params["kind"]).__name__ for name, place, _ in path[:1]
+                if name == "marked_call"]
+        return tuple(f"{name}.{number}" for name, _, number in path) + tuple(kind)
+
+    assert sorted((named(path), count) for path, _, count in found) == sorted([
+        ((), 1), (("jit.0",), 1), (("cond.0",), 1), (("cond.1",), 1), (("marked_call.0", "KernelGlue"), 1),
+        (("marked_call.0", "jit.0", "Algebra"), 1)])
+    with generation.assumed("sm90"), generation.chosen(grouped_matmul="mosaic"):
+        rewritten = jax.jit(algebra.rewritten(products_in_bodies, kernels=True)).trace(*shapes).jaxpr.jaxpr
+
+    def launches(equation) -> bool:
+        """Whether `equation` holds a native kernel's launch."""
+        return programs.opaque(equation) or any(
+            launches(inner) for body in programs.bodies(equation) for inner in body.eqns)
+
+    def left(body, within=()):
+        """Each product the pass left a product outside the regions it wrote, by the kinds of the marked spans
+        it is within: a call of one body holding a native launch is a region it wrote or a call around one,
+        and a conditional's branches are each read on their own, so one branch's launch hides none in the
+        other."""
+        for equation in body.eqns:
+            if fusion.product_form(equation) is not None:
+                yield within
+            if len(programs.bodies(equation)) == 1 and launches(equation):
+                continue
+            kind = equation.params["kind"] if equation.primitive is derivatives.marked_call_p else None
+            for inner in programs.bodies(equation):
+                yield from left(inner, (*within, *([type(kind).__name__] if kind is not None else [])))
+
+    assert sorted(left(rewritten)) == [("Algebra",), ("Protected",), ("Rare",)]
+
+
+@pytest.mark.mesh(devices=2)
+def test_a_search_weighs_a_mapped_body_in_its_maps_context():
+    """A projection, its bias and a scale mapped per shard (`biased` under `jax.shard_map`, as the pass runs
+    it in test_a_product_mapped_per_shard_runs_the_template_and_computes_as_written) on an H100 whose
+    template a call names: the map's body is one the pass weighs (`program.fused_bodies`), weighed in the
+    map's context (its axis manual), where the pass selects its product's region (`fusion.taken`) as it does
+    under the pass."""
+    from jax.sharding import Mesh, PartitionSpec
+
+    from dew.algebra import fusion, program
+
+    mesh = Mesh(np.asarray(jax.devices()[:2]), ("data",))
+    rows, whole = PartitionSpec("data"), PartitionSpec()
+    mapped = jax.shard_map(biased, mesh=mesh, in_specs=(rows, whole, whole, rows), out_specs=rows)
+    traced = jax.make_jaxpr(mapped)(*draw()).jaxpr
+
+    def selected(path, body):
+        index = fusion.Index(body)
+        return (tuple(name for name, _, _ in path), tuple(jax.sharding.get_abstract_mesh().manual_axes),
+                [fusion.taken(index, region) is not None for region in fusion.regions(index)])
+
+    with generation.assumed("sm90"), generation.chosen(grouped_matmul="mosaic"):
+        found = program.fused_bodies(traced, selected)
+    assert found == [((), (), []), (("shard_map",), ("data",), [True])], found
