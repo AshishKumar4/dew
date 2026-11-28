@@ -1063,6 +1063,43 @@ def test_a_long_rows_second_cotangent_holds_every_tile_of_its_keys():
     assert float(second[0, 0, 0, 0]) == -1.0
 
 
+def test_a_small_tiles_cotangent_keeps_its_size_beside_a_cancelling_tile():
+    """Parallax's derivative over 8192 equal logits, its second query 0 under a cotangent of 1: the first
+    tile's values `2^20 · [1, 1, -1, -1]` against second keys `[2^118, -2^118, 0, 0]` cancel exactly, the
+    next tile's `[2^-100, -2^-100]` against `[2^100, 0]` leave the second query's cotangent `-2^-13`: each
+    tile contracted at its own landing (`_on_rows`), where the whole walk's headroom applied before the
+    small tile's keys met it flushed its coefficient on this CPU (train 1500's fix's review)."""
+    keys = 8192
+    value = np.zeros((1, keys, 1, 1), np.float32)
+    second_key = np.zeros((1, keys, 1, 1), np.float32)
+    value[0, :4, 0, 0] = 2.0 ** 20 * np.asarray([1, 1, -1, -1])
+    second_key[0, :2, 0, 0] = [2.0 ** 118, -(2.0 ** 118)]
+    value[0, 128:130, 0, 0] = [2.0 ** -100, -(2.0 ** -100)]
+    second_key[0, 128, 0, 0] = 2.0 ** 100
+    zero = jnp.zeros((1, 1, 1, 1), jnp.float32)
+    operands = (zero, zero, jnp.zeros((1, keys, 1, 1), jnp.float32), jnp.asarray(second_key),
+                jnp.asarray(value))
+    spans = template.spans(1, keys, 1)
+    _, pull = jax.vjp(lambda *x: attention_parallax.attend(*x, spans, scale=1.0), *operands)
+    assert float(pull(jnp.ones((1, 1, 1, 1), jnp.float32))[1][0, 0, 0, 0]) == -(2.0 ** -13)
+
+
+def test_a_second_keys_pullback_restores_its_rows_power_after_the_values():
+    """The dense call's pullback along its second keys (`reference`'s, the derivative's higher orders):
+    second keys `[2^124, -2^124]` of a second query 1 over constant values `2^-10` under a cotangent of
+    `2^127` pull back exactly 0, the rows' power `2^-1` restored once the values met the cotangent, where
+    restored on the cotangent first it doubled `2^127` to infinity and the centring read NaN (train 1500's
+    fix's review)."""
+    second_key = jnp.asarray([2.0 ** 124, -(2.0 ** 124)], jnp.float32).reshape(1, 2, 1, 1)
+    value = jnp.full((1, 2, 1, 1), 2.0 ** -10, jnp.float32)
+    one = jnp.ones((1, 1, 1, 1), jnp.float32)
+    spans = template.spans(1, 2, 1)
+    _, pull = jax.vjp(lambda second_key: attention_parallax.reference(
+        jnp.zeros((1, 1, 1, 1), jnp.float32), one, jnp.zeros((1, 2, 1, 1), jnp.float32), second_key, value,
+        spans, scale=1.0), second_key)
+    np.testing.assert_array_equal(np.asarray(pull(jnp.full((1, 1, 1, 1), 2.0 ** 127, jnp.float32))[0]), 0.0)
+
+
 def test_a_second_products_direction_is_taken_back_by_its_rows_power():
     """Parallax's forward-mode tangent along its second query (`reference`'s, the derivative's higher
     orders), one query over second keys `[2^124, -2^124]` of a second query 1 and values `[1, -1]`, whose
