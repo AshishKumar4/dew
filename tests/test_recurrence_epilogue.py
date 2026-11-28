@@ -56,14 +56,11 @@ def test_a_layers_chunked_call_is_as_exact_as_its_tokens(hooks, packed):
                     seeds=16)
 
 
-@pytest.mark.parametrize('training', [False, True], ids=['forward', 'training'])
-def test_a_gated_delta_nets_norm_in_the_output_launch_is_on_par_with_the_portable_rule(training):
+def gated_delta_net_epilogue(training: bool, seeds: int):
     """A bf16 gated delta net naming the template, its heads' 256 values over several of the output launch's
-    value blocks and its 160 tokens over three chunks (a persistent program's several): its output (and in
-    training its gradients by its input and every parameter) on par from float64 with the portable rule's
-    (check 1, the layer's own float64 step the truth), the output launch taking the norm, interpreted. Its
-    training forward keeps the output the norm read, whose gradient the norm's own forms before the fast
-    backward's (`template.mosaic_rule`)."""
+    value blocks and its 160 tokens over three chunks: its output (or in `training` its gradients by its
+    input and every parameter) on par from float64 with the portable rule's (check 1, the layer's own float64
+    step the truth), the output launch taking the norm, interpreted, over `seeds` draws."""
     layer = GatedDeltaNet(emb_features=64, num_k_heads=1, num_v_heads=2, head_k_dim=64, head_v_dim=256,
                           dtype=jnp.bfloat16)
     weights = jax.random.normal(jax.random.key(31), (1, 160, 64), jnp.float32)
@@ -80,9 +77,10 @@ def test_a_gated_delta_nets_norm_in_the_output_launch_is_on_par_with_the_portabl
 
         def loss(params, x):
             out = layer.apply(params, x)
-            # The loss at least fp32, float64 in the truth's own.
+            # The loss at least fp32, float64 in the truth's own; its gradients judged, the outputs the
+            # forward's (one scalar a draw resolved no factor over 40).
             return jnp.sum(out.astype(jnp.promote_types(out.dtype, jnp.float32)) * weights)
-        return jax.value_and_grad(loss, argnums=(0, 1))(params, x)
+        return jax.grad(loss, argnums=(0, 1))(params, x)
 
     def applied(kernel):
         def run(params, x):
@@ -91,8 +89,21 @@ def test_a_gated_delta_nets_norm_in_the_output_launch_is_on_par_with_the_portabl
         return run
 
     assert_as_exact(applied('mosaic_gpu'), applied('xla'), sample,
-                    f'the norm in the output launch, {training=}', seeds=8,
+                    f'the norm in the output launch, {training=}', seeds=seeds,
                     truth_fn=functools.partial(stepped, layer.clone(dtype=jnp.float64)))
+
+
+def test_a_gated_delta_nets_norm_in_the_output_launch_is_on_par_with_the_portable_rule():
+    """`gated_delta_net_epilogue`'s forward: the output launch's epilogue, a forward without a gradient's."""
+    gated_delta_net_epilogue(training=False, seeds=8)
+
+
+@pytest.mark.check1_shards(seeds=80, per_task=8)
+def test_a_gated_delta_nets_training_through_its_epilogue_is_on_par_with_the_portable_rule():
+    """`gated_delta_net_epilogue`'s training: the template's training forward keeps the output its norm read,
+    whose gradient the norm's own forms before the fast backward's (`template.mosaic_rule`). 80 draws, 8 a
+    task: at 40 its `dt_bias` gradient was inconclusive (interval [0.899, 1.507] across 1.5)."""
+    gated_delta_net_epilogue(training=True, seeds=80)
 
 
 def test_a_norm_reading_its_output_in_fp32_reads_the_kernels_unrounded_output():
