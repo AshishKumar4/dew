@@ -391,6 +391,43 @@ def test_a_bf16_levels_nan_weight_leaves_a_later_resets_decay_gradient_finite():
     assert np.asarray(gradient, np.float32)[0, 67, 0] == 0, gradient
 
 
+def test_a_bf16_levels_nan_weight_leaves_a_later_resets_query_gradient_finite():
+    """Train 1450's NaN-weight read
+    (`test_a_bf16_levels_nan_weight_leaves_a_later_resets_decay_gradient_finite`) differentiated by token 67's
+    query: zero, its reader's query and weight zero before their product, where the product's transpose met
+    the NaN weight with a zero cotangent, NaN (train 1455's review)."""
+    weights = (jnp.zeros((1, 69, 1, levels(69)), jnp.float32).at[0, 67, 0, 7].set(jnp.nan)
+               .at[0, 68, 0, 7].set(1.0))
+    unit = _tokens(69, [0], [1.0])
+    g = jnp.zeros((1, 69, 1), jnp.float32).at[0, 64:68].set(-80.0).at[0, 68].set(-jnp.inf)
+
+    def read(q):
+        return log_linear_attention(q, unit, unit, g, weights, scale=1.0)[0, 68, 0, 0].astype(jnp.float32)
+
+    gradient = jax.grad(read)(_tokens(69, [67, 68], [1.0, 1.0]))
+    assert np.asarray(gradient, np.float32)[0, 67, 0, 0] == 0, gradient
+
+
+def test_a_bf16_levels_overflowed_read_leaves_a_later_tokens_decay_gradient_zero():
+    """Level-7 bf16 reads (69 tokens) of token 0's unit key and value, token 67's query `2^127` under a weight
+    of 2 (its reader and read past bf16's range) and token 68's unit query and weight, decays of -1 at token
+    67 and -1000 at token 68: token 68's output zero and its gradient by every decay zero, an overflowed
+    read's decay times a zero cotangent zero (`scan.scaled_exp`), where it was `inf * 0`, NaN (train 1455's
+    review)."""
+    weights = (jnp.zeros((1, 69, 1, levels(69)), jnp.float32).at[0, 67, 0, 7].set(2.0)
+               .at[0, 68, 0, 7].set(1.0))
+    unit = _tokens(69, [0], [1.0])
+
+    def read(g):
+        queries = _tokens(69, [67, 68], [2.0 ** 127, 1.0])
+        return log_linear_attention(queries, unit, unit, g, weights, scale=1.0)[0, 68, 0, 0].astype(jnp.float32)
+
+    found, gradient = jax.value_and_grad(read)(jnp.zeros((1, 69, 1), jnp.float32).at[0, 67].set(-1.0)
+                                               .at[0, 68].set(-1000.0))
+    assert found == 0, found
+    np.testing.assert_array_equal(np.asarray(gradient, np.float32), np.zeros((1, 69, 1), np.float32))
+
+
 def test_a_bf16_levels_nan_key_beside_an_overflow_leaves_a_resets_decay_gradient_finite():
     """A bf16 level-8 read (194 tokens) at tokens 192 and 193 by unit queries of token 0's NaN key and unit
     value and token 1's key and value 2^70 (their memory 2^140, past fp32's range), decays of -80 at tokens

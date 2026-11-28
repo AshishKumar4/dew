@@ -1752,8 +1752,12 @@ def _scaled_exp_tangent(primals, tangents):
 
 def _times_decayed_value(exponent, value, *factors):
     """`value` decayed by `exp(exponent)` (`scaled_exp`), then times each of `factors` in turn: the decay
-    applied before any factor meets the value."""
-    return functools.reduce(jnp.multiply, factors, _scaled_exp(value, exponent))
+    applied before any factor meets the value, and the product zero where a factor is (an overflowed
+    decayed value times a zero cotangent or direction, `inf * 0`, was NaN: a reset's zero cotangent met
+    an overflowed read's decay, train 1455's review)."""
+    product = functools.reduce(jnp.multiply, factors, _scaled_exp(value, exponent))
+    vanishing = functools.reduce(jnp.logical_or, (factor == 0 for factor in factors), jnp.zeros((), bool))
+    return jnp.where(vanishing, jnp.zeros_like(product), product)
 
 
 def _times_decayed_tangent(primals, tangents):

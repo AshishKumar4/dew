@@ -196,9 +196,13 @@ def _levels_above(query, key, value, g, weights, *, within):
         nan_query, infinite_query, zero_query = (halves(x)[:, :, :, 1][:, :, :, :, None] for x in query_facts)
         reader_nan = (nan_query | jnp.isnan(weight) | (infinite_query & (weight == 0))
                       | (zero_query & jnp.isinf(weight))) & ~reset
-        readers = (halves(queries)[:, :, :, 1][:, :, :, :, None].astype(g.dtype) * weight[..., None]).astype(
-            query.dtype)
-        unread = (reset[..., None] | reader_nan[..., None]
+        # A reset's or a NaN reader's query and weight zero before their product, so its transpose meets no
+        # NaN (a zero cotangent times a NaN weight was NaN in the query's gradient, train 1455's review).
+        blocked = reset | reader_nan
+        given = halves(queries)[:, :, :, 1][:, :, :, :, None].astype(g.dtype)
+        given = jnp.where(blocked[..., None], 0.0, given)
+        readers = (given * jnp.where(blocked, 0.0, weight)[..., None]).astype(query.dtype)
+        unread = (blocked[..., None]
                   | ((prefix_spent[..., None] | local_spent)[..., None] & jnp.isinf(readers)))
         readers = jnp.where(unread, 0.0, readers)
         # `[B, G, n, r, E, t, P]`, the product's own layout.
