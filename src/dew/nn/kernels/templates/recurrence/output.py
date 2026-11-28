@@ -30,6 +30,22 @@ from dew.nn.kernels.templates.recurrence.mainloop import (
     stream_views,
 )
 from dew.nn.kernels.templates.resources import largest_live_set
+from dew.nn.precision import activation_and_slope
+
+
+@dataclasses.dataclass(frozen=True)
+class Normed:
+    """The output launch's epilogue (`recurrence.Hooks.output`'s `OutputNorm`): each token's value row of a
+    head read back in `read` (its `read_in`, else fp32) through its gated RMS norm, `rms_norm(o) weight
+    act(z)` with `epsilon`, `activation` the gate's, the mean square over the head's `width` real values (its
+    padding none); with `kept`, the read-back output stored beside it, the norm's backward's residual (a
+    training forward's)."""
+
+    epsilon: float
+    activation: str
+    read: str
+    width: int
+    kept: bool = False
 
 
 def _output_streams(call: Call, bv: int) -> tuple[dict, tuple]:
@@ -80,11 +96,12 @@ def _gated_queries(call: Call, refs: tuple, row, h, scale: float, staged) -> Non
         operands.staged(call, algebra.key_gated(query, decays, scale), tile)
 
 
-def _output_swizzle(call: Call, bv: int, staging: tuple, landing: dict) -> int:
+def _output_swizzle(call: Call, bv: int, staging: tuple, landing: dict, *, normed: bool = False) -> int:
     """The swizzle `output_launch` stages its keys at under a decay a head (`Kᵀ` read transposed, each load a
     whole swizzle of its depth, `Family.rhs_fragment_depth`): the widest its key rows fill, and where products
     read their operands from shared memory the memory's value-block rows too, whose consumer thread's
-    registers fit (`_output_held`, beside its addresses into its `staging` and `landing` tiles), halved down
+    registers fit (`_output_held`, an epilogue's (`normed`) among them, beside its addresses into its
+    `staging` and `landing` tiles), halved down
     to the narrowest Mosaic stages; the narrowest where none fits, which the launch then refuses.
     Nemotron-H 4B's SSD output held a bf16 key block's whole 64-column depth at 128 bytes, 255 registers
     and a spill on an A100; at 64 bytes, 32 columns, it compiled within them (row 2943). Warpgroup MMA reads
@@ -96,13 +113,24 @@ def _output_swizzle(call: Call, bv: int, staging: tuple, landing: dict) -> int:
     if not family.operands_in_registers:
         swizzle = min(swizzle, family.right_swizzle(call.memories.stored, bv))
     while swizzle > swizzling.NARROWEST_SWIZZLE_BYTES and (
-            _output_held(call, bv, swizzle).registers(family, addressed(staging, landing))
+            _output_held(call, bv, swizzle, normed=normed).registers(family, addressed(staging, landing))
             > family.registers(1)):
         swizzle //= 2
     return swizzle
 
 
-def _output_held(call: Call, bv: int, swizzle: int | None = None) -> Held:
+def _normed_carried(chunk: int, normed: bool) -> list:
+    """An epilogue's carried tiles (`_normed_step`): its rows' sums of squares, a row's vector."""
+    return [(chunk, 1, jnp.float32)] if normed else []
+
+
+def _normed_phases(chunk: int, bv: int, normed: bool) -> tuple:
+    """An epilogue's last phase (`_normed_step`): a block's read-back row, its gate and its normalized values,
+    with the weight's column vector."""
+    return ([f32(chunk, bv)] * 3 + [(1, bv, jnp.float32)],) if normed else ()
+
+
+def _output_held(call: Call, bv: int, swizzle: int | None = None, *, normed: bool = False) -> Held:
     """What `output_launch`'s consumer thread holds. Under a decay a head: a value block's phase, its output's
     fp32 sum (the memory's and the local product's, each its own accumulator where products overlap,
     `Family.products_overlap`), its values and one product's fragments (`product_fragments`); and the first
@@ -111,7 +139,8 @@ def _output_held(call: Call, bv: int, swizzle: int | None = None) -> Held:
     value block's products issue, whether the walk takes one value block or steps over several. Under a decay
     a key dimension the value block's phase, and apart from it the first step's: a key block's prefix, its
     decay raised from it and its queries widened, read from global memory and staged for every step
-    (`_gated_queries`)."""
+    (`_gated_queries`). An epilogue's (`normed`) rows' sums carried across the steps, and at the last its
+    phase of a block's read-back row, gate and normalized values (`_normed_step`)."""
     chunk = call.chunk
     held, memories, given, family = call.held, call.memories, call.given, call.family
     products = largest_live_set(
@@ -129,7 +158,9 @@ def _output_held(call: Call, bv: int, swizzle: int | None = None) -> Held:
         # (`_gated_queries`), one block's gating at a time beside them.
         query = held_tile(given, chunk, call.block) if given.parts == 1 else [f32(chunk, call.block)]
         read = (query + [f32(chunk, call.block)] * call.prefix_limbs) * (call.width // call.block - 1)
-        return Held(phases=(values, [f32(chunk, call.block)] * (2 + call.prefix_limbs) + read))
+        return Held(carried=_normed_carried(chunk, normed),
+                    phases=(values, [f32(chunk, call.block)] * (2 + call.prefix_limbs) + read,
+                            *_normed_phases(chunk, bv, normed)))
     # Accurate three-part products each take a fresh accumulator (`Issuer.apart`), the memory's output
     # beside the local product's sums: two stated, an unrounded fp32 write gate's output was admitted where
     # ptxas serialized its warpgroup MMAs (C7512, sm90; armada output-values-fresh-sums). Two parts issue
@@ -178,19 +209,57 @@ def _output_held(call: Call, bv: int, swizzle: int | None = None) -> Held:
     # of several, an A100's bf16 output with no delta rule was stated 304 registers at a 32-wide block and
     # 272 at 16 and taken at neither, where ptxas held them at 255 and 238 spilling none (row 6233); its
     # compile certifies what this states (`tuning`'s spill refusal).
-    return Held(carried=prefixes, phases=(values + products, *(stage + scored for stage in stages)))
+    return Held(carried=prefixes + _normed_carried(chunk, normed),
+                phases=(values + products, *(stage + scored for stage in stages),
+                        *_normed_phases(chunk, bv, normed)))
+
+
+def _normed_step(normed: Normed, family, out, index, sums, *, steps: int, bv: int, columns, gate_ref,
+                 weight_ref, out_ref, kept_ref, rows, landing):
+    """The epilogue's step (`Normed`): the value block's output `out` read back and its squares summed into
+    each row's `sums`, held in the rows' own shared tile (`rows`, a head's whole value rows, staged apart from
+    every store's landing) and, where the norm's residual is kept, stored as it is read (`kept_ref`); at the
+    last block each row's inverse RMS
+    (`precision.rms_statistics`' arithmetic, its mean the sum times the width's reciprocal) and every block
+    of the row through it, the weight and the activated gate, in `precision.rms_weighted`'s order, stored to
+    `out_ref`. `columns(c)` is block `c`'s columns of the outputs' `[R, HV * Dv]` rows, the gate's alike.
+    Returns the sums the next step carries."""
+    read = out.astype(normed.read)
+    wide = read.astype(jnp.float32)
+    sums = sums + jnp.sum(wide * wide, axis=1)
+    rows.at[:, pl.ds(index * bv, bv)][...] = read
+    if kept_ref is not None:
+        family.stored([read], [kept_ref.at[columns(index)]], smem=landing["kept"])
+
+    @pl.when(index == steps - 1)
+    def _():
+        inverse = jax.lax.rsqrt(sums * (1.0 / normed.width) + normed.epsilon)
+        for block in range(steps):
+            # The row's block as it was landed: each thread reads back the entries it wrote.
+            row = family.tile_of(rows.at[:, pl.ds(block * bv, bv)]).astype(jnp.float32)
+            gate = plgpu.load(gate_ref.at[columns(block)], layout=family.layout, optimized=False)
+            weight = family.columns_of(weight_ref.at[pl.ds(block * bv, bv)]).astype(jnp.float32)
+            activated, _ = activation_and_slope(gate.astype(jnp.float32), normed.activation)
+            normalized = row * inverse[:, None] * weight[None, :] * activated
+            family.stored([normalized.astype(out_ref.dtype)], [out_ref.at[columns(block)]],
+                          smem=landing["out"])
+
+    return sums
 
 
 @building(lambda launch: ("recurrence_output",))
 def output_launch(q, k, h, corrected, prefix: tuple, taken, beta, call: Call, tiles: Tiles, *, scale: float,
-                  out_dtype, scores=None, skip=None):
+                  out_dtype, scores=None, skip=None, normed: Normed | None = None, gate=None, weight=None):
     """Each chunk's output `[R, HV * Dv]` in `out_dtype`, a program a chunk and value head and a step each
     value block, under the decay's `prefix` (`chunk_forward._Run`'s): under a decay a head its own pairs'
     scores taken once, at the first step, and staged for every block's (`algebra.chunk_scores`,
     `chunk_output`), under one a key dimension the intra launch's (`scores`, `_intra`;
     `algebra.key_decayed_output`). Where the write gate takes the keys' side (`Call.gated_keys`) the scores'
     columns take `beta` `[HV, R]` before they are rounded, and a `skip` `[HV]` adds `D v` from the values the
-    step holds (there the corrected ones)."""
+    step holds (there the corrected ones). Where `normed` (`Normed`) is given, each token's value row of the
+    head leaves through the epilogue's gated norm, its gate `gate` `[R, HV * Dv]` and `weight` `[Dv]` (fp32),
+    a program holding its chunk's whole rows across its steps (`_normed_step`): the output `(normalized,
+    read back)` where the norm's residual is kept (`Normed.kept`), else the normalized output."""
     chunk = call.chunk
     assert skip is None or call.gated_keys, "a skip reads the values a call whose keys take the gate holds"
     width, value_width, bv = call.width, call.value_width, tiles.output_block
@@ -200,12 +269,15 @@ def output_launch(q, k, h, corrected, prefix: tuple, taken, beta, call: Call, ti
     # dimension's a key block at a time (`_gated_queries`).
     prefixes = prefix if call.per_key else (*prefix, *prefix)
 
+    sides = 0 if normed is None else 2
+
     def program(at, q_ref, k_ref, h_ref, v_ref, *refs, streams, staging, landing):
         prefix_refs, (_taken_ref, beta_ref, *refs) = refs[:len(prefixes)], refs[len(prefixes):]
-        *skip_ref, o_ref = refs
+        skip_ref, refs = refs[:len(refs) - sides - 1 - kept], refs[len(refs) - sides - 1 - kept:]
+        (gate_ref, weight_ref), (o_ref, *kept_ref) = (refs[:sides] or (None, None)), refs[sides:]
         n, h = at["chunks"], at["heads"]
         row, span = n * chunk, pl.ds(n * chunk, chunk)
-        (staged,) = staging
+        staged, *rows = staging
         if call.per_key:
             given = {"scores": held.views(k_ref, row, chunk, h * chunk, chunk)}
         else:
@@ -265,20 +337,41 @@ def output_launch(q, k, h, corrected, prefix: tuple, taken, beta, call: Call, ti
                                            Parts(staged, held.dtype), value, scale, Issuer(call))
             if skip_ref:
                 out = out + skip_ref[0][h] * value.value().astype(jnp.float32)
-            view = o_ref.at[span, pl.ds(h * value_width + index * bv, bv)]
-            family.stored([out.astype(o_ref.dtype)], [view], smem=landing["out"])
+
+            def columns(block):
+                return span, pl.ds(h * value_width + block * bv, bv)
+
+            if normed is not None:
+                carry = _normed_step(normed, family, out, index, carry, steps=steps, bv=bv, columns=columns,
+                                     gate_ref=gate_ref, weight_ref=weight_ref, out_ref=o_ref,
+                                     kept_ref=kept_ref[0] if kept_ref else None, rows=rows[0],
+                                     landing=landing)
+                return carry, accumulators
+            family.stored([out.astype(o_ref.dtype)], [o_ref.at[columns(index)]], smem=landing["out"])
             return carry, accumulators
 
-        return mosaic.Walk(views, step, steps=steps, prologue=None if call.per_key else prologue)
+        # The epilogue's rows' sums of squares carried across the value blocks, zero as the chunk starts.
+        carry = () if normed is None else family.as_row(family.zeros((chunk,)))
+        return mosaic.Walk(views, step, steps=steps, prologue=None if call.per_key else prologue,
+                           carry=carry)
 
+    kept = int(normed is not None and normed.kept)
     blocks, staging = _output_streams(call, bv)
+    if normed is not None:
+        # The head's whole value rows read back across the steps, a tile of their own.
+        staging = (*staging, swizzling.plain((chunk, value_width), jnp.dtype(normed.read)))
     out_type = jax.ShapeDtypeStruct((call.rows, call.heads * value_width), out_dtype)
+    if kept:
+        out_type = (out_type, jax.ShapeDtypeStruct(out_type.shape, normed.read))
     # The chunk's scores once (the intra launch's under a decay a key dimension), then each value block's
     # memory and local products: the model's.
     scored = 0 if call.per_key else 2 * chunk * chunk * width
     model = scored + 2 * chunk * (width + chunk) * value_width
     landing = {"out": ((chunk, bv), out_dtype)}
-    swizzle = None if call.per_key else _output_swizzle(call, bv, staging, landing)
+    if kept:
+        # The norm's residual stored through its own landing.
+        landing["kept"] = ((chunk, bv), jnp.dtype(normed.read))
+    swizzle = None if call.per_key else _output_swizzle(call, bv, staging, landing, normed=normed is not None)
     keys = None if swizzle is None else {f"keys{p}": swizzle for p in range(call.given.parts)}
     # Its kernel named `recurrence_output` as the profiles and the gate know it (`launch_kernel` names a
     # launch for the function its program is defined in, here `output_launch`).
@@ -286,8 +379,10 @@ def output_launch(q, k, h, corrected, prefix: tuple, taken, beta, call: Call, ti
     return launch_kernel(program, call, out_type=out_type, grid=(call.chunks, call.heads),
                          name="recurrence_output", grid_names=("chunks", "heads"), blocks=blocks, stages=1,
                          live=chunk_liveness(len(inputs) - 1), steps=steps, model=model,
-                         held=_output_held(call, bv, swizzle), staging=staging, landing=landing,
+                         held=_output_held(call, bv, swizzle, normed=normed is not None), staging=staging,
+                         landing=landing,
                          # A 16-bit call's takes no reduction (an A100's asked for its tiles' 49152 bytes
                          # alone).
                          persistent=True, reduces=held.parts > 1, swizzles=keys)(
-        *inputs, beta, *(() if skip is None else (skip.astype(jnp.float32),)))
+        *inputs, beta, *(() if skip is None else (skip.astype(jnp.float32),)),
+        *(() if normed is None else (gate, weight.astype(jnp.float32))))

@@ -136,8 +136,9 @@ def _launched(hooks: recurrence.Hooks, operands: recurrence.Step, *, dtype, fami
     (`tuning.lowered_once`), as a model's layers' identical steps share it."""
     given = recurrence.read(hooks, operands)
     state = given['state']
-    # A row's entry a head, `[rows, Hv]`, as the token's step takes its write gate and scalar decay.
-    for name in ('beta', 'gate') + (('log_decay',) if hooks.decay == 'scalar' else ()):
+    # A row's entry a head, `[rows, Hv]`, as the token's step takes its write gate and scalar decay (a key
+    # dimension's gates and decay a row's vector a head, `[rows, Hv, Dk]`, as they come).
+    for name in ('beta',) + (('gate', 'log_decay') if hooks.decay == 'scalar' else ()):
         if name in given:
             given[name] = given[name].reshape(state.shape[0], -1)
     rows, value_heads, key_width, value_width = state.shape
@@ -441,7 +442,18 @@ def _gates(hooks, inputs, row, head, layout):
         """A head's entry (`[Hv]`), fp32."""
         return inputs[name][head].astype(jnp.float32)
 
+    def keyed(ref):
+        """A key dimension's vector of `ref` in `layout`, fp32."""
+        return plgpu.load(ref, layout=layout, optimized=False).astype(jnp.float32)
+
     one = jnp.float32(1.0)
+    if hooks.gates is not None and hooks.decay == 'vector':
+        # Each key dimension's gate over the head's rate (`recurrence.gated`, its write gate a sigmoid's).
+        given = keyed(inputs['gate'].at[row, head]) + keyed(inputs['bias'].at[head])
+        rate = accurate_exp(headed('log_a'))
+        log_decay = (hooks.gates.bound * logistic_value(rate * given) if hooks.gates.bound is not None
+                     else -rate * softplus_series(given))
+        return accurate_exp(log_decay), logistic_value(scalar('beta'))
     if hooks.gates is not None:
         rate = softplus_series(scalar('gate') + headed('bias'))
         if hooks.gates.limit is not None:
@@ -455,8 +467,7 @@ def _gates(hooks, inputs, row, head, layout):
     if hooks.decay == 'none':
         return one, write
     if hooks.decay == 'vector':
-        decay = plgpu.load(inputs['log_decay'].at[row, head], layout=layout, optimized=False)
-        return jnp.exp(decay.astype(jnp.float32)), write
+        return jnp.exp(keyed(inputs['log_decay'].at[row, head])), write
     return jnp.exp(scalar('log_decay')), write
 
 

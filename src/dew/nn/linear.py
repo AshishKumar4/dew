@@ -59,6 +59,8 @@ from .kernels.generation import INHERENT, Choice
 from .kernels.recurrence_chunk import (
     CHUNK_SIZE,
     RESET_DECAY,
+    Chunk,
+    chunk,
     chunk_gated_delta_rule,
     entering_memory,
     kernel_routed,
@@ -149,7 +151,7 @@ def causal_conv1d(x, kernel, activation: bool = True, bias=None, *, valid=None, 
             out = out[0] if parts is None else out
         else:
             out = short_conv.xla_conv1d(x, kernel, activation, bias, valid=valid, segments=segments,
-                                        parts=parts, dtype=dtype)
+                                        parts=parts, dtype=dtype, named=named)
     # The conv's output, which a remat policy may keep (`dew.nn.residuals.RESIDUALS`).
     return jax.tree.map(lambda piece: checkpoint_name(piece, Residual.CONV), out)
 
@@ -414,7 +416,7 @@ def scan_cache(rows: int, taps: int, width: int, state: str, state_shape: tuple[
 
 def held_scan(module: nn.Module, mixed, taps, bias, scan, state_shape: tuple[int, ...], *, decode: bool,
               coordinates: Coordinates, spec: Mapping[str, Opened] | None = None, state: str = 'ssm_state',
-              state_dtype=None, conv_dtype=None, parts=None, dtype=None, token=None):
+              state_dtype=None, conv_dtype=None, parts=None, dtype=None, token=None, named: bool = True):
     """The conv and scan of a mixer that holds per-row state: a decode step or
     prefill advancing `module`'s flax cache, `conv_state` `[B, K-1, D]` held
     in `conv_dtype` and `state` `[B, *state_shape]` held in `state_dtype`
@@ -437,7 +439,9 @@ def held_scan(module: nn.Module, mixed, taps, bias, scan, state_shape: tuple[int
     state its parent leaves, a root from the row's start (`forked_conv`, `forked_scan`), `scan` taking a
     forked call's table (`forked` its `(loads, stores, held)`, `held` its given memories,
     `recurrence_chunk.Chunk.loads`) in a state at least fp32 (`state_dtype` widened); a cached one starts
-    from the cache and leaves it as it was."""
+    from the cache and leaves it as it was. The scan's output is named as a remat keeps it (`Residual.SCAN`,
+    `CONTEXT`) unless `named` is False: a scan whose op names its own output before an epilogue it fuses
+    (`recurrence_chunk.chunk`'s gated norm), so a remat keeps the recurrence's output once."""
     batch = mixed.shape[0]
     held = conv_state = None
     if decode:
@@ -472,7 +476,7 @@ def held_scan(module: nn.Module, mixed, taps, bias, scan, state_shape: tuple[int
         kept(held, final.astype(held.value.dtype), state)
     # The scan's output under both names a remat policy reads it by (`RESIDUALS`): a mixer's
     # 'context', as MaxText's recipes keep it, and the 'scan' only a recurrence marks.
-    return checkpoint_name(checkpoint_name(out, Residual.SCAN), Residual.CONTEXT)
+    return checkpoint_name(checkpoint_name(out, Residual.SCAN), Residual.CONTEXT) if named else out
 
 
 def fork_histories(x, documents, real, forks: Forks, width: int, history=None):
@@ -547,7 +551,7 @@ def fork_start(held, shape: tuple[int, ...], dtype):
     return jnp.zeros(shape, dtype) if held is None else held.astype(dtype)
 
 
-def forked_scan(convolved, rule, coordinates: Coordinates, start):
+def forked_scan(convolved, rule, coordinates: Coordinates, start, *, named: bool = True):
     """The recurrence of a call over forks (`Coordinates.forks`) after its conv (`forked_conv`): each
     document from the memory its parent's tokens leave, a root from the row's start (`start`, a pytree of
     `[B, ...]` leaves: a cached call's state or zero, `fork_start`; Mamba-3's carry, four), as its own row of
@@ -559,7 +563,8 @@ def forked_scan(convolved, rule, coordinates: Coordinates, start):
     enters table slot `loads[d]` and leaves its final in stored slot `stores[d]`, returning `(output,
     final)`. A document holding no real token passes its parent's memory on, so its children enter that.
     The gradient of a memory entered sums over the documents continuing it. A cached call leaves the cache
-    as it was: no document's final is the row's."""
+    as it was: no document's final is the row's. The output is named as `held_scan`'s is, unless `named` is
+    False."""
     forks = coordinates.forks
     assert forks is not None and coordinates.segments is not None
     if forks.held is None:
@@ -601,23 +606,25 @@ def forked_scan(convolved, rule, coordinates: Coordinates, start):
     given = jax.tree.map(lambda leaf: leaf[:, None], start)
     out, _ = rule(convolved, valid=real, starts=begins, state=given, loads=loads, stores=stores,
                   held=forks.held)
-    return checkpoint_name(checkpoint_name(out, Residual.SCAN), Residual.CONTEXT)
+    return checkpoint_name(checkpoint_name(out, Residual.SCAN), Residual.CONTEXT) if named else out
 
 
 def _forked(mixed, taps, bias, scan, state_shape: tuple[int, ...], *, coordinates: Coordinates, held,
-            wide, parts, dtype):
+            wide, parts, dtype, named: bool = True):
     """`held_scan` of a call over forks: its conv (`forked_conv`) and its scan a level of the forks' chains
     in one pass (`forked_scan`), `scan(convolved, *, starts, valid, held, forked)` running each document from
     its table slot (`forked` its `(loads, stores, held)`, `held` its given memories, `Chunk.loads`); a cached
     call from the layer's held conv history and state `held`, read and left as they were. Under a sequence
-    axis the call runs whole, its documents read across the axis (`sequence_split`)."""
+    axis the call runs whole, its documents read across the axis (`sequence_split`); its output named unless
+    `named` is False (`held_scan`'s)."""
     history, held = (None, None) if held is None else held
     convolved = forked_conv(mixed, taps, coordinates, history=history, bias=bias, parts=parts, dtype=dtype)
 
     def rule(convolved, *, valid, starts, state, loads, stores, held):
         return scan(convolved, starts=starts, valid=valid, held=state, forked=(loads, stores, held))
 
-    return forked_scan(convolved, rule, coordinates, fork_start(held, (mixed.shape[0], *state_shape), wide))
+    return forked_scan(convolved, rule, coordinates, fork_start(held, (mixed.shape[0], *state_shape), wide),
+                       named=named)
 
 
 def sequence_split(decode: bool, coordinates: Coordinates) -> int:
@@ -1305,6 +1312,14 @@ class GatedDeltaNet(nn.Module):
                                 output=recurrence.OutputNorm(self.norm_eps, self.gate_activation,
                                                              read_in=jnp.dtype(operand).name))
 
+    def _chunk_hooks(self, operand, normed: bool) -> recurrence.Hooks:
+        """The sequence's chunked op (`chunk`) on the decode token's hooks (`_fused_hooks`), the conv and the
+        l2 norm before it (the conv's pieces, `held_scan`): the gates from their pre-activations and, where
+        `normed`, the gated norm in its epilogue, under the layer's declared bounds (`declared`)."""
+        fused = self._fused_hooks(operand)
+        return dataclasses.replace(fused, conv=None, l2norm=False, scale=self.head_k_dim ** -0.5,
+                                   output=fused.output if normed else None, **self.declared)
+
     def _fused_token(self, z, b, a, valid, operand):
         """A decode token's conv, gates, update and gated norm in one launch (`fused_token`): the
         layer's gate pre-activations and output gate a row's, its decay's rate and bias a head's, its
@@ -1354,25 +1369,31 @@ class GatedDeltaNet(nn.Module):
         # beta a sigmoid's, of the queries and keys the conv l2-normalized (`causal_conv1d`'s pieces).
         ported = S > 1 and kernel_routed(rows, keys, values, g, beta, **self.declared)
 
+        gate = z.reshape(B, S, -1, self.head_v_dim)
+        # The chunked op forms the gates from their pre-activations and, where the layer has made its
+        # parameters, gates and norms its output in its epilogue (`_chunk_hooks`), as the decode token does.
+        normed = not self.is_initializing()
+        chunked = S > 1 or forked
+
         def scan(convolved, *, starts, valid, held, forked=None):
             query, key, value = (self._split_heads(part, width)
                                  for part, width in zip(convolved, widths, strict=True))
             state = None if held is None else held.astype(wide)
-            if S > 1 or forked is not None:
+            if chunked:
                 # fla's layer hands its rule the projections' dtype, the
-                # queries and keys on their own heads and beta beside them. A
-                # held history can make the convolved operands vary where the
-                # projections did not, so the route is asked again of them.
+                # queries and keys on their own heads and the gates beside them.
                 # The batch's documents' firsts, built once with it (`Coordinates.firsts`); a forked call's
                 # documents from its table (`held_scan`, `Chunk.loads`), its padded tokens keeping the
-                # memory (exp(0)=1, beta=0).
-                kept = None if forked is None else valid[:, :, None]
+                # memory (`Chunk.valid`).
                 loads, stores, held = (None, None, 0) if forked is None else forked
-                return chunk_gated_delta_rule(
-                    query, key, value, g if kept is None else jnp.where(kept, g, 0.0),
-                    beta if kept is None else jnp.where(kept, beta, 0.0), state, self.chunk_size,
-                    starts=starts, max_segments=tokens.max_segments, **self.declared,
-                    firsts=tokens.firsts if forked is None else None, loads=loads, stores=stores, held=held)
+                sides = ({'z': gate, 'weight': self.norm.variables['params']['weight']} if normed else {})
+                return chunk(self._chunk_hooks(operand, normed), Chunk(
+                    query, key, value, gate=a.astype(wide), log_a=self.A_log.astype(wide),
+                    bias=self.dt_bias.astype(wide), beta=b.astype(wide), state=state, starts=starts,
+                    firsts=tokens.firsts if forked is None else None, loads=loads, stores=stores, held=held,
+                    valid=tokens.valid if forked is None else valid, **sides),
+                    chunk_size=self.chunk_size, max_segments=tokens.max_segments,
+                    dtype=(self.norm.dtype or operand) if normed else None)
             # One key head serves `per_v` value heads, the reference's `repeat_interleave`.
             query, key = (repeat_kv_heads(x, self.num_v_heads) for x in (query, key))
             if stepped and held is not None:
@@ -1402,14 +1423,17 @@ class GatedDeltaNet(nn.Module):
                             (self.num_v_heads, self.head_k_dim, self.head_v_dim), decode=decode,
                             coordinates=tokens, spec=self.cache_spec(B) if decode else None,
                             state='recurrent_state', state_dtype=stored, conv_dtype=conv,
-                            parts=heads, dtype=operand if ported else wide, token=token)
+                            parts=heads, dtype=operand if ported else wide, token=token,
+                            # The chunked op names the recurrence's output before its gated norm.
+                            named=not (chunked and normed))
         if token is not None:
             # The fused step gated and normalized its output (`_fused_hooks`), in its epilogue's dtype.
             return self.out_proj(out.astype(mixed.dtype))
 
-        gate = z.reshape(B, S, -1, self.head_v_dim)
-        # The scan read back in its projections' dtype, as Qwen3-Next's `.to(initial_dtype)` (the query's).
-        out = self.norm(out.astype(mixed.dtype), gate)  # the norm scales, then the activation gates
+        if not (chunked and normed and shards == 1):
+            # The scan read back in its projections' dtype, as Qwen3-Next's `.to(initial_dtype)` (the
+            # query's); the norm scales, then the activation gates.
+            out = self.norm(out.astype(mixed.dtype), gate)
         out = out.reshape(B, S, self.value_features)
         return self.out_proj(out)
 

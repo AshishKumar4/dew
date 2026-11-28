@@ -773,6 +773,41 @@ def test_a_gated_delta_net_named_onto_the_template_matches_the_portable_rule():
                     seeds=SEEDS, truth_fn=truth)
 
 
+def test_a_gated_delta_nets_training_step_through_its_epilogue_matches_the_portable_rule():
+    """A layer naming the template, its gates and gated norm in the chunked op (`GatedDeltaNet._chunk_hooks`):
+    its output and its gradients by its input and every parameter on par from float64 with the portable
+    rule's (check 1, the layer's own float64 step the truth). The template's training forward keeps the output
+    its output launch's epilogue read before its norm, whose gradient the norm's own forms before the fast
+    backward's (`template.mosaic_rule`)."""
+    from dew.nn.linear import GatedDeltaNet
+
+    layer = GatedDeltaNet(emb_features=64, num_k_heads=1, num_v_heads=2, head_k_dim=64, head_v_dim=64,
+                          dtype=jnp.bfloat16)
+    seed_weights = jax.random.normal(jax.random.key(31), (1, 72, 64), jnp.float32)
+
+    def draw(seed):
+        x = jax.random.normal(jax.random.key(37 + seed), (1, 72, 64)).astype(jnp.bfloat16)
+        with generation.chosen(gated_delta_rule='xla'):
+            return layer.init(jax.random.key(41 + seed), x), x
+
+    def step(layer, params, x):
+        def loss(params, x):
+            return jnp.sum(layer.apply(params, x).astype(seed_weights.dtype) * seed_weights)
+        return jax.value_and_grad(loss, argnums=(0, 1))(params, x)
+
+    def applied(kernel):
+        def run(params, x):
+            with generation.chosen(gated_delta_rule=kernel):
+                return step(layer, params, x)
+        return run
+
+    def truth(params, x):
+        return step(layer.clone(dtype=jnp.float64), params, x)
+
+    assert_as_exact(applied('mosaic_gpu'), applied('xla'), draw, 'a layer training through its epilogue',
+                    seeds=SEEDS, truth_fn=truth)
+
+
 def test_an_fp32_operand_splits_into_finite_parts_summing_to_it():
     """An fp32 operand's three bf16 parts (`product.formed`) are finite and sum to it exactly, at fp32's
     largest finite values too, past bf16's: its first part saturates there, where rounding would make it

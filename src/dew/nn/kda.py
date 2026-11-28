@@ -43,7 +43,7 @@ from dew.nn.dense import Dense
 from .flops import conv_flops, delta_flops, projection_flops
 from .inputs import PLAIN_CALL, MixerCall, coordinates_of
 from .kernels import recurrence
-from .kernels.recurrence_chunk import CHUNK_SIZE, chunk_gated_delta_rule, kernel_routed
+from .kernels.recurrence_chunk import CHUNK_SIZE, Chunk, chunk, chunk_gated_delta_rule, kernel_routed
 from .kv_cache import Opened, compute_dtype
 from .linear import (
     DepthwiseConv1d,
@@ -57,7 +57,7 @@ from .linear import (
     sequence_split,
 )
 from .mixer_base import MixerBase, MixerContext
-from .precision import accurate_exp, at_least_fp32, float32_dot_general
+from .precision import at_least_fp32, float32_dot_general
 from .residuals import DELTA_RULE_RESIDUALS
 from .sharding import LogicalAxes
 
@@ -166,18 +166,28 @@ class KimiDeltaAttention(nn.Module):
         )
         self.o_proj = dense(self.emb_features, name='o_proj')
 
-    def _decay(self, x):
-        """`Glm5NextTextForgetGate.forward` (modeling_glm5_next.py:319-335): `[B, S, H, Dk]` in fp32
-        (`at_least_fp32`)."""
+    @property
+    def _gates(self) -> recurrence.Gates:
+        """The layer's gates from their pre-activations (`recurrence.gated`), the decode token's and the
+        sequence's alike: a sigmoid write gate and a decay a key dimension, `Glm5NextTextForgetGate.forward`'s
+        (modeling_glm5_next.py:319-335): bounded below by `lower_bound` where the layer has one, else the
+        softplus step's (`recurrence._gated_decay`: its exp accurate, torch's softplus Dew's one, its value
+        past 20 the gate's within float32's rounding)."""
+        return recurrence.Gates(bound=self.lower_bound)
+
+    def _decay_gate(self, x):
+        """The forget gate's pre-activation `[B, S, H, Dk]` in at least fp32 and its bias `[H, Dk]`."""
         B, S, _ = x.shape
         gate = self.f_b_proj(self.f_a_proj(x))
-        gate = gate.astype(at_least_fp32(gate.dtype)).reshape(B, S, self.num_heads, self.head_dim)
-        bias = jnp.reshape(self.dt_bias, (self.num_heads, self.head_dim))
-        log_rate = self.A_log[None, None, :, None]
+        return (gate.astype(at_least_fp32(gate.dtype)).reshape(B, S, self.num_heads, self.head_dim),
+                jnp.reshape(self.dt_bias, (self.num_heads, self.head_dim)))
+
+    def _decay(self, gate, bias):
+        """The forget gate's log decay `[B, S, H, Dk]` from its pre-activation `gate` and `bias`
+        (`_decay_gate`), as the recurrence forms it (`_gates`, `recurrence.gated`)."""
+        log_rate = self.A_log[:, None]
         if self.lower_bound is not None:
-            return self.lower_bound * logistic(accurate_exp(log_rate) * (gate + bias))
-        # The gates' log decay as the recurrence forms it (`recurrence._gated_decay`: its exp accurate,
-        # torch's softplus Dew's one, its value past 20 the gate's within float32's rounding).
+            return recurrence.bounded_decay(self.lower_bound, gate, log_rate, bias)
         return recurrence._gated_decay(gate, log_rate, bias)
 
     @nn.nowrap
@@ -206,8 +216,10 @@ class KimiDeltaAttention(nn.Module):
         projected = jnp.concatenate(projections, axis=-1)
         wide = at_least_fp32(projected.dtype)
         taps = jnp.concatenate([conv()[0] for conv in (self.q_conv1d, self.k_conv1d, self.v_conv1d)])
-        g = self._decay(x)
-        beta = logistic(self.b_proj(x).astype(wide))
+        pre_decay, decay_bias = self._decay_gate(x)
+        g = self._decay(pre_decay, decay_bias)
+        pre_beta = self.b_proj(x).astype(wide)
+        beta = logistic(pre_beta)
         if valid is not None:
             # exp(0) = 1 and beta = 0 preserve the memory across a padded slot.
             g = jnp.where(valid[:, :, None, None], g, 0.0)
@@ -220,26 +232,32 @@ class KimiDeltaAttention(nn.Module):
         if decode and S == 1 and not forked and not self.is_initializing() and decode_kernel(
                 jax.ShapeDtypeStruct((B, self.num_heads, self.head_dim, self.head_dim), wide),
                 groups=self.num_heads, fuses=True) == 'fused':
-            token = self._fused_token(taps, g, beta, gate, valid, tokens.starts, projected.dtype)
+            token = self._fused_token(taps, pre_decay, decay_bias, pre_beta, gate, valid, tokens.starts,
+                                      projected.dtype)
 
         def split(part):
             return part.reshape(B, S, self.num_heads, self.head_dim)
 
+        # The chunked op forms the gates from their pre-activations and, where the layer has made its
+        # parameters, gates and norms its output in its epilogue (`_chunk_hooks`), as the decode token does.
+        normed = not self.is_initializing()
+        chunked = S > 1 or forked
+
         def scan(convolved, *, starts, valid, held, forked=None):
             query, key, value = (split(part) for part in convolved)
-            if S == 1 and forked is None:
+            if not chunked:
                 return decode_delta_rule(query, key, value, g, beta, held, starts=starts)
-            # A held history can make the convolved operands vary where the projections did not, so the
-            # route is asked again of them. The batch's documents' firsts, built once with it
-            # (`Coordinates.firsts`); a forked call's documents from its table (`held_scan`,
-            # `Chunk.loads`), its padded tokens keeping the memory (exp(0) = 1, beta = 0).
-            kept = None if forked is None else valid
+            # The batch's documents' firsts, built once with it (`Coordinates.firsts`); a forked call's
+            # documents from its table (`held_scan`, `Chunk.loads`), its padded tokens keeping the memory
+            # (`Chunk.valid`).
             loads, stores, table = (None, None, 0) if forked is None else forked
-            return chunk_gated_delta_rule(
-                query, key, value, g if kept is None else jnp.where(kept[:, :, None, None], g, 0.0),
-                beta if kept is None else jnp.where(kept[:, :, None], beta, 0.0), held, self.chunk_size,
-                starts=starts, max_segments=tokens.max_segments, **self.declared,
-                firsts=tokens.firsts if forked is None else None, loads=loads, stores=stores, held=table)
+            sides = {'z': gate, 'weight': self.o_norm.variables['params']['weight']} if normed else {}
+            return chunk(self._chunk_hooks(projected.dtype, normed), Chunk(
+                query, key, value, gate=pre_decay, log_a=self.A_log.astype(wide), bias=decay_bias,
+                beta=pre_beta, state=held, starts=starts, firsts=tokens.firsts if forked is None else None,
+                loads=loads, stores=stores, held=table, valid=tokens.valid if forked is None else valid,
+                **sides), chunk_size=self.chunk_size, max_segments=tokens.max_segments,
+                dtype=(self.o_norm.dtype or projected.dtype) if normed else None)
 
         # The decode state is GatedDeltaNet's pair, here in fp32 (`cache_spec`). The conv
         # normalises the queries and keys (`l2norm`) and rounds once, to the
@@ -262,24 +280,39 @@ class KimiDeltaAttention(nn.Module):
                             (self.num_heads, self.head_dim, self.head_dim), decode=decode, coordinates=tokens,
                             spec=self.cache_spec(B) if decode else None, state='recurrent_state',
                             state_dtype=wide, conv_dtype=wide, parts=heads,
-                            dtype=projected.dtype if ported else wide, token=token)
+                            dtype=projected.dtype if ported else wide, token=token,
+                            # The chunked op names the recurrence's output before its gated norm.
+                            named=not (chunked and normed))
         if token is not None:
             # The fused step gated and normalized its output (`FUSED`), in its epilogue's dtype.
             return self.o_proj(out.astype(projected.dtype))
-        # The scan read back in its projections' dtype, as Kimi's delta attention reads it.
-        out = self.o_norm(out.astype(projected.dtype), gate).reshape(B, S, self.qkv_features)
-        return self.o_proj(out)
+        if not (chunked and normed and shards == 1):
+            # The scan read back in its projections' dtype, as Kimi's delta attention reads it.
+            out = self.o_norm(out.astype(projected.dtype), gate)
+        return self.o_proj(out.reshape(B, S, self.qkv_features))
 
-    def _fused_token(self, taps, g, beta, gate, valid, starts, operand):
-        """A decode token's conv, update and gated norm in one launch (`linear.fused_token` under
-        `FUSED`): its decay a key dimension, write gate and output gate a row's, as the layer forms them, its
-        output read back in `operand`, the input projection's dtype, before the norm."""
-        hooks = dataclasses.replace(FUSED, output=recurrence.OutputNorm(self.norm_eps, 'sigmoid',
-                                                                        read_in=jnp.dtype(operand).name))
+    def _chunk_hooks(self, operand, normed: bool) -> recurrence.Hooks:
+        """The sequence's chunked op (`chunk`) on the decode token's form (`FUSED`), the conv and the l2 norm
+        before it (the conv's pieces, `held_scan`): the gates from their pre-activations (`_gates`) and,
+        where `normed`, the sigmoid-gated norm in its epilogue, its output read back in `operand`, under the
+        layer's declared bounds (`declared`)."""
+        output = recurrence.OutputNorm(self.norm_eps, 'sigmoid', read_in=jnp.dtype(operand).name)
+        return dataclasses.replace(FUSED, conv=None, l2norm=False, scale=self.head_dim ** -0.5,
+                                   gates=self._gates, output=output if normed else None, **self.declared)
+
+    def _fused_token(self, taps, decay_gate, decay_bias, beta, gate, valid, starts, operand):
+        """A decode token's conv, gates, update and gated norm in one launch (`linear.fused_token` under
+        `FUSED`): its decay gate's pre-activation a row's and key dimension's (`_decay_gate`), its write
+        gate's and output gate a row's, its decay's rate a head's and bias a head's key dimensions', formed in
+        the step as the sequence's chunked op forms them (`_gates`), its output read back in `operand`, the
+        input projection's dtype, before the norm."""
+        hooks = dataclasses.replace(FUSED, gates=self._gates, output=recurrence.OutputNorm(
+            self.norm_eps, 'sigmoid', read_in=jnp.dtype(operand).name))
         return fused_token(hooks, taps,
                            heads=(self.num_heads, self.num_heads, self.num_heads),
                            widths=(self.head_dim, self.head_dim, self.head_dim),
-                           per_row={'log_decay': g[:, 0], 'beta': beta[:, 0], 'z': gate[:, 0]}, per_head={},
+                           per_row={'gate': decay_gate[:, 0], 'beta': beta[:, 0], 'z': gate[:, 0]},
+                           per_head={'log_a': self.A_log, 'bias': decay_bias},
                            weight=lambda: self.o_norm.variables['params']['weight'], valid=valid,
                            dtype=self.o_norm.dtype, starts=starts)
 
