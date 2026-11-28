@@ -224,7 +224,7 @@ def moments(logits: jax.Array, seconds: jax.Array, value: jax.Array, powers: jax
     Differentiable at every order (the reference's, `reference`)."""
     tile = _centred_tile(logits, seconds)
     seen, below, total, over = tile.seen, tile.below, tile.total, tile.over
-    weights = jnp.exp(below) / over
+    weights = tile.masses / over
 
     def weighed(w, x):
         return float32_einsum("bhgqk,bkhd->bhgqd", w, x, precision=REFERENCE_PRECISION,
@@ -248,7 +248,7 @@ def moments(logits: jax.Array, seconds: jax.Array, value: jax.Array, powers: jax
     # are at most 1 and one channel's `2^127` takes no other's `2^-124` below fp32's least (train 1444's
     # review); the row's power then its largest pair `|w (t̂ - c)|` below `2^(G - log2 K)`, so `Σ |ũ| |v| / 2`
     # and `Σ |ũ| |a| / 2` within `2^126` in every channel.
-    channels, rows = _channel_powers(value, seen)
+    channels, rows, visible = _channel_powers(value, seen)
     reach = jnp.where(seen & (apart != 0), _reach(below) + _exponent(apart), _NONE)
     largest = jnp.max(jnp.where(reach > _NONE, reach + 1, _NONE), axis=-1)
     power = jnp.where(largest > _NONE, largest, 0) + width - 125
@@ -265,7 +265,8 @@ def moments(logits: jax.Array, seconds: jax.Array, value: jax.Array, powers: jax
         values, means = centred
         return weighed(terms, values) - jnp.sum(terms, axis=-1)[..., None] * means
 
-    halves = (power2(value, -channels) * 0.5, power2(mean, -rows) * 0.5)
+    # A key no query sees weighs nothing in the covariance: its value 0, never one past its channel's power.
+    halves = (power2(jnp.where(visible, value, 0.0), -channels) * 0.5, power2(mean, -rows) * 0.5)
     # Its power from the covariance at the lifted units, the covariance then taken to it whole (`_shifted`).
     lift = (units - before)[..., None]
     spread_power = _spread_power(jax.lax.stop_gradient(covariance(taken, halves)), lift + rows)
@@ -275,12 +276,14 @@ def moments(logits: jax.Array, seconds: jax.Array, value: jax.Array, powers: jax
 
 class _Tile(NamedTuple):
     """A key tile's softmax and centre as its moments and the dense tangent both read them
-    (`_centred_tile`): where each query sees each key, the logits below the row's maximum, the denominator
+    (`_centred_tile`): where each query sees each key, the logits below the row's maximum, their
+    exponentials (`masses`), the denominator
     (and it held at 1 where none), the second products' centre as a pair `(hi, lo)` and each second
     product's distance from it."""
 
     seen: jax.Array
     below: jax.Array
+    masses: jax.Array
     total: jax.Array
     over: jax.Array
     hi: jax.Array
@@ -295,23 +298,25 @@ def _centred_tile(logits: jax.Array, seconds: jax.Array) -> _Tile:
     seen = logits > -jnp.inf
     m = jax.lax.stop_gradient(jnp.max(logits, axis=-1))
     below = logits - jnp.where(jnp.isfinite(m), m, 0.0)[..., None]
-    total = jnp.sum(jnp.exp(below), axis=-1)
+    masses = jnp.exp(below)
+    total = jnp.sum(masses, axis=-1)
     over = jnp.where(total > 0, total, 1.0)[..., None]
     hi = jax.lax.stop_gradient(jnp.sum(exp_scaled(seconds / over, below, 0), axis=-1))
     lo = jnp.sum(exp_scaled((seconds - hi[..., None]) / over, below, 0), axis=-1)
     apart = jnp.where(seen, (seconds - hi[..., None]) - lo[..., None], 0.0)
-    return _Tile(seen, below, total, over, hi, lo, apart)
+    return _Tile(seen, below, masses, total, over, hi, lo, apart)
 
 
-def _channel_powers(value: jax.Array, seen: jax.Array) -> tuple[jax.Array, jax.Array]:
+def _channel_powers(value: jax.Array, seen: jax.Array) -> tuple[jax.Array, jax.Array, jax.Array]:
     """Each value channel's power of two over the tile's keys some query sees (`seen` `[B, Hk, G, Q, K]`;
     `value` `[B, K, Hk, Dv]`), the power its values lie below (0 for a channel of zeros), as the values take
     it `[B, 1, Hk, Dv]` and as a row's mean does `[B, Hk, 1, 1, Dv]`: a channel's mean, a mean of its seen
-    values, lies below it too; a hidden key's value bounds nothing (train 1444's review)."""
+    values, lies below it too; a hidden key's value bounds nothing (train 1444's review); and whether some
+    query sees each key `[B, K, Hk, 1]`."""
     visible = jnp.moveaxis(jnp.any(seen, axis=(2, 3)), 1, 2)[..., None]
     found = jnp.max(jnp.where(visible, _exponent(value), _ABSENT), axis=1, keepdims=True)
     found = jnp.where(found > _ABSENT, found, 0)
-    return found, jnp.moveaxis(found, 2, 1)[:, :, None]
+    return found, jnp.moveaxis(found, 2, 1)[:, :, None], visible
 
 
 def _spread_power(covariance: jax.Array, power) -> jax.Array:
