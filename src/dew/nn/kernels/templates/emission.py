@@ -586,8 +586,12 @@ class _Counting:
     def __init__(self, axis: str | None, index: int, loops: int = 0, warp: tuple | None = None,
                  forms: Mapping | None = None, arrivals: _Arrivals | None = None, lanes: int | None = None,
                  hoisted: dict[tuple, Work] | None = None, sites: Sequence = (),
-                 expansions: dict[int, tuple] | None = None, laid: Mapping | None = None):
+                 expansions: dict[int, tuple] | None = None, laid: Mapping | None = None,
+                 guaranteed: bool = True):
         self.axis, self.index, self.warp, self.forms = axis, index, warp, forms
+        # Whether every path its data may take runs it: none within an arm of a conditional its data decides,
+        # whose copies' reads count none (`Work.device_reads`, a bound on a launch's rereads).
+        self.guaranteed = guaranteed
         # Static work inside a loop, by its site: computed once outside every loop, as the compiler hoists
         # it, whichever trip or arm of whichever trial reaches it (`hoist`, row 12767), so every count within
         # that loop shares it; a conditional's arm outside every loop hoists into its own, its arm's (the
@@ -826,7 +830,7 @@ class _Counting:
             self.add(_tensor(lhs.dtype, 2 * acc.shape[0] * acc.shape[1] * lhs.shape[1]))
         elif primitive in _COPIES:
             copied = _copied(equation)
-            read = copied if primitive is gpu.copy_gmem_to_smem_p else 0
+            read = copied if primitive is gpu.copy_gmem_to_smem_p and self.guaranteed else 0
             self.add(Work(device_bytes=copied, shared_bytes=copied, device_reads=read))
         elif primitive is gpu.async_copy_smem_to_tmem_p:
             self.add(Work(shared_bytes=_smem_to_tmem_bytes(equation)))
@@ -918,7 +922,7 @@ class _Counting:
             trial = _Counting(self.axis, self.index, loops=len(self.loops) + 1, warp=self.warp,
                               forms=self.forms, arrivals=self.arrivals, lanes=self.lanes,
                               hoisted=self.hoisted, sites=self.sites, expansions=self.expansions,
-                              laid=self.laid)
+                              laid=self.laid, guaranteed=self.guaranteed)
             trial.run(body, inputs, static=static)
             self.arrivals.left(trial.landing)
             return trial
@@ -957,7 +961,7 @@ class _Counting:
                                 forms=self.forms, arrivals=self.arrivals,
                                 lanes=warp if isinstance(mesh, gpu_core.WarpMesh) else self.lanes,
                                 hoisted=self.hoisted, sites=[*self.sites, (name, warp)],
-                                expansions=self.expansions, laid=self.laid)
+                                expansions=self.expansions, laid=self.laid, guaranteed=self.guaranteed)
             counted.run(inner, barriers)
             if self.loops:
                 self.arrivals.left(counted.landing)
@@ -1042,7 +1046,7 @@ class _Counting:
             trial = _Counting(self.axis, self.index, loops=len(self.loops), warp=self.warp,
                               forms=self.forms, arrivals=self.arrivals, lanes=self.lanes,
                               hoisted=self.hoisted if self.loops else {}, sites=self.sites,
-                              expansions=self.expansions, laid=self.laid)
+                              expansions=self.expansions, laid=self.laid, guaranteed=False)
             trial.run(branch, operands, static=given[1:])
             if self.loops:
                 self.arrivals.left(trial.landing)

@@ -154,8 +154,9 @@ class Work:
     programs read, met in the L2 (`GpuTarget.l2_rate`), the device memory's own unit's rate a level up
     (`units`: row 14180, the two-level memory a launch's body counts)."""
     device_reads: float = dataclasses.field(default=0.0, metadata=_NOT_ISSUED)
-    """The bytes of a body's `device_bytes` its copies into shared memory read (no store or reduction),
-    which a launch's `l2_bytes` reads past its buffers (`emission.launch_work`)."""
+    """The bytes of a body's `device_bytes` its copies into shared memory read on every path its data may
+    take (no store or reduction, nor a copy under a conditional its data decides), which a launch's
+    `l2_bytes` reads past its buffers (`emission.launch_work`)."""
     shared_bytes: float = 0.0
     tf32_flops: float = 0.0
     span: float = dataclasses.field(default=0.0, metadata=_NOT_ISSUED)
@@ -361,12 +362,10 @@ def most(works: Sequence[Work]) -> Work:
     """The most of each unit any of `works` holds, alternatives of which one runs (a conditional's branches,
     `emission`'s and `inline_work`'s; none, `Work()`): its span the longest, every path none of the others
     outlasts (as works side by side keep them), and its issue slots the most any one of them issues
-    (`Work.issue_excess`), none issuing another's mix; its copies' reads (`Work.device_reads`) the least,
-    the ones every alternative makes, as the L2 term's bound on rereads reads them (`Work.l2_bytes`)."""
+    (`Work.issue_excess`), none issuing another's mix."""
     if not works:
         return Work()
-    taken = Work(**{field.name: (min if field.name == "device_reads" else max)(getattr(work, field.name)
-                                                                               for work in works)
+    taken = Work(**{field.name: max(getattr(work, field.name) for work in works)
                     for field in dataclasses.fields(Work) if field.name not in ("chains", "issue_excess")},
                  chains=sum(works, Work()).chains)
     return dataclasses.replace(taken, issue_excess=max(0.0, issued(taken) - max(map(issued, works))))
