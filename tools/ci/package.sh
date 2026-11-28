@@ -50,6 +50,10 @@ if [ -n "${DEW_DERIVED:-}" ]; then
     echo "package: $generation: $found derivations"
   done
 fi
+# The staged union weighed as one generation's derivations are (tools/derived_weight.py, the one rule of what a
+# package may carry): generations that each pass may not together.
+[ -z "${DEW_DERIVED:-}" ] || "$work/build/bin/python" tools/derived_weight.py "$into" ||
+  { echo "package: the staged derivations weigh past the package's limit"; exit 1; }
 (cd "$into" && ls) | sort > "$work/derived.txt"
 rm -rf "$dist"
 dist=$(mkdir -p "$dist" && cd "$dist" && pwd)

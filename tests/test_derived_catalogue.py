@@ -41,3 +41,20 @@ def test_a_step_compiled_ahead_asks_for_no_derivation_its_catalogue_lacks(tmp_pa
                    env={**env, "XDG_CACHE_HOME": str(cache), "DEW_DERIVATIONS": str(tmp_path / "none")})
     asked = {entry.name for entry in (cache / "dew" / "algebra" / "derived").glob("*.json")}
     assert asked and asked <= catalogue
+
+
+def test_a_staged_union_is_weighed_by_the_one_rule_a_generations_entries_are(tmp_path):
+    """What a package may carry (tools/derived_weight.py, the rule the catalogue weighs a generation's entries
+    by): run on a directory as a release's package step runs it on the union it staged (tools/ci/package.sh),
+    entries each under the limit refused where together they pass it, and within it, weighed."""
+    staged = tmp_path / "derived"
+    staged.mkdir()
+    for name in ("a", "b"):
+        (staged / f"{name}.json").write_bytes(b"x" * (9 * 2**20))
+    (staged / "notes.txt").write_bytes(b"x" * (9 * 2**20))  # Not an entry: never weighed.
+    weigh = [sys.executable, str(REPO_ROOT / "tools/derived_weight.py"), str(staged)]
+    past = subprocess.run(weigh, capture_output=True, text=True)
+    assert past.returncode != 0 and "18.00 MiB, past 16.0 MiB" in past.stderr
+    (staged / "b.json").unlink()
+    within = subprocess.run(weigh, capture_output=True, text=True, check=True)
+    assert json.loads(within.stdout) == {"entries": 1, "mib": 9.0}

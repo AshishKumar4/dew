@@ -29,6 +29,8 @@ import tempfile
 import time
 from pathlib import Path
 
+from derived_weight import LIMIT_MIB, weighed
+
 from dew import _files
 from dew.nn.kernels import generation
 
@@ -37,10 +39,6 @@ ROOT = TOOLS.parent
 OUT = ROOT / "src" / "dew" / "algebra" / "derived"
 GENERATIONS = tuple(name for name, target in generation.TARGETS.items() if not generation.tpu(target))
 """The CUDA generations a package's entries are derived for by default: every one Dew's table states."""
-LIMIT_MIB = 16.0
-"""The most the entries may weigh, in MiB: a package carries them to every install."""
-
-
 def lowered(step: str, generation: str) -> dict:
     """`step` lowered for a GPU of `generation` in this process, its derivations written to the store Dew's
     cache holds (the caller's): the store's counts of them, or why the generation cannot lower it."""
@@ -131,10 +129,7 @@ def main() -> None:
                              f"{[(result['step'], result['generation']) for result in failed]}")
         derived = Path(cache) / "dew" / "algebra" / "derived"
         entries = sorted(derived.glob("*.json")) if derived.is_dir() else []
-        weight = sum(entry.stat().st_size for entry in entries)
-        if weight > arguments.limit_mib * 2**20:
-            raise SystemExit(f"the entries weigh {weight / 2**20:.2f} MiB, past --limit-mib "
-                             f"{arguments.limit_mib}")
+        weight = weighed(entries, arguments.limit_mib)
         # Written whole beside `--out` and put in its place in one call, refused where `--out` holds anything
         # but entries (`_foreign`).
         with _files.swapped(arguments.out, _foreign) as staged:
