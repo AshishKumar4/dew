@@ -208,6 +208,30 @@ def test_a_batched_ragged_product_of_no_groups_is_its_zeros_and_compiles_for_a_g
     lowered_for(batched, specs, "sm90").compile()
 
 
+def test_a_ragged_batch_product_of_no_groups_is_its_batched_dot():
+    """A ragged dot whose rows' ragged axis is a batch axis (JAX's ragged-batch mode, a batched dot that reads
+    no group sizes) at sizes of no groups, through `precision.accumulated` at F32_F32_F32: two [2, 1, 1]
+    operands of 2s and 3s multiply to two 6s, and their gradients are 3s and 2s, not a product of no groups'
+    zeros (train 1478's review of row 14112)."""
+    from dew.nn import precision
+
+    numbers = jax.lax.RaggedDotDimensionNumbers(dot_dimension_numbers=(((2,), (1,)), ((0,), (0,))),
+                                                lhs_ragged_dimensions=(0,), rhs_group_dimensions=())
+    product = functools.partial(jax.lax.ragged_dot_general, ragged_dot_dimension_numbers=numbers,
+                                precision=jax.lax.DotAlgorithmPreset.F32_F32_F32)
+
+    def batched(rows, bank):
+        return precision.accumulated(product, rows, bank, jnp.zeros((0,), jnp.int32),
+                                     preferred_element_type=jnp.float32)
+
+    rows, bank = jnp.full((2, 1, 1), 2.0, jnp.float32), jnp.full((2, 1, 1), 3.0, jnp.float32)
+    out, gradients = jax.jit(lambda *pair: (batched(*pair), jax.grad(lambda *pair: batched(*pair).sum(), (0, 1))(
+        *pair)))(rows, bank)
+    np.testing.assert_array_equal(np.asarray(out), np.full((2, 1, 1), 6.0, np.float32))
+    np.testing.assert_array_equal(np.asarray(gradients[0]), np.full((2, 1, 1), 3.0, np.float32))
+    np.testing.assert_array_equal(np.asarray(gradients[1]), np.full((2, 1, 1), 2.0, np.float32))
+
+
 def test_a_weakly_typed_product_of_no_groups_stays_weak():
     """A ragged product of no groups over weakly typed rows, bank and sizes (Python scalars' fills) outside
     x64, through `precision.accumulated`: its zeros weakly typed float32 as JAX types the product, so beside a

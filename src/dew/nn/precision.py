@@ -891,33 +891,48 @@ def ragged(product: Callable[..., jax.Array], *operands, preferred_element_type:
            summed_wide: bool = False) -> jax.Array:
     """`product(*operands, preferred_element_type=...)`, a ragged dot (`jax.lax.ragged_dot_general` bound,
     `_ragged`; its last operand its group sizes, which count its rows and multiply nothing): where its groups
-    are statically none (the sizes' last axis empty) its zeros (`_no_groups`), as it multiplies no row; else,
-    `summed_wide` (`accumulated`'s), its products summed as a wide CPU process sums them (`_summed_wide`), or
-    as written. XLA's CUDA backend refuses a ragged dot of no groups (row 14112: a forward's legalization left
-    its result unmaterialized, a kernel gradient's contraction aborted the process; a bank of no experts on a
-    GH200). Every ragged product Dew forms passes here (`accumulated`'s, `xla_products.placed_ragged_dot`'s,
-    the fuser's dot as written)."""
+    are statically none (the sizes' last axis empty) and count its rows (`_grouped`) its zeros
+    (`_no_groups`), as it multiplies no row; else, `summed_wide` (`accumulated`'s), its products summed as a
+    wide CPU process sums them (`_summed_wide`), or as written. XLA's CUDA backend refuses a ragged dot of no
+    groups (row 14112: a forward's legalization left its result unmaterialized, a kernel gradient's
+    contraction aborted the process; a bank of no experts on a GH200). Every ragged product Dew forms passes
+    here (`accumulated`'s, `xla_products.placed_ragged_dot`'s, the fuser's dot as written)."""
     *multiplied, sizes = operands
-    if not jnp.shape(sizes)[-1]:
-        return _no_groups(product, operands, preferred_element_type)
+    if not jnp.shape(sizes)[-1] and (traced := _grouped(product, operands, preferred_element_type)) is not None:
+        return _no_groups(traced, operands)
     if summed_wide and _sums_in_float64(*multiplied):
         return _summed_wide(product, preferred_element_type, *operands, counts=1)
     return product(*operands, preferred_element_type=preferred_element_type)
 
 
-def _no_groups(product: Callable[..., jax.Array], operands: tuple, preferred_element_type) -> jax.Array:
-    """A ragged dot of no groups' zeros, typed as the product is: its traced aval's zeros as JAX forms a
-    value's (`ad_util.zeros_like_aval`: its dtype, a float64 one's outside x64 too, its weakness and its
-    placement each the aval's, an Explicit one a shape's evaluation drops beside an Auto axis), varying as
-    its operands vary; an eager call's committed to the one device its committed operands lie on, as their
-    product would be. A constant, its derivative zero at every order (row 14112's reviews)."""
+def _grouped(product: Callable[..., jax.Array], operands: tuple,
+             preferred_element_type) -> core.ClosedJaxpr | None:
+    """The ragged dot `product` of `operands` traced (`jax.make_jaxpr`), where its group sizes count its
+    rows: its rows' ragged axis one it keeps or contracts (JAX's ragged non-contracting and contracting
+    modes). None where that axis is a batch axis (its ragged-batch mode), a batched dot whatever its sizes,
+    which it reads not at all (`jax.lax.ragged_dot_general`; train 1478's review of row 14112: two [2, 1, 1]
+    operands of 2s and 3s batched on their ragged axis are two 6s at sizes of no groups, not zeros)."""
+    traced = jax.make_jaxpr(functools.partial(product, preferred_element_type=preferred_element_type))(*operands)
+    numbers = next(equation.params["ragged_dot_dimension_numbers"] for equation in traced.eqns
+                   if "ragged_dot_dimension_numbers" in equation.params)
+    (ragged_axis,) = numbers.lhs_ragged_dimensions
+    _, (batch_axes, _) = numbers.dot_dimension_numbers
+    return None if ragged_axis in batch_axes else traced
+
+
+def _no_groups(traced: core.ClosedJaxpr, operands: tuple) -> jax.Array:
+    """A ragged dot of no groups' zeros (`traced`, its program, `_grouped`'s), typed as the product is: its
+    traced aval's zeros as JAX forms a value's (`ad_util.zeros_like_aval`: its dtype, a float64 one's outside
+    x64 too, its weakness and its placement each the aval's, an Explicit one a shape's evaluation drops
+    beside an Auto axis), varying as its operands vary; an eager call's committed to the one device its
+    committed operands lie on, as their product would be. A constant, its derivative zero at every order
+    (row 14112's reviews)."""
     from jax._src import ad_util
 
     from dew.nn.sharding import varying_like
 
-    bound = functools.partial(product, preferred_element_type=preferred_element_type)
     # The one array a ragged dot returns.
-    typed = next(aval for aval in jax.make_jaxpr(bound)(*operands).out_avals if isinstance(aval, ShapedArray))
+    typed = next(aval for aval in traced.out_avals if isinstance(aval, ShapedArray))
     narrowed = jax.dtypes.canonicalize_dtype(typed.dtype) != typed.dtype
     with jax.enable_x64(new_val=True) if narrowed else contextlib.nullcontext():
         zeros = ad_util.zeros_like_aval(typed)
