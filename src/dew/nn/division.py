@@ -192,7 +192,8 @@ def _float64_quotient(numerator: jax.Array, denominator: jax.Array) -> jax.Array
     numerator, denominator = jnp.broadcast_arrays(numerator, denominator)
     wide = jnp.dtype(jnp.float64)
     with jax.enable_x64(new_val=True):
-        quotient = _widened_bits(numerator, wide) / jax.lax.optimization_barrier(_widened_bits(denominator, wide))
+        divisor = jax.lax.optimization_barrier(_widened_bits(denominator, wide))
+        quotient = _widened_bits(numerator, wide) / divisor
         magnitude = jnp.abs(quotient)
         below = magnitude < np.float64(2.0 ** -126)
         # Normal quotients held at zero here, so no conversion of one past the grid's range is read.
