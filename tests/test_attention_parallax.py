@@ -1006,9 +1006,10 @@ def test_exp_scaleds_derivative_meets_its_powers_before_it_rounds():
     a direction of `3 · 2^126` is `9 · 2^123`; at `1.5 · 2^-1` a cotangent of `1.5 · 2^-126` pulls back
     `1.125 · 2^-126` on a backend that flushes subnormals; at `2^126 · 2^-124` a cotangent of `3 · 2^124`
     pulls back `3 · 2^126`; at `2^-64 · 2^128` the directions `(1, -2^64)` along `z` and the exponent cancel
-    to 0; and the derivative along `z` of the one along the exponent at `2^-149` is 1. Forms that met the
-    direction before the powers, or each direction apart, overflowed or flushed these (the confirm
-    reviews)."""
+    to 0; at `0 · 2^-100` a direction of `2^80` along `z` is `2^-20`, and at `0 · 2^0` a cotangent of
+    `2^-100` pulls back `2^-100` along `z`; and the derivative along `z` of the one along the exponent at
+    `2^-149` is 1. Forms that met the direction before the powers, each direction apart, or raised a zero
+    `z` overflowed or flushed these (the confirm reviews)."""
     def along(z, power, direction):
         return float(jax.jvp(lambda e: attention_parallax.exp_scaled(jnp.float32(z), e, power),
                              (jnp.float32(0.0),), (jnp.float32(direction),))[1])
@@ -1026,6 +1027,11 @@ def test_exp_scaleds_derivative_meets_its_powers_before_it_rounds():
     directions = (jnp.float32(1.0), jnp.float32(-(2.0 ** 64)))
     joint = jax.jvp(lambda z, e: attention_parallax.exp_scaled(z, e, 128), primals, directions)[1]
     assert float(joint) == 0.0
+
+    assert float(jax.jvp(lambda z: attention_parallax.exp_scaled(z, jnp.float32(0.0), -100),
+                         (jnp.float32(0.0),), (jnp.float32(2.0 ** 80),))[1]) == 2.0 ** -20
+    _, pull = jax.vjp(lambda z: attention_parallax.exp_scaled(z, jnp.float32(0.0), 0), jnp.float32(0.0))
+    assert float(pull(jnp.float32(2.0 ** -100))[0]) == 2.0 ** -100
 
     def along_exponent(z):
         one, zero = jnp.float32(1.0), jnp.float32(0.0)

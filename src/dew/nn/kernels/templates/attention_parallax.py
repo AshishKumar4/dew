@@ -182,30 +182,43 @@ def _exact(z: jax.Array, exponent: jax.Array, power: jax.Array) -> jax.Array:
 
 
 def _halved(z: jax.Array, exponent: jax.Array, power: jax.Array) -> jax.Array:
-    """`exp_scaled` in its halved form, `z / 2` taken by `e^f` and every power at once, a tiny `z`
-    (`|z| < 2^-100`) raised by `2^64` in its stead (from its bits, `raised_exactly`, which no flushing
-    multiply reads), its power among the powers: its derivative, which JAX takes of it, both directions
-    summed before the powers, so a cancelling pair cancels, and a tiny `z`'s direction kept from flushing,
-    its derivative along `z` at most `2^64`."""
+    """`exp_scaled` in its halved form, `z / 2` taken by `e^f` and every power at once: its derivative, which
+    JAX takes of it, both directions summed before the powers, so a cancelling pair cancels."""
     finite, whole, fraction = _decay_parts(exponent)
-    tiny = jnp.abs(jax.lax.stop_gradient(z)) < 2.0 ** -100
-    lifted = z * jnp.where(tiny, 2.0 ** 64, 0.5)
+    return jnp.where(finite, _decayed(z * 0.5, accurate_exp(fraction), power + whole + 1.0), 0.0)
+
+
+def _raised(z: jax.Array, exponent: jax.Array, power: jax.Array) -> jax.Array:
+    """`exp_scaled` of a tiny nonzero `z` (`|z| < 2^-100`) raised by `2^64` from its bits (`raised_exactly`,
+    which no flushing multiply reads), its power among the powers, every power applied at once; zero for any
+    other `z`: its derivative along the exponent, which JAX takes of it, where `z / 2` flushed the
+    direction, its derivative along `z` `2^64`."""
+    finite, whole, fraction = _decay_parts(exponent)
+    held = jax.lax.stop_gradient(z)
+    tiny = (held != 0) & (jnp.abs(held) < 2.0 ** -100)
+    lifted = jnp.where(tiny, z, 0.0) * 2.0 ** 64
     if jnp.dtype(z.dtype) == jnp.float32:
-        exact = jnp.where(tiny, raised_exactly(jax.lax.stop_gradient(z), jnp.int32(64)), lifted)
+        exact = jnp.where(tiny, raised_exactly(held, jnp.int32(64)), 0.0)
         lifted = lifted + jax.lax.stop_gradient(exact - lifted)
-    return jnp.where(finite, _decayed(lifted, accurate_exp(fraction),
-                                      power + whole + jnp.where(tiny, -64.0, 1.0)), 0.0)
+    return jnp.where(finite, _decayed(lifted, accurate_exp(fraction), power + whole - 64.0), 0.0)
 
 
 def _exp_scaled_tangent(primals, tangents):
-    """`exp_scaled`'s tangent: the halved form's, JAX's own derivative of it (`_halved`), beside the rule's
-    own value, so a higher order meets the rule again: `2^-149 · 2^149` along its exponent is 1, where the
-    halved form of a subnormal flushed it 0. Its order is fixed, as JAX transposes it: a direction meets `z /
-    2` before the powers and a cotangent the powers first, so `2^120 · 2^-120` along `2^100` overflows
-    where the reverse of `3 · 2^124` at `2^126 · 2^-124` does not; a declared transpose
-    (`generation.linear_map`) read NaN past the second order of `attend`."""
-    _, tangent = jax.jvp(_halved, primals, tangents)
-    return _exp_scaled(*primals), tangent
+    """`exp_scaled`'s tangent beside the rule's own value, so a higher order meets the rule again: the halved
+    form's, JAX's own derivative of it (`_halved`), but along the exponent of a tiny nonzero `z` the raised
+    form's (`_raised`): `2^-149 · 2^149` along its exponent is 1, where `z / 2` flushed it 0 (train 1489's
+    F2). Its order is fixed, as JAX transposes it: a direction meets `z / 2` before the powers and a
+    cotangent the powers first, so `2^120 · 2^-120` along `2^100` overflows where the reverse of `3 · 2^124`
+    at `2^126 · 2^-124` does not; a declared transpose (`generation.linear_map`) read NaN past the second
+    order of `attend`."""
+    z, exponent, power = primals
+    along_z, along_exponent, along_power = tangents
+    held = jax.lax.stop_gradient(z)
+    tiny = (held != 0) & (jnp.abs(held) < 2.0 ** -100)
+    _, halved = jax.jvp(_halved, primals, (along_z, jnp.where(tiny, 0.0, along_exponent), along_power))
+    _, raised = jax.jvp(lambda exponent: _raised(z, exponent, power), (exponent,),
+                        (jnp.where(tiny, along_exponent, 0.0),))
+    return _exp_scaled(*primals), halved + raised
 
 
 _exp_scaled = contracted("test_parallax_holds_every_order")(
