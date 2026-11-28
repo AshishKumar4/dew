@@ -1099,23 +1099,29 @@ ahead of the reference path,
 whose scores are whole, where every kernel before it refuses the call."""
 
 
-def keeps_reference_rows(kernel: str, *, masked: bool, filled: bool, sunk: bool) -> bool:
+def keeps_reference_rows(kernel: str, *, masked: bool, filled: bool, sunk: bool, biased: bool) -> bool:
     """Whether every arm of the attention kernel named `kernel`, its forward and its derivatives, reads each
     row of a call as the call's reference path does (`reference_attention`): a row of no mass (its every
     logit -inf) NaN where that reads it NaN and zero where it excludes it (row 14116), for a call that hides
-    keys (`masked`), fills them (`filled`, `mask_fill`) or has sinks (`sunk`), or none of them. The reference
-    path for every call; the template for a call of no fill and no sinks (its spans' exclusion,
-    `KeySpans.excluded`; a -inf fill's call is its masked walk, whose row of no mass that sees a key reads
-    zero, and a sink's state its own, a row of no mass from it zero where the reference's softmax over a
-    -inf sink reads NaN); xla's attention and the inference route (the template's forward, xla's
-    derivatives) for a call of none of them, jax.nn's softmax op for op; no other: FlashAttention and cuDNN
-    read such a row zero, Triton's kernel and Splash take no bias. The one statement a rewrite onto a kernel
-    reads (`dew.algebra.recognize`)."""
+    keys (`masked`), fills them (`filled`, `mask_fill`), has sinks (`sunk`) or a bias or score hook that can
+    put -inf on a row's every key (`biased`). The reference path for every call. No other for a fill or
+    sinks: a -inf fill's template call is its masked walk, whose row of no mass that sees a key reads zero,
+    and a sink's state is its own, its row of no mass zero where the reference's softmax over a -inf sink
+    reads NaN. The template for every other call (its spans' exclusion, `KeySpans.excluded`); every kernel
+    for a call neither masked nor biased, whose finite logits leave no row of no mass; xla's attention and
+    the inference route (the template's forward, xla's derivatives) for an unmasked call, jax.nn's softmax
+    op for op, whose finite masked floor reads a row that sees no key as its keys' mean; FlashAttention and
+    cuDNN for an unbiased call, which read a row of no mass zero as the reference's excluded rows read the
+    rows that see no key. The one statement a rewrite onto a kernel reads (`dew.algebra.recognize`)."""
     if kernel == 'reference':
         return True
-    if kernel == 'template':
-        return not filled and not sunk
-    return kernel in ('xla', 'inference') and not masked and not filled and not sunk
+    if filled or sunk:
+        return False
+    if kernel == 'template' or not (masked or biased):
+        return True
+    if kernel in ('xla', 'inference'):
+        return not masked
+    return kernel in ('flash', 'flash_inference', 'cudnn') and not biased
 
 
 def reverse_only(kernel: str) -> bool:

@@ -188,6 +188,14 @@ def _halved(z: jax.Array, exponent: jax.Array, power: jax.Array) -> jax.Array:
     return jnp.where(finite, _decayed(z * 0.5, accurate_exp(fraction), power + whole + 1.0), 0.0)
 
 
+def _tiny(z: jax.Array) -> jax.Array:
+    """Whether `z` is nonzero and below `2^-100` in magnitude: an fp32 `z`'s zero read from its bits, as a
+    flushing backend (XLA's CPU) reads a subnormal equal to 0."""
+    nonzero = (z != 0) if jnp.dtype(z.dtype) != jnp.float32 else (
+        jax.lax.bitcast_convert_type(z, jnp.uint32) & 0x7FFFFFFF) != 0
+    return nonzero & (jnp.abs(z) < 2.0 ** -100)
+
+
 def _raised(z: jax.Array, exponent: jax.Array, power: jax.Array) -> jax.Array:
     """`exp_scaled` of a tiny nonzero `z` (`|z| < 2^-100`) raised by `2^64` from its bits (`raised_exactly`,
     which no flushing multiply reads), its power among the powers, every power applied at once; zero for any
@@ -195,7 +203,7 @@ def _raised(z: jax.Array, exponent: jax.Array, power: jax.Array) -> jax.Array:
     direction, its derivative along `z` `2^64`."""
     finite, whole, fraction = _decay_parts(exponent)
     held = jax.lax.stop_gradient(z)
-    tiny = (held != 0) & (jnp.abs(held) < 2.0 ** -100)
+    tiny = _tiny(held)
     lifted = jnp.where(tiny, z, 0.0) * 2.0 ** 64
     if jnp.dtype(z.dtype) == jnp.float32:
         exact = jnp.where(tiny, raised_exactly(held, jnp.int32(64)), 0.0)
@@ -213,8 +221,7 @@ def _exp_scaled_tangent(primals, tangents):
     order of `attend`."""
     z, exponent, power = primals
     along_z, along_exponent, along_power = tangents
-    held = jax.lax.stop_gradient(z)
-    tiny = (held != 0) & (jnp.abs(held) < 2.0 ** -100)
+    tiny = _tiny(jax.lax.stop_gradient(z))
     _, halved = jax.jvp(_halved, primals, (along_z, jnp.where(tiny, 0.0, along_exponent), along_power))
     _, raised = jax.jvp(lambda exponent: _raised(z, exponent, power), (exponent,),
                         (jnp.where(tiny, along_exponent, 0.0),))
