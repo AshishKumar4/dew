@@ -1112,7 +1112,10 @@ def keeps_reference_rows(kernel: str, *, masked: bool, filled: bool, sunk: bool,
     the inference route (the template's forward, xla's derivatives) for an unmasked call, jax.nn's softmax
     op for op, whose finite masked floor reads a row that sees no key as its keys' mean; FlashAttention and
     cuDNN for an unbiased call, which read a row of no mass zero as the reference's excluded rows read the
-    rows that see no key. The one statement a rewrite onto a kernel reads (`dew.algebra.recognize`)."""
+    rows that see no key. Its rows are the logits -inf as written (a bias, a fill, a hidden key): finite
+    products that overflow are a range each kernel answers its own way (the template's prescaled products
+    keep finite what the reference's overflow). The one statement a rewrite onto a kernel reads
+    (`dew.algebra.recognize`)."""
     if kernel == 'reference':
         return True
     if filled or sunk:

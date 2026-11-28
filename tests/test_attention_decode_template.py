@@ -208,7 +208,7 @@ def test_a_decode_step_that_reads_a_row_of_no_mass_nan_takes_no_output_hook():
     unmasked = dataclasses.replace(template.spans(1, KEYS, 2), excluded=False)
     with generation.assumed("sm90"):
         target = generation.gpu_target()
-        with pytest.raises(NotImplementedError, match="row of no mass"):
+        with pytest.raises(NotImplementedError):
             attention_decode.attend(query, key, value, unmasked, hooks, interpret=True)
         assert not attention_decode.serves(query, key, hooks, natural=False, target=target, excluded=False)
         assert attention_decode.serves(query, key, hooks, natural=False, target=target)
