@@ -611,8 +611,10 @@ def _unbounded_denominators(forward: Iv, recomputed: Iv, exponents: Iv | None, k
     visible weights (`forward`), a dQ launch's own `denominator`, where two launches ran, the sum of the
     weights it recomputes (`recomputed`, at the stored maximum). Each an fp32 row sum in any order
     (`summed`: gamma_n of its terms, each add rounded to nearest); the forward's, where it walked `online`
-    (the fast form's), its terms each within its online error of itself (`certified.online_spread`, an
-    exp2 of the lane's reach), what underflow loses beside (four a key)."""
+    (the fast form's), its terms each within its online error of itself through its row's live combines
+    alone (`certified.online_spread`, an exp2 of the lane's reach: a masked key's term an exact zero, its
+    combine no rounding, so a causal row of one key is charged one combine, not the row's width), what
+    underflow loses beside (four a live key)."""
     from certified import online_spread, underflow
 
     def visible(weights: Iv) -> Iv:
@@ -620,10 +622,10 @@ def _unbounded_denominators(forward: Iv, recomputed: Iv, exponents: Iv | None, k
 
     row = summed(visible(forward), lane)
     if online:
-        count, unit = keeps.shape[1], FLOAT32.unit_roundoff
+        live, unit = keeps.sum(-1), FLOAT32.unit_roundoff
         shifted = np.minimum(exponents.lo, 0.0) * np.log(2.0)
-        spread = online_spread(shifted, count, 2 * unit * lane.reach, FLOAT32)
-        lost = (visible(forward).hi * spread).sum(-1) + 4 * count * underflow(FLOAT32, lane.flushes)
+        spread = online_spread(shifted, live[..., None], 2 * unit * lane.reach, FLOAT32)
+        lost = (visible(forward).hi * spread).sum(-1) + 4 * live * underflow(FLOAT32, lane.flushes)
         row = Iv(row.lo - lost, row.hi + lost)
     outside = {"total": ~within(total, row), "denominator": np.zeros(total.shape, bool)}
     if denominator is not None:
@@ -976,7 +978,8 @@ def assert_backward_faults_refused(*, interpret: bool, lane: Lane | None = None,
     and the fast form's dQ and dK held as the accurate form's (one part, about the first pass's D,
     'parts'); a dQ pass's denominator doubled with the dV it weighs halved, and nudged or NaN ('doubled');
     and a fixed maximum's denominator past its fp32 row sum's bound, its masked keys no terms of it ('row
-    sums'). Every native program a part reads launches before any check (row 9546)."""
+    sums'); and the fast form's one-key causal row's denominator 2^-13 past its one live combine's bound
+    ('combine'). Every native program a part reads launches before any check (row 9546)."""
     import tier_wire
 
     faults = tuple(BACKWARD_FAULTS) if faults is None else faults
@@ -1036,6 +1039,18 @@ def _parts_refused(q, k, v, do, mask, causal: dict, accurate: dict, *, lane) -> 
     assert refused(held, "dq") and refused(held, "dk")
 
 
+def _combine_refused(q, k, v, do, mask, causal: dict, *, lane) -> None:
+    """The fast form's one-key causal row's forward denominator past its one live combine's bound."""
+    # The fast form's first causal row, its one key at its maximum: its forward's denominator exactly 1 and
+    # nudged by 2^-13, refused, its online walk charged its one live combine, 8e-6 beyond its sum's own
+    # enclosure (its exponent's recomputed rounding, about 8e-5); charged the row's 512 keys' combines, 4e-3
+    # beyond it, it passed (Train 1444's review; FS-62-DENOM3).
+    assert causal["l"][0, 0, 0] == 1.0
+    nudged = causal["l"].copy()
+    nudged[0, 0, 0] = 1 + 2.0 ** -13
+    assert refused(backward_witnessed(q, k, v, do, mask, dict(causal, l=nudged), lane=lane), "dq")
+
+
 def _doubled_refused(q, k, v, do, mask, accurate: dict, *, lane) -> None:
     """The accurate form's dQ pass denominators bent: doubled with the dV it weighs halved, and a row's
     nudged or NaN."""
@@ -1079,6 +1094,7 @@ BACKWARD_FAULTS = {
     "parts": (("causal", "accurate"), _parts_refused),
     "doubled": (("accurate",), _doubled_refused),
     "row sums": ((), _row_sums_bounded),
+    "combine": (("causal",), _combine_refused),
 }
 """The backward's faults (`assert_backward_faults_refused`), each the runs it reads and its check of them
 from the operands, the causal mask and those runs in their order, a part a test may hold alone."""

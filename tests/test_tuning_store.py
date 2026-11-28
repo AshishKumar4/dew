@@ -115,7 +115,7 @@ def _timed(ms):
 
 def _merged_pick(kind: str, ba, timings: tuning.Timings) -> None:
     """`ba` measured at `timings` merged into the store of GPUs of `kind`, its entry as `tune` makes it."""
-    tuning._store(kind, {tuning._launch_key(ba): tuning._entry(ba, timings)})
+    tuning._store(kind, {tuning._launch_key(ba): (tuning._described(ba), timings)})
 
 
 def test_a_pick_measured_under_another_jax_is_not_read(tmp_path, monkeypatch):
@@ -456,11 +456,11 @@ class _DerivedFromHooks(_HookedKernel):
         return super().traced(name, value)
 
 
-def test_a_stored_hooked_launch_is_kept_as_written_and_replaced_by_its_newer_timings(tmp_path, monkeypatch):
+def test_a_stored_hooked_launch_is_kept_as_written_and_takes_its_newer_timings(tmp_path, monkeypatch):
     """A stored launch's hooks are their traced keys, which no derivation takes: storing another launch
     keeps its entry as it was written, its derived config the one measured beside its timings (M-FS-106: a
     stored GEMM's derivation re-run on its prologue's key crashed the tuner), and its own newer timings
-    replace it, one entry a launch."""
+    merge into it, each config measured again replaced, one entry a launch."""
     monkeypatch.setattr(_cache, "kernel_picks_path", lambda kind: str(tmp_path / f"{kind}.json"))
     path = _cache.kernel_picks_path("gpu")
     op = _DerivedFromHooks(prologue=_scaled_hook)
@@ -474,7 +474,25 @@ def test_a_stored_hooked_launch_is_kept_as_written_and_replaced_by_its_newer_tim
     assert len(tuning._stored(path)) == 2
     assert {key: {config: timing.median_evaluation_time_ms for config, timing in timings.items()}
             for (_, key), (_, timings) in read.items()} == {
-        first.autotuning_cache_key: {2: 0.5}, other.autotuning_cache_key: {1: 1.0}}
+        first.autotuning_cache_key: {1: 2.0, 2: 0.5}, other.autotuning_cache_key: {1: 1.0}}
+
+
+def test_a_writer_that_measured_a_narrower_space_keeps_what_another_stored_since_it_read(tmp_path,
+                                                                                         monkeypatch):
+    """Two writers of one launch's timings (`tuning._store`): one read config 1 at 2 ms, the other then
+    stored 1 at 1 ms and 3, and the first stores what it measured since, 2, and 3 failing; the store holds
+    all three at the newer times, 3's kept, where writing the first's whole view would restore 1's older time
+    and drop 3, and a failure merged would erase it (Train 1444's review)."""
+    monkeypatch.setattr(_cache, "kernel_picks_path", lambda kind: str(tmp_path / f"{kind}.json"))
+    op = _DerivedFromHooks(prologue=_scaled_hook)
+    launch = op.keyed(op.bind(TILE, _Hooks(_scaled_hook, (0,))))
+    _merged_pick("gpu", launch, tuning.Timings({1: _timed(2.0)}))
+    _merged_pick("gpu", launch, tuning.Timings({1: _timed(1.0), 3: _timed(3.0)}))
+    _merged_pick("gpu", launch, tuning.Timings({2: _timed(1.5), 3: RuntimeError("it failed again")}))
+    read, _ = tuning._read(_cache.kernel_picks_path("gpu"))
+    [(_, timings)] = read.values()
+    assert {config: timing.median_evaluation_time_ms for config, timing in timings.items()} == {
+        1: 1.0, 2: 1.5, 3: 3.0}
 
 
 def _hooks() -> list:
