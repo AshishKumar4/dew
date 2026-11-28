@@ -418,14 +418,15 @@ def test_a_memorys_mini_batches_are_recomputed_where_the_rung_recomputes_the_chu
 
 def test_a_memorys_residual_survives_an_affine_its_bias_cancels():
     """Titans over one fp32 token, its query `e0` reading a memory whose first row is `(1, -1)` (its readout
-    `(1, -1)`, normed to itself at `eps` 2^-30), no key, value or rates, an affine weight of 2^100 and bias
-    `(-2^100, 2^100)`: its output `e0` exactly, the affine whole before the query's residual
+    `(1, -1)`, normed to itself at `eps` 2^-30), no key, value or rates, an affine weight of 2^25 and bias
+    `(-2^25, 2^25)`: its output `e0` exactly, the affine whole before the query's residual
     (`ResidualMemory`'s `q + (LN w + c)`), where `(q + LN w) + c` lost the query to the bias's cancellation (a
     head review)."""
     query = _pair((1.0, 0.0))
     zero = jnp.zeros_like(query)
     entering = jnp.zeros((1, 1, 2, 2), jnp.float32).at[0, 0, 0].set(jnp.asarray([1.0, -1.0]))
-    large = 2.0 ** 100
+    # Past fp32's 24 bits from the query's 1, within the inner gradient's range (its error times the weight).
+    large = 2.0 ** 25
     affine = (jnp.full((1, 2), large, jnp.float32), jnp.asarray([[-large, large]], jnp.float32))
     out, _ = titans(query, zero, zero, *affine, *(jnp.zeros((1, 1, 1)) for _ in range(3)),
                     state=(entering, jnp.zeros_like(entering)), chunk=1, eps=2.0 ** -30)
