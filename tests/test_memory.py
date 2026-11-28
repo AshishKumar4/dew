@@ -127,6 +127,26 @@ def test_the_chunk_parallel_memory_is_the_token_by_token_one(name):
                     truth_fn=written(module, dtype=jnp.float64))
 
 
+@pytest.mark.parametrize("name", ["ttt_linear", "titans_linear"])
+def test_a_mini_batched_memory_under_a_method_interceptor_reads_the_intercepted_call(name):
+    """A Flax method interceptor that stands in for its heads' calls (`nn.intercept_methods`) is honoured by
+    a linear residual memory a mini-batched kernel would otherwise take, as the general path honours it:
+    heads whose calls read zeros read the same through the layer as the token path does, exactly (train
+    1478's review: the kernel read a head's weights and returned its query, not zeros)."""
+    module = layer(name)
+    x, params = drawn(module)(0)
+
+    def zeroed(next_fun, args, kwargs, context):
+        if context.method_name == "__call__" and (context.module.name or "").startswith("head_"):
+            return jnp.zeros_like(args[0])
+        return next_fun(*args, **kwargs)
+
+    with nn.intercept_methods(zeroed):
+        intercepted = module.apply(params, x)
+        token_path = module.apply(params, x, packed(np.ones((ROWS, LENGTH), np.int32)))
+    np.testing.assert_array_equal(np.asarray(intercepted), np.asarray(token_path))
+
+
 PADDED = ((np.arange(LENGTH)[None] >= np.asarray([0, 1, 3, 0, 5, 2, 0, 7])[:, None])
           & (np.arange(LENGTH)[None] < np.asarray([12, 12, 12, 10, 12, 12, 8, 12])[:, None]))
 """Each row's real tokens: rows left-padded by 1 to 7 tokens, two right-padded by 2 and 4, three whole."""
