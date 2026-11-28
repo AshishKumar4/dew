@@ -169,23 +169,26 @@ def test_a_live_or_later_overflowed_score_leaves_the_reads_finite(form):
 
 def test_titans_memory_forgotten_whole_reads_zero():
     """Titans under `alpha` 1 (the memory forgotten whole) from an entering memory of 2^70 at a query of
-    `(2^70, 0)`, no key, value or momentum: its output and final memory zero, the forgetting applied to the
-    state before any read, where `0 * (q M)` with `q M` = 2^140 read NaN (train 1403's review)."""
+    `(2^70, 0)`, no key, value or momentum: its readout and final memory zero, so its output the query
+    itself (the residual around it), the forgetting applied to the state before any read, where `0 * (q M)`
+    with `q M` = 2^140 read NaN (train 1403's review)."""
     entering = jnp.zeros((1, 1, 2, 2)).at[0, 0, 0, 0].set(2.0 ** 70)
     zero = jnp.zeros((1, 1, 1, 2), jnp.float32)
-    out, (memory, _) = titans(_pair((2.0 ** 70, 0.0)), zero, zero, jnp.ones((1, 2)), jnp.zeros((1, 2)),
+    query = _pair((2.0 ** 70, 0.0))
+    out, (memory, _) = titans(query, zero, zero, jnp.ones((1, 2)), jnp.zeros((1, 2)),
                               *(jnp.full((1, 1, 1), x) for x in (0.1, 1.0, 0.5)),
                               state=(entering, jnp.zeros_like(entering)), chunk=1)
-    np.testing.assert_array_equal(np.asarray(out), np.zeros((1, 1, 1, 2), np.float32))
+    np.testing.assert_array_equal(np.asarray(out), np.asarray(query))
     np.testing.assert_array_equal(np.asarray(memory), np.zeros((1, 1, 2, 2), np.float32))
 
 
 def test_ttts_padded_token_leaves_a_real_ones_output_and_state():
-    """TTT-Linear over one real token in a mini-batch of two, its entering bias `[-A, -A, -A, 15 2^124]`
-    (`A` 2^127) and its memory's first row the bias negated, a unit query, key and value `e0`, zero affine
-    bias: the real token's readout zero, its update none, its output zero and the state leaving as it
-    entered, the padded token's readout (the bias itself) zero before the LayerNorm sees it, where its
-    overflowed variance's `0 * inf` reached the real token's output and the bias (train 1403's review)."""
+    """TTT-Linear over one real token in a mini-batch of two, its entering bias `[-A, -A, -A, 15 2^124]` (`A`
+    2^127) and its memory's first row the bias negated, a unit query, key and value `e0`, zero affine bias:
+    the real token's readout zero, its update none, its output its query (the residual around it) and the
+    state leaving as it entered, the padded token's readout (the bias itself) zero before the LayerNorm sees
+    it, where its overflowed variance's `0 * inf` reached the real token's output and the bias (train 1403's
+    review)."""
     a = 2.0 ** 127
     offset = jnp.asarray([-a, -a, -a, 15 * 2.0 ** 124], jnp.float32).reshape(1, 1, 1, 4)
     memory = jnp.zeros((1, 1, 4, 4), jnp.float32).at[0, 0, 0].set(-offset[0, 0, 0])
@@ -193,7 +196,7 @@ def test_ttts_padded_token_leaves_a_real_ones_output_and_state():
     affine = (jnp.ones((1, 4)), jnp.zeros((1, 4)))
     out, (left, left_offset) = ttt_linear(unit_e0, unit_e0, unit_e0, *affine, jnp.full((1, 1, 1), 0.1),
                                           state=(memory, offset), chunk=2, scale=1.0)
-    np.testing.assert_array_equal(np.asarray(out), np.zeros((1, 1, 1, 4), np.float32))
+    np.testing.assert_array_equal(np.asarray(out), np.asarray(unit_e0))
     np.testing.assert_array_equal(np.asarray(left), np.asarray(memory))
     np.testing.assert_array_equal(np.asarray(left_offset), np.asarray(offset))
 
