@@ -571,6 +571,9 @@
 "tests/test_attention_placed.py::test_the_walked_backward_at_width_256_holds_check_1_interpreted[full]",
 "tests/test_attention_placed.py::test_the_walked_backward_states_each_product_its_issuers_walk[fused]"
 ],
+"tests/test_attention_products.py": [
+"tests/test_attention_products.py::test_banded_products_are_on_par_on_the_mosaic_mainloop_interpreted[sm90-accurate]"
+],
 "tests/test_attention_prologues.py": [
 "tests/test_attention_prologues.py::test_a_prologued_forward_compiles_spill_free_at_its_derived_config[inference-rounded]",
 "tests/test_attention_prologues.py::test_a_prologued_forward_compiles_spill_free_at_its_derived_config[inference-weighed]",
@@ -1728,9 +1731,6 @@
 "tests/test_dreamer.py::test_dreamer_split_step_preserves_draws_percentiles_and_mid_window_resume",
 "tests/test_dreamer.py::test_each_replayed_step_draws_its_posterior_from_its_own_key",
 "tests/test_dreamer.py::test_pretraining_from_demonstrations_learns_the_world_and_clones_the_pilot"
-],
-"tests/test_dsa_kpool.py": [
-"tests/test_dsa_kpool.py::test_decode_cache_preserves_the_expanded_projection_storage_dtype"
 ],
 "tests/test_end_to_end.py": [
 "tests/test_end_to_end.py::test_a_repae_step_moves_the_running_statistics_as_train_repae_does",
@@ -3960,13 +3960,13 @@
 "tests/test_served_episodes.py::test_a_served_row_whose_context_does_not_continue_its_last_turn_is_prefilled_whole"
 ],
 "tests/test_serving.py": [
-"tests/test_serving.py::test_a_banked_servers_host_tier_reads_back_the_prefix_pages_its_pool_reclaimed",
+"tests/test_serving.py::test_a_chunked_server_over_row_groups_shares_pages_below_the_crossover",
 "tests/test_serving.py::test_a_decoder_reading_each_tokens_place_or_id_serves_in_the_mixed_step[learned-positions]",
 "tests/test_serving.py::test_a_hybrid_servers_host_states_fit_the_bytes_of_its_host_pages[1]",
 "tests/test_serving.py::test_a_hybrid_stack_keeps_or_loses_a_prefixs_state_to_the_bit_of_a_sized_sites_server[evicted]",
 "tests/test_serving.py::test_a_hybrid_stack_keeps_or_loses_a_prefixs_state_to_the_bit_of_a_sized_sites_server[from-one-host-slot]",
 "tests/test_serving.py::test_a_hybrid_stack_serves_each_rows_own_state_beside_its_pages[dense-layered]",
-"tests/test_serving.py::test_a_hybrid_stack_serves_each_rows_own_state_beside_its_pages[paged-chunked-parallel]",
+"tests/test_serving.py::test_a_hybrid_stack_serves_each_rows_own_state_beside_its_pages[paged-chunked-layered]",
 "tests/test_serving.py::test_a_hybrid_stack_serves_each_rows_own_state_beside_its_pages[paged-layered]",
 "tests/test_serving.py::test_a_multimodal_model_serves_over_its_language_models_cache[dense]",
 "tests/test_serving.py::test_a_multimodal_model_serves_over_its_language_models_cache[paged]",
