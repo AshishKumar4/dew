@@ -44,6 +44,7 @@ from reference_error import (
     with_gradients,
 )
 
+from dew.nn import norms
 from dew.nn.kernels import (
     chunked_launch,
     generation,
@@ -76,14 +77,14 @@ FORMED = [
     recurrence.Hooks(decay='scalar', gates=recurrence.Gates(), l2norm=True),
     recurrence.Hooks(decay='scalar', gates=recurrence.Gates(write='step', limit=(0.0, 0.5)), delta=False,
                      skip=True),
-    recurrence.Hooks(decay='vector', l2norm=True, output=recurrence.OutputNorm(1e-6), write_bound=1.0),
+    recurrence.Hooks(decay='vector', l2norm=True, output=norms.OutputNorm(1e-6), write_bound=1.0),
     recurrence.Hooks(decay='scalar', scale=KEY_WIDTH ** -0.5,
-                     output=recurrence.OutputNorm(1e-5, 'sigmoid'), write_bound=1.0),
+                     output=norms.OutputNorm(1e-5, 'sigmoid'), write_bound=1.0),
     recurrence.Hooks(decay='scalar', rated=True, delta=False, skip=True),
-    recurrence.Hooks(decay='scalar', rated=True, delta=False, skip=True, output=recurrence.OutputNorm(1e-5)),
+    recurrence.Hooks(decay='scalar', rated=True, delta=False, skip=True, output=norms.OutputNorm(1e-5)),
     recurrence.Hooks(decay='scalar', rated=True, l2norm=True),
     recurrence.Hooks(decay='vector', delta=False, write_gate=True, skip=True,
-                     output=recurrence.OutputNorm(1e-6, 'sigmoid')),
+                     output=norms.OutputNorm(1e-6, 'sigmoid')),
     recurrence.Hooks(decay='scalar', delta=False),
     recurrence.Hooks(decay='vector', delta=False, reads='before', own_weight=True),
     recurrence.Hooks(decay='scalar', reads='before', scale=KEY_WIDTH ** -0.5, write_bound=1.0),
@@ -1932,7 +1933,7 @@ def test_a_memory_read_through_a_decay_past_fp32s_normals_is_as_exact_as_the_rec
 
 ROUNDED_ONCE = [recurrence.Hooks(decay='none', delta=False, write_gate=True, skip=True),
                 recurrence.Hooks(decay='scalar', scale=0.1, skip=True),
-                recurrence.Hooks(decay='scalar', scale=0.1, skip=True, output=recurrence.OutputNorm(1e-6))]
+                recurrence.Hooks(decay='scalar', scale=0.1, skip=True, output=norms.OutputNorm(1e-6))]
 """The rounding sites' hooks: a write gate without a decay, which only the portable math takes, and the delta
 rule with a decay, with and without the norm, which the port takes too."""
 

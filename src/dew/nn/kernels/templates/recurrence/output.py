@@ -37,7 +37,7 @@ from dew.nn.kernels.templates.resources import largest_live_set
 @dataclasses.dataclass(frozen=True)
 class Normed:
     """The output launch's epilogue: each token's value row of a head read back in `read` (its norm's
-    `read_in`, else fp32) through a row hook (`templates.hooks.RowHook`, `recurrence.norm_row_hook`): its
+    `read_in`, else fp32) through a row hook (`templates.hooks.RowHook`, `norms.norm_row_hook`): its
     `statistic` of each value block (and the `reads` of its sides) summed across the blocks, and its `fn`
     applying each block past the walk with every side, each side loaded at the block along its `axes`
     (`_sides`); with `kept`, the read-back output stored beside it, the

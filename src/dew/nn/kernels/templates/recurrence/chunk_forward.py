@@ -12,6 +12,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
+from dew.nn import norms
 from dew.nn.kernels import chunked_launch, generation, recurrence, recurrence_algebra as algebra, tables
 from dew.nn.kernels.chunked_launch import zero_padded
 from dew.nn.kernels.templates import mosaic, product
@@ -164,7 +165,7 @@ def forward(q, k, v, g, beta, h0=None, *, tiles: Tiles, starts=None, firsts=None
             rounded: bool = False, apart: int = 0, values_gated: bool = False, unit_pairs: bool = False,
             decay_bound: float | None = None,
                 ranged: bool = False, skip=None,
-            forked: ForkedTable | None = None, reads=None, normed: recurrence.OutputNorm | None = None,
+            forked: ForkedTable | None = None, reads=None, normed: norms.OutputNorm | None = None,
             gate=None, weight=None):
     """The chunked rule's forward on this mainloop: `(o [B, T, HV, Dv], final [B, HV, Dk, Dv])` for `q`, `k`
     `[B, T, H, Dk]`, `v` `[B, T, HV, Dv]`, the natural log decay `g`, a head's `[B, T, HV]` (the gated delta
@@ -194,7 +195,7 @@ def forward(q, k, v, g, beta, h0=None, *, tiles: Tiles, starts=None, firsts=None
     given (`recurrence.Hooks.erase` 'read', the preconditioned delta rules'): `S' = (I - beta k b^T) D S +
     beta k v^T`, the system's rows and the weights the reads' (`beta b k^T`, `w = X (b beta exp g)`), the
     memory's writes and the scores the keys' (`_solved`; under a decay a key dimension `_paired` and
-    `_key_weighted`). Where `normed` (`recurrence.OutputNorm`) is given, the output leaves through the gated
+    `_key_weighted`). Where `normed` (`norms.OutputNorm`) is given, the output leaves through the gated
     RMS norm in the output launch's epilogue (`output.Normed`), its gate `gate` `[B, T, HV, Dv]` and `weight`
     `[Dv]`, in the operands' dtype."""
     out, final, _ = kept_forward(q, k, v, g, beta, h0, starts=starts, firsts=firsts,
@@ -216,7 +217,7 @@ def kept_forward(q, k, v, g, beta, h0=None, *, tiles: Tiles, starts=None, firsts
                  decay_bound: float | None = None,
                      ranged: bool = False,
                  skip=None, forked: ForkedTable | None = None,
-                 reads=None, normed: recurrence.OutputNorm | None = None, gate=None,
+                 reads=None, normed: norms.OutputNorm | None = None, gate=None,
                  weight=None) -> tuple:
     """`forward`'s `(o, final)` and what the fast backward takes rather than compute again
     (`mainloop_backward.gradients`' `inverse` and `kept`): each chunk's inverse under a decay a head
@@ -241,11 +242,11 @@ def kept_forward(q, k, v, g, beta, h0=None, *, tiles: Tiles, starts=None, firsts
     fused = skip if call.gated_keys else None
     epilogue, sides = None, ()
     if normed is not None:
-        # The norm a row hook over the head's real values (`recurrence.norm_row_hook`): its gate laid as the
+        # The norm a row hook over the head's real values (`norms.norm_row_hook`): its gate laid as the
         # output's rows and heads are, its weight every head's, each padded to the launch's value width.
         columns = call.value_width
         assert gate is not None and weight is not None, "an epilogue reads its gate and weight"
-        hook = recurrence.norm_row_hook(normed, run.value_width, out_dtype,
+        hook = norms.norm_row_hook(normed, run.value_width, out_dtype,
                                         run.laid(zero_padded(gate, 3, columns)).reshape(call.rows, call.heads,
                                                                                          columns),
                                         zero_padded(weight, 0, columns).astype(jnp.float32))

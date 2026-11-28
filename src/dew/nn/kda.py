@@ -37,8 +37,9 @@ import jax.numpy as jnp
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
+from dew.nn import norms
 from dew.nn.activations import logistic
-from dew.nn.dense import Dense
+from dew.nn.dense import Dense, watched_or_owned
 
 from .flops import conv_flops, delta_flops, projection_flops
 from .inputs import PLAIN_CALL, MixerCall, coordinates_of
@@ -223,8 +224,12 @@ class KimiDeltaAttention(nn.Module):
         gate = gate.reshape(B, S, self.num_heads, self.head_dim)
         token = None
         forked = tokens.forks is not None
+        # A caller watching or capturing the norm's call (`dense.watched_or_owned`) has it run as its module:
+        # no kernel takes it in an epilogue then (train 1484's K-F3).
+        fusing = not self.is_initializing() and not watched_or_owned(self.o_norm)
         # An initialization runs the general path, where the layer makes its parameters.
-        if decode and S == 1 and not forked and not self.is_initializing() and decode_kernel(
+        # Not fusing, the decode step selects (and reports) its own route (`decode_delta_rule`).
+        if decode and S == 1 and not forked and fusing and decode_kernel(
                 jax.ShapeDtypeStruct((B, self.num_heads, self.head_dim, self.head_dim), wide),
                 groups=self.num_heads, fuses=True) == 'fused':
             token = self._fused_token(taps, g, beta, gate, valid, tokens.starts, projected.dtype)
@@ -235,7 +240,7 @@ class KimiDeltaAttention(nn.Module):
         # The chunked op, where the layer has made its parameters, gates and norms its output in its epilogue
         # (`_chunk_hooks`), as the decode token does.
         chunked = S > 1 or forked
-        normed = chunked and not self.is_initializing()
+        normed = chunked and fusing
         # The epilogue's gate, weight and output dtype, the sequence's either path's.
         hooks = self._chunk_hooks(projected.dtype, normed)
         sides = {'z': gate, 'weight': self.o_norm.variables['params']['weight']} if normed else {}
@@ -295,7 +300,7 @@ class KimiDeltaAttention(nn.Module):
         before it (the conv's pieces, `held_scan`): its decay the layer's (`_decay`) and, where `normed`,
         the sigmoid-gated norm in its epilogue, its output read back in `operand`, under the layer's declared
         bounds (`declared`)."""
-        output = recurrence.OutputNorm(self.norm_eps, 'sigmoid', read_in=jnp.dtype(operand).name)
+        output = norms.OutputNorm(self.norm_eps, 'sigmoid', read_in=jnp.dtype(operand).name)
         return dataclasses.replace(FUSED, conv=None, l2norm=False, scale=self.head_dim ** -0.5,
                                    output=output if normed else None, **self.declared)
 
@@ -303,7 +308,7 @@ class KimiDeltaAttention(nn.Module):
         """A decode token's conv, update and gated norm in one launch (`linear.fused_token` under
         `FUSED`): its decay a key dimension, write gate and output gate a row's, as the layer forms them, its
         output read back in `operand`, the input projection's dtype, before the norm."""
-        hooks = dataclasses.replace(FUSED, output=recurrence.OutputNorm(self.norm_eps, 'sigmoid',
+        hooks = dataclasses.replace(FUSED, output=norms.OutputNorm(self.norm_eps, 'sigmoid',
                                                                         read_in=jnp.dtype(operand).name))
         return fused_token(hooks, taps,
                            heads=(self.num_heads, self.num_heads, self.num_heads),

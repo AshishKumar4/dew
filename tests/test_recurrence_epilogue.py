@@ -14,6 +14,8 @@ from generation_support import COMPILES_ON_CPU, lowers
 from reference_error import assert_as_exact
 from test_recurrence_chunk import CHUNK, KEY_WIDTH, PACKED, chunk_on, draw, hosted, token_by_token
 
+from dew.nn import norms
+from dew.nn.kda import KimiDeltaAttention
 from dew.nn.kernels import generation, norm_swiglu, recurrence
 from dew.nn.kernels.recurrence_chunk import Chunk, chunk
 from dew.nn.kernels.templates.hooks import RowHook, Side
@@ -23,10 +25,10 @@ from dew.nn.mixers.mamba2 import MambaRMSNormGated
 
 LAYER_HOOKS = {
     'gated delta net': recurrence.Hooks(decay='scalar', gates=recurrence.Gates(), scale=KEY_WIDTH ** -0.5,
-                                        output=recurrence.OutputNorm(1e-6), write_bound=1.0),
+                                        output=norms.OutputNorm(1e-6), write_bound=1.0),
     'kimi delta attention': recurrence.Hooks(decay='vector', gates=recurrence.Gates(bound=-5.0),
                                              scale=KEY_WIDTH ** -0.5,
-                                             output=recurrence.OutputNorm(1e-5, 'sigmoid'), write_bound=1.0,
+                                             output=norms.OutputNorm(1e-5, 'sigmoid'), write_bound=1.0,
                                              decay_bound=-5.0),
     'a key dimension softplus step': recurrence.Hooks(decay='vector', gates=recurrence.Gates(), l2norm=True),
 }
@@ -115,13 +117,13 @@ def test_a_norm_reading_its_output_in_fp32_reads_the_kernels_unrounded_output():
     norm of the port's fp32 output, where the output landed in bf16 first moved the norm across a bf16
     midpoint (a head review: 0.251953125 for 0.25)."""
     hooks = recurrence.Hooks(decay='scalar', scale=0.1,
-                             output=recurrence.OutputNorm(0.02972, 'sigmoid', read_in='float32'))
+                             output=norms.OutputNorm(0.02972, 'sigmoid', read_in='float32'))
     unit = jnp.zeros((1, 1, 1, 8), jnp.bfloat16).at[..., 0].set(1.0)
     operands = Chunk(unit, unit, jnp.ones((1, 1, 1, 8), jnp.bfloat16), log_decay=jnp.zeros((1, 1, 1)),
                      beta=jnp.ones((1, 1, 1)), z=jnp.zeros((1, 1, 1, 8)), weight=jnp.ones((8,)))
     raw, _ = chunk_on('fla', dataclasses.replace(hooks, output=None), operands, dtype=jnp.float32)
     found, _ = chunk_on('fla', hooks, operands, dtype=jnp.bfloat16)
-    expected = recurrence.output_normed(hooks.output, raw, operands.z, operands.weight, jnp.bfloat16,
+    expected = norms.output_normed(hooks.output, raw, operands.z, operands.weight, jnp.bfloat16,
                                         jnp.float32)
     np.testing.assert_array_equal(np.asarray(found, np.float32), np.asarray(expected, np.float32))
 
@@ -170,7 +172,7 @@ def test_a_float64_recurrences_norm_read_back_in_fp32_keeps_its_gates_precision(
     + 1e-6)` each (its binade), the read-back widened to the recurrence's float64 before the norm, where the
     norm worked in the read-back's fp32 and its gate's `exp(100)` overflowed to a zero output (train 1461's
     review)."""
-    hooks = recurrence.Hooks(decay='scalar', output=recurrence.OutputNorm(1e-6, 'sigmoid', read_in='float32'))
+    hooks = recurrence.Hooks(decay='scalar', output=norms.OutputNorm(1e-6, 'sigmoid', read_in='float32'))
     with jax.enable_x64(new_val=True):
         unit = jnp.zeros((1, 1, 1, 8), jnp.float64).at[..., 0].set(1.0)
         operands = Chunk(unit, unit, jnp.ones((1, 1, 1, 8), jnp.float64), log_decay=jnp.zeros((1, 1, 1)),
@@ -219,16 +221,16 @@ NORM_FORMS = {
     'norm before gate': {},
     'gate before norm, weight rounded': {'gate_first': True, 'rounded': True},
 }
-"""The epilogue's norm forms (`recurrence.OutputNorm`): Qwen3-Next's and Kimi's, and Mamba-2's
+"""The epilogue's norm forms (`norms.OutputNorm`): Qwen3-Next's and Kimi's, and Mamba-2's
 `MambaRMSNormGated`'s."""
 
 
 def epilogue_run(block: int, fused: bool, training: bool, form: dict | None = None):
     """The template's rule at the output launch's value `block` (`template.mosaic_rule`, interpreted off a
     GPU) with the sigmoid-gated norm of `form` (`NORM_FORMS`) in its output launch (`fused`), or after its
-    launches (`recurrence.output_normed`): its output, or in `training` the gradients of its output's
+    launches (`norms.output_normed`): its output, or in `training` the gradients of its output's
     weighted sum by every operand."""
-    norm = recurrence.OutputNorm(1e-6, 'sigmoid', read_in='bfloat16', **(form or {}))
+    norm = norms.OutputNorm(1e-6, 'sigmoid', read_in='bfloat16', **(form or {}))
     tiles = mainloop.Tiles(32, 1, block_o=block, chunk=64)
 
     def output(q, k, v, g, beta, z, weight):
@@ -237,7 +239,7 @@ def epilogue_run(block: int, fused: bool, training: bool, form: dict | None = No
                                           weight=weight)
             return out
         out, _ = template.mosaic_rule(q, k, v, g, beta, tiles=tiles, scale=0.125)
-        return recurrence.output_normed(norm, out, z, weight, jnp.bfloat16, jnp.float32)
+        return norms.output_normed(norm, out, z, weight, jnp.bfloat16, jnp.float32)
 
     if not training:
         return output
@@ -255,7 +257,7 @@ def test_the_output_launchs_norm_is_on_par_with_the_norm_after_it(block, trainin
     after them (check 1, the float64 composition the truth), the launch taking the epilogue itself, no route
     deciding it (train 1461's review), each norm form (`NORM_FORMS`) the launch's row hook (train 1473's)."""
     # The truth's norm reads the exact output (a read-back dtype narrows the float64 truth).
-    norm = recurrence.OutputNorm(1e-6, 'sigmoid', **form)
+    norm = norms.OutputNorm(1e-6, 'sigmoid', **form)
     hooks = recurrence.Hooks(decay='scalar', scale=0.125, output=norm)
 
     def truth(*operands):
@@ -301,7 +303,7 @@ def test_a_skip_beside_the_norm_declines_the_epilogue_on_par_with_the_portable_r
     epilogue declined (the output launch adds no skip before a norm, `_normed_runs`' `fuses`), the norm
     after the recurrence, on par from float64 with the portable rule's (check 1)."""
     hooks = recurrence.Hooks(decay='scalar', delta=False, skip=True, scale=0.125,
-                             output=recurrence.OutputNorm(1e-6, read_in='bfloat16'))
+                             output=norms.OutputNorm(1e-6, read_in='bfloat16'))
 
     def sample(seed):
         q, k, v, g, beta, z, weight = epilogue_draw(seed)
@@ -317,7 +319,7 @@ def test_a_padded_tokens_infinite_gate_leaves_the_norm_weights_gradient_finite()
     infinite output gate, the first's unit query, key, value and write: the gradient of the live output by the
     shared norm weight the one-token call's, the padded token's gate zeroed before the norm, where its
     infinity met its zero cotangent as NaN (a head review)."""
-    hooks = recurrence.Hooks(decay='scalar', output=recurrence.OutputNorm(1.0, 'silu'))
+    hooks = recurrence.Hooks(decay='scalar', output=norms.OutputNorm(1.0, 'silu'))
     ones = jnp.ones((1, 2, 1, 1), jnp.float32)
 
     def live(weight, z, valid):
@@ -339,7 +341,7 @@ def test_a_named_norm_kernel_keeps_the_norm_after_the_launches():
     from dew import kernels
 
     hooks = recurrence.Hooks(decay='scalar', scale=0.125,
-                             output=recurrence.OutputNorm(1e-6, 'sigmoid', read_in='bfloat16'))
+                             output=norms.OutputNorm(1e-6, 'sigmoid', read_in='bfloat16'))
     q, k, v, g, beta, z, weight = epilogue_draw(0)
     operands = Chunk(q, k, v, log_decay=g, beta=beta, z=z, weight=weight)
 
@@ -377,16 +379,16 @@ MAMBA_FORMS = {'gate after wide': (False, False), 'gate after rounded': (False, 
 
 @pytest.mark.parametrize('form', MAMBA_FORMS.values(), ids=MAMBA_FORMS)
 def test_an_output_norms_form_is_mamba2s_gated_norm_over_a_head(form):
-    """`recurrence.output_normed` over bf16 rows of two heads of 64 values, each `OutputNorm` form (the gate
+    """`norms.output_normed` over bf16 rows of two heads of 64 values, each `OutputNorm` form (the gate
     first or after, the weight wide or the normalized rows rounded first): bit for bit `MambaRMSNormGated`
     with a group a head (`groups` 2) in the matching form (`gate_after`, `scale_wide`), one arithmetic
-    (`recurrence.gated_norm_rows`) for the layers' gated norms and the launch's (train 1473's review)."""
+    (`norms.gated_norm_rows`) for the layers' gated norms and the launch's (train 1473's review)."""
     gate_first, rounded = form
     rng = np.random.default_rng(1473)
     out, z = (jnp.asarray(rng.standard_normal((2, 3, 2, 64)), jnp.bfloat16) for _ in range(2))
     weight = jnp.asarray(1 + rng.standard_normal(128) / 8, jnp.float32)
-    norm = recurrence.OutputNorm(1e-5, 'silu', gate_first=gate_first, rounded=rounded)
-    found = recurrence.output_normed(norm, out, z, weight.reshape(2, 64), jnp.bfloat16, jnp.float32)
+    norm = norms.OutputNorm(1e-5, 'silu', gate_first=gate_first, rounded=rounded)
+    found = norms.output_normed(norm, out, z, weight.reshape(2, 64), jnp.bfloat16, jnp.float32)
     layer = MambaRMSNormGated(1e-5, groups=2, gate_after=not gate_first, scale_wide=not rounded)
     expected = layer.apply({'params': {'weight': weight}}, out.reshape(2, 3, 128), z.reshape(2, 3, 128))
     np.testing.assert_array_equal(np.asarray(found.reshape(2, 3, 128), np.float32),
@@ -401,11 +403,11 @@ def test_a_norm_form_the_fused_kernel_lacks_is_xlas_alone():
     from dew import kernels
     from dew.nn.kernels.selection import KernelRefused
 
-    norm = recurrence.OutputNorm(1e-6, 'silu', gate_first=True)
+    norm = norms.OutputNorm(1e-6, 'silu', gate_first=True)
     out, z = (jnp.ones((1, 2, 1, 8), jnp.bfloat16) for _ in range(2))
 
     def normed():
-        return recurrence.output_normed(norm, out, z, jnp.ones((8,), jnp.float32), jnp.bfloat16, jnp.float32)
+        return norms.output_normed(norm, out, z, jnp.ones((8,), jnp.float32), jnp.bfloat16, jnp.float32)
 
     with generation.routes() as found:
         jax.eval_shape(normed)
@@ -437,7 +439,7 @@ def test_a_rounding_norm_forms_decode_token_is_its_reference_bit_for_bit():
     its sigmoid gate's logits zero and its weight `1 + 7/2048`: bit for bit `recurrence.step_reference`,
     both rounding the normalized rows to the token's bf16 output before the weight, where the reference
     rounded them in its fp32 work (a head review)."""
-    hooks = recurrence.Hooks(decay='scalar', output=recurrence.OutputNorm(0.39, 'sigmoid', gate_first=True,
+    hooks = recurrence.Hooks(decay='scalar', output=norms.OutputNorm(0.39, 'sigmoid', gate_first=True,
                                                                           rounded=True))
     unit = jnp.zeros((1, 1, 128), jnp.bfloat16).at[..., 0].set(1.0)
     given = recurrence.Step(state=jnp.zeros((1, 1, 128, 128), jnp.float32), query=unit, key=unit,
@@ -467,3 +469,48 @@ def test_a_row_hooks_side_lies_on_its_axes_in_the_launchs_order(axes):
     hook(('rows', 'columns'))
     with pytest.raises(ValueError):
         hook(axes)
+
+
+@pytest.mark.parametrize("name", ["gated delta net", "kimi delta attention"])
+def test_a_captured_norm_runs_as_its_module(name):
+    """A caller capturing a delta-rule mixer's calls (`capture_intermediates`) keeps its gated norm's: the
+    chunked op leaves the norm to its module where a caller watches or captures it (`dense.watched_or_owned`),
+    which an epilogue standing in for the call would bypass, the capture holding no norm (train 1484's
+    K-F3)."""
+    module, norm = {
+        "gated delta net": (GatedDeltaNet(emb_features=32, num_k_heads=1, num_v_heads=2, head_k_dim=8,
+                                          head_v_dim=8, chunk_size=4, dtype=jnp.float32), 'norm'),
+        "kimi delta attention": (KimiDeltaAttention(emb_features=32, num_heads=2, head_dim=8, conv_kernel=4,
+                                                    lower_bound=-5.0, chunk_size=4), 'o_norm')}[name]
+    x = jnp.asarray(np.random.default_rng(1484).standard_normal((2, 12, 32)), jnp.float32)
+    variables = module.init(jax.random.key(3), x)
+    _, captured = module.apply(variables, x, capture_intermediates=True, mutable=['intermediates'])
+    (normed,) = captured['intermediates'][norm]['__call__']
+    assert normed.shape[:2] == x.shape[:2]
+
+
+def test_a_captured_norms_padded_gate_leaves_its_weights_gradient_finite():
+    """A gated delta net whose caller captures its calls, so its gated norm runs as its module
+    (`dense.watched_or_owned`), over a row whose last two tokens are padded and infinite: the gradient of
+    its live tokens' output by the norm's weight finite, the padded tokens' output gate zeroed before the
+    norm as the chunked op's epilogue zeroes it, where their infinite or undefined gate met their zero
+    cotangent as NaN (head review of train 1484's K-F3)."""
+    from dew.batch import coordinates
+    from dew.nn.inputs import AttentionMetadata, MixerCall
+
+    module = GatedDeltaNet(emb_features=32, num_k_heads=1, num_v_heads=2, head_k_dim=8, head_v_dim=8,
+                           chunk_size=4, dtype=jnp.float32)
+    x = np.random.default_rng(1484).standard_normal((1, 12, 32)).astype(np.float32)
+    x[:, 10:] = np.inf
+    valid = jnp.asarray(np.arange(12) < 10)[None]
+    variables = module.init(jax.random.key(3), jnp.zeros((1, 12, 32), jnp.float32))
+    call = MixerCall(AttentionMetadata(coordinates=coordinates(valid=valid)))
+
+    def live(weight):
+        params = {**variables['params'], 'norm': {**variables['params']['norm'], 'weight': weight}}
+        out, _ = module.apply({'params': params}, jnp.asarray(x), call, capture_intermediates=True,
+                              mutable=['intermediates'])
+        return jnp.sum(out[:, :10])
+
+    found = jax.jit(jax.grad(live))(variables['params']['norm']['weight'])
+    assert np.all(np.isfinite(np.asarray(found)))

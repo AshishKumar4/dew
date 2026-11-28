@@ -42,11 +42,12 @@ from jax.sharding import PartitionSpec as P
 
 from dew.batch import Coordinates, Forks, document_ranks, prefix_sum, real_bounds, valid_order
 from dew.mesh import SEQUENCE_AXIS, LayoutRefused, MeshAxes, logical_spec, mesh_axes
-from dew.nn.dense import Dense
+from dew.nn.dense import Dense, watched_or_owned
 from dew.nn.kernels import recurrence, short_conv
 from dew.nn.kv_cache import Opened, cache_variables, compute_dtype, kept, stated
 from dew.nn.residuals import Residual, recurrence_output
 
+from . import norms
 from .activations import silu
 from .attention_masks import repeat_kv_heads
 from .blocks import normal_kernel
@@ -787,13 +788,16 @@ def split_delta_rule(mixed, g, beta, segments, starts, valid, taps, *, widths, p
     `mixed` and `taps` each this shard's heads of each part laid in turn, rounded to `conv_dtype`), the
     pieces in heads of their `widths`, and `rule(query, key, value, g, beta, state, starts=)` (its chunk
     `chunk_size`, bound by `sequence_delta_rule`) from the memory this shard's slice enters with
-    (`entering_memory`, its transfer at the same `chunk_size`), its output named as `held_scan`'s. Its
-    `epilogue` (the gated norm's `output`, `z`, `weight` and `dtype`, `chunk_gated_delta_rule`'s), where
-    given, the run from that memory takes, its output normed and named by the op (`recurrence_chunk.chunk`);
-    the slice's summary from zero reads the final memory alone."""
+    (`entering_memory`, its transfer at the same `chunk_size`), each run reading the slice's `valid` tokens
+    (`Chunk.valid`), its output named as `held_scan`'s. Its `epilogue` (the gated norm's `output`, `z`,
+    `weight` and `dtype`, `chunk_gated_delta_rule`'s), where given, the run from that memory takes, its
+    output normed and named by the op (`recurrence_chunk.chunk`); the slice's summary from zero reads the
+    final memory alone."""
     query, key, value = (piece.reshape(*piece.shape[:2], -1, width) for piece, width in
                          zip(sequence_conv(mixed, taps, None, segments, valid, parts=parts, dtype=conv_dtype),
                              widths, strict=True))
+    # The shard's padded tokens keep the memory in its runs alike, as the unsplit op's (`Chunk.valid`).
+    rule = functools.partial(rule, valid=valid)
     state = entering_memory(rule, query, key, value, g, beta, starts, axis=SEQUENCE_AXIS,
                             chunk_size=chunk_size)
     out, _ = rule(query, key, value, g, beta, state, starts=starts, **(epilogue or {}))
@@ -802,7 +806,7 @@ def split_delta_rule(mixed, g, beta, segments, starts, valid, taps, *, widths, p
 
 def sequence_delta_rule(mixed, taps, g, beta, coordinates, valid, *, shards: int, key_heads: int, widths,
                         parts: Pieces, conv_dtype, rule, chunk_size: int,
-                        output: recurrence.OutputNorm | None = None, z=None, weight=None, dtype=None):
+                        output: norms.OutputNorm | None = None, z=None, weight=None, dtype=None):
     """A delta-rule mixer's conv and rule (`split_delta_rule`) on shards that split the rows, the sequence and
     the heads (`over_sequence`, the split dividing its `key_heads`): each of `parts`' channels of `mixed`
     `[B, S, C]` and of the conv's `taps` `[C, K]` an operand split by its heads, the queries', keys' and
@@ -1303,13 +1307,13 @@ class GatedDeltaNet(nn.Module):
         return scan_cache(rows, self.conv_kernel, self.conv_features, 'recurrent_state',
                           (self.num_v_heads, self.head_k_dim, self.head_v_dim), stored, conv)
 
-    def _decode_kernel(self, x, operand) -> str:
+    def _decode_kernel(self, x, operand, *, fuses: bool) -> str:
         """The kernel a decode token runs (`decode_kernel`): the fused step with the layer's conv,
-        gates and norm (`_fused_token`), the step alone between them (`decode_gated_delta_rule`), or
-        the portable recurrence ('xla')."""
+        gates and norm (`_fused_token`) where it `fuses` them, the step alone between them
+        (`decode_gated_delta_rule`), or the portable recurrence ('xla')."""
         state = jax.ShapeDtypeStruct((x.shape[0], self.num_v_heads, self.head_k_dim, self.head_v_dim),
                                      self._stored(operand)[0])
-        return decode_kernel(state, groups=self.num_k_heads, fuses=True)
+        return decode_kernel(state, groups=self.num_k_heads, fuses=fuses)
 
     @property
     def _gates(self) -> recurrence.Gates:
@@ -1323,7 +1327,7 @@ class GatedDeltaNet(nn.Module):
         read back first in `operand`, the input projection's dtype."""
         return recurrence.Hooks(conv=recurrence.Conv('silu'), l2norm=True, decay='scalar',
                                 gates=self._gates,
-                                output=recurrence.OutputNorm(self.norm_eps, self.gate_activation,
+                                output=norms.OutputNorm(self.norm_eps, self.gate_activation,
                                                              read_in=jnp.dtype(operand).name))
 
     def _chunk_hooks(self, operand, normed: bool) -> recurrence.Hooks:
@@ -1358,9 +1362,12 @@ class GatedDeltaNet(nn.Module):
         operand = mixed.dtype
         token, stepped = None, False
         forked = tokens.forks is not None
+        # A caller watching or capturing the norm's call (`dense.watched_or_owned`) has it run as its module:
+        # no kernel takes it in an epilogue then (train 1484's K-F3).
+        fusing = not self.is_initializing() and not watched_or_owned(self.norm)
         # An initialization runs the general path, where the layer makes its parameters.
         if decode and S == 1 and not forked and not self.is_initializing():
-            kernel = self._decode_kernel(x, operand)
+            kernel = self._decode_kernel(x, operand, fuses=fusing)
             token = self._fused_token(z, b, a, valid, operand) if kernel == 'fused' else None
             stepped = kernel == 'step'
 
@@ -1368,8 +1375,11 @@ class GatedDeltaNet(nn.Module):
         # underflow to -inf (modeling_qwen3_next.py:652-653); at least fp32,
         # so a float64 model's stays float64 (`at_least_fp32`).
         wide = at_least_fp32(operand)
+        # A padded token's gates formed from zeros, its head's rate among them (`recurrence.gated`), as the
+        # chunked op forms them: a rate of exp(100) beside its zero cotangent was NaN in the split rule's
+        # gradient (train 1484's K-F4).
         g, beta = recurrence.gated(self._gates, a.astype(wide), self.A_log.astype(wide),
-                                   self.dt_bias.astype(wide), b.astype(wide))
+                                   self.dt_bias.astype(wide), b.astype(wide), valid)
         assert beta is not None, "the gated delta rule's write gate is its sigmoid's"
         if valid is not None:
             # exp(0)=1 and beta=0 preserve recurrent memory for invalid input.
@@ -1385,11 +1395,16 @@ class GatedDeltaNet(nn.Module):
         ported = S > 1 and kernel_routed(rows, keys, values, g, beta, **self.declared)
 
         gate = z.reshape(B, S, -1, self.head_v_dim)
+        if valid is not None:
+            # A padded token's output gate zero, as the chunked op's epilogue zeroes it (`Chunk.valid`): the
+            # norm the module runs where a caller watches it met an infinite one beside its zero cotangent as
+            # NaN in the shared weight's gradient (head review of train 1484's K-F3).
+            gate = jnp.where(valid[:, :, None, None], gate, jnp.zeros((), gate.dtype))
         # The chunked op forms the gates from their pre-activations and, where the layer has made its
         # parameters, gates and norms its output in its epilogue (`_chunk_hooks`), as the decode token does:
         # its gate, weight and output dtype, the sequence's either path's.
         chunked = S > 1 or forked
-        normed = chunked and not self.is_initializing()
+        normed = chunked and fusing
         hooks = self._chunk_hooks(operand, normed)
         sides = {'z': gate, 'weight': self.norm.variables['params']['weight']} if normed else {}
         normed_dtype = (self.norm.dtype or operand) if normed else None

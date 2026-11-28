@@ -80,6 +80,30 @@ def test_a_delta_rule_split_over_the_sequence_moves_along_its_parameters_as_a_wh
                           forward=True)
 
 
+@pytest.mark.mesh
+@pytest.mark.parametrize("name", sorted(MIXERS))
+def test_a_split_idle_rows_rate_gradient_is_zero_whatever_its_rate(name):
+    """A delta-rule mixer split four ways over the sequence, over rows every token of which is padded, its
+    rate `A_log` 100: its loss's gradient by `A_log` exactly zero, a padded token's gates formed from zeros as
+    the unsplit layer forms them (`recurrence.gated`'s `valid`) and each shard's rule reading which tokens
+    are present (`Chunk.valid`). The split gated delta net formed them from the rate and masked them after,
+    where `exp(100)`'s overflow met the padding's zero cotangent as NaN (train 1484's K-F4)."""
+    from dew.batch import coordinates
+    from dew.nn.inputs import AttentionMetadata
+
+    module = MIXERS[name]
+    x = jnp.asarray(np.random.default_rng(1484).standard_normal((SPLIT_BATCH, 32, WIDTH)), jnp.float32)
+    variables = module.init(jax.random.key(7), jnp.zeros((1, 32, WIDTH), jnp.float32))
+    params = dict(variables['params'], A_log=jnp.full_like(variables['params']['A_log'], 100.0))
+    mesh = MeshSpec(sequence=4).build(jax.devices()[:4])
+
+    call = MixerCall(AttentionMetadata(coordinates=coordinates(valid=jnp.zeros((SPLIT_BATCH, 32), bool))))
+    summed = jax.grad(lambda params: jnp.sum(module.apply({**variables, 'params': params}, x, call)))
+    with jax.set_mesh(mesh):
+        found = jax.jit(summed)(params)
+    np.testing.assert_array_equal(np.asarray(found['A_log']), np.zeros_like(np.asarray(found['A_log'])))
+
+
 WIDE_HEADS = {
     "gated delta net": GatedDeltaNet(emb_features=WIDTH, num_k_heads=4, num_v_heads=8, head_k_dim=32,
                                      head_v_dim=32, chunk_size=4, dtype=jnp.float32),

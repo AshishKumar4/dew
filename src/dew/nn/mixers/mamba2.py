@@ -66,7 +66,7 @@ from dew.nn.flops import conv_flops, projection_flops, ssd_flops
 from dew.nn.inputs import PLAIN_CALL, MixerCall, coordinates_of
 from dew.nn.kernels import recurrence, recurrence_algebra
 from dew.nn.kernels.generation import triton_runs
-from dew.nn.kernels.recurrence import Hooks, OutputNorm, gated_rows, weighted_rows
+from dew.nn.kernels.recurrence import Hooks
 from dew.nn.kernels.recurrence_chunk import Chunk, chunk
 from dew.nn.kv_cache import Opened, compute_dtype
 from dew.nn.linear import (
@@ -83,6 +83,7 @@ from dew.nn.linear import (
 )
 from dew.nn.mixer_base import MixerBase, MixerContext
 from dew.nn.mixers.mamba import inverse_softplus_step, log_index
+from dew.nn.norms import OutputNorm, gated_rows, weighted_rows
 from dew.nn.precision import accurate_exp, at_least_fp32, float32_dot_general, rms_statistics, softplus
 from dew.nn.residuals import Residual, recurrence_output
 
@@ -212,7 +213,7 @@ class MambaRMSNormGated(nn.Module):
         def grouped(value):
             return value.reshape(*value.shape[:-1], self.groups, -1)
 
-        # The recurrence's output norm's one arithmetic (`recurrence.gated_norm_rows`) over each group:
+        # The recurrence's output norm's one arithmetic (`norms.gated_norm_rows`) over each group:
         # weighted wide, or the normalized values cast back before the weight multiplies them.
         # The gate first broadcasts the rows its product makes; after, the input's own features are normed and
         # the gate broadcast over the weighted norm.

@@ -489,7 +489,7 @@ class NormRows(NamedTuple):
 
 
 GATED_FORMS = ('gate after', 'gate after, rounded', 'gate first', 'gate first, rounded')
-"""A gated norm's forms (`dew.nn.kernels.recurrence.OutputNorm`): its gate after the weighted norm
+"""A gated norm's forms (`dew.nn.norms.OutputNorm`): its gate after the weighted norm
 (Qwen3-Next's) or before the norm (Mamba-2's), its weight wide or after the normalized rows round to the
 output's dtype. The kernel computes the first alone."""
 
