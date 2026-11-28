@@ -19,6 +19,7 @@ from jax import lax
 from jax._src.state import types as state_types
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
+from jax.experimental.xla_metadata import set_xla_metadata
 
 from dew.nn import programs
 from dew.nn.kernels import generation, launches
@@ -304,9 +305,16 @@ class VmemRings(mosaic.Family[dict, Streams, jax.Array]):
                 operands[at][...] = added
             return jax.tree.unflatten(structure, written[:len(outputs)])
 
-        # Its call declares the model's share of its work as a GPU family's does (`mosaic.checked`).
-        return mosaic.checked(emission.costed(launched, cost), name or self.name, model_flops=model_flops,
-                              moves=False, out_type=out_type)
+        costed = emission.costed(launched, cost)
+        if not (declared := mosaic.model_declared(model_flops)):
+            return costed
+
+        def declaring(*operands):
+            # Its call declares the model's share of its work, as a GPU family's does (`mosaic.checked`).
+            with set_xla_metadata(**declared):
+                return costed(*operands)
+
+        return declaring
 
     def program_index(self, name: str, *, fresh: bool = False) -> jax.Array:
         # Pallas TPU numbers a grid's axes: `name`'s place among the launch's (`kernel`'s `grid_names`), a

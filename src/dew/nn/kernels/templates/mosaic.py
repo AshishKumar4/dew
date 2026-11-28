@@ -116,6 +116,12 @@ def _is_ref(operand) -> bool:
     return isinstance(jax.typeof(operand), state_types.AbstractRef)
 
 
+def model_declared(model_flops: int | None) -> dict[str, str]:
+    """The frontend attribute a launch's call declares `model_flops` in, the model's share of the work its
+    cost states (`instrumentation.MODEL_FLOPS`, which Dew's FLOP count reads); none where it states none."""
+    return {} if model_flops is None else {MODEL_FLOPS: str(model_flops)}
+
+
 def checked(built: Callable, kernel: str, resident: int = 1, model_flops: int | None = None, *,
             moves: bool = True, out_type=None) -> Callable:
     """The launch `built` (`launches.kernel`, which holds each call per shard), each call traced at its
@@ -127,7 +133,7 @@ def checked(built: Callable, kernel: str, resident: int = 1, model_flops: int | 
     frontend attribute (`instrumentation.MODEL_FLOPS`), which Dew's FLOP count reads; and, where its
     `out_type` states its outputs as its operands' axes (`outputs.Output`), the dimensions each descends from
     (`outputs.OUTPUT_DIMS`), which a compile's live buffers read."""
-    declared = {} if model_flops is None else {MODEL_FLOPS: str(model_flops)}
+    declared = model_declared(model_flops)
 
     def launch(*operands):
         stated = {**declared, **outputs.declared(out_type, operands)}
