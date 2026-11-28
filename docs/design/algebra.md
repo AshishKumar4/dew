@@ -398,9 +398,14 @@ fitted to them, and a rule set ships only with measured receipts.
   e-graph. Otherwise the program enters one term
   region and saturates under exactly the rule sets the call's numerics admit (`rules.admitted`: the exact
   sets alone under the accurate forms), and the region is the call's where each of its results shares its
-  declaration's e-class. Either way the call's selector must give it a kernel of Dew's. A different constant, cast,
-  axis, statistic or rounding point is another program and stays as traced: a reordering matches only
-  where the fast forms admit it and the engine can bound what it makes (§6.3).
+  declaration's e-class. Either way the call's selector must give it a kernel of Dew's, and for attention
+  one that reads each row as the declaration does (`attention_kernels.keeps_reference_rows`: a row of no
+  mass, its every logit -inf as written by a mask, a fill or a bias, NaN where the reference's softmax
+  reads it NaN, and an excluded row as the reference excludes it; a product of finite operands that
+  overflows is each kernel's own range, which this does not certify; a kernel this host cannot lower for
+  the target is weighed as the target takes it, and its call, written, refuses a compile ahead). A
+  different constant, cast, axis, statistic or rounding point is another program and stays as traced: a
+  reordering matches only where the fast forms admit it and the engine can bound what it makes (§6.3).
 
 ## 3. Verification
 

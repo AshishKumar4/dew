@@ -40,6 +40,7 @@ import jax.numpy as jnp
 import kernel_matrix
 import numpy as np
 import pytest
+import test_algebra_recognize as recognize_tests
 import test_attention_decode_template as decode_template
 import test_attention_dropout as dropout
 import test_attention_masked_rows as masked_rows
@@ -181,7 +182,16 @@ def test_the_fused_attention_routes_run_on_this_gpu(without_deterministic_ops):
         Cell("packed windowed bf16 attention runs its band on par",
              when(bf16_dot_runs(), BF16_PRODUCTS, functools.partial(
                  local.packed_windowed_bf16_attention_runs_its_band_on_par, without_deterministic_ops))),
+        Cell("a plain program's row of no mass is left off cuDNN",
+             when(bf16_dot_runs(), BF16_PRODUCTS,
+                  recognize_tests.a_plain_programs_row_of_no_mass_is_left_off_cudnn),
+             at_run=EXACT_NAN_ROWS),
     ])
+
+
+EXACT_NAN_ROWS = "exact NaN rows its run compiles and reads, no check-1 site for a prepare to compile ahead"
+"""Why the recognizer's cuDNN cell runs its programs at run (`Cell.at_run`): it asserts which rows are NaN,
+bitwise, where a compile-only prepare's device runs nothing (row 14116)."""
 
 
 UNEVEN_WALKS = ("lengths-starts", "cross-causal-lengths-starts", "causal-chunk")
