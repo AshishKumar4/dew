@@ -538,13 +538,16 @@ def test_a_hoppers_gpt_oss_kernel_gradient_takes_a_cooperative_tile_its_depth_le
             bound, cooperative, target)
         lowered = functools.partial(mosaic_gpu.tgmm, tiles=cooperative, out_dtype=jnp.float32,
                                     multiprocessors=132, interpret=False)
-        jax.jit(lowered).trace(bf16((4096, 2880)), bf16((4096, 2880)), jax.ShapeDtypeStruct((16,), jnp.int32)
-                               ).lower(lowering_platforms=("cuda",))
+        # Lowered for an H100 whatever the lane's GPU: Mosaic reads the architecture from the abstract
+        # device (an A100's default rejected the H100's barrier copy).
+        mesh = generation.gpu_mesh(Mesh(np.array(jax.devices()[:1]), ("data",)), "sm90")
+        with jax.sharding.use_abstract_mesh(mesh):
+            jax.jit(lowered).trace(bf16((4096, 2880)), bf16((4096, 2880)),
+                                   jax.ShapeDtypeStruct((16,), jnp.int32)).lower(lowering_platforms=("cuda",))
         whole = launch.derived(launch.bind(bf16((32768, 2048)), bf16((32768, 2880)), sizes, (),
                                            out_dtype="float32", interpret=False), target)
         assert whole is not None and 2048 % whole.block_m == 0, whole
-    # The interpreted launches on this CPU whatever the lane's default device, as the interpreter runs them
-    # (an A100's default device ran the H100's barrier copy natively).
+    # The interpreted launches on this CPU whatever the lane's default device, as the interpreter runs them.
     with generation.assumed("sm90"), on_the_host():
         rng = np.random.default_rng(37)
         tokens = jnp.asarray(rng.integers(-3, 4, size=(300, 320)), jnp.bfloat16)
