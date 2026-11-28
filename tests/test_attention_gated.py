@@ -275,6 +275,26 @@ class _Derived:
         return doubled(out)
 
 
+def test_a_hooks_key_in_one_call_is_each_targets_own():
+    """A hook that reads the GPU it is traced for (`generation.gpu_target`), keyed twice within one kernel
+    call (`tuning.one_call`), under an H100 and an A100: each target's key its own program's
+    (`attention.hook_program`), where a call's table held by the hook's arguments alone gave the A100 the
+    H100's (review of b949a0077a: a GH200's forward priced as the canonical H100)."""
+    def scaled(out):
+        return out * (2.0 if generation.gpu_target().generation == "sm90" else 3.0)
+
+    @tuning.one_call
+    def keyed():
+        keys = []
+        for target in ("sm90", "sm80"):
+            with generation.assumed(target):
+                keys.append(template.hook_program("output_mod", scaled, (), ()))
+        return keys
+
+    hopper, ampere = keyed()
+    assert hopper != ampere
+
+
 def test_an_epilogue_program_with_a_deferred_rule_is_never_held():
     """A held hook (`_Derived`, a dataclass over a box) whose custom derivative's backward closes over a
     device array its primal does not read: its program, whose deferred rule no capture check sees, is
