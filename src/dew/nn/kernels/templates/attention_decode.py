@@ -60,18 +60,14 @@ from dew.nn.kernels.templates.cost import Work
 from dew.nn.kernels.templates.hooks import NO_HOOK, Hook, Side
 
 
-def packable(hooks: Hooks | None, *, excluded: bool = True) -> bool:
+def packable(hooks: Hooks | None) -> bool:
     """Whether a call's query heads can become its rows (`packed`): no score parameter (a packed row's is
     its pair's, not its query's) and no dropout; a score hook reads each row's own query's place
     (`unpacked_places`), a softcap (the scaled logits alone), sinks (an initial state a head), and output
-    hooks admitted by `merged.output_hook_refusal` pack (row 5385), but where the call reads a row of no
-    mass NaN (not `excluded`, `KeySpans.excluded`): a merge's finish fuses the hook before the row is read
-    (`_massless_read`)."""
+    hooks admitted by `merged.output_hook_refusal` pack (row 5385)."""
     if hooks is None:
         return True
     if hooks.score.sides or hooks.drop is not None:
-        return False
-    if not excluded and hooks.output.fn is not None:
         return False
     return merged.output_hook_refusal(hooks.output) is None
 
@@ -102,7 +98,11 @@ def serves(query: jax.Array, key: jax.Array, hooks: Hooks | None, *, natural: bo
     through the forward took 1.1 to 5.9 ms where the work list took 30 us to 1.36 ms on an H100, its query
     heads read the keys once a key head (ET-VERIFY-h100)."""
     heads, kv_heads = query.shape[2], key.shape[2]
-    if natural or heads % kv_heads or not packable(hooks, excluded=excluded):
+    if natural or heads % kv_heads or not packable(hooks):
+        return False
+    if not excluded and hooks is not None and hooks.output.fn is not None:
+        # A merge's finish fuses the hook, a row of no mass zero before it (`_massless_read`): the
+        # template's forward reads the row NaN before its hook.
         return False
     batch, positions, _, width = query.shape
     rows = jax.ShapeDtypeStruct((batch, positions * (heads // kv_heads), kv_heads, width), query.dtype)
@@ -496,12 +496,13 @@ def _certified_stream(op: attention_mosaic.MosaicForward, ba, target: generation
 
 
 def _massless_read(spec: algebra.Forward, out: jax.Array, stacked: jax.Array, initial: Initial | None, *,
-                   queries: int, heads: int) -> jax.Array:
-    """A merge's finished `out` `[B, T, heads, Dv]` (`merged.merged_finished`, of no output hook: `serves`),
-    each row of no mass NaN where the call reads it so (`algebra.Forward.massless_nan`, a call from no
-    `initial` state): no slice's denominator (`stacked[1]` `[B, KV, S, R]`), which the merge's own finish
-    reads zero."""
-    if not spec.massless_nan or initial is not None:
+                   queries: int, heads: int, output: bool) -> jax.Array:
+    """A merge's finished `out` `[B, T, heads, Dv]` (`merged.merged_finished`), each row of no mass NaN where
+    the call reads it so (`algebra.Forward.massless_nan`, a call from no `initial` state): no slice's
+    denominator (`stacked[1]` `[B, KV, S, R]`), which the merge's own finish reads zero. Past an `output`
+    hook the merge fused, the row is as the hook read its zero (`serves` keeps such a call off the work
+    list)."""
+    if not spec.massless_nan or initial is not None or output:
         return out
     empty = jnp.all(stacked[1][..., :queries] == 0, axis=2)
     rows = ungrouped_rows(jnp.swapaxes(empty, 1, 2)[..., None], heads)
@@ -583,10 +584,9 @@ def _planned_step(query: jax.Array, key: jax.Array, value: jax.Array, spans: Key
     query, key, hooks = prologues_taken(query, key, hooks)
     if not finished and hooks.output.fn is not None:
         raise ValueError("an unfinished decode step returns a partial state and takes no output hook")
-    if not packable(hooks, excluded=spans.excluded):
+    if not packable(hooks):
         raise NotImplementedError("the template's decode packs no score parameter, unsupported output "
-                                  "parameter, dropout, or output hook of a call that reads a row of no mass "
-                                  "NaN (`packable`)")
+                                  "parameter or dropout (`packable`)")
     heads = query.shape[2]
     work, rows, row_spans, whole = planned(query, key, value, spans, hooks, scale=scale, table=table,
                                            sources=sources, scales=scales, in_key=in_key, finished=finished)
@@ -638,7 +638,8 @@ def _planned_step(query: jax.Array, key: jax.Array, value: jax.Array, spans: Key
             out = merged.merged_finished(spec, padded, stacked, queries=queries, width=width,
                                          out_dtype=query.dtype, out_heads=heads, initial=initial,
                                          output=hooks.output)
-            return _massless_read(spec, out, stacked, initial, queries=queries, heads=heads)
+            return _massless_read(spec, out, stacked, initial, queries=queries, heads=heads,
+                                  output=hooks.output.fn is not None)
         if branch == "state":
             state = algebra.merged_state(spec, padded, stacked[0], stacked[1], initial)
         else:
