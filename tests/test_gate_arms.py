@@ -677,7 +677,7 @@ def test_a_prepares_failure_inside_a_site_is_recorded_by_its_label(tmp_path):
     """A prepare that fails inside a Check 1 site before it is kept (its draws, its truth's tracing), its
     failure recorded by the suite's hook (tests/conftest.py's `recorded_unprepared`), names that site by its
     label, never by its call's opening line, which two of a test's sites may share (train 1498's F2); one that
-    fails outside any site names its line's text."""
+    fails outside any site names the text of its innermost line in the test's file."""
     import json
 
     import pytest
@@ -699,4 +699,4 @@ def test_a_prepares_failure_inside_a_site_is_recorded_by_its_label(tmp_path):
     (inside_reason,) = json.loads((tmp_path / "inside" / UNPREPARED).read_text())["reasons"]
     (outside_reason,) = json.loads((tmp_path / "outside" / UNPREPARED).read_text())["reasons"]
     assert inside_reason["site"] == f"{tier_wire.LABELED}a site whose draw fails"
-    assert outside_reason["site"] == "failing(0)"
+    assert outside_reason["site"] == 'raise ValueError("a draw that cannot be made")'
