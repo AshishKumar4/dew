@@ -201,8 +201,7 @@ def process(ci, python: str, file: str, group: str, verdict: Path, left: float, 
            wire.PREPARE_HOLDS: held_caps(ci) if capped else ""}
     # A dry prepare's tests run in as many processes as keep each under `RECYCLE_AT` (recycle.py).
     return ci.tested(python, [file], group, verdict, mine, cache, ci.session.GRACE, common,
-                     {"JAX_PLATFORMS": "cpu", wire.PREPARE: "1", wire.GPU_TIER: "1",
-                      "OMP_NUM_THREADS": threads,
+                     {"JAX_PLATFORMS": "cpu", wire.PREPARE: "1", "OMP_NUM_THREADS": threads,
                       **(VARIANTS["users"][1] if users else {}), wire.UNIT: unit, **cap, **(environ or {})},
                      recorded=recorded, variant=variant, kept=kept, judged=judged,
                      recycle_at=RECYCLE_AT if capped else None, written=written,
@@ -709,8 +708,10 @@ def run(ci, python: str, tests: list[str], split: str, out: Path, deadline: floa
                 ci, python, name, ci.cut_of(group), verdict, deadline - (time.monotonic() - began),
                 unit=ci.row(python, name, group), threads=str(max(1, len(os.sched_getaffinity(0)))),
                 users=users, variant=row_variant, cache=cache, common=common(), recorded=True, capped=True,
-                # The node's one GPU, counted as a node's prepare counts its own (tests/lane_environment.py).
-                environ={wire.TRUTHS: str(truths), wire.TOPOLOGY: str(topology), "CUDA_VISIBLE_DEVICES": "0"},
+                # The node's one GPU, counted as a node's prepare counts its own (tests/lane_environment.py);
+                # a tier's files, its gpu-marked tests alone (`tier_wire.GPU_TIER`).
+                environ={wire.TRUTHS: str(truths), wire.TOPOLOGY: str(topology), "CUDA_VISIBLE_DEVICES": "0",
+                         wire.GPU_TIER: "1"},
                 kept={name: kept[(name, group)]} if (name, group) in kept else None, written=written,
                 ends=began + deadline,
                 judged=lambda found, truths=truths, before_=before_, generation=generation: graded(

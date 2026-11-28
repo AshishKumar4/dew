@@ -2070,7 +2070,11 @@ def gpu_lane(python: str, tests: list[str], out: Path, *, cache: str, processes:
     shares = {name: share for name, (share, _) in needed.items()}
     holds = {name: held for name, (_, held) in needed.items()}
     short = gpu_measures.measured_short({name: measures[name] for name in tests}, budget)
-    common = lane_inputs(python)  # Before any test writes under tests/, the inputs every file's key hashes.
+    # Before any test writes under tests/, the inputs every file's key hashes; and whether it runs a tier's
+    # gpu-marked tests alone (`tier_wire.GPU_TIER`, its caller's word), so a submitted job's run of every test it
+    # names is never a tier's row of the same file, nor a tier's a job's.
+    marked = os.environ.get(tier_wire().GPU_TIER) == "1"
+    common = hashlib.sha256((lane_inputs(python) + ("\0gpu-marked" if marked else "")).encode()).hexdigest()
     verdicts = {name: out.with_name(f"{out.name}.{index}") for index, name in enumerate(tests)}
 
     waiting = sorted(tests, key=lambda name: -holds[name])
@@ -2085,7 +2089,7 @@ def gpu_lane(python: str, tests: list[str], out: Path, *, cache: str, processes:
                 # says whatever its own environment does: a GPU node's session grows every job's pool.
                 environ = {"XLA_PYTHON_CLIENT_MEM_FRACTION": str(shares[fits] / total),
                            "XLA_PYTHON_CLIENT_PREALLOCATE": "false" if shares[fits] >= budget else "true",
-                           "OMP_NUM_THREADS": threads, **({} if network else {tier_wire().GPU_TIER: "1"})}
+                           "OMP_NUM_THREADS": threads}
                 file, group, variant = units[fits]
                 running[pool.submit(tested, python, [file], group, verdicts[fits], deadline, cache,
                                     session.GRACE, common,

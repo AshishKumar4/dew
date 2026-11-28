@@ -12,9 +12,10 @@ from pathlib import Path
 PREPARE = "DEW_TIER_PREPARE"
 """Set to 1, a flow prepares rather than runs: on the node's CPU, before its GPU run."""
 GPU_TIER = "DEW_GPU_TIER"
-"""Set to 1 by the GPU lane for a file it runs or prepares (tools/armada/ci.py's `gpu_lane`, prepares.py's
-`process`), whoever launched the lane: its process runs the file's gpu-marked tests alone (tests/conftest.py).
-The network lane, which runs the network-marked tests, sets it not."""
+"""Set to 1 by what runs a GPU tier (dew-ops' tier jobs, composite.py's `marked_tier`; the kernel lab's
+verifier; a dry prepare, prepares.py's `run`), never by a job that names its own tests: a lane's processes
+inherit it and run their files' gpu-marked tests alone (tests/conftest.py). A submitted pytest job runs what
+it names."""
 TRUTHS = "DEW_TIER_TRUTHS"
 """The directory a part's prepare writes its flows' programs and their truths to, which its run reads."""
 UNPREPARED = "unprepared.json"
