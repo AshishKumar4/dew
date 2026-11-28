@@ -277,7 +277,7 @@ def test_the_output_launchs_norm_lowers_on_a_hopper(block, training):
     from fla_gdn_support import KernelCase
     from kernel_compile import compile_mosaic_kernels, failures
 
-    run = epilogue_run(block, True, training)
+    run = epilogue_run(block, fused=True, training=training)
     operands = tuple(jax.ShapeDtypeStruct(x.shape, x.dtype) for x in epilogue_draw(0))
     case = KernelCase(f'the epilogue at {block} {training=}', lambda: (run, operands))
     found = compile_mosaic_kernels([case], 'sm90')
