@@ -39,6 +39,8 @@ from dew.nn.kernels.templates.recurrence.mainloop import (
     lowered_once,
     masks,
     memory_landing,
+    memory_stored,
+    memory_stores,
     prefix_reader,
     product_fragments,
     product_results,
@@ -52,6 +54,7 @@ from dew.nn.kernels.templates.recurrence.mainloop import (
     summed_issuer,
     summing_staging,
     table_held,
+    value_unit,
     vector_blocks,
     vector_views,
     walk_stores,
@@ -651,7 +654,7 @@ def _reverse(q, k, w, do, local, prefix: tuple, dht, sequences, v, beta, call: C
     grads = _reverse_values(call, gates=gates)
     bv, slices, walkers = tiles.block_v, width // call.block, tiles.walkers
     walked_width = bv * walkers
-    memories, given = call.memories, call.given
+    given = call.given
     batch, chunks = dht.shape[0] // (call.heads * width), call.chunks
     final = Operand(dht.shape[0], 1, jnp.dtype(jnp.float32))
     assert gates or not skips, "the walk adds a skip where it gates the values"
@@ -685,8 +688,8 @@ def _reverse(q, k, w, do, local, prefix: tuple, dht, sequences, v, beta, call: C
         walked_streams = family.opened(streams["walked"], views)
         leaving = family.opened(streams["once"], final_views)
 
-        # Each key slice of the memory's gradient and the corrected values', a store each in flight.
-        before_store = walk_stores(family, width // call.block + 1)
+        # Each key slice's part of the memory's gradient and the corrected values', a store each in flight.
+        before_store = walk_stores(family, memory_stores(call) + 1)
 
         def step(role):
             (*staged, (second,)), lands = roled(role)
@@ -705,9 +708,7 @@ def _reverse(q, k, w, do, local, prefix: tuple, dht, sequences, v, beta, call: C
             n = chunks - 1 - f
             span = pl.ds(n * chunk, chunk)
             for i, part in enumerate(grad):
-                before_store()
-                memories.store(dh_ref, part, memory(n, i), call.block, column, bv, family=family,
-                               smem=lands[f"memory{i}"], wait=False)
+                memory_stored(call, dh_ref, part, i, memory(n, i), column, bv, lands, before_store)
                 if entered_ref is not None:
                     entered = stream_tile(slots, f"entered{i}", call.memories, columns=columns)
                     gated_ref[0].at[column // bv, pl.ds(memory(n, i), call.block)][...] = (
@@ -907,21 +908,25 @@ def _summed_into(call: Call, tile, value: jax.Array) -> None:
 
 
 def _memory_sum(call: Call, issue: Issuer, entered: Parts, leaving: Parts) -> jax.Array:
-    """`sum(S dS)` over the value columns of a block of the memories entered and left, `[rows]`: the
-    diagonal of their product `S dS^T` where the family's products read registers, else their elementwise
-    product's rows (`_query_key`)."""
+    """`sum(S dS)` over the value columns of a block of the memories entered and left, `[rows]`, of their
+    parts as the decay's sum reads them (`Call.entered`: limbed, the leading limbs, one product where both
+    limbs' terms were three): the diagonal of their product `S dS^T` where the family's products read
+    registers, else their elementwise product's rows (`_query_key`)."""
+    read = call.entered
+    entered, leaving = (Parts(tile.refs[:read.parts], read.dtype) for tile in (entered, leaving))
     if call.family.operands_in_registers:
         traced = issue("memory_trace", entered, leaving.T)
         return jnp.sum(jnp.where(diagonal(traced.shape[0], call.family), traced, 0.0), axis=1)
     return jnp.sum(entered.value().astype(jnp.float32) * leaving.value().astype(jnp.float32), axis=1)
 
 
-def _query_key_split(call: Call) -> int:
-    """`_query_key`'s value columns a program takes of each value head: the widest whole number of value
-    tiles (`Call.value_block`) dividing the value width whose streams (each step's values, output gradient
-    and corrected values' gradient `[C, vq]`, its memories `[block, vq]`, the queries', keys' and scores'
-    gradient's blocks) fit the block's shared memory (`generation.shared_budget`) and their live registers
-    (`_query_key_held`), a tile where none does:
+def _query_key_split(call: Call) -> tuple[int, int]:
+    """`_query_key`'s value columns a program takes of each value head and the value block its products step
+    over: the widest whole number of value tiles (`Call.value_block`) dividing the value width whose streams
+    (each step's values, output gradient and corrected values' gradient `[C, vq]`, its memories `[block,
+    vq]`, the queries', keys' and scores' gradient's blocks) fit the block's shared memory
+    (`generation.shared_budget`) and their live registers (`_query_key_held`) at the widest block that holds
+    them (`_query_key_blocks`), a tile where none does:
     an fp32 call's two parts at Qwen3.5-27B's widths took 237824 bytes and a 256-wide value row's 215040 on
     an A100, past its 166912 (fp32-plan-sm90 at cdcd620ef, wide-backward). Halved instead, 192 columns took
     96, a block and a half, and the split's programs read no column past their first block's. Each split's
@@ -930,23 +935,37 @@ def _query_key_split(call: Call) -> int:
     from its accumulator, because CUDA 12.9's ptxas folded the read's sign flip (an xor) so that the
     product's HGMMA wrote the zero register, not the split (row 4346: the JAX fork's float-sign-ops
     lowering, post66; M-JS-22q native as interpreted)."""
-    return next((vq for vq in whole_blocks(call.value_width, call.value_block)
-                 if _query_key_fits(call, vq, holds=False)), call.value_block)
+    return next(((vq, vb) for vq in whole_blocks(call.value_width, call.value_block)
+                 for vb in _query_key_blocks(call) if _query_key_fits(call, vq, vb, holds=False)),
+                (call.value_block, call.value_block))
 
 
-def _query_key_fits(call: Call, vq: int, *, holds: bool) -> bool:
-    """Whether `_query_key` at value split `vq` fits the block's shared memory (`generation.shared_budget`)
-    and a thread's registers (`_query_key_held`), its streams one deep, its landing and, where it `holds` its
-    sums, their staging (`_query_key_staging`): each split's bytes the launch's own (`shared_allocation`, as
-    `launch_kernel` lays it)."""
+def _query_key_blocks(call: Call) -> list[int]:
+    """The value blocks `_query_key`'s products may step over, widest first: the value tile
+    (`Call.value_block`), then where products read registers each half of it down to the narrowest columns
+    a family stages (`value_unit`), their operands' fragments and the memories' parts' a block's (a limbed
+    call's two, `Call.limbed`): at Nemotron-H 30B's 64-wide value tile an RTX PRO 6000's query_key stated
+    268 registers past its 255, a 32-wide block's within them. Products reading shared memory hold no
+    fragments a block narrows."""
+    blocks = [call.value_block]
+    while call.family.operands_in_registers and blocks[-1] // 2 >= value_unit(call.family):
+        blocks.append(blocks[-1] // 2)
+    return blocks
+
+
+def _query_key_fits(call: Call, vq: int, vb: int, *, holds: bool) -> bool:
+    """Whether `_query_key` at value split `vq` and value block `vb` fits the block's shared memory
+    (`generation.shared_budget`) and a thread's registers (`_query_key_held`), its streams one deep, its
+    landing and, where it `holds` its sums, their staging (`_query_key_staging`): each split's bytes the
+    launch's own (`shared_allocation`, as `launch_kernel` lays it)."""
     splits = call.value_width // vq
     landing = _query_key_landing(call, splits, _query_key_summed(call, splits, holds))
     staging = _query_key_staging(call) if holds else ()
-    return launch_fits(call, _query_key_held(call, vq, holds=holds), (staging, landing),
-                       _query_key_streams(call, vq))
+    return launch_fits(call, _query_key_held(call, vq, vb, holds=holds), (staging, landing),
+                       _query_key_streams(call, vq), swizzles=_query_key_swizzles(call, vq, vb))
 
 
-def _query_key_held(call: Call, vq: int, *, holds: bool) -> Held:
+def _query_key_held(call: Call, vq: int, vb: int, *, holds: bool) -> Held:
     """What `_query_key`'s consumer thread holds (`algebra.memory_gradients`): a block's gradient's fp32 sum
     (one accumulator over the value blocks), that sum gated, its scores' product, and a block's queries or
     keys in fp32 for the range terms; then `sum(S dS)` (`_memory_sum`): the memories' product and its
@@ -954,8 +973,9 @@ def _query_key_held(call: Call, vq: int, *, holds: bool) -> Held:
     An accumulator a value block, the SSD's spilled 168 bytes a thread on an A100, where one needed 249
     registers (gateqk at c2808ebbe). Where it `holds` its sums (`_query_key_holds`), a sum's tile read back
     beside the gradient it adds (`_summed_into`): unstated, the scalar write's training at 16-wide value
-    tiles spilled at 255 registers on an A100 against a stated 232 (M-JS-191)."""
-    chunk, vb = call.chunk, call.value_block
+    tiles spilled at 255 registers on an A100 against a stated 232 (M-JS-191). Its products step over value
+    blocks `vb` wide (`_query_key_blocks`)."""
+    chunk = call.chunk
     held, memories, given = call.held, call.memories, call.given
 
     def read(rows: int, lhs, rhs_parts: int, *, retained: bool = False) -> list:
@@ -965,13 +985,15 @@ def _query_key_held(call: Call, vq: int, *, holds: bool) -> Held:
             resources.OperandRead(memories.stored, rhs_parts, retained=retained, transposed=True))
 
     # The output's gradient and the corrected values against the memories entered and leaving, read
-    # transposed ('memory_dq', 'memory_dk'); then the memories against themselves (`_memory_sum`).
+    # transposed ('memory_dq', 'memory_dk'); then the memories against themselves (`_memory_sum`), in the
+    # parts its sum reads (`Call.entered`).
     # The unscored head segment reads each memory in its gradients and again in its trace, with no
     # weights store between them: its staged operands remain live across those products. Each value block
     # has its own operands. A scored head or a weights store ends that phase.
     retained = not call.delta and call.group > 1
+    traced = call.entered
     trace_operands = [tile for _ in range(vq // vb if retained else 1)
-                      for tile in read(call.block, memories, memories.parts, retained=retained)]
+                      for tile in read(call.block, traced, traced.parts, retained=retained)]
     summed = ([f32(call.block, call.block), *masks(call.block, call.block), *trace_operands]
               if call.family.operands_in_registers else [f32(call.block, vb)] * 2)
     # An fp32 call's products overlapping (warpgroup MMA's) keep its row results `after` and `leaving`
@@ -1013,8 +1035,9 @@ def _query_key_staging(call: Call) -> tuple:
     return (swizzling.plain((call.chunk, call.block), jnp.float32),) * 2
 
 
-def _query_key_holds(call: Call, vq: int) -> bool:
-    """Whether `_query_key` at value split `vq` holds its sums in shared memory (`_query_key_staging`): where
+def _query_key_holds(call: Call, vq: int, vb: int) -> bool:
+    """Whether `_query_key` at value split `vq` and value block `vb` holds its sums in shared memory
+    (`_query_key_staging`): where
     its block's shared memory and its registers fit them beside its streams, as `_query_key_split` fits
     those. Else each value head's added into the output in turn (`Family.added`), the same fp32 sums in the
     same order: held, an A100's element-wise global atomics each value head (26% of query_key's stall
@@ -1026,17 +1049,32 @@ def _query_key_holds(call: Call, vq: int) -> bool:
     split adds nothing to hold: its sums stored as they come."""
     if not call.family.stores_through_registers or (call.group == 1 and vq == call.value_width):
         return False
-    return _query_key_fits(call, vq, holds=True)
+    return _query_key_fits(call, vq, vb, holds=True)
+
+
+def _query_key_sliced(call: Call, vq: int) -> dict:
+    """`_query_key`'s streams a step reads a value block of at a time (`column_tile`), `[rows, vq]` each in
+    its `Operand` (`stream_blocks`' arguments)."""
+    chunk, held, memories = call.chunk, call.held, call.memories
+    return dict(values=((chunk, vq), held), out=((chunk, vq), call.given),
+                **({"value_grads": ((chunk, vq), held)} if call.delta else {}),
+                entered=((call.block, vq), memories), leaving=((call.block, vq), memories))
+
+
+def _query_key_swizzles(call: Call, vq: int, vb: int) -> dict[str, int]:
+    """`_query_key`'s value-sliced streams' parts (`_query_key_sliced`), each staged at the widest swizzle a
+    value block `vb` wide fills, as `_weighted_swizzles` stages a block's, so a block is whole swizzle rows:
+    a 64-wide stream's 128-byte swizzle split into 32-wide blocks (`_query_key_blocks`) left each block half
+    a swizzle row, which an sm80's register products load whole."""
+    return {part: resources.widest_swizzle(dtype, vb)
+            for part, (_, dtype) in stream_blocks(**_query_key_sliced(call, vq)).items()}
 
 
 def _query_key_streams(call: Call, vq: int) -> dict:
     """`_query_key`'s streams at value split `vq` (`_query_key_split`)."""
-    chunk, held, memories, given = call.chunk, call.held, call.memories, call.given
+    chunk, given = call.chunk, call.given
     return stream_blocks(queries=((chunk, call.block), given), keys=((chunk, call.block), given),
-                         values=((chunk, vq), held), out=((chunk, vq), given),
-                         **({"value_grads": ((chunk, vq), held)} if call.delta else {}),
-                         entered=((call.block, vq), memories),
-                         leaving=((call.block, vq), memories), ds=((chunk, chunk), _score_grads(call)))
+                         **_query_key_sliced(call, vq), ds=((chunk, chunk), _score_grads(call)))
 
 
 def _query_key_outputs(call: Call, vq: int, summed: jnp.dtype) -> tuple:
@@ -1057,27 +1095,26 @@ def _query_key_outputs(call: Call, vq: int, summed: jnp.dtype) -> tuple:
 @lowered_once
 def _query_key(q, k, corrected, do, dv, h, dh, ds, hi, lo, taken, beta, call: Call, *, scale: float):
     """`(dq, dk [R, H * Dk] fp32, dw [R, HV * Dk] as call.held (None without the delta rule, which forms no
-    weights), after, leaving [blocks, HV, R], memory
-    [blocks, HV, chunks * block] fp32)`: each chunk's and key block's queries', keys' and weights' gradients
-    (fla's dqkwg's memory products, `algebra.memory_gradients`, given the scores' gradient `ds` in
-    `_score_grads`' form, `_grouped_scores`': `[R, HV * C]` with the delta rule, each step's value head's
-    product; without it `[R, H * C]`, the key head's, its products the first step's alone), a program a key
-    head's and a step each value head it serves,
-    the queries' and keys' summed over them in fp32 where they leave (each program's own tiles: a register
-    carry across the steps spilled), as the port's sum; the decay's range terms over the block's key columns,
-    each token's (`algebra.memory_gradients`' `(after, leaving)`, which `gradients` sums over their ranges:
-    summed here, their `[C, C]` tiles spilled 376 bytes a thread on an H100's), and the block's rows of `sum(S
-    dS)`, the memory's decay's gradient across the chunk. `h` and `dh` the memories each chunk enters and its
-    leaving memory's gradient (`call.memories`). Where a value row's streams are past the block's shared
-    memory, a program takes a split of each value head's columns (`_query_key_split`), each split's sums its
-    own, which XLA adds, the scores' gradient's products the first split's alone."""
+    weights), after, leaving [blocks, HV, R], memory [blocks, HV, chunks * block] fp32)`: each chunk's and key
+    block's queries', keys' and weights' gradients (fla's dqkwg's memory products, `algebra.memory_gradients`,
+    given the scores' gradient `ds` in `_score_grads`' form, `_grouped_scores`': `[R, HV * C]` with the delta
+    rule, each step's value head's product; without it `[R, H * C]`, the key head's, its products the first
+    step's alone), a program a key head's and a step each value head it serves, the queries' and keys' summed
+    over them in fp32 where they leave (each program's own tiles: a register carry across the steps spilled),
+    as the port's sum; the decay's range terms over the block's key columns, each token's
+    (`algebra.memory_gradients`' `(after, leaving)`, which `gradients` sums over their ranges: summed here,
+    their `[C, C]` tiles spilled 376 bytes a thread on an H100's), and the block's rows of `sum(S dS)`, the
+    memory's decay's gradient across the chunk. `h` and `dh` the memories each chunk enters and its leaving
+    memory's gradient (`call.memories`). Where a value row's streams are past the block's shared memory, a
+    program takes a split of each value head's columns (`_query_key_split`), each split's sums its own, which
+    XLA adds, the scores' gradient's products the first split's alone."""
     chunk = call.chunk
     width, value_width, family = call.width, call.value_width, call.family
     held, memories, given = dataclasses.replace(call.held, rows=call.rows), call.memories, call.given
     grads = _score_grads(call)
-    vq = _query_key_split(call)
-    holds = _query_key_holds(call, vq)
-    splits, blocks, group = value_width // vq, vq // call.value_block, call.group
+    vq, vb = _query_key_split(call)
+    holds = _query_key_holds(call, vq, vb)
+    splits, blocks, group = value_width // vq, vq // vb, call.group
     keyed_width, key_blocks = call.heads // group * width, width // call.block
 
     def program(at, q_ref, k_ref, v_ref, do_ref, dv_ref, h_ref, dh_ref, ds_ref, hi_ref, lo_ref, taken_ref,
@@ -1096,7 +1133,7 @@ def _query_key(q, k, corrected, do, dv, h, dh, ds, hi, lo, taken, beta, call: Ca
         def step(index, slots, carry, accumulators, *, scores: bool = True):
             h = first + index
 
-            column = functools.partial(column_tile, call, slots, width=call.value_block)
+            column = functools.partial(column_tile, call, slots, width=vb)
 
             def whole(name, operand, i):
                 del i
@@ -1165,7 +1202,8 @@ def _query_key(q, k, corrected, do, dv, h, dh, ds, hi, lo, taken, beta, call: Ca
         program, call, out_type=_query_key_outputs(call, vq, summed), stages=(1, min(2, call.group)),
         grid=(splits, width // call.block, call.chunks, call.heads // group), live=chunk_liveness(10),
         grid_names=("values", "blocks", "chunks", "heads"), blocks=tiles, once=once or None,
-        steps=call.group, model=_query_key_model(call), held=_query_key_held(call, vq, holds=holds),
+        steps=call.group, model=_query_key_model(call) / splits,
+        held=_query_key_held(call, vq, vb, holds=holds), swizzles=_query_key_swizzles(call, vq, vb),
         landing=_query_key_landing(call, splits, summed), staging=_query_key_staging(call) if holds else (),
         persistent=call.delta, together=(call.block,) * (2 + call.delta + 2 * (splits == 1)))(
         q, k, corrected, do, dv, h, dh, ds, hi, lo, taken, beta)
@@ -1190,9 +1228,10 @@ def _walked_once(call: Call, streams: dict) -> tuple[dict, dict]:
 
 
 def _query_key_model(call: Call) -> float:
-    """`_query_key`'s tile's model FLOPs, a step a value head of its group: each value head's three memory
-    products (two without the delta rule's weights) and the scores' gradient's two, a key head's two without
-    the delta rule."""
+    """`_query_key`'s model FLOPs of a key block of a chunk and key head, over every value split, a step a
+    value head of its group: each value head's three memory products (two without the delta rule's weights)
+    and the scores' gradient's two, a key head's two without the delta rule; a split's tile its share
+    (`_query_key`)."""
     chunk = call.chunk
     scores = 2 * chunk * chunk * call.block
     each = (2 + call.delta) * chunk * call.value_width * call.block + scores * call.delta

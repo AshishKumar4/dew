@@ -29,7 +29,7 @@ from reference_error import (
 )
 from sharded import assert_runs_per_shard
 from ssd_support import mamba_ssd_draw, mamba_ssd_operands, mamba_ssd_xla, ssd_value_and_grad
-from test_recurrence_chunk import formed
+from test_recurrence_chunk import formed, on_route
 from tool_support import load
 from tuned import configs_by_kernel
 
@@ -264,6 +264,43 @@ def test_a_packed_calls_skip_gradient_on_the_template_is_as_exact_as_on_mamba_ss
     assert_as_exact(jax.jit(skip_gradient("mosaic_gpu")), jax.jit(skip_gradient("pallas")), draw,
                     "the packed skip's gradient on the template", seeds=SKIPPED_SEEDS,
                     truth_fn=jax.jit(truth))
+
+
+RATED = (1, 512, 2, 80, 1, 128)
+"""The rate site's rows, tokens, heads, head width, groups and state width: Nemotron-H 4B's widths (heads of
+80, a state of 128) over two heads of one group and two of its chunks (`RATED_CHUNK`), across which the
+template's 64-token chunks cross seven boundaries to the port's one."""
+RATED_CHUNK = 256
+"""Nemotron-H 4B's chunk (tools/benchmark_recurrence.py's `nemotron-h-4b-ssd`), the port's."""
+RATED_SEEDS = 8
+"""The rate site's declared draws, sized by `seeds_for` on armada, paired."""
+
+
+def test_the_templates_ssd_training_at_the_4bs_widths_is_as_exact_as_the_ports():
+    """Mamba-2's SSD training at Nemotron-H 4B's widths and chunk (`RATED`) on the recurrence template under
+    the run's fast forms, interpreted on an A100's route (mma.sync's bundle at its facts): every output and
+    gradient on par with the port of mamba_ssm's kernels' (check 1), the truth the portable math's in
+    float64. Its boundaries at one bf16 limb, the rate's gradient `dA` lay 3.9 times the port's distance from
+    float64 and 2.7 times at twelve heads of a group, 1.74 to 1.96 times natively on an A100 at T1024 to 4096
+    (M-JS-300c), every other leaf on par; in two limbs 0.003 times (`mainloop.Call.limbed`, row 7877)."""
+    def on(kernel):
+        def run(arrays):
+            with generation.chosen(ssd=kernel):
+                return mamba_ssd_xla(arrays, RATED_CHUNK, jnp.bfloat16)
+
+        return formed("fast", run)
+
+    def draw(seed):
+        return (mamba_ssd_draw(seed, RATED, jnp.bfloat16, documents=False),)
+
+    def truth(arrays):
+        with generation.chosen(ssd="xla"):
+            return mamba_ssd_xla(arrays, RATED_CHUNK)
+
+    with on_route("sm80"):
+        assert_as_exact(jax.jit(on("mosaic_gpu")), jax.jit(on("pallas")), draw,
+                        "Nemotron-H 4B's SSD training on the template", seeds=RATED_SEEDS,
+                        truth_fn=jax.jit(truth))
 
 
 def test_the_port_takes_widths_padded_to_powers_of_two():

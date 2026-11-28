@@ -1841,15 +1841,16 @@ def test_an_h100_training_steps_start_certifies_each_kernel_at_most_twice():
 
 @lowers('sm90')
 def test_a_launch_past_its_ladders_foot_is_certified_at_a_program_fewer():
-    """Mamba-2's chunked recurrence at a small decoder's widths (8 heads of 32, a state of 32, 4 groups, bf16,
-    its skip; tests/test_declared_cells_memory.py's guard's), its training gradient lowered for a compile-only
-    H100 through the call's route, certified as a run's step certifies it: it compiles, its query/key walk
-    certified at a program fewer a multiprocessor, the kernel it keeps unspilled. At three programs that
-    walk's consumers spilled two table reads at every rung of its producer's ladder, and the call raised
-    Unfitted (row 6718)."""
+    """Mamba-2's chunked recurrence at a small decoder's widths (8 heads of 16, a state of 32, 4 groups, bf16,
+    its skip), its training gradient lowered for a compile-only H100 through the call's route, certified as a
+    run's step certifies it: it compiles, its query/key walk certified at a program fewer a multiprocessor,
+    the kernel it keeps unspilled. At three programs that walk's consumers spilled two table reads at every
+    rung of its producer's ladder, and the call raised Unfitted (row 6718). At heads of 32
+    (tests/test_declared_cells_memory.py's guard's) its memories in two limbs (`mainloop.Call.limbed`, row
+    7877) plan the walk at two programs itself, no rung asked."""
     from dew.nn.kernels.generation import compile_only_gpus
 
-    heads, width, state, groups = 8, 32, 32, 4
+    heads, width, state, groups = 8, 16, 32, 4
     shape = jax.ShapeDtypeStruct
     hooks = recurrence.Hooks(decay='scalar', rated=True, delta=False, skip=True)
     keyed = shape((2, 256, groups, state), jnp.bfloat16)

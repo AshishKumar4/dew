@@ -9,8 +9,8 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 import recurrence_witness as rw
-from interval_certificates import point, staged, within
-from op_certificates import FLOAT32, exp2_rounded
+from interval_certificates import cast, point, saturated, staged, within
+from op_certificates import BFLOAT16, FLOAT32, exp2_rounded
 
 from dew.nn.kernels import generation
 from dew.nn.kernels.templates import product
@@ -156,3 +156,15 @@ def test_the_decay_prefix_sums_its_terms_by_the_one_compensated_reduction():
 
     for got, wanted in zip(jax.jit(prefix)(g), jax.jit(fenced_each_step)(g), strict=True):
         np.testing.assert_array_equal(np.asarray(got), np.asarray(wanted))
+
+
+def test_a_saturating_cast_encloses_a_part_stored_past_bf16s_overflow_midpoint():
+    """fp32's largest finite value, past bf16's overflow midpoint, as a store forms its leading bf16 part
+    (`product.bf16_parts`, clipped then rounded): bf16's largest, which `saturated` encloses (the step
+    witness's leading limbs, `rw.enclosed`'s `read`) and a plain cast, which rounds it to infinity, does
+    not."""
+    largest = np.finfo(np.float32).max
+    [part] = product.bf16_parts(jnp.asarray([largest], jnp.float32), 1, saturating=1)
+    stored, given = np.asarray(part, np.float64), point(np.asarray([largest], np.float64))
+    assert within(stored, saturated(given, BFLOAT16)).all()
+    assert not within(stored, cast(given, BFLOAT16)).any()

@@ -693,8 +693,10 @@ def carried(state, keys: Load, values, decay, dtype, issue: Issue, last: tuple |
 def keys_gated_carried(state, keys: TileLoad, values, gate, decay, dtype, issue: Issue) -> list:
     """`carried` with the write's gate on the keys' side: `state[i] decay[i] + (keys(i) gate)^T values`, each
     key row scaled by its token's `gate` `[C]` (its write gate and its decay to the chunk's end) in fp32 and
-    rounded to `dtype` for the product, the values (`values`, a tile) as they are: mamba_ssm's state write,
-    `(B dt exp(dA_last - dA))^T x` (`_chunk_state_fwd`), whose rounding a 16-bit call's takes."""
+    cast to `dtype` for the product, the values (`values`, a tile) as they are: mamba_ssm's state write,
+    `(B dt exp(dA_last - dA))^T x` (`_chunk_state_fwd`), whose rounding a 16-bit call's takes where `dtype`
+    is its own; fp32, the product takes the gated keys in the parts its issue stages (a training call's
+    limbs, `mainloop.Call.write_keys`)."""
     return [part * decay[i] + issue("write", Transposed(
         (keys(i).value().astype(jnp.float32) * gate[:, None]).astype(dtype)), values)
         for i, part in enumerate(state)]

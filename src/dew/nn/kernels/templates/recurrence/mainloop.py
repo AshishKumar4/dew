@@ -35,12 +35,14 @@ cumulative sum.
 
 A 16-bit call's numbers are fla's (`fla_gdn.chunk_gated_delta_rule`'s): the values the launches pass (the
 inverse, `w`, `u`, the memories and the corrected values) and the operands the algebra rounds are in its
-dtype, the memory fp32 across chunks. An fp32 call keeps them fp32, and its products take each operand as
-the run's forms ask (`_parts`): under the accurate forms as three bf16 parts summing to it exactly
-(`product.formed`), its product the six of the parts' whose orders sum under three, an fp32 product's
-accuracy; under the fast forms as itself, a TF32 operand, on a family whose products take transposed TF32
-operands (mma.sync's, `_fast_parts`: JAX's default precision for an fp32 product, and fla's, which its
-recording holds it to), else as `FAST_PARTS` bf16 parts.
+dtype, the memory fp32 across chunks; a training call whose write gate takes the keys' side (Mamba-2's SSD)
+passes its chunk boundaries' memories, their gradients and its write's gated keys in two bf16 limbs, its
+64-token chunks crossing four times mamba_ssm's boundaries (`Call.limbed`). An fp32 call keeps them fp32, and
+its products take each operand as the run's forms ask (`_parts`): under the accurate forms as three bf16 parts
+summing to it exactly (`product.formed`), its product the six of the parts' whose orders sum under three, an
+fp32 product's accuracy; under the fast forms as itself, a TF32 operand, on a family whose products take
+transposed TF32 operands (mma.sync's, `_fast_parts`: JAX's default precision for an fp32 product, and fla's,
+which its recording holds it to), else as `FAST_PARTS` bf16 parts.
 
 The fast backward's launches and the plan of a call's launches, forward and backward, are
 `mainloop_backward`'s, on this module's machinery. Decode is not on the mainloop: a one-token step takes
@@ -275,14 +277,23 @@ class Operand:
         """Its parts' views of row `row`, `[columns]` from `column`."""
         return [ref.at[p * self.rows + row, pl.ds(column, columns)] for p in range(self.parts)]
 
+    def pieces(self, value) -> list:
+        """`value` as its parts in their stored dtype, largest first (`product.formed`)."""
+        pieces = product.formed(value.astype(jnp.float32), self.parts) if self.parts > 1 else (value,)
+        return [piece.astype(self.stored) for piece in pieces]
+
     def store(self, ref, value, row, rows: int, column, columns: int, *, family: mosaic.Family,
               smem, wait: bool = True) -> None:
         """`value` `[rows, columns]` as its parts at `row` and `column`, through `smem` (a `[rows, columns]`
         tile of its stored dtype the launch lands its stores in, `_landed`), its last copy left in flight
         unless `wait` (`Family.stored`, `walk_stores`)."""
-        pieces = product.formed(value.astype(jnp.float32), self.parts) if self.parts > 1 else (value,)
-        family.stored([piece.astype(self.stored) for piece in pieces],
-                      self.views(ref, row, rows, column, columns), smem=smem, wait=wait)
+        family.stored(self.pieces(value), self.views(ref, row, rows, column, columns), smem=smem, wait=wait)
+
+    @property
+    def leading(self) -> "Operand":
+        """Its leading part alone, an operand of its stored dtype over the same array: the value rounded once
+        (`product.formed`'s first part), which a reader of one rounding takes."""
+        return dataclasses.replace(self, parts=1, dtype=self.stored)
 
     def landing(self, rows: int, columns: int) -> tuple:
         """A store's `landing` entry (`launch_kernel`): a `[rows, columns]` tile in its stored dtype."""
@@ -359,6 +370,30 @@ def bounded_prefix(decay_bound: float | None, chunk: int) -> bool:
     """Whether decays bounded below by `decay_bound` a token hold a chunk of `chunk` tokens' base-2 prefix
     within `ROUNDED_PREFIX_REACH`."""
     return decay_bound is not None and chunk * -decay_bound * algebra.LOG2_E <= ROUNDED_PREFIX_REACH
+
+
+LIMBS = 2
+"""The bf16 limbs a limbed call's chunk boundaries pass in (`limbed`, `product.formed`): 16 of fp32's 24
+bits, a normal value's two limbs within 2^-16 of it where one limb rounds it by up to 2^-8 (bf16's unit
+roundoff; tests/interval_certificates.py's `two_parts_reach`), below bf16's normals and at its saturation
+not relatively."""
+
+
+def limbed(gated_keys: bool, dtype, *, alone: bool) -> bool:
+    """Whether a call's chunk boundaries pass in `LIMBS` bf16 limbs rather than one (`Call.limbed`): each
+    memory a chunk enters, its gradient, and its write's gated keys (`algebra.keys_gated_carried`), where its
+    write gate takes the keys' side in bf16 (`gated_keys`, Mamba-2's SSD under the fast forms) and a backward
+    reads them (not `alone`). The template's 64-token chunks cross four times the boundaries of mamba_ssm's
+    256 at Nemotron-H 4B, each rounding the memory and its adjoint, and the pairs across them pass through the
+    rounded memory and its rounded write: at one limb the rate's gradient `dA`, which sums every boundary's
+    rounding over the sequence, lay 1.74 to 1.96 times the port's distance from float64 on an A100, every
+    other leaf on par (M-JS-300c), and the port itself at 64-token chunks as far as the template (T1024: 0.219
+    against the template's 0.197 and its own 0.072 at 256). The memories and their gradients in two limbs took
+    it to 1.50 times the port's; the write's gated keys too, to 0.003 times (interpreted at the 4B's widths,
+    row 7877). A forward alone reads each entered memory once, on par at one limb (M-JS-300c's outputs), and
+    keeps it so; a bf16 limb meets no fp16 operand in one product, and the template trains no fp16 call
+    without the delta rule (`mainloop_backward.fast_backward_form`)."""
+    return gated_keys and jnp.dtype(dtype) == jnp.bfloat16 and not alone
 
 
 @dataclasses.dataclass(frozen=True)
@@ -451,6 +486,26 @@ class Call:
         return not self.delta and self.held.parts == 1 and not self.values_gated
 
     @property
+    def limbed(self) -> bool:
+        """Whether its chunk boundaries pass in `LIMBS` bf16 limbs (`limbed`): its memories, their gradients
+        and its write's gated keys (`memories`, `write_keys`), a training call's whose write gate takes the
+        keys' side in bf16."""
+        return limbed(self.gated_keys, self.held.dtype, alone=self.alone)
+
+    def _crossing(self, rows: int) -> Operand:
+        """A value its chunks' boundaries pass, `rows` of them: in `LIMBS` bf16 limbs where they pass so
+        (`limbed`), else as `held`."""
+        if self.limbed:
+            return Operand(rows, LIMBS, jnp.dtype(jnp.float32))
+        return dataclasses.replace(self.held, rows=rows)
+
+    @property
+    def write_keys(self) -> Operand:
+        """The form a keys-gated write takes its gated keys in for its product (`algebra.keys_gated_carried`,
+        `_keys_gated_write`), its rows the call's."""
+        return self._crossing(self.rows)
+
+    @property
     def gates(self) -> Operand:
         """A decay a key dimension's prefix (`intra._prefix`), `[rows, heads * width]` fp32."""
         return Operand(self.rows, 1, jnp.dtype(jnp.float32))
@@ -486,8 +541,19 @@ class Call:
 
     @property
     def memories(self) -> Operand:
-        """The memories the chunks enter, `[chunks * heads * width, value_width]` as `held`."""
-        return dataclasses.replace(self.held, rows=self.chunks * self.heads * self.width)
+        """The memories the chunks enter and, in the fast backward, their gradients, `[chunks * heads * width,
+        value_width]`: as `held`, or in `LIMBS` bf16 limbs (`limbed`)."""
+        return self._crossing(self.chunks * self.heads * self.width)
+
+    @property
+    def entered(self) -> Operand:
+        """The memories as the output launch reads them (`output.output_launch`), and the fast backward its
+        memory decay's sum (`mainloop_backward._memory_sum`): `memories`, their leading limb alone where they
+        pass in limbs (`limbed`), as mamba_ssm's output reads its `prev_states` rounded once and as a forward
+        alone holds them. Each reads a chunk's memory once: the outputs on par so (M-JS-300c), the decay's
+        sum 5.5e-5 of Nemotron-H 4B's rate gradient's error at one limb against the port's whole 0.072 (row
+        7877), where the rate's ranges (`algebra.memory_gradients`) read both limbs."""
+        return self.memories.leading if self.limbed else self.memories
 
 
 def part_names(name: str, parts: int) -> tuple[str, ...]:
@@ -958,9 +1024,37 @@ def walk_stores(family: mosaic.Family, stores: int):
     return lambda: family.store_wait(stores - 1)
 
 
+def memory_tiles(call: Call) -> tuple[tuple[str, ...], ...]:
+    """A walk's memory's landing tiles' names in the order its step stores them, each key slice's a part
+    each (`Call.memories`): `((memory0_0, ...), (memory1_0, ...), ...)`, which its landing allocates
+    (`memory_landing`), its stores take (`memory_stored`) and its pending stores count (`memory_stores`)."""
+    return tuple(part_names(f"memory{i}_", call.memories.parts) for i in range(call.width // call.block))
+
+
 def memory_landing(call: Call, bv: int) -> dict:
-    """A walk's memory's landing tiles, one a key slice `[block, bv]` (`walk_stores`): `{memory0, ...}`."""
-    return {f"memory{i}": call.memories.landing(call.block, bv) for i in range(call.width // call.block)}
+    """A walk's memory's landing tiles, `[block, bv]` each (`memory_tiles`)."""
+    return {name: call.memories.landing(call.block, bv) for names in memory_tiles(call) for name in names}
+
+
+def memory_stores(call: Call) -> int:
+    """The stores a walk's step makes of its memory (`memory_stored`, `walk_stores`): a landing tile each
+    (`memory_tiles`)."""
+    return sum(len(names) for names in memory_tiles(call))
+
+
+def memory_stored(call: Call, ref, value, i: int, row, column, bv: int, lands: dict,
+                  before: Callable) -> None:
+    """Key slice `i` of a walk's memory, `value` `[block, bv]`, stored as the memories' parts
+    (`Call.memories`) at `row` and `column` of `ref`, each part through its own landing tile
+    (`memory_landing`) and left in flight after `before()` (`walk_stores`), a store of its own: through one
+    tile, a part's copy out waited for every store in flight before the next part was written there
+    (`mosaic.stored`), where the walk's stores overlap the next step's work (the states walk waiting each out
+    took 9.5% of its samples on an H100, SE-sass-h100-be7214123)."""
+    memories = call.memories
+    views = memories.views(ref, row, call.block, column, bv)
+    for piece, view, name in zip(memories.pieces(value), views, memory_tiles(call)[i], strict=True):
+        before()
+        call.family.stored([piece], [view], smem=lands[name], wait=False)
 
 
 def _landing_keys(landing: dict, family: mosaic.Family) -> dict:
@@ -1492,14 +1586,15 @@ def key_blocks(call: Call, *, contracted: bool = False) -> list[int]:
     return [block for block in whole_blocks(widest, unit) if call.width % block == 0]
 
 
-def launch_fits(call: Call, held: Held, staged: tuple, blocks: dict) -> bool:
+def launch_fits(call: Call, held: Held, staged: tuple, blocks: dict, *,
+                swizzles: dict[str, int] | None = None) -> bool:
     """Whether a launch fits its GPU one stage deep: its consumer thread's registers (`held`, beside its
     addresses into its staging and landing tiles, `staged`) within a thread's (`Family.registers`), and its
-    streams' `blocks` one deep beside that staging and landing within a block's shared memory
-    (`generation.shared_budget`), its bytes the launch's own (`shared_allocation`, as `launch_kernel` lays
-    it)."""
+    streams' `blocks` one deep (at their `swizzles` where given) beside that staging and landing within a
+    block's shared memory (`generation.shared_budget`), its bytes the launch's own (`shared_allocation`, as
+    `launch_kernel` lays it)."""
     staging, landing = staged
-    _, scope, _, _ = shared_allocation(call, blocks, staging, landing)
+    _, scope, _, _ = shared_allocation(call, blocks, staging, landing, swizzles=swizzles)
     registers = held.registers(call.family, addressed(staging, landing))
     return (resources.shared_bytes(call.family, scope(1)) <= generation.shared_budget(call.target)
             and registers <= call.family.registers(1))
@@ -2013,9 +2108,10 @@ def role_tiles(staging, landing: dict, walkers: int):
 def _write_staging(call: Call, bv: int) -> tuple:
     """A walk's staged right operands of its memory's prediction ('corrected': a key slice of the memory
     `[block, bv]`) and of its write ('write': the gated values `[C, bv]`, or the gated keys `[C, block]`
-    where the gate takes the keys' side, which no prediction reads): one tile where they are one shape."""
+    in their form (`Call.write_keys`) where the gate takes the keys' side, which no prediction reads): one
+    tile where they are one shape."""
     if call.gated_keys:
-        return staging_tiles(call.held, (call.chunk, call.block))
+        return staging_tiles(call.write_keys, (call.chunk, call.block))
     return staging_tiles(call.held, *dict.fromkeys(((call.block, bv), (call.chunk, bv))))
 
 
@@ -2055,15 +2151,16 @@ def _prefetched_ends(call: Call, prefix: tuple, head, n) -> tuple:
 def _keys_gated_write(call: Call, slots, keys: Operand, values: Operand, loaded, state, issue, role: int,
                       bv: int) -> list:
     """`_states`' step's memory where the write's gate takes the keys' side (`Call.gated_keys`): each key
-    row gated by its write gate and decay to the chunk's end, the values as they are
-    (`algebra.keys_gated_carried`), from `loaded` (`_states`' prefetch, a step ahead)."""
+    row gated by its write gate and decay to the chunk's end, in their form for the product
+    (`Call.write_keys`), the values as they are (`algebra.keys_gated_carried`), from `loaded` (`_states`'
+    prefetch, a step ahead)."""
     assert loaded is not None, "a decay a head's walk prefetches its prefix"
     (ending, ending_low), (gate, low), betas, memory = loaded
     ends = algebra.range_decay((ending, ending_low), (gate, low)) * betas
     return algebra.keys_gated_carried(
         state, lambda i: stream_tile(slots, "keys", keys, columns=pl.ds(i * call.block, call.block)),
         stream_tile(slots, "values", values, columns=pl.ds(role * bv, bv)), ends,
-        [algebra.raised(*memory)[:, None]] * (call.width // call.block), call.held.dtype, issue)
+        [algebra.raised(*memory)[:, None]] * (call.width // call.block), call.write_keys.dtype, issue)
 
 
 def _gated_write(call: Call, corrected, loaded) -> tuple:
@@ -2104,20 +2201,21 @@ def _states_held(call: Call, values: Operand, keys: Operand, bv: int) -> Held:
     chunk's prefix vectors (`prefetch`); a step's corrected and written values beside the values' block and
     a memory slice as a product's operand (and, where products read registers, a block of the weighted keys
     and of the keys); where the write's gate takes the keys' side (`Call.gated_keys`), a key block gated
-    in fp32 and narrowed beside the values' block instead."""
+    in fp32 and formed for its product (`Call.write_keys`) beside the values' block instead."""
     chunk = call.chunk
     held = call.held
     if call.gated_keys:
         carried = [f32(call.width, bv)] + [f32(chunk, 1)] * 5
-        # The write's gate on the keys' rows (`algebra.keys_gated_carried`): a key block in fp32 and narrowed
+        gated = call.write_keys
+        # The write's gate on the keys' rows (`algebra.keys_gated_carried`): a key block in fp32 and formed
         # for its product, beside the values' block as they are, and the product's own fp32 sum `[K_i, BV]`
         # before it joins the decayed memory slice: without it the model held a 128-wide value block that
         # spilled 520 bytes on an H100 (the resource gate's Nemotron-H 4B SSD forward alone).
         return Held(carried=carried, phases=([
-            f32(chunk, call.block), f32(call.block, bv), *held_tile(held, chunk, call.block),
+            f32(chunk, call.block), f32(call.block, bv), *held_tile(gated, chunk, call.block),
             *held_tile(values, chunk, bv),
             # The gated keys read transposed against the values (`algebra.keys_gated_carried`'s 'write').
-            *product_fragments(call, (held, call.block, chunk), (values, chunk, bv))],))
+            *product_fragments(call, (gated, call.block, chunk), (values, chunk, bv))],))
     # As the lowered peak counts it (jsf-states-held): the corrected and written values, the values' block,
     # a memory slice for the product, its fragments, the product's sums (a key block's, every block's where
     # a family's products overlap), and in parts (an fp32 call's) the split's remainder, the peeled last
@@ -2175,7 +2273,7 @@ def _states(k, w, u, prefix: tuple, beta, h0, sequences, taken, call: Call, tile
     width, value_width, bv, family = call.width, call.value_width, tiles.block_v, call.family
     slices, walkers = width // call.block, tiles.walkers
     walked_width = bv * walkers
-    held, memories = dataclasses.replace(call.held, rows=call.rows), call.memories
+    held = dataclasses.replace(call.held, rows=call.rows)
     batch = h0.shape[0] // (call.heads * width)
     initial = Operand(h0.shape[0], 1, jnp.dtype(jnp.float32))
     delta = w is not None
@@ -2215,8 +2313,8 @@ def _states(k, w, u, prefix: tuple, beta, h0, sequences, taken, call: Call, tile
 
         prefetch = (functools.partial(_prefetched_ends, call, prefix_refs, h) if call.per_key
                     else functools.partial(_prefetched, call, prefix_refs, None if delta else beta_ref, h))
-        # Each key slice of the memory and, where stored, the corrected values, a store each in flight.
-        before_store = walk_stores(family, width // call.block + int(stores_corrected))
+        # Each key slice's part of the memory and, where stored, the corrected values, a store each in flight.
+        before_store = walk_stores(family, memory_stores(call) + int(stores_corrected))
 
         def step(role):
             (staged, scratch), lands = roled(role)
@@ -2227,9 +2325,7 @@ def _states(k, w, u, prefix: tuple, beta, h0, sequences, taken, call: Call, tile
         def _states_step(lands, issue, scratch, column, role, n, slots, state, accumulators, loaded=None):
             span = pl.ds(n * chunk, chunk)
             for i, part in enumerate(state):
-                before_store()
-                memories.store(h_ref, part, memory(n, i), call.block, column, bv, family=family,
-                               smem=lands[f"memory{i}"], wait=False)
+                memory_stored(call, h_ref, part, i, memory(n, i), column, bv, lands, before_store)
             if call.gated_keys:
                 # The values as they are the write's operand and their own corrected values: none formed.
                 state = _keys_gated_write(call, slots, keys, values, loaded, state, issue, role, bv)

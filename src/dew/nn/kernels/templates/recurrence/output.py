@@ -59,15 +59,15 @@ class Normed:
 
 def _output_streams(call: Call, bv: int) -> tuple[dict, tuple]:
     """`output_launch`'s streamed blocks and its staging tiles at value blocks `bv` wide: a value block's
-    memory entered and values; under a decay a head the queries and keys, the scores staged once for every
-    value block's product; under one a key dimension the intra launch's scores, and each key block's gated
-    queries staged, their queries and prefix read from global memory at the first step alone
-    (`_gated_queries`), no stream's slots held for the walk: streamed, the queries' and two fp32 prefixes'
-    slots (a compensated prefix's halves) staged Kimi delta attention's output at 147,456 bytes at every
-    value block, past a 99 KB part's block (an sm86's, sm89's and sm120's: its call the port's there,
+    memory entered (as the output reads it, `Call.entered`) and values; under a decay a head the queries and
+    keys, the scores staged once for every value block's product; under one a key dimension the intra launch's
+    scores, and each key block's gated queries staged, their queries and prefix read from global memory at the
+    first step alone (`_gated_queries`), no stream's slots held for the walk: streamed, the queries' and two
+    fp32 prefixes' slots (a compensated prefix's halves) staged Kimi delta attention's output at 147,456 bytes
+    at every value block, past a 99 KB part's block (an sm86's, sm89's and sm120's: its call the port's there,
     jsf-kda-derive)."""
     chunk = call.chunk
-    width, held, memories = call.width, call.held, call.memories
+    width, held, memories = call.width, call.held, call.entered
     queries = {} if call.per_key else {"queries": ((chunk, width), call.given)}
     if call.per_key:
         given = {"scores": ((chunk, chunk), held)}
@@ -120,7 +120,7 @@ def _output_swizzle(call: Call, bv: int, staging: tuple, landing: dict, *, norme
     family = call.family
     swizzle = resources.widest_swizzle(call.given.stored, call.width)
     if not family.operands_in_registers:
-        swizzle = min(swizzle, family.right_swizzle(call.memories.stored, bv))
+        swizzle = min(swizzle, family.right_swizzle(call.entered.stored, bv))
     while swizzle > swizzling.NARROWEST_SWIZZLE_BYTES and (
             _output_held(call, bv, swizzle, normed=normed).registers(family, addressed(staging, landing))
             > family.registers(1)):
@@ -154,7 +154,7 @@ def _output_held(call: Call, bv: int, swizzle: int | None = None, *, normed: boo
     (`_gated_queries`). An epilogue's (`normed`) rows' sums carried across the steps, and at the last its
     phase of a block's read-back row, gate and normalized values (`_normed_step`)."""
     chunk = call.chunk
-    held, memories, given, family = call.held, call.memories, call.given, call.family
+    held, memories, given, family = call.held, call.entered, call.given, call.family
     products = largest_live_set(
         product_fragments(call, (given, chunk, call.block), (memories, call.block, bv)),
         product_fragments(call, (held, chunk, chunk), (held, chunk, bv)))
@@ -357,11 +357,12 @@ def output_launch(q, k, h, corrected, prefix: tuple, taken, beta, call: Call, ti
     `algebra.key_decayed_output`). Where the write gate takes the keys' side (`Call.gated_keys`) the scores'
     columns take `beta` `[HV, R]` before they are rounded, and a `skip` `[HV]` adds `D v` from the values the
     step holds (there the corrected ones). A `normed` call's rows leave through its row hook, its `sides`
-    laid over the output's `[R, HV * Dv]` as their axes say (`_normed_step`, `_normed_layout`)."""
+    laid over the output's `[R, HV * Dv]` as their axes say (`_normed_step`, `_normed_layout`). The memories
+    `h` are read as `Call.entered` gives them: a limbed call's leading limb alone."""
     chunk = call.chunk
     assert skip is None or call.gated_keys, "a skip reads the values a call whose keys take the gate holds"
     width, value_width, bv = call.width, call.value_width, tiles.output_block
-    held, memories, family = dataclasses.replace(call.held, rows=call.rows), call.memories, call.family
+    held, memories, family = dataclasses.replace(call.held, rows=call.rows), call.entered, call.family
     steps = value_width // bv
     # A decay a head's prefix read as a row's vectors and as a column's, each from its own operand; a key
     # dimension's a key block at a time (`_gated_queries`).
