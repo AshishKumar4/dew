@@ -81,15 +81,17 @@ def test_a_network_lane_runs_the_network_marked_tests_with_the_hub_open_and_reco
         "import os, pytest\nfrom pathlib import Path\n"
         "@pytest.mark.network\ndef test_reads_the_hub():\n"
         "    assert not {'HF_HUB_OFFLINE', 'HF_ENDPOINT'} & set(os.environ), 'the Hub is closed'\n"
-        "    Path('hub').write_text('ran')\n"
+        f"    Path('hub').write_text(os.environ.get('{tier_wire.GPU_TIER}', '-'))\n"
         "def test_offline():\n"
         "    assert os.environ['HF_HUB_OFFLINE'] == '1'\n"
-        "    Path('offline').write_text('ran')\n")
+        f"    Path('offline').write_text(os.environ.get('{tier_wire.GPU_TIER}', '-'))\n")
     hub, offline = tmp_path / "hub", tmp_path / "offline"
     lane = functools.partial(lane_rows, ci, tmp_path, ["tests/test_hub.py"], [hub, offline])
     assert lane(network=True) == [("3.12:tests/test_hub.py", 0)]
-    assert hub.is_file() and not offline.exists()
+    # The network lane's tests run under no GPU lane's word (tests/conftest.py would skip them as another's).
+    assert hub.read_text() == "-" and not offline.exists()
     assert lane() == [("3.12:tests/test_hub.py", 0)]
+    assert offline.read_text() == "1", "the CUDA lane's run is under its word (`tier_wire.GPU_TIER`)"
     assert offline.is_file() and not hub.exists(), "the CUDA lane's run is its own"
     assert lane(network=True) == [("3.12:tests/test_hub.py", 0)]
     assert not hub.exists(), "the network lane reuses its own green run on the same inputs"
@@ -117,28 +119,33 @@ def test_the_gpu_lane_runs_a_files_gpu_marked_tests_alone(tmp_path, lane):
     """The suite's conftest under the GPU lane's word (`tier_wire.GPU_TIER`, which the lane sets for a file
     it runs or prepares, whoever launched it): a file's test not marked gpu is skipped as another lane's, so
     a CPU test in a file that also holds a GPU one is neither prepared on the tier's compute-nothing device
-    (#4577, train 1448) nor run on a GPU beside the CPU lane's run of it; its gpu-marked test is not; the CPU
-    lane, without the word, runs the CPU test."""
+    (#4577, train 1448) nor run on a GPU beside the CPU lane's run of it, and its gpu-marked test runs; the
+    CPU lane, without the word, runs the CPU test. On this CPU host the GPU lane's side is its prepare (its
+    run's conftest reads the host's GPUs first), its GPU test one that prepares on the CPU."""
     site = tmp_path / "test_mixed.py"
-    site.write_text("import pytest\n\n\n@pytest.mark.gpu\ndef test_gpu():\n    pass\n\n\n"
-                    "def test_cpu():\n    pass\n")
+    site.write_text("import pytest\n\n\n@pytest.mark.gpu\n@pytest.mark.prepares\n"
+                    "def test_gpu():\n    pass\n\n\ndef test_cpu():\n    pass\n")
     tests = Path(__file__).resolve().parent
     environ = {key: value for key, value in os.environ.items()
                if key not in (tier_wire.GPU_TIER, tier_wire.TRUTHS, tier_wire.PREPARE)}
     environ.update({"PYTHONPATH": os.pathsep.join([str(tests), os.environ.get("PYTHONPATH", "")]),
-                    "CUDA_VISIBLE_DEVICES": "0", **({tier_wire.GPU_TIER: "1"} if lane == "gpu" else {})})
+                    "JAX_PLATFORMS": "cpu", "CUDA_VISIBLE_DEVICES": "0"})
+    if lane == "gpu":
+        environ.update({tier_wire.GPU_TIER: "1", tier_wire.PREPARE: "1"})
     report = tmp_path / "report.xml"
     done = subprocess.run([sys.executable, "-m", "pytest", "-q", "-p", "conftest", "-p", "no:cacheprovider",
                            f"--junitxml={report}", str(site)], cwd=tmp_path, env=environ, capture_output=True,
                           text=True)
     assert done.returncode == 0, done.stdout + done.stderr
-    cases = ElementTree.parse(report).iter("testcase")
-    skipped = {case.get("name"): node.get("message", "") for case in cases for node in case.iter("skipped")}
+    outcomes = {}
+    for case in ElementTree.parse(report).iter("testcase"):
+        skipped = case.find("skipped")
+        outcomes[case.get("name")] = "passed" if skipped is None else skipped.get("message", "")
     why = "the GPU tier runs gpu-marked tests alone"
-    assert why not in skipped.get("test_gpu", ""), skipped
-    assert (why in skipped.get("test_cpu", "")) == (lane == "gpu"), skipped
-    if lane == "cpu":
-        assert "test_cpu" not in skipped, skipped
+    if lane == "gpu":
+        assert outcomes["test_gpu"] == "passed" and why in outcomes["test_cpu"], outcomes
+    else:
+        assert outcomes["test_cpu"] == "passed" and why not in outcomes["test_gpu"], outcomes
 
 
 def test_a_lanes_prepare_runs_on_the_cpu_what_its_run_will_hold_and_records_nothing(
@@ -173,7 +180,8 @@ def test_a_lanes_prepare_runs_on_the_cpu_what_its_run_will_hold_and_records_noth
         "        log.write(' '.join([name, os.environ.get('JAX_PLATFORMS', '-'),\n"
         f"                            os.environ.get('{tier_wire.TRUTHS}', '-'),\n"
         f"                            os.environ.get('{tier_wire.UNIT}', '-'),\n"
-        f"                            os.environ.get('{tier_wire.PREPARE_BY}') or '-']) + chr(10))\n"
+        f"                            os.environ.get('{tier_wire.PREPARE_BY}') or '-',\n"
+        f"                            os.environ.get('{tier_wire.GPU_TIER}', '-')]) + chr(10))\n"
         + "".join(f"{'@pytest.mark.prepares' + chr(10) if index % 2 else ''}"
                   f"def test_{index}():\n    said('test_{index}')\n" for index in range(6)))
     (tmp_path / "tests/test_plain.py").write_text(LANE_TEST)
@@ -203,7 +211,8 @@ def test_a_lanes_prepare_runs_on_the_cpu_what_its_run_will_hold_and_records_noth
         lines = said("prepared")
         # Each told the unit it prepares, as the lane names it, under which its programs' memory is filed;
         # no time cap, as its run reads every program it prepares (only a dry prepare's is capped).
-        assert {tuple(line[1:]) for line in lines} == {("cpu", str(tmp_path / "truths"), name, "-")}
+        # And each under the GPU lane's word (`tier_wire.GPU_TIER`): it prepares gpu-marked tests alone.
+        assert {tuple(line[1:]) for line in lines} == {("cpu", str(tmp_path / "truths"), name, "-", "1")}
         prepared[group] = {line[0] for line in lines}
     assert fetched.is_file() and not lane_runs(tmp_path, "test_plain"), "one that prepares nothing is skipped"
     assert not stored, "a prepare records no row"
@@ -213,7 +222,9 @@ def test_a_lanes_prepare_runs_on_the_cpu_what_its_run_will_hold_and_records_noth
     for group in ("1/2", "2/2"):
         assert ci.gpu_lane("3.12", [f"tests/test_flows.py#{group}"], out, cache="on", processes=1,
                            deadline=600.0) == 0
-        assert {line[0] for line in said("ran")} & marked == prepared[group], group
+        ran = said("ran")
+        assert {line[0] for line in ran} & marked == prepared[group], group
+        assert {line[-1] for line in ran} == {"1"}, "its run under the lane's word as its prepare"
     assert stored, "its run's rows are recorded as any lane's"
 
 
