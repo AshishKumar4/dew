@@ -56,9 +56,12 @@ taken at one power a row over the pairs it sees (`_row_bounds`): its largest vis
 (`HELD`, the headroom threshold), a visible dot more than fp32's range below that largest held to plain
 fp32's parity (row 14033); the row's power taken by its second query before its products, so an entry of
 `r` more than fp32's range below the row's largest visible dot past `2^125` flushes, as plain fp32's
-product overflows there (Main's ruling on train 1444's review, row 14033). Every higher order
-differentiates the dense reference (`reference`), whose tails read as the plain formula's (row 14007): a
-lifted term meets a tangent or cotangent at its own size, its power taken first (`_shifted`).
+product overflows there (Main's ruling on train 1444's review, row 14033). Each value channel is taken
+to one power a tile over the keys its queries see (`_channel_powers`), the covariance's one `[Q, K] @
+[K, Dv]` contraction: a row's seen values more than fp32's range below another row's seen value of the same
+channel and key head are held to plain fp32's parity (Main's ruling of 2026-11-28, row 14033). Every higher
+order differentiates the dense reference (`reference`), whose tails read as the plain formula's (row 14007):
+a lifted term meets a tangent or cotangent at its own size, its power taken first (`_shifted`).
 
 It is XLA's alone: no launch of a Pallas mainloop (a GH200's Triton walk spilled at every backward tile and
 walked its forward 10 times the template's sdpa, M-NA-58b)."""
