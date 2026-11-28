@@ -512,8 +512,8 @@ def test_two_sites_opening_on_one_line_are_two_cells_by_their_labels(ci, tmp_pat
     (first,), (second,) = (json.loads((tmp_path / name / tier_wire.UNPREPARED).read_text())["reasons"]
                            for name in ("merged-forward", "merged-backward"))
     at = "tests/test_gpu_attention.py:83"
-    assert (first["where"], first["site"]) == (at, f"{tier_wire.LABELED}merged forward")
-    assert (second["where"], second["site"]) == (at, f"{tier_wire.LABELED}merged backward")
+    assert (first["where"], first["site"].partition("\n")[0]) == (at, f"{tier_wire.LABELED}merged forward")
+    assert (second["where"], second["site"].partition("\n")[0]) == (at, f"{tier_wire.LABELED}merged backward")
     main = {(test, first["where"], None, "site", first["site"])}
     found = {"name": "3.12:tests/test_gpu_attention.py#5/25@prepare-sm90", "exitCode": 0, "output": ""}
     left = {"test": test, "where": second["where"], "error": second["error"], "kind": "site",
@@ -525,10 +525,12 @@ def test_two_sites_opening_on_one_line_are_two_cells_by_their_labels(ci, tmp_pat
 
 
 def test_a_label_and_a_line_s_text_are_two_kinds_of_site_never_compared(ci):
-    """A site's identity is its Check 1 label (tests/tier_wire.py's `LABELED`) or, in a baseline written
-    before labels were kept, its line's text: two kinds a grade never compares (prepares.py's `knowing`), so a
-    site unchanged since an older baseline stays green; two labels are compared, an A→B swap red; and a flow's
-    cell is its label (`cell`) whatever its site says (train 1498's F1)."""
+    """A site's identity is its Check 1 label (tests/tier_wire.py's `LABELED`), its line's text beside it, or,
+    in a baseline written before labels were kept, that text alone (prepares.py's `knowing`): a site
+    unchanged since an older baseline stays green by its text; a label held to an older baseline's other site
+    is red (train 1499's F1: main left `verify_a()` unprepared, the head fixed it and left site B); two labels
+    are compared, an A→B swap red; and a flow's cell is its label (`cell`) whatever its site says (train
+    1498's F1)."""
     name = "3.12:tests/test_gpu_attention.py#5/25@prepare-sm90"
     test = "tests/test_gpu_attention.py::test_merged"
     where = "tests/test_gpu_attention.py:83"
@@ -540,11 +542,16 @@ def test_a_label_and_a_line_s_text_are_two_kinds_of_site_never_compared(ci):
                                    lambda named: ci.grading.owning(ci.parsed_row(named)[1]),
                                    ci.grading.STALE, ci.tier_wire().CAPPED, label_prefix=labeled)
         return row
-    site = {"test": test, "where": where, "error": "e", "kind": "site", "site": f"{labeled}merged forward"}
+    site = {"test": test, "where": where, "error": "e", "kind": "site",
+            "site": f"{labeled}merged forward\nassert_as_exact("}
     old_site = {(test, where, None, "site", "assert_as_exact(")}
     assert graded([site], old_site)["exitCode"] == 0
-    swapped = {(test, where, None, "site", f"{labeled}merged backward")}
+    swapped = {(test, where, None, "site", f"{labeled}merged backward\nassert_as_exact(")}
     assert graded([site], swapped)["new_unprepared"] == [f"{test} @ {where}"]
+    later = "tests/test_gpu_attention.py:112"
+    site_b = {"test": test, "where": later, "error": "e", "kind": "site", "site": f"{labeled}B\nverify_b()"}
+    old_a = {(test, where, None, "site", "verify_a()")}
+    assert graded([site_b], old_a)["new_unprepared"] == [f"{test} @ {later}"]
     flow = {"test": test, "where": where, "error": "e", "kind": "flow", "cell": "merged forward",
             "site": f"{labeled}merged forward"}
     old_flow = {(test, where, "merged forward", "flow", "assert_as_exact(")}

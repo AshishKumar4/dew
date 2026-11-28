@@ -698,5 +698,14 @@ def test_a_prepares_failure_inside_a_site_is_recorded_by_its_label(tmp_path):
         recorded_unprepared(tmp_path / "outside", test, outside)
     (inside_reason,) = json.loads((tmp_path / "inside" / UNPREPARED).read_text())["reasons"]
     (outside_reason,) = json.loads((tmp_path / "outside" / UNPREPARED).read_text())["reasons"]
-    assert inside_reason["site"] == f"{tier_wire.LABELED}a site whose draw fails"
+    assert inside_reason["site"].partition("\n")[0] == f"{tier_wire.LABELED}a site whose draw fails"
     assert outside_reason["site"] == 'raise ValueError("a draw that cannot be made")'
+    # A site's failure caught leaves no label on a later failure outside any site (train 1499's F2).
+    with compiled_truths(tmp_path / "later", prepare=True, stamp="here"):
+        with pytest.raises(ValueError):
+            assert_as_exact(_combined, _combined, failing, "a site whose failure is caught", seeds=8)
+        with pytest.raises(ValueError) as later:
+            failing(1)
+        recorded_unprepared(tmp_path / "later", test, later)
+    (later_reason,) = json.loads((tmp_path / "later" / UNPREPARED).read_text())["reasons"]
+    assert later_reason["site"] == 'raise ValueError("a draw that cannot be made")'

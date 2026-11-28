@@ -352,18 +352,12 @@ def judged_on_zeros(excinfo) -> bool:
 
 def recorded_unprepared(store: Path, test: str, excinfo) -> str:
     """A test's failure in its prepare (`excinfo`) recorded unprepared in its `store`
-    (`truths_ahead.unprepared`), and where it stood: the Check 1 site it stopped in its identity
-    (`CompiledTruths.preparing`'s tried and not done, a site's label and not its arms' beside it, the labels
-    joined where it stopped in several), its line's text alone where it stopped in none."""
-    import store_wire
-    from truths_ahead import UNPREPARED, unprepared
+    (`truths_ahead.unprepared`), and where it stood: the Check 1 site the failure escaped its identity
+    (`truths_ahead.stopped_in`, the innermost site's), its line's text alone where it escaped none."""
+    from truths_ahead import UNPREPARED, stopped_in, unprepared
 
-    compiled = store_wire.COMPILED.get()
-    open_ = sorted(compiled.tried - compiled.done) if compiled is not None else []
-    # A site's own label, never its arms' beside it (`arm_store.armed`: the label, then ", its arms").
-    open_ = [label for label in open_ if not any(label.startswith(f"{other}, ") for other in open_)]
     frames = [(str(entry.path), entry.lineno + 1) for entry in reversed(excinfo.traceback)]
-    unprepared(store, test, frames, excinfo.exconly().splitlines()[0][:400], site=" | ".join(open_) or None)
+    unprepared(store, test, frames, excinfo.exconly().splitlines()[0][:400], site=stopped_in(excinfo.value))
     return json.loads((store / UNPREPARED).read_text())["where"]
 
 
