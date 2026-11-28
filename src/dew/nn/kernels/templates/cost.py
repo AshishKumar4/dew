@@ -18,6 +18,7 @@ from collections.abc import Sequence
 from typing import TYPE_CHECKING, NamedTuple
 
 import jax
+import jax.numpy as jnp
 from jax.experimental import pallas as pl
 
 from dew.nn.kernels import generation
@@ -40,7 +41,7 @@ def stored(*arrays) -> int:
     from dew.nn.kernels.templates import resources
 
     return int(sum(resources.stored_bytes(array.shape, array.dtype) for array in arrays
-                   if not jax.dtypes.issubdtype(array.dtype, jax.dtypes.extended)))
+                   if not jnp.issubdtype(array.dtype, jax.dtypes.extended)))
 
 
 @dataclasses.dataclass(frozen=True)
