@@ -12,6 +12,7 @@ import numpy as np
 import optax
 import pytest
 from flax import linen as nn
+from map_judge import marked_seeds
 from model_support import TINY_DECODER, scanning, stacked_as, under_kernels, unrolled
 from reference_error import assert_as_exact, dew_path, widened
 from token_support import token_rows
@@ -805,8 +806,11 @@ loop or within a nested jit."""
                  marks=pytest.mark.check1_shards(seeds=64, per_task=32)),
     pytest.param("bfloat16", 1.0, False, "lm", id="bf16-clipped",
                  marks=pytest.mark.check1_shards(seeds=64, per_task=32)),
+    # Sized at 128 (a qualification run at the attention fix-forward of train 1473, 6475891db6): train 1368's
+    # F2, a masked call's hidden keys -inf and its massless rows weighed nothing on the reference path,
+    # moved the periodic stack's rounding, and 64 seeds left it Inconclusive.
     pytest.param("float32", 0.0, True, "lm", id="periodic",
-                 marks=pytest.mark.check1_shards(seeds=64, per_task=32)),
+                 marks=pytest.mark.check1_shards(seeds=128, per_task=32)),
     pytest.param("float32", 0.0, False, "penalized", id="direct-reader",
                  marks=pytest.mark.check1_shards(seeds=64, per_task=32)),
     pytest.param("float32", 0.0, False, "branched", id="branched",
@@ -826,7 +830,7 @@ loop or within a nested jit."""
     pytest.param("float32", 0.0, False, "substituted", id="constant-substitute",
                  marks=pytest.mark.check1_shards(seeds=64, per_task=32)),
 ])
-def test_an_accumulating_scanned_step_matches_unrolled(dtype, clip, periodic, objective):
+def test_an_accumulating_scanned_step_matches_unrolled(dtype, clip, periodic, objective, request):
     """A scanned step accumulating a window of two batches each split in two, its parts of unequal token
     counts (padding scored as none), leaves its parameters and optimizer state after two updates on par
     with the unrolled step's (check 1, against one device's float64 unrolled step), on two devices
@@ -836,7 +840,8 @@ def test_an_accumulating_scanned_step_matches_unrolled(dtype, clip, periodic, ob
     its loss reads a run beside a term on its weights, in a branch, in a loop, within a nested jit or
     through a transpose of its weights, a permuting reshape, with two of its weights swapped or one
     replaced by a constant (`_read_once`)."""
-    _on_par_unrolled(dtype, clip, objective, periodic=periodic, batches=2, split=2)
+    _on_par_unrolled(dtype, clip, objective, periodic=periodic, batches=2, split=2,
+                     seeds=marked_seeds(request))
 
 
 @pytest.mark.mesh(devices=2)
@@ -885,7 +890,8 @@ def test_a_scanned_step_whose_loss_casts_its_weights_keeps_them_unrounded():
     assert gridded < sum(leaf.size for leaf in leaves) / 2, gridded
 
 
-def _on_par_unrolled(dtype: str, clip: float, objective: str, *, periodic: bool, batches: int, split: int):
+def _on_par_unrolled(dtype: str, clip: float, objective: str, *, periodic: bool, batches: int, split: int,
+                     seeds: int = ACCUMULATING_SEEDS):
     """Check 1 of a scanned step against the unrolled step, each over four batches of four rows, an update
     every `batches` of them each split in `split`, `objective`'s loss (`OBJECTIVES`), in `dtype`, clipped
     at `clip`, over a periodic stack where `periodic`, on two devices splitting its parameters, against
@@ -963,7 +969,7 @@ def _on_par_unrolled(dtype: str, clip: float, objective: str, *, periodic: bool,
         return np.stack(batches), np.int64(seed)
 
     assert_as_exact(stepped(scan=True), stepped(scan=False), draw, f"a scanned step over {objective}",
-                    seeds=ACCUMULATING_SEEDS, truth_fn=stepped(scan=False, exact=True))
+                    seeds=seeds, truth_fn=stepped(scan=False, exact=True))
 
 
 
