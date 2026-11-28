@@ -27,6 +27,7 @@ from .programs import (
     called,
     cumulative,
     generated,
+    high_expansion,
     loop_programs,
     opaque,
     platform_branch,
@@ -260,7 +261,8 @@ def traced_flops[**Arguments, Result](function: Callable[Arguments, Result], *ar
     """The forward work of `function` on `arguments` (arrays, or their `jax.ShapeDtypeStruct`s): two FLOPs a
     multiply-add of every matrix product and convolution its traced program runs (`dot_general`,
     `conv_general_dilated`), a scan's body times its length, a branch's the costliest of them, and the
-    program an operation calls (a jitted call's, a rematerialized one's, a custom derivative's primal).
+    program an operation calls (a jitted call's, a rematerialized one's, a custom derivative's primal, a
+    high-level operation's expansion: `programs.high_expansion`).
     Pointwise work is excluded, as the analytical counts exclude it. For a model whose work no closed form
     here counts (a world model's loss with its imagination). The program is traced as for a CPU, where every
     product is one the jaxpr shows (a GPU's kernels are custom calls, whose products it does not), and of a
@@ -268,7 +270,8 @@ def traced_flops[**Arguments, Result](function: Callable[Arguments, Result], *ar
     products (a CPU's sums them wide, `dew.nn.precision`). A grouped product (`ragged_dot_general`, a
     mixture's experts on a CPU) counts its rows' products, each against its own group's matrix. An
     operation that does no product (an entrywise or positionwise one, one that moves entries, a reduction,
-    a cumulative one, a scatter, one that reads no operand: `dew.nn.programs`' facts, as JAX states them)
+    a cumulative one, a scatter, one that makes its value from no operand: `dew.nn.programs`' facts, as JAX
+    states them)
     costs nothing here where no program it runs does a product (a scatter's updater), as does a while loop
     whose body and condition do none, whatever its trips. Any other is refused by name, never counted as
     nothing: a while loop's trips where it does a product, a scatter's updater's, a kernel launch's work
@@ -276,9 +279,10 @@ def traced_flops[**Arguments, Result](function: Callable[Arguments, Result], *ar
     primitive of another library's)."""
     from dew.nn.kernels.generation import assumed
 
+    # Counted under the CPU it is traced for, so a high-level operation's expansion (`high_expansion`) is the
+    # one its trace staged (train 1493's review of theme 87).
     with assumed("cpu"):
-        traced = jax.make_jaxpr(function)(*arguments, **keywords)
-    return _program_flops(traced)
+        return _program_flops(jax.make_jaxpr(function)(*arguments, **keywords))
 
 
 def _program_flops(program: jaxpr_core.Jaxpr) -> float:
@@ -321,6 +325,10 @@ def _program_flops(program: jaxpr_core.Jaxpr) -> float:
                 raise MissingFlopsCount("a while loop's trips are unknown to a traced count")
         elif (body := called(equation)) is not None:
             total += _program_flops(body)
+        elif (expansion := high_expansion(equation)) is not None:
+            # A high-level operation's work its expansion's, as it lowers (`linear_map`'s, a softmax's
+            # tangent: train 1493's review).
+            total += _program_flops(expansion)
         elif opaque(equation):
             raise MissingFlopsCount(f"{primitive.name} launches a kernel whose work its trace does not show")
         elif not _productless(equation):

@@ -519,8 +519,8 @@ _KINDS: dict[str, tuple[tuple[ModuleType, tuple[str, ...]], ...]] = {
     # shape), a bitcast between widths, a polynomial over its coefficients, a staged value.
     "positionwise": (
         (_LAX, ("bitcast_convert_type_p", "polynomial_p", "stage_p")),
-        (_EXTENDED, ("random_bits_p", "random_clone_p", "random_fold_in_p", "random_seed_p", "random_split_p",
-                     "random_unwrap_p", "random_wrap_p")),
+        (_EXTENDED, ("random_bits_p", "random_clone_p", "random_fold_in_p", "random_gamma_p", "random_seed_p",
+                     "random_split_p", "random_unwrap_p", "random_wrap_p")),
         # The identity `jax.experimental.xla_metadata.set_xla_metadata` tags a value with, which JAX
         # defines in its private module alone and batches as a vectorized operation (train 1368's review).
         (_XLA_METADATA, ("xla_metadata_value_p",))),
@@ -657,6 +657,31 @@ def _of(equation: jcore.JaxprEqn, primitive: jcore.Primitive) -> Mapping:
     if equation.primitive is not primitive:
         raise TypeError(f"{equation.primitive.name} is not {primitive.name}, whose programs were asked of it")
     return equation.params
+
+
+def high_expansion(equation: jcore.JaxprEqn) -> jcore.Jaxpr | None:
+    """The program a high-level operation (`jax.experimental.hijax.HiPrim`, bound as JAX's
+    `call_hi_primitive`) runs as it lowers, its expansion (`HiPrim.expand`, JAX's `to_lojax`) traced as JAX's
+    own lowering expands it (`partial_eval.lower_jaxpr`): in the context its equation was staged in
+    (`equation.ctx`: its mesh, its metadata), a literal operand its value and every other its type; None for
+    any other equation. Its own derivatives and transpose are the operation's rules, not its expansion's: a
+    reader of the work it does reads this (`flops.traced_flops`)."""
+    from jax._src import hijax
+
+    if equation.primitive is not hijax.call_hi_primitive_p:
+        return None
+    literals = {index: operand.val for index, operand in enumerate(equation.invars)
+                if isinstance(operand, jcore.Literal)}
+
+    def expansion(*traced):
+        given = iter(traced)
+        operands = [literals[index] if index in literals else next(given)
+                    for index in range(len(equation.invars))]
+        return equation.primitive.to_lojax(*operands, **equation.params)
+
+    avals = [operand.aval for index, operand in enumerate(equation.invars) if index not in literals]
+    with equation.ctx.manager:
+        return jax.make_jaxpr(expansion)(*avals).jaxpr
 
 
 def scan_body(equation: jcore.JaxprEqn) -> jcore.Jaxpr:

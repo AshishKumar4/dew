@@ -355,9 +355,7 @@ def _removed(tree: Path) -> None:
             _emptied(root, log)
         # Its name removed while the folder it named is held open, so no other folder takes its inode; one
         # no right of this process reads (a mode an earlier tree's restored on it) removed where it is empty.
-        if not os.path.samestat(os.lstat(tree), named):
-            raise FileExistsError(errno.EEXIST, "another entry took its name while it was removed", str(tree))
-        os.rmdir(tree)
+        _rmdir_held(None, os.fspath(tree), named, log)
     except OSError as left:
         # A save's own leftover, named for whoever clears it; the save's outcome is its own.
         log.warning("could not remove a save's discarded tree %s: %s", tree, left)
@@ -482,11 +480,12 @@ def _listed(folder: int, log: logging.Logger) -> Iterator[str]:
         return iter(())
 
 
-def _rmdir_held(folder: int, name: str, held: os.stat_result, log: logging.Logger) -> None:
-    """The folder `name` of the folder the descriptor `folder` holds removed where it is still the entry
-    `held` (`_emptied`): its caller holds it open where a descriptor can, so no other folder takes its inode;
-    a stat and a removal apart, not one call; a failure logged, not raised. The one checked removal of a
-    folder of a discarded tree."""
+def _rmdir_held(folder: int | None, name: str, held: os.stat_result, log: logging.Logger) -> None:
+    """The folder `name` of the folder the descriptor `folder` holds (a path where `folder` is None: a
+    discarded tree's root, whose parent no descriptor holds) removed where it is still the entry `held`
+    (`_emptied`, `_removed`): its caller holds it open where a descriptor can, so no other folder takes its
+    inode; a stat and a removal apart, not one call; a failure logged, not raised. The one checked removal of
+    a folder of a discarded tree, its root's too (train 1493's review)."""
     try:
         if not os.path.samestat(os.stat(name, dir_fd=folder, follow_symlinks=False), held):
             raise FileExistsError(errno.EEXIST, "another entry took its name while it was removed", name)
