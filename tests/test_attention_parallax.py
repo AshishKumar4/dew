@@ -990,6 +990,8 @@ def test_a_subnormal_term_decays_and_raises_before_it_rounds():
     least = jnp.float32(2.0 ** -149)
     assert float(attention_parallax.exp_scaled(least, jnp.float32(0.0), 149)) == 1.0
     assert float(attention_parallax.exp_scaled(jnp.float32(3 * 2.0 ** -149), jnp.float32(0.0), 148)) == 1.5
+    # Past fp32's largest, its infinity, no NaN of the exact value's difference (round 2 of the confirm).
+    assert float(attention_parallax.exp_scaled(jnp.float32(1.0), jnp.float32(0.0), 128)) == float("inf")
 
 def test_a_float64_second_product_keeps_its_keys_apart():
     """Parallax (`attention_parallax.attend`) with x64 on over fp32 queries, keys and values (zeros, and

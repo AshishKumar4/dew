@@ -176,7 +176,8 @@ def exp_scaled(z: jax.Array, exponent: jax.Array, power) -> jax.Array:
     big = jnp.abs(held) >= 1
     exact = jnp.where(finite, _decayed(jnp.where(big, held * 0.5, held), jax.lax.stop_gradient(scale),
                                        jax.lax.stop_gradient(powers) + jnp.where(big, 1.0, 0.0) - up), 0.0)
-    return decayed + jax.lax.stop_gradient(exact - decayed)
+    # The exact value where it differs (an infinity, past fp32's range, equal in both: no `inf - inf`).
+    return jnp.where(exact == decayed, decayed, decayed + jax.lax.stop_gradient(exact - decayed))
 
 
 def _decayed(lifted: jax.Array, scale: jax.Array, powers: jax.Array) -> jax.Array:
