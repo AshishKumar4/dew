@@ -267,7 +267,8 @@ def blocks_quantized(w: jax.Array, *, k_major: bool = False) -> tuple[jax.Array,
     no pass reads the matrix transposed but a K-major one's codes, written transposed as they are formed
     (row 4518: one reduction over a block's both axes shared the codes' fp32 matrix, which XLA then wrote
     through a 6.7 ms transposing fusion of an 8.8 ms quantization on a GH200, M-NG-67f). A depth an
-    Explicit axis splits in whole blocks keeps its split."""
+    Explicit axis splits in whole blocks keeps its split: each reshape splits or merges one axis, as an
+    Explicit placement's reshape takes it (the single 5-D reshape was refused there)."""
     from dew.nn import fake_quant
     from dew.nn.float_bits import largest_magnitude
 
@@ -276,11 +277,14 @@ def blocks_quantized(w: jax.Array, *, k_major: bool = False) -> tuple[jax.Array,
     rows = largest_magnitude(w.reshape(groups, depth, width // edge, edge), -1)
     amax = largest_magnitude(rows.reshape(groups, depth // edge, edge, width // edge), 2)
     scale = fake_quant.fp8_block_scale(amax.astype(at_least_fp32(w.dtype)))
-    tiles, spread = w.reshape(groups, depth // edge, edge, width // edge, edge), scale[:, :, None, :, None]
+    tiles = w.reshape(groups, depth // edge, edge, width).reshape(groups, depth // edge, edge, width // edge, edge)
+    spread = scale[:, :, None, :, None]
     if k_major:
         tiles, spread = tiles.transpose(0, 3, 4, 1, 2), spread.transpose(0, 3, 4, 1, 2)
     codes = fake_quant.fp8_codes(tiles.astype(at_least_fp32(w.dtype)) / spread)
-    return codes.reshape((groups, width, depth) if k_major else w.shape).astype(jnp.float8_e4m3fn), scale
+    outer, inner = (width, depth) if k_major else (depth, width)
+    codes = codes.reshape(groups, outer // edge, edge, inner).reshape(groups, outer, inner)
+    return codes.astype(jnp.float8_e4m3fn), scale
 
 
 def _quantized_rows_product(rows, rows_scales, w, sizes, out_dtype, interpret) -> jax.Array:

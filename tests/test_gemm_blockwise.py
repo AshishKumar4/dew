@@ -616,7 +616,7 @@ def test_a_nan_in_a_weight_block_among_normal_draws_scales_that_block_alone(dtyp
 def test_a_bank_split_by_whole_depth_blocks_quantizes_on_an_explicit_mesh(k_major):
     """`projections.blocks_quantized` of a bank whose depth an Explicit axis splits in whole 128-row blocks,
     jitted, natural or K-major: its codes and scales bitwise the unsplit bank's (theme 22's review: a scale
-    spread by `jnp.repeat` over the split axis was refused)."""
+    spread by `jnp.repeat` over the split axis was refused, and main's one reshape splitting both axes)."""
     from jax.sharding import NamedSharding, PartitionSpec
 
     w = np.random.default_rng(4518).normal(size=(2, 512, 256)).astype(np.float32)
