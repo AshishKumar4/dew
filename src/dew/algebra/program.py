@@ -42,6 +42,7 @@ from dew.nn.programs import (
     inlined,
     is_inlined_call,
     live,
+    platform_branch,
     with_bodies,
     with_bodies_of,
     with_equations,
@@ -1215,38 +1216,46 @@ def _entry(equation: jcore.JaxprEqn) -> str | None:
     return "opened" if _opening(equation) is not None else None
 
 
-def _entered(equation: jcore.JaxprEqn, region: Callable[[jcore.Jaxpr, bool, bool], jcore.Jaxpr],
-             opened: Callable[[jcore.Jaxpr], jcore.Jaxpr]) -> dict:
+def _entered(equation: jcore.JaxprEqn, region: Callable[[jcore.Jaxpr, int, bool, bool], jcore.Jaxpr],
+             opened: Callable[[jcore.Jaxpr, int], jcore.Jaxpr]) -> dict:
     """`equation`'s parameters with each body the pass enters (`_entry`) rebuilt, in the context it enters
-    them in (`_entering`), one at a time in the order `with_bodies` reads them: one the pass rewrites as a
-    region of its own by `region(body, cleaned, mapped)` (`cleaned`: its caller's dead-code elimination
-    entered it, `_read`; `mapped`: a manual mesh's, its scope its own), where the pass rewrites it at all
-    (`_rewritable`, else kept as it is); an opened Algebra span's by `opened(body)`, its math left to the
-    region it opens into (`_opened`). The parameters themselves for an opaque leaf. The one dispatch the
-    pass's rewrite (`_within`) and a search's walk of its bodies (`fused_bodies`) enter bodies by."""
+    them in (`_entering`), one slot at a time in the order `with_bodies` reads them, each by its slot's
+    number among them (one body two slots hold, two numbers): one the pass rewrites as a region of its own by
+    `region(body, number, cleaned, mapped)` (`cleaned`: its caller's dead-code elimination entered it,
+    `_read`; `mapped`: a manual mesh's, its scope its own), where the pass rewrites it at all (`_rewritable`,
+    else kept as it is); an opened Algebra span's by `opened(body, number)`, its math left to the region it
+    opens into (`_opened`). The parameters themselves for an opaque leaf. The one dispatch the pass's rewrite
+    (`_within`) and a search's walk of its bodies (`fused_bodies`) enter bodies by."""
     entry = _entry(equation)
     if entry is None:
         return equation.params
     cleaned = equation.primitive in partial_eval.dce_rules
-    with _entering(equation, entry):
+    slots = itertools.count()
+
+    def entered(body: jcore.Jaxpr) -> jcore.Jaxpr:
+        number = next(slots)
         if entry == "opened":
-            return with_bodies(equation.params, opened)
-        return with_bodies(equation.params, lambda body: region(body, cleaned, entry == "mapped")
-                           if _rewritable(body) else body)
+            return opened(body, number)
+        return region(body, number, cleaned, entry == "mapped") if _rewritable(body) else body
+
+    with _entering(equation, entry):
+        return with_bodies(equation.params, entered)
 
 
 def fused_bodies[Weighed](jaxpr: jcore.Jaxpr,
-                          weigh: Callable[[tuple[tuple[str, int, int], ...], jcore.Jaxpr], Weighed]
-                          ) -> list[Weighed]:
+                          weigh: Callable[[tuple[tuple[str, int, int], ...], jcore.Jaxpr], Weighed], *,
+                          platform: str | None = None) -> list[Weighed]:
     """`weigh` of each body the pass with kernels weighs product regions in (`fusion.fused_program`,
     `_rewritten`), each called in the context the pass weighs it in (a manual mesh's body and those within it
     in the map's): `jaxpr` where it holds equations (`_passed`), and each body within it the pass rewrites as
     a region of its own, entered as the pass enters it (`_entered`), each by its path from `jaxpr` (each step
-    its equation's primitive's name, its place and the body's number in the order the pass enters them) and
-    as the pass reads it (`_read`: its unread work dropped, which the places a path names are of). An Algebra
-    span opened into its caller weighs no body of its own, its bodies' own walked; nor does an opaque leaf,
-    nor a body the pass keeps as it is. Windows are not derived: an Algebra span a window's form lands across
-    stays open in its caller, its products weighed there, which this walk does not see."""
+    its equation's primitive's name, its place and the body's number among its equation's bodies) and as the
+    pass reads it (`_read`: its unread work dropped, which the places a path names are of). An Algebra span
+    opened into its caller weighs no body of its own, its bodies' own walked; nor does an opaque leaf, nor a
+    body the pass keeps as it is. Windows are not derived: an Algebra span a window's form lands across stays
+    open in its caller, its products weighed there, which this walk does not see. With `platform` (a
+    lowering's, `programs.lowering_platform`), a platform choice's branches but the one a program lowered for
+    it runs (`programs.platform_branch`) are passed by: the pass weighs every branch, a launch runs one."""
     weighed: list[Weighed] = []
 
     def walk(body: jcore.Jaxpr, path: tuple, *, cleaned: bool, own: bool) -> None:
@@ -1254,17 +1263,23 @@ def fused_bodies[Weighed](jaxpr: jcore.Jaxpr,
         if own:
             weighed.append(weigh(path, read))
         for place, equation in enumerate(read.eqns):
-            enter(equation, path, place)
+            if _entry(equation) is not None:
+                enter(equation, path, place)
 
     def enter(equation: jcore.JaxprEqn, path: tuple, place: int) -> None:
-        numbers = itertools.count()
+        # A platform choice's branch a lowering for `platform` runs, by its slot (its branches' own), the
+        # others passed by.
+        platforms = (equation.params.get("branches_platforms") if equation.primitive is jax.lax.cond_p
+                     else None)
+        runs = None if platform is None or platforms is None else platform_branch(platforms, platform)
 
-        def region(inner: jcore.Jaxpr, cleaned: bool, _mapped: bool) -> jcore.Jaxpr:
-            walk(inner, (*path, (equation.primitive.name, place, next(numbers))), cleaned=cleaned, own=True)
+        def region(inner: jcore.Jaxpr, number: int, cleaned: bool, _mapped: bool) -> jcore.Jaxpr:
+            if runs is None or number == runs:
+                walk(inner, (*path, (equation.primitive.name, place, number)), cleaned=cleaned, own=True)
             return inner
 
-        def opened(inner: jcore.Jaxpr) -> jcore.Jaxpr:
-            walk(inner, (*path, (equation.primitive.name, place, next(numbers))), cleaned=True, own=False)
+        def opened(inner: jcore.Jaxpr, number: int) -> jcore.Jaxpr:
+            walk(inner, (*path, (equation.primitive.name, place, number)), cleaned=True, own=False)
             return inner
 
         _entered(equation, region, opened)
@@ -1299,11 +1314,11 @@ def _within(jaxpr: jcore.Jaxpr, accurate: bool, saturation: Saturation, kernels:
     equations = []
     # A region's body rewritten in place (a manual mesh's in its own scope, `_entered`), an opened Algebra
     # span's own bodies rewritten, its math left to the region it opens into (`_opened`).
-    def region(body: jcore.Jaxpr, cleaned: bool, mapped: bool) -> jcore.Jaxpr:
+    def region(body: jcore.Jaxpr, _number: int, cleaned: bool, mapped: bool) -> jcore.Jaxpr:
         scope = None if mapped else _scope
         return _closed(body, accurate, saturation, kernels, _cleaned=cleaned, _scope=scope)
 
-    def opened(body: jcore.Jaxpr) -> jcore.Jaxpr:
+    def opened(body: jcore.Jaxpr, _number: int) -> jcore.Jaxpr:
         return _within(body, accurate, saturation, kernels, _scope=_scope)
 
     for equation in jaxpr.eqns:
