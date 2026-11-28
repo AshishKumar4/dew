@@ -863,3 +863,35 @@ def test_a_small_value_direction_meets_lifted_terms_at_their_size(arm):
     _, tangent = jax.jvp(lambda value: attend(query, second, key, second_key, value, spans), (value,),
                          (direction,))
     np.testing.assert_array_equal(np.asarray(tangent), np.full((1, 1, 1, 4), -(2.0 ** -56), np.float32))
+
+
+@pytest.mark.parametrize("arm", ["walk", "reference"])
+def test_a_channels_power_is_its_own_before_its_products(arm):
+    """Eight equal logits, second products `[2^100, -2^100, 2^70, -2^70, 0, 0, 0, 0]`, a channel of `2^127`
+    on the last four keys beside one of `[0, 0, 2^-124, -2^-124, 0, 0, 0, 0]`: the output `[2^126, -2^-56]`,
+    each channel taken to its own power before its products (`attention_parallax._channel_powers`), where the
+    first channel's power took the second's products to `2^-165` (train 1444's review)."""
+    seconds = (2.0 ** 100, -(2.0 ** 100), 2.0 ** 70, -(2.0 ** 70), 0.0, 0.0, 0.0, 0.0)
+    query, second, key, second_key, _, spans = _witness((0.0,) * 8, seconds, (0.0,) * 8, width=2)
+    value = jnp.stack([jnp.asarray((0.0,) * 4 + (2.0 ** 127,) * 4, jnp.float32),
+                       jnp.asarray((0.0, 0.0, 2.0 ** -124, -(2.0 ** -124), 0.0, 0.0, 0.0, 0.0), jnp.float32)],
+                      axis=-1)[None, :, None]
+    attend = attention_parallax.attend if arm == "walk" else attention_parallax.reference
+    out = attend(query, second, key, second_key, value, spans)
+    np.testing.assert_array_equal(np.asarray(out)[0, 0, 0],
+                                  np.asarray([2.0 ** 126, -(2.0 ** -56)], np.float32))
+
+
+@pytest.mark.parametrize("arm", ["walk", "reference"])
+def test_a_values_tangent_meets_its_mean_before_it_lands(arm):
+    """Equal logits, second products `[8, 0]`, values 0 along `[2^127, 0]`: the output's tangent plain fp32's
+    `-3 · 2^126` (the first value's coefficient `w (1 - τ)` is `-1.5`), the values' direction met by the one
+    contraction `Σ w (1 - τ) dv` (`attention_parallax._dense`), where the covariance's tangent `2^128`
+    overflowed before the mean's `2^126` met it (train 1444's review)."""
+    query, second, key, second_key, value, spans = _witness((0.0, 0.0), (8.0, 0.0), (0.0, 0.0))
+    attend = attention_parallax.attend if arm == "walk" else attention_parallax.reference
+    direction = jnp.broadcast_to(jnp.asarray([2.0 ** 127, 0.0], jnp.float32)[None, :, None, None],
+                                 value.shape)
+    _, tangent = jax.jvp(lambda value: attend(query, second, key, second_key, value, spans), (value,),
+                         (direction,))
+    np.testing.assert_array_equal(np.asarray(tangent), np.full((1, 1, 1, 4), -3.0 * 2.0 ** 126, np.float32))

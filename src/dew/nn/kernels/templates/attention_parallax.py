@@ -248,12 +248,13 @@ def moments(logits: jax.Array, seconds: jax.Array, value: jax.Array, powers: jax
     hi = jax.lax.stop_gradient(jnp.sum(exp_scaled(seconds / over, below, 0), axis=-1))
     lo = jnp.sum(exp_scaled((seconds - hi[..., None]) / over, below, 0), axis=-1)
     apart = jnp.where(seen, (seconds - hi[..., None]) - lo[..., None], 0.0)
-    # The row's power: its largest pair `|w (t̂ - c)| |v|` and `|w (t̂ - c)| |a|` below `2^(G - log2 K)`, so
-    # `Σ |ũ| |v| / 2` and `Σ |ũ| |a| / 2` within `2^126`, each pair's own value read (a key of no weight
-    # and a value of `2^127` lowers no other pair's).
+    # Each value channel taken to its own largest power first (`_channel_powers`), so its values and mean
+    # are at most 1 and one channel's `2^127` takes no other's `2^-124` below fp32's least (train 1444's
+    # review); the row's power then its largest pair `|w (t̂ - c)|` below `2^(G - log2 K)`, so `Σ |ũ| |v| / 2`
+    # and `Σ |ũ| |a| / 2` within `2^126` in every channel.
+    channels, rows = _channel_powers(value)
     reach = jnp.where(seen & (apart != 0), _reach(below) + _exponent(apart), _NONE)
-    centred = jnp.maximum(1, jnp.max(_exponent(mean), axis=-1))[..., None]
-    largest = jnp.max(jnp.where(reach > _NONE, reach + jnp.maximum(valued, centred), _NONE), axis=-1)
+    largest = jnp.max(jnp.where(reach > _NONE, reach + 1, _NONE), axis=-1)
     power = jnp.where(largest > _NONE, largest, 0) + width - 125
     # The call's units' power, `2^(G + 1) / 2^p`: a part below 1 (at most `2^-60` of it, `ũ` kept above
     # fp32's least normal for its values' products) taken into `ũ` before its products, so a derivative's
@@ -268,12 +269,21 @@ def moments(logits: jax.Array, seconds: jax.Array, value: jax.Array, powers: jax
         values, means = centred
         return weighed(terms, values) - jnp.sum(terms, axis=-1)[..., None] * means
 
-    halves = (value * 0.5, mean * 0.5)
+    halves = (power2(value, -channels) * 0.5, power2(mean, -rows) * 0.5)
     # Its power from the covariance at the lifted units, the covariance then taken to it whole (`_shifted`).
     lift = (units - before)[..., None]
-    spread_power = _spread_power(jax.lax.stop_gradient(covariance(taken, halves)), lift)
-    spread = _shifted(covariance, taken, halves, lift, -spread_power)
+    spread_power = _spread_power(jax.lax.stop_gradient(covariance(taken, halves)), lift + rows)
+    spread = _shifted(covariance, taken, halves, lift, rows - spread_power)
     return Moments(jnp.max(logits, axis=-1), total, mean, (hi, lo), spread, spread_power)
+
+
+def _channel_powers(value: jax.Array) -> tuple[jax.Array, jax.Array]:
+    """Each value channel's power of two over a tile's keys (`[B, K, Hk, Dv]`), the power its values lie
+    below (0 for a channel of zeros), as the values take it `[B, 1, Hk, Dv]` and as a row's mean does
+    `[B, Hk, 1, 1, Dv]`: a channel's mean, a mean of its values, lies below it too."""
+    found = jnp.max(_exponent(value), axis=1, keepdims=True)
+    found = jnp.where(found > _ABSENT, found, 0)
+    return found, jnp.moveaxis(found, 2, 1)[:, :, None]
 
 
 def _spread_power(covariance: jax.Array, power) -> jax.Array:
@@ -741,5 +751,42 @@ def reference(query: jax.Array, second: jax.Array, key: jax.Array, second_key: j
     keys = max(key.shape[1], 1)
     call = _called(query, second, key, second_key, value, spans, scale, keys)
     logits, seconds, values, _ = _tile(call, 0, keys)
-    return _output(moments(logits, seconds, values, call.powers), query.dtype)
+    return _dense(jnp.dtype(query.dtype).name, logits, seconds, values, call.powers)
+
+
+def _dense_value(dtype: str, logits, seconds, values, powers) -> jax.Array:
+    """The dense call's output from its one tile (`reference`): its moments' `a - C` (`_output`)."""
+    return _output(moments(logits, seconds, values, powers), dtype)
+
+
+def _dense_tangent(dtype: str, primals, tangents, value) -> jax.Array:
+    """`_dense`'s tangent: the logits' and second products' directions the moments' own (their values
+    held), the values' the output's one contraction `Σ w (1 - τ) dv` (`out = Σ w (1 - τ) v`, `Σ w τ = 0`),
+    so a mean's and a covariance's tangents meet in it before either rounds: second products `[8, 0]`
+    over values 0 along `[2^127, 0]` read plain fp32's `-3 · 2^126`, where the covariance's `2^128` landed
+    apart and overflowed (train 1444's review)."""
+    del value
+    logits, seconds, values, powers = primals
+    dlogits, dseconds, dvalues, _ = tangents
+
+    def held(logits, seconds):
+        return _dense_value(dtype, logits, seconds, values, powers)
+
+    _, moved = jax.jvp(held, (logits, seconds), (dlogits, dseconds))
+    seen = logits > -jnp.inf
+    m = jax.lax.stop_gradient(jnp.max(logits, axis=-1, keepdims=True))
+    p = jnp.where(seen, jnp.exp(logits - jnp.where(jnp.isfinite(m), m, 0.0)), 0.0)
+    weights = p / jnp.maximum(jnp.sum(p, axis=-1, keepdims=True), jnp.finfo(p.dtype).tiny)
+    centre = jnp.sum(weights * seconds, axis=-1, keepdims=True)
+    apart = power2(jnp.where(seen, seconds - centre, 0.0), -powers[..., None])
+    coefficients = weights * (1 - apart)
+    valued = float32_einsum("bhgqk,bkhd->bhgqd", coefficients, dvalues, precision=REFERENCE_PRECISION,
+                            preferred_element_type=dvalues.dtype)
+    return moved + _ungrouped(valued).astype(dtype)
+
+
+_dense = contracted("test_parallax_holds_every_order")(
+    surrogate(_dense_value, _dense_tangent, nondiff_argnums=(0,)))
+"""A dense call's output from its one tile (`_dense_value`), its values' tangent the plain formula's one
+contraction (`_dense_tangent`)."""
 
