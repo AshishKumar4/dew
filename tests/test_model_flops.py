@@ -257,7 +257,8 @@ def test_a_high_level_operation_counts_its_expansion_in_the_context_it_was_stage
     mesh = jax.make_mesh((2,), ("rows",), axis_types=(AxisType.Explicit,), devices=jax.devices()[:2])
 
     def apply(weight, x):
-        return jax.lax.dot_general(x, weight, (((1,), (0,)), ((), ())), out_sharding=PartitionSpec("rows", None))
+        rows = PartitionSpec("rows", None)
+        return jax.lax.dot_general(x, weight, (((1,), (0,)), ((), ())), out_sharding=rows)
 
     def pullback(weight, cotangent):
         return jax.lax.dot_general(cotangent, weight, (((1,), (1,)), ((), ())))
