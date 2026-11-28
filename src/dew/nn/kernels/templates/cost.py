@@ -62,8 +62,9 @@ class Chain:
     reductions (`span`, each `GpuTarget.kernel_step_seconds`), the warpgroup products it waits on (`products`)
     and their columns (`columns`, each a 16-bit step of 64 of their depth), its warpgroups' barrier round
     trips (`barriers`), and the tile copies it waits on (`copies`, their `copy_bytes`) through a ring of
-    `stages`, whose S - 1 steps ahead hide what of a copy a step outlasts. A walk of K such steps counts K
-    times each and keeps its stages."""
+    `stages`, whose S - 1 steps ahead hide what of a copy a step outlasts; and `seconds` already priced, paths
+    of launches one after another each priced at its own rings (`path`), whatever events they were. A walk of
+    K such steps counts K times each and keeps its stages."""
 
     span: float = 0.0
     products: float = 0.0
@@ -71,6 +72,7 @@ class Chain:
     barriers: float = 0.0
     copies: float = 0.0
     copy_bytes: float = 0.0
+    seconds: float = 0.0
     stages: int = 1
 
     def then(self, other: "Chain") -> "Chain":
@@ -96,7 +98,7 @@ class Chain:
         return counted and (self.stages <= other.stages or not other.copied)
 
 
-_COUNTED = ("span", "products", "columns", "barriers", "copies", "copy_bytes")
+_COUNTED = ("span", "products", "columns", "barriers", "copies", "copy_bytes", "seconds")
 
 
 def _kept(chains: tuple[Chain, ...]) -> tuple[Chain, ...]:
@@ -412,7 +414,8 @@ def path(work: Work, target: generation.GpuTarget) -> float:
 
 def chained(work: Work, target: generation.GpuTarget) -> float:
     """The longest of `work`'s paths (`Work.chains`) at `target`'s part's latencies: a path's events waited
-    one after another, C, and its copies, L, waited past what its ring hides, max(C, (L + C) / stages); an
+    one after another, C, and its copies, L, waited past what its ring hides, max(C, (L + C) / stages), and
+    its seconds already priced after them; an
     event the part measured no latency of priced by none (`GpuTarget.product_latency`, `barrier_seconds`,
     `copy_latency`, `kernel_step_seconds`)."""
     step = target.kernel_step_seconds or 0.0
@@ -423,7 +426,10 @@ def chained(work: Work, target: generation.GpuTarget) -> float:
     def seconds(chain: Chain) -> float:
         waited = (chain.span * step + chain.products * fixed + chain.columns * per_column
                   + chain.barriers * barrier)
-        return max(waited, (chain.copies * copied + chain.copy_bytes * per_byte + waited) / chain.stages)
+        # Seconds already priced (`Chain.seconds`: launches one after another, each at its own rings) wait
+        # beside the ring's overlap, none of them hidden by it.
+        return (max(waited, (chain.copies * copied + chain.copy_bytes * per_byte + waited) / chain.stages)
+                + chain.seconds)
 
     return max(map(seconds, work.chains), default=0.0)
 

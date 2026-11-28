@@ -696,14 +696,12 @@ def priced_step(target: generation.GpuTarget, *, rows: int, queries: int, keys: 
                 merge=equation.params.get("merge")))
     all_launches = launches + merges
     # The launches one after another: their counters summed, and the step's dependent path theirs added,
-    # each launch's priced at its own rings (`cost.path`), held as that many in-kernel steps (a launch's
-    # rings are its own: one chain of the launches' copies would wait them through the shallowest).
+    # each launch's priced at its own rings (`cost.path`), in seconds (a launch's rings are its own: one
+    # chain of the launches' copies would wait them through the shallowest), whatever in-kernel step the
+    # part measured or did not (row 14183: a GH200's merge wait was lost where its step was unmeasured).
     work = dataclasses.replace(sum(all_launches, Work()), span=sum(each.span for each in all_launches))
-    kernel_step = target.kernel_step_seconds
-    if not kernel_step:
-        return work
-    return dataclasses.replace(work, chains=(cost.Chain(span=sum(cost.path(each, target)
-                                                                 for each in all_launches) / kernel_step),))
+    return dataclasses.replace(work, chains=(cost.Chain(seconds=sum(cost.path(each, target)
+                                                                    for each in all_launches)),))
 
 @overload
 def attend(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks | None = None, *,

@@ -768,12 +768,19 @@ def _rtx_4080_placements() -> tuple[tuning.Placement, tuning.Placement]:
 class _Facted(norm_swiglu.RmsForward):
     """The norm's forward, its space and its configs read at the GPU in effect: on a GPU of 76
     multiprocessors its space lacks one of its configs (`UNSPACED`) and it refuses another (`REFUSED`) as a
-    pin, a tile one GPU's budget holds and another's of the same model does not; each GPU its space and its
-    configs were read at recorded (`asked`)."""
+    pin, a tile one GPU's budget holds and another's of the same model does not, and it derives another
+    config (`DERIVED`, half the rows), so a derivation states the GPU it was read at; each GPU its space and
+    its configs were read at recorded (`asked`)."""
 
     REFUSED: ClassVar = None
     UNSPACED: ClassVar = None
     asked: ClassVar[list] = []
+
+    def _get_heuristics_config(self, ba):
+        derived = super()._get_heuristics_config(ba)
+        if generation.gpu_target().multiprocessors != 76:
+            return derived
+        return dataclasses.replace(derived, rows=max(1, derived.rows // 2))
 
     def _get_autotuning_configs(self, ba):
         target = generation.gpu_target()
@@ -901,7 +908,14 @@ def test_a_launch_an_assumed_device_chose_is_timed_on_no_other_gpu(monkeypatch):
             [calls] = measured
             assert [call.placed for call in calls] == [attached, restricted]
             [fresh] = stored
-            _, timings = fresh[(op, key)]
+            described, timings = fresh[(op, key)]
+            # Its derivation the attached placement's, where the timings were measured, not the restricted
+            # GPU's half-row one (`_Facted`), whichever call traced first.
+            with tuning._placed_in(attached):
+                derived = both[0].keyed.heuristics_config
+            with tuning._placed_in(restricted):
+                assert both[0].keyed.heuristics_config != derived
+            assert tuning.decoded(described["derived"]) == derived
             assert set(timings) == set(tuning._takes(both))
             assert {_Facted.REFUSED, _Facted.UNSPACED}.isdisjoint(timings)
             assert picks[key].fastest_config in timings

@@ -1220,7 +1220,8 @@ def test_a_template_walks_chain_is_priced_at_its_parts_measured_latencies():
     chain = kernel_cost.Chain(span=1, products=4, columns=4 * 128, barriers=2)
     chained = kernel_cost.walked(kernel_cost.Work(flops=1.0, chains=(chain,)), target)
     spanned = kernel_cost.walked(kernel_cost.Work(flops=1.0, span=1), target)
-    expected = target.kernel_step_seconds + 4 * fixed + 512 * per_column + 2 * barrier
+    # Its span's one reduction at the die's step, none where the GH200's own is unmeasured (row 14183).
+    expected = (target.kernel_step_seconds or 0.0) + 4 * fixed + 512 * per_column + 2 * barrier
     assert_computes_the_oracle(np.float64(chained), np.float64(expected), "the chain's seconds", roundings=8)
     assert chained > 4 * spanned
     copied, per_byte = GH200_LATENCIES["copy"]
@@ -1228,6 +1229,17 @@ def test_a_template_walks_chain_is_priced_at_its_parts_measured_latencies():
     waited = kernel_cost.walked(kernel_cost.Work(flops=1.0, chains=(cold,)), target)
     assert_computes_the_oracle(np.float64(waited), np.float64(expected + copied + 32768 * per_byte),
                                "the cold copy's seconds", roundings=8)
+
+
+def test_a_priced_path_waits_beside_a_staged_copy_none_of_it_hidden():
+    """A path of seconds already priced (`Chain.seconds`: launches one after another, each at its own rings)
+    followed by a tile copy waited through a ring of three stages costs its seconds plus the copy's third:
+    the ring hides what of a copy a step outlasts, never a priced launch's time (the k01-71 review)."""
+    target = generation.gpu_target("NVIDIA GH200 480GB")
+    copied, per_byte = target.copy_latency
+    priced = kernel_cost.Chain(seconds=2e-6).then(kernel_cost.Chain(copies=1, copy_bytes=32768, stages=3))
+    waited = kernel_cost.chained(kernel_cost.Work(chains=(priced,)), target)
+    assert waited == (1 * copied + 32768 * per_byte + 0.0) / 3 + 2e-6
 
 
 def test_a_rings_stages_hide_a_tile_copy_its_steps_outlast():

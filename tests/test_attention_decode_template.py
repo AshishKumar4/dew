@@ -1352,17 +1352,20 @@ def test_an_inference_forward_compiles_spill_free_whether_or_not_it_decides(gene
 
 
 @COMPILES_ON_CPU
-def test_a_split_decode_steps_price_includes_the_native_merges_bytes_and_span():
-    """A split decode step on an H100 (`attention_decode.priced_step`: 1 row, 1 query, 8 heads over 2 key
-    heads 128 wide over 8192 keys) prices its native `merged_padded` launch independently of
+@pytest.mark.parametrize("part", ["sm90", "NVIDIA GH200 480GB"])
+def test_a_split_decode_steps_price_includes_the_native_merges_bytes_and_span(part):
+    """A split decode step on an H100 or a GH200 (`attention_decode.priced_step`: 1 row, 1 query, 8 heads over
+    2 key heads 128 wide over 8192 keys) prices its native `merged_padded` launch independently of
     `merged.launch_work` (rows 8845, 10533): its kernel count, span (`3 * chunks`) and device bytes equal the
-    split walk's plus the emitted `get`/`swap` traffic of `merged._launch`'s traced Pallas body."""
+    split walk's plus the emitted `get`/`swap` traffic of `merged._launch`'s traced Pallas body; and its
+    dependent path is its launches' paths one after another, in seconds, whether or not the part measured an
+    in-kernel step (row 14183: a GH200's, unmeasured, priced its merge's wait in parallel with its walk)."""
     from test_merged import _traced_merge_bytes
 
     from dew.algebra import windows
     from dew.nn.kernels.templates import merged
 
-    target = generation.gpu_target("sm90")
+    target = generation.gpu_target(part)
     priced = attention_decode.priced_step(target, rows=1, queries=1, keys=8192, heads=8, kv_heads=2,
                                           width=128, dtype=jnp.bfloat16)
     assert priced is not None and priced.kernels >= 2.0
@@ -1391,6 +1394,15 @@ def test_a_split_decode_steps_price_includes_the_native_merges_bytes_and_span():
     assert priced.kernels == len(walk_launches) + 1.0
     assert priced.span == sum(w.span for w in walk_launches) + merge_span
     assert priced.device_bytes == sum(w.device_bytes for w in walk_launches) + emitted_bytes
+    params = merge_eq.params
+    merge = merged.launch_work(params["units"], padded_s, stacked_s, queries, width, target,
+                               has_initial=len(merge_eq.invars) > 2, raw_scale=params.get("raw_scale"),
+                               out_dtype=out_dtype, out_heads=out_heads,
+                               normalized=params.get("normalized", False), traced=True,
+                               merge=params.get("merge"))
+    paths = [cost.path(launch, target) for launch in (*walk_launches, merge)]
+    assert min(paths) > 0.0
+    assert cost.chained(priced, target) == sum(paths)
 
 
 @INTERPRETS
