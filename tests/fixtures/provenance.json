@@ -522,7 +522,18 @@
      "runs": "diffusers"
     }
    ],
-   "note": "The seeds mode: every pointwise case's trajectory gradient over check 1's recorded seeds (tools/recorded_references.py's record_case, confirmed paired with Dew's walk), each seed's (8, 3, 32) initial state at init_noise_sigma and its cotangent drawn by torch's generator, a thresholding case's draw clear of its clip by selection_margins.MARGIN, DDIM's thresholding over two steps (SEEDED_STEPS), the float32 VJP and the float64 one with the per-step JAX noise of key 0 replayed in both. Torch 2.14.1+cpu, torchsde 0.2.6."
+   "note": "The seeds mode: every case's walk but DPMSolverSDE's over check 1's recorded seeds (tools/recorded_references.py's record_case, confirmed paired with Dew's walk), each seed's (8, 3, 32) initial state at init_noise_sigma and its cotangent drawn by torch's generator, a thresholding case's draw clear of its clip by selection_margins.MARGIN, DDIM's thresholding over two steps (SEEDED_STEPS): the float32 walk's latents (a guided case's last) and VJP (none for CFG epsilon) and the float64 twin's, with the per-step JAX noise of key 0 replayed in both."
+  },
+  "diffusers/scheduler_seeds": {
+   "tool": "tools/diffusers_reference.py",
+   "sources": [
+    {
+     "repo": "huggingface/diffusers",
+     "version": "0.34.0",
+     "runs": "diffusers"
+    }
+   ],
+   "note": "The seeds mode, one recording a scheduler family: every case's walk over check 1's recorded seeds (record_case, confirmed paired with Dew's walk), each seed's (2, 3, 16) x_T at the walk's top marginal deviation and cotangent a seeded NumPy draw the test makes again, the float32 walk's latents and VJP and its float64 twin's (every table the scheduler builds widened), the per-step JAX noise of key 0 replayed in both."
   },
   "distillation": {
    "tool": "tools/distillation_reference.py",
@@ -3176,7 +3187,7 @@
      "runs": "transformers"
     }
    ],
-   "note": "Fetched by its pin (qwen_image_seeds.npz.fetched.json). Check 1's recordings over tests/qwen_image_draws.py's draws, torch 2.14.0+cpu: each transformer case's walk summarized (record_case: the reference's evidence and its float64 truth's sketch), and the prompt encoding and the pipeline walk whole, the float32 reference and the float64 twin's truth (float64_twin, the scheduler's tables widened by float64_scheduler); the twin replaces only the source's sinusoidal frequency rounding (src/_dew_torch/precision.py's float64_twin)."
+   "note": "Fetched by its pin (qwen_image_seeds.npz.fetched.json). Check 1's recordings over tests/qwen_image_draws.py's draws, torch 2.14.0+cpu: each transformer case's walk summarized (record_case: the reference's evidence and its float64 truth's sketch), and the prompt encoding and the pipeline walk whole, the float32 reference and the float64 twin's truth (float64_twin, its scheduler the class's independent float64 oracle, tools/float64_schedulers.py's oracle_of); the twin replaces only the source's sinusoidal frequency rounding (src/_dew_torch/precision.py's float64_twin)."
   },
   "qwen_image_vae.tar.xz": {
    "tool": "tools/diffusers_qwen_image_vae_reference.py",

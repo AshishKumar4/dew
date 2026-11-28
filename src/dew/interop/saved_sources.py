@@ -76,8 +76,12 @@ def export_run(run: SavedRun, destination: str | Path, *, ema: bool | None = Non
     saved run it holds (`HELD_FILE`); another replaces the release in one call (`ReleasePlan.write`).
     Every process returns once the release is published, the pool agreeing its commit (ledgers 2874,
     2992)."""
-    from dew.interop.releases import pooled_destination
+    from dew.interop.releases import pooled_destination, refused_store
 
+    # A store's location refused by every process of a pool alike, before any round of its export or a write
+    # (`refused_store`, row 14124), each process naming its own destination.
+    for named_by in from_every_process(str(destination)):
+        refused_store(named_by)
     named, shared = Path(destination), False
     if publishes is None:
         shared = (jax.process_count() > 1 and len(set(from_every_process(named.name))) == 1

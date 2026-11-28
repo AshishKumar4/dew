@@ -527,6 +527,121 @@ def test_a_sigma_schedule_keeps_a_float64_runs_times_in_float64(schedule):
         assert not np.array_equal(np.asarray(sigma), np.asarray(narrow, np.float64))
 
 
+@pytest.mark.parametrize("low", [1.0, float.fromhex("0x1.ffffe0p127")], ids=["wide", "narrow"])
+def test_a_karras_grid_reads_a_level_near_the_floats_largest_back_to_its_time(low):
+    """A Karras grid up to float32's largest at rho 8 reads a level one float below its top back to its time
+    correctly rounded, as float64's inverse does: the level's 8th root rounds to 2^16, whose 8th power
+    passes float32's range, and the accurate inverse's Newton step on it was NaN (train 1407's P0). From 1
+    its time is the top's (1 - 2^-26 of T, whose nearest float32 is T); from 15 floats below the top it lies
+    inside, near 14/15 of T, where the plain inverse reads T (review)."""
+    top = float(np.finfo(np.float32).max)
+    level = float.fromhex("0x1.fffffcp127")
+    narrow = KarrasVENoiseScheduler(sigma_min=low, sigma_max=top, rho=8.0)
+    t = float(narrow.t_of_sigma(jnp.asarray(level, jnp.float32)))
+    with jax.enable_x64(new_val=True):
+        wide = KarrasVENoiseScheduler(sigma_min=low, sigma_max=top, rho=8.0)
+        exact = float(wide.t_of_sigma(jnp.asarray(level, jnp.float64)))
+    assert exact < wide.T and t == float(np.float32(exact)), (t, exact)
+
+
+@pytest.mark.parametrize("rho", [8.0, 1024.0])
+def test_a_narrow_karras_grid_at_the_floats_largest_reads_each_level_in_order(rho):
+    """A Karras grid over the 16 largest float32s reads each back to its own time, in order, from 0 at its
+    least to T at its largest: the levels' roots round up past their powers' range (2^16 at rho 8,
+    0x1.172b84p0 at rho 1024), and the plain inverse read the interior ones as the top (review). Where the
+    roots of neighbouring levels are fewer floats apart than one, as at rho 1024, no float32 inverse reads
+    each level's time to a float, so the order is what is held."""
+    least, top = float.fromhex("0x1.ffffe0p127"), float(np.finfo(np.float32).max)
+    schedule = KarrasVENoiseScheduler(sigma_min=least, sigma_max=top, rho=rho)
+    levels = np.full(16, least, np.float32)
+    for index in range(1, 16):
+        levels[index] = np.nextafter(levels[index - 1], np.float32(np.inf))
+    read = np.asarray(schedule.t_of_sigma(jnp.asarray(levels)))
+    assert read[0] == 0.0 and read[-1] == schedule.T and bool(np.all(np.diff(read) > 0)), read
+
+
+def test_a_karras_grid_at_the_least_normal_reads_its_level_without_flushing():
+    """A Karras grid from float32's least normal to four times it at rho 1 reads 1.5 times it back to its
+    time correctly rounded, 1/6 of T: the level's difference from the low end, 2^-127, is subnormal, which
+    a device flushing subnormals reads as zero unless the inverse forms it at the top end's binade (train
+    1419's P0)."""
+    least = float(np.finfo(np.float32).tiny)
+    narrow = KarrasVENoiseScheduler(sigma_min=least, sigma_max=4 * least, rho=1.0)
+    t = float(narrow.t_of_sigma(jnp.asarray(1.5 * least, jnp.float32)))
+    assert t == float(np.float32(narrow.T / 6)), t
+
+
+def test_a_karras_grid_of_a_large_rho_reads_an_interior_level_back_to_its_time():
+    """A Karras grid from 0.5 to 2 at rho 256 reads its interior level 1 back to its time correctly rounded,
+    as float64's inverse does: its root is 1, whose powers stay in range unnormalized, where a root scaled
+    into [0.5, 1) underflows its 256th power to zero (review)."""
+    narrow = KarrasVENoiseScheduler(sigma_min=0.5, sigma_max=2.0, rho=256.0)
+    t = float(narrow.t_of_sigma(jnp.asarray(1.0, jnp.float32)))
+    with jax.enable_x64(new_val=True):
+        wide = KarrasVENoiseScheduler(sigma_min=0.5, sigma_max=2.0, rho=256.0)
+        exact = float(wide.t_of_sigma(jnp.asarray(1.0, jnp.float64)))
+    assert 0 < exact < wide.T and t == float(np.float32(exact)), (t, exact)
+
+
+@pytest.mark.parametrize("dtype", [jnp.float32, jnp.float64])
+def test_a_karras_grid_reads_its_ends_back_to_its_ends(dtype):
+    """A Karras grid whose sigma_min is zero reaches it at t = 0 and its top at t = T, in float32 and
+    float64, and reads sigma 0 back to time 0: the accurate inverse's Newton step divides by the level's
+    root, and an RK4 stage at a zero-floored grid asks for it, which is time 0, not NaN; a level past its top
+    reads as the top's time; a level's inverse has a finite derivative inside the grid; and near the zero end
+    a level keeps the bits of its rho-th power, rounded once."""
+    with jax.enable_x64(new_val=dtype == jnp.float64):
+        schedule = KarrasVENoiseScheduler(sigma_min=0.0, sigma_max=80.0, rho=7.0)
+        sigmas = schedule.sigmas(jnp.asarray([0.0, schedule.T], dtype))
+        assert sigmas.dtype == dtype and float(sigmas[0]) == 0.0 and float(sigmas[1]) == 80.0
+        assert float(schedule.t_of_sigma(jnp.zeros((), dtype))) == 0.0
+        # A level past the top reads as the top's time, not NaN, the clamp ahead of the solve.
+        assert float(schedule.t_of_sigma(jnp.asarray(1e30, dtype))) == schedule.T
+        slope = jax.grad(lambda sigma: schedule.t_of_sigma(sigma))(jnp.asarray(3.0, dtype))
+        assert np.isfinite(float(slope)) and float(slope) > 0
+    # A level past a narrow range's top, whose clamp rounds inside it, reads as the top's time all the same.
+    narrow = KarrasVENoiseScheduler(sigma_min=1.0, sigma_max=1.0 + 5 * 2.0 ** -25, rho=1.0)
+    assert float(narrow.t_of_sigma(jnp.asarray(2.0, jnp.float32))) == narrow.T
+    # Its configured ends read as its ends' times, though their roots' powers round off them (2 at rho 2,
+    # sqrt(2)^2 = 2 + 2^-51), and a range whose ends' roots round to one reads each level as an end's time.
+    with jax.enable_x64(new_val=True):
+        squared = KarrasVENoiseScheduler(sigma_min=0.5, sigma_max=2.0, rho=2.0)
+        ends = squared.t_of_sigma(jnp.asarray([0.5, 2.0], jnp.float64))
+        assert [float(end) for end in ends] == [0.0, squared.T]
+        grid = squared.sigmas(jnp.asarray([0.0, squared.T], jnp.float64))
+        assert [float(level) for level in grid] == [0.5, 2.0]
+        assert [float(end) for end in squared.t_of_sigma(grid)] == [0.0, squared.T]
+        # A level one time short of an end lies within its configured range, so levels keep their order.
+        near = KarrasVENoiseScheduler(sigma_min=1.99, sigma_max=2.0, rho=2.0)
+        times = jnp.asarray([0.0, 2.0 ** -52, 1 - 2.0 ** -52, 1.0], jnp.float64) * near.T
+        levels = [float(level) for level in near.sigmas(times)]
+        assert levels == sorted(levels) and min(levels) >= 1.99 and max(levels) <= 2.0, levels
+        tight = KarrasVENoiseScheduler(sigma_min=1.0, sigma_max=1.0 + 2.0 ** -52, rho=4.0)
+        held = tight.t_of_sigma(jnp.asarray([1.0, 1.0 + 2.0 ** -52], jnp.float64))
+        assert [float(end) for end in held] == [0.0, tight.T]
+    # Near its zero end a cube keeps its own last bits: (t / T)^3 at t / T one ulp past 2^-25, rounded once.
+    cubed = KarrasVENoiseScheduler(sigma_min=0.0, sigma_max=1.0, rho=3.0)
+    share = np.nextafter(np.float32(2.0 ** -25), np.float32(1))
+    level = cubed.sigmas(jnp.asarray(share * np.float32(cubed.T), jnp.float32))
+    assert float(level) == float(np.float32(np.float64(share) ** 3))
+
+
+@pytest.mark.parametrize("level", [0.5, 2.0], ids=["sigma_min", "sigma_max"])
+def test_a_karras_grid_differentiates_its_inverse_at_an_end_as_its_clipped_form(level):
+    """A Karras grid's inverse at an end exactly (sigma_min 0.5, sigma_max 2, rho 1) takes the clipped
+    plain inverse's derivative, its snap onto the end's time the value's alone (train 1461: snapped after,
+    the inverse at sigma_min differentiated to zero)."""
+    schedule = KarrasVENoiseScheduler(sigma_min=0.5, sigma_max=2.0, rho=1.0)
+
+    def plain(sigma):
+        inside = jnp.clip(sigma, schedule.sigma_min, schedule.sigma_max)
+        ramp = (inside - schedule.min_inv_rho) / (schedule.max_inv_rho - schedule.min_inv_rho)
+        return jnp.clip(ramp, 0.0, 1.0) * schedule.T
+
+    at = jnp.asarray(level, jnp.float32)
+    assert float(jax.grad(schedule.t_of_sigma)(at)) == float(jax.grad(plain)(at))
+
+
 def test_an_equal_rho_walks_one_karras_grid_whatever_its_type():
     """A Karras schedule given rho 7 (a config read back, YAML's `7`) computes the grid it computes at
     7.0, the default and FlaxDiff's, bit for bit: an int power lowered to repeated products, about an

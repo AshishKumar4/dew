@@ -1,4 +1,14 @@
-"""DPM-Solver and DEIS exponential integrators in log-SNR."""
+"""DPM-Solver and DEIS exponential integrators in log-SNR.
+
+Every weight of an update depends on the grid alone, so `init` solves each
+step's row of weights once in float64 on the host, from the schedule's own
+rates (`_solved_levels`), and a step is its row's weighted sum of the sample,
+the model's outputs and their differences (`_weighted`), the differences
+taken in the walk before any weight, as the source takes them. The source
+computes the same coefficients in float32 inside the walk; their logs of
+rates near zero rounded there put the noise-prediction forms several times
+the source's error from the float64 truth (rows 13650 to 13653).
+"""
 
 from __future__ import annotations
 
@@ -13,17 +23,20 @@ from jax import lax
 from dew.nn.programs import on_host
 
 from .common import (
-    Multistep,
+    Tabled,
+    Term,
+    _apart,
     _check_endpoint_domain,
     _check_gaps,
-    _grid_levels,
-    _half_log_snr,
+    _column,
     _history_gaps,
-    _lambda_step,
-    _multistep,
-    _tapered_order,
+    _moved,
+    _shifted,
+    _solved_levels,
+    _tabled,
     _tapered_orders,
     _unit_noise,
+    _weighted,
 )
 
 Algorithm = Literal["dpmsolver++", "dpmsolver", "sde-dpmsolver++", "sde-dpmsolver"]
@@ -35,28 +48,64 @@ def _dpm_terms(algorithm: str, alpha_s, sigma_s, alpha_t, sigma_t, h):
     x_t = a x + b D0 + c D1 + c_2 D2 + n z, with c the midpoint or Heun
     second-order form (the third order takes the Heun one) and z standard
     normal noise the SDE forms add. `dpmsolver++` and `sde-dpmsolver++`
-    integrate the clean prediction; the other two integrate eps."""
-    alpha_s = jnp.where(alpha_s == 0, 1.0, alpha_s)
-    if algorithm == "dpmsolver++":
-        phi = jnp.exp(-h) - 1.0
-        # The source's -alpha_t (e^-h - 1). The same scale written from the rates,
-        # alpha_t - (sigma_t / sigma_s) alpha_s, cancels two terms of alpha_t's size.
-        clean_scale = -(alpha_t * phi)
-        return (sigma_t / sigma_s, clean_scale, 0.5 * clean_scale,
-                alpha_t * (phi / h + 1.0), -alpha_t * ((phi + h) / h ** 2 - 0.5), 0.0)
-    if algorithm == "dpmsolver":
-        psi = jnp.exp(h) - 1.0
-        return (alpha_t / alpha_s, -sigma_t * psi, -0.5 * sigma_t * psi,
-                -sigma_t * (psi / h - 1.0), -sigma_t * ((psi - h) / h ** 2 - 0.5), 0.0)
-    if algorithm == "sde-dpmsolver++":
-        decay = 1.0 - jnp.exp(-2.0 * h)
-        return (sigma_t / sigma_s * jnp.exp(-h), alpha_t * decay, 0.5 * alpha_t * decay,
-                alpha_t * (decay / (-2.0 * h) + 1.0),
-                alpha_t * ((decay - 2.0 * h) / (2.0 * h) ** 2 - 0.5),
-                sigma_t * jnp.sqrt(decay))
-    psi = jnp.exp(h) - 1.0
-    return (alpha_t / alpha_s, -2.0 * sigma_t * psi, -sigma_t * psi,
-            -2.0 * sigma_t * (psi / h - 1.0), None, sigma_t * jnp.sqrt(jnp.exp(2 * h) - 1.0))
+    integrate the clean prediction; the other two integrate eps. Host
+    float64 numbers in, the same out (`sde-dpmsolver`'s c_2 NaN: it has no third order,
+    which `DPMSolverMultistep` refuses). Over an
+    interval of no length (h 0) the forms a step does not take there are
+    0 / 0; `_check_gaps` refuses a grid on which a step takes one."""
+    alpha_s = 1.0 if alpha_s == 0 else alpha_s
+    with np.errstate(divide="ignore", invalid="ignore"):
+        if algorithm == "dpmsolver++":
+            phi = np.expm1(-h)
+            # The source's -alpha_t (e^-h - 1). The same scale written from the rates,
+            # alpha_t - (sigma_t / sigma_s) alpha_s, cancels two terms of alpha_t's size.
+            clean_scale = -(alpha_t * phi)
+            return (sigma_t / sigma_s, clean_scale, 0.5 * clean_scale,
+                    alpha_t * (phi / h + 1.0), -alpha_t * ((phi + h) / h ** 2 - 0.5), 0.0)
+        if algorithm == "dpmsolver":
+            psi = np.expm1(h)
+            return (alpha_t / alpha_s, -sigma_t * psi, -0.5 * sigma_t * psi,
+                    -sigma_t * (psi / h - 1.0), -sigma_t * ((psi - h) / h ** 2 - 0.5), 0.0)
+        if algorithm == "sde-dpmsolver++":
+            decay = -np.expm1(-2.0 * h)
+            return (sigma_t / sigma_s * np.exp(-h), alpha_t * decay, 0.5 * alpha_t * decay,
+                    alpha_t * (decay / (-2.0 * h) + 1.0),
+                    alpha_t * ((decay - 2.0 * h) / (2.0 * h) ** 2 - 0.5),
+                    sigma_t * np.sqrt(decay))
+        psi = np.expm1(h)
+        return (alpha_t / alpha_s, -2.0 * sigma_t * psi, -sigma_t * psi,
+                -2.0 * sigma_t * (psi / h - 1.0), np.nan, sigma_t * np.sqrt(np.expm1(2 * h)))
+
+
+def _step_h(alpha, sigma, lambdas, source: int, target: int) -> float:
+    """h = lambda_target - lambda_source, or 1 where either end is an endpoint (a zero target sigma or a
+    zero source alpha), whose step each update writes as its own limit instead."""
+    if sigma[target] <= 0 or alpha[source] == 0:
+        return 1.0
+    return float(lambdas[target] - lambdas[source])
+
+
+_MULTISTEP = ("x", "denoised", "eps", "first", "second", "noise", "fresh", "shift", "kept")
+"""A multistep row's columns: the sample moved by the newest output (`x`, the sample less `shift` times
+that output), the clean prediction and the noise read at the sample, the newest output's difference from
+the one before (`first`), that one's from the one before it (`second`), the step's unit draw, the draw
+less the noise read (`fresh`: the non-++ SDE's terminal limit scales the difference, not each apart), the
+shift, and the newest output's weight unshifted (`Moved.kept`)."""
+
+
+def _multistep_terms(x, denoised, eps, output: str, outputs: jax.Array, noise, row, *, fresh: bool = False
+                     ) -> list[Term]:
+    """The terms a `_MULTISTEP` row weighs, from the step's output (`output`: its column, `denoised` or
+    `eps`) and the history `outputs` (most recent last)."""
+    zero = jnp.zeros_like(x)
+    first = _apart(outputs[-1], outputs[-2]) if outputs.shape[0] > 1 else zero
+    second = _apart(outputs[-2], outputs[-3]) if outputs.shape[0] > 2 else zero
+    drawn = zero if noise is None else noise
+    moved = _moved(x, denoised if output == "denoised" else eps, row, _column(_MULTISTEP, "shift"),
+                   _column(_MULTISTEP, output), _column(_MULTISTEP, "kept"))
+    terms: list[Term] = [moved, denoised, eps, first, second, drawn]
+    # The draw less the noise read, which the non-++ SDE's terminal limit alone weighs.
+    return [*terms, _apart(drawn, eps)] if fresh else terms
 
 
 @struct.dataclass
@@ -91,7 +140,6 @@ class DPMSolverMultistep:
     algorithm="dpmsolver++", solver_type="midpoint", lower_order_final=False,
     euler_at_final=False.
     """
-    # `_dpm_terms` holds each algorithm's coefficients.
 
     order: int = struct.field(pytree_node=False, default=2)
     algorithm: Algorithm = struct.field(pytree_node=False, default="dpmsolver++")
@@ -113,66 +161,77 @@ class DPMSolverMultistep:
                 process, times, source=True, target=not first_at_end,
                 reason="sde-dpmsolver requires finite alpha and a lowered order at sigma zero")
         orders = _tapered_orders(self.order, times.shape[0] - 1, self.lower_order_final, self.euler_at_final)
-        alpha, sigma, levels = _grid_levels(process, times)
+        alpha, sigma, levels = _solved_levels(process, times)
         # A Heun or third-order coefficient divides by its own step's h too, but at an endpoint, where h
-        # is a placeholder (`_lambda_step`); the midpoint one is 0 with h, and its step stays put.
+        # is a placeholder (`_step_h`); the midpoint one is 0 with h, and its step stays put.
         divides = [k == 3 or (k == 2 and self.solver_type == "heun") for k in orders]
         spans = [(i, i + 1) for i, divided in enumerate(divides)
                  if divided and sigma[i + 1] > 0 and alpha[i] != 0]
         _check_gaps(levels, _history_gaps(orders) + spans, reason="DPM-Solver's higher orders divide by")
-        return _multistep(x, times, self.order, process)
+        rows = np.zeros((len(orders), len(_MULTISTEP)))
+        for i, order in enumerate(orders):
+            rows[i] = self._row(alpha, sigma, levels, i, order)
+        return _tabled(x, self.order, rows)
 
-    def step(self, x, t, t_next, denoised, eps, state, key, process, denoise):
-        alpha_s0, sigma_s0 = process.rates(t, like=x)
-        alpha_t, sigma_t = process.rates(t_next, like=x)
-        history = state.push(denoised if self.algorithm.endswith("++") else eps, alpha_s0, sigma_s0)
-        terminal, h = _lambda_step(alpha_s0, sigma_s0, alpha_t, sigma_t)
-        a, b, c_midpoint, c_heun, c_2, n = _dpm_terms(
-            self.algorithm, alpha_s0, sigma_s0, alpha_t, sigma_t, h)
-        lambdas, outputs = history.lambdas, history.outputs
-        m0 = outputs[-1]
-        base = a * x + b * m0
-        target_limit = alpha_t * denoised
-        if self.algorithm.startswith("sde"):
-            noise = _unit_noise(key, x)
-            base = base + n * noise
-            source_limit = alpha_t * denoised + sigma_t * noise
+    def _row(self, alpha, sigma, levels, i: int, order: int) -> np.ndarray:
+        """Step `i`'s weights at `order`, from grid point i to i + 1 (`_MULTISTEP`)."""
+        row = np.zeros(len(_MULTISTEP))
+        alpha_s0, sigma_s0, alpha_t, sigma_t = alpha[i], sigma[i], alpha[i + 1], sigma[i + 1]
+        output = _column(_MULTISTEP, "denoised" if self.algorithm.endswith("++") else "eps")
+        if sigma_t <= 0:
+            # The clean limit; the non-++ SDE keeps its noise's limit too.
+            row[_column(_MULTISTEP, "denoised")] = alpha_t
             if self.algorithm == "sde-dpmsolver":
-                target_limit = target_limit + alpha_t * sigma_s0 / alpha_s0 * (noise - eps)
+                row[_column(_MULTISTEP, "fresh")] = alpha_t * sigma_s0 / alpha_s0
+            return row
+        h = _step_h(alpha, sigma, levels, i, i + 1)
+        a, b, c_midpoint, c_heun, c_2, n = _dpm_terms(self.algorithm, alpha_s0, sigma_s0, alpha_t, sigma_t, h)
+        stochastic = self.algorithm.startswith("sde")
+        if alpha_s0 == 0:
+            row[_column(_MULTISTEP, "denoised")] = alpha_t
+            row[_column(_MULTISTEP, "noise" if stochastic else "eps")] = sigma_t
         else:
-            source_limit = alpha_t * denoised + sigma_t * eps
-        base = jnp.where(alpha_s0 == 0, source_limit, base)
+            shift = alpha_s0 if self.algorithm.endswith("++") else sigma_s0
+            (row[_column(_MULTISTEP, "x")], row[output], row[_column(_MULTISTEP, "shift")],
+             row[_column(_MULTISTEP, "kept")]) = _shifted(a, b, shift)
+            row[_column(_MULTISTEP, "noise")] = n
+        # D1 = (m0 - m1) / r0 and D2 from the gaps h_0 = r0 h and h_1 = r1 h behind the step.
+        if order == 2:
+            c = c_midpoint if self.solver_type == "midpoint" else c_heun
+            row[_column(_MULTISTEP, "first")] = c * h / (levels[i] - levels[i - 1])
+        elif order == 3:
+            r0 = (levels[i] - levels[i - 1]) / h
+            r1 = (levels[i - 1] - levels[i - 2]) / h
+            # d1 = d1_0 + r0 / (r0 + r1) (d1_0 - d1_1), d2 = (d1_0 - d1_1) / (r0 + r1),
+            # d1_0 = first / r0, d1_1 = second / r1.
+            row[_column(_MULTISTEP, "first")] = (c_heun * (1 + r0 / (r0 + r1)) + c_2 / (r0 + r1)) / r0
+            row[_column(_MULTISTEP, "second")] = -(c_heun * r0 + c_2) / ((r0 + r1) * r1)
+        return row
 
-        def first(_):
-            return base
-
-        def second(_):
-            r0 = (lambdas[-1] - lambdas[-2]) / h
-            d1 = (m0 - outputs[-2]) / r0
-            return base + (c_midpoint if self.solver_type == "midpoint" else c_heun) * d1
-
-        def third(_):
-            r0 = (lambdas[-1] - lambdas[-2]) / h
-            r1 = (lambdas[-2] - lambdas[-3]) / h
-            d1_0 = (m0 - outputs[-2]) / r0
-            d1_1 = (outputs[-2] - outputs[-3]) / r1
-            d1 = d1_0 + (r0 / (r0 + r1)) * (d1_0 - d1_1)
-            d2 = (d1_0 - d1_1) / (r0 + r1)
-            return base + c_heun * d1 + c_2 * d2
-
-        order = _tapered_order(self.order, history.taken, history.steps, self.lower_order_final,
-                               self.euler_at_final)
-        stepped = lax.switch(order - 1, [first, second, third][:self.order], None)
-        return jnp.where(terminal, target_limit, stepped), history.advance()
+    def step(self, x, t, t_next, denoised, eps, state: Tabled, key, process, denoise):
+        output = "denoised" if self.algorithm.endswith("++") else "eps"
+        state, row = state.push(denoised if output == "denoised" else eps), state.row()
+        noise = _unit_noise(key, x) if self.algorithm.startswith("sde") else None
+        stepped = _weighted(row, _multistep_terms(x, denoised, eps, output, state.outputs, noise, row,
+                                                  fresh=self.algorithm == "sde-dpmsolver"))
+        return stepped.astype(x.dtype), state.advance()
 
 
 class Singlestep(NamedTuple):
-    """`DPMSolverSinglestep`'s state: the output history, the sample its
-    current group of steps started from, and the order of every step."""
+    """`DPMSolverSinglestep`'s state: the output history with every step's
+    row of weights, the sample its current group of steps started from, and
+    the order of every step."""
 
-    history: Multistep
+    history: Tabled
     anchor: jax.Array
     orders: jax.Array
+
+
+_SINGLESTEP = ("anchor", "denoised", "base", "first", "second", "noise", "shift", "kept")
+"""A singlestep row's columns: the sample its group started from moved by the model output read there
+(`anchor`, less `shift` times `base`; `_shifted`), the clean prediction read now, that output (`base`),
+the next two outputs' differences from it, the step's unit draw, the shift, and `base`'s weight unshifted
+(`Moved.kept`)."""
 
 
 @struct.dataclass
@@ -222,11 +281,9 @@ class DPMSolverSinglestep:
     def init(self, x, times, process, *, key):
         steps = times.shape[0] - 1
         orders = self.order_list(steps)
-        if orders:
-            with on_host():
-                _, last_sigma = process.sampler_schedule.rates(times[-1:])
-                if bool(jnp.all(last_sigma == 0)):
-                    orders[-1] = 1
+        alpha, sigma, levels = _solved_levels(process, times)
+        if orders and sigma[-1] == 0:
+            orders[-1] = 1
         if self.algorithm == "dpmsolver" and len(orders) > 1 and orders[1] > 1:
             _check_endpoint_domain(
                 process,
@@ -238,9 +295,13 @@ class DPMSolverSinglestep:
                 and 3 in orders[:3]):
             _check_endpoint_domain(process, times, source=True,
                                    reason="third-order SDE Heun differences diverge at an alpha=0 anchor")
-        alpha, _, levels = _grid_levels(process, times)
         _check_gaps(levels, self._gaps(orders, alpha), reason="DPM-Solver's higher orders divide by")
-        return Singlestep(_multistep(x, times, self.order, process), x, jnp.asarray(orders, jnp.int32))
+        rows = np.zeros((len(orders), len(_SINGLESTEP)))
+        for i, order in enumerate(orders):
+            rows[i] = self._row(alpha, sigma, levels, i, order)
+        with on_host():
+            order_of = jnp.asarray(orders, jnp.int32)
+        return Singlestep(_tabled(x, self.order, rows), x, order_of)
 
     def _gaps(self, orders: list[int], alpha: np.ndarray) -> list[tuple[int, int]]:
         """The pairs of points whose gap each step's update divides by (`_check_gaps`).
@@ -261,118 +322,102 @@ class DPMSolverSinglestep:
                 gaps.append((i - 1, i))
         return gaps
 
-    def step(self, x, t, t_next, denoised, eps, state, key, process, denoise):
-        alpha_s0, sigma_s0 = process.rates(t, like=x)
-        alpha_t, sigma_t = process.rates(t_next, like=x)
-        history = state.history.push(
-            denoised if self.algorithm.endswith("++") else eps, alpha_s0, sigma_s0)
-        order = jnp.where(jnp.all(sigma_t == 0), 1, state.orders[history.taken])
+    def _row(self, alpha, sigma, levels, i: int, order: int) -> np.ndarray:
+        """Step `i`'s weights at `order`, from its group's anchor `order - 1` points back to point i + 1
+        (`_SINGLESTEP`). The outputs from the anchor on are m_a = base, then base + first and base +
+        second."""
+        row = np.zeros(len(_SINGLESTEP))
+        column = {name: _column(_SINGLESTEP, name) for name in _SINGLESTEP}
+        alpha_t, sigma_t = alpha[i + 1], sigma[i + 1]
+        if sigma_t <= 0:
+            row[column["denoised"]] = alpha_t
+            return row
+        anchor = i - order + 1
+        alpha_a, sigma_a = alpha[anchor], sigma[anchor]
+        h = _step_h(alpha, sigma, levels, anchor, i + 1)
+        a, b, c_midpoint, c_heun, c_2, n = _dpm_terms(self.algorithm, alpha_a, sigma_a, alpha_t, sigma_t, h)
+        stochastic = self.algorithm.startswith("sde")
+        if alpha_a == 0:
+            # The alpha=0 anchor's limit: alpha_t times a clean estimate, beside the noise the SDE draws or
+            # the anchor's own share.
+            midpoint = 0.5 if self.solver_type == "midpoint" else 1.0
+            clean = {1: {"denoised": 1.0}, 2: {"base": 1.0, "first": midpoint},
+                     3: {"base": 1.0, "second": 1.0}}[order]
+            if order == 3 and self.solver_type == "heun" and self.algorithm == "dpmsolver++":
+                # D1 and D2 combined before the infinite-anchor limit: their divergent leading terms cancel.
+                with np.errstate(divide="ignore"):
+                    gap = np.log(alpha_t) - np.log(sigma_t) - levels[i]
+                share = (gap - 1.0) / (levels[i] - levels[i - 1])
+                clean = {"base": 1.0, "second": 1.0 + share, "first": -share}
+            for name, weight in clean.items():
+                row[column[name]] = alpha_t * weight
+            if stochastic:
+                row[column["noise"]] = sigma_t
+            else:
+                row[column["anchor"]] = sigma_t / sigma_a
+            return row
+        shift = alpha_a if self.algorithm.endswith("++") else sigma_a
+        row[column["anchor"]], row[column["base"]], row[column["shift"]], row[column["kept"]] = _shifted(
+            a, b, shift)
+        row[column["noise"]] = n
+        if order == 2:
+            c = c_midpoint if self.solver_type == "midpoint" else c_heun
+            row[column["first"]] = c * h / (levels[i] - levels[anchor])
+        elif order == 3:
+            r0 = (levels[i] - levels[anchor]) / h
+            r1 = (levels[i - 1] - levels[anchor]) / h
+            if self.solver_type == "midpoint":
+                row[column["second"]] = c_heun / r0
+            else:
+                # d1 = (r0 d1_0 - r1 d1_1) / (r0 - r1), d2 = 2 (d1_1 - d1_0) / (r0 - r1),
+                # d1_0 = first / r1, d1_1 = second / r0.
+                row[column["first"]] = (c_heun * r0 - 2 * c_2) / (r1 * (r0 - r1))
+                row[column["second"]] = (2 * c_2 - c_heun * r1) / (r0 * (r0 - r1))
+        return row
+
+    def step(self, x, t, t_next, denoised, eps, state: Singlestep, key, process, denoise):
+        history = state.history.push(denoised if self.algorithm.endswith("++") else eps)
+        order = state.orders[history.taken]
         anchor = jnp.where(order == 1, x, state.anchor)
-        lambdas, outputs = history.lambdas, history.outputs
-        m0 = outputs[-1]
-        noise = _unit_noise(key, x)
+        depth = history.outputs.shape[0]
+        start = depth - order
 
-        def update(back: int):
-            """The update's coefficients from the group's anchor, `back`
-            points behind, and the noise term at its h."""
-            alpha_a, sigma_a = history.alphas[-back], history.sigmas[-back]
-            _, h = _lambda_step(alpha_a, sigma_a, alpha_t, sigma_t)
-            a, b, c_midpoint, c_heun, c_2, n = _dpm_terms(
-                self.algorithm, alpha_a, sigma_a, alpha_t, sigma_t, h)
-            return h, a * anchor, b, c_midpoint, c_heun, c_2, n * noise
+        def output(offset: int) -> jax.Array:
+            return lax.dynamic_index_in_dim(history.outputs, jnp.minimum(start + offset, depth - 1),
+                                            keepdims=False)
 
-        def source_limit(back: int, clean):
-            if self.algorithm.startswith("sde"):
-                return alpha_t * clean + sigma_t * noise
-            return sigma_t / history.sigmas[-back] * anchor + alpha_t * clean
-
-        def first(_):
-            _, ax, b, _, _, _, dz = update(1)
-            stepped = ax + b * m0
-            if self.algorithm.startswith("sde"):
-                stepped = stepped + dz
-            return jnp.where(alpha_s0 == 0, source_limit(1, denoised), stepped)
-
-        def second(_):
-            h, ax, b, c_midpoint, c_heun, _, dz = update(2)
-            m1 = outputs[-2]
-            from_zero = history.alphas[-2] == 0
-            r0 = jnp.where(from_zero, 1.0, (lambdas[-1] - lambdas[-2]) / h)
-            d1 = (m0 - m1) / r0
-            stepped = ax + b * m1 + (c_midpoint if self.solver_type == "midpoint" else c_heun) * d1
-            if self.algorithm.startswith("sde"):
-                stepped = stepped + dz
-            weight = 0.5 if self.solver_type == "midpoint" else 1.0
-            return jnp.where(from_zero, source_limit(2, m1 + weight * (m0 - m1)), stepped)
-
-        def third(_):
-            return _singlestep_third(self, update, source_limit, history, alpha_t, sigma_t)
-
-        stepped = lax.switch(order - 1, [first, second, third][:self.order], None)
-        terminal = sigma_t <= 0
-        next_x = jnp.where(terminal, alpha_t * denoised, stepped)
-        return next_x, Singlestep(history.advance(), anchor, state.orders)
-
-
-def _singlestep_third(solver: DPMSolverSinglestep, update, source_limit, history: Multistep,
-                      alpha_t, sigma_t):
-    """The third-order singlestep update from the anchor three points back.
-
-    `update` gives that anchor's coefficients and its noise term, and
-    `source_limit` the alpha=0 limit. The Heun `dpmsolver++` form combines
-    the two differences before the limit is taken, because their leading
-    terms diverge individually and cancel together.
-    """
-    lambdas, outputs = history.lambdas, history.outputs
-    m0, m1, m2 = outputs[-1], outputs[-2], outputs[-3]
-    h, ax, b, _, c_heun, c_2, dz = update(3)
-    from_zero = history.alphas[-3] == 0
-    r0 = jnp.where(from_zero, 1.0, (lambdas[-1] - lambdas[-3]) / h)
-    r1 = jnp.where(from_zero, 0.5, (lambdas[-2] - lambdas[-3]) / h)
-    d1_0 = (m1 - m2) / r1
-    d1_1 = (m0 - m2) / r0
-    if solver.solver_type == "midpoint":
-        stepped = ax + b * m2 + c_heun * d1_1
-    else:
-        d1 = (r0 * d1_0 - r1 * d1_1) / (r0 - r1)
-        d2 = 2.0 * (d1_1 - d1_0) / (r0 - r1)
-        stepped = ax + b * m2 + c_heun * d1 + c_2 * d2
-    if solver.algorithm.startswith("sde"):
-        stepped = stepped + dz
-    endpoint_clean = m0
-    if solver.solver_type == "heun" and solver.algorithm == "dpmsolver++":
-        # Combine D1 and D2 before taking the infinite-anchor limit.
-        # Their individually divergent leading terms cancel.
-        gap = _half_log_snr(alpha_t, jnp.where(sigma_t == 0, 1.0, sigma_t)) - lambdas[-1]
-        endpoint_clean = m0 + (gap - 1.0) * (m0 - m1) / (lambdas[-1] - lambdas[-2])
-    return jnp.where(from_zero, source_limit(3, endpoint_clean), stepped)
+        base, row = output(0), history.row()
+        noise = _unit_noise(key, x) if self.algorithm.startswith("sde") else jnp.zeros_like(x)
+        moved = _moved(anchor, base, row, _column(_SINGLESTEP, "shift"), _column(_SINGLESTEP, "base"),
+                       _column(_SINGLESTEP, "kept"))
+        terms = [moved, denoised, base, _apart(output(1), base), _apart(output(2), base), noise]
+        stepped = _weighted(row, terms)
+        return stepped.astype(x.dtype), Singlestep(history.advance(), anchor, state.orders)
 
 
 def _deis_second(t, b, c):
-    """Integral of the log-rho Lagrange basis, including t=0 and a node at infinity."""
-    infinite_b, infinite_c = jnp.isinf(b), jnp.isinf(c)
-    log_b = jnp.log(jnp.where(infinite_b, 1.0, b))
-    log_c = jnp.log(jnp.where(infinite_c, 1.0, c))
-    log_t = jnp.log(jnp.where(t == 0, 1.0, t))
-    denominator = jnp.where(infinite_b | infinite_c, 1.0, log_b - log_c)
-    integral = t * (-log_c + log_t - 1) / denominator
-    return jnp.where(infinite_b, 0.0, jnp.where(infinite_c, t, integral))
+    """Integral of the log-rho Lagrange basis, including t=0 and a node at infinity (host float64)."""
+    if np.isinf(b):
+        return 0.0
+    if np.isinf(c):
+        return t
+    log_t = np.log(t) if t != 0 else 0.0
+    return t * (-np.log(c) + log_t - 1) / (np.log(b) - np.log(c))
 
 
 def _deis_third(t, b, c, d):
     """Integral of the quadratic log-rho basis; an infinite node has zero
-    weight, and each other basis loses its corresponding factor."""
-    infinite_b, infinite_c, infinite_d = jnp.isinf(b), jnp.isinf(c), jnp.isinf(d)
-    lb = jnp.log(jnp.where(infinite_b, 1.0, b))
-    lc = jnp.log(jnp.where(infinite_c, 1.0, c))
-    ld = jnp.log(jnp.where(infinite_d, 1.0, d))
-    lt = jnp.log(jnp.where(t == 0, 1.0, t))
+    weight, and each other basis loses its corresponding factor (host float64)."""
+    if np.isinf(b):
+        return 0.0
+    if np.isinf(c):
+        return _deis_second(t, b, d)
+    if np.isinf(d):
+        return _deis_second(t, b, c)
+    lb, lc, ld = np.log(b), np.log(c), np.log(d)
+    lt = np.log(t) if t != 0 else 0.0
     numerator = t * (lc * (ld - lt + 1) - ld * lt + ld + lt ** 2 - 2 * lt + 2)
-    denominator = jnp.where(infinite_b | infinite_c | infinite_d, 1.0, (lb - lc) * (lb - ld))
-    integral = numerator / denominator
-    integral = jnp.where(infinite_c, _deis_second(t, b, d), integral)
-    integral = jnp.where(infinite_d, _deis_second(t, b, c), integral)
-    return jnp.where(infinite_b, 0.0, integral)
+    return numerator / ((lb - lc) * (lb - ld))
 
 
 @struct.dataclass
@@ -386,6 +431,8 @@ class DEIS:
     `DPMSolverMultistep`'s. At sigma=0 the integrated log-rho basis retains
     its history terms. An alpha=0 source contributes a node at infinite rho;
     that node's weight vanishes in subsequent finite-interval integrals.
+    The outputs' weights sum to the first order's, so a row weighs the
+    newest output by that sum and the history by its differences.
     """
 
     order: int = struct.field(pytree_node=False, default=2)
@@ -397,42 +444,53 @@ class DEIS:
 
     def init(self, x, times, process, *, key):
         orders = _tapered_orders(self.order, times.shape[0] - 1, self.lower_order_final, euler_at_final=False)
-        _check_gaps(_grid_levels(process, times)[2], _history_gaps(orders),
-                    reason="DEIS's higher orders divide by")
-        return _multistep(x, times, self.order, process)
+        alpha, sigma, levels = _solved_levels(process, times)
+        _check_gaps(levels, _history_gaps(orders), reason="DEIS's higher orders divide by")
+        rows = np.zeros((len(orders), len(_MULTISTEP)))
+        with np.errstate(divide="ignore"):
+            rhos = np.where(alpha == 0, np.inf, sigma / np.where(alpha == 0, 1.0, alpha))
+        for i, order in enumerate(orders):
+            rows[i] = self._row(alpha, sigma, levels, rhos, i, order)
+        return _tabled(x, self.order, rows)
 
-    def step(self, x, t, t_next, denoised, eps, state, key, process, denoise):
-        alpha_s0, sigma_s0 = process.rates(t, like=x)
-        alpha_t, sigma_t = process.rates(t_next, like=x)
-        history = state.push(eps, alpha_s0, sigma_s0)
-        terminal, h = _lambda_step(alpha_s0, sigma_s0, alpha_t, sigma_t)
+    @staticmethod
+    def _row(alpha, sigma, levels, rhos, i: int, order: int) -> np.ndarray:
+        """Step `i`'s weights at `order` (`_MULTISTEP`)."""
+        row = np.zeros(len(_MULTISTEP))
+        alpha_s0, alpha_t, sigma_t = alpha[i], alpha[i + 1], sigma[i + 1]
+        if order == 1:
+            if alpha_s0 == 0 or sigma_t <= 0:
+                row[_column(_MULTISTEP, "denoised")] = alpha_t
+                row[_column(_MULTISTEP, "eps")] = sigma_t
+            else:
+                # DPM-Solver's first-order step in eps (`_dpm_terms`).
+                h = _step_h(alpha, sigma, levels, i, i + 1)
+                a, b, *_ = _dpm_terms("dpmsolver", alpha_s0, sigma[i], alpha_t, sigma_t, h)
+                (row[_column(_MULTISTEP, "x")], row[_column(_MULTISTEP, "eps")],
+                 row[_column(_MULTISTEP, "shift")], row[_column(_MULTISTEP, "kept")]) = _shifted(
+                    a, b, sigma[i])
+            return row
         rho_t = sigma_t / alpha_t
-        rhos = history.sigmas / history.alphas
-        rho_s0, rho_s1 = rhos[-1], rhos[-2]
-        m0, m1 = history.outputs[-1], history.outputs[-2]
+        nodes = [rhos[i - k] for k in range(order)]
+        if order == 2:
+            coefficients = [_deis_second(rho_t, nodes[k], nodes[1 - k])
+                            - _deis_second(nodes[0], nodes[k], nodes[1 - k]) for k in range(2)]
+        else:
+            others = [(1, 2), (2, 0), (0, 1)]
+            coefficients = [_deis_third(rho_t, nodes[k], nodes[p], nodes[q])
+                            - _deis_third(nodes[0], nodes[k], nodes[p], nodes[q])
+                            for k, (p, q) in enumerate(others)]
+        # x_t = alpha_t (x / alpha_s0 + sum_k c_k m_k): the newest output by the coefficients' sum, then
+        # m_0 - m_1 by minus the sum of the older ones, m_1 - m_2 by minus the oldest.
+        (row[_column(_MULTISTEP, "x")], row[_column(_MULTISTEP, "eps")], row[_column(_MULTISTEP, "shift")],
+         row[_column(_MULTISTEP, "kept")]) = _shifted(alpha_t / alpha_s0, alpha_t * sum(coefficients),
+                                                      sigma[i])
+        row[_column(_MULTISTEP, "first")] = -alpha_t * sum(coefficients[1:])
+        if order == 3:
+            row[_column(_MULTISTEP, "second")] = -alpha_t * coefficients[2]
+        return row
 
-        def first(_):
-            # DPM-Solver's first-order step in eps (`_dpm_terms`), the clean endpoint where it reaches none.
-            scale, step, *_ = _dpm_terms("dpmsolver", alpha_s0, sigma_s0, alpha_t, sigma_t, h)
-            regular = scale * x + step * m0
-            return jnp.where((alpha_s0 == 0) | terminal, alpha_t * denoised + sigma_t * eps, regular)
-
-        def second(_):
-            coef1 = _deis_second(rho_t, rho_s0, rho_s1) - _deis_second(rho_s0, rho_s0, rho_s1)
-            coef2 = _deis_second(rho_t, rho_s1, rho_s0) - _deis_second(rho_s0, rho_s1, rho_s0)
-            return alpha_t * (x / alpha_s0 + coef1 * m0 + coef2 * m1)
-
-        def third(_):
-            rho_s2, m2 = rhos[-3], history.outputs[-3]
-            coef1 = (_deis_third(rho_t, rho_s0, rho_s1, rho_s2)
-                     - _deis_third(rho_s0, rho_s0, rho_s1, rho_s2))
-            coef2 = (_deis_third(rho_t, rho_s1, rho_s2, rho_s0)
-                     - _deis_third(rho_s0, rho_s1, rho_s2, rho_s0))
-            coef3 = (_deis_third(rho_t, rho_s2, rho_s0, rho_s1)
-                     - _deis_third(rho_s0, rho_s2, rho_s0, rho_s1))
-            return alpha_t * (x / alpha_s0 + coef1 * m0 + coef2 * m1 + coef3 * m2)
-
-        order = _tapered_order(self.order, history.taken, history.steps, self.lower_order_final,
-                               euler_at_final=False)
-        stepped = lax.switch(order - 1, [first, second, third][:self.order], None)
-        return stepped, history.advance()
+    def step(self, x, t, t_next, denoised, eps, state: Tabled, key, process, denoise):
+        state, row = state.push(eps), state.row()
+        stepped = _weighted(row, _multistep_terms(x, denoised, eps, "eps", state.outputs, None, row))
+        return stepped.astype(x.dtype), state.advance()

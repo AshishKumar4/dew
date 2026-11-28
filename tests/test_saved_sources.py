@@ -116,6 +116,30 @@ def test_a_decision_run_whose_head_holds_no_backbone_of_its_family_exports_as_it
 
 
 @pytest.mark.shared_setup("native_release_run")
+def test_a_run_exported_to_a_store_is_refused_before_anything_is_written(native_release_run, tmp_path,
+                                                                        monkeypatch):
+    """`dew export <run> <store URI>` is refused before anything is written, the store and this host's disk
+    alike, as a store has no rename to publish a release whole; a local destination exports (row 14124:
+    `gs://bucket/x` taken as a path was written under `gs:/bucket/x` on the local disk, the export reported
+    as published in the store)."""
+    import uuid
+
+    from dew._cli.main import main
+    from dew.data.storage import Store
+
+    root, _, source, _ = native_release_run
+    monkeypatch.setenv("XDG_CACHE_HOME", str(root / "cache"))
+    monkeypatch.chdir(tmp_path)
+    remote = f"memory://export-{uuid.uuid4().hex}"
+    with pytest.raises(ValueError):
+        main(["export", str(source), remote])
+    fs, path = Store(remote).resolve()
+    assert not fs.exists(path) and not list(tmp_path.iterdir())
+    assert main(["export", str(source), str(tmp_path / "local")]) == 0
+    assert (tmp_path / "local").is_dir()
+
+
+@pytest.mark.shared_setup("native_release_run")
 def test_a_decision_run_started_from_a_native_release_trains_records_it_and_answers(native_release_run,
                                                                                      monkeypatch):
     """A run started from that native release trains, its record naming the run and step it read, and its

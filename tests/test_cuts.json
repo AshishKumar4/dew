@@ -1318,9 +1318,6 @@
 "tests/test_decision_objective.py::test_a_step_reads_its_windows_at_the_documents_its_read_declares",
 "tests/test_decision_objective.py::test_the_abstract_state_draws_a_missing_head_at_the_shapes_init_draws[False]"
 ],
-"tests/test_decision_option_slots.py": [
-"tests/test_decision_option_slots.py::test_the_stored_joint_head_scores_compacted_options_as_it_scores_the_grid"
-],
 "tests/test_decision_packing.py": [
 "tests/test_decision_packing.py::test_a_decision_run_steps_one_program_over_rows_of_every_length",
 "tests/test_decision_packing.py::test_a_joint_head_given_no_layout_reads_every_question_of_a_request_in_one_row[False]",

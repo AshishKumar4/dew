@@ -74,7 +74,7 @@ def test_generated_rounded_bodies_keep_the_written_surrogate_law(dtype):
 
 def test_generated_quantized_straight_through_holds_signed_zero_and_higher_orders():
     from dew.algebra import format_cases_derived
-    from dew.nn import fake_quant
+    from dew.nn import derivatives
 
     emitted, taken = _recorded(format_cases_derived)
     composed = format_cases.QUANTIZED_STE.assembled(emitted)
@@ -85,7 +85,7 @@ def test_generated_quantized_straight_through_holds_signed_zero_and_higher_order
     primal, moved = jax.jit(lambda a, b, da, db: jax.jvp(composed, (a, b), (da, db)))(
         x, stored, tangent, rounded_tangent)
     np.testing.assert_array_equal(np.asarray(primal).view(np.uint32),
-                                  np.asarray(fake_quant.straight_through(x, stored)).view(np.uint32))
+                                  np.asarray(derivatives.straight_through(x, stored)).view(np.uint32))
     np.testing.assert_array_equal(moved, tangent)
     gradient = jax.grad(lambda arg: jnp.square(composed(arg, stored)).sum())
     _, higher = jax.jvp(gradient, (x,), (tangent,))

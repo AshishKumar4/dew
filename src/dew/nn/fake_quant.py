@@ -14,7 +14,7 @@ import ml_dtypes
 import numpy as np
 from flax import linen as nn
 
-from dew.nn.derivatives import contracted, surrogate
+from dew.nn.derivatives import straight_through
 from dew.nn.float_bits import exact_power2, largest_magnitude, raw_fields
 from dew.nn.precision import at_least_fp32, correctly_rounded_divide, divided
 
@@ -101,22 +101,6 @@ def _e2m1_quotient(values, scale):
     return jnp.copysign(jnp.asarray(E2M1[:8])[index], values)
 
 
-def _rounded_value(x, rounded):
-    """`rounded` in `x`'s dtype, bit for bit, a negative zero included, which the kernels keep."""
-    return rounded.astype(x.dtype)
-
-
-def rounded_tangent(primals, tangents, value):
-    """The straight-through quantizer propagates only the written input's tangent."""
-    return tangents[0]
-
-
-straight_through = contracted("test_a_straight_through_rounding_holds_every_order")(
-    surrogate(_rounded_value, rounded_tangent))
-"""`rounded` forward, bit for bit in `x`'s dtype (`_rounded_value`), and the identity's derivative, `x`'s
-tangent, at every order, declared (`dew.nn.derivatives.surrogate`): `x + (rounded - x)` would re-round in
-bf16 wherever the quantizer clamped far from `x`, and turn a -0 into +0. The estimator is Dew's choice; the
-release is inference code and the paper names none."""
 
 
 def fp8_block_scale(amax):

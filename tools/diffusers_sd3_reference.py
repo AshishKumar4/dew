@@ -24,6 +24,7 @@ import inspect
 import json
 import os
 import sys
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -33,6 +34,7 @@ os.environ["JAX_PLATFORMS"] = "cpu"
 import numpy as np
 import torch
 from diffusers_reference_helpers import recording, restore_transformers_names
+from scheduler_cases import FLOW_CONFIGS, flow_arguments, flow_walk
 
 BASE = dict(sample_size=16, patch_size=2, in_channels=4, num_layers=2, attention_head_dim=8,
             num_attention_heads=2, joint_attention_dim=12, caption_projection_dim=16,
@@ -123,19 +125,6 @@ def build(name: str, case: Case, root: Path) -> dict[str, np.ndarray]:
     return arrays
 
 
-FLOW_CASES: dict[str, dict] = {
-    # The files SD3 and SD3.5 ship, plus the controls the class declares that
-    # change where its sigmas land.
-    "flow.plain": dict(num_train_timesteps=1000),
-    "flow.shift3": dict(num_train_timesteps=1000, shift=3.0),
-    "flow.dynamic": dict(num_train_timesteps=1000, use_dynamic_shifting=True, base_shift=0.5,
-                         max_shift=1.15, base_image_seq_len=256, max_image_seq_len=4096),
-    "flow.linear_dynamic": dict(num_train_timesteps=1000, use_dynamic_shifting=True,
-                                time_shift_type="linear"),
-    "flow.terminal": dict(num_train_timesteps=1000, shift=3.0, shift_terminal=0.1),
-    "flow.karras": dict(num_train_timesteps=1000, shift=3.0, use_karras_sigmas=True),
-    "flow.exponential": dict(num_train_timesteps=1000, use_exponential_sigmas=True),
-}
 # Steps and the latent token counts a pipeline computes for a resolution: SD3
 # counts (h/p)(w/p) patches, Flux (h/2)(w/2) packed positions.
 FLOW_STEPS = (4, 7)
@@ -143,24 +132,7 @@ FLOW_TOKENS = (256, 1024, 4096)
 DATA_STD = 0.4
 
 
-def flow_walk(scheduler, latent, sigmas):
-    """The Euler walk the source takes: one model call per interval, the
-    velocity of the optimal transport path for x0 ~ N(0, DATA_STD^2)."""
-    latents = []
-    for index, time in enumerate(scheduler.timesteps):
-        sigma = scheduler.sigmas[index]
-        # E[eps - x0 | x_t] for a Gaussian data law under x = (1-s) x0 + s eps
-        variance = (1 - sigma) ** 2 * DATA_STD ** 2 + sigma ** 2
-        x0 = latent * (1 - sigma) * DATA_STD ** 2 / variance
-        eps = latent * sigma / variance
-        velocity = eps - x0
-        latent = scheduler.step(velocity, time, latent, return_dict=False)[0]
-        latents.append(latent)
-    return latents
-
-
-def flow_record(name: str, config: dict) -> dict[str, np.ndarray]:
-    from diffusers.pipelines.flux.pipeline_flux import calculate_shift
+def flow_record(name: str, config: Mapping[str, Any]) -> dict[str, np.ndarray]:
     from diffusers.schedulers.scheduling_flow_match_euler_discrete import FlowMatchEulerDiscreteScheduler
 
     arrays: dict[str, np.ndarray] = {}
@@ -168,25 +140,14 @@ def flow_record(name: str, config: dict) -> dict[str, np.ndarray]:
         for tokens in FLOW_TOKENS:
             for origin in ("scheduler", "linspace"):
                 scheduler = FlowMatchEulerDiscreteScheduler(**config)
-                kwargs: dict = {}
-                if config.get("use_dynamic_shifting"):
-                    kwargs["mu"] = calculate_shift(
-                        tokens, config.get("base_image_seq_len", 256),
-                        config.get("max_image_seq_len", 4096), config.get("base_shift", 0.5),
-                        config.get("max_shift", 1.15))
-                if origin == "linspace":
-                    kwargs["sigmas"] = np.linspace(1.0, 1 / steps, steps)
-                elif config.get("use_dynamic_shifting"):
-                    # The SD3 pipeline only passes mu; its sigmas stay the
-                    # scheduler's own.
-                    pass
+                kwargs = flow_arguments(config, steps, tokens, origin == "linspace")
                 scheduler.set_timesteps(steps, **kwargs)
                 tag = f"{steps}.{tokens}.{origin}"
                 generator = torch.Generator().manual_seed(SEED + steps)
                 latent = torch.randn((2, 3, 4), generator=generator, dtype=torch.float32,
                                      requires_grad=True)
                 cotangent = torch.randn(latent.shape, generator=generator, dtype=torch.float32)
-                latents = flow_walk(scheduler, latent, scheduler.sigmas)
+                latents = flow_walk(scheduler, latent, std=DATA_STD)
                 (gradient,) = torch.autograd.grad((latents[-1] * cotangent).sum(), latent)
                 sigmas, times = scheduler.sigmas, scheduler.timesteps
                 assert isinstance(sigmas, torch.Tensor) and isinstance(times, torch.Tensor)  # Once set.
@@ -217,12 +178,12 @@ def main(destination: str) -> None:
         cases[name] = {"config": {**BASE, **case.config}, "latent": list(case.latent),
                        "batch": case.batch}
     flow: dict[str, np.ndarray] = {}
-    for name, config in FLOW_CASES.items():
+    for name, config in FLOW_CONFIGS.items():
         flow[f"{name}.config"] = np.asarray(json.dumps(
             {"_class_name": "FlowMatchEulerDiscreteScheduler", **config}))
         for key, value in flow_record(name, config).items():
             flow[f"{name}.{key}"] = value
-    record["flow"] = {"cases": sorted(FLOW_CASES), "steps": list(FLOW_STEPS),
+    record["flow"] = {"cases": sorted(FLOW_CONFIGS), "steps": list(FLOW_STEPS),
                       "tokens": list(FLOW_TOKENS), "data_std": DATA_STD}
     pipeline = pipeline_record(root)
     from diffusers.pipelines.stable_diffusion_3.pipeline_stable_diffusion_3 import StableDiffusion3Pipeline

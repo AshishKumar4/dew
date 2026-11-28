@@ -2189,32 +2189,35 @@ def _sort(declared: TypeOrVarRef) -> type[BaseExpr]:
     return sort[parameters[0] if len(parameters) == 1 else parameters] if parameters else sort
 
 
-def _arguments(constructor) -> tuple[type[BaseExpr], ...]:
-    """The sorts of the arguments `constructor` takes after the term it is called on, as `Term` declares its
-    method (egglog's signature of it)."""
-    signature = declarations(Term).get_callable_decl(constructor.__egg_ref__).signature
+def sorts_of(owner: type[BaseExpr], constructor) -> tuple[type[BaseExpr], ...]:
+    """The sorts of the arguments `constructor`, one of `owner`'s, takes, a method's the one it is called on
+    first, as `owner` declares it (egglog's signature of it): what a pattern over any sort's constructors is
+    made of (`pattern_of`: the language's, `Term`, and `dew.algebra.linear_scan`'s chunk language)."""
+    signature = declarations(owner).get_callable_decl(constructor.__egg_ref__).signature
     if not isinstance(signature, FunctionSignature):
         raise TypeError(f"{constructor} is declared by {signature!r}, no signature of its arguments")
-    return tuple(map(_sort, signature.arg_types[1:]))
+    return tuple(map(_sort, signature.arg_types))
 
 
-LANGUAGE: Mapping = {constructor: _arguments(constructor)
-                     for constructor in (getattr(Term, written.constructor) for written in WRITTEN.values())}
-"""The language's constructors that read terms (a leaf's and a literal's none: each kind's, `WRITTEN`), each
-by the sorts of the arguments it takes after the term it is called on, as `Term` declares them: the one
-inventory every reader of the language walks (`subterms`, `pattern`)."""
+LANGUAGE = tuple(getattr(Term, written.constructor) for written in WRITTEN.values())
+"""The language's constructors that read terms (a leaf's and a literal's none: each kind's, `WRITTEN`): the
+one inventory every reader of the language walks (`subterms`, `carry`'s state readers by `pattern_of`)."""
 
 
-def pattern(constructor, name: str) -> tuple[Term, tuple[Term, ...]]:
-    """`constructor` (a `LANGUAGE` entry) over fresh variables named from `name`: the pattern, and the terms
-    it reads, the one it is called on first."""
+def pattern_of[Sort: BaseExpr](owner: type[Sort], constructor, name: str) -> tuple[Sort, tuple[Sort, ...]]:
+    """`constructor`, one of `owner`'s, over fresh variables named from `name`, each of the sort its signature
+    declares (`sorts_of`): the pattern, and the variables of `owner`'s own sort it reads, in order."""
     from egglog import var
 
-    called = var(f"{name}_called", Term)
-    kinds = LANGUAGE[constructor]
-    arguments = [var(f"{name}_{index}", kind) for index, kind in enumerate(kinds)]
-    read = tuple(argument for argument, kind in zip(arguments, kinds, strict=True) if kind is Term)
-    return constructor(called, *arguments), (called, *read)
+    arguments, read = [], []
+    for index, kind in enumerate(sorts_of(owner, constructor)):
+        if kind is owner:
+            own = var(f"{name}_{index}", owner)
+            read.append(own)
+            arguments.append(own)
+        else:
+            arguments.append(var(f"{name}_{index}", kind))
+    return constructor(*arguments), tuple(read)
 
 
 def subterms(form: Term) -> Iterator[Term]:

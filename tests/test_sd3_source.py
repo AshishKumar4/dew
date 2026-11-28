@@ -16,6 +16,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+import tool_support
 from arm_arithmetic import float64_held
 from arm_forms import dew_path
 from flax import linen as nn
@@ -158,40 +159,113 @@ FLOW_CASES = ("flow.plain", "flow.shift3", "flow.dynamic", "flow.linear_dynamic"
               "flow.terminal", "flow.karras", "flow.exponential")
 
 
+FLOW_SEEDS = 32
+"""Each flow schedule site's declared check-1 seeds."""
+FLOW_SHAPE = (4, 3, 8)
+FLOW_TOKENS = (256, 4096)
+"""The latent token counts a flow seed draws between: SD3's 256 patches at 512 pixels to Flux's 4096 packed
+positions at 1024."""
+
+
+def flow_draw(seed: int) -> tuple[np.ndarray, ...]:
+    """A flow seed's inputs: x_T, the cotangent its last latent is pulled back by, the latent token count
+    a resolution's shift reads (`FLOW_TOKENS`) and the sigmas' origin, 0 the scheduler's own and 1 the
+    `linspace(1, 1/N, N)` a Flux pipeline hands it."""
+    generator = np.random.default_rng([0xF10, seed])
+    return (generator.standard_normal(FLOW_SHAPE).astype(np.float32),
+            generator.standard_normal(FLOW_SHAPE).astype(np.float32),
+            np.int32(generator.integers(FLOW_TOKENS[0], FLOW_TOKENS[1] + 1)), np.int32(generator.integers(2)))
+
+
+def source_flow(config: dict, steps: int, std: float, dtype, x_T, cotangent, tokens, origin):
+    """`FlowMatchEulerDiscreteScheduler` under `config` at `steps` (the unmodified library's at float32, its
+    independent oracle's at float64, tools/float64_schedulers.py), its sigmas set as SD3's pipeline (`mu`
+    alone, from `calculate_shift` at `tokens`, where the file shifts dynamically) or a Flux pipeline
+    (`origin` 1: its linspace beside that mu) sets them, and the recording's Euler walk over the closed-form
+    velocity at `dtype` (tools/scheduler_cases.py's `flow_arguments`, `flow_walk`): the sigmas, the
+    model times, every latent and the last one's VJP. The velocity reads the timestep the scheduler hands
+    its model, as a transformer reads it and as Dew's model reads the model time it is handed."""
+    import torch
+    from diffusers.schedulers.scheduling_flow_match_euler_discrete import FlowMatchEulerDiscreteScheduler
+
+    cases = tool_support.load("scheduler_cases")
+    library = FlowMatchEulerDiscreteScheduler.from_config(config)
+    assert isinstance(library, FlowMatchEulerDiscreteScheduler)  # `from_config`'s stub widens it.
+    scheduler = (tool_support.scheduler_oracles().oracle_of(library) if dtype == torch.float64
+                 else library)
+    arguments = cases.flow_arguments(config, steps, int(tokens), bool(int(origin)))
+    scheduler.set_timesteps(steps, **arguments)
+    with torch.enable_grad():
+        latent = torch.from_numpy(np.asarray(x_T)).to(dtype).requires_grad_()
+        def level(index, time):
+            return torch.as_tensor(time).to(dtype) / 1000.0
+
+        latents = cases.flow_walk(scheduler, latent, level, std=std)
+        pulled = torch.from_numpy(np.asarray(cotangent)).to(dtype)
+        (gradient,) = torch.autograd.grad((latents[-1] * pulled).sum(), latent)
+    return {"sigmas": scheduler.sigmas, "times": scheduler.timesteps,
+            **{f"after {index}": latent.detach() for index, latent in enumerate(latents)}, "grad": gradient}
+
+
+@pytest.mark.parametrize("steps", [4, 7])
 @pytest.mark.parametrize("name", FLOW_CASES)
-def test_native_flow_schedule_matches_the_source_grids_and_trajectory(name, source):
-    """The actual `FlowMatchEulerDiscreteScheduler` at two step counts, three
-    resolutions and both sigma origins.
+def test_native_flow_schedule_matches_the_source_grids_and_trajectory(name, steps, source):
+    """The actual `FlowMatchEulerDiscreteScheduler` of each published file, at a drawn resolution and
+    either sigma origin.
 
     `scheduler` is the seed SD3's pipeline leaves to the class, whose
     constructor has already applied the static shift once, so the shift lands
     twice; `linspace` is the `linspace(1, 1/N, N)` a Flux pipeline hands it
     with the mu its `calculate_shift` returns. The sigmas, the model times,
-    every latent of the Euler walk and its input gradient land within 3e-7 of
-    the source's own scale.
+    every latent of the Euler walk and its input gradient are on par with the
+    source's own float32 walk over drawn starts, cotangents, token counts and
+    origins (check 1), the class's independent float64 oracle
+    (tools/float64_schedulers.py) the truth.
     """
-    arrays = flow_reference(source)
-    meta = json.loads((source / "sd3_transformer.json").read_text())["flow"]
-    schedule = SourceSchedule.from_config(json.loads(str(arrays[f"{name}.config"])))
-    model = Velocity(meta["data_std"])
-    params = model.init(jax.random.PRNGKey(0), jnp.ones((1, 3, 4)), jnp.ones((1,)))
-    for steps in meta["steps"]:
-        for tokens in meta["tokens"]:
-            for origin in ("scheduler", "linspace"):
-                tag = f"{name}.{steps}.{tokens}.{origin}"
-                process, times = schedule.sampling(steps, tokens=tokens, origin=origin)
-                assert relative_gap(process.sampler_schedule.sigmas(times),
-                                    arrays[f"{tag}.sigmas"]) < 1e-5
-                assert relative_gap(process.sampler_schedule.model_time(times[:-1]),
-                                    arrays[f"{tag}.times"]) < 1e-5
-                denoise = process.denoiser(model, params, {})
-                def run(value, *, denoise=denoise, times=times):
-                    return sample(denoise, value, solver=schedule.solver, key=jax.random.PRNGKey(0),
-                                  times=times, final_denoise=False)
-                x_T = jnp.asarray(arrays[f"{tag}.x_T"])
-                assert relative_gap(run(x_T), arrays[f"{tag}.latents"][-1]) < 1e-4
-                (gradient,) = jax.vjp(run, x_T)[1](jnp.asarray(arrays[f"{tag}.cotangent"]))
-                assert relative_gap(gradient, arrays[f"{tag}.grad"]) < 1e-4
+    import torch
+
+    from _dew_torch.precision import float64
+
+    config = json.loads(str(flow_reference(source)[f"{name}.config"]))
+    std = json.loads((source / "sd3_transformer.json").read_text())["flow"]["data_std"]
+    schedule = SourceSchedule.from_config(config)
+    model = Velocity(std)
+    params = model.init(jax.random.PRNGKey(0), jnp.ones((1, *FLOW_SHAPE[1:])), jnp.ones((1,)))
+
+    @as_given
+    def native(x_T, cotangent, tokens, origin):
+        process, times = schedule.sampling(steps, tokens=int(tokens),
+                                           origin="linspace" if origin else "scheduler")
+        denoise = process.denoiser(model, params, {})
+
+        def run(value):
+            return walk_latents(denoise, schedule.solver, value, times)
+
+        latents, pullback = jax.vjp(run, jnp.asarray(x_T))
+        (gradient,) = pullback(jnp.zeros_like(latents).at[-1].set(jnp.asarray(cotangent, latents.dtype)))
+        return {"sigmas": process.sampler_schedule.sigmas(times),
+                "times": process.sampler_schedule.model_time(times[:-1]),
+                **{f"after {index}": latent for index, latent in enumerate(latents)}, "grad": gradient}
+
+    def reference(dtype):
+        def walked(*inputs):
+            return jax.tree.map(lambda value: value.numpy(), source_flow(config, steps, std, dtype, *inputs))
+        return walked
+
+    @as_given
+    def truth(*inputs):
+        with float64():
+            return reference(torch.float64)(*inputs)
+
+    assert_as_exact(native, as_given(reference(torch.float32)), flow_draw, f"{name} at {steps} steps",
+                    seeds=FLOW_SEEDS, truth_fn=truth)
+
+
+def walk_latents(denoise, solver, x_T, times):
+    """Each interval's latent of `sample`'s walk over `times` from `x_T`, without the closing denoise."""
+    _, latents = sample(denoise, x_T, solver=solver, key=jax.random.PRNGKey(0), times=times,
+                        final_denoise=False, record=lambda x, state, denoised: x)
+    return latents
 
 
 @attending("xla")

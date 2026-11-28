@@ -1,7 +1,8 @@
-"""Titans' linear memory (`dew.nn.kernels.titans`, fla's chunk_titans_linear_ref) and TTT-Linear
-(`dew.nn.kernels.ttt`, fla's chunk_ttt_linear_ref) a mini-batch at a time: each one's output, final states
-and every operand's gradient on par with a token recurrence from float64 (check 1), the recurrence this
-file's own (its inner gradient the inner loss's by autodiff, no part of either module's)."""
+"""Titans' linear memory (`dew.nn.kernels.titans`) and TTT-Linear (`dew.nn.kernels.ttt`) a mini-batch at a
+time, as Dew's in-context memory computes them (each token stepping by its own rate, the residual around its
+query): each one's output, final states and every operand's gradient on par with a token recurrence from
+float64 (check 1), the recurrence this file's own (its inner gradient the inner loss's by autodiff, no part
+of either module's)."""
 
 import functools
 
@@ -28,15 +29,16 @@ def _layer_normed(x, eps: float):
 
 
 def _half_gradient(k, v, readout, weight, bias, eps: float):
-    """Half the inner loss `|LN(readout) w + b - (v - k)|^2`'s gradient at `readout`, by autodiff."""
+    """Half the inner loss `|k + (LN(readout) w + b) - v|^2`'s gradient at `readout`, by autodiff."""
     def loss(at):
-        return 0.5 * jnp.sum((_layer_normed(at, eps) * weight + bias - (v - k)) ** 2)
+        return 0.5 * jnp.sum(((k + (_layer_normed(at, eps) * weight + bias)) - v) ** 2)
 
     return jax.grad(loss)(readout)
 
 
-def _read_out(out, weight, bias, eps: float):
-    return out + _layer_normed(out, eps) * weight + bias
+def _read_out(q, out, weight, bias, eps: float):
+    """Each query plus its readout's LayerNorm under the affine: the memory's residual around its input."""
+    return q + (_layer_normed(out, eps) * weight + bias)
 
 
 def _tokens_first(work, *xs):
@@ -68,14 +70,15 @@ def titans_by_token(query, key, value, weight, bias, theta, alpha, eta, state=No
 
     steps = (jnp.arange(tokens[0].shape[0]), *tokens)
     (memory, momentum, _), outs = jax.lax.scan(step, (memory, momentum, memory), steps)
-    return _read_out(jnp.moveaxis(outs, 0, 1), weight, bias, eps).astype(dtype), (memory, momentum)
+    queries = jnp.moveaxis(tokens[0], 0, 1)
+    return _read_out(queries, jnp.moveaxis(outs, 0, 1), weight, bias, eps).astype(dtype), (memory, momentum)
 
 
 def ttt_by_token(query, key, value, weight, bias, eta, state=None, *, chunk: int, scale=None,
                  eps: float = 1e-6):
-    """TTT-Linear a token at a time: each mini-batch's entering memory and bias held, each token's gradient at
-    them (`_half_gradient`), its update sums running, its output read at its own rate, the state leaving
-    at the mini-batch's last token's, in at least fp32 of its operands."""
+    """TTT-Linear a token at a time as Dew's in-context memory steps it: each mini-batch's entering memory and
+    bias held, each token's gradient at them (`_half_gradient`), each token stepping the state by its own
+    rate times its own gradient and reading the state it leaves, in at least fp32 of its operands."""
     dtype = jnp.result_type(query, key, value)
     work = jnp.promote_types(dtype, jnp.float32)
     q, k, v, eta = _tokens_first(work, query, key, value, eta)
@@ -86,25 +89,23 @@ def ttt_by_token(query, key, value, weight, bias, eta, state=None, *, chunk: int
                       if state is None else (jnp.asarray(s, work) for s in state))
 
     def step(carried, at):
-        memory, offset, entering, entering_offset, keys, values = carried
+        memory, offset, entering, entering_offset = carried
         t, q, k, v, eta = at
         start = t % chunk == 0
         entering = jnp.where(start, memory, entering)
         entering_offset = jnp.where(start, offset, entering_offset)
-        keys, values = jnp.where(start, 0.0, keys), jnp.where(start, 0.0, values)
         readout = jnp.einsum('bhk,bhkv->bhv', k, entering) + entering_offset[:, :, 0]
         u = _half_gradient(k, v, readout, weight, bias, eps)
-        keys = keys + k[..., :, None] * u[..., None, :]
-        values = values + u[..., None, :]
         rate = eta[..., None, None]
-        # The state as this token leaves it: the next mini-batch's entering one at its last token.
-        memory, offset = entering - rate * keys, entering_offset - rate * values
+        memory = memory - rate * k[..., :, None] * u[..., None, :]
+        offset = offset - rate * u[..., None, :]
         out = jnp.einsum('bhk,bhkv->bhv', q, memory) + offset[:, :, 0]
-        return (memory, offset, entering, entering_offset, keys, values), out
+        return (memory, offset, entering, entering_offset), out
 
-    carried = (memory, offset, memory, offset, jnp.zeros_like(memory), jnp.zeros_like(offset))
+    carried = (memory, offset, memory, offset)
     (memory, offset, *_), outs = jax.lax.scan(step, carried, (jnp.arange(q.shape[0]), q, k, v, eta))
-    return _read_out(jnp.moveaxis(outs, 0, 1), weight, bias, eps).astype(dtype), (memory, offset)
+    return _read_out(jnp.moveaxis(q, 0, 1), jnp.moveaxis(outs, 0, 1), weight, bias,
+                     eps).astype(dtype), (memory, offset)
 
 
 def operands(form: str, dtype):
@@ -168,23 +169,26 @@ def test_a_live_or_later_overflowed_score_leaves_the_reads_finite(form):
 
 def test_titans_memory_forgotten_whole_reads_zero():
     """Titans under `alpha` 1 (the memory forgotten whole) from an entering memory of 2^70 at a query of
-    `(2^70, 0)`, no key, value or momentum: its output and final memory zero, the forgetting applied to the
-    state before any read, where `0 * (q M)` with `q M` = 2^140 read NaN (train 1403's review)."""
+    `(2^70, 0)`, no key, value or momentum: its readout and final memory zero, so its output the query
+    itself (the residual around it), the forgetting applied to the state before any read, where `0 * (q M)`
+    with `q M` = 2^140 read NaN (train 1403's review)."""
     entering = jnp.zeros((1, 1, 2, 2)).at[0, 0, 0, 0].set(2.0 ** 70)
     zero = jnp.zeros((1, 1, 1, 2), jnp.float32)
-    out, (memory, _) = titans(_pair((2.0 ** 70, 0.0)), zero, zero, jnp.ones((1, 2)), jnp.zeros((1, 2)),
+    query = _pair((2.0 ** 70, 0.0))
+    out, (memory, _) = titans(query, zero, zero, jnp.ones((1, 2)), jnp.zeros((1, 2)),
                               *(jnp.full((1, 1, 1), x) for x in (0.1, 1.0, 0.5)),
                               state=(entering, jnp.zeros_like(entering)), chunk=1)
-    np.testing.assert_array_equal(np.asarray(out), np.zeros((1, 1, 1, 2), np.float32))
+    np.testing.assert_array_equal(np.asarray(out), np.asarray(query))
     np.testing.assert_array_equal(np.asarray(memory), np.zeros((1, 1, 2, 2), np.float32))
 
 
 def test_ttts_padded_token_leaves_a_real_ones_output_and_state():
-    """TTT-Linear over one real token in a mini-batch of two, its entering bias `[-A, -A, -A, 15 2^124]`
-    (`A` 2^127) and its memory's first row the bias negated, a unit query, key and value `e0`, zero affine
-    bias: the real token's readout zero, its update none, its output zero and the state leaving as it
-    entered, the padded token's readout (the bias itself) zero before the LayerNorm sees it, where its
-    overflowed variance's `0 * inf` reached the real token's output and the bias (train 1403's review)."""
+    """TTT-Linear over one real token in a mini-batch of two, its entering bias `[-A, -A, -A, 15 2^124]` (`A`
+    2^127) and its memory's first row the bias negated, a unit query, key and value `e0`, zero affine bias:
+    the real token's readout zero, its update none, its output its query (the residual around it) and the
+    state leaving as it entered, the padded token's readout (the bias itself) zero before the LayerNorm sees
+    it, where its overflowed variance's `0 * inf` reached the real token's output and the bias (train 1403's
+    review)."""
     a = 2.0 ** 127
     offset = jnp.asarray([-a, -a, -a, 15 * 2.0 ** 124], jnp.float32).reshape(1, 1, 1, 4)
     memory = jnp.zeros((1, 1, 4, 4), jnp.float32).at[0, 0, 0].set(-offset[0, 0, 0])
@@ -192,7 +196,7 @@ def test_ttts_padded_token_leaves_a_real_ones_output_and_state():
     affine = (jnp.ones((1, 4)), jnp.zeros((1, 4)))
     out, (left, left_offset) = ttt_linear(unit_e0, unit_e0, unit_e0, *affine, jnp.full((1, 1, 1), 0.1),
                                           state=(memory, offset), chunk=2, scale=1.0)
-    np.testing.assert_array_equal(np.asarray(out), np.zeros((1, 1, 1, 4), np.float32))
+    np.testing.assert_array_equal(np.asarray(out), np.asarray(unit_e0))
     np.testing.assert_array_equal(np.asarray(left), np.asarray(memory))
     np.testing.assert_array_equal(np.asarray(left_offset), np.asarray(offset))
 
@@ -336,14 +340,141 @@ def test_ttts_rate_meets_its_keys_before_their_updates_sum():
 def test_a_later_tokens_overflowing_update_leaves_an_earlier_read_as_it_is():
     """TTT-Linear over two fp32 tokens of one mini-batch, width 2, a zero query, key and entering state, the
     second token's value `(2^127, 0)`, unit rates, an affine weight of 4 and zero bias, `eps` 1: the first
-    token's output zero, the second token's non-finite update (its LayerNorm pullback's seed `-2^127 4`)
-    selected out of the first's prefix before any product, where a zero factor times it was NaN (a head
-    review)."""
+    token's output zero, read from the state its own step leaves, the second token's non-finite update (its
+    LayerNorm pullback's seed `-2^127 4`) none of it, where a prefix holding it behind a zero factor was NaN
+    (a head review)."""
     zeros = _pair((0.0, 0.0), (0.0, 0.0))
     affine = (jnp.full((1, 2), 4.0, jnp.float32), jnp.zeros((1, 2), jnp.float32))
     out, _ = ttt_linear(zeros, zeros, _pair((0.0, 0.0), (2.0 ** 127, 0.0)), *affine, jnp.ones((1, 2, 1)),
                         chunk=2, eps=1.0)
     np.testing.assert_array_equal(np.asarray(out)[0, 0], np.zeros((1, 2), np.float32))
+
+
+@pytest.mark.parametrize('memory', ['titans', 'ttt'])
+def test_a_calls_absent_tail_leaves_it_the_call_on_its_real_tokens(memory):
+    """Titans' or TTT-Linear's fp32 call over five tokens of two heads in mini-batches of two, its last two
+    absent (`valid`) and holding `2^120` in every operand: its outputs at its real tokens and its final state
+    bit for bit the call over its three real tokens alone, an absent token's operands zeroed before any
+    product (an in-context memory's compacted rows' tails, rows 1448/1449's consumer)."""
+    rng = np.random.default_rng(1448)
+
+    def normal(*shape):
+        return jnp.asarray(rng.standard_normal(shape) / 4, jnp.float32)
+
+    q, k, v = (normal(1, 5, 2, 4) for _ in range(3))
+    gates = [jnp.asarray(rng.uniform(0.05, 0.3, (1, 5, 2)), jnp.float32)
+             for _ in range(3 if memory == 'titans' else 1)]
+    affine = (1 + normal(2, 4), normal(2, 4))
+    run = functools.partial(titans if memory == 'titans' else ttt_linear, chunk=2)
+
+    def junk(x):
+        return x.at[:, 3:].set(2.0 ** 120)
+
+    found, found_state = run(*map(junk, (q, k, v)), *affine, *map(junk, gates),
+                             valid=jnp.asarray([[True, True, True, False, False]]))
+    expected, expected_state = run(q[:, :3], k[:, :3], v[:, :3], *affine, *(gate[:, :3] for gate in gates))
+    np.testing.assert_array_equal(np.asarray(found)[:, :3], np.asarray(expected))
+    for state, alone in zip(found_state, expected_state, strict=True):
+        np.testing.assert_array_equal(np.asarray(state), np.asarray(alone))
+
+
+def test_titans_write_coefficient_is_one_factor_of_its_product():
+    """Titans' write at `coefficient` 1 and its rate `theta` is bit for bit its write at the default 2 and
+    half the rate (an in-context memory's half-squared loss), each one factor of the write's exact
+    product."""
+    query, key, value, weight, bias, theta, alpha, eta, state, _ = operands('titans', jnp.float32)(0)
+    run = functools.partial(titans, query, key, value, weight, bias, chunk=CHUNK, state=state)
+    halved = run(theta / 2, alpha, eta)
+    unit = run(theta, alpha, eta, coefficient=1.0)
+    for found, expected in zip(jax.tree.leaves(unit), jax.tree.leaves(halved), strict=True):
+        np.testing.assert_array_equal(np.asarray(found), np.asarray(expected))
+
+
+@pytest.mark.parametrize('form', sorted(FORMS))
+def test_a_memorys_mini_batches_are_recomputed_where_the_rung_recomputes_the_chunks(form):
+    """Each mini-batched memory's residuals for its gradient (`jax.ad_checkpoint.saved_residuals`) fewer bytes
+    where the run's rung recomputes the memory's chunks (`residuals.memory_chunks`, as `dew.nn.memory`'s),
+    each mini-batch recomputed from the state it entered with (XLA fuses the recomputation its own way, so
+    its gradients round apart from the stored run's)."""
+    from jax._src.ad_checkpoint import saved_residuals
+    from jax._src.core import ShapedArray
+
+    from dew.nn.residuals import MEMORY_RESIDUALS, recomputing
+
+    *given, states, _ = operands(form, jnp.float32)(1)
+    memory = functools.partial(FORMS[form][0], chunk=CHUNK)
+
+    def total(*arguments):
+        return sum(jnp.sum(x) for x in jax.tree.leaves(memory(*arguments)))
+
+    def saved():
+        found = 0
+        for aval, _ in saved_residuals(total, *given, states):
+            assert isinstance(aval, ShapedArray), aval
+            found += aval.size * aval.dtype.itemsize
+        return found
+
+    stored_bytes = saved()
+    with recomputing((MEMORY_RESIDUALS[1],)):
+        recomputed_bytes = saved()
+    assert recomputed_bytes < stored_bytes, (recomputed_bytes, stored_bytes)
+
+
+def test_a_memorys_residual_survives_an_affine_its_bias_cancels():
+    """Titans over one fp32 token, its query `e0` reading a memory whose first row is `(1, -1)` (its readout
+    `(1, -1)`, normed to itself at `eps` 2^-30), no key, value or rates, an affine weight of 2^25 and bias
+    `(-2^25, 2^25)`: its output `e0` exactly, the affine whole before the query's residual
+    (`ResidualMemory`'s `q + (LN w + c)`), where `(q + LN w) + c` lost the query to the bias's cancellation (a
+    head review)."""
+    query = _pair((1.0, 0.0))
+    zero = jnp.zeros_like(query)
+    entering = jnp.zeros((1, 1, 2, 2), jnp.float32).at[0, 0, 0].set(jnp.asarray([1.0, -1.0]))
+    # Past fp32's 24 bits from the query's 1, within the inner gradient's range (its error times the weight).
+    large = 2.0 ** 25
+    affine = (jnp.full((1, 2), large, jnp.float32), jnp.asarray([[-large, large]], jnp.float32))
+    out, _ = titans(query, zero, zero, *affine, *(jnp.zeros((1, 1, 1)) for _ in range(3)),
+                    state=(entering, jnp.zeros_like(entering)), chunk=1, eps=2.0 ** -30)
+    np.testing.assert_array_equal(np.asarray(out), np.asarray(query))
+
+
+def test_a_ttt_tokens_absent_slot_leaves_its_live_gradients_the_one_slot_calls():
+    """TTT-Linear over two tokens, the second absent (`valid`) with an infinite query, beside the entering
+    bias `[-A, -A, -A, 15 2^124]` (`A` 2^127) of `test_ttts_padded_token_leaves_a_real_ones_output_and_state`:
+    the live output's gradients by the entering states and the query scale finite and the one-slot call's bit
+    for bit, the absent query zeroed before its scale and its readout (the bias kept) zeroed before the
+    LayerNorm, where either met its zero cotangent as NaN (a head review)."""
+    a = 2.0 ** 127
+    offset = jnp.asarray([-a, -a, -a, 15 * 2.0 ** 124], jnp.float32).reshape(1, 1, 1, 4)
+    memory = jnp.zeros((1, 1, 4, 4), jnp.float32).at[0, 0, 0].set(-offset[0, 0, 0])
+    unit_e0 = jnp.zeros((1, 1, 1, 4), jnp.float32).at[..., 0].set(1.0)
+    affine = (jnp.ones((1, 4)), jnp.zeros((1, 4)))
+
+    def live(memory, offset, scale, query, key, value, rate, valid):
+        out, _ = ttt_linear(query, key, value, *affine, rate, state=(memory, offset), chunk=2, scale=scale,
+                            valid=valid)
+        return jnp.sum(out[:, :1])
+
+    two = (jnp.concatenate([unit_e0, jnp.full_like(unit_e0, np.inf)], axis=1),
+           *(jnp.concatenate([unit_e0, unit_e0], axis=1) for _ in range(2)), jnp.full((1, 2, 1), 0.1),
+           jnp.asarray([[True, False]]))
+    one = (unit_e0, unit_e0, unit_e0, jnp.full((1, 1, 1), 0.1), None)
+    gradient = jax.jit(jax.grad(live, argnums=(0, 1, 2)))
+    found = gradient(memory, offset, jnp.float32(1.0), *two)
+    expected = gradient(memory, offset, jnp.float32(1.0), *one)
+    for leaf, alone in zip(found, expected, strict=True):
+        np.testing.assert_array_equal(np.asarray(leaf), np.asarray(alone))
+
+
+def test_ttts_inner_error_keeps_a_residual_its_target_would_round_away():
+    """TTT-Linear over one fp32 token, its entering state zero, the inner loss's affine weight one and bias
+    `(-2^100, 0)`, `eps` 1, its key `(2^100, 1)`, value `(1, 1)` and rate 2^-100: its memory's first row
+    `(1/2, -1/2)` exactly, the error `(k + (LN(k W) w + c)) - v` the memory's own (`(-1, 0)`), where against
+    `v - k` the target rounded to `(-2^100, 0)` and erased the update (a head review)."""
+    key, value = _pair((2.0 ** 100, 1.0)), _pair((1.0, 1.0))
+    affine = (jnp.ones((1, 2), jnp.float32), jnp.asarray([[-(2.0 ** 100), 0.0]], jnp.float32))
+    _, (memory, _) = ttt_linear(jnp.zeros_like(key), key, value, *affine, jnp.full((1, 1, 1), 2.0 ** -100),
+                                chunk=1, scale=1.0, eps=1.0)
+    np.testing.assert_array_equal(np.asarray(memory)[0, 0, 0], np.asarray([0.5, -0.5], np.float32))
 
 
 def test_titans_partial_mini_batch_leaves_the_state_its_last_token_does():
@@ -451,7 +582,8 @@ def test_the_mini_batches_run_on_an_explicit_mesh_with_the_affine_alone_split_by
 
 
 @pytest.mark.mesh(devices=2)
-@pytest.mark.parametrize('split', ['rows', 'rows, a replicated state', 'affine', 'a state leaf', 'the query'])
+@pytest.mark.parametrize('split', ['rows', 'rows, a replicated state', 'affine', 'a state leaf', 'the query',
+                                   'the mask'])
 @pytest.mark.parametrize('form', sorted(FORMS))
 def test_the_mini_batches_run_in_a_checked_shard_map_whatever_varies(form, split):
     """Each form in a checked `shard_map` over two devices, each device's operands its own where they vary
@@ -460,22 +592,25 @@ def test_the_mini_batches_run_in_a_checked_shard_map_whatever_varies(form, split
     final state the device's call's shape and dtype and finite, and every operand's gradient finite, its
     scans' carries typed as every operand varies (`sharding.varying_like`), where an invariant carry was
     refused (train 1403's review), and one typed as the tokens and gates alone beside an affine or a state
-    leaf that varies (a head review). Its values are the oracle test's. An odd seed's, whose entering states
-    are not zero (a zero leaf doubled is no leaf that varies)."""
+    leaf that varies (a head review), or beside a token mask that varies alone (one device's tokens live, the
+    other's absent: a head review). Its values are the oracle test's. An odd seed's, whose entering states are
+    not zero (a zero leaf doubled is no leaf that varies)."""
     *given, _ = operands(form, jnp.float32)(1)
     tokens, affine, gates, states = tuple(given[:3]), tuple(given[3:5]), tuple(given[5:-1]), given[-1]
 
     def on(device):
-        """The device's operands, `(tokens, affine, gates, state)`."""
+        """The device's operands, `(tokens, affine, gates, state, valid)`."""
         if split.startswith('rows'):
             rows = slice(device, device + 1)
             state = None if split == 'rows' else tuple(s[:1] for s in states)
-            return tuple(x[rows] for x in tokens), affine, tuple(x[rows] for x in gates), state
+            return tuple(x[rows] for x in tokens), affine, tuple(x[rows] for x in gates), state, None
         if split == 'affine':
-            return tokens, tuple(x * (1 + device) for x in affine), gates, None
+            return tokens, tuple(x * (1 + device) for x in affine), gates, None, None
         if split == 'the query':
-            return (tokens[0] * (1 + device), *tokens[1:]), affine, gates, None
-        return tokens, affine, gates, (states[0], states[1] * (1 + device))
+            return (tokens[0] * (1 + device), *tokens[1:]), affine, gates, None, None
+        if split == 'the mask':
+            return tokens, affine, gates, None, np.full(jnp.shape(tokens[0])[:2], device == 0)
+        return tokens, affine, gates, (states[0], states[1] * (1 + device)), None
 
     each = [on(device) for device in range(2)]
     leaves, structure = jax.tree.flatten(each[0])
@@ -483,8 +618,8 @@ def test_the_mini_batches_run_in_a_checked_shard_map_whatever_varies(form, split
     args = [jnp.stack(pair) if vary else pair[0]
             for pair, vary in zip(zip(*(jax.tree.leaves(e) for e in each), strict=True), varies, strict=True)]
 
-    def call(tokens, affine, gates, state):
-        return FORMS[form][0](*tokens, *affine, *gates, state=state, chunk=CHUNK)
+    def call(tokens, affine, gates, state, valid):
+        return FORMS[form][0](*tokens, *affine, *gates, state=state, chunk=CHUNK, valid=valid)
 
     def local(*leaves):
         mine = [x[0] if vary else x for x, vary in zip(leaves, varies, strict=True)]
@@ -497,9 +632,15 @@ def test_the_mini_batches_run_in_a_checked_shard_map_whatever_varies(form, split
     shapes = jax.eval_shape(call, *each[0])
     assert ([(x.shape, x.dtype) for x in jax.tree.leaves(found)]
             == [((2, *x.shape), x.dtype) for x in jax.tree.leaves(shapes)])
+    if split == 'the mask':
+        # The idle device's states leave as they entered (zeros).
+        for state in jax.tree.leaves(found[1]):
+            np.testing.assert_array_equal(np.asarray(state)[1], np.zeros(state.shape[1:], state.dtype))
 
     def total(*leaves):
         return sum(jnp.sum(x) for x in jax.tree.leaves(mapped(*leaves)))
 
-    gradients = jax.jit(jax.grad(total, argnums=tuple(range(len(args)))))(*args)
+    # Every float operand's gradient (a token mask has none).
+    floats = tuple(index for index, x in enumerate(args) if jnp.issubdtype(jnp.result_type(x), jnp.inexact))
+    gradients = jax.jit(jax.grad(total, argnums=floats))(*args)
     assert all(np.isfinite(np.asarray(x)).all() for x in (*jax.tree.leaves(found), *gradients))

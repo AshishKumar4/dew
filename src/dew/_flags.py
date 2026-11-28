@@ -9,7 +9,7 @@ import functools
 import operator
 import types
 import typing
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from typing import Annotated, Literal, Union
 
 import tyro
@@ -60,6 +60,11 @@ def _fits(value: registry.Configured, annotation: Annotation) -> bool:
     return type(value) is annotation or (annotation is float and type(value) is int)
 
 
+MERGED = "dew_flags_merged"
+"""The names a subcommand's record's flags merged into its binding (`record_flags`), held on the binding
+itself (a `functools.partial`'s attributes), no field of the record's, so a parse over it drops them."""
+
+
 @functools.cache
 def record_flags[R: Bound](record: type[R], member: type | Callable[..., registry.Configured], path: str,
                            alias: str) -> type[R]:
@@ -88,10 +93,20 @@ def record_flags[R: Bound](record: type[R], member: type | Callable[..., registr
                   ("defaults", tyro.conf.Suppress[JsonRecords], dataclasses.field(default_factory=dict))]
 
     def __post_init__(self) -> None:
+        # The flags the sole source of what they state: the arguments an earlier record's flags merged into
+        # its `bound` (named on that binding, `MERGED`, which a parse over the record carries with it) are
+        # dropped before this one's flags set apart from their defaults are merged, so a flag reset to its
+        # default leaves the member's default, not a recipe's value it was set over (row 14127:
+        # `--rollout.train-ratio 1024.0` over a recipe's 16.0 kept 16.0). An argument no flag merged stays,
+        # a default-valued one stated outright among them (`Bound.flagged`); a binding made anew merged none.
+        merged = vars(self.bound).get(MERGED, frozenset())
+        kept = {name: value for name, value in self.bound.keywords.items() if name not in merged}
         given = {name: vars(self)[name] for name in stated_defaults
                  if vars(self)[name] != stated_defaults[name]}
-        object.__setattr__(self, "bound", functools.partial(member, **{**self.bound.keywords, **given}))
+        object.__setattr__(self, "bound", functools.partial(member, **{**kept, **given}))
         record.__post_init__(self)
+        # Named on the binding the record holds once its own normalizing (`Bound.__post_init__`) has made it.
+        vars(self.bound)[MERGED] = frozenset(given)
 
     namespace = {"__post_init__": __post_init__, "__module__": __name__, "_alias": alias.replace("_", "-"),
                  "_flags": flats, "__doc__": (member.__doc__ or "").split("\n\n")[0]}
@@ -101,6 +116,28 @@ def record_flags[R: Bound](record: type[R], member: type | Callable[..., registr
     if not issubclass(made, record):
         raise TypeError(f"{made.__name__} is no {record.__name__}")
     return made
+
+
+def flag_held(made: type[Bound], fields: Mapping[str, registry.Configured]) -> dict[str, registry.Configured]:
+    """The arguments among `fields` a subcommand's record (`made`, `record_flags`'s) holds on its flags
+    (`Bound.flagged`): each a flag can state and set apart from the flag's default; one at the default stays
+    an argument, stated as the record states it, which a flag at its default would leave unstated."""
+    defaults = {field.name: field.default for field in dataclasses.fields(made)}
+    return {name: value for name, value in fields.items()
+            if name in made._flags and _fits(value, made._flags[name]) and value != defaults[name]}
+
+
+def rebound[R: Bound](record: R, fields: Mapping[str, registry.Configured]) -> R:
+    """`record` stating `fields` as its arguments (`Bound.with_fields`, `without_fields`): a command line's
+    subcommand (`record_flags`) as its kind's own record so bound flags it (`Bound.flagged`), every flag and
+    its `bound` taken from that, so an argument a flag held is the one stated now, not the flag's earlier
+    value merged over it (row 14127); any other record so bound."""
+    bound = functools.partial(record.member, **fields)
+    if "_alias" not in vars(type(record)):
+        return dataclasses.replace(record, bound=bound)
+    flagged = dataclasses.replace(record.recorded(), bound=bound).flagged()
+    return dataclasses.replace(record, **{field.name: vars(flagged)[field.name]
+                                          for field in dataclasses.fields(record)})
 
 
 def implied_subcommand(default: registry.Configured) -> str | None:

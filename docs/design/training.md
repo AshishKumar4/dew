@@ -52,7 +52,7 @@ A run that draws modules fresh over a loaded base, a decision's cross-attention 
 
 ### Quantization-aware training
 
-A model whose activations round through a quantizer as it runs (DeepSeek V4's FP8 window and FP4 compressed entries and indexer, `dew.nn.fake_quant`) trains through each rounding with the straight-through estimator: the rounding's value forward, bit for bit, and the identity's derivative at every order, declared as a surrogate (`fake_quant.straight_through`, `dew.nn.derivatives.surrogate`). The estimator is Dew's choice: DeepSeek V4's release is inference code, and its paper names none. A step is held to Dew's own float64 evaluation of that contract, and its weights after a step to the release's unmodified forward over them.
+A model whose activations round through a quantizer as it runs (DeepSeek V4's FP8 window and FP4 compressed entries and indexer, `dew.nn.fake_quant`) trains through each rounding with the straight-through estimator: the rounding's value forward, bit for bit, and the identity's derivative at every order, declared as a surrogate (`dew.nn.derivatives.straight_through`, a `surrogate`). The estimator is Dew's choice: DeepSeek V4's release is inference code, and its paper names none. A step is held to Dew's own float64 evaluation of that contract, and its weights after a step to the release's unmodified forward over them.
 
 ### Consistency groups
 
