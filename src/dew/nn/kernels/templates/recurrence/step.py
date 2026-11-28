@@ -161,18 +161,19 @@ def _launched(hooks: recurrence.Hooks, operands: recurrence.Step, *, dtype, fami
     def entry(active_ref, *refs):
         inputs = dict(zip(names, refs[:len(names)], strict=True))
         moving = 1 if hooks.conv is not None else 0
-        rest = refs[len(names):]
+        state_out, *rest = refs[len(names):]
         moved, (out_ref, vectors, exchanged) = rest[:moving], rest[moving:moving + 3]
         joining = rest[moving + 3:]
         partials, joined = joining if joining else (None, None)
         half = lax.axis_index("wg") if halves > 1 else 0
-        _program(hooks, inputs, active_ref, moved[0] if moved else None, out_ref,
+        _program(hooks, inputs, active_ref, state_out, moved[0] if moved else None, out_ref,
                  (vectors, exchanged.at[half], _Halves(halves, half, partials, joined)), block=block,
                  group=value_heads // key_heads, key_heads=key_heads, interpret=interpret)
 
     history = ((jax.ShapeDtypeStruct(given['held'].shape, given['held'].dtype),) if hooks.conv is not None
                else ())
-    out_type = (*history, jax.ShapeDtypeStruct((rows, value_heads, value_width), out_dtype))
+    out_type = (jax.ShapeDtypeStruct(state.shape, state.dtype), *history,
+                jax.ShapeDtypeStruct((rows, value_heads, value_width), out_dtype))
     launched = mosaic.kernel(entry, out_type=out_type,
                              grid=(rows, value_heads // block.heads, value_width // block.columns),
                              grid_names=("rows", "heads", "columns"), warpgroups=halves,
@@ -181,13 +182,8 @@ def _launched(hooks: recurrence.Hooks, operands: recurrence.Step, *, dtype, fami
                              scratch=(plgpu.SMEM((block.heads, 3 + hooks.own_weight, key_width), jnp.float32),
                                       plgpu.SMEM((halves, 2, scan.THREADS // scan.WARP), jnp.float32),
                                       *_joining(halves, block)))
-    # The state stepped in place, one operand its launch reads and writes (`jax.new_ref`): returned as a
-    # separate output, its call read the donated state and wrote its successor apart, which the step's cache
-    # then copied back, 4 MiB a layer a step (row 14174: an LM_HYBRID B8 decode, 12 copies).
-    state_ref = jax.new_ref(state)
-    given['state'] = state_ref
-    *moved, out = launched(active, *given.values())
-    return out, moved[0] if moved else None, jax.freeze(state_ref)
+    state_out, *moved, out = launched(active, *given.values())
+    return out, moved[0] if moved else None, state_out
 
 
 @dataclasses.dataclass(frozen=True)
@@ -272,19 +268,19 @@ class _Token:
         return laid
 
 
-def _program(hooks, inputs, active_ref, moved, out_ref, scratch, *, block: _Block, group: int,
+def _program(hooks, inputs, active_ref, state_out, moved, out_ref, scratch, *, block: _Block, group: int,
              key_heads: int, interpret: bool):
     """A program's token (`step`): its queries, keys and values (the conv's, `_Conv`, where the prologue
     takes one), each head's key vectors staged, its block of the state stepped, its output and state stored,
-    and the conv's history moved; an idle row copies its history and leaves the state untouched."""
+    and the conv's history moved; an idle row's state and history copied and its output zeros."""
     vectors, exchanged, halves = scratch
     first = lax.axis_index("heads") * block.heads
     heads = tuple(first + index for index in range(block.heads))
     token = _Token(lax.axis_index("rows"), first, heads, tuple(head // group for head in heads),
                    pl.ds(lax.axis_index("columns") * block.columns, block.columns), block)
     state_ref = inputs['state']
-    key_width, value_width = state_ref.shape[2:]
-    conv = (_Conv(inputs, moved, token, hooks.conv, key_heads, key_width, value_width, group)
+    key_width = state_ref.shape[2]
+    conv = (_Conv(inputs, moved, token, hooks.conv, key_heads, key_width, state_ref.shape[3], group)
             if hooks.conv is not None else None)
 
     @pl.when(active_ref[token.row] != 0)
@@ -304,13 +300,16 @@ def _program(hooks, inputs, active_ref, moved, out_ref, scratch, *, block: _Bloc
         writes = [_staged(hooks, inputs, token, p, keyed[p][0], keyed[p][1], vectors, exchanged,
                           interpret=interpret) for p in range(block.heads)]
         mosaic.synced(interpret)
-        out = _stepped(hooks, state_ref, value, vectors, token.per_head(writes), token, halves,
+        out = _stepped(hooks, state_ref, state_out, value, vectors, token.per_head(writes), token, halves,
                        interpret=interpret)
         out = _epilogue(hooks, inputs, token, out, value, exchanged, dtype=out_ref.dtype, interpret=interpret)
         halves.first(lambda: token.stored(out_ref, out))
 
     @pl.when(active_ref[token.row] == 0)
     def _():
+        start, span = halves.keys(key_width)
+        _walked_keys(span, lambda k: token.tile(state_ref, start + k),
+                     lambda k, tile: token.stored(state_out, tile, start + k))
         zeros = jnp.zeros((block.heads, block.columns), jnp.float32)
         halves.first(lambda: token.stored(out_ref, zeros))
         if conv is not None:
@@ -472,10 +471,10 @@ def _gates(hooks, inputs, row, head, layout):
     return jnp.exp(scalar('log_decay')), write
 
 
-def _stepped(hooks, state_ref, value, vectors, write, token: _Token, halves: _Halves, *,
+def _stepped(hooks, state_ref, state_out, value, vectors, write, token: _Token, halves: _Halves, *,
              interpret: bool):
-    """`recurrence.update` over the block's column of the state, updated in place as it is held
-    (`recurrence._held`), the output `(g q)^T S + q^T ((beta k) c^T)`: under the
+    """`recurrence.update` over the block's column of the state, read from `state_ref` and written to
+    `state_out` as it is held (`recurrence._held`), the output `(g q)^T S + q^T ((beta k) c^T)`: under the
     delta rule its sums over the keys before the update (the decayed query's and key's reads of the state)
     one pass over the state and its update another, which sums the query's read of the write; without it,
     nothing corrected, both reads summed in the update's one pass (two passes put an interpreted step test
@@ -515,9 +514,9 @@ def _stepped(hooks, state_ref, value, vectors, write, token: _Token, halves: _Ha
         # Held as `recurrence._held` holds it: bf16 rounded stochastically, salted by its key and value, the
         # key's entry laid over the block as the entry is (a scalar's bit cast lowers to no vector).
         keyed_k = jnp.zeros_like(entry_k) + entry(1, k)
-        kept = (recurrence.salted_bf16(entry_k, keyed_k, value) if state_ref.dtype == jnp.bfloat16
+        kept = (recurrence.salted_bf16(entry_k, keyed_k, value) if state_out.dtype == jnp.bfloat16
                 else entry_k)
-        token.stored(state_ref, kept, start + k)
+        token.stored(state_out, kept, start + k)
         if hooks.delta:
             return (read_write(k, written) if reads_write else jnp.zeros_like(written),)
         # Two terms summed apart where the query reads the write, else the one.
@@ -569,6 +568,18 @@ def _summed_keys(key_width: int, read, term, like: jax.Array, count: int = 1):
         totals.append(total)
     return tuple(totals)
 
+
+def _walked_keys(key_width: int, read, body) -> None:
+    """`body(k, read(k))` over the keys, `UNROLLED` keys a turn of a rolled loop, each turn's reads issued
+    before its first use (`_summed_keys`' walk, summing nothing)."""
+    def turn(i, carry):
+        base = i * UNROLLED
+        tiles = [read(base + u) for u in range(UNROLLED)]
+        for u, tile in enumerate(tiles):
+            body(base + u, tile)
+        return carry
+
+    lax.fori_loop(0, key_width // UNROLLED, turn, None)
 
 
 def _tree_added(partials: tuple, index, term) -> tuple:
