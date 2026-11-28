@@ -13,7 +13,7 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
 from dew.nn.kernels import launches
-from dew.nn.kernels.templates import fed, mosaic, resources, ring_family
+from dew.nn.kernels.templates import fed, mosaic, resources, ring_family, swizzling
 
 WAIT_MOST = 7
 """The most product groups a warpgroup's wait leaves in flight: `wgmma.wait_group`'s immediate, 0 to 7 (PTX
@@ -102,7 +102,7 @@ class WgmmaIssuer(WgmmaLayout, mosaic.Issuer):
             pending = min(committed(), WAIT_MOST)
             return value, (acc_ref[...] if pending == 0 else self.read(acc_ref, pending=pending))
 
-        return pl.run_scoped(scores, plgpu.WGMMAAccumulatorRef(shape, jnp.float32))
+        return swizzling.run_scoped(scores, plgpu.WGMMAAccumulatorRef(shape, jnp.float32))
 
     def summed_together(self, shapes: tuple[tuple[int, int], ...], issues: tuple, *, apart: bool = False,
                         then: tuple[Callable | None, ...] | None = None) -> tuple[Callable, ...]:
@@ -126,7 +126,8 @@ class WgmmaIssuer(WgmmaLayout, mosaic.Issuer):
                 value = self.read(acc, pending=mosaic.sure_commits() - end)
                 values.append(value if each is None else each(value))
             return tuple(values)
-        values = pl.run_scoped(scoped, *(plgpu.WGMMAAccumulatorRef(shape, jnp.float32) for shape in shapes))
+        values = swizzling.run_scoped(scoped, *(plgpu.WGMMAAccumulatorRef(shape, jnp.float32)
+                                                for shape in shapes))
         return tuple(functools.partial(lambda value: value, value) for value in values)
 
     def registers_product(self, lhs: jax.Array, rhs) -> jax.Array:
@@ -201,7 +202,7 @@ class WgmmaIssuer(WgmmaLayout, mosaic.Issuer):
             issue(acc_ref)
             return acc_ref[...]
 
-        return pl.run_scoped(run, plgpu.WGMMAAccumulatorRef(shape, jnp.float32))
+        return swizzling.run_scoped(run, plgpu.WGMMAAccumulatorRef(shape, jnp.float32))
 
     def added_into(self, acc, value: jax.Array, interpret: bool):
         """`Family.added_into` for a warpgroup accumulator ref: its value read once its products are done,
@@ -239,7 +240,7 @@ class WgmmaIssuer(WgmmaLayout, mosaic.Issuer):
             plgpu.wgmma_wait(0)
             return carry, tuple(acc[...] for acc in accumulators)
 
-        return pl.run_scoped(run, *(plgpu.WGMMAAccumulatorRef(shape, jnp.float32) for shape in shapes))
+        return swizzling.run_scoped(run, *(plgpu.WGMMAAccumulatorRef(shape, jnp.float32) for shape in shapes))
 
 
 class Wgmma(WgmmaIssuer, ring_family.RingFamily):

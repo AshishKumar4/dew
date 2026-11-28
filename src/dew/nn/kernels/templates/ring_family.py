@@ -115,8 +115,8 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
                                                    + self.warpgroup_reduction_scratch * reducing_warpgroups)))
 
     def program_scoped(self, body, *allocations, streams):
-        return pl.run_scoped(lambda *refs, **rings: body(*refs, streams=rings), *allocations, **streams,
-                             collective_axes="wg")
+        return swizzling.run_scoped(lambda *refs, **rings: body(*refs, streams=rings), *allocations,
+                                    **streams, collective_axes="wg")
 
     def roles(self, consumers: int, producer: int | None = None) -> handoffs.Schedule:
         return handoffs.Schedule((handoffs.Role("consumer", consumers), handoffs.Role("producer", weight=0)),
@@ -215,7 +215,7 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
             consumer = consuming(smems, turn_refs[0] if turn_refs else None)
             self.scheduled(consumers, consumer, loading, floor=producer)
 
-        pl.run_scoped(scoped, *staging, *turns, collective_axes="wg")
+        swizzling.run_scoped(scoped, *staging, *turns, collective_axes="wg")
 
     def _tiled(self, rings: dict[str, Ring], tiles: tuple[int, ...], schedule: Callable, issue: Callable,
                finish: Callable, smems, *, axis: str, interpret: bool, in_flight: int,

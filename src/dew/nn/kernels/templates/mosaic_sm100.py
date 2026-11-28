@@ -833,7 +833,8 @@ class Tcgen05Rings(Tcgen05Issuer, ring_family.RingFamily[Accumulator]):
 
         (accumulated,) = roles.scratch(generation.gpu_target())
         # Each ring's slots' rewrites published, a barrier of the ring's own (`prepared`).
-        pl.run_scoped(scoped, accumulated, *_publish_barriers(rewrites), *staging, collective_axes="wg")
+        swizzling.run_scoped(scoped, accumulated, *_publish_barriers(rewrites), *staging,
+                             collective_axes="wg")
 
     def _read_out(self, store: Callable, index, tensor: "Tensor", held: Callable, running: tuple,
                   issue: Callable, finish: Callable, *, summed: int, accumulators: tuple) -> Callable:

@@ -7,7 +7,7 @@ import contextlib
 import contextvars
 import functools
 import threading
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 
 import jax
 import jax.numpy as jnp
@@ -97,11 +97,34 @@ def pallas_call(kernel: Callable, *, name: str, **params) -> Callable:
 
 def kernel(entry: Callable, *, name: str, out_type, **params) -> Callable:
     """`jax.experimental.pallas.mosaic_gpu.kernel(entry, out_type=out_type, **params)` held per shard
-    (`_held`), named by `name`, its body traced as a launch's (`_traced`), its outputs typed as its operands
-    make them (`_typed`)."""
+    (`_held`), named by `name`, its body traced as a launch's (`_traced`), its scratch refs noted with their
+    staging as it traces (`_scratch_noted`), its outputs typed as its operands make them (`_typed`)."""
     _register_mosaic_gpu_lowerings()
-    traced = _traced(entry, params.get("interpret"))
+    traced = _traced(_scratch_noted(entry, params.get("scratch_types", ())), params.get("interpret"))
     return _typed(lambda typed: plgpu.kernel(traced, out_type=typed, **params), out_type, name)
+
+
+def _scratch_noted(entry: Callable, scratch) -> Callable:
+    """`entry` with the scratch refs `scratch` allocates for it (its trailing arguments, or its keyword
+    arguments for a mapping, as Mosaic GPU's `kernel` hands them) noted with their staging while it traces
+    (`swizzling.noting`), as `swizzling.run_scoped` notes its own: one seam for every allocation a body
+    reads its staging of (`swizzling.staging_of`)."""
+    from dew.nn.kernels.templates import swizzling
+
+    if not scratch:
+        return entry
+
+    @functools.wraps(entry)
+    def noted(*refs, **kw_refs):
+        if isinstance(scratch, Mapping):
+            pairs = [pair for name, kind in scratch.items()
+                     for pair in swizzling.allocated(kw_refs[name], kind)]
+        else:
+            pairs = swizzling.allocated(refs[len(refs) - len(scratch):], tuple(scratch))
+        with swizzling.noting(pairs):
+            return entry(*refs, **kw_refs)
+
+    return noted
 
 
 def _typed(made: Callable, out, name: str) -> Callable:

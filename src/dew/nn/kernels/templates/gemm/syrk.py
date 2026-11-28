@@ -339,7 +339,7 @@ def _store_cp_async_symmetric(value: jax.Array, out_b, part_row, col_start, stri
         def _mirror():
             _swizzled_columns_out(smem, out_b, part_row, col_start, swizzle=swizzle)
 
-    pl.run_scoped(copied, family.output_staging(((value.shape, out_b.dtype),), 1)[0])
+    swizzling.run_scoped(copied, family.output_staging(((value.shape, out_b.dtype),), 1)[0])
     plgpu.wait_gmem_to_smem(0)
 
 
