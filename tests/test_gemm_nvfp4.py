@@ -932,6 +932,36 @@ def a_packed_nvfp4_call_placed_on_its_hosts_cpu_keeps_a_subnormal_scale():
     np.testing.assert_array_equal(np.asarray(out), np.full((256, 128), 2.0 ** -119, np.float32))
 
 
+def a_packed_nvfp4_prefills_finish_is_its_products_finished_apart():
+    """On a GPU, a packed NVFP4 prefill (named packed, 256 rows of two experts' groups) whose tensor scale is
+    one a column, the columns' scales 1, 2^-127 (subnormal, the 2^8 it owes taking it to a normal 2^-119)
+    and 2^121 (finite, its product by 2^8 past float32's largest) by turns and each expert's its own: its
+    launch's finish (`gemm._packed_finish`, the scale and the owed 2^8 in the epilogue) is bitwise its
+    products finished apart (XLA's decoded product, `factored`'s one rounding after it) and the float64
+    truth, over small integer codes and rows (train 1474's review: the finish was lowered and run on the
+    host, never natively against the finish apart). Run by tests/test_gpu_gemm.py's cells."""
+    rng = np.random.default_rng(13743)
+    # Codes of E2M1's half steps and rows of units: every sum small, so 2^121 times it stays finite.
+    codes = rng.integers(-2, 3, (2, 256, 128)).astype(np.float32) / 2
+    scales = np.tile(np.asarray([1.0, 2.0 ** -127, 2.0 ** 121], np.float32), 43)[:128]
+    scale = np.stack([scales, np.roll(scales, 1)])
+    bank = formats.NvFp4.of(jnp.asarray(codes), jnp.ones((2, 16, 128), jnp.float8_e4m3fn), jnp.asarray(scale))
+    rows = rng.integers(-1, 2, (256, 256)).astype(np.float32)
+    sizes = jnp.asarray([128, 128], jnp.int32)
+
+    def product(route):
+        with generation.chosen(nvfp4=route):
+            return np.asarray(jax.jit(lambda x: gemm.nvfp4_product(x, bank, sizes, out_dtype=jnp.float32))(
+                jnp.asarray(rows, jnp.bfloat16)))
+
+    truth = np.concatenate([rows[group * 128:(group + 1) * 128].astype(np.float64) @ codes[group]
+                            * scale[group].astype(np.float64) for group in range(2)]).astype(np.float32)
+    finished, apart = product("packed"), product("xla")
+    assert np.isfinite(truth).all()
+    np.testing.assert_array_equal(apart.view(np.uint32), truth.view(np.uint32))
+    np.testing.assert_array_equal(finished.view(np.uint32), apart.view(np.uint32))
+
+
 def _packed_epilogues(launched) -> list:
     """The epilogue of each packed NVFP4 launch a trace took (`tuning.seen`)."""
     return [observed.keyed.arguments["hooks"].epilogue for observed in launched
