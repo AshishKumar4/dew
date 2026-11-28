@@ -1642,6 +1642,10 @@ def _site_judged(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth_fn
 
     def conditioning_now():
         if weighing is not None and "of" not in weighed:
+            # The site's arms' mode decided before the weighing runs its reference, on the draw and the
+            # programs the verdict decides it on (`_drawn`), so both measure the executables the arms run.
+            with summed_as_run():
+                _ynn_decided(label, arms, draw(0))
             began = time.perf_counter()
             weighed["of"] = weighing(given, truth_fn, ran=reference_fn)
             weighed["seconds"] = time.perf_counter() - began
@@ -1796,6 +1800,9 @@ def seeds_for(reference_fn, draw, label: str, *, start: int = FEWEST_SEEDS, most
     # elements classed over its first stages' draws.
     weighing = (_conditioning(reference_fn, truth_fn, draw, range(staged_units(max(start, FEWEST_SEEDS))),
                               scale=conditioning_scale) if conditioning else None)
+    # A truth it names none of, the reference it compiles as its arm is, unchecked: a library arm's check
+    # reads the executable its arm runs, never its truth's widened one (`_site_judged`'s alike).
+    unchecked = None
     if arms is None:
         from arm_store import _routed_arm
 
@@ -1803,13 +1810,14 @@ def seeds_for(reference_fn, draw, label: str, *, start: int = FEWEST_SEEDS, most
         # verdict's are (`arm_store._routed_arm`, row 14096).
         given = dew_fn if paired else reference_fn
         compiled = _arms(given, reference_fn)
+        unchecked = twin or compiled[1]
         arms = (_routed_arm(None, label, given, compiled[0], "dew"),
                 _routed_arm(None, label, reference_fn, compiled[1], "reference"))
         twin = twin and _routed_arm(None, label, reference_fn, twin, _written_role(None), written=True)
     dew_fn, reference_fn = arms
     reference_fn = twin or reference_fn
     dew_fn = dew_fn if paired else None
-    truth_fn = _truth_program(truth_fn)
+    truth_fn = _truth_program(truth_fn) if truth_fn is not None else unchecked
     # Both modes from SIZING_FROM, the draws no verdict takes: the reference compared with itself from seed 0
     # chose its count by the verdict's own inputs, its confirming blocks overlapping at least the whole first
     # stage (spec alignment, 9005).

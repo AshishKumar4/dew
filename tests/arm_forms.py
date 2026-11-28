@@ -99,12 +99,12 @@ class _RunToRun(_Adapting):
 
 
 def _layers(fn):
-    """`fn` and every arm it adapts, outermost first: through a declaration (`_RunToRun`), a window loop
-    (`_Windowed`), a library arm's check (`_LibraryChecked`) and a reference's unrewritten scope
+    """`fn` and every arm it adapts, outermost first: through an arm adapting it (`_Adapting`: a declaration,
+    a library arm's check), a window loop (`_Windowed`) and a reference's unrewritten scope
     (`Unrewritten`)."""
     while True:
         yield fn
-        if isinstance(fn, _RunToRun | _Windowed | _LibraryChecked):
+        if isinstance(fn, _Adapting | _Windowed):
             fn = fn.fn
         elif isinstance(fn, Unrewritten):
             fn = fn.wrapped
@@ -584,10 +584,9 @@ def _ynn_decided(label: str, arms, inputs) -> None:
     _ynn_option_held()
     refused = None
     for arm in arms:
-        # Through a declaration and a library arm's check alone: a window loop's arm takes each window's
-        # slices, which the draw is not.
-        arm = arm.fn if isinstance(arm, _RunToRun) else arm
-        arm = arm.fn if isinstance(arm, _LibraryChecked) else arm
+        # Through the arms that adapt it alone (a declaration, a library arm's check): a window loop's arm
+        # takes each window's slices, which the draw is not.
+        arm = next(layer for layer in _layers(arm) if not isinstance(layer, _Adapting))
         if not isinstance(arm, _Paired) or not hasattr(arm.without, "lower"):
             continue
         try:
