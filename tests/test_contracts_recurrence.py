@@ -396,6 +396,33 @@ def test_a_decayed_value_times_factors_holds_every_order(edge):
                     plain_fn=lambda exponent, value, a, b: value * jnp.exp(exponent) * a * b)
 
 
+def test_scaled_exps_tangent_of_a_complex_value_is_its_decayed_value():
+    """The tangent of `scan.scaled_exp` of a complex64 `1 + 2j` along a unit float32 exponent at 0: `1 + 2j`,
+    the stored zero of a complex direction read from its parts, where its words were bitcast whole and JAX
+    refused the complex bitcast (train 1466's review)."""
+    _, found = jax.jvp(lambda exponent: scan.scaled_exp(jnp.complex64(1 + 2j), exponent), (jnp.float32(0.0),),
+                       (jnp.float32(1.0),))
+    assert found == jnp.complex64(1 + 2j), found
+
+
+@pytest.mark.parametrize("edge", sorted(EDGES))
+def test_a_guarded_product_holds_every_order(edge):
+    """`log_linear._product`, a product of two operands summed in fp32, its transposes each term a zero factor
+    annihilates (`_product_value`'s guarded form), its derivatives declared (each order a product again):
+    every order finite wherever float64 is a normal float32 and the plain product's is, at operands scaled to
+    the edge."""
+    from dew.nn.kernels import log_linear
+
+    a, b, seeded, along_a, along_b = normal_draw(1466, (2, 3, 4), (2, 5, 4), (2, 3, 5), (2, 3, 4), (2, 5, 4),
+                                                 scale=EDGES[edge])
+
+    def product(a, b):
+        return log_linear._product('btk,bpk->btp', False, a, b)
+
+    assert_contract(product, (a, b), (along_a, along_b), seeded, f"a guarded product {edge}",
+                    plain_fn=lambda a, b: jnp.einsum('btk,bpk->btp', a, b))
+
+
 def test_a_decayed_value_times_a_zero_factor_is_zero_and_its_derivative_by_it_finite():
     """`scan._times_decayed` of an overflowed value (`inf`) under `exp(-1)` times a zero factor and a unit
     one: zero, its derivative by the exponent zero (the zero factor annihilating the value at every order),

@@ -27,13 +27,16 @@ its tokens in 64-token chunks (row 1446)."""
 
 from __future__ import annotations
 
+import functools
 import math
 
 import jax
 import jax.numpy as jnp
 import numpy as np
+from jax.custom_derivatives import SymbolicZero
 
 from dew.algebra import scan
+from dew.nn.derivatives import Protected, contracted, declared_tangent
 from dew.nn.kernels import generation, recurrence, selection
 from dew.nn.kernels.recurrence_chunk import Chunk, chunk
 from dew.nn.precision import at_least_fp32
@@ -223,21 +226,83 @@ def _levels_above(query, key, value, g, weights, *, within):
 
 def _read(readers, held):
     """Each reader's read of its chunk's held memory, `[B, G, n, r, E, t, P]` (the product's own layout): the
-    readers' product with the memory, an overflowed reader's (an infinite one its finite query and weight
-    formed) left out of the memory's gradient, so the product's transpose meets no infinite reader with
-    another output's zero cotangent (`inf * 0`; train 1455's review), its read the plain product's where one
-    overflowed (formed apart, where any did: an unmapped call without one pays nothing for it; under `vmap`
-    the condition is batched, and both products are formed beside a select)."""
-    def product(readers, held):
-        return jnp.einsum('bgnretk,bgnrepk->bgnretp', readers, held, preferred_element_type=jnp.float32)
+    plain product (`_product`), its transposes each term a zero factor annihilates, so an overflowed reader
+    (an infinite one its finite query and weight formed) meets another output's zero cotangent as zero, not
+    `inf * 0` (train 1455's review), its finite channels' partials kept (train 1466's)."""
+    return _product('bgnretk,bgnrepk->bgnretp', False, readers, held)
 
-    overflowed = jnp.isinf(readers)
-    read = product(jnp.where(overflowed, 0.0, readers), held)
-    rows = jnp.any(overflowed, axis=-1)[..., None]
-    def exceptional():
-        return jnp.where(rows, product(readers, jax.lax.stop_gradient(held)), read)
 
-    return jax.lax.cond(jnp.any(rows), exceptional, lambda: read)
+def _transposed_spec(spec: str, side: int) -> str:
+    """The transpose of the product `spec` (`x,y->z`, every index of the output its operands') in its operand
+    `side`: the output's cotangent with the other operand."""
+    given, out = spec.split('->')
+    x, y = given.split(',')
+    return f"{out},{y}->{x}" if side == 0 else f"{x},{out}->{y}"
+
+
+def _product_value(spec: str, guarded: bool, a, b):
+    """`spec`'s product of `a` and `b` summed in fp32: plain, or where `guarded` each term a zero factor
+    annihilates whatever the other (a transpose's: a cotangent's zero against an infinite operand none, not
+    `inf * 0`): the product of the finite parts, and where an operand holds an infinity (formed apart, where
+    any does), each sum's infinite terms' signs counted, `+inf` where a positive one is, `-inf` where a
+    negative one is, NaN where both."""
+    plain = functools.partial(jnp.einsum, spec, preferred_element_type=jnp.float32)
+    if not guarded:
+        return plain(a, b)
+    finite = plain(*(jnp.where(jnp.isinf(x), jnp.zeros((), x.dtype), x) for x in (a, b)))
+
+    def infinite():
+        def counted(*pairs):
+            return functools.reduce(jnp.add, [plain(x.astype(a.dtype), y.astype(b.dtype)) for x, y in pairs])
+
+        a_up, a_down, b_up, b_down = a == np.inf, a == -np.inf, b == np.inf, b == -np.inf
+        a_pos, a_neg = jnp.isfinite(a) & (a > 0), jnp.isfinite(a) & (a < 0)
+        rising = counted((a_up, b > 0), (a_down, b < 0), (a_pos, b_up), (a_neg, b_down))
+        falling = counted((a_up, b < 0), (a_down, b > 0), (a_pos, b_down), (a_neg, b_up))
+        signed = jnp.where(rising > 0, np.inf, 0.0) + jnp.where(falling > 0, -np.inf, 0.0)
+        return signed.astype(finite.dtype)
+
+    unbounded = jnp.any(jnp.isinf(a)) | jnp.any(jnp.isinf(b))
+    return finite + jax.lax.cond(unbounded, infinite, lambda: jnp.zeros_like(finite))
+
+
+def _product_tangent(spec: str, guarded: bool, primals, tangents):
+    """`_product`'s value and tangent, bilinear: each moving operand's product with the other held, a linear
+    map whose transposes are the transposed products, guarded (`_product_value`), each summed as its operand
+    is placed and varies and in its dtype (`sharding.summed_like`), the map's own derivative its products'
+    (`generation.linear_map`'s `traced_tangent`): every order a guarded product."""
+    from dew.nn import sharding
+
+    a, b = primals
+    out = _product(spec, guarded, a, b)
+    live = tuple(side for side, part in enumerate(tangents) if not isinstance(part, SymbolicZero))
+    if not live:
+        return out, SymbolicZero(jax.typeof(out).to_tangent_aval())
+    types = {side: jax.typeof(tangents[side]) for side in live}
+
+    def applied(held, moving):
+        a, b = held
+        terms = [_product(spec, guarded, *((direction, b) if side == 0 else (a, direction)))
+                 for side, direction in zip(live, moving, strict=True)]
+        return functools.reduce(jnp.add, terms)
+
+    def transposed(held, cotangent):
+        def pulled(side):
+            other = held[1 - side]
+            operands = (cotangent, other) if side == 0 else (other, cotangent)
+            typed = jax.ShapeDtypeStruct(types[side].shape, types[side].dtype, sharding=types[side].sharding,
+                                         manual_axis_type=types[side].mat)
+            return sharding.summed_like(_product(_transposed_spec(spec, side), True, *operands),
+                                        typed).astype(typed.dtype)
+        return tuple(pulled(side) for side in live)
+
+    return out, generation.linear_map(applied, transposed, (a, b), tuple(tangents[side] for side in live),
+                                      out_aval=jax.typeof(out).to_tangent_aval(), traced_tangent=True)
+
+
+_product = contracted("test_a_guarded_product_holds_every_order")(
+    declared_tangent(Protected(), _product_value, _product_tangent, nondiff_argnums=(0, 1),
+                     symbolic_zeros=True))
 
 
 def _held_memory(memory, poisoned, before, emptied, prefix_spent, dtype):

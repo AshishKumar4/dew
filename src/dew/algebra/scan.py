@@ -1750,15 +1750,21 @@ def _scaled_exp_tangent(primals, tangents):
     return out, _linear_tangent(primals, tangents, out, moved, pulled)
 
 
+def _stores_zero(x) -> jax.Array:
+    """Whether `x` stores a zero (`float_bits.stored_zero`: a subnormal a flushing comparison reads as zero is
+    none), a complex value's both parts (a complex direction of `scaled_exp`'s; train 1466's review)."""
+    if jnp.iscomplexobj(x):
+        return float_bits.stored_zero(jnp.real(x)) & float_bits.stored_zero(jnp.imag(x))
+    return float_bits.stored_zero(x)
+
+
 def _times_decayed_value(exponent, value, *factors):
     """`value` decayed by `exp(exponent)` (`scaled_exp`), then times each of `factors` in turn: the decay
     applied before any factor meets the value, and the product zero where a factor is (an overflowed
     decayed value times a zero cotangent or direction, `inf * 0`, was NaN: a reset's zero cotangent met
     an overflowed read's decay, train 1455's review)."""
     product = functools.reduce(jnp.multiply, factors, _scaled_exp(value, exponent))
-    # A factor storing a zero (`float_bits.stored_zero`: a subnormal a flushing comparison reads as zero is
-    # none).
-    vanishing = functools.reduce(jnp.logical_or, map(float_bits.stored_zero, factors), jnp.zeros((), bool))
+    vanishing = functools.reduce(jnp.logical_or, map(_stores_zero, factors), jnp.zeros((), bool))
     return jnp.where(vanishing, jnp.zeros_like(product), product)
 
 
