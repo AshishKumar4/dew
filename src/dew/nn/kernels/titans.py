@@ -37,19 +37,26 @@ from dew.nn.residuals import memory_chunks
 
 
 def layer_normed(x, weight, bias, eps: float):
-    """`x`'s LayerNorm over its last axis under the affine `weight` and `bias`, `(x - mean x) (w / sqrt(var +
-    eps)) + b`: its rows less their shift first (`norms.row_shift`, Dew's layer norm's own, which the
+    """`x`'s LayerNorm over its last axis under the affine `weight` and `bias`, `(x - mean x) / sqrt(var +
+    eps) w + b`: its rows less their shift first (`norms.row_shift`, Dew's layer norm's own, which the
     memory's general path reads: train 1484's review, `[2^24, 2^24 + 2]` normalized unshifted to `[0, 1.15]`
-    where it is `[-1, 1] / 1.41` at an epsilon of one), the weight folded into the inverse root as flax's
-    layer norm folds its scale (79g's review: a centered `2^-100` under an epsilon of `2^100` normalized
-    first flushed to zero, where the scale of `2^100` read `2^-50`), the plain formula over the shifted rows,
-    fla's reference's, its derivatives autodiff's (the shift a constant, whose term a layer norm's invariance
+    where it is `[-1, 1] / 1.41` at an epsilon of one), then the plain formula over the shifted rows, fla's
+    reference's, its derivatives autodiff's (the shift a constant, whose term a layer norm's invariance
     makes zero), so every order is finite wherever the plain formula's is (docs/design/testing.md, the
-    derivative contract). A quotient by the root, not a product by `rsqrt`, whose derivative `rsqrt(v) / v`
-    passes the range first (2^150 at `eps` 2^-100, its product with a zero NaN)."""
+    derivative contract). Where a normalized entry leaves the range (below fp32's least normal, its entry
+    not zero) its weight is taken into the inverse root first, as flax's layer norm takes its scale, so a
+    weight past one brings it back (79g's review: a centered `2^-100` under an epsilon of `2^100` normalized
+    to `2^-150`, which rounds to zero, where a weight of `2^100` reads `2^-50`); its operands held at zero
+    elsewhere, so no derivative of that order meets a range it does not reach. A quotient by the root, not a
+    product by `rsqrt`, whose derivative `rsqrt(v) / v` passes the range first (2^150 at `eps` 2^-100, its
+    product with a zero NaN)."""
     shifted = x - row_shift(x, -1)
     centered = shifted - jnp.mean(shifted, axis=-1, keepdims=True)
-    return centered * (weight / jnp.sqrt(jnp.mean(centered * centered, axis=-1, keepdims=True) + eps)) + bias
+    root = jnp.sqrt(jnp.mean(centered * centered, axis=-1, keepdims=True) + eps)
+    normed = centered / root
+    lost = (jnp.abs(normed) < jnp.finfo(normed.dtype).tiny) & (centered != 0)
+    folded = jnp.where(lost, centered, 0) * (jnp.where(lost, weight, 0) / root)
+    return jnp.where(lost, folded, normed * weight) + bias
 
 
 def inner_gradient(k, v, km, weight, bias, eps: float):
