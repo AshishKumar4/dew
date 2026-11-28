@@ -48,7 +48,8 @@ def test_an_nvfp4_product_is_its_decoded_products_times_the_deferred_factor():
     matrix, values = nvfp4(0, 256, 192, scale=0.25)
     rows = jnp.asarray(np.random.default_rng(1).integers(-3, 4, size=(64, 256)), jnp.bfloat16)
     got = jax.jit(lambda x, m: gemm.nvfp4_product(x, m, out_dtype=jnp.float32))(rows, matrix)
-    written = jnp.dot(rows, matrix.decoded(), preferred_element_type=jnp.float32) * matrix.factor
+    owed = jnp.float32(bits.NVFP4_OWED) * jnp.asarray(matrix.scale, jnp.float32)
+    written = jnp.dot(rows, matrix.decoded(), preferred_element_type=jnp.float32) * owed
     np.testing.assert_array_equal(np.asarray(got), np.asarray(written))
     np.testing.assert_array_equal(np.asarray(got, np.float64), np.asarray(rows, np.float64) @ values)
 
@@ -269,6 +270,369 @@ def test_an_nvfp4_banks_grouped_product_is_its_values_product(generation_name, k
     for group, (first, last) in enumerate(itertools.pairwise(starts)):
         truth[first:last] = np.asarray(rows[first:last], np.float64) @ values[group]
     np.testing.assert_array_equal(np.asarray(got, np.float64), truth)
+
+
+@pytest.mark.parametrize("grouped", [False, True], ids=["matrix", "bank"])
+@pytest.mark.parametrize("kernel", ["packed", "xla"])
+def test_nvfp4_members_side_by_side_are_their_products_apart(kernel, grouped):
+    """Two NVFP4 members (a gate and an up projection, 128 columns each) of tensor scales of their own, side
+    by side as one matrix whose tensor scale is one a column (`NvFp4.columned`, row 13743: a ModelOpt
+    source's fused experts), through `kernel` on an H100 (interpreted) and as a bank of three experts each
+    its own pair: `gemm.nvfp4_product` of it is exactly the float64 product of each member's values times
+    its own scale, side by side (small integer rows, dyadic values: every product and sum exact in fp32),
+    the decoded arm's inner product XLA's; the matrix checks its scale one a matrix or one a column
+    (`NvFp4.checked`)."""
+    experts = 3 if grouped else 1
+    drawn = [nvfp4_bank(21 + member, experts, 512, 128) for member in range(2)]
+    # Each member's own tensor scales, five binades apart from the other's.
+    members = [dataclasses.replace(bank, scale=jnp.asarray(bank.scale) * 2.0 ** (5 * member))
+               for member, (bank, _) in enumerate(drawn)]
+    values = np.concatenate([held * 2.0 ** (5 * member) for member, (_, held) in enumerate(drawn)], axis=-1)
+    fused = formats.NvFp4(jnp.concatenate([bank.words for bank in members], axis=-2),
+                          jnp.concatenate([bank.scales for bank in members], axis=-2),
+                          jnp.concatenate([jnp.repeat(jnp.asarray(bank.scale)[..., None], 128, axis=-1)
+                                           for bank in members], axis=-1))
+    assert fused.columned and fused.checked() is fused
+    if not grouped:
+        fused, values = jax.tree.map(lambda leaf: leaf[0], fused), values[0]
+    counts = (40, 0, 56) if grouped else (96,)
+    sizes = jnp.asarray(counts, jnp.int32) if grouped else None
+    rows = jnp.asarray(np.random.default_rng(13743).integers(-3, 4, size=(96, 512)), jnp.float32)
+    inner = {} if kernel == "packed" else {"grouped_matmul": "xla"}
+    with generation.assumed("sm90"), generation.chosen(nvfp4=kernel, **inner):
+        got = np.asarray(gemm.nvfp4_product(rows, fused, sizes, out_dtype=jnp.float32, interpret_on_cpu=True))
+    truth = np.zeros((96, 256))
+    for group, (first, last) in enumerate(itertools.pairwise(np.cumsum([0, *counts]))):
+        truth[first:last] = np.asarray(rows[first:last], np.float64) @ (values[group] if grouped else values)
+    np.testing.assert_array_equal(np.asarray(got, np.float64), truth)
+    with pytest.raises(ValueError):
+        dataclasses.replace(fused, scale=jnp.ones((7,), jnp.float32)).checked()
+
+
+def test_a_columned_nvfp4_linear_binds_as_a_dense_kernel():
+    """A Linear's NVFP4 kernel whose tensor scale is one a column (`NvFp4.columned`, row 13743) binds by its
+    matrix's rank as a dense kernel (`quantized_loads.with_banks`: transposed from the source's `[out, in]`),
+    not as a bank by its scale's (train 1390's review); a packed matrix of another rank is refused by name."""
+    from dew.interop.quantized_loads import with_banks
+    from dew.interop.streaming import WeightLayout
+    from dew.quantization import QUANTIZATION
+
+    bank, _ = nvfp4_bank(31, 1, 512, 128)
+    dense = jax.tree.map(lambda leaf: leaf[0], dataclasses.replace(
+        bank, scale=jnp.repeat(jnp.asarray(bank.scale)[:, None], 128, axis=-1)))
+    assert dense.columned and dense.shape == (512, 128)
+    layout = WeightLayout("proj.weight", (("params", "proj", "kernel"),), (128, 512), transpose=(1, 0))
+    variables = {"params": {"proj": {"kernel": jnp.zeros((512, 128), jnp.bfloat16)}}}
+    bound = with_banks(variables, (layout,), {"proj.weight": dense})
+    assert bound[QUANTIZATION]["proj"]["kernel"] is dense and "proj" not in bound["params"]
+    # A stack of banks (rank 4) under an identity layout of its shape, which binds a bank as it stands: the
+    # rank alone refuses it.
+    stacked = jax.tree.map(lambda leaf: jnp.stack([leaf, leaf]), bank)
+    whole = WeightLayout("experts.weight", (("params", "experts"),), stacked.shape)
+    with pytest.raises(ValueError):
+        with_banks({"params": {"experts": jnp.zeros(stacked.shape, jnp.bfloat16)}}, (whole,),
+                   {"experts.weight": stacked})
+
+
+def _cancelling_columns(depth: int, width: int) -> formats.NvFp4:
+    """An NVFP4 matrix of codes +1, -1, +1 at depth 0 of its first three columns, unit block scales, and
+    tensor scales one a column (`NvFp4.columned`): 4, 8 and 1 there, 1 elsewhere."""
+    codes = np.zeros((depth, width), np.float32)
+    codes[0, :3] = (1.0, -1.0, 1.0)
+    scale = np.ones((width,), np.float32)
+    scale[:3] = (4.0, 8.0, 1.0)
+    return formats.NvFp4.of(jnp.asarray(codes), jnp.ones((depth // 16, width), jnp.float8_e4m3fn),
+                            jnp.asarray(scale))
+
+
+@pytest.mark.parametrize("gathered", [False, True], ids=["dense", "gathered-bank"])
+@pytest.mark.parametrize("kernel", ["packed", "xla"])
+def test_an_nvfp4_rows_gradient_cancels_across_column_scales(kernel, gathered):
+    """Codes +1, -1, +1 at one depth of three columns whose tensor scales are 4, 8 and 1 (`NvFp4.columned`),
+    unit block scales, and the output's cotangents 2^126, 2^125 and 1 there, through `kernel` on an H100
+    (interpreted; the decoded arm's inner product XLA's), dense and as a bank of one expert read by duplicate
+    gather routes: the rows' gradient at that depth is 2^128 - 2^128 + 1 = 1 a route (a token's its routes'
+    sum), each product scaled apart overflowing (train 1390's review of row 13743: the column factor's
+    transpose bypassed `factored`'s range-safe one)."""
+    depth, width = 256, 128
+    matrix = _cancelling_columns(depth, width)
+    routes = 8
+    cotangent = np.zeros((routes, width), np.float32)
+    cotangent[:, :3] = (2.0 ** 126, 2.0 ** 125, 1.0)
+    if gathered:
+        matrix = jax.tree.map(lambda leaf: leaf[None], matrix)
+        tokens, gather = 3, jnp.asarray([0, 0, 2, 2, 2, 0, 1, 2], jnp.int32)
+        sizes = jnp.asarray([routes], jnp.int32)
+        expected = np.bincount(np.asarray(gather), minlength=tokens).astype(np.float32)
+    else:
+        tokens, gather, sizes = routes, None, None
+        expected = np.ones((routes,), np.float32)
+    rows = jnp.ones((tokens, depth), jnp.float32)
+    inner = {} if kernel == "packed" else {"grouped_matmul": "xla"}
+    with generation.assumed("sm90"), generation.chosen(nvfp4=kernel, **inner):
+        _, pull = jax.vjp(lambda rows: gemm.nvfp4_product(rows, matrix, sizes, gather, out_dtype=jnp.float32,
+                                                          interpret_on_cpu=True), rows)
+        (grad,) = pull(jnp.asarray(cotangent))
+    grad = np.asarray(grad)
+    np.testing.assert_array_equal(grad[:, 0], expected)
+    np.testing.assert_array_equal(grad[:, 1:], 0.0)
+
+
+@pytest.mark.parametrize("columned", [False, True], ids=["scale a matrix", "scale a column"])
+def test_an_nvfp4_bank_of_no_experts_multiplies_no_rows(columned):
+    """A bank of no experts (`[0, depth, width]`), its tensor scales `[0]` or one a column `[0, width]`
+    (`NvFp4.columned`): its product of no rows is `[0, width]` and pulls back an empty gradient, each row
+    taking its group's scale where there is none (`factored`'s `groups`; train 1403's review: the factor
+    reshaped to `[0, -1]` raised)."""
+    scale = jnp.zeros((0, 128) if columned else (0,), jnp.float32)
+    bank = formats.NvFp4(jnp.zeros((0, 128, 64), jnp.uint32), jnp.zeros((0, 128, 32), jnp.float8_e4m3fn),
+                         scale)
+    assert bank.checked().columned == columned
+    rows = jnp.zeros((0, 512), jnp.float32)
+    with generation.chosen(nvfp4="xla"):
+        out, pull = jax.vjp(lambda rows: gemm.nvfp4_product(rows, bank, jnp.zeros((0,), jnp.int32),
+                                                            out_dtype=jnp.float32), rows)
+        (grad,) = pull(jnp.zeros((0, 128), jnp.float32))
+    assert out.shape == (0, 128) and grad.shape == (0, 512)
+
+
+@pytest.mark.parametrize("grouped", [False, True], ids=["matrix", "bank"])
+@pytest.mark.parametrize("kernel", ["packed", "xla"])
+def test_an_nvfp4_column_scale_of_2_122_keeps_its_product_and_gradient_finite(kernel, grouped):
+    """Columns whose tensor scales are 2^122 beside columns of 2^100 (`NvFp4.columned`, row 13743), every
+    code 0.5 under block scales of 0.25, so each value is 2^119 or 2^97 (`quantization.packed_values`),
+    through `kernel` on an H100 (interpreted; the decoded arm's inner product XLA's), as one matrix and as
+    a bank of two experts whose large columns differ: the product of small integer rows and their gradient
+    under a small integer cotangent are the float64 ones exactly, finite, where the decode's owed 2^8 folded
+    into the scale (2^130) was infinite (train 1403's review)."""
+    from dew.quantization import packed_values
+
+    experts, depth, width = (2 if grouped else 1), 256, 64
+    large = (np.arange(width)[None] + np.arange(experts)[:, None]) % 2 == 0
+    scale = np.where(large, 2.0 ** 122, 2.0 ** 100).astype(np.float32)
+    matrix = formats.NvFp4.of(jnp.full((experts, depth, width), 0.5, jnp.float32),
+                              jnp.full((experts, depth // 16, width), 0.25, jnp.float8_e4m3fn),
+                              jnp.asarray(scale))
+    if not grouped:
+        matrix = jax.tree.map(lambda leaf: leaf[0], matrix)
+    values = np.asarray(packed_values(matrix), np.float64).reshape(experts, depth, width)
+    assert set(np.unique(values)) == {2.0 ** 97, 2.0 ** 119}
+    counts = (40, 24) if grouped else (64,)
+    sizes = jnp.asarray(counts, jnp.int32) if grouped else None
+    rng = np.random.default_rng(14032)
+    rows = jnp.asarray(rng.integers(-1, 2, size=(64, depth)), jnp.float32)
+    cotangent = jnp.asarray(rng.integers(-1, 2, size=(64, width)), jnp.float32)
+    inner = {} if kernel == "packed" else {"grouped_matmul": "xla"}
+    with generation.assumed("sm90"), generation.chosen(nvfp4=kernel, **inner):
+        out, pull = jax.vjp(lambda rows: gemm.nvfp4_product(rows, matrix, sizes, out_dtype=jnp.float32,
+                                                            interpret_on_cpu=True), rows)
+        (grad,) = pull(cotangent)
+    product, gradient = np.zeros((64, width)), np.zeros((64, depth))
+    for group, (first, last) in enumerate(itertools.pairwise(np.cumsum([0, *counts]))):
+        product[first:last] = np.asarray(rows[first:last], np.float64) @ values[group]
+        gradient[first:last] = np.asarray(cotangent[first:last], np.float64) @ values[group].T
+    np.testing.assert_array_equal(np.asarray(out, np.float64), product)
+    np.testing.assert_array_equal(np.asarray(grad), gradient.astype(np.float32))
+    assert np.all(np.isfinite(product)) and np.all(np.isfinite(gradient.astype(np.float32)))
+
+
+@pytest.mark.parametrize("kernel", ["packed", "xla"])
+def test_an_nvfp4_rows_gradient_keeps_a_cancelling_pairs_rounding_residual(kernel):
+    """Codes +1 and -1 at depth 0 of two columns whose tensor scales are 4 (1 - 2^-23) and 4, unit block
+    scales, under cotangents 2^126 (1 + 2^-23) and 2^126 there, through `kernel` on an H100 (interpreted;
+    the decoded arm's inner product XLA's): each scaled cotangent overflows, so the exact transpose sums
+    them, and the depth's gradient is their exact difference, 2^128 ((1 - 2^-46) - 1) = -2^82, bit for bit
+    (train 1426's review: their significands' product rounded in fp32, both read 2^129, summed 0)."""
+    depth, width = 256, 128
+    codes = np.zeros((depth, width), np.float32)
+    codes[0, :2] = (1.0, -1.0)
+    scale = np.ones((width,), np.float32)
+    scale[:2] = (4 * (1 - 2.0 ** -23), 4.0)
+    matrix = formats.NvFp4.of(jnp.asarray(codes), jnp.ones((depth // 16, width), jnp.float8_e4m3fn),
+                              jnp.asarray(scale))
+    cotangent = np.zeros((8, width), np.float32)
+    cotangent[:, :2] = (2.0 ** 126 * (1 + 2.0 ** -23), 2.0 ** 126)
+    inner = {} if kernel == "packed" else {"grouped_matmul": "xla"}
+    with generation.assumed("sm90"), generation.chosen(nvfp4=kernel, **inner):
+        _, pull = jax.vjp(lambda rows: gemm.nvfp4_product(rows, matrix, out_dtype=jnp.float32,
+                                                          interpret_on_cpu=True), jnp.zeros((8, depth)))
+        (grad,) = pull(jnp.asarray(cotangent))
+    want = np.zeros((8, depth), np.float32)
+    want[:, 0] = -(2.0 ** 82)
+    np.testing.assert_array_equal(np.asarray(grad).view(np.uint32), want.view(np.uint32))
+
+
+@pytest.mark.parametrize("left_dtype", [jnp.float32, jnp.bfloat16])
+def test_an_owed_product_is_its_exact_value_rounded_once_into_float32(left_dtype):
+    """`float_bits.owed_product` of operands drawn across their whole range (a normal's binades and a
+    subnormal's, both signs) times powers of two owed either way, jitted on this CPU, whose float32
+    arithmetic flushes subnormals: each the float64 product, exact, rounded once into float32 by numpy, bit
+    for bit, a subnormal or an overflow's infinity included (the one rule GEMM's factored products and a
+    stored decode's values share, train 1437's review)."""
+    from dew.nn.float_bits import owed_product
+
+    rng = np.random.default_rng(14372)
+    bits = 16 if left_dtype == jnp.bfloat16 else 32
+    words = rng.integers(0, 2 ** bits, size=4096, dtype=np.uint64).astype(f"uint{bits}")
+    left = jax.lax.bitcast_convert_type(jnp.asarray(words), left_dtype)
+    right = rng.integers(0, 2 ** 32, size=4096, dtype=np.uint64).astype(np.uint32).view(np.float32)
+    owed = rng.integers(-40, 41, size=4096).astype(np.int32)
+    finite = np.isfinite(np.asarray(left, np.float64)) & np.isfinite(right.astype(np.float64))
+    got = np.asarray(jax.jit(owed_product)(left, jnp.asarray(right), jnp.asarray(owed)))
+    with np.errstate(over="ignore"):
+        want = (np.asarray(left, np.float64) * right.astype(np.float64) * np.exp2(owed)).astype(np.float32)
+    np.testing.assert_array_equal(got[finite].view(np.uint32), want[finite].view(np.uint32))
+
+
+def test_a_scaled_products_subnormal_operand_keeps_its_products_every_bit():
+    """`factored.scaled_exactly` of the least subnormal, 2^-149, times (1 + 2^-23) 2^126, on this CPU whose
+    float32 arithmetic flushes subnormals: 2^-23 + 2^-46 exactly, its last bit kept (train 1437's review:
+    the subnormal's short significand, multiplied unnormalized, lost it to the product's cut), and an owed
+    exponent past every place holds at its edge, not wrapping: 1 times 2^28 lowered by 2^31 - 1 is zero."""
+    from dew.nn.kernels.templates.gemm.factored import lowered_product, scaled_exactly
+
+    least = np.uint32(1).view(np.float32)
+    got = jax.jit(scaled_exactly)(jnp.float32(least), jnp.float32((1 + 2.0 ** -23) * 2.0 ** 126))
+    assert np.asarray(got).view(np.uint32) == np.float32(2.0 ** -23 + 2.0 ** -46).view(np.uint32)
+    lowered = jax.jit(lowered_product)(jnp.float32(1.0), jnp.float32(2.0 ** 28), jnp.int32(2 ** 31 - 1))
+    assert np.asarray(lowered).view(np.uint32) == 0
+
+
+def test_an_owed_products_reverse_mode_in_its_factor_is_the_product_owed():
+    """`factored.owed_exactly(1, scale, 8)`'s gradient in its scale is the owed power of two, 256, its
+    derivative in the factor a linear map of its own (train 1426's review: it ran through the value's bit
+    reading, which reverse mode cannot transpose)."""
+    from dew.nn.kernels.templates.gemm.factored import owed_exactly
+
+    grad = jax.grad(lambda scale: owed_exactly(jnp.float32(1.0), scale, 8))(jnp.float32(0.5))
+    assert float(grad) == 256.0
+
+
+def test_an_owed_power_past_float32s_is_owed_exactly_natively_and_in_software():
+    """An owed power of two past fp32's largest is owed exactly by `factored.owed_native` (the fold a
+    platform keeping subnormals takes, CUDA's) and `owed_exactly` (this CPU's, in integer arithmetic)
+    alike: 2^-100 times 1 owed 2^128 is 2^28, 2^-120 times 2^-20 owed 2^160 is 2^20, 1.5 2^-126 times
+    2^-10 owed 2^130 is 1.5 2^-6, where the native fold's float32 power of 2^128 was infinite (train
+    1450's review)."""
+    from dew.nn.kernels.templates.gemm.factored import owed_exactly, owed_native
+
+    cases = ((2.0 ** -100, 1.0, 128, 2.0 ** 28), (2.0 ** -120, 2.0 ** -20, 160, 2.0 ** 20),
+             (1.5 * 2.0 ** -126, 2.0 ** -10, 130, 1.5 * 2.0 ** -6))
+    for product, factor, raised, want in cases:
+        for owed in (functools.partial(owed_native, raised=raised),
+                     functools.partial(owed_exactly, raised=raised)):
+            got = jax.jit(owed)(jnp.float32(product), jnp.float32(factor))
+            assert np.asarray(got).view(np.uint32) == np.float32(want).view(np.uint32), (raised, got)
+
+
+@pytest.mark.mesh(devices=2)
+def test_an_owed_products_scale_gradient_over_a_column_split_product_runs_outside_its_mesh():
+    """`factored.owed_exactly`'s sum over a product of ones an Explicit axis splits by its columns, times
+    one replicated scale owed 2^8, differentiated in the scale and jitted outside the mesh's context: the
+    scale's gradient is 256 times the product's 2 x 128 entries, its transpose placed as the scale's
+    direction by its own sharding (train 1426's review: resharded by a bare spec, which needs the
+    context)."""
+    from jax.sharding import AxisType, NamedSharding, PartitionSpec
+
+    from dew.nn.kernels.templates.gemm.factored import owed_exactly
+
+    mesh = jax.make_mesh((2,), ("tensor",), axis_types=(AxisType.Explicit,), devices=jax.devices()[:2])
+    columns = NamedSharding(mesh, PartitionSpec(None, "tensor"))
+    product = jax.device_put(jnp.ones((2, 128), jnp.float32), columns)
+    scale = jax.device_put(jnp.float32(0.5), NamedSharding(mesh, PartitionSpec()))
+    grad = jax.jit(jax.grad(lambda scale, product: jnp.sum(owed_exactly(product, scale, 8))))(scale, product)
+    assert float(grad) == 256.0 * 2 * 128
+
+
+@pytest.mark.parametrize(("scale", "code", "block", "value"), [
+    (2.0 ** -126, 0.5, 0.25, 2.0 ** -129),
+    (2.0 ** -140, 4.0, 256.0, 2.0 ** -122),
+], ids=["subnormal product", "subnormal scale"])
+@pytest.mark.parametrize("kernel", ["packed", "xla"])
+def test_an_nvfp4_products_owed_power_of_two_keeps_its_subnormals(kernel, scale, code, block, value):
+    """An NVFP4 product whose tensor scale and the decode's owed 2^8 (`bits.NVFP4_OWED`) make a subnormal
+    output (a scale of 2^-126 under one code of 0.5 at block scale 0.25 a column: 2^-129), or whose
+    subnormal scale (2^-140) makes a normal one (codes of 4 at block scale 256 over 256 depths: 2^-122),
+    through `kernel` on an H100 (interpreted; the decoded arm's inner product XLA's): each output is that
+    value, bit for bit, on this CPU whose float32 arithmetic flushes subnormals, the owed power of two the
+    product's one rounding's (`factored.owed_exactly`; train 1403's review: a runtime multiply by one
+    flushed the first, the scale raised by 2^8 the second)."""
+    depth, width = 256, 64
+    codes = np.zeros((depth, width), np.float32)
+    codes[: 1 if code == 0.5 else depth] = code
+    matrix = formats.NvFp4.of(jnp.asarray(codes), jnp.full((depth // 16, width), block, jnp.float8_e4m3fn),
+                              jnp.float32(scale))
+    rows = jnp.ones((8, depth), jnp.float32)
+    inner = {} if kernel == "packed" else {"grouped_matmul": "xla"}
+    with generation.assumed("sm90"), generation.chosen(nvfp4=kernel, **inner):
+        got = gemm.nvfp4_product(rows, matrix, out_dtype=jnp.float32, interpret_on_cpu=True)
+    np.testing.assert_array_equal(np.asarray(got).view(np.uint32),
+                                  np.full((8, width), value, np.float32).view(np.uint32))
+
+
+@pytest.mark.parametrize(("case", "code", "block", "scale", "cotangent", "want"), [
+    ("tiny routes", (4.0,) * 128, 256.0, 2.0 ** -142, (1.0,) * 128, 2.0 ** -125),
+    ("a cancelling pair's residual", (0.5, -0.5), 2.0 ** -9, 1.0, (2.0 ** -116 + 2.0 ** -131, 2.0 ** -116),
+     2.0 ** -141),
+    ("a product rounding to zero", (4.0,), 448.0, 2.0 ** -50, (2.0 ** -108,), 2.0 ** -147),
+], ids=lambda value: value if isinstance(value, str) else None)
+@pytest.mark.parametrize("kernel", ["packed", "xla"])
+def test_an_nvfp4_rows_gradient_keeps_tiny_scaled_products(kernel, case, code, block, scale, cotangent, want):
+    """An NVFP4 matrix whose depth 0 holds `code` at block scale `block` in its first columns, every column's
+    tensor scale `scale` (`NvFp4.columned`), its rows' gradient at depth 0 under output cotangents
+    `cotangent` there, through `kernel` on an H100 (interpreted; the decoded arm's inner product XLA's),
+    jitted on this CPU, which flushes subnormal float32 arithmetic: the exact transpose's `want`, bit for
+    bit, where the plain one lost it below its range (train 1409's review): 128 routes' 2^-134, each below
+    its bf16 parts, sum to the normal 2^-125; a cancelling pair's residual 2^-123 times 2^-18 is the
+    subnormal 2^-141; and 2^-108 times 2^-50 owed 2^8, 2^-150, rounds to zero alone yet times 7 is
+    2^-147."""
+    del case
+    depth, width = 256, 128
+    codes = np.zeros((depth, width), np.float32)
+    codes[0, :len(code)] = code
+    matrix = formats.NvFp4.of(jnp.asarray(codes), jnp.full((depth // 16, width), block, jnp.float8_e4m3fn),
+                              jnp.full((width,), scale, jnp.float32))
+    dy = np.zeros((8, width), np.float32)
+    dy[:, :len(cotangent)] = cotangent
+    inner = {} if kernel == "packed" else {"grouped_matmul": "xla"}
+    with generation.assumed("sm90"), generation.chosen(nvfp4=kernel, **inner):
+        pull = jax.jit(lambda dy: jax.vjp(lambda rows: gemm.nvfp4_product(
+            rows, matrix, out_dtype=jnp.float32, interpret_on_cpu=True), jnp.zeros((8, depth)))[1](dy)[0])
+        grad = pull(jnp.asarray(dy))
+    expected = np.zeros((8, depth), np.float32)
+    expected[:, 0] = want
+    np.testing.assert_array_equal(np.asarray(grad).view(np.uint32), expected.view(np.uint32))
+
+
+@pytest.mark.parametrize("kernel", ["packed", "xla"])
+def test_an_nvfp4_pullbacks_derivative_keeps_a_cancelling_directions_remainder(kernel):
+    """Codes +1, -1, +1 at one depth of three columns whose tensor scales are 4, 8 and 1, unit block scales,
+    through `kernel` on an H100 (interpreted): the rows' pullback's derivative at a zero cotangent along
+    2^126, 2^125 and 1 is the range-safe transpose of that direction, 2^128 - 2^128 + 1 = 1 at the depth
+    (train 1409's review: the derivative's terms pulled back plainly, two infinities, read NaN), and reverse
+    mode over the pullback reads the product's own transpose, each column's value (4, -8, 1)."""
+    depth, width = 256, 128
+    matrix = _cancelling_columns(depth, width)
+    direction = jnp.zeros((8, width), jnp.float32).at[:, :3].set(jnp.asarray([2.0 ** 126, 2.0 ** 125, 1.0]))
+    inner = {} if kernel == "packed" else {"grouped_matmul": "xla"}
+    with generation.assumed("sm90"), generation.chosen(nvfp4=kernel, **inner):
+        def pullback(cotangent, matrix):
+            _, pull = jax.vjp(lambda rows: gemm.nvfp4_product(rows, matrix, out_dtype=jnp.float32,
+                                                              interpret_on_cpu=True), jnp.zeros((8, depth)))
+            return pull(cotangent)[0]
+
+        # Jitted, the matrix an argument: the derivative's map reads it as its residual.
+        _, moved = jax.jit(lambda matrix, direction: jax.jvp(
+            lambda cotangent: pullback(cotangent, matrix), (jnp.zeros_like(direction),), (direction,)))(
+            matrix, direction)
+        # Reverse mode over the pullback: its transpose is the product, each column its value at depth 0.
+        across = jax.grad(lambda cotangent: jnp.sum(pullback(cotangent, matrix)))(jnp.zeros_like(direction))
+    want = np.zeros((8, depth), np.float32)
+    want[:, 0] = 1.0
+    np.testing.assert_array_equal(np.asarray(moved), want)
+    values = np.zeros((8, width), np.float32)
+    values[:, :3] = (4.0, -8.0, 1.0)
+    np.testing.assert_array_equal(np.asarray(across), values)
 
 
 @pytest.mark.parametrize("gathered", [False, True], ids=["rows", "gathered-rows"])
@@ -847,6 +1211,20 @@ def test_an_nvfp4_products_gathered_gradient_keeps_far_routes_apart_and_routes_n
     np.testing.assert_array_equal(np.asarray(d_none), np.zeros((1, 512), np.float32))
 
 
+def _small_integer_projection(seed: int) -> tuple:
+    """A `[512, 128]` NVFP4 matrix of small integer codes (unit block scales, a tensor scale of 2^-8, its
+    values the codes), its values in float64 (`packed_values`), eight rows and their output's cotangent,
+    small integers each: every product and sum of them exact."""
+    from dew.quantization import packed_values
+
+    rng = np.random.default_rng(seed)
+    codes = jnp.asarray(rng.integers(-2, 3, (512, 128)), jnp.float32)
+    matrix = formats.NvFp4.of(codes, jnp.ones((32, 128), jnp.float8_e4m3fn), jnp.float32(2.0 ** -8))
+    rows = rng.integers(-3, 4, (8, 512)).astype(np.float32)
+    cotangent = rng.integers(-3, 4, (8, 128)).astype(np.float32)
+    return matrix, np.asarray(packed_values(matrix), np.float64), rows, cotangent
+
+
 @pytest.mark.mesh(devices=2)
 def test_a_column_split_nvfp4_projections_input_gradient_runs_on_an_explicit_mesh():
     """A dense NVFP4 projection whose matrix an Explicit 'tensor' axis splits by its columns (its words' and
@@ -857,14 +1235,7 @@ def test_a_column_split_nvfp4_projections_input_gradient_runs_on_an_explicit_mes
     review: the placed call's XLA product raised)."""
     from jax.sharding import AxisType, PartitionSpec
 
-    rng = np.random.default_rng(14031)
-    codes = jnp.asarray(rng.integers(-2, 3, (512, 128)), jnp.float32)
-    matrix = formats.NvFp4.of(codes, jnp.ones((32, 128), jnp.float8_e4m3fn), jnp.float32(2.0 ** -8))
-    from dew.quantization import packed_values
-
-    values = np.asarray(packed_values(matrix), np.float64)
-    rows = rng.integers(-3, 4, (8, 512)).astype(np.float32)
-    cotangent = rng.integers(-3, 4, (8, 128)).astype(np.float32)
+    matrix, values, rows, cotangent = _small_integer_projection(14031)
     mesh = jax.make_mesh((2,), ("tensor",), axis_types=(AxisType.Explicit,))
 
     @jax.jit
@@ -879,6 +1250,179 @@ def test_a_column_split_nvfp4_projections_input_gradient_runs_on_an_explicit_mes
         out, grad = pulled(jax.device_put(rows, PartitionSpec()), placed,
                            jax.device_put(cotangent, PartitionSpec(None, "tensor")))
     np.testing.assert_array_equal(np.asarray(out, np.float64), rows.astype(np.float64) @ values)
+    np.testing.assert_array_equal(np.asarray(grad, np.float64), cotangent.astype(np.float64) @ values.T)
+
+
+@pytest.mark.mesh(devices=2)
+def test_a_column_split_nvfp4_banks_column_scales_run_on_an_explicit_mesh():
+    """A bank of two NVFP4 experts whose tensor scales are one a column (`NvFp4.columned`, row 13743: a
+    ModelOpt source's fused gate and up), an Explicit 'tensor' axis splitting every field by its columns
+    (the bank's own layout, `NvFp4.leaf_axes`), over replicated sorted bfloat16 rows and group sizes,
+    jitted: its forward, exactly, and its rows' gradient, the cotangent split by the same columns, rounded
+    once to the rows' bfloat16, are the product written plainly over each expert's values
+    (`packed_values`) in float64, over small integers; each row reads its group's column scales where the
+    product and its pullback expand them (`factored`'s `groups`)."""
+    from jax.sharding import AxisType, PartitionSpec
+
+    from dew.quantization import packed_values
+
+    rng = np.random.default_rng(14033)
+    codes = jnp.asarray(rng.integers(-2, 3, (2, 512, 128)), jnp.float32)
+    scale = jnp.asarray(np.exp2(rng.integers(-10, -6, (2, 128))), jnp.float32)
+    bank = formats.NvFp4.of(codes, jnp.ones((2, 32, 128), jnp.float8_e4m3fn), scale)
+    values = np.asarray(packed_values(bank), np.float64)
+    counts = (40, 24)
+    sizes = jnp.asarray(counts, jnp.int32)
+    rows = rng.integers(-3, 4, (64, 512)).astype(np.float32)
+    cotangent = rng.integers(-3, 4, (64, 128)).astype(np.float32)
+    mesh = jax.make_mesh((2,), ("tensor",), axis_types=(AxisType.Explicit,))
+    narrow = jnp.asarray(rows, jnp.bfloat16)
+
+    @jax.jit
+    def pulled(x, bank, sizes, cotangent):
+        out, pull = jax.vjp(lambda x: gemm.nvfp4_product(x, bank, sizes, out_dtype=jnp.float32), x)
+        return jax.reshard(out, PartitionSpec()), pull(cotangent)[0]
+
+    with jax.set_mesh(mesh):
+        split = PartitionSpec(None, "tensor")
+        placed = formats.NvFp4(*(jax.device_put(field, split)
+                                 for field in (bank.words, bank.scales, bank.scale)))
+        whole = PartitionSpec()
+        out, grad = pulled(jax.device_put(narrow, whole), placed, jax.device_put(sizes, whole),
+                           jax.device_put(cotangent, split))
+    product, gradient = np.zeros((64, 128)), np.zeros((64, 512))
+    for group, (first, last) in enumerate(itertools.pairwise(np.cumsum([0, *counts]))):
+        product[first:last] = rows[first:last].astype(np.float64) @ values[group]
+        gradient[first:last] = cotangent[first:last].astype(np.float64) @ values[group].T
+    np.testing.assert_array_equal(np.asarray(out, np.float64), product)
+    rounded = jnp.asarray(gradient, jnp.float32).astype(jnp.bfloat16)
+    np.testing.assert_array_equal(np.asarray(grad, np.float32), np.asarray(rounded, np.float32))
+
+
+@pytest.mark.mesh(devices=2)
+def test_an_expert_split_nvfp4_banks_column_scales_run_on_an_explicit_mesh():
+    """A bank of two NVFP4 experts whose tensor scales are one a column (`NvFp4.columned`), an Explicit
+    'expert' axis splitting every field by its experts (`P('expert', ...)`), over replicated rows one an
+    expert, jitted: its forward and its rows' gradient are the product written plainly over each expert's
+    values (`packed_values`) in float64, exactly over small integers, the rows' gradient rounded once to
+    their bfloat16; each row reads its expert's column scales where an Explicit axis splits the experts
+    (`axes.at_rows`, train 1409's review: the repeat along a split axis raised)."""
+    from jax.sharding import AxisType, PartitionSpec
+
+    from dew.quantization import packed_values
+
+    rng = np.random.default_rng(14091)
+    codes = jnp.asarray(rng.integers(-2, 3, (2, 256, 128)), jnp.float32)
+    scale = jnp.asarray(np.exp2(rng.integers(-10, -6, (2, 128))), jnp.float32)
+    bank = formats.NvFp4.of(codes, jnp.ones((2, 16, 128), jnp.float8_e4m3fn), scale)
+    values = np.asarray(packed_values(bank), np.float64)
+    rows = rng.integers(-3, 4, (2, 256)).astype(np.float32)
+    cotangent = rng.integers(-3, 4, (2, 128)).astype(np.float32)
+    mesh = jax.make_mesh((2,), ("expert",), axis_types=(AxisType.Explicit,))
+
+    @jax.jit
+    def pulled(x, bank, cotangent):
+        out, pull = jax.vjp(lambda x: gemm.nvfp4_product(x, bank, jnp.asarray([1, 1], jnp.int32),
+                                                         out_dtype=jnp.float32), x)
+        return jax.reshard(out, PartitionSpec()), pull(cotangent)[0]
+
+    with jax.set_mesh(mesh):
+        experts = PartitionSpec("expert")
+        placed = formats.NvFp4(*(jax.device_put(field, experts)
+                                 for field in (bank.words, bank.scales, bank.scale)))
+        whole = PartitionSpec()
+        out, grad = pulled(jax.device_put(jnp.asarray(rows, jnp.bfloat16), whole), placed,
+                           jax.device_put(cotangent, whole))
+    product = np.stack([rows[expert].astype(np.float64) @ values[expert] for expert in range(2)])
+    gradient = np.stack([cotangent[expert].astype(np.float64) @ values[expert].T for expert in range(2)])
+    np.testing.assert_array_equal(np.asarray(out, np.float64), product)
+    rounded = jnp.asarray(gradient, jnp.float32).astype(jnp.bfloat16)
+    np.testing.assert_array_equal(np.asarray(grad, np.float32), np.asarray(rounded, np.float32))
+
+
+def _read_at_rows(side, sizes, cotangent) -> tuple:
+    """A group side read at the cotangent's rows (`axes.at_rows`), its sum against the cotangent beside the
+    rows: a value and its gradient's witness."""
+    from dew.nn.kernels.templates import axes
+
+    rows = axes.at_rows(side, (axes.GROUPS, "columns"), sizes, cotangent.shape[0])
+    return jnp.sum(rows * cotangent), rows
+
+
+@pytest.mark.mesh(devices=2)
+def test_a_replicated_group_side_read_at_rows_its_split_group_sizes_count_is_its_repeat():
+    """`axes.at_rows` of a replicated `[4, 128]` group side over group sizes of one row each that an
+    Explicit axis splits over two devices, jitted outside the mesh's context: each row its group's value
+    and its gradient each group's row's cotangent, as the unsplit repeat reads them, exactly over small
+    integers (train 1437's review: the split sizes repeated the side by each device's half, which raised)."""
+    from jax.sharding import AxisType, NamedSharding, PartitionSpec
+
+    rng = np.random.default_rng(14371)
+    side = jnp.asarray(rng.integers(-3, 4, (4, 128)), jnp.float32)
+    cotangent = jnp.asarray(rng.integers(-3, 4, (4, 128)), jnp.float32)
+
+    def read(side, sizes):
+        return _read_at_rows(side, sizes, cotangent)
+
+    sizes = jnp.ones((4,), jnp.int32)
+    mesh = jax.make_mesh((2,), ("expert",), axis_types=(AxisType.Explicit,), devices=jax.devices()[:2])
+    split = jax.device_put(sizes, NamedSharding(mesh, PartitionSpec("expert")))
+    whole = jax.device_put(side, NamedSharding(mesh, PartitionSpec()))
+    (_, rows), grad = jax.jit(jax.value_and_grad(read, has_aux=True))(whole, split)
+    (_, plain_rows), plain_grad = jax.value_and_grad(read, has_aux=True)(side, sizes)
+    np.testing.assert_array_equal(np.asarray(rows), np.asarray(plain_rows))
+    np.testing.assert_array_equal(np.asarray(grad), np.asarray(plain_grad))
+
+
+@pytest.mark.mesh(devices=4)
+def test_a_group_side_read_at_its_rows_across_an_explicit_groups_split_is_its_repeat():
+    """`axes.at_rows` of a `[2, 128]` group side whose groups one Explicit axis splits and whose columns
+    another does, over groups of 3 and 5 rows and 2 rows past them, jitted: each row its group's value (a
+    row past the groups the last's), as the unsplit repeat reads them, placed whole along the rows with its
+    columns' split kept, and its gradient under each row's cotangent each group's rows summed, as the
+    repeat's transpose sums them, placed as the side is, exactly over small integers (train 1409's review:
+    the repeat along a split axis raised)."""
+    from jax.sharding import AxisType, NamedSharding, PartitionSpec
+
+    rng = np.random.default_rng(14092)
+    side = jnp.asarray(rng.integers(-3, 4, (2, 128)), jnp.float32)
+    cotangent = jnp.asarray(rng.integers(-3, 4, (10, 128)), jnp.float32)
+    sizes = jnp.asarray([3, 5], jnp.int32)
+
+    def read(side):
+        return _read_at_rows(side, sizes, cotangent)
+
+    mesh = jax.make_mesh((2, 2), ("expert", "tensor"), axis_types=(AxisType.Explicit,) * 2,
+                         devices=jax.devices()[:4])
+    split = jax.device_put(side, NamedSharding(mesh, PartitionSpec("expert", "tensor")))
+    (_, rows), grad = jax.jit(jax.value_and_grad(read, has_aux=True))(split)
+    (_, plain_rows), plain_grad = jax.value_and_grad(read, has_aux=True)(side)
+    assert rows.sharding.spec == PartitionSpec(None, "tensor"), rows.sharding
+    assert grad.sharding.spec == PartitionSpec("expert", "tensor"), grad.sharding
+    np.testing.assert_array_equal(np.asarray(rows), np.asarray(plain_rows))
+    np.testing.assert_array_equal(np.asarray(grad), np.asarray(plain_grad))
+
+
+@pytest.mark.mesh(devices=2)
+def test_an_nvfp4_pullback_over_a_matrix_split_by_its_columns_alone_runs_outside_its_mesh():
+    """A dense NVFP4 projection whose matrix alone an Explicit 'tensor' axis splits by its columns, its rows,
+    tensor scale and cotangent unplaced, jitted outside the mesh's context (the matrix's type carrying it):
+    its rows' gradient is the product written plainly over its values (`packed_values`), exactly over small
+    integers, the exact rescue (traced in every pullback) placing its sums on the matrix's mesh (train
+    1426's review: meshless sums beside a GEMM on the matrix's)."""
+    from jax.sharding import AxisType, NamedSharding, PartitionSpec
+
+    matrix, values, rows, cotangent = _small_integer_projection(14263)
+    mesh = jax.make_mesh((2,), ("tensor",), axis_types=(AxisType.Explicit,), devices=jax.devices()[:2])
+    split = NamedSharding(mesh, PartitionSpec("tensor"))
+    placed = formats.NvFp4(jax.device_put(matrix.words, split), jax.device_put(matrix.scales, split),
+                           matrix.scale)
+
+    def pulled(x, matrix, cotangent):
+        _, pull = jax.vjp(lambda x: gemm.nvfp4_product(x, matrix, out_dtype=jnp.float32), x)
+        return pull(cotangent)[0]
+
+    grad = jax.jit(pulled)(rows, placed, cotangent)
     np.testing.assert_array_equal(np.asarray(grad, np.float64), cotangent.astype(np.float64) @ values.T)
 
 
@@ -906,7 +1450,8 @@ def test_an_nvfp4_products_gathered_gradient_in_a_checked_map_is_the_tokens_sum(
     def plain(x, table, w):
         experts = jnp.repeat(jnp.arange(2), sizes, total_repeat_length=table.shape[0])
         rows = x[table].astype(jnp.bfloat16).astype(jnp.float32)
-        return jnp.sum(jnp.einsum('rd,rdw->rw', rows, decoded[experts]) * bank.factor[experts][:, None] * w)
+        factor = jnp.float32(bits.NVFP4_OWED) * bank.scale[experts][:, None]
+        return jnp.sum(jnp.einsum('rd,rdw->rw', rows, decoded[experts]) * factor * w)
 
     def gradient(product):
         def each_device(x, table, w):

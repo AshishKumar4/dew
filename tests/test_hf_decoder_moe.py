@@ -44,6 +44,7 @@ from dew.interop import Pretrained, PretrainedDecoder
 from dew.interop.codecs import dequantize_mxfp4, quantize_mxfp4
 from dew.interop.hf_decoders import translate_config, translate_weights
 from dew.nn.backbones.causal_transformer import CausalTransformer
+from dew.quantization import packed_values
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "hf"
 
@@ -315,7 +316,7 @@ def test_an_mxfp4_gpt_oss_served_packed_is_on_par_with_it_decoded(tmp_path):
     params = flat_tree(packed.variables["params"])
     for path, bank in banks.items():
         assert isinstance(bank, NvFp4) and path not in params
-        values = np.asarray(bank.decoded(), np.float32) * np.asarray(bank.factor)[:, None, None]
+        values = np.asarray(packed_values(bank), np.float32)
         held = flat_tree(decoded.variables["params"])[path]
         np.testing.assert_array_equal(values, np.asarray(held, np.float32))
 
@@ -368,7 +369,7 @@ def test_an_mxfp4_bank_under_the_zero_byte_loads_packed_as_it_loads_dense(tmp_pa
         dict(packed.variables[QUANTIZATION]), is_leaf=lambda _, leaf: isinstance(leaf, NvFp4)).items()}
     path = next(name for name in banks if name.endswith("down_proj") and ".layers_0." in f".{name}.")
     bank = banks[path]
-    values = np.asarray(bank.decoded(), np.float32) * np.asarray(bank.factor)[:, None, None]
+    values = np.asarray(packed_values(bank), np.float32)
     held = np.asarray(flat_tree(dense.variables["params"])[path], np.float32)
     np.testing.assert_array_equal(values.view(np.uint32), held.view(np.uint32))
     # An export writes the values back, which the released encoder may state at another scale than the

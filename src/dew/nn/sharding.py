@@ -950,6 +950,16 @@ def excess_axes(value: jax.Array, of: jax.Array) -> tuple[str, ...]:
     return tuple(sorted(jax.typeof(value).mat.varying - jax.typeof(of).mat.varying))
 
 
+def broadcast_axes(shape: tuple[int, ...], broadcast: tuple[int, ...]) -> tuple[int, ...]:
+    """The axes of `broadcast` (a shape) that a broadcast of `shape` to it added or widened: its leading
+    axes past `shape`'s rank, and each axis of size one in `shape` that `broadcast` makes wider. A
+    broadcast's transpose sums its cotangent over them: the one statement of them every such sum reads
+    (`summed_like`, `kernels.generation.unbroadcast`; train 1450's review)."""
+    lead = len(broadcast) - len(shape)
+    return (*range(lead), *(lead + axis for axis, size in enumerate(shape)
+                            if size == 1 and broadcast[lead + axis] != 1))
+
+
 def summed_to(cotangent, operand):
     """`cotangent` summed over each manual axis it varies over that `operand` does not (`excess_axes`),
     typed as `operand` varies: a kernel's result varies over every axis an operand varies over

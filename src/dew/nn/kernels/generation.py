@@ -1876,13 +1876,18 @@ def linear_tangent(forward: Callable, backward: Callable, portable: Callable, *,
 
 def unbroadcast(cotangent, shape: tuple[int, ...]):
     """`cotangent`, of the shape an operand of `shape` was broadcast to, summed back to `shape`, as JAX pulls
-    a broadcast back."""
+    a broadcast back: every axis the broadcast added or widened from one reduced at once, in the
+    cotangent's dtype (one `reduce_sum`, as JAX's own broadcast transpose: one rounding of each sum), then
+    reshaped to `shape`. Summed from the cotangent itself, so the sum keeps its type (an Explicit placement,
+    a manual axis's variation; train 1437's review: a broadcast's pullback traced from plain zeros refused
+    a split cotangent)."""
     import jax
-    import jax.numpy as jnp
 
-    _, pulled = jax.vjp(lambda wide: jnp.broadcast_to(wide, cotangent.shape),
-                        jnp.zeros(shape, cotangent.dtype))
-    return pulled(cotangent)[0]
+    from dew.nn.sharding import broadcast_axes
+
+    reduced = broadcast_axes(tuple(shape), cotangent.shape)
+    summed = jax.lax.reduce_sum(cotangent, reduced) if reduced else cotangent
+    return summed.reshape(shape)
 
 
 def linear_map(apply: Callable, pullback: Callable, residuals, moving, *, out_aval=None,

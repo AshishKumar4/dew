@@ -331,6 +331,132 @@ def test_a_grouped_ternary_weight_product_is_exact_at_every_scale_shape():
 
 
 
+@pytest.mark.parametrize("cotangent_placed", [True, False], ids=["cotangent placed as the output",
+                                                                 "unplaced cotangent"])
+@pytest.mark.parametrize("in_context", [True, False], ids=["under its mesh", "outside its mesh's context"])
+@pytest.mark.mesh(devices=2)
+def test_a_column_split_ternary_pullback_over_an_odd_half_width_runs_on_an_explicit_mesh(in_context,
+                                                                                         cotangent_placed):
+    """A ternary product 6146 columns wide (3073 a device) whose per-column scale an Explicit axis of two
+    devices splits by those columns, its cotangent placed as its output is or unplaced, jitted under its
+    mesh or outside
+    its context (the placed arguments' types carrying it): its rows' gradient is the unsplit one's, exactly
+    over small integers, the exact rescue (traced in every pullback) cutting its column chunks whole on each
+    device for every operand it cuts and its sums placed on that mesh, its rows whole (train 1426's review:
+    a chunk of 3073 columns was unplaceable, sized by the cotangent alone; its sums meshless beside the
+    columns' split)."""
+    from jax.sharding import AxisType, NamedSharding, PartitionSpec
+
+    rng = np.random.default_rng(14261)
+    values = rng.integers(-1, 2, (256, 6146)).astype(np.float32)
+    scale = np.exp2(rng.integers(-2, 3, (6146,))).astype(np.float32)
+    weights = formats.TernaryWeights.of(values * scale, scale=scale)
+    rows = rng.integers(-3, 4, (8, 256)).astype(np.float32)
+    cotangent = rng.integers(-3, 4, (8, 6146)).astype(np.float32)
+
+    def pulled(rows, weights, cotangent, placed=False):
+        out, pull = jax.vjp(lambda rows: gemm.ternary_weight_product(
+            rows, weights, quantize_activations=False, out_dtype=jnp.float32), rows)
+        return pull(jax.sharding.reshard(cotangent, jax.typeof(out).sharding) if placed else cotangent)[0]
+
+    plain = pulled(jnp.asarray(rows), weights, jnp.asarray(cotangent))
+    mesh = jax.make_mesh((2,), ("tensor",), axis_types=(AxisType.Explicit,), devices=jax.devices()[:2])
+    placed = dataclasses.replace(weights, scale=jax.device_put(
+        jnp.asarray(weights.scale), NamedSharding(mesh, PartitionSpec("tensor"))))
+    held = jax.device_put(cotangent, NamedSharding(mesh, PartitionSpec())) if cotangent_placed else cotangent
+    with jax.set_mesh(mesh) if in_context else contextlib.nullcontext():
+        grad = jax.jit(functools.partial(pulled, placed=cotangent_placed))(
+            jax.device_put(rows, NamedSharding(mesh, PartitionSpec())), placed, held)
+    np.testing.assert_array_equal(np.asarray(grad), np.asarray(plain))
+
+
+@pytest.mark.parametrize("cotangent_placed", [True, False], ids=["cotangent placed as the product",
+                                                                 "unplaced cotangent"])
+@pytest.mark.mesh(devices=2)
+def test_an_eager_ternary_pullback_of_explicitly_split_rows_runs_outside_its_mesh(cotangent_placed):
+    """A ternary product of rows an Explicit axis splits by their rows, pulled back eagerly (no `jit`)
+    outside its mesh's context, the cotangent placed as the product is or unplaced: the rows' gradient is
+    the unsplit one's, exactly over small integers, the pullback's seed made on the rows' own devices
+    (train 1426's review: an eager allocation at an abstract mesh had no devices)."""
+    from jax.sharding import AxisType, NamedSharding, PartitionSpec
+
+    rng = np.random.default_rng(14264)
+    values = rng.integers(-1, 2, (256, 64)).astype(np.float32)
+    weights = formats.TernaryWeights.of(values, scale=jnp.float32(1.0))
+    rows = rng.integers(-3, 4, (16, 256)).astype(np.float32)
+    cotangent = rng.integers(-3, 4, (16, 64)).astype(np.float32)
+
+    def product(rows):
+        return gemm.ternary_weight_product(rows, weights, quantize_activations=False, out_dtype=jnp.float32)
+
+    plain = jax.vjp(product, jnp.asarray(rows))[1](jnp.asarray(cotangent))[0]
+    mesh = jax.make_mesh((2,), ("data",), axis_types=(AxisType.Explicit,), devices=jax.devices()[:2])
+    split = NamedSharding(mesh, PartitionSpec("data"))
+    out, pull = jax.vjp(product, jax.device_put(rows, split))
+    (grad,) = pull(jax.device_put(cotangent, out.sharding) if cotangent_placed else jnp.asarray(cotangent))
+    np.testing.assert_array_equal(np.asarray(grad), np.asarray(plain))
+
+
+@pytest.mark.parametrize("in_context", [True, False], ids=["under its mesh", "outside its context"])
+@pytest.mark.parametrize("shape", [(1, 64), (8, 1, 64), (64,), ()], ids=["rank-changing", "widened",
+                                                                       "trailing", "scalar"])
+@pytest.mark.mesh(devices=2)
+def test_a_broadcasts_transpose_sums_a_split_cotangent_keeping_its_placement(shape, in_context):
+    """`generation.unbroadcast` of a `[8, 16, 64]` cotangent an Explicit axis splits by its leading rows, back
+    to an operand's `shape` broadcast to it (a rank-changing `[1, 64]` under a batch axis, a widened `[8, 1,
+    64]`, a trailing `[64]`, a scalar), jitted under its mesh or outside its context: the sum JAX's own
+    broadcast pullback gives of the plain cotangent, exactly over small integers, its placement the split
+    cotangent's sum's where its rows remain (train 1437's review: a pullback traced from plain zeros refused
+    the split cotangent)."""
+    from jax.sharding import AxisType, NamedSharding, PartitionSpec
+
+    from dew.nn.kernels import generation
+
+    rng = np.random.default_rng(14373)
+    cotangent = rng.integers(-3, 4, (8, 16, 64)).astype(np.float32)
+    _, pull = jax.vjp(lambda wide: jnp.broadcast_to(wide, cotangent.shape), jnp.zeros(shape, jnp.float32))
+    (plain,) = pull(jnp.asarray(cotangent))
+    mesh = jax.make_mesh((2,), ("data",), axis_types=(AxisType.Explicit,), devices=jax.devices()[:2])
+    split = jax.device_put(cotangent, NamedSharding(mesh, PartitionSpec("data")))
+    with jax.set_mesh(mesh) if in_context else contextlib.nullcontext():
+        summed = jax.jit(lambda each: generation.unbroadcast(each, shape))(split)
+    assert summed.shape == shape
+    np.testing.assert_array_equal(np.asarray(summed), np.asarray(plain))
+    if len(shape) == 3:
+        assert summed.sharding.spec[0] == "data", summed.sharding
+
+
+@pytest.mark.mesh(devices=2)
+def test_an_expert_split_ternary_banks_column_scales_run_on_an_explicit_mesh():
+    """A grouped ternary product of two experts whose per-group column scales (`[2, 1, 128]`) an Explicit
+    'expert' axis splits, over replicated rows one an expert, jitted under its mesh: its product is the
+    unsplit one's, exactly over small integers, each row reading its group's scales by the one placed
+    group-to-row mapping (`templates.axes.at_rows`; train 1426's review: a repeat along the split axis)."""
+    from jax.sharding import AxisType, NamedSharding, PartitionSpec
+
+    rng = np.random.default_rng(14262)
+    values = rng.integers(-1, 2, (2, 256, 128)).astype(np.float32)
+    scale = np.exp2(rng.integers(-2, 3, (2, 1, 128))).astype(np.float32)
+    bank = formats.TernaryWeights.of(values * scale, scale=scale)
+    rows = rng.integers(-3, 4, (2, 256)).astype(np.float32)
+    sizes = jnp.asarray([1, 1], jnp.int32)
+
+    def product(rows, bank):
+        return gemm.ternary_weight_product(rows, bank, sizes, quantize_activations=False,
+                                           out_dtype=jnp.float32)
+
+    plain = product(jnp.asarray(rows), bank)
+    mesh = jax.make_mesh((2,), ("expert",), axis_types=(AxisType.Explicit,), devices=jax.devices()[:2])
+    with jax.set_mesh(mesh):
+        placed = dataclasses.replace(bank, scale=jax.device_put(
+            jnp.asarray(bank.scale), NamedSharding(mesh, PartitionSpec("expert"))))
+        got = jax.jit(product)(jax.device_put(rows, NamedSharding(mesh, PartitionSpec())), placed)
+    np.testing.assert_array_equal(np.asarray(got), np.asarray(plain))
+    np.testing.assert_array_equal(np.asarray(plain, np.float64),
+                                  np.stack([rows[e].astype(np.float64) @ (values[e] * scale[e])
+                                            for e in range(2)]))
+
+
 def test_a_ternary_weight_product_quantizes_its_activations_as_bitnet_does():
     """BitNet b1.58's per-token int8 activation quantization, a zero row's product zero, and the unquantized
     straight-through gradient in the rows and the scale, on both routes (row 1464)."""
@@ -765,6 +891,126 @@ def test_a_named_ternary_launch_takes_whole_rows_and_words_beside_a_split_scale(
         got = product(jax.device_put(jnp.asarray(rows, jnp.bfloat16), whole), placed)
     want = rows.astype(np.float64) @ (values.astype(np.float64) * scale)
     np.testing.assert_array_equal(np.asarray(got, np.float64), want)
+
+
+def _rows_pullback(codes: jax.Array, cotangent: jax.Array, scale: jax.Array) -> jax.Array:
+    """The rows' pullback at sixteen zero rows of a ternary product of `codes` at `scale` (unquantized
+    rows), along the output's `cotangent`."""
+    weights = dataclasses.replace(formats.TernaryWeights.of(codes, scale=jnp.float32(1.0)), scale=scale)
+    _, pull = jax.vjp(lambda x: gemm.ternary_weight_product(x, weights, quantize_activations=False,
+                                                            out_dtype=jnp.float32),
+                      jnp.zeros((16, 256), jnp.float32))
+    return pull(cotangent)[0]
+
+
+def test_a_packed_pullbacks_cotangent_and_scale_terms_meet_in_one_exact_sum():
+    """A ternary row's pullback (+1 codes in five columns at a scale of 0.5, cotangents 2^126 in four and 0)
+    differentiated along a cotangent direction of 2^127 in four and 2 and a scale direction of -1: its two
+    terms, each past fp32's largest alone (2^128 and -2^128), meet in one exact sum, 1 (train 1409's
+    review: each term pulled back alone, inf - inf, read NaN)."""
+    codes = jnp.zeros((256, 64), jnp.float32).at[0, :5].set(1.0)
+    cotangent = jnp.zeros((16, 64), jnp.float32).at[0, :4].set(2.0 ** 126)
+    direction = jnp.zeros((16, 64), jnp.float32).at[0, :4].set(2.0 ** 127).at[0, 4].set(2.0)
+
+    def pullback(cotangent, scale):
+        return _rows_pullback(codes, cotangent, scale)
+
+    _, moved = jax.jvp(pullback, (cotangent, jnp.float32(0.5)), (direction, jnp.float32(-1.0)))
+    want = np.zeros((16, 256), np.float32)
+    want[0, 0] = 1.0
+    np.testing.assert_array_equal(np.asarray(moved), want)
+
+
+def test_a_packed_pullbacks_mixed_second_derivative_reaches_its_rescue_declared():
+    """A ternary +1 at a scale of 2^-110: the rows' pullback differentiated along a unit cotangent direction
+    reads 2^-110 there, a product below what the plain transpose holds, so its exact transpose; that
+    derivative differentiated along a unit scale direction is 1, each order's derivative declared, not the
+    exact transpose's integer slices differentiated (train 1409's review: 0)."""
+    codes = jnp.zeros((256, 64), jnp.float32).at[0, 0].set(1.0)
+    unit = jnp.zeros((16, 64), jnp.float32).at[0, 0].set(1.0)
+
+    def pullback(cotangent, scale):
+        return _rows_pullback(codes, cotangent, scale)
+
+    def along_cotangent(scale):
+        return jax.jvp(lambda cotangent: pullback(cotangent, scale), (jnp.zeros_like(unit),), (unit,))[1]
+
+    first = along_cotangent(jnp.float32(2.0 ** -110))
+    _, second = jax.jvp(along_cotangent, (jnp.float32(2.0 ** -110),), (jnp.float32(1.0),))
+    assert float(first[0, 0]) == 2.0 ** -110 and float(second[0, 0]) == 1.0
+
+
+def test_a_packed_pullbacks_joint_higher_derivative_meets_in_one_exact_sum():
+    """The ternary row's pullback (+1 codes in five columns at a scale of 0.5) differentiated along its
+    cotangent at zero, a function of that direction and the scale, differentiated once more moving both:
+    at a direction of 2^126 in four columns, along 2^127 in four and 2 and a scale direction of -1, its two
+    terms, each past fp32's largest alone, meet in one exact sum, 1 (train 1409's review: the map's moving
+    and residual terms rounded apart, inf - inf, read NaN)."""
+    codes = jnp.zeros((256, 64), jnp.float32).at[0, :5].set(1.0)
+    at = jnp.zeros((16, 64), jnp.float32).at[0, :4].set(2.0 ** 126)
+    along = jnp.zeros((16, 64), jnp.float32).at[0, :4].set(2.0 ** 127).at[0, 4].set(2.0)
+
+    def moved(direction, scale):
+        return jax.jvp(lambda cotangent: _rows_pullback(codes, cotangent, scale),
+                       (jnp.zeros_like(direction),), (direction,))[1]
+
+    _, joint = jax.jvp(moved, (at, jnp.float32(0.5)), (along, jnp.float32(-1.0)))
+    want = np.zeros((16, 256), np.float32)
+    want[0, 0] = 1.0
+    np.testing.assert_array_equal(np.asarray(joint), want)
+
+
+@pytest.mark.parametrize("grouped", [False, True], ids=["dense", "grouped"])
+@pytest.mark.parametrize("mesh_kind", ["explicit", "explicit outside its context", "checked map"])
+@pytest.mark.mesh(devices=2)
+def test_reverse_mode_over_a_packed_pullback_takes_its_scales_gradient_placed_as_it(mesh_kind, grouped):
+    """Reverse mode over a ternary rows' pullback in its scale (the gradient of the pulled-back rows' sum),
+    its rows and their cotangent split over two devices (an Explicit axis's placement, or a checked
+    `shard_map`'s varying rows), its scale every device's (one, or a bank's one a group, `[2, 1, 1]`, read
+    at each row): the scale's gradient is the unsplit one's, typed and placed as the scale (train 1409's
+    review: the transpose's adjoint kept the rows' variation and placement, which JAX refused for the
+    replicated scale)."""
+    from jax.sharding import AxisType, NamedSharding, PartitionSpec
+
+    rng = np.random.default_rng(14093)
+    shape = (2, 256, 64) if grouped else (256, 64)
+    codes = jnp.asarray(rng.integers(-1, 2, shape), jnp.float32)
+    cotangent = jnp.asarray(rng.integers(-3, 4, (16, 64)), jnp.float32)
+    scale = jnp.full((2, 1, 1) if grouped else (), 0.5, jnp.float32)
+    sizes = jnp.asarray([8, 8], jnp.int32) if grouped else None
+
+    def summed(rows, cotangent, scale, sizes):
+        weights = dataclasses.replace(formats.TernaryWeights.of(codes, scale=jnp.ones_like(scale)),
+                                      scale=scale)
+        _, pull = jax.vjp(lambda x: gemm.ternary_weight_product(x, weights, sizes, quantize_activations=False,
+                                                                out_dtype=jnp.float32), rows)
+        return jnp.sum(pull(cotangent)[0])
+
+    rows = jnp.zeros((16, 256), jnp.float32)
+    plain = jax.grad(summed, argnums=2)(rows, cotangent, scale, sizes)
+    axis_type = AxisType.Explicit if mesh_kind.startswith("explicit") else AxisType.Auto
+    mesh = jax.make_mesh((2,), ("data",), axis_types=(axis_type,), devices=jax.devices()[:2])
+    if mesh_kind.startswith("explicit"):
+        # Jitted under its mesh's context, or outside it, the placed arguments' types carrying it alone (row
+        # 13986: the exact rescue's sums placed as their products are).
+        split = NamedSharding(mesh, PartitionSpec("data"))
+        context = jax.set_mesh(mesh) if mesh_kind == "explicit" else contextlib.nullcontext()
+        with context:
+            grad = jax.jit(jax.grad(summed, argnums=2))(jax.device_put(rows, split),
+                                                        jax.device_put(cotangent, split), scale, sizes)
+    else:
+        # Each device's rows' sum differentiated in the scale every device holds: its gradient summed over
+        # the devices, as the scale's own transpose sums it; a bank's each device's own groups' sizes (its
+        # eight rows the first expert's, then the second's).
+        local = jnp.asarray([[8, 0], [0, 8]], jnp.int32) if grouped else jnp.zeros((2, 0), jnp.int32)
+
+        def each_device(rows, cotangent, scale, local):
+            return jax.grad(summed, argnums=2)(rows, cotangent, scale, local[0] if grouped else None)
+
+        specs = (PartitionSpec("data"), PartitionSpec("data"), PartitionSpec(), PartitionSpec("data"))
+        grad = jax.jit(jax.shard_map(each_device, mesh=mesh, in_specs=specs, out_specs=PartitionSpec(),
+                                     check_vma=True))(rows, cotangent, scale, local)
+    np.testing.assert_array_equal(np.asarray(grad), np.asarray(plain))
 
 
 def test_a_packed_products_rescue_keeps_a_subnormal_remainder():

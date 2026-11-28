@@ -12,23 +12,33 @@ from collections.abc import Callable
 import jax
 import jax.numpy as jnp
 import numpy as np
+from jax.core import Tracer
 from jax.custom_derivatives import SymbolicZero
 
 from dew.nn import float_bits, precision
 from dew.nn.derivatives import KernelGlue, contracted, declared_tangent
 from dew.nn.kernels import generation
-from dew.nn.sharding import explicit_spec, varying_like
+from dew.nn.kernels.templates import axes as side_axes
+from dew.nn.sharding import explicit_placement, explicit_spec, summed_to, varying_like
 
 
 def factored(run: Callable, operands: tuple, factor: jax.Array, rows: jax.Array, *, wide: Callable,
-             wide_operands: tuple, prepared: Callable | None = None,
-             gather: jax.Array | None = None) -> jax.Array:
-    """`run(rows as bf16, *operands) * factor`, linear in `rows`: `run` a product of bf16 rows (those
-    `gather` reads where given, `gemm`'s `gather`, among `operands`), and `factor` a packed matrix's fp32
-    scales broadcast against its output (`formats.scale_factor`), one a row's or one for all (a column's,
-    which the transpose sums over, is the plain product's). Its transpose is the plain one, the cotangent
-    times its factor through `run`'s pullback, wherever that is finite; where it is not (a product past
-    fp32's largest), the exact one (`_Transpose.moved`): each product `cotangent * factor` and each
+             wide_operands: tuple, prepared: Callable | None = None, gather: jax.Array | None = None,
+             groups: jax.Array | None = None, owed: float = 1.0, least: float = 1.0) -> jax.Array:
+    """`run(rows as bf16, *operands) * factor * owed`, linear in `rows`: `run` a product of bf16 rows (those
+    `gather` reads where given, `gemm`'s `gather`, among `operands`), `factor` a packed matrix's fp32 scales
+    broadcast against its output (`formats.scale_factor`, an NVFP4 matrix's tensor scale): one a row's, one
+    a column's, one an entry's or one for all; with `groups` (the group sizes of the output's rows), one a
+    group's (`[groups]`) or one a group's column (`[groups, width]`), which each row takes from its group
+    where the product and its pullback read it (`_per_row`), no row's saved. `owed` is a power of two the
+    product owes besides (an NVFP4 decode's, `bits.NVFP4_OWED`), applied with the factor in its one
+    rounding (`owed_exactly`), never folded into a factor it would carry past fp32's largest (a tensor scale
+    of 2**122 under the decode's 2**8) or below its normals. `least`, the least magnitude of a nonzero
+    coefficient of the decoded matrix (`prepared`'s). Its transpose is the plain one, the cotangent times its
+    factor through `run`'s pullback, wherever that holds it: finite, and every nonzero product of a row's
+    route at least the plain transpose's least (`plain_least`); where it does not (a product past fp32's
+    largest, or one its bf16 parts or fp32's normals lose), the exact one (`_Transpose.moved`): each
+    product `cotangent * factor` and each
     coefficient of the decoded matrix (`prepared(*wide_operands)`, its depth its axis -2) cut into integer
     slices on grids of their own, each pair of slices multiplied by a bf16 GEMM whose fp32 sums are exact
     integers (`wide`, the transpose over the rows `run` reads, a route each where gathered), the sums kept
@@ -37,21 +47,49 @@ def factored(run: Callable, operands: tuple, factor: jax.Array, rows: jax.Array,
     product overflows or flushes, so a scale of 2**126 under cotangents that cancel pulls back their
     remainder, a subnormal one among them. A checked `shard_map`'s devices sum a cotangent only they vary
     over before its pullback, and their partials after."""
-    if jnp.ndim(factor) and jnp.shape(factor)[-1] != 1:
-        return scaled_exactly(run(rows.astype(jnp.bfloat16), *operands), factor)
+    raised = round(math.log2(owed))
+    if owed != 2.0 ** raised or raised < 0:
+        raise ValueError(f"a product's owed factor is a power of two of at least 1, not {owed}")
     transpose = _Transpose(run, rows.shape, rows.dtype, frozenset(jax.typeof(rows).mat.varying),
-                           explicit_spec(rows), wide, prepared or (lambda *each: each))
+                           explicit_spec(rows), wide, prepared or (lambda *each: each), raised,
+                           plain_least(least))
 
     def apply(residuals, moving):
-        scale, ran, _ = residuals
-        return scaled_exactly(run(moving.astype(jnp.bfloat16), *ran), scale)
+        scale, sizes, ran, _ = residuals
+        product = run(moving.astype(jnp.bfloat16), *ran)
+        return owed_exactly(product, _per_row(scale, sizes, product.shape[0]), raised)
 
     def pullback(residuals, cotangent):
-        scale, ran, routed = residuals
-        return transpose.declared(cotangent.astype(jnp.float32), scale.astype(jnp.float32), ran, routed
-                                  ).astype(rows.dtype)
+        scale, sizes, ran, routed = residuals
+        scale = _per_row(scale, sizes, cotangent.shape[0]).astype(jnp.float32)
+        return transpose.paired(ran, routed, (cotangent.astype(jnp.float32),), (scale,)).astype(rows.dtype)
 
-    return generation.linear_map(apply, pullback, (factor, operands, (gather, wide_operands)), rows)
+    # An Explicit placement of the rows kept as a residual of no rows (`rows[:0]`, no memory): an eager
+    # pullback's allocations and transfers take its concrete devices (`_zeros`, `_placed`).
+    anchor = None if transpose.placed is None else jax.lax.stop_gradient(rows[:0])
+    routed = (gather, wide_operands, anchor)
+    return generation.linear_map(apply, pullback, (factor, groups, operands, routed), rows)
+
+
+def plain_least(least: float) -> int:
+    """The least binade of a nonzero scaled cotangent the plain transpose holds, its matrix's least nonzero
+    coefficient `least`: every bit of it, its least a bf16 part may carry (`gemm._bf16_parts`, 23 binades
+    below its own), times that coefficient a normal float32, which a flushing platform keeps, so neither its
+    parts nor its products lose any of it (train 1409's review: a column scale of 2**-142 made every route's
+    2**-134, which its bf16 parts dropped, and the depth's normal 2**-125 read 0; a cancelling pair's
+    residual's product, 2**-141, flushed): -85 for an NVFP4 matrix's 2**-18, -103 for a ternary one's 1."""
+    return (jnp.finfo(jnp.float32).minexp + jnp.finfo(jnp.float32).nmant
+            - math.floor(math.log2(least)))
+
+
+def _per_row(factor: jax.Array, groups: jax.Array | None, rows: int) -> jax.Array:
+    """`factor` as `rows` output rows take it: as it is without `groups`; with them, each row its group's
+    (`side_axes.at_rows`, the one group-to-row mapping): `[groups]` a row's, `[rows, 1]`; `[groups, width]`
+    a row's columns', `[rows, width]`."""
+    if groups is None:
+        return factor
+    each = factor if jnp.ndim(factor) == 2 else factor[:, None]
+    return side_axes.at_rows(each, (side_axes.GROUPS, 'columns'), groups, rows)
 
 
 FACTOR_RAISE = 62
@@ -91,44 +129,16 @@ def int8_epilogue(product: jax.Array, peak: jax.Array, factor: jax.Array, shift:
     return flushing(software, native, product, peak, factor, jnp.asarray(shift, jnp.int32))
 
 
-def _held_apart(x: jax.Array) -> tuple[jax.Array, jax.Array]:
-    """An fp32 `x` as its signed significand in `[1, 2)` and its binary exponent, one read of its bits
-    (`_decoded`); a zero, an infinity or a NaN as it is, exponent 0."""
-    significand, exponent, finite = _decoded(x)
-    return jnp.where(finite, significand, x), jnp.where(finite, exponent, 0).astype(jnp.int32)
-
-
 def lowered_product(left: jax.Array, right: jax.Array, k: jax.Array | int) -> jax.Array:
-    """`left * right * 2**-k` (fp32 operands, `k` int32 at least 0, broadcast) rounded once to nearest even in
-    fp32, however far below its least normal, whatever the platform flushes: each operand's significand in
-    `[1, 2)` read from its bits (`_held_apart`, a subnormal's normalized), their product formed exactly
-    into a rounded product and its residual (`precision.two_product`, every part of it a normal float32),
-    its exponents carried apart and the product rounded once at its own place, the residual deciding a tie
-    (`float_bits.rounded_binary`'s `tail`); a zero, an infinity or a NaN multiplied as IEEE's."""
-    left, right = jnp.broadcast_arrays(jnp.asarray(left, jnp.float32), jnp.asarray(right, jnp.float32))
-    (left, left_exponent), (right, right_exponent) = _held_apart(left), _held_apart(right)
-    high, low = precision.two_product(left, right)
-    _, sign, biased, fraction = float_bits.raw_fields(high)
-    biased = biased.astype(jnp.int32)
-    significand = jnp.where(biased > 0, fraction | np.uint32(0x800000), fraction)
-    exponent = jnp.maximum(biased, 1) - 150 + left_exponent + right_exponent - k
-    # The exact product's residual decides a tie at the lowered place, so it rounds once.
-    tail = jnp.where(low == 0, 0, jnp.where((low > 0) == (high > 0), 1, -1)).astype(jnp.int32)
-    top = biased == 0xFF
-    return float_bits.rounded_binary(sign, significand, exponent, jnp.float32, tail=tail,
-                                     last=jnp.maximum(exponent, -149), infinite=top & (fraction == 0),
-                                     nan=top & (fraction != 0))
+    """`left * right * 2**-k` (fp32 operands, `k` int32 either sign) rounded once to nearest even in fp32,
+    however far below its least normal, whatever the platform flushes (`float_bits.owed_product`)."""
+    k = jnp.clip(k, -float_bits.EXPONENT_REACH, float_bits.EXPONENT_REACH)
+    return float_bits.owed_product(jnp.asarray(left, jnp.float32), right, -k)
 
 
-def _scaled_value(product: jax.Array, factor: jax.Array) -> jax.Array:
-    product, factor = jnp.broadcast_arrays(product.astype(jnp.float32), jnp.asarray(factor, jnp.float32))
-    return flushing(lambda product, factor: lowered_product(product, factor, 0), jnp.multiply, product,
-                    factor)
-
-
-def _linear_scaled(tangent: jax.Array, factor: jax.Array) -> jax.Array:
-    """`tangent * factor` rounded once as `scaled_exactly` rounds it (a subnormal factor's product formed
-    among the normals on a flushing platform, `lowered_product`: `2**126 * 2**-127` is 0.5, row 13703),
+def _linear_scaled(tangent: jax.Array, factor: jax.Array, raised: int = 0) -> jax.Array:
+    """`tangent * factor * 2**raised` rounded once as `owed_exactly` rounds it (a subnormal factor's product
+    formed among the normals on a flushing platform, `lowered_product`: `2**126 * 2**-127` is 0.5, row 13703),
     linear in `tangent`, its transpose the cotangent times the same factor alike (`generation.linear_map`),
     its derivative in `factor` `scaled_exactly`'s own (the mixed term a higher order meets). The moving
     operand is widened to fp32 before it is broadcast to the factor's shape and made to vary where it does,
@@ -137,15 +147,13 @@ def _linear_scaled(tangent: jax.Array, factor: jax.Array) -> jax.Array:
     0.5, not the 0 of each term rounded first)."""
 
     def apply(factor, moving):
-        return scaled_exactly(moving, factor)
+        return owed_exactly(moving, factor, raised)
 
     def pullback(factor, cotangent):
         # Placed as the moving operand is on an Explicit mesh (a replicated tangent's cotangent gathered from
-        # a split scale's product), as the plain multiply's transpose places it.
-        pulled = scaled_exactly(cotangent.astype(jnp.float32), factor)
-        if placed.mesh.explicit_axes and jax.typeof(pulled).sharding.spec != placed.spec:
-            pulled = jax.sharding.reshard(pulled, placed.spec)
-        return pulled
+        # a split scale's product), as the plain multiply's transpose places it: by its type's sharding
+        # itself, which no mesh context need hold (train 1426's review).
+        return _placed(owed_exactly(cotangent.astype(jnp.float32), factor, raised), placed)
 
     factor = jnp.asarray(factor, jnp.float32)
     wide = jnp.asarray(tangent).astype(jnp.float32)
@@ -155,25 +163,76 @@ def _linear_scaled(tangent: jax.Array, factor: jax.Array) -> jax.Array:
     return generation.linear_map(apply, pullback, factor, moving)
 
 
-def _scaled_tangent(primals, tangents):
+def _scaled_value(raised: int, product: jax.Array, factor: jax.Array) -> jax.Array:
+    """`owed_exactly`'s value: where the platform flushes subnormals (`flushing`), `lowered_product`'s one
+    rounding, the owed power of two its exponent's, so a subnormal factor or result survives (no multiply of
+    a subnormal, which such a platform flushes: a packed matrix's scale of `2**-127`, row 13340; a tensor
+    scale of 2**-126 whose product is 2**-129, train 1403's review); elsewhere `owed_native`'s."""
+    product, factor = jnp.broadcast_arrays(product.astype(jnp.float32), jnp.asarray(factor, jnp.float32))
+
+    def software(product, factor):
+        return lowered_product(product, factor, -raised)
+
+    return flushing(software, functools.partial(owed_native, raised=raised), product, factor)
+
+
+def owed_native(product: jax.Array, factor: jax.Array, *, raised: int) -> jax.Array:
+    """`owed_exactly`'s value where the platform keeps subnormals (CUDA's float32): the plain multiply, the
+    factor and the owed power of two one multiplier where that is finite (a subnormal factor raised
+    exactly), else the product times the factor, rounded once, then times the power of two, exact: no
+    nonzero float32 times a factor of 2**(128 - raised) or more falls below the normals, where it rounds. A
+    power past fp32's (`raised` 128 or more, which no float32 multiplier holds: train 1450's review) is
+    `lowered_product`'s one rounding in integer arithmetic."""
+    product, factor = jnp.broadcast_arrays(product, jnp.asarray(factor, product.dtype))
+    if not raised:
+        return product * factor
+    if raised > jnp.finfo(jnp.float32).maxexp - 1:
+        return lowered_product(product, factor, -raised)
+    power = np.float32(2.0 ** raised)
+    whole = factor * power
+    together = jnp.isfinite(whole) | ~jnp.isfinite(factor)
+    return product * jnp.where(together, whole, factor) * jnp.where(together, np.float32(1), power)
+
+
+def _scaled_tangent(raised: int, primals, tangents):
     (product, factor), (d_product, d_factor) = primals, tangents
-    value = scaled_exactly(product, factor)
+    value = _scaled(raised, product, factor)
     # Each perturbed operand's term alone (`_Transpose.tangent`'s rule): a factor held still meets no
-    # cotangent of its own, so an infinite one gives no NaN, nor an absent term a lost negative zero; the
-    # product's term range-safe in a subnormal factor (`_linear_scaled`).
-    terms = [*(() if isinstance(d_product, SymbolicZero) else (_linear_scaled(d_product, factor),)),
-             *(() if isinstance(d_factor, SymbolicZero) else (product.astype(jnp.float32) * d_factor,))]
+    # cotangent of its own, so an infinite one gives no NaN, nor an absent term a lost negative zero; each
+    # term linear in its direction (`_linear_scaled`, its transpose the other operand times the cotangent:
+    # train 1426's review, the factor's term through the value's bit reading had none), the product's range-
+    # safe in a subnormal factor, the factor's owed its power of two exactly where it is.
+    wide = product.astype(jnp.float32)
+    terms = [*(() if isinstance(d_product, SymbolicZero) else (_linear_scaled(d_product, factor, raised),)),
+             *(() if isinstance(d_factor, SymbolicZero) else
+               (_linear_scaled(d_factor, wide, raised) if raised else wide * d_factor,))]
     if not terms:
         return value, jnp.zeros_like(value)
     return value, jnp.broadcast_to(functools.reduce(jnp.add, terms), value.shape)
 
 
-scaled_exactly = contracted("test_a_ternary_weight_product_holds_every_order")(
-    declared_tangent(KernelGlue(), _scaled_value, _scaled_tangent, symbolic_zeros=True))
-"""`product * factor` in fp32 as IEEE's multiply rounds it, however small the factor or the result: where the
-platform flushes subnormals (`flushing`), `lowered_product`'s one rounding, so a subnormal scale (a packed
-matrix's `2**-127`) or a subnormal result survives (row 13340); elsewhere the plain multiply. Its derivative
-is the plain product's, each perturbed operand's term alone."""
+_scaled = contracted("test_a_ternary_weight_product_holds_every_order")(
+    declared_tangent(KernelGlue(), _scaled_value, _scaled_tangent, nondiff_argnums=(0,), symbolic_zeros=True))
+
+
+def scaled_exactly(product: jax.Array, factor: jax.Array) -> jax.Array:
+    """`product * factor` in fp32 as IEEE's multiply rounds it, however small the factor or the result
+    (`owed_exactly` owing nothing): a subnormal scale (a packed matrix's `2**-127`) or a subnormal result
+    survives a platform that flushes them (row 13340). Its derivative is the plain product's, each perturbed
+    operand's term alone."""
+    return _scaled(0, product, factor)
+
+
+def owed_exactly(product: jax.Array, factor: jax.Array, raised: int) -> jax.Array:
+    """`product * factor * 2**raised` (`raised` a whole exponent of at least 0, an owed power of two's: an
+    NVFP4 decode's, `bits.NVFP4_OWED`) in fp32 rounded once, however large or small the factor, the result
+    or the power (`_scaled_value`): natively the factor and the power one multiplier only where the power is
+    a float32's (`raised` at most 127) and their product finite, else the product times the factor rounded
+    once before the power; past 127, or where the platform flushes subnormals, rounded once in integer
+    arithmetic (`lowered_product`; train 1403's review: an NVFP4 column's tensor scale of 2**122 under its
+    decode's 2**8 overflowed a folded multiplier; train 1450's: 2**128 overflowed the power itself). Its
+    derivative is the plain product's, each perturbed operand's term alone."""
+    return _scaled(raised, product, factor)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -184,16 +243,23 @@ class _Transpose:
     shape: tuple
     dtype: jnp.dtype
     held: frozenset
-    placed: jax.sharding.NamedSharding | jax.sharding.PartitionSpec | None
+    placed: jax.sharding.NamedSharding | None
     wide: Callable
     prepared: Callable
+    raised: int
+    least: int
 
     @functools.cached_property
-    def declared(self) -> Callable:
-        """`value`, its derivative the plain transpose's (`tangent`)."""
+    def paired(self) -> Callable:
+        """`paired(ran, routed, cotangents, scales)`: the transpose of the sum of the pairs' products
+        (`combined`), its derivative each perturbed operand's term a pair of the same exact sum
+        (`_paired_tangent`)."""
         return contracted("test_a_ternary_weight_product_holds_every_order")(
-            declared_tangent(KernelGlue(), self.value, self.tangent, nondiff_argnums=(2, 3),
+            declared_tangent(KernelGlue(), self._paired_value, self._paired_tangent, nondiff_argnums=(0, 1),
                              symbolic_zeros=True))
+
+    def _paired_value(self, ran, routed, cotangents, scales):
+        return self.combined(tuple(zip(cotangents, scales, strict=True)), ran, routed)
 
     def operand_axes(self, ran) -> frozenset:
         """The manual axes the product's own operands, its rows and its matrix's, vary over."""
@@ -206,15 +272,19 @@ class _Transpose:
         return tuple(sorted(frozenset().union(*(jax.typeof(value).mat.varying for value in values))
                             - self.operand_axes(ran)))
 
-    def pulled(self, near, ran) -> tuple:
+    def pulled(self, near, ran, anchor) -> tuple:
         """`near` pulled back through `run`, summed first over the axes it alone varies over, and the axes the
-        partial varies over and the rows do not (each device's to sum after)."""
+        partial varies over and the rows do not (each device's to sum after); its seed made where the rows
+        are (`anchor`, theirs of no rows)."""
         before = self.alone(ran, near)
         near = jax.lax.psum(near, before) if before else near
         # The pullback at zeros typed as the rows are: placed, and varying as the cotangent's partials do.
-        zeros = jnp.zeros(self.shape, jnp.bfloat16, out_sharding=self.placed)
+        zeros = _zeros(self.shape, jnp.bfloat16, self.placed, anchor)
         at = varying_like(zeros, near, *jax.tree.leaves(ran))
-        (partial,) = jax.vjp(lambda each: self.run(each, *ran), at)[1](near)
+        out, pull = jax.vjp(lambda each: self.run(each, *ran), at)
+        # The cotangent typed as the product is (a split column scale's product split as it is not: train
+        # 1426's review's column-split witness).
+        (partial,) = pull(_placed(near, jax.typeof(out).sharding, out))
         partial = partial.astype(jnp.float32)
         return partial, tuple(sorted(jax.typeof(partial).mat.varying - self.held))
 
@@ -222,91 +292,134 @@ class _Transpose:
     def summed(partial, excess):
         return jax.lax.psum(partial, excess) if excess else partial
 
-    def value(self, cotangent, scale, ran, routed):
-        """The plain transpose, the cotangent times its factor pulled back; where an entry of it is not
-        finite, the moved one's (`moved`)."""
-        plain = self.summed(*self.pulled(scaled_exactly(cotangent, scale), ran))
-        if 0 in self.shape or cotangent.shape[-1] == 0:
+    def combined(self, pairs, ran, routed):
+        """The transpose of the sum of `pairs`' products, each a cotangent times its factor and the owed power
+        of two: the plain one, their products summed and pulled back; where an entry of it is not finite,
+        or a row's product is smaller than it holds (`lost`), the moved one's (`moved`), every pair's
+        products in its one exact sum. Pairs whose products lie within the plain range and cancel past
+        fp32's resolution of them (`2**-102` and `-(2**-102)(1 + 2**-46)`) round as the plain products'
+        sum, as fp32's own would (train 1437's review): a check of every pair's cancellation would cost the
+        plain path its zero overhead."""
+        near = functools.reduce(jnp.add, [owed_exactly(cotangent, scale, self.raised)
+                                          for cotangent, scale in pairs])
+        plain = self.summed(*self.pulled(near, ran, routed[2]))
+        if 0 in self.shape or near.shape[-1] == 0:
             # No row, no depth or no column: the plain transpose's empty or zero gradient is the whole of it.
             return plain
+        # Summed before its pullback where the operands are every device's; the axes its partials will vary
+        # over that the rows do not, the operands', from types alone.
+        before = self.alone(ran, *(value for pair in pairs for value in pair))
+        excess = tuple(sorted(self.operand_axes(ran) - self.held))
+        kept = jnp.isfinite(plain) & ~self.lost(pairs, routed[0], tuple(sorted({*before, *excess})))
 
         def moved():
-            # Summed before its pullback where the operands are every device's; the axes its partials will
-            # vary over that the rows do not, the operands', from types alone.
-            before = self.alone(ran, cotangent, scale)
-            excess = tuple(sorted(self.operand_axes(ran) - self.held))
-            rescued = self.moved(cotangent, scale, routed, before, excess, plain)
-            return jnp.where(jnp.isfinite(plain), plain, rescued)
+            rescued = self.moved(pairs, routed, before, excess, plain)
+            return jnp.where(kept, plain, rescued)
 
-        # The moved pullback where the plain one is not finite alone: each device of a sum decides alike,
-        # the plain transpose summed over its axes.
-        return jax.lax.cond(jnp.all(jnp.isfinite(plain)), lambda: plain, moved)
+        # The moved pullback where the plain one does not hold every row: each device of a sum decides alike,
+        # the plain transpose summed over its axes and the range shared over them.
+        return jax.lax.cond(jnp.all(kept), lambda: plain, moved)
 
-    def moved(self, cotangent, scale, routed, before, excess, plain):
-        """The exact rescue (`factored`): every product `cotangent * scale` as fp32 forms it, from its
+    def lost(self, pairs, gather, shared) -> jax.Array:
+        """Whether the plain transpose loses a row's range below (`[rows, 1]`): a route of it a pair's product
+        of which, finite and nonzero, falls below the least binade it holds (`least`), read from its
+        operands' binades and the owed power of two (a subnormal's from its bits, where a process flushes
+        them; a product that rounds to zero by its operands'), every device that sums it (`shared`)
+        deciding alike."""
+        small = functools.reduce(jnp.logical_or,
+                                 [self._small(cotangent, scale) for cotangent, scale in pairs])
+        small = jnp.any(small, axis=-1, keepdims=True).astype(jnp.int32)
+        if gather is not None:
+            token = varying_like(jnp.zeros((self.shape[0], 1), jnp.int32), small, gather)
+            small = token.at[gather].max(small)
+        return _shared_max(small, shared) > 0
+
+    def _small(self, cotangent, scale) -> jax.Array:
+        # A product of finite nonzero operands whose binades and the owed power of two sum below `least`.
+        e_c = float_bits.binade_of(cotangent)
+        e_f = float_bits.binade_of(jnp.broadcast_to(jnp.asarray(scale, jnp.float32), cotangent.shape))
+        counted = (e_c > -1024) & (e_c < 128) & (e_f > -1024) & (e_f < 128)
+        return counted & (e_c + e_f + self.raised < self.least)
+
+    def moved(self, pairs, routed, before, excess, plain):
+        """The exact rescue (`factored`): every pair's product `cotangent * scale` as fp32 forms it, from its
         operands' significands and binades, on a grid of `FACTORED_SLICE` bits a row (its token's, gathered,
         shared by every device that sums it), and the decoded matrix on its own; each slice pair's
         product summed by a bf16 GEMM whose fp32 sums are integers below 2**24, so exact
         (`FACTORED_WIDTH` columns a chunk), into int32 limbs, its routes' limbs added into their tokens and
         the devices' over the axes they sum, carried, then rounded once (`_rounded`). No product
         overflows, flushes or rounds before the one rounding, within a route, across its routes, or across
-        its devices: what cancels anywhere leaves its exact remainder (rows 1464, 12392, 12403). A product
-        not finite (a cotangent, factor or coefficient not finite) is left out of the sums and counted by
-        its class (`_nonfinite_terms`): a coordinate meeting a NaN or both infinities is NaN, else one
-        infinity's sign."""
-        gather, wide_operands = routed
-        f = jnp.broadcast_to(scale, cotangent.shape)
-        bits, binade, negative = _products(cotangent, f)
-        grid, token_grid = self.grids(binade, gather, tuple(sorted({*before, *excess})))
+        its devices: what cancels in it leaves its exact remainder (rows 1464, 12392, 12403); it runs where
+        the plain transpose cannot hold a row (`combined`'s reach). A product not finite (a cotangent,
+        factor or coefficient not finite) is left out of the sums and counted by its class
+        (`_nonfinite_terms`): a coordinate meeting a NaN or both infinities is NaN, else one infinity's
+        sign."""
+        gather, wide_operands, _ = routed
+        cotangents = tuple(cotangent for cotangent, _ in pairs)
+        factors = tuple(jnp.broadcast_to(scale, cotangent.shape) for cotangent, scale in pairs)
+        products = [_products(cotangent, f) for cotangent, f in zip(cotangents, factors, strict=True)]
+        # One grid a row for every pair's products, which meet in its one sum.
+        grid, token_grid = self.grids(functools.reduce(jnp.maximum, [binade for _, _, binade, _ in products]),
+                                      gather, tuple(sorted({*before, *excess})))
         matrix, *rest = self.prepared(*wide_operands)
-        # The finite coefficients' grid: one not finite is IEEE's (`value`), outside the exact sums.
+        # The finite coefficients' grid: one not finite is IEEE's (`combined`), outside the exact sums.
         held = jnp.abs(matrix.astype(jnp.float32))
         held = jnp.where(jnp.isfinite(held), held, 0.0)
         matrix_top = jnp.max(jnp.where(held > 0, float_bits.binade_of(held), -1024), initial=-1024)
         matrix_grid = _edge(_shared_max(matrix_top, tuple(sorted(jax.typeof(matrix_top).mat.varying
                                                                    - self.held))))
-        depth, width = self.shape[-1], cotangent.shape[-1]
-        self.bounded(cotangent, f, gather, matrix, rest)
+        depth = self.shape[-1]
+        columns_a_chunk = self.column_chunk(cotangents, factors, gather, matrix, rest)
         chunk = math.gcd(depth, FACTORED_DEPTH)
-        columns_a_chunk = max(d for d in range(1, min(width, FACTORED_WIDTH) + 1) if width % d == 0)
-        # The products' limbs below `FACTORED_HEADROOM` limbs over them that their sums carry into.
-        limbs_count = FACTORED_HEADROOM + FACTORED_ROW_SLICES + FACTORED_MATRIX_SLICES - 1
 
         def pulled_chunk(at, out):
             columns = jax.lax.dynamic_slice_in_dim(matrix, at * chunk, chunk, axis=-2)
-            limbs = varying_like(_limbs(limbs_count, cotangent, chunk), cotangent, columns,
+            # Placed as the GEMMs' sums are: rows the cotangents' and factors', the mesh any operand's.
+            rows, read = (*cotangents, *factors), (*cotangents, *factors, matrix)
+            limbs = varying_like(_limbs(FACTORED_LIMBS, rows, chunk, read), *cotangents, columns,
                                  *jax.tree.leaves(rest), grid)
             # Whether a coordinate sums a product of each class not finite (`_nonfinite_terms`).
-            classes = varying_like(_limbs(3, cotangent, chunk), cotangent, f, columns, *jax.tree.leaves(rest))
+            classes = varying_like(_limbs(3, rows, chunk, read), *cotangents, *factors, columns,
+                                   *jax.tree.leaves(rest))
 
             def width_chunk(index, carry):
                 limbs, classes = carry
                 start = index * columns_a_chunk
-                row_bits, row_binade, row_negative = (
-                    jax.lax.dynamic_slice_in_dim(v, start, columns_a_chunk, axis=-1)
-                    for v in (bits, binade, negative))
-                block = jax.lax.dynamic_slice_in_dim(columns, start, columns_a_chunk, axis=-1)
-                row_values = jax.lax.dynamic_slice_in_dim(cotangent, start, columns_a_chunk, axis=-1)
-                row_factors = jax.lax.dynamic_slice_in_dim(f, start, columns_a_chunk, axis=-1)
-                classes = self.classified(classes, row_values, row_factors, block, rest)
+
+                def cut(value):
+                    return jax.lax.dynamic_slice_in_dim(value, start, columns_a_chunk, axis=-1)
+
+                block = cut(columns)
+                for cotangent, f in zip(cotangents, factors, strict=True):
+                    classes = self.classified(classes, cut(cotangent), cut(f), block, rest)
                 block = jnp.where(jnp.isfinite(block), block, jnp.zeros_like(block))
                 block_abs = jnp.abs(block.astype(jnp.float32))
                 block_binade = jnp.where(block_abs > 0, float_bits.binade_of(block_abs), -1024)
                 block_bits = (block_abs * float_bits.exact_power2(jnp.clip(7 - block_binade, -126, 127))
                               ).astype(jnp.int32)
                 block_negative = block < 0
+                # Each pair's products sliced against the one block's coefficients, into the same limbs.
+                for high, low, binade, negative in products:
+                    limbs = pair_slices(limbs, cut(high), cut(low), cut(binade), cut(negative), block_bits,
+                                        block_binade, block_negative)
+                return limbs, classes
 
+            def pair_slices(limbs, row_high, row_low, row_binade, row_negative, block_bits, block_binade,
+                            block_negative):
                 def row_slice(i, limbs):
-                    a = _slice(row_bits, row_binade - 23, grid, i, row_negative)
+                    # The exact product's digit: its halves' bits are disjoint, so their pieces add to it.
+                    a = (_slice(row_high, row_binade - 23, grid, i, row_negative)
+                         + _slice(row_low, row_binade - 47, grid, i, row_negative))
 
                     def taken(limbs):
                         def matrix_slice(j, limbs):
                             b = _slice(block_bits, block_binade - 7, matrix_grid, j, block_negative)
 
                             def multiplied(limbs):
-                                summed = self.wide(a, b, *rest).astype(jnp.int32)
                                 t = FACTORED_HEADROOM + i + j
                                 at_t = jax.lax.dynamic_index_in_dim(limbs, t, 0, keepdims=False)
+                                # Placed as the limb it adds into (the GEMM's own placement its operands').
+                                summed = _placed_like(self.wide(a, b, *rest).astype(jnp.int32), at_t)
                                 return jax.lax.dynamic_update_index_in_dim(limbs, at_t + summed, t, 0)
 
                             return jax.lax.cond(jnp.any(b != 0), multiplied, lambda limbs: limbs, limbs)
@@ -315,29 +428,36 @@ class _Transpose:
 
                     return jax.lax.cond(jnp.any(a != 0), taken, lambda limbs: limbs, limbs)
 
-                return _carried(jax.lax.fori_loop(0, FACTORED_ROW_SLICES, row_slice, limbs)), classes
+                return _carried(jax.lax.fori_loop(0, FACTORED_ROW_SLICES, row_slice, limbs))
 
-            limbs, classes = jax.lax.fori_loop(0, width // columns_a_chunk, width_chunk, (limbs, classes))
+            limbs, classes = jax.lax.fori_loop(0, cotangents[0].shape[-1] // columns_a_chunk, width_chunk,
+                                               (limbs, classes))
             # In fp32 from here, each 0 or 1: a sum over routes and devices is positive where any is.
             classes = classes.astype(jnp.float32)
             if gather is not None:
-                routed_limbs = varying_like(_limbs(limbs_count, plain, chunk), limbs, gather)
+                routed_limbs = varying_like(_limbs(FACTORED_LIMBS, (plain,), chunk, (plain, limbs)), limbs,
+                                            gather)
                 limbs = _routed(routed_limbs, gather, limbs)
-                tokens = varying_like(_limbs(3, plain, chunk).astype(jnp.float32), classes, gather)
+                tokens = varying_like(_limbs(3, (plain,), chunk, (plain, classes)).astype(jnp.float32),
+                                      classes, gather)
                 classes = tokens.at[:, gather].add(classes)
             over = tuple(sorted(jax.typeof(limbs).mat.varying - self.held))
             if over:
                 limbs = _carried(jax.lax.psum(limbs, over))
             if counted := tuple(sorted(jax.typeof(classes).mat.varying - self.held)):
                 classes = jax.lax.psum(classes, counted)
-            # The first limb's unit: 2**(grid + matrix grid - 2 slices + the headroom's slices).
-            summed = _rounded(limbs, token_grid + matrix_grid + FACTORED_SLICE * (FACTORED_HEADROOM - 2))
-            return jax.lax.dynamic_update_slice_in_dim(out, varying_like(_ieee(classes, summed), out),
-                                                       at * chunk, axis=-1)
+            # The first limb's unit: 2**(grid + matrix grid - 2 slices + the headroom's slices), times the
+            # owed power of two, which moves the unit alone.
+            summed = _rounded(limbs, token_grid + matrix_grid + FACTORED_SLICE * (FACTORED_HEADROOM - 2)
+                              + self.raised)
+            # Its chunk placed as the gradient it is written into (a replicated one's mesh too).
+            written = _placed_like(varying_like(_ieee(classes, summed), out), out)
+            return jax.lax.dynamic_update_slice_in_dim(out, written, at * chunk, axis=-1)
 
         # The rows' gradient, typed and placed as the plain transpose's is (its devices' sums taken, as each
-        # chunk's are), so the loop's carry and the branch it returns from keep its type.
-        out = varying_like(jnp.zeros(self.shape, jnp.float32, out_sharding=explicit_spec(plain)), plain)
+        # chunk's are; on its Explicit mesh where it has one, replicated too), so the loop's carry and the
+        # branch it returns from keep its type.
+        out = varying_like(_zeros(self.shape, jnp.float32, explicit_placement(jax.typeof(plain))), plain)
         return jax.lax.fori_loop(0, depth // chunk, pulled_chunk, out)
 
     def grids(self, binade, gather, shared) -> tuple[jax.Array, jax.Array]:
@@ -353,21 +473,36 @@ class _Transpose:
         token_grid = _edge(_shared_max(token, tuple(sorted(jax.typeof(token).mat.varying - self.held))))
         return token_grid[gather], token_grid
 
-    def bounded(self, cotangent, factor, gather, matrix, rest) -> None:
+    def column_chunk(self, cotangents, factors, gather, matrix, rest) -> int:
+        """The cotangents' columns a chunk the rescue's GEMMs sum at once, whole on every device an Explicit
+        axis splits any operand it cuts by its columns over (cotangents, factors, the matrix): a multiple of
+        their splits' count, at most `FACTORED_WIDTH`, so its GEMMs' sums stay exact (`bounded` refusing a
+        split past it; train 1426's review: 3073 of 6146 columns split over two devices was unplaceable)."""
+        split = math.lcm(*(_column_split(each) for each in (*cotangents, *factors, matrix)))
+        self.bounded(cotangents, factors, gather, matrix, rest, split)
+        width = cotangents[0].shape[-1]
+        return split * max(d for d in range(1, FACTORED_WIDTH // split + 1) if (width // split) % d == 0)
+
+    def bounded(self, cotangents, factors, gather, matrix, rest, split: int) -> None:
         """Refuse a rescue whose sums its int32 limbs cannot hold: more devices summing its digits than
         `FACTORED_FAN_IN`, or more products (columns, routes, devices) than `FACTORED_REACH`. Its devices
         are every axis a contributing operand varies over the rows do not, of which each psum sums those
         its own sums vary over."""
-        leaves = jax.tree.leaves((cotangent, factor, gather, matrix, rest))
+        leaves = jax.tree.leaves((cotangents, factors, gather, matrix, rest))
         varying = frozenset().union(*(jax.typeof(leaf).mat.varying for leaf in leaves))
         devices = math.prod(jax.lax.axis_size(axis) for axis in sorted(varying - self.held))
         if devices > FACTORED_FAN_IN:
             raise ValueError(f"the exact rescue sums {devices} devices' digits, past the {FACTORED_FAN_IN} "
                              f"whose sum int32 holds")
-        width = cotangent.shape[-1]
+        if split > FACTORED_WIDTH:
+            raise ValueError(f"the exact rescue's column chunks, whole on each of the {split} devices that "
+                             f"split its columns, pass the {FACTORED_WIDTH} whose GEMM sums fp32 holds "
+                             "exactly")
+        # Each pair's products a column of the sum (`combined`).
+        width = cotangents[0].shape[-1] * len(cotangents)
         if width * (1 if gather is None else gather.shape[0]) * devices >= FACTORED_REACH:
-            raise ValueError(f"the exact rescue's sums of {width} columns, {cotangent.shape[0]} routes and "
-                             f"{devices} devices could pass its leading limb's int32 ({FACTORED_REACH})")
+            raise ValueError(f"the exact rescue's sums of {width} columns, {cotangents[0].shape[0]} routes "
+                             f"and {devices} devices could pass its leading limb's int32 ({FACTORED_REACH})")
 
     def classified(self, classes, cotangent, factor, coefficients, rest):
         """`classes` (int32 0 or 1: whether each coordinate's products include one of a class not finite,
@@ -388,16 +523,101 @@ class _Transpose:
                                                     for v in (cotangent, factor, coefficients)])
         return jax.lax.cond(special, counted, lambda classes: classes, classes)
 
-    def tangent(self, ran, routed, primals, tangents):
-        """The plain transpose's derivative, `cotangent * scale` pulled back, every term of a perturbed
-        operand alone (a scale held still meets no cotangent of its own: an infinite one is no NaN)."""
-        (cotangent, scale), (d_cotangent, d_scale) = primals, tangents
-        terms = [*(() if isinstance(d_cotangent, SymbolicZero) else (_linear_scaled(d_cotangent, scale),)),
-                 *(() if isinstance(d_scale, SymbolicZero) else (cotangent * d_scale,))]
-        value = self.declared(cotangent, scale, ran, routed)
-        if not terms:
+    def _paired_tangent(self, ran, routed, primals, tangents):
+        """The pair sum's derivative: bilinear in each pair's cotangent and scale, each perturbed operand's
+        term (a held one's none: an infinite scale meets no cotangent of its own) a pair of one exact sum
+        (`paired` again, so terms that cancel keep their remainder and every order's derivative is
+        declared: train 1409's review, 2**126 and 2**125 at scales 4 and 8 and 1 at scale 1 read NaN; a
+        cotangent's and a scale's terms each infinite read NaN), as a linear map of the moving tangents
+        whose residuals carry every array it reads and whose transpose is the product's own (`adjoint`),
+        so reverse mode over it takes no branch of the moving tangents'."""
+        cotangents, scales = primals
+        value = self.paired(ran, routed, cotangents, scales)
+        # Each live tangent's slot: a pair whose cotangent moves (its scale held), or whose scale does.
+        slots = [(moves_cotangent, index)
+                 for index, pair in enumerate(zip(*tangents, strict=True))
+                 for moves_cotangent, tangent in zip((True, False), pair, strict=True)
+                 if not isinstance(tangent, SymbolicZero)]
+        if not slots:
             return value, jnp.zeros_like(value)
-        return value, self.summed(*self.pulled(functools.reduce(jnp.add, terms), ran))
+        moving = tuple(tangents[0 if cotangent else 1][index] for cotangent, index in slots)
+
+        def apply(residuals, moving):
+            ran, routed, cotangents, scales = residuals
+            pairs = [(each, scales[index]) if cotangent else (cotangents[index], each)
+                     for (cotangent, index), each in zip(slots, moving, strict=True)]
+            return self.paired(ran, routed, *map(tuple, zip(*pairs, strict=True)))
+
+        def adjoint(residuals, rows):
+            # The rows' map's transpose: their product (`factored`'s apply) times the held operand of each
+            # slot's pair, summed to the moving one's shape and typed and placed as it is.
+            ran, _, cotangents, scales = residuals
+            product = self.run(rows.astype(jnp.bfloat16), *ran).astype(jnp.float32)
+            terms = []
+            for cotangent, index in slots:
+                held, like = (scales[index], cotangents[index]) if cotangent else (cotangents[index],
+                                                                                    scales[index])
+                terms.append(_placed_like(generation.unbroadcast(owed_exactly(product, held, self.raised),
+                                                                 jnp.shape(like)), like))
+            return tuple(terms)
+
+        # Its joint derivative in the moving tangents and the residuals the declared pair sum's own
+        # (`traced_tangent`: terms that cancel across them meet in one sum), its type the primal's.
+        return value, generation.linear_map(apply, adjoint, (ran, routed, cotangents, scales), moving,
+                                            out_aval=jax.typeof(value).to_tangent_aval(), traced_tangent=True)
+
+
+def _placed_like(value: jax.Array, like: jax.Array) -> jax.Array:
+    """`value` typed as `like` is (a cotangent of a broadcast product of it, a chunk of the gradient it is):
+    summed over each manual axis it varies over that `like` does not (`sharding.summed_to`), and placed as
+    `like`'s type places it on an Explicit mesh, a replicated one's too (`sharding.explicit_placement`),
+    by its sharding itself, so no mesh context need hold it."""
+    return _placed(summed_to(value, like), jax.typeof(like).sharding)
+
+
+def _placed(value: jax.Array, sharding: jax.sharding.NamedSharding, anchor=None) -> jax.Array:
+    """`value` placed at `sharding` (a type's), resharded under that sharding's own abstract mesh, so its
+    placement holds outside any mesh context (train 1426's review: one made at a type's sharding outside the
+    context lost it), or run eagerly (`value` and `anchor` concrete arrays), put on `anchor`'s own devices;
+    where `sharding` has no Explicit mesh and `value` does, whole on its own (a meshless cotangent's
+    operand: as JAX's type check reads either)."""
+    held = jax.typeof(value).sharding
+    if sharding.mesh.explicit_axes:
+        if held == sharding:
+            return value
+        # A concrete value (an uncommitted one's single device too) beside a concrete anchor: run eagerly.
+        mesh = _concrete_mesh(anchor)
+        if not isinstance(value, Tracer) and mesh is not None:
+            return jax.device_put(value, jax.sharding.NamedSharding(mesh, sharding.spec))
+        with jax.sharding.use_abstract_mesh(sharding.mesh.abstract_mesh):
+            return jax.sharding.reshard(value, sharding.spec)
+    if held.mesh.explicit_axes and any(entry is not None for entry in held.spec):
+        with jax.sharding.use_abstract_mesh(held.mesh.abstract_mesh):
+            return jax.sharding.reshard(value, jax.sharding.PartitionSpec())
+    return value
+
+
+
+def _concrete_mesh(value) -> jax.sharding.Mesh | None:
+    """The named mesh of devices placing `value` where it is an array this process holds, run eagerly; None
+    for a tracer, None, or an array placed otherwise."""
+    if value is None or isinstance(value, Tracer):
+        return None
+    sharding = value.sharding
+    held = sharding.mesh if isinstance(sharding, jax.sharding.NamedSharding) else None
+    return held if isinstance(held, jax.sharding.Mesh) else None
+
+
+def _zeros(shape: tuple, dtype, sharding: jax.sharding.NamedSharding | None, anchor=None) -> jax.Array:
+    """Zeros of `shape` placed at `sharding` (a type's, or None), made under its own abstract mesh, so their
+    placement holds outside any mesh context (`_placed`); run eagerly (`anchor` a concrete array), made on
+    the devices of `anchor`'s own mesh, which an eager allocation needs (train 1426's review)."""
+    if sharding is None or not sharding.mesh.explicit_axes:
+        return jnp.zeros(shape, dtype)
+    if (mesh := _concrete_mesh(anchor)) is not None:
+        return jnp.zeros(shape, dtype, device=jax.sharding.NamedSharding(mesh, sharding.spec))
+    with jax.sharding.use_abstract_mesh(sharding.mesh.abstract_mesh):
+        return jnp.zeros(shape, dtype, out_sharding=sharding.spec)
 
 
 FACTORED_SLICE = 6
@@ -416,9 +636,10 @@ FACTORED_HEADROOM = 6
 """Limbs above the products' first its sums carry into (36 bits): a sum over 2**19 columns, every route of a
 token and every device of a mesh, each product below the two grids' tops."""
 
-FACTORED_ROW_SLICES = 97
-"""A row's slices: its products' binades span at most a cotangent's and a factor's ranges multiplied (-298
-to 254, the largest product's grid rounded up a slice) and 24 bits of significand below them."""
+FACTORED_ROW_SLICES = 101
+"""A row's slices: its products' binades span at most a cotangent's and a factor's ranges multiplied (-297
+to 255, the largest product's grid rounded up a slice) and the 48 bits of their significands' exact
+product below them (`_products`)."""
 
 FACTORED_FAN_IN = 1 << 24
 """The carried limbs (each digit below `2**FACTORED_SLICE`) the exact rescue adds into one before carrying:
@@ -433,14 +654,36 @@ FACTORED_MATRIX_SLICES = 6
 """A decoded packed matrix's slices on its grid: 36 bits, past any format's span (NVFP4's E2M1 codes times
 E4M3 block scales, 21 binades and 5 bits; ternary's one)."""
 
+FACTORED_LIMBS = FACTORED_HEADROOM + FACTORED_ROW_SLICES + FACTORED_MATRIX_SLICES - 1
+"""The exact rescue's int32 limbs a sum: its products' (a row slice's by a matrix slice's), below
+`FACTORED_HEADROOM` limbs over them that their sums carry into."""
 
-def _limbs(count: int, like: jax.Array, columns: int) -> jax.Array:
-    """`count` int32 limbs of zeros, each `like`'s rows by `columns`, its rows placed as `like`'s are where an
-    Explicit axis splits them (a chunk's sums, which the GEMMs' row-placed products add into)."""
-    placed = explicit_spec(like)
-    rows = None if placed is None else placed.spec[0]
-    return jnp.zeros((count, like.shape[0], columns), jnp.int32, out_sharding=None if placed is None else
-                     jax.sharding.NamedSharding(placed.mesh, jax.sharding.PartitionSpec(None, rows, None)))
+
+def _column_split(cotangent: jax.Array) -> int:
+    """The devices an Explicit axis splits `cotangent`'s columns (its last axis) over: 1 where none does."""
+    placed = explicit_spec(cotangent)
+    if placed is None or placed.spec[-1] is None:
+        return 1
+    entry = placed.spec[-1]
+    return math.prod(placed.mesh.shape[axis] for axis in ((entry,) if isinstance(entry, str) else entry))
+
+
+def _limbs(count: int, operands: tuple, columns: int, read: tuple) -> jax.Array:
+    """`count` int32 limbs of zeros, each the `operands`' rows by `columns`, placed as the products the sums
+    `read` make are (a chunk's sums, which they add into): on the Explicit mesh of any array they read (a
+    replicated one's, or a matrix split by the columns its GEMMs contract, too), their rows as the first of
+    `operands` an Explicit axis splits by its rows places them, as JAX places an elementwise product of a
+    split and an unsplit operand, else whole (train 1409's review: placed by one operand alone, an
+    unplaced cotangent's limbs met a split factor's products, row 13986; train 1426's: meshless beside a
+    column split's sums)."""
+    placements = [explicit_placement(jax.typeof(each)) for each in read]
+    meshes = [placed.mesh for placed in placements if placed is not None]
+    specs = [explicit_spec(each) for each in operands]
+    rows = next((placed.spec[0] for placed in specs if placed is not None and placed.spec[0] is not None),
+                None)
+    spec = None if not meshes else jax.sharding.NamedSharding(
+        meshes[0], jax.sharding.PartitionSpec(None, rows, None))
+    return _zeros((count, operands[0].shape[0], columns), jnp.int32, spec)
 
 
 def _routed(tokens: jax.Array, gather: jax.Array, limbs: jax.Array,
@@ -483,17 +726,23 @@ def _nonfinite_terms(cotangent: jax.Array, factor: jax.Array, matrix: jax.Array)
     return positive, negative, invalid
 
 
-def _products(cotangent: jax.Array, factor: jax.Array) -> tuple[jax.Array, jax.Array, jax.Array]:
-    """Each product `cotangent * factor` as fp32 forms it, from its operands' bits (a subnormal's kept where
-    a process flushes subnormal operands): its significand normalized into [1, 2) as a 24-bit integer at
-    2**23, its binade (-1024 where it is zero or not finite) and its sign."""
-    e_c, e_f = (float_bits.binade_of(v) for v in (cotangent, factor))
-    counted = (e_c > -1024) & (e_c < 128) & (e_f > -1024) & (e_f < 128)
-    product = jnp.where(counted, _significand(cotangent) * _significand(factor), 0.0)
-    doubled = jnp.abs(product) >= 2
-    product = jnp.where(doubled, product * 0.5, product)
-    binade = jnp.where(counted, e_c + e_f + doubled.astype(e_c.dtype), -1024)
-    return (jnp.abs(product) * 2.0 ** 23).astype(jnp.int32), binade, product < 0
+def _products(cotangent: jax.Array, factor: jax.Array) -> tuple[jax.Array, ...]:
+    """Each product `cotangent * factor` exactly, from its operands' bits (a subnormal's kept where a process
+    flushes subnormal operands): its two significands' 48-bit product as two 24-bit integers, the high one
+    at `2**23` of the product's binade over [1, 4) and the low one 24 binades below it, that binade (-1024
+    where the product is zero or not finite) and its sign. No bit of it rounds (train 1426's review: a
+    significand product rounded in fp32 lost the residual two cancelling products leave, 2**-46 of
+    them)."""
+    def parts(x):
+        sign, biased, fraction, normalized, exponent = float_bits.float_bits(x.astype(jnp.float32))
+        held = ((biased != 0) | (fraction != 0)) & (biased != 0xFF)
+        return (1 << 23) | normalized, exponent, sign != 0, held
+
+    (m_c, e_c, s_c, c_held), (m_f, e_f, s_f, f_held) = parts(cotangent), parts(factor)
+    counted = c_held & f_held
+    high, low = float_bits.significand_product(m_c, m_f)
+    return (jnp.where(counted, high, 0), jnp.where(counted, low, 0),
+            jnp.where(counted, e_c + e_f + 1, -1024), s_c != s_f)
 
 
 def _present(held: jax.Array, counts: jax.Array) -> jax.Array:
@@ -595,18 +844,3 @@ def _rounded(limbs: jax.Array, unit: jax.Array) -> jax.Array:
 
 FACTORED_LEAD = 6
 """The digits of `FACTORED_SLICE` bits the first limb's int32 magnitude is read as (`_rounded`): 36 bits."""
-
-
-def _significand(x: jax.Array) -> jax.Array:
-    """A finite fp32 `x`'s significand with its sign, in [1, 2), from its bits (`float_bits`): a subnormal's
-    normalized, read where a process flushes subnormal operands; 0 for zero."""
-    return _decoded(x)[0]
-
-
-def _decoded(x: jax.Array) -> tuple[jax.Array, jax.Array, jax.Array]:
-    """`_significand`'s significand of an fp32 `x` (0 for zero), its binary exponent and whether it is finite
-    and nonzero, from one read of its bits (`float_bits.float_bits`)."""
-    sign, biased, fraction, normalized, exponent = float_bits.float_bits(x.astype(jnp.float32))
-    one = jax.lax.bitcast_convert_type(sign | (127 << 23) | normalized, jnp.float32)
-    zero = (biased == 0) & (fraction == 0)
-    return jnp.where(zero, 0.0, one), exponent, ~zero & (biased != 0xFF)

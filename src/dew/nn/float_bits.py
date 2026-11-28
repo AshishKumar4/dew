@@ -153,6 +153,68 @@ def raised_exactly(x: jax.Array, k: jax.Array) -> jax.Array:
     return jnp.where(kept, x.astype(jnp.float32), jax.lax.bitcast_convert_type(raised, jnp.float32))
 
 
+def significand_product(left: jax.Array, right: jax.Array) -> tuple[jax.Array, jax.Array]:
+    """The exact product of two significands under `2**24` each (int32 or uint32, the halves of their own
+    dtype), as its high and low 24-bit halves (`high * 2**24 + low`), from 12-bit pieces whose every partial
+    product and sum stays under `2**31`: the one exact float32 significand multiply, an owed product's
+    (`owed_product`) and a GEMM rescue's (`templates.gemm.factored`)."""
+    a_l, b_l, a_r, b_r = left >> 12, left & 0xFFF, right >> 12, right & 0xFFF
+    middle = a_l * b_r + b_l * a_r
+    low = b_l * b_r + ((middle & 0xFFF) << 12)
+    high = a_l * a_r + (middle >> 12) + (low >> 24)
+    return high, low & 0xFFFFFF
+
+
+def owed_product(left: jax.Array, right: jax.Array, owed: jax.Array | int) -> jax.Array:
+    """`left * right * 2**owed` (`left` bfloat16 or float32, `right` float32, broadcast; `owed` int32, either
+    sign, past `EXPONENT_REACH` held at it) rounded once to nearest even into float32, however far below the
+    least normal, and past the largest finite an infinity of the product's sign: the exact product of their
+    significands formed in integer arithmetic on their fields, its exponents carried apart, and rounded once
+    (`rounded_binary`), so a process whose float32 arithmetic flushes a subnormal operand or result (XLA's
+    CPU, row 4023) still returns it; a non-finite operand's product IEEE's, read off the operands' bits.
+    The one rule of an owed scaled product: a stored bfloat16 decode times its scale (`dew.quantization`'s,
+    row 11807) and a GEMM product times its factor (`templates.gemm.factored`'s). A float32 multiply
+    rounds a result below the least normal twice where its operands' significands are wider than the
+    result's (to 24 bits, then to the subnormal's), or flushes it: 1.5 times 0.25 times 2^-126 (1 + 7
+    2^-23) is 3145730.625 2^-149, `0x00300003` once rounded, `0x00300002` twice; and the owed power applied
+    to a factor alone first overflows a finite product's (row 11740's review). A bfloat16 operand's product
+    (8 bits times 24) is under 2^32 whole; a float32's, of significands normalized (a subnormal's leading
+    bit raised to the implicit bit's place: train 1437's review), is carried as its 32 leading bits and the
+    sign of the rest, which decides a tie alone (`rounded_binary`'s `tail`)."""
+    left, right = jnp.broadcast_arrays(left, jnp.asarray(right, jnp.float32))
+    owed = jnp.clip(owed, -EXPONENT_REACH, EXPONENT_REACH)
+    _, sign_l, biased_l, fraction_l = (field.astype(jnp.uint32) for field in raw_fields(left))
+    _, sign_r, biased_r, fraction_r = raw_fields(right)
+    if jnp.finfo(left.dtype).nmant <= 8:
+        # Each a whole significand times a power of two, a subnormal's at the least normal's exponent.
+        whole_l = jnp.where(biased_l > 0, fraction_l | np.uint32(1 << 7), fraction_l)
+        whole_r = jnp.where(biased_r > 0, fraction_r | np.uint32(1 << 23), fraction_r)
+        significand, tail = whole_l * whole_r, 0
+        exponent = ((jnp.maximum(biased_l.astype(jnp.int32), 1) - 134)
+                    + (jnp.maximum(biased_r.astype(jnp.int32), 1) - 150) + owed)
+    else:
+        # Each significand normalized to 24 bits at its binade (`float_bits`); their 48-bit product's 32
+        # leading bits kept and the rest's sign its tail.
+        (*_, normalized_l, exponent_l), (*_, normalized_r, exponent_r) = float_bits(left), float_bits(right)
+        whole_l, whole_r = (np.uint32(1 << 23) | each.astype(jnp.uint32)
+                            for each in (normalized_l, normalized_r))
+        high, low = significand_product(whole_l, whole_r)
+        significand = (high << np.uint32(8)) | (low >> np.uint32(16))
+        tail = ((low & np.uint32(0xFFFF)) != 0).astype(jnp.int32)
+        exponent = exponent_l.astype(jnp.int32) + exponent_r.astype(jnp.int32) - 46 + 16 + owed
+    special_l = np.uint32((1 << jnp.finfo(left.dtype).nexp) - 1)
+    infinite_l = (biased_l == special_l) & (fraction_l == 0)
+    infinite_r = (biased_r == 0xFF) & (fraction_r == 0)
+    zero_l, zero_r = (biased_l == 0) & (fraction_l == 0), (biased_r == 0) & (fraction_r == 0)
+    nan = (((biased_l == special_l) & ~infinite_l) | ((biased_r == 0xFF) & ~infinite_r)
+           | (infinite_l & zero_r) | (infinite_r & zero_l))
+    # A zero operand's product a zero of the product's sign (its normalized significand reads one).
+    significand = jnp.where(zero_l | zero_r, np.uint32(0), significand)
+    sign = (sign_l << np.uint32(32 - jnp.finfo(left.dtype).bits)) ^ sign_r
+    return rounded_binary(sign, significand, exponent, jnp.float32, tail=tail,
+                          infinite=infinite_l | infinite_r, nan=nan)
+
+
 def rounded_float32(sign: jax.Array, significand: jax.Array, exponent: jax.Array, *,
                     last: jax.Array | None = None, infinite: jax.Array | bool = False,
                     nan: jax.Array | bool = False) -> jax.Array:

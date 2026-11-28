@@ -16,6 +16,7 @@ from reference_error import assert_as_exact, with_gradients
 
 from dew.nn.kernels import formats, gemm, generation, projections
 from dew.nn.kernels.templates import product
+from dew.quantization import packed_values
 
 SEEDS = 8
 
@@ -38,7 +39,7 @@ def test_an_nvfp4_operand_is_its_values_again_and_its_stored_matrix():
     stored = formats.NvFp4.quantized(spread(1, (64, 256), product.NVFP4.depth).T)
     read = formats.NvFp4Block.of(stored)
     np.testing.assert_array_equal(np.asarray(read.decoded()[0].T * read.scale),
-                                  np.asarray(stored.decoded().astype(jnp.float32) * stored.factor))
+                                  np.asarray(packed_values(stored)))
 
 
 def _operands(seed: int, shapes: tuple) -> tuple:

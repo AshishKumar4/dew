@@ -129,12 +129,15 @@ def test_a_packed_flows_exact_banks_are_its_banks_values():
     host in float64, where their product is exact, bit for bit."""
     from flax.traverse_util import flatten_dict
 
+    from dew.algebra.bits import NVFP4_OWED
     from dew.nn.kernels.formats import NvFp4
     from dew.quantization import QUANTIZATION
 
     flow = next(flow for flow in model_flows.FLOWS if isinstance(flow, model_flows.Flow) and flow.packed)
     drawn = flow.taken(flow.model.init(jax.random.key(0), *flow.initialized()))
-    banks = flatten_dict(dict(drawn[QUANTIZATION]), is_leaf=lambda _, leaf: isinstance(leaf, NvFp4))
+    banks = {path: leaf for path, leaf in flatten_dict(
+        dict(drawn[QUANTIZATION]), is_leaf=lambda _, leaf: isinstance(leaf, NvFp4)).items()
+        if isinstance(leaf, NvFp4)}
 
     def widened(leaf):
         # As check 1 widens a draw's floats for its truth.
@@ -145,8 +148,8 @@ def test_a_packed_flows_exact_banks_are_its_banks_values():
         assert exact.keys() == banks.keys()
         for path, matrix in exact.items():
             bank = banks[path]
-            want = (np.asarray(bank.decoded(), np.float64)
-                    * np.asarray(bank.factor, np.float64)[..., None, None])
+            want = (np.asarray(bank.decoded(), np.float64) * NVFP4_OWED
+                    * np.asarray(bank.scale, np.float64)[..., None, None])
             assert matrix.dtype == jnp.float64
             np.testing.assert_array_equal(np.asarray(matrix), want)
 
