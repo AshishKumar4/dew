@@ -2,7 +2,8 @@
 read of one generation's derivations as the catalogue writes them and of the union a release stages
 (tools/ci/package.sh), by Python alone, as the package's build environment holds no Dew.
 
-    python tools/derived_weight.py DIRECTORY   the directory's entries weighed, refused past the limit
+    python tools/derived_weight.py DIRECTORY   the directory's entries weighed, its {"entries", "mib",
+                                               "limit_mib"} on stdout; exit 1 past the limit
 """
 
 import json
@@ -23,4 +24,7 @@ def weighed(entries: list[Path], limit_mib: float = LIMIT_MIB) -> int:
 
 if __name__ == "__main__":
     found = sorted(Path(sys.argv[1]).glob("*.json"))
-    print(json.dumps({"entries": len(found), "mib": round(weighed(found) / 2**20, 3)}))
+    weight = sum(entry.stat().st_size for entry in found)
+    print(json.dumps({"entries": len(found), "mib": round(weight / 2**20, 3), "limit_mib": LIMIT_MIB}),
+          flush=True)
+    weighed(found)
