@@ -875,6 +875,16 @@ def test_a_launch_an_assumed_device_chose_is_timed_on_no_other_gpu(monkeypatch):
     assert tuning._settle([call], measurer=measurer) == 1
     assert (measured, stored) == ([], [])
     assert tuning._chosen_for(attached, here) and not tuning._chosen_for(assumed, here)
+    # One key traced both under the assumption and as this host runs it, in either order: timed once, at the
+    # call the attached GPU's placement chose, its placement the one compiled at, both calls' legality read
+    # (Train 1484's review: an assumed call traced first kept its peer from being timed).
+    for order in ((assumed, attached), (attached, assumed)):
+        measured.clear()
+        both = _facted_calls(*order)
+        assert len({tuning._distinct_key(call) for call in both}) == 1
+        tuning._settle(both, measurer=measurer)
+        [timed] = measured
+        assert [call.placed for call in timed[2]] == [attached, assumed]
     # A process's measurer is the device that runs the timing, whatever GPU the caller's mesh names: under an
     # RTX 4080's abstract mesh, this host's own device's facts, which that mesh's launches were not chosen
     # for (the k01-69 review: the mesh's catalog facts were read as the attached GPU's).
