@@ -217,6 +217,11 @@ def held_by_stage(sites: Sequence[DecoderBank]) -> Iterator[None]:
         _STAGE_SITES.reset(token)
 
 
+def stage_sites() -> tuple[DecoderBank, ...]:
+    """The stage-local sites in context (`held_by_stage`), empty outside a stage-local run."""
+    return _STAGE_SITES.get()
+
+
 def stacked_layers(path: tuple) -> tuple[tuple[tuple, ...], int] | None:
     """The paths of the stored layers a leaf at `path` stacks, in its rows' order, and how many of
     its leading dimensions stack them, where `path` is a stage-local run's under the sites in
@@ -753,6 +758,21 @@ def explicit_placement(aval: ShapedArray) -> jax.sharding.NamedSharding | None:
     return sharding if explicit else None
 
 
+def leading_row(stacked, index: tuple[int, ...]):
+    """`stacked`'s row at `index`, the indices of its leading (stacked) axes, taken where it lies: a JAX array
+    an Explicit axis splits (a stage-local store's leaf on its `stage` axis, `StageLocal`) placed as its own
+    spec past those axes, as JAX's gather of an Explicit dimension needs stated (`out_sharding`); any other
+    array, a host array or a leaf read as it is read (`quantization.PackedDecode`, `StoredRow`) among them,
+    by its own indexing."""
+    if not index:
+        return stacked
+    placed = explicit_spec(stacked) if isinstance(stacked, jax.Array) else None
+    if placed is None:
+        return stacked[index]
+    past = jax.sharding.PartitionSpec(*tuple(placed.spec)[len(index):])
+    return stacked.at[index].get(out_sharding=jax.sharding.NamedSharding(placed.mesh, past))
+
+
 def explicit_spec(x: jax.Array, trailing: int = 0) -> jax.sharding.NamedSharding | None:
     """Where `x`'s type places it, over its dimensions and `trailing` more
     left whole, when an Explicit axis splits it (`MeshSpec.explicit`); None
@@ -942,6 +962,24 @@ def summed_to(cotangent, operand):
         return cotangent
     axes = excess_axes(cotangent, operand)
     return jax.lax.psum(cotangent, axes) if axes else cotangent
+
+
+def summed_like(cotangent, like):
+    """`cotangent` as the cotangent of `like`: summed over the axes `like` broadcast across (its missing
+    leading axes, and each of size one where `cotangent`'s is not) in the cotangent's dtype promoted with
+    `like`'s and fp32, never narrowed, so every sum is taken wide; over each manual mesh axis it varies over
+    that `like` does not (`summed_to`: a replicated operand's cotangent each shard's partial of a split one's,
+    which JAX's accumulator refuses unsummed); and placed as `like` is where an Explicit axis places it, as
+    `templates.gemm.factored` places its rows' (a replicated value's cotangent left split as a split
+    exponent's was; train 1398's review). One transpose's reduction for every declared rule that broadcasts
+    an operand (`dew.algebra.scan`'s, `dew.nn.kernels.titans`'; train 1430's review)."""
+    summing = jnp.promote_types(jnp.promote_types(cotangent.dtype, like.dtype), jnp.float32)
+    extra = cotangent.ndim - like.ndim
+    axes = (*range(extra), *(extra + axis for axis, size in enumerate(like.shape)
+                              if size == 1 and cotangent.shape[extra + axis] != 1))
+    total = summed_to(jnp.sum(cotangent.astype(summing), axis=axes).reshape(like.shape), like)
+    placed = explicit_placement(jax.typeof(like))
+    return total if placed is None else jax.sharding.reshard(total, placed)
 
 
 def checked() -> bool:

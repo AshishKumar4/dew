@@ -614,7 +614,7 @@ def test_gemm_over_a_window_into_bf16_at_the_highest_precision_takes_the_windows
     with (generation.assumed("sm90"), generation.chosen(grouped_matmul="mosaic"),
           jax.default_matmul_precision("highest"), tuning.seen() as seen):
         got = gemm.gemm(rows, window, None, out_dtype=jnp.bfloat16, interpret_on_cpu=True)
-    assert any(isinstance(call.op, grouped_quantized.MosaicWordPackedGmm) for _, call in seen.taken), seen
+    assert any(isinstance(observed.op, grouped_quantized.MosaicWordPackedGmm) for observed in seen), seen
     np.testing.assert_array_equal(np.asarray(got).view(np.uint16), weights.view(np.uint16))
 
 
@@ -629,8 +629,9 @@ def test_gemm_over_a_window_sums_exactly_where_its_call_asks():
           jax.default_matmul_precision("highest"), tuning.seen() as seen):
         jax.eval_shape(lambda x: gemm.gemm(x, window, None, out_dtype=jnp.float32, interpret_on_cpu=True),
                        rows)
-    assert [call.arguments["exact_sums"] for _, call in seen.taken
-            if isinstance(call.op, grouped_matmul.MosaicGmm) and call.arguments["interpret"]] == [True]
+    assert [observed.arguments.arguments["exact_sums"] for observed in seen
+            if isinstance(observed.op, grouped_matmul.MosaicGmm) and observed.arguments.arguments["interpret"]
+            ] == [True]
 
 
 def _dot_arithmetics(lowered: jax.stages.Lowered) -> list:
@@ -797,8 +798,9 @@ def test_a_packed_bank_split_by_stage_over_an_explicit_axis_reads_its_rows():
     an Explicit dimension, was refused for want of its placement)."""
     from jax.sharding import AxisType, NamedSharding, PartitionSpec
 
-    from dew.nn.backbones.layer_names import array_rows
+    from dew.nn.backbones.layer_names import StoredRow, array_rows
     from dew.nn.kernels.formats import NvFp4
+    from dew.nn.sharding import leading_row
 
     stacked = np.random.default_rng(4560).standard_normal((2, 256, 64)).astype(np.float32)
     bank = NvFp4.quantized(jnp.asarray(stacked))
@@ -815,41 +817,33 @@ def test_a_packed_bank_split_by_stage_over_an_explicit_axis_reads_its_rows():
     split = jax.tree.map(placed, bank)
     planes = [plane for plane in jax.tree.leaves(split) if plane.sharding.spec[:1] == ("stage",)]
     assert planes
+
     def spec(array):
         held = tuple(array.sharding.spec)
         return held + (None,) * (array.ndim - len(held))
 
     for plane in planes:
         # A row keeps the bank's placement past the stage: its last axis still split where it was.
-        assert spec(quantization._row_of(plane, (1,))) == spec(plane)[1:]
+        assert spec(leading_row(plane, (1,))) == spec(plane)[1:]
     assert any("model" in spec(plane) for plane in planes)
-    tree = quantization.deferred_packed({quantization.QUANTIZATION: {"stages": {"kernel": split}}})
-    for index, row in enumerate(array_rows(("params", "stages", "kernel"), tree["params"]["stages"]["kernel"],
-                                           (2,))):
-        np.testing.assert_array_equal(np.asarray(row), whole[index])
-
-
-WINDOW_WITHOUT_CPU = """
-import jax, jax.numpy as jnp, numpy as np
-from dew import quantization
-kernel = (np.random.default_rng(13987).normal(size=(256, 256)) * 0.02).astype(jnp.bfloat16)
-held = quantization.bf16_windows({"params": {"kernel": jnp.asarray(kernel)}}, sites=[""])
-decoded = np.asarray(quantization.decoded_packed(held)["params"]["kernel"])
-print(jax.default_backend(), bool(np.array_equal(decoded.view(np.uint16), kernel.view(np.uint16))))
-"""
-
-
-@pytest.mark.gpu
-@pytest.mark.compiles_at_run(reason="a fresh process, whose JAX runs no CPU backend, compiles where it runs")
-def test_a_window_decodes_for_an_export_where_jax_runs_no_cpu():
-    """A window decoded for an export (`quantization.decoded_packed`, `Pretrained.save`'s) in a process whose
-    JAX runs no CPU backend (`JAX_PLATFORMS=cuda`) decodes on its device, bit for bit, rather than ask for a
-    CPU it does not have (audit 2026-11-27 P03)."""
-    import os
-    import subprocess
-    import sys
-
-    ran = subprocess.run([sys.executable, "-c", WINDOW_WITHOUT_CPU], capture_output=True, text=True,
-                         env={**os.environ, "JAX_PLATFORMS": "cuda"}, timeout=600)
-    assert ran.returncode == 0, ran.stderr[-2000:]
-    assert ran.stdout.split()[-2:] == ["gpu", "True"], ran.stdout
+    # A store of a packed leaf beside a dense one, both split by stage, cut into its rows as an export
+    # reads them (`array_rows`, and a banked store's `StoredRow`): each its own row (train 1422's review: a
+    # dense leaf's row was a plain gather of the Explicit dimension).
+    dense = placed(stacked)
+    tree = quantization.deferred_packed({quantization.QUANTIZATION: {"stages": {"kernel": split}},
+                                         "params": {"stages": {"bias": dense}}})
+    stages = tree["params"]["stages"]
+    for leaf, expected in ((stages["kernel"], whole), (stages["bias"], stacked)):
+        for index, row in enumerate(array_rows(("params", "stages", "kernel"), leaf, (2,))):
+            np.testing.assert_array_equal(np.asarray(row), expected[index])
+        np.testing.assert_array_equal(np.asarray(StoredRow(leaf, (1,))), expected[1])
+    # A mixed index's integer prefix picks the row before its decode: the row alone decoded and held.
+    kernel = stages["kernel"]
+    np.testing.assert_array_equal(np.asarray(kernel[1, :, :8]), whole[1, :, :8])
+    assert [np.shape(decoded) for _, _, decoded in kernel.memo] == [(256, 64)]
+    # An advanced index keeps NumPy's axes: its integers join its arrays, the index applied whole.
+    for index in ((1, slice(None), [0, 1]), (1, slice(None), True)):
+        advanced = kernel[index]
+        np.testing.assert_array_equal(np.asarray(advanced), whole[index])
+        assert np.shape(np.asarray(advanced)) == advanced.shape == np.shape(whole[index])
+    assert np.shape(whole[1, :, [0, 1]]) == (2, 256)

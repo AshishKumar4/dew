@@ -1,0 +1,14 @@
+HloModule m, entry_computation_layout={(f32[2]{0}, f32[2]{0})->f32[2]{0}}
+
+body {
+  a = f32[2]{0} parameter(0)
+  b = f32[2]{0} parameter(1)
+  t = (f32[2]{0}, f32[2]{0}) tuple(a, b)
+  ROOT g = f32[2]{0} get-tuple-element(t), index=0, metadata={op_name="jit(f)/transpose(jvp(g))/get"}
+}
+
+ENTRY e {
+  x = f32[2]{0} parameter(0)
+  y = f32[2]{0} parameter(1)
+  ROOT f = f32[2]{0} fusion(x, y), kind=kLoop, calls=body
+}

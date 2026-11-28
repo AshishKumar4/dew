@@ -11,6 +11,7 @@ import os
 from pathlib import Path
 
 import jax
+from kernel_compile import lowered_for
 from process_support import serve_mode, worker_parser
 from test_tuning import launched, operands, step
 
@@ -23,7 +24,8 @@ def mode_settle(args) -> list:
     jax.config.update("jax_compilation_cache_dir", str(args.cache / f"process{args.process_id}"))
     held = args.picks / f"process{args.process_id}.json"
     if held.exists():
-        path = _cache.kernel_picks_path(jax.devices()[0].device_kind)
+        # The store of the GPU its launches are chosen for, an sm80's: the step is lowered for one.
+        path = _cache.kernel_picks_path(generation.gpu_target("sm80").device_kind)
         os.makedirs(os.path.dirname(path), exist_ok=True)
         write_atomically(path, held.read_text())
     rows = [int(count) for count in args.rows.split(",")]
@@ -31,9 +33,12 @@ def mode_settle(args) -> list:
     def program():
         return [step()(*operands(count)) for count in rows]
 
+    # Lowered for an sm80 GPU as `tune` reads a step (its reach), the trace of its last lowering kept: the
+    # configs each launch took once the pool settled them.
+    traces: list = []
     with generation.assumed("sm80"):
-        tuned = tuning.tune(lambda: jax.make_jaxpr(program)())
-    return launched(tuned)
+        tuning.tune(lambda: lowered_for(program, (), "sm80", kept=traces))
+    return launched(traces[-1].jaxpr)
 
 
 MODES = {"settle": mode_settle}

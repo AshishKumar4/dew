@@ -221,9 +221,9 @@ def test_a_decode_sized_nvfp4_product_swapped_is_its_decoded_product():
     with generation.assumed("sm90"):
         with tuning.seen() as launches:
             product(rows, "packed")
-        assert all(launch.legal(ba, config, generation.gpu_target())
-                   for (op, _), (config, ba) in zip(launches, launches.taken, strict=True)
-                   if isinstance(op, grouped_quantized.MosaicPackedGmm)), launches.taken
+        assert all(launch.legal(observed.arguments, observed.config, generation.gpu_target())
+                   for observed in launches
+                   if isinstance(observed.op, grouped_quantized.MosaicPackedGmm)), launches
         with tuning.pinned({grouped_quantized.MosaicPackedGmm: swapped}):
             got = product(rows, "packed")
         want = product(rows, "xla")

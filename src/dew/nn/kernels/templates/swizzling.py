@@ -5,13 +5,19 @@ block (`staged`) and read back from a ref (`swizzle_of`); the copies between sha
 or global memory that read that layout (`copied`, `coalesced`, `copied_swizzle`); and a narrow tile's read
 into an accumulator's column vector (`rows_read`)."""
 
+import contextlib
+import contextvars
 import dataclasses
 import math
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 
+import jax
 from jax import dtypes, numpy as jnp
+from jax._src import core as jax_core
+from jax._src.pallas import core as pallas_core
 from jax._src.pallas.mosaic_gpu import core as plgpu_core
 from jax._src.state import types as state_types
+from jax.experimental import pallas as pl
 from jax.experimental.mosaic.gpu import fragmented_array as mgpu_fragments
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
@@ -161,12 +167,104 @@ def plain(shape: tuple, dtype):
 
 
 def swizzle_of(ref) -> int:
-    """The swizzle, in bytes, a shared-memory ref's rows are staged at (`staged`): 0 where it is staged plain
-    (`UNSWIZZLED`)."""
-    if not isinstance(ref, state_types.TransformedRef):
-        return UNSWIZZLED
-    return max((transform.swizzle for transform in ref.transforms
+    """The swizzle, in bytes, a shared-memory ref's rows are staged at (`staged`, read by `staging_of`): 0
+    where it is staged plain (`UNSWIZZLED`)."""
+    return max((transform.swizzle for transform in staging_of(ref)
                 if isinstance(transform, plgpu_core.UnswizzleRef)), default=UNSWIZZLED)
+
+
+def staging_of(ref) -> tuple[state_types.Transform, ...]:
+    """The transforms `ref` reads its memory through, its allocation's staging undone first (an
+    `UntilingTransform` and an `UnswizzleRef` of a tiled, swizzled block; a ref union's member's after the
+    member's selection, `ExtractAliasedRef`) and then each view's (`.at[]`, a transpose), as JAX 0.12.0
+    states them on a staged ref itself. JAX 0.12.1 hands a body its refs' logical avals alone, their staging
+    a `run_scoped` equation's parameter, so a ref states none of it as it traces: its allocation's staging
+    is the one Dew noted as it allocated it (`run_scoped`, `launches.kernel`'s scratch, `noting`), the views
+    on it composed after; none where Dew noted none."""
+    base, views = ref, ()
+    while isinstance(base, state_types.TransformedRef):
+        base, views = base.ref, (*base.transforms, *views)
+    selected, member = (views[:1], _member(views[0])) if views and _member(views[0]) else ((), None)
+    views = views[len(selected):]
+    noted = (_STAGING.get() or {}).get((id(base), member))
+    if noted is None or noted[0] is not base:
+        return (*selected, *views)
+    staging = noted[1]
+    # A ref that states its staging itself (JAX 0.12.0's) holds it first among its transforms.
+    return (*selected, *(views if views[:len(staging)] == staging else (*staging, *views)))
+
+
+def _member(transform: state_types.Transform) -> tuple[int, int] | None:
+    """The member of a ref union a transform selects (`ExtractAliasedRef`: its group and byte offset), None
+    for any other transform."""
+    if isinstance(transform, plgpu_core.ExtractAliasedRef):
+        return transform.alias_group_idx, transform.offset
+    return None
+
+
+_STAGING: contextvars.ContextVar[Mapping[tuple[int, tuple[int, int] | None],
+                                         tuple[object, tuple[state_types.Transform, ...]]] | None] = (
+    contextvars.ContextVar("dew_staging", default=None))
+"""Each ref an allocation of the trace in progress made (`noting`), by its base ref's identity and the union
+member it is (`_member`, None for a ref of its own), with its base (so its identity is its own while it is
+noted) and its staging's undoing (`staging_of`); none outside any."""
+
+
+@contextlib.contextmanager
+def noting(allocated: Iterable[tuple[object, object]]) -> Iterator[None]:
+    """Within the block, each ref of `allocated`'s `(ref, type)` pairs (a ref and the memory type it was
+    allocated as, `plgpu.SMEM`'s and its kin's; a ref union's each member, as the union hands it out)
+    noted with its type's staging undone (`staging_of`), as JAX 0.12.0's `get_ref_aval` undid it: the block
+    a body's trace, its allocations' refs alive within it, none noted past it."""
+    noted = dict(_STAGING.get() or {})
+    for ref, kind in _members(allocated):
+        # A staged allocation's type alone states transforms (a barrier's, a TPU's, an accumulator's none).
+        if not isinstance(kind, plgpu_core.GPUMemoryRef) or not (transforms := tuple(kind.transforms)):
+            continue
+        base, selected = ref, ()
+        while isinstance(base, state_types.TransformedRef):
+            base, selected = base.ref, (*base.transforms, *selected)
+        member = _member(selected[0]) if selected else None
+        aval = jax_core.ShapedArray(kind.shape, kind.dtype)
+        noted[id(base), member] = base, tuple(pallas_core.undo_transforms(aval, transforms))
+    token = _STAGING.set(noted)
+    try:
+        yield
+    finally:
+        _STAGING.reset(token)
+
+
+def _members(allocated: Iterable[tuple[object, object]]) -> Iterator[tuple[object, object]]:
+    """Each `(ref, type)` of `allocated`, a ref union's each member as the union hands it out (its ref one
+    whose iteration selects its members, `ExtractAliasedRef`, paired with the union's member types in their
+    order)."""
+    for ref, kind in allocated:
+        if not isinstance(kind, plgpu.RefUnion):
+            yield ref, kind
+            continue
+        if not isinstance(ref, jax_core.Tracer):
+            raise TypeError(f"a ref union's allocation is a ref of its members, not {type(ref).__name__}")
+        for group, kinds in zip(list(iter(ref)), kind.refs, strict=True):
+            views = jax.tree.leaves(group, is_leaf=lambda leaf: isinstance(leaf, state_types.TransformedRef))
+            yield from zip(views, jax.tree.leaves(kinds), strict=True)
+
+
+def allocated(refs, kinds) -> list[tuple[object, object]]:
+    """The `(ref, type)` pairs of a body's allocated `refs` and the `kinds` they were allocated as, a ref
+    union one of each (`noting` reads its members)."""
+    return list(zip(jax.tree.leaves(refs), jax.tree.leaves(kinds), strict=True))
+
+
+def run_scoped(body: Callable, *types, collective_axes=(), **kw_types):
+    """`pl.run_scoped(body, *types, collective_axes=collective_axes, **kw_types)`, each ref it allocates
+    noted with its staging while `body` traces (`noting`, `staging_of`)."""
+    def noted(*refs, **kw_refs):
+        pairs = allocated(refs, types) + [pair for name, kind in kw_types.items()
+                                          for pair in allocated(kw_refs[name], kind)]
+        with noting(pairs):
+            return body(*refs, **kw_refs)
+
+    return pl.run_scoped(noted, *types, collective_axes=collective_axes, **kw_types)
 
 
 def staged(shape: tuple, dtype, swizzle: int | None = None):

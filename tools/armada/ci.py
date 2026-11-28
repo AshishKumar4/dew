@@ -2085,7 +2085,7 @@ def gpu_lane(python: str, tests: list[str], out: Path, *, cache: str, processes:
                 # says whatever its own environment does: a GPU node's session grows every job's pool.
                 environ = {"XLA_PYTHON_CLIENT_MEM_FRACTION": str(shares[fits] / total),
                            "XLA_PYTHON_CLIENT_PREALLOCATE": "false" if shares[fits] >= budget else "true",
-                           "OMP_NUM_THREADS": threads}
+                           "OMP_NUM_THREADS": threads, **({} if network else {tier_wire().GPU_TIER: "1"})}
                 file, group, variant = units[fits]
                 running[pool.submit(tested, python, [file], group, verdicts[fits], deadline, cache,
                                     session.GRACE, common,

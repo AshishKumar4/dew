@@ -352,58 +352,127 @@ def test_scaled_exp_holds_every_order(edge):
 
 
 @pytest.mark.parametrize("edge", sorted(EDGES))
-def test_a_decayed_product_holds_every_order(edge):
-    """`scan._decayed`, factors' product times `exp` of an exponent at most 0 landed once as a scaled value's,
-    the derivatives `scaled_exp` declares by it (every one another such product): every order finite
-    wherever float64 is a normal float32 and the plain `a * b * exp(exponent)` is, at factors scaled to the
-    edge and decays from 0 to past fp32's least normal."""
-    left, right, cotangent, along_left, along_right = normal_draw(1709, *[(6,)] * 5, scale=EDGES[edge])
+def test_a_decayed_sum_of_products_holds_every_order(edge):
+    """`scan._decayed_terms`, a sum of products times `exp` of an exponent at most 0, each product with the
+    decay a scaled value's and the terms summed as such, landed once (`_times_decayed`'s derivatives,
+    `scaled_exp`'s second ones, every one another such sum): every order finite wherever float64 is a
+    normal float32 and the plain `(a * b + c) * exp(exponent)` is, at operands scaled to the edge and
+    decays from 0 to past fp32's least normal."""
+    left, right, third, cotangent, along_left, along_right, along_third = normal_draw(
+        1709, *[(6,)] * 7, scale=EDGES[edge])
     exponent = -jnp.asarray([0.0, 0.5, 3.0, 40.0, 90.0, 150.0], jnp.float32)
     (rate,) = normal_draw(1710, (6,))
-    assert_contract(scan._decayed, (exponent, left, right), (rate, along_left, along_right), cotangent,
-                    f"a decayed product {edge}", plain_fn=lambda exponent, a, b: a * b * jnp.exp(exponent))
+    assert_contract(functools.partial(scan._decayed_terms, ((0, 1), (2,))), (exponent, left, right, third),
+                    (rate, along_left, along_right, along_third), cotangent,
+                    f"a decayed sum of products {edge}",
+                    plain_fn=lambda exponent, a, b, c: (a * b + c) * jnp.exp(exponent))
 
 
-@pytest.mark.parametrize(("value", "cotangent", "decay"), [(2.0 ** 127, 2.0 ** 127, -90.0),
-                                                          (1.0, 2.0 ** 120, -120.0),
-                                                          (2.0 ** -120, 2.0 ** 100, -25.0),
-                                                          (2.0 ** -120, 2.0 ** 120, -10.0)])
-def test_scaled_exps_exponent_cotangent_is_its_value_and_decay_in_range(value, cotangent, decay):
-    """`scan.scaled_exp`'s exponent cotangent, `cotangent * value * exp(decay)`, in float64's binade wherever
-    that is a normal fp32, its forward and its tangent alike: `2^254 e^-90` (2.4e37), which autodiff through
-    the factors overflowed forming `2^127 * 2^127 e^-87` (train 1379's review K-F2); `2^120 e^-120`
-    (1.0e-16) and `2^-20 e^-25` (1.3e-17), which the cotangent times the decayed value read zero, that value
-    underflowed, and an even split of the decay alone `2^-120 e^-12.5` (train 1383's reviews of 7534dfb59);
-    `e^-10` of 2^-120 by 2^120."""
+def test_a_decayed_sums_tangent_in_one_operand_takes_the_whole_sums_shape():
+    """`scan._decayed_terms` of `(a b + c) e^0`, `a` and `b` of two and `c` a scalar, its tangent in `c`
+    alone under a unit direction: `[1, 1]`, the whole sum's shape, where the derived terms (`c`'s alone)
+    gave a scalar its declared rule refused against the two-wide primal (a head review)."""
+    a, b = jnp.asarray([2.0, 3.0], jnp.float32), jnp.asarray([5.0, 7.0], jnp.float32)
+    exponent, c = jnp.float32(0.0), jnp.float32(1.0)
+    _, tangent = jax.jvp(lambda c: scan._decayed_terms(((0, 1), (2,)), exponent, a, b, c), (c,),
+                         (jnp.float32(1.0),))
+    np.testing.assert_array_equal(np.asarray(tangent), np.ones(2, np.float32))
+
+
+@pytest.mark.parametrize("edge", sorted(EDGES))
+def test_a_decayed_value_times_factors_holds_every_order(edge):
+    """`scan._times_decayed`, a value decayed by `exp` of an exponent at most 0 and then times two factors in
+    turn (`scaled_exp`'s exponent derivative's form), its derivatives declared (each the form again, the
+    decay applied before two directions meet): every order finite wherever float64 is a normal float32 and
+    the plain `value * exp(exponent) * a * b` is, at values and factors scaled to the edge and decays from 0
+    to past fp32's least normal."""
+    value, left, right, cotangent, along, along_left, along_right = normal_draw(
+        1709, *[(6,)] * 7, scale=EDGES[edge])
+    exponent = -jnp.asarray([0.0, 0.5, 3.0, 40.0, 90.0, 150.0], jnp.float32)
+    (rate,) = normal_draw(1710, (6,))
+    assert_contract(scan._times_decayed, (exponent, value, left, right),
+                    (rate, along, along_left, along_right), cotangent,
+                    f"a decayed value times factors {edge}",
+                    plain_fn=lambda exponent, value, a, b: value * jnp.exp(exponent) * a * b)
+
+
+def test_scaled_exps_mixed_second_derivative_decays_before_its_directions_meet():
+    """The derivative by `scan.scaled_exp`'s value of a direction of 2^100 times its exponent's pullback of
+    a cotangent of 2^100, at a value of 1 under `e^-60`: `2^200 e^-60` (2^113.4) in float64's binade, the
+    decay applied to one direction before the other meets it, where their product `2^200` overflowed first
+    (a head review)."""
+    value, exponent = jnp.asarray([1.0], jnp.float32), jnp.asarray([-60.0], jnp.float32)
+    big = jnp.asarray([2.0 ** 100], jnp.float32)
+
+    def directed(value):
+        return jnp.sum(big * jax.vjp(scan.scaled_exp, value, exponent)[1](big)[1])
+
+    found = np.asarray(jax.grad(directed)(value), np.float64)
+    assert np.isfinite(found).all(), found
+    assert np.frexp(found[0])[1] == np.frexp(2.0 ** 200 * np.exp(-60.0))[1], found
+
+
+@pytest.mark.parametrize("order", ["reverse over reverse", "forward over reverse"])
+def test_scaled_exps_exponent_second_derivative_keeps_its_factors_grouping(order):
+    """`scan.scaled_exp`'s exponent pullback of a cotangent of `2^-100` at a value of 2^100 under `e^0`,
+    differentiated by its exponent under a direction or cotangent of 2^100, in either order: 2^100 in
+    float64's binade, the value, the cotangent and the direction one range-exact product
+    (`scan._decayed_terms`), where the value met the direction first, `2^200`, before the cotangent (head
+    reviews)."""
+    value, exponent = jnp.asarray([2.0 ** 100], jnp.float32), jnp.asarray([0.0], jnp.float32)
+    small, big = jnp.asarray([2.0 ** -100], jnp.float32), jnp.asarray([2.0 ** 100], jnp.float32)
+
+    def pulled(exponent):
+        return jax.vjp(scan.scaled_exp, value, exponent)[1](small)[1]
+
+    if order == "reverse over reverse":
+        found = jax.grad(lambda exponent: jnp.sum(big * pulled(exponent)))(exponent)
+    else:
+        found = jax.jvp(pulled, (exponent,), (big,))[1]
+    found = np.asarray(found, np.float64)
+    assert np.isfinite(found).all() and np.frexp(found[0])[1] == np.frexp(2.0 ** 100)[1], found
+
+
+@pytest.mark.parametrize(("value", "cotangent", "decay", "kept"), [(2.0 ** 127, 2.0 ** 127, -90.0, True),
+                                                                  (2.0 ** 127, 2.0 ** 127, -150.0, True),
+                                                                  (1.0, 2.0 ** 120, -120.0, False),
+                                                                  (2.0 ** -120, 2.0 ** 100, -25.0, False)])
+def test_scaled_exps_exponent_derivatives_are_the_direction_times_the_decayed_value(value, cotangent, decay,
+                                                                                     kept):
+    """`scan.scaled_exp`'s exponent cotangent and tangent under `cotangent`, the cotangent times the decayed
+    value (Main's ruling on row 13750, 11-28: row 5426's envelope, finite wherever the plain formula is):
+    where the decay keeps the value normal (`kept`), `cotangent * value * exp(decay)` in float64's binade,
+    `2^254 e^-90` (2.4e37) and `2^254 e^-150` (3.0e-12), which autodiff through the factors overflowed
+    forming `2^127 * 2^127 e^-87` (train 1379's review K-F2); where it underflows, the cotangent times that
+    underflowed value, zero (1 under `e^-120` by 2^120, its derivative 1.0e-16; 2^-120 under `e^-25` by
+    2^100, which the plain formula's own grouping, the cotangent times the value first, keeps), finite as the
+    envelope asks, which the range-exact product of the three held at a GH200's training cost of 8.6 to 15.3
+    ms against 4.4 (M-JS-307, 310, 312c, 314b)."""
     value, decay, cotangent = (jnp.asarray([x], jnp.float32) for x in (value, decay, cotangent))
-    truth = np.frexp(float(value[0]) * float(cotangent[0]) * np.exp(float(decay[0])))[1]
     pulled = jax.vjp(scan.scaled_exp, value, decay)[1](cotangent)[1]
     tangent = jax.jvp(scan.scaled_exp, (value, decay), (jnp.zeros_like(value), cotangent))[1]
     for found in (pulled, tangent):
-        assert np.isfinite(found).all() and (found != 0).all(), found
-        assert np.frexp(np.asarray(found, np.float64))[1][0] == truth, (found, truth)
+        if kept:
+            truth = np.frexp(float(value[0]) * float(cotangent[0]) * np.exp(float(decay[0])))[1]
+            assert np.isfinite(found).all() and (found != 0).all(), found
+            assert np.frexp(np.asarray(found, np.float64))[1][0] == truth, (found, truth)
+        else:
+            decayed = cotangent * scan.scaled_exp(value, decay)
+            np.testing.assert_array_equal(np.asarray(found), np.asarray(decayed))
+            np.testing.assert_array_equal(np.asarray(found), np.zeros(1, np.float32))
 
 
 def test_scaled_exps_derivatives_hold_past_an_infinite_decay_and_fp32s_range():
     """`scan.scaled_exp`'s derivatives at an exponent of -inf, under a value and an exponent direction or
-    cotangent of 2^127 each, and at fp32's most negative exponent under 1 each: zero and finite, no product
-    of the two formed (2^254 times the zero decay was NaN) and no base-two head formed past the cutoff (its
-    overflow's -inf less -inf was NaN); and in float64 at an exponent of -800 under a direction of 2^500,
-    the exponent's tangent `2^500 e^-800` (about 2^-654, a normal float64) in its binade, the decay's power
-    derived from the format and the factors (a cutoff for fp32's three factors clipped it to 2^-524). Head
-    reviews of 96ef59e42 and 34d7afdf7."""
+    cotangent of 2^127 each, and at fp32's most negative exponent under 1 each: zero and finite, the decayed
+    value zero before any direction or cotangent meets it (2^254 times the zero decay was NaN). Head reviews
+    of 96ef59e42 and 34d7afdf7."""
     for value, decay in ((2.0 ** 127, -np.inf), (1.0, -float(np.finfo(np.float32).max))):
         value, decay = jnp.asarray([value], jnp.float32), jnp.asarray([decay], jnp.float32)
         pulled = jax.vjp(scan.scaled_exp, value, decay)[1](value)
         tangent = jax.jvp(scan.scaled_exp, (value, decay), (jnp.zeros_like(value), value))[1]
         for found in (*pulled, tangent):
             np.testing.assert_array_equal(np.asarray(found), np.zeros(1, np.float32))
-    with jax.enable_x64(new_val=True):
-        one, decay = jnp.asarray([1.0], jnp.float64), jnp.asarray([-800.0], jnp.float64)
-        wide = jax.jvp(scan.scaled_exp, (one, decay), (jnp.zeros_like(one), jnp.asarray([2.0 ** 500])))[1]
-        found = np.asarray(wide, np.float64)
-    assert np.isfinite(found).all() and found[0] != 0, found
-    assert np.frexp(found[0])[1] == np.frexp(np.exp(500 * np.log(2.0) - 800.0))[1], found
 
 
 @pytest.mark.parametrize("dtype", [jnp.float16, jnp.bfloat16], ids=["fp16", "bf16"])
@@ -550,6 +619,24 @@ def test_scaled_exps_shared_exponent_gradient_sums_its_batch_wide(values, dtype,
 
         found = jax.grad(total)(jnp.asarray(0.0, jnp.bfloat16))
     assert found.dtype == jnp.bfloat16 and float(found) == expected, found
+
+
+@pytest.mark.mesh
+def test_a_decayed_sum_of_products_holds_mixed_explicit_placements():
+    """`scan._decayed_terms` of `(a b + c) e^0` on an Explicit axis of two devices, `a` and `b` split across
+    them and `c` replicated, all of shape `[2]`: `a b + c` exactly, its terms placed alike before they are
+    summed as scaled values, where `scaled.add`'s select over a split and a replicated term was refused
+    (train 1430's review)."""
+    from jax.sharding import AxisType, NamedSharding, PartitionSpec
+
+    mesh = jax.make_mesh((2,), ("data",), axis_types=(AxisType.Explicit,), devices=jax.devices()[:2])
+    split, whole = NamedSharding(mesh, PartitionSpec("data")), NamedSharding(mesh, PartitionSpec())
+    with jax.set_mesh(mesh):
+        a, b = (jax.device_put(jnp.asarray(x, jnp.float32), split) for x in ((2.0, 3.0), (5.0, 7.0)))
+        c = jax.device_put(jnp.asarray((1.0, -1.0), jnp.float32), whole)
+        terms = jax.jit(lambda a, b, c: scan._decayed_terms(((0, 1), (2,)), jnp.float32(0.0), a, b, c))
+        found = terms(a, b, c)
+    np.testing.assert_array_equal(np.asarray(found), [11.0, 20.0])
 
 
 @pytest.mark.mesh

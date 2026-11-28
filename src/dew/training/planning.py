@@ -1110,6 +1110,10 @@ class FitSearch[LossT, EffectsT]:
     placed state serves an unplaced one."""
     parting: Parting | None = None
     """How its search parted its joined Newton-Schulz stacks (`searched`), None before it climbed."""
+    copies: bool = True
+    """Whether a narrow rung's step reads narrow copies at all (`dew.training._candidates.copies_narrow`),
+    the same on every process: where it reads none, a rung and its copy-free form lower one program, and a
+    frontier reads one of them (`below`)."""
     asked: list[Rung] = dataclasses.field(default_factory=list)
     """The rungs its search asked past the one it stood on first (`searched`), which a plan made offline
     asks none of again (`below`)."""
@@ -1768,9 +1772,16 @@ class FitSearch[LossT, EffectsT]:
         # A rung read here that misses is no checkpoint's rung missing (`fits_here`).
         self.resumed = None
         found = []
-        for rung in order[:order.index(plan)]:
-            if rung in self.asked:
+        # Where no step copies, a rung and its copy-free form are one program: each read once, by its
+        # copy-free form, none the search asked in either form, and none past the plan's first form, a
+        # warm plan's own among them (row 14072). Compared by equality: a rung's modules need not hash.
+        same = (lambda rung: rung) if self.copies else (lambda rung: dataclasses.replace(rung, narrow=False))
+        read = [same(rung) for rung in self.asked]
+        end = next(index for index, rung in enumerate(order) if same(rung) == same(plan))
+        for rung in order[:end]:
+            if same(rung) in read:
                 continue
+            read.append(same(rung))
             self.at(rung)
             # Every split in turn, coarsest first, to the first that fits: no forecast passes one over
             # (`walked` may, its miss's figures no bound on what the compiler allocates), as this report

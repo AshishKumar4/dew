@@ -7,6 +7,9 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
 
 ## Unreleased
 
+- On Linux, Dew's build of egglog is 14.0.0.post2 from Dew's package index: a repeated run of the e-graph costs
+  what is new to it (a wholly added ruleset returned at once, declarations' hashes kept), Dew's attention
+  derivations 4.069 s to 3.599 s of CPU a round.
 - A template's trace-time derivations are stored in Dew's cache across processes: a cold process reads a
   fixed tile's forms back instead of saturating them again (a cold attention step 25 s to 15 s on armada).
 - Generated components share one helper module across declaring modules, so each family's components are

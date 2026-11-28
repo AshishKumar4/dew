@@ -67,7 +67,9 @@ from dew.held_updates import holds_back, input_held, waiting
 from dew.inputs import Field, InputSpec
 from dew.mesh import STAGE_AXIS, LayoutRefused, LogicalAxes
 from dew.nn.dense import NVFP4_HISTORY, NVFP4_PENDING, pending_amax
+from dew.nn.finite import checked
 from dew.nn.flops import MissingFlopsCount
+from dew.nn.kernels.generation import GpuTarget
 from dew.nn.kernels.options import Compiling, attempting, shapes_of
 from dew.nn.kernels.templates import report
 from dew.nn.precision import Numerics
@@ -188,7 +190,6 @@ from dew.training.tracker import Tracker
 from dew.training.transaction import (
     PassesProgress,
     Transaction,
-    checked,
     loss_scale,
     numerics_read,
     refuse_unpassed_progress,
@@ -272,8 +273,10 @@ class TrainerAdvanced(Generic[Loss, Effects]):
     """Scale the loss dynamically, as a float16 compute needs (`loss_scale`)."""
     profile: ProfileWindow | None = None
     """The steps a profiler traces (`ProfileWindow`)."""
-    lower_for: str | None = None
-    """A CUDA generation the first step is lowered for in place of compiling it (`_lowering.Lowered`)."""
+    lower_for: str | GpuTarget | None = None
+    """A CUDA generation the first step is lowered for in place of compiling it (`_lowering.Lowered`), or a
+    GPU's own target (`generation.gpu_target()`: an attached GH200's SKU, its facts its own, where a
+    generation names its canonical GPU's: the kernel tuner's, `tools/kernel_picks.py`)."""
     ahead: AheadOfTime | None = None
     """A step compiled ahead (`dew.training.ahead`), run as the first step where it is that program; one
     compiled without its GPU kind's tuned choices (`AheadOfTime.tuned`) is not run: the run compiles its

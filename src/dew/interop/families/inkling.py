@@ -30,6 +30,7 @@ this yet: a checkpoint holding them loads its text decoder alone.
 from __future__ import annotations
 
 import re
+import string
 from collections.abc import Mapping
 from types import MappingProxyType
 
@@ -298,7 +299,11 @@ def _draft(mtp: Mapping[str, object], text: Mapping[str, object]) -> NativeField
 
 
 _SITES = {'q': 'attn', 'k': 'k', 'v': 'v', 'mlp': 'mlp'}
-"""Each cross-pass site of Dew's (`cross_pass_<site>`) by the release's name of its controller."""
+"""Each cross-pass site of Dew's (`cross_pass_<site>`) by the release's name of its controller and of its
+depth query (`<site>_query`)."""
+
+_RESIDUALS = {'q': 'attention_res', 'k': 'attention_res_k', 'v': 'attention_res_v', 'mlp': 'mlp_res'}
+"""Each site's depth query in the shared decoder (`_LAYER_LEAVES`), by Dew's name of the site (`_SITES`)."""
 
 _NAMES: Renames = (
     ('model.llm.unembed', 'lm_head'), ('model.llm.embed', 'model.embed_tokens'),
@@ -321,8 +326,7 @@ decoder under `model.llm.`) onto the shared decoder's and this family's own (`_L
 transformers' conversion reads them (conversion_mapping.py `inkling2_text`, `inkling2_loop_text`)."""
 
 _LAYER_LEAVES: Leaves = {
-    'attn_query': ('attention_res', 'kernel'), 'k_query': ('attention_res_k', 'kernel'),
-    'v_query': ('attention_res_v', 'kernel'), 'mlp_query': ('mlp_res', 'kernel'),
+    **{f'{theirs}_query': (_RESIDUALS[site], 'kernel') for site, theirs in _SITES.items()},
     'input_layernorm_k.weight': ('input_layernorm_k', 'scale'),
     'input_layernorm_v.weight': ('input_layernorm_v', 'scale'),
     'attn_conv.weight': ('attn_conv', 'conv', 'weight'), 'mlp_conv.weight': ('mlp_conv', 'conv', 'weight'),
@@ -424,6 +428,53 @@ def _dynamic_taps(record: Mapping[str, object]) -> int | None:
                  if isinstance(value, Mapping) and (taps := _dynamic_taps(value)) is not None), None)
 
 
+_STACK_NAMES = MappingProxyType({
+    'output_query': 'model.llm.attn_res.output_query',
+    'output': 'model.llm.output_query',
+    'attn_queries': 'model.llm.attn_res.attn_queries.{index}',
+    'mlp_queries': 'model.llm.attn_res.mlp_queries.{layer}',
+    'query': 'model.llm.layers.{layer}.{site}_query',
+    'static_taps': 'model.llm.layers.{layer}.attn.{conv}_sconv.static_w',
+    'taps': 'model.llm.layers.{layer}.attn.{conv}_sconv.weight',
+    'projection': 'model.llm.layers.{layer}.attn.{conv}_sconv.weight_proj',
+    'bank': 'model.llm.layers.{layer}.mlp.experts.{bank}_weight',
+    'expert': 'model.llm.layers.{layer}.mlp.experts.{expert}.{part}.weight',
+    'controller': 'model.llm.layers.{layer}.controllers.{site}.{leaf}',
+    'messages': 'model.llm.middle_cycle_cross_pass_{stack}',
+})
+"""The names of the release's stacked tensors and of their parts (`_stacks`, `_unstored`), each a template of
+the fields `_FIELDS` declares: the one spelling `_stacks` names them by and `_RESERVED` recognizes them by."""
+
+_FIELDS = MappingProxyType({
+    'index': r'\d+', 'layer': r'\d+', 'expert': r'\d+', 'site': tuple(_SITES.values()), 'conv': ('k', 'v'),
+    'bank': ('w13', 'w2'), 'part': ('gate_proj', 'up_proj', 'down_proj'),
+    'leaf': ('down_weight', 'forget_weight', 'gain_weight', 'input_down', 'message_down', 'forget', 'gain',
+             'query'),
+    'stack': ('queries', 'kv_queries'),
+})
+"""Each field of `_STACK_NAMES`' templates: a number, or the words it takes."""
+
+
+def _named(name: str, **fields: str | int) -> str:
+    """The tensor name `_STACK_NAMES[name]` spells with `fields`, each one `_FIELDS` declares."""
+    for field, value in fields.items():
+        domain = _FIELDS[field]
+        if not (str(value).isdigit() if isinstance(domain, str) else value in domain):
+            raise ValueError(f"{field}={value!r} is no {name} field: {domain}")
+    return _STACK_NAMES[name].format(**fields)
+
+
+def _pattern(template: str) -> str:
+    """`template`'s names as a regular expression, each field its declared domain (`_FIELDS`)."""
+    pieces = []
+    for literal, field, _, _ in string.Formatter().parse(template):
+        pieces.append(re.escape(literal))
+        if field is not None:
+            domain = _FIELDS[field]
+            pieces.append(domain if isinstance(domain, str) else f"(?:{'|'.join(map(re.escape, domain))})")
+    return ''.join(pieces)
+
+
 def _query(name: str, parts: tuple[str, ...], width: int) -> Stacked:
     """A depth query `[D]`, or a global layer's sites' `[3, D]`, as the `[1, D]` projection each leaf
     reads (a kernel, `[out, in]`), `D` the decoder's `width`."""
@@ -434,7 +485,7 @@ def _query(name: str, parts: tuple[str, ...], width: int) -> Stacked:
 
 def _sites(kind: Mapping[str, object]) -> tuple[str, ...]:
     """A layer's attention query sites: a global layer's query, key and value, a local one's one."""
-    return ('attn', 'k', 'v') if kind.get('depth_sites') else ('attn',)
+    return tuple(_SITES[site] for site in (('q', 'k', 'v') if kind.get('depth_sites') else ('q',)))
 
 
 def _stacks(config: Mapping[str, object]) -> list[Stacked]:
@@ -461,45 +512,48 @@ def _stacks(config: Mapping[str, object]) -> list[Stacked]:
     mixture = None if stated is None else _records.record(stated, 'mixture')
     routed = () if mixture is None else _records.integers(mixture['layers'], 'layers')
     experts = 0 if mixture is None else _records.integer(mixture['experts'], 'experts')
-    stacks = [_query('model.llm.attn_res.output_query', ('model.llm.output_query',), width)]
+    stacks = [_query(_named('output_query'), (_named('output'),), width)]
     for layer, kind in enumerate(_records.record(kinds[kind], 'kinds') for kind in types):
-        stem = f'model.llm.layers.{layer}'
         if layer:
-            stacks.append(_query(f'model.llm.attn_res.attn_queries.{layer - 1}',
-                                 tuple(f'{stem}.{site}_query' for site in _sites(kind)), width))
-        stacks.append(_query(f'model.llm.attn_res.mlp_queries.{layer}', (f'{stem}.mlp_query',), width))
+            sites = tuple(_named('query', layer=layer, site=site) for site in _sites(kind))
+            stacks.append(_query(_named('attn_queries', index=layer - 1), sites, width))
+        stacks.append(_query(_named('mlp_queries', layer=layer),
+                             (_named('query', layer=layer, site=_SITES['mlp']),), width))
         if (taps := _dynamic_taps(kind)) is not None:
-            for site in 'kv':
-                conv = f'{stem}.attn.{site}_sconv'
-                stacks += [Stacked(f'{conv}.static_w', (f'{conv}.weight',),
+            for conv in ('k', 'v'):
+                projection = _named('projection', layer=layer, conv=conv)
+                stacks += [Stacked(_named('static_taps', layer=layer, conv=conv),
+                                   (_named('taps', layer=layer, conv=conv),),
                                    (Reversed(0), Transposed((1, 0)), Split(1)), grid=()),
-                           Stacked(f'{conv}.weight_proj', (f'{conv}.weight_proj',),
+                           Stacked(projection, (projection,),
                                    (Split(0, taps), Reversed(1), Inverted(Split(0, taps))), grid=())]
         if layer in routed:
-            fused = f'{stem}.mlp.experts'
-            stacks += [Stacked(f'{fused}.w13_weight', tuple(f'{fused}.{expert}.{part}.weight'
-                                                           for expert in range(experts)
-                                                           for part in ('gate_proj', 'up_proj')),
+            stacks += [Stacked(_named('bank', layer=layer, bank='w13'),
+                               tuple(_named('expert', layer=layer, expert=expert, part=part)
+                                     for expert in range(experts) for part in ('gate_proj', 'up_proj')),
                                (Split(1, 2), Transposed((0, 2, 1, 3))), grid=(experts, 2)),
-                       Stacked(f'{fused}.w2_weight',
-                               tuple(f'{fused}.{expert}.down_proj.weight' for expert in range(experts)))]
+                       Stacked(_named('bank', layer=layer, bank='w2'),
+                               tuple(_named('expert', layer=layer, expert=expert, part='down_proj')
+                                     for expert in range(experts)))]
     loop = config.get('loop')
     if not isinstance(loop, Mapping):
         return stacks
     span = range(*_records.integers(loop['layers'], 'loop.layers'))
     for layer in span:
-        for site in ('attn', 'mlp', 'k', 'v'):
-            controller = f'model.llm.layers.{layer}.controllers.{site}'
-            stacks += [Stacked(f'{controller}.down_weight',
-                               (f'{controller}.input_down', f'{controller}.message_down'),
+        for site in _SITES.values():
+            def leaf(name: str, layer=layer, site=site) -> str:
+                return _named('controller', layer=layer, site=site, leaf=name)
+
+            stacks += [Stacked(leaf('down_weight'), (leaf('input_down'), leaf('message_down')),
                                (Transposed((1, 0)), Split(0, width))),
-                       *(Stacked(f'{controller}.{leaf}_weight', (f'{controller}.{leaf}',),
-                                 (Transposed((1, 0)),), grid=()) for leaf in ('forget', 'gain'))]
+                       *(Stacked(leaf(f'{held}_weight'), (leaf(held),), (Transposed((1, 0)),), grid=())
+                         for held in ('forget', 'gain'))]
     if loop.get('messages') is not None:
-        stacks += [Stacked(f'model.llm.middle_cycle_cross_pass_{stack}',
-                           tuple(f'model.llm.layers.{layer}.controllers.{site}.query'
+        stacks += [Stacked(_named('messages', stack=stack),
+                           tuple(_named('controller', layer=layer, site=site, leaf='query')
                                  for layer in span for site in sites), (Split(1),), shape=(1, width))
-                   for stack, sites in (('queries', ('attn', 'mlp')), ('kv_queries', ('k', 'v')))]
+                   for stack, sites in (('queries', (_SITES['q'], _SITES['mlp'])),
+                                        ('kv_queries', (_SITES['k'], _SITES['v'])))]
     return stacks
 
 
@@ -509,16 +563,14 @@ def _unstored(config: Mapping[str, object]) -> dict[str, np.ndarray]:
     width = _records.integer(config['emb_features'], 'emb_features')
     kinds = _records.record(config['kinds'], 'kinds')
     first = _records.record(kinds[_records.strings(config['layer_types'], 'layer_types')[0]], 'kinds')
-    return {f'model.llm.layers.0.{site}_query': np.zeros((1, width), np.float32) for site in _sites(first)}
+    return {_named('query', layer=0, site=site): np.zeros((1, width), np.float32) for site in _sites(first)}
 
 
-_RESERVED = re.compile(
-    r'model\.llm\.(output_query|attn_res\..+|middle_cycle_cross_pass_\w+'
-    r'|layers\.\d+\.((attn|k|v|mlp)_query|attn\.[kv]_sconv\.(weight_proj|static_w)'
-    r'|controllers\.(attn|mlp|k|v)\.(query|input_down|message_down|forget|gain|\w+_weight)'
-    r'|mlp\.experts\.(\d+\.(gate|up|down)_proj\.weight|w(13|2)_weight)))')
-"""The names only `_stacks` and their parts, or `_unstored`, take, whatever the decoder's record: the
-release's stacked tensors' and those `_ROUTES` read of them."""
+_RESERVED = re.compile('|'.join(_pattern(template) for name, template in _STACK_NAMES.items()
+                               if name != 'taps'))
+"""The names only `_stacks` and their parts, or `_unstored`, take, whatever the decoder's record, read off
+their one spelling (`_STACK_NAMES`): all but a static convolution's taps, which the release stores as they
+are where its convolution is not dynamic."""
 
 _RESTACKED = Restacked(_stacks, _unstored, _RESERVED)
 """Inkling 2's release as `_ROUTES` read it and back, one declaration both ways."""

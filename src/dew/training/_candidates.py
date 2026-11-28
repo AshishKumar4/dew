@@ -27,7 +27,7 @@ from dew.data.pipeline import DeviceStep
 from dew.distributed.batches import PREFETCH_DEPTH, batch_shardings, prefetched_bytes
 from dew.distributed.placement import Placement, Validation, allocated_bytes, placed_bytes, placed_shapes
 from dew.nn.kernels import tuning
-from dew.nn.kernels.generation import assumed, gpu_mesh
+from dew.nn.kernels.generation import GpuTarget, assumed, gpu_mesh
 from dew.nn.kernels.options import (
     compiler_options,
     held_context,
@@ -107,7 +107,7 @@ class StepSettings[LossT, EffectsT]:
     inspection: Inspection | None
     microbatches: int
     record: bool
-    lower_for: str | None
+    lower_for: str | GpuTarget | None
     state_mesh: Mesh
     skip_nonfinite: bool = False
     """Whether a step with no loss scale that is not finite is skipped (`TrainerAdvanced(skip_nonfinite=)`),
@@ -246,6 +246,16 @@ def as_placed[LossT, EffectsT](stepping: Stepping[LossT, EffectsT], state: Train
     if jax.tree.structure(shardings) != jax.tree.structure(state):
         return state
     return placed_shapes(state, shardings)
+
+
+def copies_narrow(settings: StepSettings, state: TrainState) -> bool:
+    """Whether a narrow rung's step over `state` under `settings` reads narrow copies at all: none where its
+    loss is scaled, nor under DiLoCo, whose groups read their own parameters, which no copy shadows, nor in
+    a custom step, which traces no loss to read its casts from (train 1437), nor where the device or the
+    state reads none (`narrow_copies`). The same on every process (its settings, its backend and its
+    state's collections), so a search may read a rung and its copy-free form as one."""
+    return (settings.step is None and not settings.dynamic_scale and settings.diloco is None
+            and narrow_copies(state))
 
 
 def candidate_for[LossT, EffectsT](stepping: Stepping[LossT, EffectsT], state: TrainState, batch: Batch,
@@ -439,10 +449,9 @@ def prepared_for[LossT, EffectsT](stepping: Stepping[LossT, EffectsT], state: Tr
         stepping.staging.refuse_unpipelined(schedule, settings.objective)
     prepared = windowed(lambda state, rows, *, shape_only: stepping.initialize_accumulation(
         state, rows, shapes, window=window, split=split, shape_only=shape_only), state, batch)
-    # DiLoCo's groups read their own parameters, which no narrow copy shadows.
     # A step the trainer composes narrows, from the loss it traced; a custom step's traces none (`traced`
-    # None), and a scaled loss's copies none.
-    narrows = narrow and not settings.dynamic_scale and settings.diloco is None and narrow_copies(state)
+    # None).
+    narrows = narrow and copies_narrow(settings, state)
     reads = state_reads(state, traced) if traced is not None and narrows else None
     copies = reads.casts if reads is not None else {}
     prepared = dataclasses.replace(prepared, compute=jax.eval_shape(
@@ -495,7 +504,7 @@ def step_program[LossT, EffectsT](stepping: Stepping[LossT, EffectsT], shapes, c
 
 
 def lowered_for[LossT, EffectsT](stepping: Stepping[LossT, EffectsT], objective: Objective[LossT, EffectsT],
-                                 state: TrainState, batch: Batch, generation: str, narrow: bool,
+                                 state: TrainState, batch: Batch, generation: str | GpuTarget, narrow: bool,
                                  xla_defaults: bool = False
                                  ) -> tuple[jax.stages.Lowered, jax.stages.CompilerOptions | None]:
     """The step `compile` builds first, traced as on a GPU of the CUDA `generation` and lowered for one

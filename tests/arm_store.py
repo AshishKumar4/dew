@@ -487,7 +487,7 @@ def compile_site(store: CompiledTruths, dew_fn, reference_fn, draw, label: str, 
                 # (row 8576).
                 store.compile_site(label, programs, held, at_run=str(refused))
         # A qualification run sizes a plain site first (`_qualified`), on its sizing draws through its arms.
-        sizing = _sizing_seeds(reference_fn) if os.environ.get(QUALIFY) and plain else range(0)
+        sizing = _sizing_seeds(dew_fn, reference_fn) if os.environ.get(QUALIFY) and plain else range(0)
         compile = _compile_for(dew_fn, reference_fn)
         # A library arm (`library_fn`) one of them, run on Dew's own inputs as a further reference is (row
         # 8468).

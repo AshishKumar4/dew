@@ -250,8 +250,9 @@ def test_a_paired_products_input_gradient_is_one_launch_over_its_joined_depths()
           jax.default_matmul_precision("default"), generation.chosen(grouped_matmul="mosaic"),
           tuning.seen() as launches):
         jax.jit(jax.grad(loss)).trace(*shapes).lower(lowering_platforms=("cuda",))
-    input_gradients = [bound for _, bound in launches.taken
-                       if bound.arguments.get("trans_rhs") and bound.arguments.get("kernel") is not None]
+    input_gradients = [observed.arguments for observed in launches
+                       if observed.arguments.arguments.get("trans_rhs")
+                       and observed.arguments.arguments.get("kernel") is not None]
     assert len(input_gradients) == 1, len(input_gradients)
 
 
@@ -692,9 +693,10 @@ def _chained_taken() -> Iterator[None]:
         yield
     # Every input-gradient launch one of the three products with the other two chained to it: a product
     # run apart beside a chain of two passed where its sum cancelled (base review 5028c8148 F1).
-    transposed = [bound for _, bound in launches.taken if bound.arguments.get("trans_rhs")]
+    transposed = [observed.arguments for observed in launches
+                  if observed.arguments.arguments.get("trans_rhs")]
     assert transposed and all(len(bound.arguments.get("chained") or ()) == 2 for bound in transposed), (
-        launches.taken)
+        launches)
 
 
 CHAINED_CASES = ("projections", "unequal scales", "cancelling")
@@ -1088,7 +1090,7 @@ def test_a_launch_pinned_at_a_tile_no_chain_holds_keeps_its_products_apart():
     with (generation.assumed("sm90"), generation.chosen(grouped_matmul="mosaic"),
           tuning.pinned({grouped_matmul.MosaicGmm: pin}), tuning.seen() as launches):
         got = jax.vjp(projected, x)[1](tuple(cotangents))[0]
-    assert not any(bound.arguments.get("chained") for _, bound in launches.taken), launches.taken
+    assert not any(observed.arguments.arguments.get("chained") for observed in launches), launches
     group_of = np.repeat([0, 1], 128)
     expected = sum(np.einsum("rw,rfw->rf", np.asarray(d, np.float32), np.asarray(w, np.float32)[group_of])
                    for d, w in zip(cotangents, matrices, strict=True))
@@ -1132,8 +1134,9 @@ def test_a_chained_input_gradient_lowers_as_one_call(generation_name):
           jax.default_matmul_precision("default"), generation.chosen(grouped_matmul="mosaic"),
           tuning.seen() as launches):
         jax.jit(jax.grad(loss)).trace(*shapes).lower(lowering_platforms=("cuda",))
-    input_gradients = [bound for _, bound in launches.taken
-                       if bound.arguments.get("trans_rhs") and bound.arguments.get("kernel") is not None]
+    input_gradients = [observed.arguments for observed in launches
+                       if observed.arguments.arguments.get("trans_rhs")
+                       and observed.arguments.arguments.get("kernel") is not None]
     assert len(input_gradients) == 1 and input_gradients[0].arguments.get("chained"), input_gradients
 
 

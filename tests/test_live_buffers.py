@@ -36,7 +36,8 @@ from live_buffers_support import (
     read,
 )
 
-from dew.training.live_buffers import LiveBuffer, peak_live
+from dew.training.live_buffers import LiveBuffer, LiveInterval, peak_live
+from dew.training.memory import LiveProfile
 
 FIXTURES = Path(__file__).parent / "fixtures" / "live_buffers"
 """The HLO modules these read, each as XLA's text writes it."""
@@ -157,6 +158,75 @@ def test_a_fusion_within_a_fusion_reads_a_value_as_the_ops_it_fuses():
     buffer.defined_at.instruction_id = defined["a"].id
     assert read(assignment, module).used(0, {("e", "f"): 1}) == ((1, "jit(f)/jvp(g)/neg"),)
 
+
+@pytest.mark.parametrize(("operand", "expected"), [("x", ""), ("y", "jit(f)/transpose(jvp(g))/neg")])
+def test_a_fusion_reads_each_operand_as_the_ops_reading_it(operand, expected):
+    """A fusion of no name over two operands, a backward's named op reading the second alone and an unnamed
+    product within reading both: the second reads as that op, and the first, which no named op reads, as
+    a read no phase is told of, not as the backward's (train 1427)."""
+    module = module_bytes((FIXTURES / "operands.hlo").read_text())
+    defined = instruction_ids(module, "e")
+    assignment: Any = empty_assignment()
+    assignment.buffer_allocations.add(index=0, size=8)
+    buffer = assignment.logical_buffers.add(id=0, size=8)
+    buffer.defined_at.instruction_id = defined[operand].id
+    assert read(assignment, module).used(0, {("e", "f"): 1}) == ((1, expected),)
+
+
+@pytest.mark.parametrize(("fixture", "operand", "expected"), [
+    ("converging", "a", ("jit(f)/sin", "jit(f)/transpose(jvp(g))/neg")),
+    ("forwarded", "a", ("jit(f)/jvp(g)/exp",)),
+    ("returned", "a", ("jit(f)/jvp(g)/exp",)),
+    ("named_view", "a", ("jit(f)/jvp(g)/reshape", "jit(f)/transpose(jvp(g))/exp")),
+    ("named_root", "a", ("jit(f)/transpose(jvp(g))/transpose",)),
+    ("named_getter", "x", ("jit(f)/transpose(jvp(g))/get",)),
+    ("named_getter", "y", ()),
+    ("named_nested", "a", ("jit(f)/jvp(g)/reshape", "jit(f)/transpose(jvp(g))/exp")),
+    ("slots", "x", ("jit(f)/sin",)),
+    ("slots", "y", ("jit(f)/transpose(jvp(g))/neg",)),
+], ids=["converging-views", "nested-result", "nested-parameter", "named-view", "named-root",
+        "named-getter-slot-0", "named-getter-slot-1", "named-nested", "tuple-slot-0",
+        "tuple-slot-1"])
+def test_a_fusion_reads_a_value_as_the_ops_its_paths_reach(fixture, operand, expected):
+    """A fusion of no name reads a value as the named ops each path from its operand slots reaches: one
+    value reaching two slots, directly and through a view, as both slots' ops; a nested fusion returning
+    it unchanged (a view of its parameter, or the parameter itself), as the op reading the nested result;
+    one packed into a tuple, as the ops reading its own slot alone (train 1427's review); one through a view
+    XLA kept a forward's name on, as that view and the backward op reading it (train 1437's P0); one a named
+    view returns from the scheduled fusion, as that view's op alone, no read unknown besides, as is one a
+    named getter of its slot returns, the other slot read by none (its review); one a nested fusion of a
+    forward's name returns, as that name and the backward op reading its result (train 1444's P0)."""
+    module = module_bytes((FIXTURES / f"{fixture}.hlo").read_text())
+    defined = instruction_ids(module, "e")
+    assignment: Any = empty_assignment()
+    assignment.buffer_allocations.add(index=0, size=8)
+    buffer = assignment.logical_buffers.add(id=0, size=8)
+    buffer.defined_at.instruction_id = defined[operand].id
+    assert read(assignment, module).used(0, {("e", "f"): 1}) == tuple((1, name) for name in expected)
+
+
+
+def test_a_value_a_named_nested_fusion_returns_to_a_backward_is_a_residual():
+    """A forward's value its scheduled fusion's backward op reads through a nested fusion of the forward's
+    name, read off the compile's buffers, is a residual: live into the backward by that read, though freed
+    as the backward's first buffer is made (train 1444's P0)."""
+    module = module_bytes((FIXTURES / "named_nested.hlo").read_text())
+    assignment: Any = empty_assignment()
+    assignment.buffer_allocations.add(index=0, size=8)
+    buffer = assignment.logical_buffers.add(id=0, size=8)
+    buffer.defined_at.instruction_id = instruction_ids(module, "e")["a"].id
+    uses = read(assignment, module).used(0, {("e", "f"): 1})
+
+    def interval(start, end, buffer, op_name, uses=()):
+        return LiveInterval(bytes=8, shape=(2,), dtype="f32", kind="temporary", instruction=f"i{buffer}",
+                            op_name=op_name, source="", allocation=0, trace=0, timeline=0, uses=uses,
+                            whole=True, complete=True, start=start, end=end, buffer=buffer, storage=buffer,
+                            charged=True)
+
+    profile = LiveProfile.of((interval(0, 2, 0, "jit(f)/jvp(g)/sin", uses),
+                              interval(2, 3, 1, "jit(f)/transpose(jvp(g))/exp")), frozenset())
+    assert profile is not None
+    assert [held.residual for held in profile.held] == [True, False]
 
 GOTTEN = (FIXTURES / "gotten.hlo").read_text()
 

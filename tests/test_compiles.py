@@ -1,6 +1,7 @@
 """JAX's compile events as Dew hears them (`dew.telemetry.compiles`): a block counting the programs it
 needs, a thread held to loaded programs alone."""
 
+import contextlib
 import threading
 
 import jax
@@ -68,3 +69,52 @@ def test_a_compiles_block_that_closes_waits_for_the_events_already_told_to_it():
     closer.join()
     compiler.join()
     assert closed == [1] and [program.kind for program in compiles.programs] == ["traced"]
+
+
+def test_a_program_heard_names_the_first_caller_outside_jax():
+    """Each program a block hears names where outside JAX its trace and compile were asked: this test's
+    line, not JAX's own frames or the block's; and a block that tells its own `heard` on, the line that
+    tells it, its first caller outside JAX (row 5556); whatever `sys.tracebacklimit` limits a traceback to,
+    none here, where a stack extracted would hold no frame (train 1437)."""
+    import inspect
+    import sys
+
+    @contextlib.contextmanager
+    def no_tracebacks():
+        limit = getattr(sys, "tracebacklimit", None)
+        sys.tracebacklimit = 0
+        try:
+            yield
+        finally:
+            if limit is None:
+                del sys.tracebacklimit
+            else:
+                sys.tracebacklimit = limit
+
+    def double(value):
+        return value * 2
+
+    def triple(value):
+        return value * 3
+
+    told = []
+
+    class Forwarding(Compiles):
+        """A block that tells each event on to `Compiles.heard`, from the line it notes."""
+
+        def heard(self, kind, duration_secs, metadata):
+            frame = inspect.currentframe()
+            told.append(f"{__file__}:{0 if frame is None else frame.f_lineno + 1}")
+            super().heard(kind, duration_secs, metadata)
+
+    values = jnp.arange(4.0)
+    with Compiles("double") as heard, no_tracebacks():
+        frame = inspect.currentframe()
+        asked = f"{__file__}:{0 if frame is None else frame.f_lineno + 1}"
+        jax.jit(double)(values)
+    assert {(program.kind, program.where) for program in heard.programs} == {
+        ("traced", asked), ("compiled", asked)}, heard.programs
+    with Forwarding("triple") as forwarded, no_tracebacks():
+        jax.jit(triple)(values)
+    assert [program.kind for program in forwarded.programs] == ["traced", "compiled"], forwarded.programs
+    assert {program.where for program in forwarded.programs} == set(told), forwarded.programs

@@ -102,7 +102,11 @@ def _fla_levels(dtype) -> bool:
     portable recurrence's range: a values' decay applied to its memory, not to each value before its key
     (a key of 2^100 under three decays of -40 kept, where `e^-120` on its unit value rounded to zero). A
     call within `generation.chosen` naming the recurrence's kernel (`gated_delta_rule`) takes that kernel a
-    level, as an A/B of its kernels asks (tools/benchmark_recurrence.py's `mosaic` and `xla` arms)."""
+    level, as an A/B of its kernels asks (tools/benchmark_recurrence.py's `mosaic` and `xla` arms). The fast
+    path's gradient is the exact autodiff of its forward (fla's forward arithmetic, differentiated), held by
+    check 1 against float64; fla's backward kernels' own rounding orders (its within's `dV` rounding a score
+    to bf16 before its decay, chunk.py:1059-1063 at 413ad2c) are not its contract (Main's ruling, row
+    10525)."""
     return (jnp.dtype(dtype) == jnp.bfloat16 and generation.numerics().forms != 'accurate'
             and selection.forced(generation.Choice.GATED_DELTA_RULE) is None)
 
@@ -187,10 +191,10 @@ def _levels_above(query, key, value, g, weights, *, within):
         emptied = (severed | inside[..., 0])[..., None, None]
         left = memory[:, :, 0::2, None]
         # An overflowed memory, reader or read alone is zeroed where its decay keeps no finite fp32 value
-        # (`_dropped`), its value there every finite one's; a finite one decays as it is, its derivatives
-        # those of its exact product: four live decays of -80 took an overflowed read of 2^70 by 2^70 to
-        # NaN and a reader of 2^128 times its emptied memory too (train 1379's review), and zeroing a
-        # finite read of 2^127 under four decays of -50 lost its decay's gradient 4.0e-11 (train 1398's).
+        # (`_dropped`), its value there every finite one's; a finite one decays as it is (`scan.scaled_exp`,
+        # its decay's derivative the cotangent times its decayed value, as the plain formula's): four live
+        # decays of -80 took an overflowed read of 2^70 by 2^70 to NaN and a reader of 2^128 times its
+        # emptied memory too (train 1379's review).
         spent = emptied | (~jnp.isfinite(left) & _dropped(before)[..., None, None])
         held = scan.scaled_exp(jnp.where(spent, 0.0, left), jnp.where(spent, 0.0, before[..., None, None]))
         held = jnp.where(spent, 0.0, held).astype(value.dtype)

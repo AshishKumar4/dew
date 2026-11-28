@@ -718,21 +718,28 @@ def _of_its_inputs(label: str, name: str, fn, inputs, first) -> None:
                            f"depends on more than them")
 
 
-def _paired_most(reference_fn, most: int = MOST_SEEDS, *, paired: bool = True) -> int | None:
-    """The most seeds a sizing of `reference_fn` takes (`seeds_for`'s, its draws from SIZING_FROM on,
-    `parity._sized_count`: twice it paired, four times it of the reference compared with itself): `most`, a
-    recording's pilots' share where it holds fewer; None for a recording without pilots, which no sizing
-    takes (`_qualified`), its count its recording's."""
-    if not getattr(reference_fn, "recorded", False):
-        return most
-    pilots = getattr(reference_fn, "pilots", None)
-    return None if pilots is None else min(most, len(pilots) // (2 if paired else 4))
+def _paired_most(*arms, most: int = MOST_SEEDS, paired: bool = True) -> int | None:
+    """The most seeds a sizing of a site's `arms` takes (`seeds_for`'s, its draws from SIZING_FROM on,
+    `parity._sized_count`: twice paired, four times a reference compared with itself): `most`, or the
+    fewest any recorded arm's pilots hold a share of; None where an arm is a recording without pilots (a
+    judged recording, Dew's arm, among them), which no sizing takes (`_qualified`), its count its
+    recording's. The one reading of the pair's pilot budget: a qualification's (`_qualified`), a sizing's
+    (`seeds_for`) and a prepare's (`_sizing_seeds`). An arm of None (an unpaired sizing's Dew) is none."""
+    held = most
+    for fn in arms:
+        if fn is None or not getattr(fn, "recorded", False):
+            continue
+        pilots = getattr(fn, "pilots", None)
+        if pilots is None:
+            return None
+        held = min(held, len(pilots) // (2 if paired else 4))
+    return held
 
 
-def _sizing_seeds(reference_fn) -> range:
+def _sizing_seeds(dew_fn, reference_fn) -> range:
     """The seeds a qualification run's paired sizing of a site may draw (`_qualified`, `seeds_for`), none
-    where it takes none (`_paired_most`)."""
-    most = _paired_most(reference_fn)
+    where it takes none (`_paired_most` of the pair)."""
+    most = _paired_most(dew_fn, reference_fn)
     return range(0) if most is None else range(SIZING_FROM, SIZING_FROM + 2 * most)
 
 
@@ -1493,9 +1500,10 @@ def _qualified(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth_fn, 
     here, Dew paired with its reference as the verdict pairs them, on sizing seeds no verdict draws, as every
     site's count is sized (without its terms: `seeds_for` reads none); above the site's declared `seeds` it
     raises StaleSeeds. Each site appends a line to the run's file (`QUALIFY`'s value): its test, its label,
-    its declared count and the count sized, or why it is not sized: its reference is a recording without
-    pilots, whose count is its recording's, or its verdict is not the `plain` pair's (a library arm, further
-    references, terms of its own, a weighed check), which this sizing does not judge. A site whose draw
+    its declared count and the count sized, or why it is not sized: either arm is a recording without
+    pilots (a judged recording is Dew's arm), whose count is its recording's, or its verdict is not the
+    `plain` pair's (a library arm, further references, terms of its own, a weighed check), which this sizing
+    does not judge. A site whose draw
     cannot draw a sizing seed (one that indexes a fixed set of draws) fails with its draw's own error: it has
     no pilot stream, so its count cannot be sized again (`seeds_for`'s contract). A site judged under a
     store of programs compiled ahead (`truths_ahead.compiled_truths`: a GPU flow's) sizes in its run, its
@@ -1505,7 +1513,7 @@ def _qualified(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth_fn, 
 
     record = {"site": os.environ.get("PYTEST_CURRENT_TEST", "").rsplit(" (", 1)[0], "label": label,
               "declared": seeds}
-    recorded = _paired_most(reference_fn) is None
+    recorded = _paired_most(dew_fn, reference_fn) is None
     if not plain or recorded:
         record["unsized"] = "its verdict is not the plain pair's" if not plain else "a recording's count"
     else:
@@ -1770,10 +1778,10 @@ def seeds_for(reference_fn, draw, label: str, *, start: int = FEWEST_SEEDS, most
     paired = dew_fn is not None
     refuse_rounded(label, reference_fn, truth_fn=truth_fn, followed=followed, conditioning=conditioning,
                    beside_dew=paired)
-    held = _paired_most(reference_fn, most, paired=paired)
+    held = _paired_most(dew_fn, reference_fn, most=most, paired=paired)
     if held is None:
-        raise ValueError(f"{label}: a recorded reference holds its recorded seeds alone, never a sizing's "
-                         f"from SIZING_FROM; its site keeps its recorded count")
+        raise ValueError(f"{label}: a recorded arm without pilots holds its recorded seeds alone, never a "
+                         f"sizing's from SIZING_FROM; its site keeps its recorded count")
     most = held
     if arms is None:
         _refuse_numpy_arms(draw, *([dew_fn] if paired else []), reference_fn)

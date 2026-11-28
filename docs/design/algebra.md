@@ -75,9 +75,9 @@ traces each surrogate's written bodies, not its pilot's generated functions.
   - `Protected`: the error-free transforms of `dew.nn.precision` (`two_sum`, `two_product`, `compensated_add`,
     `compensated_difference`; `compensated_sum` with its site's declaration, row 4026; `widened_reduction`'s
     widened path, a span of its own whatever its caller's)
-    and the numerics bodies of custom derivatives (§1.3). A protected span is a boundary no region crosses. At compile time it is one opaque leaf. At dev time
-    the generator may propose another form for it, which extraction admits only when its error estimate meets the
-    span's own (§1.5), and which lands only as reviewed generated code.
+    and the numerics bodies of custom derivatives (§1.3). A protected span is a boundary no region crosses: it is
+    opaque to both the compile-time pass and the dev-time search. The generator searches separately declared
+    stable forms (§1.5), whose results land only as reviewed generated code.
   - `Surrogate`: a declared surrogate gradient's forward or backward body (§1.3). Rules rewrite inside it, and no
     rule relates it to anything outside it.
   - `KernelGlue`: the XLA glue of a kernel's custom derivative around its Pallas launches, which rules rewrite as
@@ -103,10 +103,13 @@ reference's error, past the gate's 1.5).
 
 Dew holds 58 custom-derivative sites (the inventory of 2026-11-01, by class: 24 kernel, 26 numerics, 8 surrogate),
 and two more since, retired again: nGPT's join and normed hidden (`ngpt.stepped`, `ngpt.normed_hidden`, row
-1308) reversed in two passes only to restructure the norm's algebra (§0's example), and since row 11940 run as
-their formulas, every derivative JAX's: their contract (`test_ngpts_join_and_normed_hidden_hold_every_order`)
-holds every order finite against float64 at the normal, least-normal and largest edges with no rule of their
-own, so no hand-written algebra derivative is left in `src/dew`.
+1308) reversed in two passes only to restructure the norm's algebra (§0's example). Since row 11940 JAX
+differentiates `ngpt.stepped` and `ngpt.normed_hidden` as written, and neither declares a derivative rule, so no
+hand-written algebra derivative is left in `src/dew`. Both call `precision.l2_normed`, whose `Protected`
+range-safe tangent (a Numerics site, below) the pass leaves as written. Their contract
+(`test_ngpts_join_and_normed_hidden_hold_every_order`) checks every order finite at the normal, least-normal and
+largest input scales wherever the float64 reference is a normal float32, the plain formula is finite and no sum
+overflows (`tests/contract_support.py`).
 
 The engine sees through every site (a `Protected` body it reads and leaves as written): it rewrites inside each
 custom VJP's and JVP's forward and backward bodies, by the site's declared class:
@@ -118,8 +121,9 @@ custom VJP's and JVP's forward and backward bodies, by the site's declared class
   `nn.precision`'s compensated and correctly rounded functions, the recurrence algebra's decay prefix and readout,
   `exact_gelu`, the grouped projection's widened sums, among them): both bodies
   are `Protected`. They exist to restructure math for accuracy, often at a cost (the decay prefix costs 4–26% more
-  for 3.6–4.5 times less error), so no compile-time rule undoes them. At dev time the generator searches each
-  body's alternatives and proposes one only where its sampled error meets the body's own (§1.5).
+  for 3.6–4.5 times less error), so no compile-time rule undoes them. At dev time the generator searches the
+  alternatives of a body declared as a stable form (`generate.StableForm`; today §1.5's two acceptance cases,
+  no Numerics site's) and proposes one only where its sampled error meets the body's own (§1.5).
 - **Surrogate** (`Objective.with_gradients`' rules, node perturbation, the quantized convolution's
   straight-through backward, `rounded_operand`'s straight-through tangent, among them): a declared
   form, `surrogate(forward, derivative)` (row 3271), whose derivative is a rule, not the forward's. The engine
@@ -222,13 +226,14 @@ glue is (§6.2), reorderings over its values held by the dominance rule alone (�
 
 ### 1.5 Error-aware extraction
 
-Extraction picks the cheapest form whose error meets the precision policy's declared accuracy, as Herbie does for
-floating-point expressions:
+The generator takes the first candidate that meets the precision policy's declared accuracy, in the order below,
+as Herbie weighs error against cost for floating-point expressions:
 
 - **Error is a property of a candidate, not of an e-class.** The forms an e-class holds are equal in ℝ and differ
   in error, and a form's error depends on which form of each operand it reads, so the estimate belongs to a
-  concrete candidate: an extracted DAG, every child chosen. Extraction proposes candidates in order of price, and
-  each is measured before it is admitted (§6.5). Each program is proposed once: an extraction that prints as
+  concrete candidate: an extracted DAG, every child chosen. Extraction proposes candidates in order of price,
+  every uncompensated candidate before every compensated one, and each is measured before it is admitted
+  (§6.5). Each program is proposed once: an extraction that prints as
   an earlier candidate does (a variant that is the form as written) is the same measurement. Error is never an
   e-class fact.
 - **Dev time measures each candidate** by sampling: the candidate evaluated in its dtype against the declaration
@@ -240,8 +245,10 @@ floating-point expressions:
     and every other candidate as exact as it (§6.5; the gate is pairwise, so no single most accurate candidate
     is ranked, and none may be admitted; a proposal not as exact as the form as written, one past the
     float's range where it is finite, raises no bar).
-- **Among the candidates that meet it,** the generator takes the cheapest by time (§1.6). A candidate that
-  misses it is never chosen, however cheap.
+- **Among the candidates that meet it,** the generator takes the first in that order (§6.5): the cheapest by
+  time (§1.6) of the uncompensated ones, else a compensated one, tried in the price order of the uncompensated
+  forms they compensate (`Candidate.seconds` is the uncompensated form's price). A candidate that misses it is
+  never chosen, however cheap.
 - **At compile time no candidate is measured;** admission is by rounding class alone (§1.4).
 - **Stable rewrites** come mostly from dev time: `log(1 + x)` to `log1p(x)`, a KL in log space, a compensated or
   widened sum, `a − b` rearranged where `a` and `b` are near-equal sums. Two equal forms whose choice is decided by
@@ -336,8 +343,8 @@ fitted to them, and a rule set ships only with measured receipts.
   less; where a stage refuses or does not pay, the product is weighed with fewer (without its prologue,
   without its epilogue, alone), the stage left as the program wrote it, so a refused consumer leaves no
   product a plain dot (row 8996); so a plain JAX program compiled through Dew runs the templates its products
-  match (row 3450). A search that weighs a region's variants itself (row 9038's whole-layer search) reads them
-  through `fusion.regions` (each product region as the pass finds it, before `fused_program` sets aside those an
+  match (row 3450). A search that weighs a region's variants itself (row 9038's whole-layer search) reads them,
+  over one `fusion.Index` a body, through `fusion.regions` (each product region as the pass finds it, before `fused_program` sets aside those an
   attention or recurrence region holds), `fusion.fewer` (every region of fewer of its stages, the region itself
   not among them, in the order the pass weighs them, one walk with it), `fusion.analyzed` (the analysis the pass
   weighs a region by) and `fusion.product_form` (a product's form). A
@@ -493,7 +500,7 @@ All accuracy checks are the [accuracy gate](testing.md)'s, with no tolerance of 
 
 Draft, 2026-11-01. Every part of the work builds against this section, so a change to it is a change to the design.
 The engine runs egglog 14.0.0 (MIT; wheels for CPython 3.12–3.14 on Linux, macOS and Windows; on Linux Dew's
-own build of that release, 14.0.0.post1, from its package index), pinned exactly,
+own build of that release from its package index, the post release pyproject.toml pins), pinned exactly,
 because its Python API is still marked as subject to change.
 
 ### 6.1 Modules

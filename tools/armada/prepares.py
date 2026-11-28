@@ -201,7 +201,8 @@ def process(ci, python: str, file: str, group: str, verdict: Path, left: float, 
            wire.PREPARE_HOLDS: held_caps(ci) if capped else ""}
     # A dry prepare's tests run in as many processes as keep each under `RECYCLE_AT` (recycle.py).
     return ci.tested(python, [file], group, verdict, mine, cache, ci.session.GRACE, common,
-                     {"JAX_PLATFORMS": "cpu", wire.PREPARE: "1", "OMP_NUM_THREADS": threads,
+                     {"JAX_PLATFORMS": "cpu", wire.PREPARE: "1", wire.GPU_TIER: "1",
+                      "OMP_NUM_THREADS": threads,
                       **(VARIANTS["users"][1] if users else {}), wire.UNIT: unit, **cap, **(environ or {})},
                      recorded=recorded, variant=variant, kept=kept, judged=judged,
                      recycle_at=RECYCLE_AT if capped else None, written=written,

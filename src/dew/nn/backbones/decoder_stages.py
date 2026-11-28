@@ -12,11 +12,11 @@ from flax import linen as nn
 
 from dew.mesh import LayoutRefused
 
-from ..dense import captures_any_method
+from ..dense import QUANTIZATION, captures_any_method
 from ..host_memory import on_host
 from ..hyper_connections import Carried
 from ..precision import at_least_fp32
-from ..sharding import pipeline_stages
+from ..sharding import pipeline_stages, stage_sites
 from .decoder_stack import (
     PipelineStage,
     StackView,
@@ -43,6 +43,64 @@ def scanned() -> bool:
     from dew.nn.kernels.generation import Choice, chosen_kernel
 
     return chosen_kernel(Choice.LAYER_SCAN, "scanned") == "scanned"
+
+
+def _frozen_staged(decoder: CausalTransformer, view: StackView) -> tuple[str, ...]:
+    """The collections a one-stage stage-local run whose layers are all frozen (`DecoderBank.frozen`), its
+    scan's runs `view`, keeps on their stored layers to read in place (`LAYER_ROWS`), empty otherwise."""
+    sites = [site for site in stage_sites() if site.frozen]
+    if not sites:
+        return ()
+    path = decoder.path
+    if not any(site.view == view and len(site.namespace) >= len(path)
+               and (not path or site.namespace[-len(path):] == path)
+               for site in sites):
+        return ()
+    held = decoder.variables.get('params')
+    return (*(('params',) if held is not None and view.holds(held) else ()), *_packed_rows(decoder, view))
+
+
+def _packed_rows(decoder: CausalTransformer, view: StackView) -> tuple[str, ...]:
+    """`QUANTIZATION`, where a one-stage scan reads it a row an iteration where it lies (`LAYER_ROWS`) beside
+    a stage-local state's runs: where it holds the view's layers (packed frozen weights, `FROZEN_FP8`) and the
+    call updates none of it. A collection the call updates (a layer's calibration scale) stays on the scan's
+    own path, which carries what its layers write (train 1443's review: the rows read in place are bound
+    immutable, and a layer's write there was refused)."""
+    held = decoder.variables.get(QUANTIZATION)
+    return ((QUANTIZATION,) if held is not None and not decoder.is_mutable_collection(QUANTIZATION)
+            and view.holds(held) else ())
+
+
+def _one_stage(decoder: CausalTransformer, staged: tuple[str, ...], banked: tuple[str, ...], first: int,
+               end: int, span: tuple[int, int] | None) -> tuple[StackView, StageSplit] | None:
+    """One stage's view of the stack (`stack`) and its split: a stage-local state's runs as its scan reads
+    them (`stage_view`), else the scan's runs (`one_stage_runs`), a run whose every layer is frozen reading
+    them where they lie (`_frozen_staged`); None where every layer runs as the plain stack runs it."""
+    whole = StageSplit(0, decoder.num_layers, 0)
+    if staged:
+        if span is not None:
+            raise LayoutRefused(f"a loop over layers {span} runs part of the stack, and a stage-local "
+                                f"state holds whole runs; {list(staged)} arrived stacked")
+        # A stage-local state on one stage holds each run as the scan reads it (`stage_view`), its packed
+        # frozen weights read where they lie beside it (`_packed_rows`).
+        view = stage_view(decoder, 1)
+        packed = () if QUANTIZATION in staged else _packed_rows(decoder, view)
+        return dataclasses.replace(view, staged=(*staged, *packed)), whole
+    groups, periods = one_stage_runs(decoder, first, end, banked=bool(banked))
+    if span is not None and banked and not set(groups).issubset(decoder.groups):
+        raise LayoutRefused(f"a loop over layers {span} runs part of the stack, and a store banked "
+                            f"by run holds whole runs; {list(banked)} arrived banked")
+    if not any(count > 1 for _, count in groups) or (
+            not banked and 'streaming' not in decoder.variables and captures_any_method(decoder)):
+        # No run scans, or a caller's capture of any method may keep what no scan stacks (a method's
+        # non-array return, wherever its filter selects it): each layer runs as the plain stack runs it,
+        # as a loop's passes do under such a capture (`looping`).
+        return None
+    # A run whose every layer is frozen reads them where they lie, as a stage-local state's runs: past the
+    # one decision above of whether the stack scans at all (theme 74's review).
+    view = StackView(groups, banked=banked, periods=periods)
+    frozen = () if banked or span is not None else _frozen_staged(decoder, view)
+    return (dataclasses.replace(view, staged=frozen) if frozen else view), whole
 
 
 def stack(decoder: CausalTransformer, x, *, train: bool, decode: bool, per_layer_input,
@@ -111,26 +169,10 @@ def stack(decoder: CausalTransformer, x, *, train: bool, decode: bool, per_layer
         # (`decoder_cache._banked_runs`), each run's layers' under the run's name, as the run's scan
         # carries it; a cache handed in a layer at a time goes back so.
         banked = (*banked, 'cache')
-    if stages == 1 and staged:
-        if span is not None:
-            raise LayoutRefused(f"a loop over layers {span} runs part of the stack, and a stage-local "
-                                f"state holds whole runs; {list(staged)} arrived stacked")
-        # A stage-local state on one stage holds each run as the scan reads it (`stage_view`).
-        view, split = (dataclasses.replace(stage_view(decoder, 1), staged=staged),
-                       StageSplit(0, decoder.num_layers, 0))
-    elif stages == 1:
-        groups, periods = one_stage_runs(decoder, first, end, banked=bool(banked))
-        if span is not None and banked and not set(groups).issubset(decoder.groups):
-            raise LayoutRefused(f"a loop over layers {span} runs part of the stack, and a store banked "
-                                f"by run holds whole runs; {list(banked)} arrived banked")
-        if not any(count > 1 for _, count in groups) or (
-                not banked and 'streaming' not in decoder.variables and captures_any_method(decoder)):
-            # No run scans, or a caller's capture of any method may keep what no scan stacks (a method's
-            # non-array return, wherever its filter selects it): each layer runs as the plain stack runs it,
-            # as a loop's passes do under such a capture (`looping`).
+    if stages == 1:
+        if (chosen := _one_stage(decoder, staged, banked, first, end, span)) is None:
             return unrolled()
-        view, split = (StackView(groups, banked=banked, periods=periods),
-                       StageSplit(0, decoder.num_layers, 0))
+        view, split = chosen
     else:
         if prior_bank is not None:
             raise LayoutRefused("a looped pass reads the bank its pass before left in every layer, which "

@@ -194,8 +194,8 @@ def a_joined_layers_training_step_is_on_par(case: tuple[str, ...]) -> None:
         for joins, forms in ((True, {"beside", "chained"}), (False, set())):
             with generation.chosen(**unfused), row_joins("qkv", joins=joins), tuning.seen() as launches:
                 jax.eval_shape(with_gradients(layer.apply), *operands)
-            bound = {form for _, each in launches.taken for form in ("beside", "chained")
-                     if each.arguments.get(form)}
+            bound = {form for observed in launches for form in ("beside", "chained")
+                     if observed.arguments.arguments.get(form)}
             assert bound == forms, (joins, bound)
 
 

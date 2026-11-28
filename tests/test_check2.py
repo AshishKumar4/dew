@@ -27,6 +27,64 @@ def _named(value):
     return value.name if isinstance(value, jcore.Primitive) else None
 
 
+def test_an_unflushed_exp_keeps_a_subnormal_weight():
+    """An accurate exponential's enclosure (`interval_certificates.exp`) on a lane whose `exp` keeps
+    subnormals (`Lane.exp_flushes`, measured by `exp_flushes`): e^-88, a subnormal, holds its correct rounding
+    and refuses zero; where the lane's `exp` flushes, zero held beside it. A lane rounding correctly keeps
+    them, and one zeroing every subnormal flushes, its reach refused where it may not flush."""
+    x = np.asarray([-88.0])
+    exact = oc.exp_rounded(x, oc.FLOAT32)
+    for flushes in (False, True):
+        held = ic.exp(ic.point(x), ic.Lane(0, flushes=False, block=0, exp_reach=1, exp_flushes=flushes))
+        assert ic.within(exact, held).all() and bool(ic.within(np.zeros(1), held).all()) == flushes
+    def zeroed(x):
+        return np.where(_wide_exp(x) < 2.0 ** -126, 0.0, _wide_exp(x)).astype(np.float32)
+
+    assert not ic.exp_flushes(lambda x: _wide_exp(x).astype(np.float32)) and ic.exp_flushes(zeroed)
+    # A lane that may not flush (a native unapproximated exp): its zero at a subnormal refused, not measured.
+    ic.exp_reach(zeroed)
+    with pytest.raises(ArithmeticError):
+        ic.exp_reach(zeroed, flushes=False)
+
+
+def _wide_exp(x):
+    """`exp` of fp32 operands in float64, an fp32 cast of it rounding once more (NumPy's own float32 `exp`
+    lies two steps off)."""
+    return np.exp(np.asarray(x, np.float64))
+
+
+@pytest.mark.parametrize(("probe", "rounded", "wrong"), [
+    (ic.tanh_reach, np.tanh, np.float32(np.nan)), (ic.tanh_reach, np.tanh, np.float32(1.5)),
+    (ic.exp2_reach, np.exp2, np.float32(np.nan)), (ic.exp2_reach, np.exp2, np.float32(-1.0)),
+    (ic.exp2_reach, np.exp2, np.float32(np.inf)), (ic.exp_reach, _wide_exp, np.float32(np.nan)),
+    (ic.exp_reach, _wide_exp, np.float32(-1.0)), (ic.exp_reach, _wide_exp, np.float32(np.inf))])
+def test_a_reach_probe_refuses_a_result_no_rounding_gives(probe, rounded, wrong):
+    """A lane's tanh, exp2 or exp whose result at zero is no rounding of it (a quiet NaN, a tanh past 1, a
+    negative exponential, an infinite one where its value at 0 is 1) is refused before its reach is measured
+    (`interval_certificates.tanh_reach`, `exp2_reach`, `exp_reach`), never read as two billion grid steps;
+    the function rounded in fp32 is measured."""
+    def lane(x):
+        return np.where(x == 0, wrong, rounded(x).astype(np.float32))
+
+    assert probe(lambda x: rounded(x).astype(np.float32)) <= 1
+    with pytest.raises(ArithmeticError):
+        probe(lane)
+
+
+def test_an_exp2_reach_measures_a_lane_overflowing_where_its_rounding_does():
+    """Over (128, 129), where 2^x rounded in fp32 is infinite (`op_certificates.exp2_rounded`), an exp2
+    overflowing there is exact, its reach measured over the finite results (none), not refused; one finite
+    there, its last fp32 value, is refused (`interval_certificates.exp2_reach`)."""
+    def overflowing(x):
+        with np.errstate(over="ignore"):
+            return np.exp2(x).astype(np.float32)
+
+    assert ic.exp2_reach(overflowing, low=128.0, high=129.0) == 0
+    with pytest.raises(ArithmeticError):
+        ic.exp2_reach(lambda x: np.full(x.shape, np.finfo(np.float32).max, np.float32), low=128.0,
+                      high=129.0)
+
+
 def test_an_operation_is_its_primitive_and_another_bearing_its_name_is_refused():
     """Check 2 knows an operation by its primitive object: one of another library's or a user's that bears
     the name of JAX's `add`, and here even computes a sum, has no contract and is refused, where a lookup by

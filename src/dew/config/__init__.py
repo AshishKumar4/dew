@@ -42,6 +42,7 @@ from dew import _records, registry, training
 from dew._cleanup import attempted
 from dew._coordination import agree_process_phase, agreed, agreed_same
 from dew._files import write_atomically
+from dew._flags import implied_subcommand
 from dew._records import JSON
 from dew.checkpoints import RUN_FILE, Checkpoints
 from dew.checkpoints._step_records import saved_under
@@ -86,7 +87,6 @@ from dew.registry import (
     ModelConfig,
     declared_type,
     from_record,
-    implied_subcommand,
     member_fields,
     metrics,
     models,
@@ -339,7 +339,7 @@ def flag_subcommands(config: type, prefix: str = "", held: Configured = None) ->
                    else field.default_factory() if callable(field.default_factory)
                    else None if field.default is dataclasses.MISSING else field.default)
         # A default's own subcommand, which a flag of its fields given alone implies: a chosen record's
-        # (`dew.registry.implied_subcommand`), or the one member of its own class: `--optim.optimizer.b2 0.95`
+        # (`dew._flags.implied_subcommand`), or the one member of its own class: `--optim.optimizer.b2 0.95`
         # sets the default AdamW's. Members of one class apart by their defaults (`trainer.precision`'s
         # presets) imply none: the command line names one.
         implied = implied_subcommand(default) if default is not None else None
@@ -643,7 +643,7 @@ def _placed(config: "RunConfig | DataclassInstance", path: str, record: Mapping[
             held, kind = value, type(value)
         node = stated
     if isinstance(held, Bound):
-        # A command line's subcommand (`registry.record_flags`) is the record it makes: its plain flags are
+        # A command line's subcommand (`dew._flags.record_flags`) is the record it makes: its plain flags are
         # that record's bound arguments.
         held = held.recorded()
     if isinstance(held, Bound) and field not in _names(held):

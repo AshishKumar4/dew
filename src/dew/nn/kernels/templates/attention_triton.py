@@ -30,7 +30,6 @@ from dew.nn.kernels.templates import (
     axes,
     band,
     outputs,
-    report,
     resources,
 )
 from dew.nn.kernels.templates.attention import (
@@ -460,8 +459,7 @@ class TritonForward(AttentionLaunch, Template[Tiles]):
             # (`algebra.unfolded`) beside the call's own form, and a scaled walk beside its unscaled form
             # (`scaled`), so no two bodies share a name (`report.kernel_bodies`).
             rewalk = form.natural and not spec.natural
-            return report.named(f"attention_forward{'_natural' if rewalk else ''}"
-                                f"{'_scaled' if form.headroom else ''}")
+            return f"attention_forward{'_natural' if rewalk else ''}{'_scaled' if form.headroom else ''}"
 
         def launched(form: algebra.Forward, live: jax.Array | None, into=None):
             # The call in `form` (`algebra.walked_launches`' launch): its outputs and its rows' running
@@ -1250,7 +1248,7 @@ def _dq_launch(query, key, value, dout, peak, total, initial_term, maximum, key_
                                split=sums is not None, accurate=accurate, interpret=interpret)
     out = launches.pallas_call(
         kernel, grid=(queries // block_q, batch, heads), in_specs=in_specs, out_specs=out_specs,
-        out_shape=out_shape, interpret=interpret, name=report.named("attention_dq"),
+        out_shape=out_shape, interpret=interpret, name="attention_dq",
         compiler_params=plgpu.CompilerParams(num_warps=warps, num_stages=stages),
     )(*arrays)
     return tuple(out)
@@ -1324,7 +1322,7 @@ def _dkv_launch(query, key, value, dout, peak, total, anchor, delta, key_index, 
     out = launches.pallas_call(
         kernel, grid=(keys // block_k, batch, heads), in_specs=in_specs, out_specs=out_specs,
         out_shape=out_shape, input_output_aliases=aliases, interpret=interpret,
-        name=report.named("attention_dkv"),
+        name="attention_dkv",
         compiler_params=plgpu.CompilerParams(num_warps=warps, num_stages=stages),
     )(*arrays)
     return tuple(out)

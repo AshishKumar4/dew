@@ -31,6 +31,7 @@ from dew.nn.kernels.templates import (
     persistent,
     product,
     rings,
+    swizzling,
 )
 from dew.nn.kernels.templates.cost import Stated
 
@@ -144,8 +145,8 @@ class MxuIssuer(mosaic.Issuer[jax.Array]):
 
     def scalar_of(self, ref) -> jax.Array:
         # A scalar a core's scalar unit reads: its first entry copied into SMEM.
-        return pl.run_scoped(lambda held: (pltpu.sync_copy(ref.at[pl.ds(0, 1)], held), held[0])[1],
-                             pltpu.SMEM((1,), ref.dtype))
+        return swizzling.run_scoped(lambda held: (pltpu.sync_copy(ref.at[pl.ds(0, 1)], held), held[0])[1],
+                                    pltpu.SMEM((1,), ref.dtype))
 
     def keys_read(self, tile) -> tuple[jax.Array, int]:
         # A core's tile as it lies, its columns along its second axis.
@@ -312,7 +313,8 @@ class VmemRings(mosaic.Family[dict, Streams, jax.Array]):
         return pl.program_id(_GRID_NAMES.get().index(name))
 
     def program_scoped(self, body, *allocations, streams):
-        return pl.run_scoped(lambda *refs, **rings: body(*refs, streams=rings), *allocations, **streams)
+        return swizzling.run_scoped(lambda *refs, **rings: body(*refs, streams=rings), *allocations,
+                                    **streams)
 
     def roles(self, consumers: int, producer: int | None = None) -> handoffs.Schedule:
         _one(consumers)
@@ -412,7 +414,7 @@ class VmemRings(mosaic.Family[dict, Streams, jax.Array]):
 
             lax.fori_loop(0, (total - program + programs - 1) // programs, visit, 0)
 
-        pl.run_scoped(run, *self.output_staging(outputs, consumers, chunks))
+        swizzling.run_scoped(run, *self.output_staging(outputs, consumers, chunks))
 
     def walk[C](self, streams, segments, start: C, shapes: tuple, interpret: bool, *,
                 first: jax.Array | int = 0, in_flight: int = 0, initial: tuple | None = None,
@@ -509,7 +511,7 @@ class VmemRings(mosaic.Family[dict, Streams, jax.Array]):
             held[...] = held[...] + value.astype(held.dtype)
             pltpu.sync_copy(held, view)
 
-        pl.run_scoped(add, pltpu.VMEM(view.shape, view.dtype))
+        swizzling.run_scoped(add, pltpu.VMEM(view.shape, view.dtype))
 
 
 @dataclasses.dataclass(frozen=True)
@@ -523,8 +525,8 @@ MXU = Mxu()
 
 def _read(ref) -> jax.Array:
     """`ref`'s whole value through a scoped VMEM buffer of its shape (`pltpu.sync_copy`)."""
-    return pl.run_scoped(lambda held: (pltpu.sync_copy(ref, held), held[...])[1],
-                         pltpu.VMEM(ref.shape, ref.dtype))
+    return swizzling.run_scoped(lambda held: (pltpu.sync_copy(ref, held), held[...])[1],
+                                pltpu.VMEM(ref.shape, ref.dtype))
 
 
 def _one(consumers: int, *, clustered: bool = False) -> None:

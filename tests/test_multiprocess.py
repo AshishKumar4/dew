@@ -1483,6 +1483,43 @@ def test_a_pools_local_step_restores_into_a_template_holding_an_array_it_never_w
         assert report == {"refused": None, "made": [0.0, 1.0, 2.0], "as_written": True}, report
 
 
+PACKED_CHECKPOINT = Path(__file__).with_name("packed_checkpoint_worker.py")
+
+
+@pytest.mark.distributed
+@pytest.mark.parametrize("mode", ["local_packed", "local_packed_lost"], ids=["held", "lost"])
+def test_a_pools_local_step_restores_its_packed_matrices_and_refuses_a_foreign_form(tmp_path, mode):
+    """A pool's train state holding a frozen quantized collection (a bfloat16 window and an NVFP4 matrix,
+    each placed whole on the run's mesh) saved on the local tier alone at steps 1 and 2 and restored into
+    its template: each packed matrix its type, its form and every shard as written on every process, where
+    process 1 lost its local copy too (its matrices read from process 0's replica); the same step 2 with
+    its window under another encoder's form is refused by every process, each holding its digest, as it
+    reads it, where a control run's step 2 of the same matrices reads (row 13742; train 1431's review: the
+    refusal and its control differ in the digest alone)."""
+    reports = run_pool(mode, tmp_path / "out", 2, script=PACKED_CHECKPOINT, run_dir=tmp_path / "run",
+                       fsdp_size=2, local_dir=tmp_path / "local")
+    read = {"window": True, "nvfp4": True}
+    for report in reports:
+        assert report == {"read": read, "control": read, "first": read,
+                          "foreign": {"type": "ValueError", "phase": None, "named": None}}, report
+
+
+@pytest.mark.distributed
+def test_a_pipelines_stage_saves_and_restores_packed_matrices_its_other_rank_holds_none_of(tmp_path):
+    """A two-stage pipeline whose stages are each one process's devices, its frozen quantized collection on
+    the second stage's devices alone (process 0 holding no shard of its matrices or of their digests), saved
+    as a pipeline's rows held apart and restored into its template: each matrix as written where it is
+    held; a step whose window is under another encoder's form is refused on both processes, process 1 by
+    its digest's check and process 0, holding none of it, by the pool's agreement (row 13742)."""
+    reports = run_pool("stage_packed", tmp_path / "out", 2, script=PACKED_CHECKPOINT, devices=2,
+                       run_dir=tmp_path / "run")
+    assert [report["holds"] for report in reports] == [False, True], reports
+    assert [report["read"] for report in reports] == [{"window": True, "nvfp4": True}] * 2, reports
+    assert [report["foreign"] for report in reports] == [
+        {"type": "PeerFailure", "phase": "packed forms", "named": 1},
+        {"type": "ValueError", "phase": None, "named": None}], reports
+
+
 @pytest.mark.distributed
 def test_a_local_save_that_fails_in_the_background_ends_the_pool(tmp_path):
     """A process whose local checkpoint fails in orbax's background thread

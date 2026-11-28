@@ -610,8 +610,8 @@ def _summed_stored(family: mosaic.Family, sums: tuple, views: tuple, consumers: 
             across.summed_across(value, scratch, lax.axis_index("wg"), consumers,
                                  lambda summed: written(summed, stage))
 
-        pl.run_scoped(total, family.staged_memory(value.shape, jnp.float32),
-                      **across.summing(value.shape, consumers), collective_axes="wg")
+        swizzling.run_scoped(total, family.staged_memory(value.shape, jnp.float32),
+                             **across.summing(value.shape, consumers), collective_axes="wg")
 
 def _dkv_scoped(refs, *, widths: bool, staged: bool, vectors: bool) -> tuple:
     """The dK/dV program's allocations (`_dkv_allocations`) by role: its resident keys and values, dK's output

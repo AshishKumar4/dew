@@ -61,7 +61,7 @@ def rule_launches(module) -> list:
     beta = g.update(shape=g.shape[:3], dtype=jnp.bfloat16)
     with tuning.seen() as found:
         jax.make_jaxpr(both)(q, q, v, g, beta, h0, v)
-    return [ba for _, ba in found]
+    return [observed.keyed for observed in found]
 
 
 @pytest.mark.parametrize("module", [fla_gdn, fla_kda])
@@ -367,7 +367,7 @@ def _lowering(forward, shapes, traced: list):
     def lowered():
         with tuning.seen() as seen:
             program = jax.jit(forward).trace(*shapes).lower()
-        traced.append(seen.taken[0][0])
+        traced.append(seen[0].config)
         return program
 
     return lowered
@@ -1038,10 +1038,10 @@ def test_a_b200s_dense_kernel_gradient_runs_no_rewriting_role():
     with generation.chosen(grouped_matmul="mosaic"), generation.assumed("sm100"), tuning.seen() as seen:
         jax.jit(kernel_gradient).trace(*operands)
         target = generation.gpu_target()
-        assert seen.taken and all(op.legal(ba, config, target) for (op, _), (config, ba)
-                                  in zip(seen, seen.taken, strict=True)), seen.taken
+        assert seen and all(observed.op.legal(observed.arguments, observed.config, target)
+                            for observed in seen), seen
     # A warpgroup's 128 threads for each consumer the derivation chose and the producer's, none rewriting.
-    planned = {128 * (config.warpgroups + 1) for config, _ in seen.taken}
+    planned = {128 * (observed.config.warpgroups + 1) for observed in seen}
     with generation.chosen(grouped_matmul="mosaic"):
         found = kc.compile_mosaic_kernels([support.KernelCase("up kernel gradient",
                                                               lambda: (kernel_gradient, operands))], "sm100")
@@ -1327,7 +1327,7 @@ def test_an_amperes_dense_product_compiles_its_tile_within_its_registers():
     rows, weights = bf16((8192, 14336)), bf16((14336, 4096))
     with generation.assumed("sm80"), generation.chosen(grouped_matmul="mosaic"), tuning.seen() as launches:
         jax.eval_shape(lambda x, w: gemm.gemm(x, w, None, out_dtype=jnp.bfloat16), rows, weights)
-    [(tile, ba)] = launches.taken
+    [(tile, ba)] = [(observed.config, observed.arguments) for observed in launches]
     with generation.assumed("sm80"):
         model = _model(ba.op, ba, tile)
     case = support.KernelCase(f"llama-3-8b down forward {tile}", lambda: ba.op.lowering(ba, tile),
@@ -1462,9 +1462,9 @@ def test_a_hoppers_nvfp4_decode_tile_bands_its_columns_and_stages_unrestaged(dep
         with tuning.seen() as launches:
             jax.eval_shape(lambda lhs, held: gemm.nvfp4_product(lhs, held, out_dtype=jnp.bfloat16),
                            jax.ShapeDtypeStruct((rows, depth), jnp.bfloat16), held)
-        packed = [(op, config, ba) for (op, _), (config, ba) in zip(launches, launches.taken, strict=True)
-                  if isinstance(op, grouped_quantized.MosaicPackedGmm)]
-        assert packed, launches.taken
+        packed = [(observed.op, observed.config, observed.arguments) for observed in launches
+                  if isinstance(observed.op, grouped_quantized.MosaicPackedGmm)]
+        assert packed, launches
         for op, config, ba in packed:
             assert isinstance(config, tiling.Tiles), config
             swapped = op._swapped_tile(ba, target)
@@ -1644,8 +1644,8 @@ def test_an_mx_products_tile_holds_its_block_scale_rings_in_tensor_memory_too():
     product, specs = _mx_projection()
     with generation.assumed("sm100"), tuning.seen() as seen:
         lowered_for(product, specs, "sm100")
-    taken = [(op, config, ba) for (op, _), (config, ba) in zip(seen, seen.taken, strict=True)
-             if isinstance(op, grouped_quantized.MosaicMxGmm)]
+    taken = [(observed.op, observed.config, observed.arguments) for observed in seen
+             if isinstance(observed.op, grouped_quantized.MosaicMxGmm)]
     assert taken
     wide = tiling.Tiles(128, 256, 128, 2, 1, warpgroups=1, family="tcgen05")
     with generation.assumed("sm100"):

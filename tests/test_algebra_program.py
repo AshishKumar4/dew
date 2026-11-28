@@ -1745,7 +1745,7 @@ def test_a_held_body_rewritten_under_another_tile_pin_takes_that_pin():
         with (generation.assumed("sm90"), generation.chosen(grouped_matmul="mosaic"),
               tuning.pinned({grouped_matmul.MosaicGmm: tile}), tuning.seen() as launches):
             algebra.rewritten_program(closed)
-        taken = [config for config, _ in launches.taken]
+        taken = [observed.config for observed in launches]
         assert len(taken) == 1, taken
         assert [(config.block_n, config.stages) for config in taken if isinstance(config, tiling.Tiles)] == [
             (tile.block_n, tile.stages)], taken

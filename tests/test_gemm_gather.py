@@ -141,8 +141,7 @@ def a_gathered_product_is_on_par(interpret: bool = False, *, paired: bool = Fals
         assert_as_exact(jax.jit(through("mosaic")), jax.jit(through("xla")), draw,
                         f"a gathered grouped product: {variant or 'derived'}", seeds=SEEDS,
                         truth_fn=through("xla"), **library)
-    taken = [config for (op, _), (config, _) in zip(launches, launches.taken, strict=True)
-             if type(op) is grouped_matmul.MosaicGmm]
+    taken = [observed.config for observed in launches if type(observed.op) is grouped_matmul.MosaicGmm]
     assert taken and all(config == tiles for config in taken) if pinned else taken, taken
 
 
@@ -980,8 +979,9 @@ def test_a_refused_gathered_tile_leaves_its_launch_a_config_it_takes(depth):
               jax.ShapeDtypeStruct((2, depth, 512), bf16))
     with generation.assumed("sm90"), generation.chosen(grouped_matmul="mosaic"), tuning.seen() as launches:
         jax.make_jaxpr(paired)(*shapes)
-    [ba] = [bound for _, bound in launches.taken if bound.arguments.get("paired") is not None
-            and not bound.arguments.get("trans_rhs")]
+    [ba] = [observed.arguments for observed in launches
+            if observed.arguments.arguments.get("paired") is not None
+            and not observed.arguments.arguments.get("trans_rhs")]
     op = ba.op
     assert isinstance(op, grouped_matmul.MosaicGmm), op
     with generation.assumed("sm90"), report.refusals():

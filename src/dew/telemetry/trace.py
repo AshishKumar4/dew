@@ -35,6 +35,25 @@ xla/hlo/utils/hlo_query.cc's `IsCollectiveCommunicationOp` and the send and recv
 collectives take (`IsAsyncCollectiveStartOp`), each spelled as xla/hlo/ir/hlo_opcode.h prints it."""
 
 
+REDUCING = ("all-reduce", "reduce-scatter", "collective-reduce")
+"""The collectives (`COLLECTIVES`) that compute as they move data, reducing it; every other moves alone."""
+
+TRANSFERS = ("copy", "infeed", "outfeed")
+"""The HLO ops other than a collective that move data and compute none: a copy, and a host's infeed and
+outfeed."""
+
+
+def moves_only(op: str) -> bool:
+    """Whether the HLO op `op` (an opcode as XLA prints it) moves data and computes none, or runs half of one
+    (`<op>-start`, `<op>-done`): a transfer (`TRANSFERS`) or a collective (`collective`) that reduces nothing
+    (`REDUCING`). An `async-start` is none, its wrapped op unnamed by its opcode: a reader names it first
+    (`benchmark._opcodes`, from its module's typed instructions)."""
+    kind = collective(op)
+    if kind is not None:
+        return kind not in REDUCING
+    return op.removesuffix("-start").removesuffix("-done") in TRANSFERS
+
+
 def collective(op: str) -> str | None:
     """The collective (`COLLECTIVES`) HLO op `op` is, or runs half of; None for any other."""
     kind = op.removesuffix("-start").removesuffix("-done")

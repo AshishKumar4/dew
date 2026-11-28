@@ -27,7 +27,7 @@ from dew.data.dataset import rows_of
 from dew.distributed.batches import batch_layout, batch_shardings, batch_signature
 from dew.distributed.placement import Validation, allocated_bytes, placed_bytes, placed_shapes
 from dew.mesh import SEQUENCE_AXIS, TENSOR_AXIS
-from dew.nn.kernels.generation import assumed, gpu_mesh, gpu_target
+from dew.nn.kernels.generation import GpuTarget, assumed, gpu_mesh, gpu_target
 from dew.nn.kernels.options import (
     OuterProgram,
     abstract_signature,
@@ -48,6 +48,7 @@ from dew.training._candidates import (
     Stepping,
     _shaped,
     candidate_for,
+    copies_narrow,
     forget,
     forget_program,
     lowered_for,
@@ -1404,7 +1405,8 @@ class StepCompiler[L, E]:
             self.objective, mesh, self._xla_defaults, self._narrow, self._ns_group,
             None if self._base_rung is None
             else self._base_rung[1], resumed, remat=self.remat, ahead=self.ahead,
-            provisional=provisional, stated_remat=stated, unplaced=unplaced, executables=self._executables)
+            provisional=provisional, stated_remat=stated, unplaced=unplaced, executables=self._executables,
+            copies=copies_narrow(settings, state))
         if search.provisional:
             # Its programs held until a plan is taken in its place, or its run abandons it, even where it
             # refuses (`Unplaced.release`, `dew.training.ahead.LaterPlans`).
@@ -1540,7 +1542,7 @@ class StepCompiler[L, E]:
         _log.info("AutoPGLE's profile of a host step's %d trial steps (%d bytes) guided %d of its %d "
                   "accelerator programs", runs, len(profile), len(guided), len(ran))
 
-    def _lowered_host(self, stepping: Stepping, state: TrainState, batch: Batch, target: str
+    def _lowered_host(self, stepping: Stepping, state: TrainState, batch: Batch, target: str | GpuTarget
                       ) -> list[tuple[str, jax.stages.Lowered]]:
         """The host step's programs lowered for a GPU of the CUDA `target` this host is not (`lower_for`):
         built as `_compile_host` builds it, under the target's choices (`generation.assumed`) and over an
