@@ -371,6 +371,47 @@ def test_a_bf16_levels_nan_key_leaves_a_later_resets_decay_gradients_finite(over
     assert np.asarray(gradient, np.float32)[0, 67, 0] == 0, gradient
 
 
+def test_a_bf16_levels_nan_weight_leaves_a_later_resets_decay_gradient_finite():
+    """Level-7 bf16 reads (69 tokens) at tokens 67 and 68 of token 0's unit key and value, token 67's level-7
+    weight NaN and token 68's 1, decays of -80 at tokens 64 to 67, token 68 vanished: token 68's output zero
+    and its gradient by token 67's decay zero (token 68's output depends on none of it), token 67's NaN
+    reader zero in its product and its read none of its decay's operands, its NaN set once after, where its
+    NaN read entered the decay and the pullback's zero cotangent met it, NaN (train 1450's review)."""
+    weights = (jnp.zeros((1, 69, 1, levels(69)), jnp.float32).at[0, 67, 0, 7].set(jnp.nan)
+               .at[0, 68, 0, 7].set(1.0))
+    unit = _tokens(69, [0], [1.0])
+
+    def read(g):
+        out = log_linear_attention(_tokens(69, [67, 68], [1.0, 1.0]), unit, unit, g, weights, scale=1.0)
+        return out[0, 68, 0, 0].astype(jnp.float32)
+
+    g = jnp.zeros((1, 69, 1), jnp.float32).at[0, 64:68].set(-80.0).at[0, 68].set(-jnp.inf)
+    found, gradient = jax.value_and_grad(read)(g)
+    assert found == 0, found
+    assert np.asarray(gradient, np.float32)[0, 67, 0] == 0, gradient
+
+
+def test_a_bf16_levels_nan_key_beside_an_overflow_leaves_a_resets_decay_gradient_finite():
+    """A bf16 level-8 read (194 tokens) at tokens 192 and 193 by unit queries of token 0's NaN key and unit
+    value and token 1's key and value 2^70 (their memory 2^140, past fp32's range), decays of -80 at tokens
+    128 to 131, token 193 vanished: token 193's output zero and its gradient by token 131's decay zero, the
+    NaN key's rows zero in the held memory's decay and their NaN-ness carried apart, where the overflowed
+    memory the NaN exempted from its mask entered the decay and the reset's zero cotangent met it, NaN
+    (train 1450's review)."""
+    weights = jnp.zeros((1, 194, 1, levels(194)), jnp.float32).at[0, 192:194, 0, 8].set(1.0)
+    big = 2.0 ** 70
+    keys, values = _tokens(194, [0, 1], [jnp.nan, big]), _tokens(194, [0, 1], [1.0, big])
+
+    def read(g):
+        out = log_linear_attention(_tokens(194, [192, 193], [1.0, 1.0]), keys, values, g, weights, scale=1.0)
+        return out[0, 193, 0, 0].astype(jnp.float32)
+
+    g = jnp.zeros((1, 194, 1), jnp.float32).at[0, 128:132].set(-80.0).at[0, 193].set(-jnp.inf)
+    found, gradient = jax.value_and_grad(read)(g)
+    assert found == 0, found
+    assert np.asarray(gradient, np.float32)[0, 131, 0] == 0, gradient
+
+
 def test_a_bf16_levels_vanished_token_dominates_a_nan_gate_in_its_span():
     """A bf16 level-9 read (260 tokens) at token 259 of token 0's unit key and value, a NaN gate at 128 and a
     vanished token at 192 in the span between, decays of -80 at 256 to 259: zero, the vanished token
