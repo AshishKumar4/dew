@@ -1093,6 +1093,15 @@ TARGETS = {target.generation: target for target in (
               # In-kernel: a dependent lane reduction's 137.7 ns (FS-STEP-SECONDS1-g4, its two rounds 137.68
               # and 137.66).
               step_seconds=3.68e-6, kernel_step_seconds=137.7e-9,
+              # A step's latencies, the slope of a chain of 256 to 4,096 waited steps, its clock unlocked at
+              # 2.27 to 2.28 GHz (M-NG-69Lb-g4, tools' latencies chains at main a10579a293): mma.sync products
+              # (64 x 64 by 64 x N, each onto the last's register accumulator) 38.1 ns and 3.607 ns a column
+              # over N 64 to 256; a warpgroup barrier round trip 140.0 ns; a tile copied by TMA from device
+              # memory past an L2 eviction 476.5 ns and 12.90 ps a byte over 4 to 64 KiB (from L2, 199.5 ns
+              # and 13.71 ps), every fit within 2.5%.
+              # The Server Edition's alone: the Workstation parts' memory and clocks are their own.
+              measured={'NVIDIA RTX PRO 6000 Blackwell Server Edition': Measured(
+                  product=(38.08e-9, 3.607e-9), barrier=140.0e-9, copy=(476.5e-9, 12.90e-12))},
               # PCIe Gen5 x16 (the Server Edition's datasheet, 128 GB/s both ways).
               host_links={'NVIDIA RTX PRO 6000 Blackwell': 64e9}),
     # A TPU's host link is stated where a primary source states it: v6e's alone (below); the others stream

@@ -2196,11 +2196,14 @@ def _settle(found: Sequence[Observed], *, measurer: Measurer | None) -> int:
             op, ba = observed.launch
             group = calls[_distinct_key(observed)]
             fastest = None if (held := _timings_of(observed)) is None else _usable(held, group)
-            fresh = None
-            # Timed only where the placement it compiles at (its group's first call's, `_candidate_compiles`)
-            # chose it for the GPU attached.
-            if fastest is None and measuring is not None and _chosen_for(group[0].placed, measuring.target):
-                measured = measuring.measured(op, ba, group)
+            # Timed only at a call's placement that chose it for the GPU attached, whichever call traced
+            # first: that call first, its placement the one its candidates compile at
+            # (`_candidate_compiles`), every call's legality still read (`_measurable`).
+            timing = None if fastest is not None or measuring is None else next(
+                (call for call in group if _chosen_for(call.placed, measuring.target)), None)
+            if timing is not None and measuring is not None:
+                ordered = [timing, *(call for call in group if call is not timing)]
+                measured = measuring.measured(op, ba, ordered)
                 if not measured.prune_errors():
                     _log.warning("no config of %s compiled or ran; it keeps its heuristic: %s",
                                  type(op).__name__, next(iter(measured.values()), None))
@@ -2212,14 +2215,15 @@ def _settle(found: Sequence[Observed], *, measurer: Measurer | None) -> int:
                 timings = Timings({**(held.prune_errors() if held is not None else {}), **fresh})
                 identity, key = _launch_key(ba)
                 _TIMINGS.setdefault((identity, kind), _Picks())[key] = timings
+                # Stored at the placement they were measured at, its derivation theirs.
+                with _placed_in(timing.placed):
+                    timed[_launch_key(ba)] = _described(ba), fresh
                 fastest = _usable(timings, group)
             if fastest is None:
                 continue
             # Each entry made at its launch's placement, the derived config it carries its GPU's (`_entry`).
             with _placed_in(observed.placed):
                 decisions.append(_entry(ba, fastest))
-                if fresh is not None:
-                    timed[_launch_key(ba)] = _described(ba), fresh
         if timed and measuring is not None:
             measuring.store(kind, timed)
         return _picks_json(kind, decisions)

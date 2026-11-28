@@ -875,6 +875,39 @@ def test_a_launch_an_assumed_device_chose_is_timed_on_no_other_gpu(monkeypatch):
     assert tuning._settle([call], measurer=measurer) == 1
     assert (measured, stored) == ([], [])
     assert tuning._chosen_for(attached, here) and not tuning._chosen_for(assumed, here)
+    # One key traced both under an assumed RTX 4080 of 76 multiprocessors (whose space lacks one config and
+    # refuses another, `_Facted`) and as this host runs it, in either order: timed once, at the call the
+    # attached GPU's placement chose, its placement the one compiled at, over the configs both calls take
+    # (`_takes`: neither the one the assumed space lacks nor the one it refuses), the pick one of them and
+    # the timings stored (Train 1484's review: an assumed call traced first kept its peer from being timed).
+    with generation.assumed(dataclasses.replace(generation.gpu_target("NVIDIA GeForce RTX 4080"),
+                                                multiprocessors=76)):
+        restricted = tuning.Placement.current()
+
+    def timed_common(op, ba, calls):
+        measured.append(calls)
+        return tuning.Timings({config: _timed(1.0 + at) for at, config in enumerate(tuning._takes(calls))})
+
+    common = measurer._replace(measured=timed_common)
+    for order in ((restricted, attached), (attached, restricted)):
+        measured.clear()
+        stored.clear()
+        both = _facted_calls(*order)
+        kind, (op, key) = tuning._mesh_kind(attached), tuning._launch_key(both[0].keyed)
+        picks = both[0].op.get_autotuning_cache(kind)
+        try:
+            assert len({tuning._distinct_key(call) for call in both}) == 1
+            assert tuning._settle(both, measurer=common) == 0
+            [calls] = measured
+            assert [call.placed for call in calls] == [attached, restricted]
+            [fresh] = stored
+            _, timings = fresh[(op, key)]
+            assert set(timings) == set(tuning._takes(both))
+            assert {_Facted.REFUSED, _Facted.UNSPACED}.isdisjoint(timings)
+            assert picks[key].fastest_config in timings
+        finally:
+            tuning._TIMINGS.get((op, kind), {}).pop(key, None)
+            picks.pop(key, None)
     # A process's measurer is the device that runs the timing, whatever GPU the caller's mesh names: under an
     # RTX 4080's abstract mesh, this host's own device's facts, which that mesh's launches were not chosen
     # for (the k01-69 review: the mesh's catalog facts were read as the attached GPU's).
