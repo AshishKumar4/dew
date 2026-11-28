@@ -105,40 +105,25 @@ def per_row(factor: jax.Array, groups: jax.Array | None, rows: int) -> jax.Array
 
 
 FACTOR_RAISE = 62
-"""The power of two `int8_epilogue` raises a subnormal scale by on a flushing platform: the least
+"""The power of two `int8_epilogue` raises a subnormal scale by: the least
 (`2**-149`) into the normals (`2**-87`), the largest still below `2**-64`, so no product of it overflows that
 the plain one would not."""
 
 
-def flushing(software: Callable[..., jax.Array], native: Callable[..., jax.Array],
-             *operands: jax.Array) -> jax.Array:
-    """`software(*operands)` where the program runs on a platform whose float32 arithmetic flushes
-    subnormal operands and results to zero (XLA's CPU, row 4023, and TPU), `native(*operands)` elsewhere,
-    the platform the program lowers for deciding (`lax.platform_dependent`), not the one it is traced on
-    (row 13569: a program traced on a CUDA host and lowered for a CPU took the native multiply)."""
-    return jax.lax.platform_dependent(*operands, cpu=software, tpu=software, default=native)
-
-
 def int8_epilogue(product: jax.Array, peak: jax.Array, factor: jax.Array, shift: jax.Array) -> jax.Array:
-    """The int8-row ternary product's epilogue (`ternary.ternary_weight_product`): `product * peak * factor *
-    2**-shift` in `precision.twice_scaled`'s order and rounded once with its lowering
-    (`float_bits.lowered_rounded`); on a flushing platform (`flushing`) a subnormal `factor` raised by
-    `2**FACTOR_RAISE` from its bits and the last multiply exact and rounded once with the lowering
-    (`lowered_product`), so a subnormal scale survives (row 13340)."""
-    def software(product, peak, factor, shift):
-        binade = float_bits.binade_of(factor)
-        raised = jnp.where((binade < jnp.finfo(jnp.float32).minexp) & (binade > -1024),
-                           jnp.int32(FACTOR_RAISE), jnp.int32(0))
-        whole = float_bits.raised_exactly(factor, raised)
-        left, right = precision.twice_scaled_operands(product, peak, whole)
-        return lowered_product(left, right, shift + raised)
-
-    def native(product, peak, factor, shift):
-        left, right = precision.twice_scaled_operands(product, peak, factor)
-        return float_bits.lowered_rounded(left * right, shift)
-
+    """The int8-row ternary product's epilogue (`ternary.ternary_weight_product`, an XLA program after its
+    launch): `product * peak * factor * 2**-shift` in `precision.twice_scaled`'s order, a subnormal `factor`
+    raised by `2**FACTOR_RAISE` from its bits and the last multiply exact and rounded once with the lowering
+    (`lowered_product`), so a subnormal scale survives whatever the platform flushes: XLA's CPU and TPU
+    flush subnormals (row 4023), and so did a GH200's compiled program (row 14172: a column scale of 2^-127
+    read zero there, where each multiply alone kept it, M-NG-73)."""
     product, peak, factor = (jnp.asarray(each, jnp.float32) for each in (product, peak, factor))
-    return flushing(software, native, product, peak, factor, jnp.asarray(shift, jnp.int32))
+    binade = float_bits.binade_of(factor)
+    raised = jnp.where((binade < jnp.finfo(jnp.float32).minexp) & (binade > -1024),
+                       jnp.int32(FACTOR_RAISE), jnp.int32(0))
+    whole = float_bits.raised_exactly(factor, raised)
+    left, right = precision.twice_scaled_operands(product, peak, whole)
+    return lowered_product(left, right, jnp.asarray(shift, jnp.int32) + raised)
 
 
 def lowered_product(left: jax.Array, right: jax.Array, k: jax.Array | int) -> jax.Array:
@@ -176,27 +161,24 @@ def _linear_scaled(tangent: jax.Array, factor: jax.Array, raised: int = 0) -> ja
 
 
 def _scaled_value(raised: int, product: jax.Array, factor: jax.Array) -> jax.Array:
-    """`owed_exactly`'s value: where the platform flushes subnormals (`flushing`), `lowered_product`'s one
-    rounding, the owed power of two its exponent's, so a subnormal factor or result survives (no multiply of
-    a subnormal, which such a platform flushes: a packed matrix's scale of `2**-127`, row 13340; a tensor
-    scale of 2**-126 whose product is 2**-129, train 1403's review); elsewhere `owed_native`'s."""
+    """`owed_exactly`'s value, an XLA program's: `lowered_product`'s one rounding, the owed power of two its
+    exponent's, so a subnormal factor or result survives whatever the platform flushes (no multiply of a
+    subnormal: a packed matrix's scale of `2**-127`, row 13340; a tensor scale of 2**-126 whose product is
+    2**-129, train 1403's review; on a GH200 the native multiply's program read a column scale of 2^-127's
+    products as zero, where each multiply alone kept them, row 14172, M-NG-73)."""
     product, factor = jnp.broadcast_arrays(product.astype(jnp.float32), jnp.asarray(factor, jnp.float32))
-
-    def software(product, factor):
-        return lowered_product(product, factor, -raised)
-
-    return flushing(software, functools.partial(owed_native, raised=raised), product, factor)
+    return lowered_product(product, factor, -raised)
 
 
 def owed_native(product: jax.Array, factor: jax.Array, *, raised: int) -> jax.Array:
-    """`owed_exactly`'s value where the platform keeps subnormals (CUDA's float32, a launch's epilogue
-    `gemm.nvfp4_product` finishes with), rounded once: the plain multiply, the factor and the owed power of
-    two one multiplier where that is finite (a subnormal factor raised exactly), else the product times the
-    power of two, exact (a subnormal product raised; one it overflows is one whose owed product past a factor
-    of 2**(128 - raised) overflows too), then times the factor, rounded once (train 1450's review: the
-    product times the factor first rounded a subnormal one on the subnormal grid before the power raised
-    it). A power past fp32's (`raised` 128 or more, which no float32 multiplier holds) is
-    `lowered_product`'s one rounding in integer arithmetic."""
+    """`owed_exactly`'s value in a packed launch's epilogue alone (`gemm._packed_finish`, its kernel's float32
+    keeping subnormals; tests/test_gemm_nvfp4.py's GPU cells hold it to the exact finish), rounded once: the
+    plain multiply, the factor and the owed power of two one multiplier where that is finite (a subnormal
+    factor raised exactly), else the product times the power of two, exact (a subnormal product raised; one it
+    overflows is one whose owed product past a factor of 2**(128 - raised) overflows too), then times the
+    factor, rounded once (train 1450's review: the product times the factor first rounded a subnormal one on
+    the subnormal grid before the power raised it). A power past fp32's (`raised` 128 or more, which no
+    float32 multiplier holds) is `lowered_product`'s one rounding in integer arithmetic."""
     # The side's columns broadcast to the accumulator's tile explicitly (an epilogue's `[columns]` factor).
     product, factor = jnp.broadcast_arrays(product, jnp.asarray(factor, product.dtype))
     if not raised:
@@ -241,10 +223,11 @@ def scaled_exactly(product: jax.Array, factor: jax.Array) -> jax.Array:
 def owed_exactly(product: jax.Array, factor: jax.Array, raised: int) -> jax.Array:
     """`product * factor * 2**raised` (`raised` a whole exponent of at least 0, an owed power of two's: an
     NVFP4 decode's, `bits.NVFP4_OWED`) in fp32 rounded once, however large or small the factor, the result
-    or the power: natively by `owed_native`'s fold, where the platform flushes subnormals in integer
-    arithmetic (`lowered_product`, `_scaled_value`; train 1403's review: an NVFP4 column's tensor scale of
-    2**122 under its decode's 2**8 overflowed a folded multiplier; train 1450's: 2**128 overflowed the power
-    itself). Its derivative is the plain product's, each perturbed operand's term alone."""
+    or the power, in integer arithmetic on every platform (`lowered_product`, `_scaled_value`: an XLA program
+    whatever it flushes, row 14172; train 1403's review: an NVFP4 column's tensor scale of 2**122 under its
+    decode's 2**8 overflowed a folded multiplier; train 1450's: 2**128 overflowed the power itself); only a
+    packed launch's epilogue folds it natively (`owed_native`). Its derivative is the plain product's, each
+    perturbed operand's term alone."""
     return _scaled(raised, product, factor)
 
 

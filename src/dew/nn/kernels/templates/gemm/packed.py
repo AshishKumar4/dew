@@ -10,7 +10,7 @@ import dataclasses
 import functools
 import itertools
 from collections.abc import Callable
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import jax
 from jax import numpy as jnp
@@ -20,6 +20,9 @@ from jax.experimental.pallas import mosaic_gpu as plgpu
 
 from dew.algebra import bits
 from dew.nn.kernels.templates import product as product_formats, resources, swizzling
+
+if TYPE_CHECKING:
+    from dew.nn.kernels.templates.cost import Work
 
 NVFP4_GROUP = product_formats.NVFP4.depth * 32 // bits.E2M1.width
 """Dew: the depths an NVFP4 matrix's staged order groups (`nvfp4_staged_depth`): a block's depth of word rows
@@ -506,6 +509,15 @@ def rows_decoded(words, scales, interpret: bool, *, layout=None, fmt: str | None
     stream = (packed_lanes(words, fmt, interpret, layout=layout) if fmt is not None
               else lanes(words, scales, interpret, layout=layout))
     return jnp.concatenate([lane for _, _, lane in stream], axis=1)
+
+
+def nvfp4_decode_work() -> "Work":
+    """A staged NVFP4 value's decode (`lanes`), in the one cost vocabulary (`templates.cost.Work`): its
+    word's share of `bits.NVFP4_BFLOAT16_FORM`'s issues (eight codes a word) and its block's share of
+    `bits.E4M3_SCALE_FORM`'s (one scale a `product.NVFP4.depth` values), each pipe's (row 14106). The fp32
+    lanes' restore and the multiply by the scale are not counted."""
+    return (bits.NVFP4_BFLOAT16_FORM.work(bits.E2M1.width / 32)
+            + bits.E4M3_SCALE_FORM.work(1 / product_formats.NVFP4.depth))
 
 
 def lanes(words, scales, interpret: bool, *, layout=None):
