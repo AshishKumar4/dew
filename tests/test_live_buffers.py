@@ -356,6 +356,27 @@ def _loop_names(steps: int, config: str = _STATED) -> dict[str, tuple[str, ...]]
     return {buffer.instruction: buffer.names for buffer in read(assignment, module).live()}
 
 
+def test_a_stack_is_scoped_by_its_row_however_it_is_assigned():
+    """A viewed stack's buffer, whether its initial broadcast's aliased to the loop's element or the loop's
+    own element, is made by the row its body writes, in the row's rung scope, not by the broadcast or the
+    loop (train 1474's P-F3)."""
+    text = _LOOP.replace("STEPS", "4")
+    module = module_bytes(text)
+    defined = instruction_ids(module, "e")
+    assignment: Any = empty_assignment()
+    assignment.buffer_allocations.add(index=0, size=32)
+    peak = assignment.peak_buffers.add(index=0)
+    buffer = assignment.logical_buffers.add(id=0, size=32)
+    buffer.defined_at.instruction_id = defined["viewed"].id
+    alias = assignment.buffer_aliases.add(source_buffer_id=0)
+    alias.location.instruction_id = defined["loop"].id
+    alias.location.shape_index.append(8)
+    peak.logical_buffer_ids.append(0)
+    [aliased] = read(assignment, module).live()
+    assert (aliased.names, aliased.op_name) == (("viewed",), "jit(f)/jvp(g)/dew_rung/seen")
+    assert _defined_at_loop(text, (8,)) == {("viewed",): "jit(f)/jvp(g)/dew_rung/seen"}
+
+
 _VIEWED_OUTSIDE = (("  flat = f32[4,2]{1,0} parameter(0)\n  stack = f32[4,1,2]{2,1,0} bitcast(flat)",
                     "  stack = f32[4,1,2]{2,1,0} parameter(0)"),
                    ("fusion(flat, seen, i)", "fusion(wide, seen, i)"),

@@ -52,6 +52,7 @@ from dew.nn.kernels.options import abstract_signature, owned_program, trace_cont
 from dew.nn.moe import fixed_routers
 from dew.nn.precision import Numerics, at_least_fp32
 from dew.nn.programs import called, computed
+from dew.nn.protocols import UPDATE_SCOPE
 from dew.nn.sharding import constrained, rows_spec
 from dew.objectives.base import (
     EXAMPLE_STREAM,
@@ -375,9 +376,11 @@ def optimizer_update(optimizer: optax.GradientTransformation, gradient, opt_stat
         clipped = {"qk_stats": qk} if clips_qk(state) else {}
         return optimizer.update(gradient, state, params, **clipped)
 
-    if qk is not None and clips_qk(opt_state) and holds_back(opt_state):
-        return pooled_update(update, opt_state, params, qk)
-    return update(opt_state)
+    # Under its own scope, so a compile's live set tells its values (`UPDATE_SCOPE`).
+    with jax.named_scope(UPDATE_SCOPE):
+        if qk is not None and clips_qk(opt_state) and holds_back(opt_state):
+            return pooled_update(update, opt_state, params, qk)
+        return update(opt_state)
 
 
 def leaf_local(optimizer: optax.GradientTransformation, gradients, state, *, progressed: bool) -> bool:

@@ -383,26 +383,20 @@ class Assignment:
         # call's names its result alone, an unknown call's none of its elements.
         named = (instruction.frontend_attributes.map.get("checkpoint_name")
                  if _names_output(instruction, index) else None)
-        # A loop's state element: what its body writes into it, the buffer defined at the loop itself (its
-        # state's value past the loop, which XLA assigns apart from its initial element's) or at an
-        # instruction a loop's element aliases (row 12463: a scanned decoder's stacks, defined at its loop,
-        # read unnamed).
-        looped = (_loop_named(instruction, index[0], self.instructions, self.computations, ran=True)
-                  if not named and instruction.opcode == "while" and len(index) == 1 else None)
-        written = looped if named or looped is not None else _aliased_named(
-            self.aliases.get(buffer.id, ()), self.instructions, self.computations)
-        row_op = ""
-        if written is not None:
-            named, row_op = _value_named(written, self.instructions, self.computations)
+        # A loop's state element: the row its body writes into it, named and scoped as that row (`_looped`).
+        row = None if named else _looped(instruction, index, self.aliases.get(buffer.id, ()),
+                                         self.instructions, self.computations)
+        if row is not None:
+            named = row.name
         made, within, getter = _maker(instruction, index, self.instructions, self.computations)
         if not named and getter is not None:
             named = getter.frontend_attributes.map.get("checkpoint_name")
         if not named and _names_output(made, within):
             named = made.frontend_attributes.map.get("checkpoint_name")
-        # A stack's op is the row its loop writes, which its rung's scope names (row 12463: read as the
-        # loop's, a scanned decoder's stacks lay in no rung's scope, so no remat was priced to drop them).
-        op_name = ((row_op if looped is not None else "") or metadata.op_name or row_op
-                   or made.metadata.op_name)
+        # A stack's op is the row its loop writes, which its rung's scope names, however the stack is
+        # assigned (row 12463: read as the loop's or its initializer's, a scanned decoder's stacks lay in no
+        # rung's scope, so no remat was priced to drop them; train 1474's P-F3).
+        op_name = ((row.scope if row is not None else "") or metadata.op_name or made.metadata.op_name)
         return {"bytes": buffer.size, "shape": tuple(shape.dimensions),
                 "dtype": self.types.values_by_number[shape.element_type].name.lower(), "kind": kind,
                 "instruction": instruction.name, "op_name": op_name,
@@ -508,16 +502,32 @@ def _role(maker, index: tuple[int, ...]) -> str:
     return "workspace" if _cublas(maker) and last > 0 and index == (last,) else ""
 
 
-def _aliased_named(locations, instructions, computations):
-    """What a while loop's body writes into a state element a buffer is also at (its aliases' `locations`: a
-    while's output element), the first found (`_loop_named`); None where it is at none."""
-    for location in locations:
+class _Row(NamedTuple):
+    """The value a loop's body writes into a state element (`_looped`): its checkpoint name and the op that
+    names or makes it, the scope a remat rung reads it by."""
+
+    name: str | None
+    scope: str
+
+
+def _looped(instruction, index: tuple[int, ...], locations, instructions, computations) -> _Row | None:
+    """The row a loop's body writes into the state element a buffer holds, named and scoped as that row
+    (`_value_named`): the buffer defined at the loop itself (its state's value past the loop, which XLA
+    assigns apart from its initial element's), where the loop is stated to run, or at an instruction one of
+    the loop's elements aliases (its `locations`: a scan's stack broadcast before the loop); None where it
+    holds none (row 12463: a scanned decoder's stacks, read unnamed and in no rung's scope)."""
+    written = None
+    if instruction.opcode == "while" and len(index) == 1:
+        written = _loop_named(instruction, index[0], instructions, computations, ran=True)
+    for location in () if written is not None else locations:
         loop = instructions[location.instruction_id]
         if loop.opcode == "while" and len(location.shape_index) == 1:
             written = _loop_named(loop, location.shape_index[0], instructions, computations)
             if written is not None:
-                return written
-    return None
+                break
+    if written is None:
+        return None
+    return _Row(*_value_named(written, instructions, computations))
 
 
 class _Trips(NamedTuple):

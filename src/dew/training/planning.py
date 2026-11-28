@@ -947,15 +947,19 @@ class Parting:
     futile: bool = False
     """Whether a parted rung's miss measured parting to free nothing on some process (`measured`)."""
 
-    def after(self, rung: Rung, shortfall: int | None) -> Rung | None:
+    def after(self, rung: Rung, shortfall: int | None, updating: int | None = None) -> Rung | None:
         """`rung`, asked joined and missed by `shortfall` (None where it measured no miss), parted, where it
         is asked at once: every process's miss measured and within what parting frees, which no parted rung
-        measured to free nothing; None where its parted variant is deferred, or where the step joins no
-        stacks or its rung parts them already."""
+        measured to free nothing, and which is no more than the miss's peak holds of the update's own values
+        (`updating`, `LiveSet.updating`: the stacks are the update's, so a peak in the forward or the backward
+        holds none of them, and parting lowers no such peak; row 12463: a 4B cold start parted its stacks
+        against a 47 GiB miss its layers' residuals made); None where its parted variant is deferred, or
+        where the step joins no stacks or its rung parts them already."""
         if not self.estimate or rung.ns_group is not None:
             return None
         parted = dataclasses.replace(rung, ns_group=1)
-        if self.futile or any(self.gather(shortfall is None or shortfall > self.estimate)):
+        frees = self.estimate if updating is None else min(self.estimate, updating)
+        if self.futile or any(self.gather(shortfall is None or shortfall > frees)):
             self.deferred.append(parted)
             return None
         return parted
@@ -1578,8 +1582,7 @@ class FitSearch[LossT, EffectsT]:
             # so; a miss of it measures what parting freed against the joined rung's at the same split
             # (`Parting.measured`), none where either measured nothing there.
             at = named[self.asked.index(rung)]
-            joined = self.last_shortfall(at)
-            variant = parting.after(rung, None if joined is None else joined[1])
+            variant = parting.after(rung, *self.missed_with_update(at))
             if variant is None or variant in self.asked:
                 return None
             split = ask(variant, "the step does not fit the devices with its Newton-Schulz stacks joined; "
@@ -1732,11 +1735,15 @@ class FitSearch[LossT, EffectsT]:
                      if (split := tried(rung)) is not None), None)
 
     @staticmethod
-    def placed(start: Rung, rungs: Sequence[Rung]) -> list[Rung]:
+    def placed(start: Rung, rungs: Sequence[Rung], copies: bool = True) -> list[Rung]:
         """The places past `start` in the order a search reads them, the jump's (`jumped`) and the frontier's
         (`below`) alike: the start's copy-only release where it reads narrow copies, then each of `rungs`
         and, where it reads them, its form without them (train 1409: a frontier ordering fewer places than
-        the jump admits read a copy-free plan as none of its own)."""
+        the jump admits read a copy-free plan as none of its own). Where the step reads no copies
+        (`copies`, `FitSearch.copies`), a rung and its copy-free form lower one program: each is read once,
+        as it stands, and no release of copies none holds (row 14129: priced twice at a cold start)."""
+        if not copies:
+            return list(rungs)
         return [*([dataclasses.replace(start, narrow=False)] if start.narrow else []),
                 *(place for rung in rungs for place in
                   ((rung, dataclasses.replace(rung, narrow=False)) if rung.narrow else (rung,)))]
@@ -1826,6 +1833,17 @@ class FitSearch[LossT, EffectsT]:
                       if json.dumps(probe.rung, sort_keys=True) == rung), None)
         return None if split is None else (split, self.shortfall_at(rung, split))
 
+    def missed_with_update(self, rung: str) -> tuple[int | None, int | None]:
+        """The last miss `rung` measured (`last_shortfall`), and what its miss's peak held of the update's own
+        values (`LiveSet.updating`), each None where it measured none: what a rung's parting is read
+        against (`Parting.after`)."""
+        joined = self.last_shortfall(rung)
+        if joined is None:
+            return None, None
+        live = self.live.get((rung, joined[0]))
+        # Both a device's bytes: the miss is read per device already (`shortfall_at`), as a live set is.
+        return joined[1], None if live is None else live.updating()
+
     def shortfall_at(self, rung: str, split: int) -> int | None:
         """What the search fell short by at `rung` at `split`, None where it measured no miss there."""
         miss = self.misses.get((rung, split))
@@ -1861,7 +1879,8 @@ class FitSearch[LossT, EffectsT]:
         common one was asked; why is recorded (`jump`). Its compile is the judge (XLA schedules each place
         anew and recomputes what it drops), the climb going on past a miss."""
         ladder = self.ladder(start, narrow, ns_group, remat_set=self.remat_set, defaults=self.own_defaults())
-        places = self.placed(start, [rung for places in ladder for rung in places])
+        # Each place once where the step reads no copies (`placed`, row 14129).
+        places = self.placed(start, [rung for places in ladder for rung in places], self.copies)
         profiles = {split: live.profile for (rung, split), live in self.live.items()
                     if rung == begun and live.profile is not None}
         tiled = self.objective.tiled_logits if isinstance(self.objective, HeadedObjective) else None

@@ -967,6 +967,11 @@ COPIES_SCOPE = "dew_narrow_copies"
 """The name scope of a step's narrow copies of its parameters (`dew.training.narrow.narrowed`): the buffers a
 step reading none of them makes none of, read off a compile's live intervals as `HEAD_SCOPE`'s are."""
 
+UPDATE_SCOPE = "dew_update"
+"""The name scope a step's optimizer update runs under (`dew.training.transaction.optimizer_update`): the
+values its update makes (a Newton-Schulz iteration's joined stacks among them), read off a compile's live
+intervals as `COPIES_SCOPE`'s are (`dew.training.memory.LiveSet.updating`)."""
+
 RUNG_SCOPE = "dew_rung"
 """The name scope each decoder block's forward runs under at every rung, none included (`DecoderBlock`): the
 values a remat rung's checkpoint keeps or recomputes by its policy's names, which a compile's live set tells
