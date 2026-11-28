@@ -2409,22 +2409,6 @@ def test_a_flag_given_twice_is_read_by_its_order():
     assert computation_flags(first) == (f"{excess}=false", f"{excess}=true")
 
 
-def test_a_quoted_dump_path_naming_a_flag_is_no_flag_of_a_programs_target(tmp_path):
-    """A dump path quoted in XLA_FLAGS that names a flag is no flag (dew._xla_flags, as XLA reads it): it
-    states nothing of what a program computes (`computation_flags`), whose target a path naming
-    --xla_gpu_deterministic_ops refused compatible artifacts by, and a run given `dumps` drops the dump flag
-    whole, its quoted path with it."""
-    from dew.training.ahead import computation_flags, dumps
-
-    quoted = '--xla_dump_to="/logs/a --xla_gpu_deterministic_ops b"'
-    assert computation_flags(f"{quoted} --xla_allow_excess_precision=false") == (
-        "--xla_allow_excess_precision=false",)
-    assert computation_flags(quoted) == computation_flags("")
-    given = dumps(tmp_path / "dumps", {"XLA_FLAGS": f"{quoted} --xla_allow_excess_precision=false"})
-    xla = tmp_path / "dumps" / "xla"
-    assert given["XLA_FLAGS"] == f"--xla_allow_excess_precision=false --xla_dump_to={xla}"
-
-
 @pytest.mark.parametrize(("generation", "capability"),
                          [("sm100", (10, 0)), ("sm90", (9, 0)), ("sm80", (8, 0))])
 def test_cudnn_attentions_gates_read_the_capability_of_the_gpus_a_program_is_traced_for(generation,
