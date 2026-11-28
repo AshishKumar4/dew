@@ -180,24 +180,20 @@ def _float64_quotient(numerator: jax.Array, denominator: jax.Array) -> jax.Array
     divided once, and the quotient rounded once into fp32. Float64's 53 bits round a quotient of 24-bit
     operands as once (53 >= 2 x 24 + 2), its zeros, infinities and NaNs IEEE division's; the quotient of two
     fp32 values is zero, special or a normal float64 (at least 2^-277), so no step reads or makes a value a
-    CPU flushes. Both operands reach it at the quotient's shape (a batched division's divisor arrives of unit
-    axes) past an optimization barrier, which no fusion crosses: XLA keeps it a division (it rewrites one by
-    a broadcast or a constant as a product by the rounded reciprocal, openxla/xla#51148, whose second
-    rounding, even in float64, misses a tie on the subnormal grid: `147 * 2^-149 / 98` is `1.5 * 2^-149`),
-    and each operand is read as the one value its other readers read, as `software_divide`'s error-free
-    steps read theirs (`precision.uncontracted`): its producer fused into the division's widening, a
-    multiply-add contracted there and rounded apart elsewhere, read two values of one operand (theme 85's
-    return: a kdpm2 scheduler's gradient 1.65 times the reference's error, and a streamed SD pipeline's
-    images a few ulps off its whole run's). A normal fp32
+    CPU flushes. The divisor reaches the division at the quotient's shape (a batched division's arrives of
+    unit axes) past an optimization barrier, so XLA keeps it a division: it rewrites one by a broadcast or a
+    constant as a product by the rounded reciprocal (openxla/xla#51148), whose second rounding, even in
+    float64, misses a tie on the subnormal grid (`147 * 2^-149 / 98` is `1.5 * 2^-149`). A normal fp32
     quotient is the conversion's; one below fp32's least normal, which XLA:CPU's conversion flushes, is its
     magnitude scaled onto the subnormal grid (times 2^149, exact) and rounded to the nearest integer, ties to
     even (`rint`): the result's bits, signed as the quotient is. A CPU's float64 is IEEE's whole, which a
     GPU's is at a fraction of its fp32 rate and a TPU's is not, so every other backend divides by
     `software_divide`."""
-    numerator, denominator = jax.lax.optimization_barrier(jnp.broadcast_arrays(numerator, denominator))
+    numerator, denominator = jnp.broadcast_arrays(numerator, denominator)
     wide = jnp.dtype(jnp.float64)
     with jax.enable_x64(new_val=True):
-        quotient = _widened_bits(numerator, wide) / _widened_bits(denominator, wide)
+        divisor = jax.lax.optimization_barrier(_widened_bits(denominator, wide))
+        quotient = _widened_bits(numerator, wide) / divisor
         magnitude = jnp.abs(quotient)
         below = magnitude < np.float64(2.0 ** -126)
         # Normal quotients held at zero here, so no conversion of one past the grid's range is read.
