@@ -225,12 +225,16 @@ def _levels_above(query, key, value, g, weights, *, within):
     return out[:, :length]
 
 
+PLAIN, GUARDED = False, True
+"""`_product`'s forms: the plain product, or each term a zero factor annihilates."""
+
+
 def _read(readers, held):
     """Each reader's read of its chunk's held memory, `[B, G, n, r, E, t, P]` (the product's own layout): the
     plain product (`_product`), its derivatives each term a zero factor annihilates, so an overflowed reader
     (an infinite one its finite query and weight formed) meets another output's zero cotangent as zero, not
     `inf * 0` (train 1455's review), its finite channels' partials kept (train 1466's)."""
-    return _product('bgnretk,bgnrepk->bgnretp', False, None, readers, held)
+    return _product('bgnretk,bgnrepk->bgnretp', PLAIN, None, readers, held)
 
 
 def _transposed_spec(spec: str, side: int) -> str:
@@ -242,10 +246,12 @@ def _transposed_spec(spec: str, side: int) -> str:
 
 
 def _signs(x):
-    """`x`'s stored signs, `(positive, negative, NaN)` masks: a value's sign bit and nonzero stored word (a
-    subnormal a flushing comparison reads as zero is no zero)."""
-    stored = ~float_bits.stored_zero(x) & ~jnp.isnan(x)
-    return stored & ~jnp.signbit(x), stored & jnp.signbit(x), jnp.isnan(x)
+    """`x`'s stored signs, `(positive, negative, NaN)` masks: a value's sign field and its nonzero stored
+    fields (`scan.stores_zero`: a subnormal a flushing comparison reads as zero is no zero)."""
+    _, sign, _, _ = float_bits.raw_fields(x)
+    nan = jnp.isnan(x)
+    stored = ~scan.stores_zero(x) & ~nan
+    return stored & (sign == 0), stored & (sign != 0), nan
 
 
 def _product_value(spec: str, guarded: bool, placement, a, b):
@@ -297,7 +303,7 @@ def _product_tangent(spec: str, guarded: bool, placement, primals, tangents):
 
     def applied(held, moving):
         a, b = held
-        terms = [_product(spec, True, placement, *((direction, b) if side == 0 else (a, direction)))
+        terms = [_product(spec, GUARDED, placement, *((direction, b) if side == 0 else (a, direction)))
                  for side, direction in zip(live, moving, strict=True)]
         return functools.reduce(jnp.add, terms)
 
@@ -308,7 +314,7 @@ def _product_tangent(spec: str, guarded: bool, placement, primals, tangents):
             typed = jax.ShapeDtypeStruct(aval.shape, aval.dtype, sharding=aval.sharding,
                                          manual_axis_type=aval.mat)
             placed = sharding.explicit_placement(aval)
-            product = _product(_transposed_spec(spec, side), True, placed, *operands)
+            product = _product(_transposed_spec(spec, side), GUARDED, placed, *operands)
             return sharding.summed_like(product, typed).astype(typed.dtype)
         return tuple(pulled(side) for side in live)
 

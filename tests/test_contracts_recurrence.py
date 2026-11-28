@@ -417,7 +417,7 @@ def test_a_guarded_product_holds_every_order(edge):
                                                  scale=EDGES[edge])
 
     def product(a, b):
-        return log_linear._product('btk,bpk->btp', False, None, a, b)
+        return log_linear._product('btk,bpk->btp', log_linear.PLAIN, None, a, b)
 
     def einsum(a, b):
         return jnp.einsum('btk,bpk->btp', a, b)
@@ -439,7 +439,7 @@ def test_a_guarded_products_terms_survive_as_their_stored_factors_say(a, b, expe
     head review)."""
     from dew.nn.kernels import log_linear
 
-    found = log_linear._product('tk,pk->tp', True, None, jnp.asarray([a], jnp.float32),
+    found = log_linear._product('tk,pk->tp', log_linear.GUARDED, None, jnp.asarray([a], jnp.float32),
                                 jnp.asarray([b], jnp.float32))
     np.testing.assert_array_equal(np.asarray(found), np.asarray([[expected]], np.float32))
 
@@ -451,7 +451,7 @@ def test_a_plain_products_tangent_along_a_zero_direction_keeps_its_finite_channe
     from dew.nn.kernels import log_linear
 
     a = jnp.asarray([[np.inf, 2.0]], jnp.float32)
-    _, found = jax.jvp(lambda b: log_linear._product('tk,pk->tp', False, None, a, b),
+    _, found = jax.jvp(lambda b: log_linear._product('tk,pk->tp', log_linear.PLAIN, None, a, b),
                        (jnp.ones((1, 2), jnp.float32),), (jnp.asarray([[0.0, 1.0]], jnp.float32),))
     assert found[0, 0] == 2, found
 
@@ -471,10 +471,10 @@ def test_a_guarded_products_transpose_contracts_an_explicitly_split_axis():
         a = jax.device_put(np.ones((1, 1, 1), np.float32), NamedSharding(mesh, P()))
         b = jax.device_put(np.ones((1, 2, 1), np.float32), NamedSharding(mesh, P(None, "value", None)))
         def total(a):
-            return jnp.sum(log_linear._product('btk,bpk->btp', False, None, a, b))
+            return jnp.sum(log_linear._product('btk,bpk->btp', log_linear.PLAIN, None, a, b))
 
         found = jax.jit(jax.grad(total))(a)
-    assert found.sharding.spec == P(), found.sharding
+    assert found.sharding.is_fully_replicated, found.sharding
     np.testing.assert_array_equal(np.asarray(found), np.full((1, 1, 1), 2.0, np.float32))
 
 

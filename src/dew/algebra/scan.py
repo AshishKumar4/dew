@@ -1750,12 +1750,15 @@ def _scaled_exp_tangent(primals, tangents):
     return out, _linear_tangent(primals, tangents, out, moved, pulled)
 
 
-def _stores_zero(x) -> jax.Array:
-    """Whether `x` stores a zero (`float_bits.stored_zero`: a subnormal a flushing comparison reads as zero is
-    none), a complex value's both parts (a complex direction of `scaled_exp`'s; train 1466's review)."""
+def stores_zero(x) -> jax.Array:
+    """Whether `x` stores a zero, read from its exponent and fraction fields (`float_bits.raw_fields`, as a
+    scaled value's subnormal is: a subnormal a flushing process's comparison reads as zero is none, a masked
+    word's compare against zero a compiler may fold to one), a complex value's both parts (a complex
+    direction of `scaled_exp`'s; train 1466's review)."""
     if jnp.iscomplexobj(x):
-        return float_bits.stored_zero(jnp.real(x)) & float_bits.stored_zero(jnp.imag(x))
-    return float_bits.stored_zero(x)
+        return stores_zero(jnp.real(x)) & stores_zero(jnp.imag(x))
+    _, _, biased, fraction = float_bits.raw_fields(x)
+    return (biased == 0) & (fraction == 0)
 
 
 def _times_decayed_value(exponent, value, *factors):
@@ -1764,7 +1767,7 @@ def _times_decayed_value(exponent, value, *factors):
     decayed value times a zero cotangent or direction, `inf * 0`, was NaN: a reset's zero cotangent met
     an overflowed read's decay, train 1455's review)."""
     product = functools.reduce(jnp.multiply, factors, _scaled_exp(value, exponent))
-    vanishing = functools.reduce(jnp.logical_or, map(_stores_zero, factors), jnp.zeros((), bool))
+    vanishing = functools.reduce(jnp.logical_or, map(stores_zero, factors), jnp.zeros((), bool))
     return jnp.where(vanishing, jnp.zeros_like(product), product)
 
 
