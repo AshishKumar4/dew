@@ -795,11 +795,11 @@ class Mosaic(base.Template[mainloop.Tiles]):
     def _stepped(self, ba: tokamax.BoundArguments, joined: mainloop.Tiles, spilled: frozenset[str],
                  target: generation.GpuTarget) -> mainloop.Tiles | None:
         """`joined`'s next rung for its `spilled` launches: their producers a rung down their ladders
-        (`_raised`), or, past a ladder's foot or where every rung left gives their consumers less
-        (`_consumers_spilled`), those launches a program fewer a multiprocessor with their producers at the
-        least again (`_fewer`), whose ladders then run at that residency; past one program, or on a launch
-        that moves no registers, one that walks a key block of its own at half of it (`_narrowed`); None
-        past those."""
+        (`_raised`), or, past a ladder's foot, where every rung left gives their consumers less
+        (`_consumers_spilled`) or on a launch that moves no registers, those launches a program fewer a
+        multiprocessor, a producer's at the least again (`_fewer`), whose ladders then run at that residency;
+        past one program, one that walks a key block of its own at half of it (`_narrowed`); None past
+        those."""
         if not self._consumers_spilled(ba, joined, spilled, target) and (
                 raised := self._raised(ba, joined, spilled, target)) is not None:
             return _limited(joined, producers=raised, residents=joined.residents, keys=joined.keys)
@@ -825,19 +825,27 @@ class Mosaic(base.Template[mainloop.Tiles]):
 
     def _fewer(self, ba: tokamax.BoundArguments, joined: mainloop.Tiles, spilled: frozenset[str],
                target: generation.GpuTarget) -> mainloop.Tiles | None:
-        """`joined` with its `spilled` launches whose producers' ladders ran out (`_moving`: a launch that
-        moves no registers has no ladder, and its tiles are refused as before) a program fewer a
+        """`joined` with its `spilled` launches (each kernel's own, `_owners`) a program fewer a
         multiprocessor than they plan now (`resources.Residents.fewer`), each the fewest its instances plan
-        (the training call's and the forward alone's, each at its own tiles), their producers at the least;
-        None where one plans one program already. Every role of a launch takes a larger share there, where
-        the assembler may hold what no rung of its producer's ladder gave its consumers (row 6718)."""
+        (the training call's and the forward alone's, each at its own tiles), the producers of those whose
+        ladders ran out (`_moving`) at the least; None where one plans one program already. Every role of a
+        launch takes a larger share there, where the assembler may hold what no rung of its producer's ladder
+        gave its consumers (row 6718); a launch that moves no registers has no producer's ladder, and the
+        share its residency plans is its every thread's (`mainloop.launch_kernel`): Kimi's key-scores backward
+        on an sm90, three `[C, C]` accumulators at 128 registers, spilled 176 bytes under JAX 0.12.1's
+        lowering where 0.12.0's held, and with no rung its training derived no tiles (row 14169)."""
+        launches = (*self.launches(ba, joined, target, backward=True),
+                    *self.launches(ba, joined.forward or joined, target, backward=False))
+        owned = _owners(spilled, launches)
         planned: dict[str, int] = {}
-        for launch in self._moving(ba, joined, spilled, target):
-            planned[launch.name] = min(planned.get(launch.name, launch.resident), launch.resident)
+        for launch in launches:
+            if launch.name in owned:
+                planned[launch.name] = min(planned.get(launch.name, launch.resident), launch.resident)
         residents = joined.residents.fewer(planned) if planned else None
         if residents is None:
             return None
-        return _limited(joined, producers=joined.producers.without(planned), residents=residents,
+        moving = {launch.name for launch in self._moving(ba, joined, spilled, target)}
+        return _limited(joined, producers=joined.producers.without(moving), residents=residents,
                         keys=joined.keys)
 
     def _narrowed(self, ba: tokamax.BoundArguments, joined: mainloop.Tiles, spilled: frozenset[str],
