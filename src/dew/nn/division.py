@@ -1,7 +1,8 @@
 """fp32 division correctly rounded on every backend (`correctly_rounded_divide`, a primitive of its own,
-`correctly_rounded_divide_p`), however far below the normal range (`lowered_divide`), its derivatives
-dividing as it does (the denominator's by `binades.over_denominator`), and PyTorch's division by a rate
-(`divided`): `dew.nn.precision`'s division, which it re-exports."""
+`correctly_rounded_divide_p`: in float64 on a CPU, `software_divide` elsewhere), however far below the
+normal range (`lowered_divide`), its derivatives dividing as it does (the denominator's by
+`binades.over_denominator`), and PyTorch's division by a rate (`divided`): `dew.nn.precision`'s division,
+which it re-exports."""
 
 from __future__ import annotations
 
@@ -10,12 +11,20 @@ import functools
 import jax
 import jax.numpy as jnp
 import numpy as np
+from jax._src import dispatch
 from jax.extend import core
 from jax.interpreters import ad, batching, mlir
 
 from dew.nn.binades import over_denominator, stood_in
 from dew.nn.derivatives import Protected, bound_span, contracted
-from dew.nn.float_bits import exact_power2, float_bits, lowered_rounded, quiet_nan_bits, raw_fields
+from dew.nn.float_bits import (
+    _widened_bits,
+    exact_power2,
+    float_bits,
+    lowered_rounded,
+    quiet_nan_bits,
+    raw_fields,
+)
 from dew.nn.programs import UNROUNDED, register_entrywise
 
 
@@ -43,7 +52,8 @@ def software_divide(numerator: jax.typing.ArrayLike,
     Every step is a bit operation or a float32 operation on normal values, about 140
     operations a quotient where frexp's and nextafter's own special cases took 210
     (row 6312). It is the lowering of a primitive of its own
-    (`correctly_rounded_divide`), so no pass sees its error-free steps to reassociate them.
+    (`correctly_rounded_divide`) on every backend but a CPU's (`_float64_quotient`) and
+    in a Mosaic GPU kernel, so no pass sees its error-free steps to reassociate them.
     """
     return _divided(numerator, denominator)
 
@@ -204,13 +214,49 @@ numerator `ct / d`. As `jnp.divide`'s, they divided as XLA does: by the divisor'
 is a constant or a broadcast on a CPU (openxla/xla#51148) and off IEEE on 30 to 50% of quotients on a GPU, so
 a quantizer's scale or a rate's gradient left the reference's by an ulp on a third of its entries (row
 5277). It is entrywise (`dew.nn.programs.register_entrywise`), which the analyses of a program's entries
-read."""
-correctly_rounded_divide_p.def_impl(software_divide)
+read. Run eagerly it is one dispatch of its lowering, as JAX's own operations are: its software form run
+eagerly was a program for each of its operations (row 14078: 1,964 programs compiled for one eager loss)."""
+correctly_rounded_divide_p.def_impl(functools.partial(dispatch.apply_primitive, correctly_rounded_divide_p))
 # Its result is typed as JAX types its own division's: the operands' broadcast shape, their dtype, and
 # their sharding and varying axes, which a mesh's Explicit axis carries in a value's type.
 correctly_rounded_divide_p.def_effectful_abstract_eval(jax.lax.div_p.abstract_eval)
 mlir.register_lowering(correctly_rounded_divide_p,
                        mlir.lower_fun(software_divide, multiple_results=False))
+
+
+def _float64_quotient(numerator: jax.Array, denominator: jax.Array) -> jax.Array:
+    """`correctly_rounded_divide`'s quotient on a CPU, `software_divide`'s correctly rounded result and NaN
+    class in a fifth of its operations (row 14078: a program of 64 divisions 34,178 StableHLO operations
+    against 7,106; a NaN's payload is the CPU's float64 division's): each fp32 operand widened into float64
+    exactly (`float_bits._widened_bits`, a subnormal from its fraction, which XLA:CPU's conversion flushes),
+    divided once, and the quotient rounded once into fp32. Float64's 53 bits round a quotient of 24-bit
+    operands as once (53 >= 2 x 24 + 2), its zeros, infinities and NaNs IEEE division's; the quotient of two
+    fp32 values is zero, special or a normal float64 (at least 2^-277), so no step reads or makes a value a
+    CPU flushes. The divisor reaches the division at the quotient's shape (a batched division's arrives of
+    unit axes) past an optimization barrier, so XLA keeps it a division: it rewrites one by a broadcast or a
+    constant as a product by the rounded reciprocal (openxla/xla#51148), whose second rounding, even in
+    float64, misses a tie on the subnormal grid (`147 * 2^-149 / 98` is `1.5 * 2^-149`). A normal fp32
+    quotient is the conversion's; one below fp32's least normal, which XLA:CPU's conversion flushes, is its
+    magnitude scaled onto the subnormal grid (times 2^149, exact) and rounded to the nearest integer, ties to
+    even (`rint`): the result's bits, signed as the quotient is. A CPU's float64 is IEEE's whole, which a
+    GPU's is at a fraction of its fp32 rate and a TPU's is not, so every other backend divides by
+    `software_divide`."""
+    numerator, denominator = jnp.broadcast_arrays(numerator, denominator)
+    wide = jnp.dtype(jnp.float64)
+    with jax.enable_x64(new_val=True):
+        divisor = jax.lax.optimization_barrier(_widened_bits(denominator, wide))
+        quotient = _widened_bits(numerator, wide) / divisor
+        magnitude = jnp.abs(quotient)
+        below = magnitude < np.float64(2.0 ** -126)
+        # Normal quotients held at zero here, so no conversion of one past the grid's range is read.
+        units = jnp.rint(jnp.where(below, magnitude, 0.0) * np.float64(2.0 ** 149)).astype(jnp.uint32)
+        sign = jnp.signbit(quotient).astype(jnp.uint32) << np.uint32(31)
+        subnormal = jax.lax.bitcast_convert_type(units | sign, jnp.float32)
+        return jnp.where(below, subnormal, quotient.astype(jnp.float32))
+
+
+mlir.register_lowering(correctly_rounded_divide_p, mlir.lower_fun(_float64_quotient, multiple_results=False),
+                       platform="cpu")
 
 
 @functools.cache
