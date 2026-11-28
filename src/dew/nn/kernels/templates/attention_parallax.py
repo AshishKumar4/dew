@@ -155,8 +155,8 @@ def exp_scaled(z: jax.Array, exponent: jax.Array, power) -> jax.Array:
     `2^254`, `2^-115`, where applying the power after the decay read 0. Its value takes a tiny fp32 `z` from
     its bits (`raised_exactly`), so a subnormal is no operand a flushing multiply reads (XLA's CPU), and
     halves only `|z| >= 1` against `e^f`'s overflow: halving `2^-149` first read it 0, which `2^149` then
-    raised to 0, not 1 (train 1478's K-F2). Its derivative at every order the halved form's (`_halved`,
-    differentiated by JAX), the value the exact one's (`_exact`)."""
+    raised to 0, not 1 (train 1478's K-F2). Its derivative along `z` the halved form's, along the exponent
+    the exact value's (`_exp_scaled_tangent`), the value the exact one's (`_exact`)."""
     exponent = jnp.broadcast_to(exponent, jnp.shape(z))
     return _exp_scaled(z, exponent, jnp.broadcast_to(jnp.asarray(power, jnp.float32), jnp.shape(z)))
 
@@ -177,12 +177,6 @@ def _decayed(lifted: jax.Array, scale: jax.Array, powers: jax.Array) -> jax.Arra
     return power2(lifted * scale, jnp.clip(powers, -400.0, 400.0).astype(jnp.int32))
 
 
-def _halved(z: jax.Array, exponent: jax.Array, power: jax.Array) -> jax.Array:
-    """`exp_scaled` in its halved form, `z / 2` taken by `e^f` and every power at once: its derivative."""
-    finite, whole, fraction = _decay_parts(exponent)
-    return jnp.where(finite, _decayed(z * 0.5, accurate_exp(fraction), power + whole + 1.0), 0.0)
-
-
 def _exact(z: jax.Array, exponent: jax.Array, power: jax.Array) -> jax.Array:
     """`exp_scaled`'s value: a tiny fp32 `z` raised by `2^64` from its bits, `|z| >= 1` alone halved."""
     finite, whole, fraction = _decay_parts(exponent)
@@ -195,11 +189,25 @@ def _exact(z: jax.Array, exponent: jax.Array, power: jax.Array) -> jax.Array:
                                       power + whole + jnp.where(big, 1.0, 0.0) - up), 0.0)
 
 
+def _halved(z: jax.Array, exponent: jax.Array, power: jax.Array) -> jax.Array:
+    """`exp_scaled` in its halved form, `z / 2` taken by `e^f` and every power at once: its derivative along
+    `z`, which JAX takes of it."""
+    finite, whole, fraction = _decay_parts(exponent)
+    return jnp.where(finite, _decayed(z * 0.5, accurate_exp(fraction), power + whole + 1.0), 0.0)
+
+
 def _exp_scaled_tangent(primals, tangents):
-    """`exp_scaled`'s tangent: the halved form's, JAX's own derivative of it, beside the rule's own value, so
-    a higher order meets the rule again."""
-    _, tangent = jax.jvp(_halved, primals, tangents)
-    return _exp_scaled(*primals), tangent
+    """`exp_scaled`'s tangent beside the rule's own value, so a higher order meets the rule again: along `z`
+    the halved form's, JAX's derivative of it, every power applied to the direction at once; along the
+    exponent the value itself times the direction, `z e^exponent 2^power` formed exact before it meets it, so
+    `2^-149 · 2^149` along a unit direction is 1 and `2^120 · 2^-120` along `2^100` is `2^100`, where the
+    halved form's derivative there flushed to 0 and overflowed (train 1489's F2). Both linear in the
+    tangents, so reverse mode transposes them."""
+    z, exponent, power = primals
+    along_z, along_exponent, _ = tangents
+    value = _exp_scaled(*primals)
+    _, moved = jax.jvp(lambda z: _halved(z, exponent, power), (z,), (along_z,))
+    return value, moved + value * along_exponent
 
 
 _exp_scaled = contracted("test_parallax_holds_every_order")(
@@ -559,7 +567,9 @@ def _called(query, second, key, second_key, value, spans: KeySpans, scale: float
     # Every operand's dtype: a float64 second product's keys rounded to fp32 tie where they differ (train
     # 1478's K-F1: `[2^24, 2^24 + 1]` read 0 where 0.5 is).
     wide = _wide(query, second, key, second_key, value)
-    prescaled_query, left, _ = prescaled(query, scale)
+    # Widened before its power of two: an fp32 query of 2^-126 at a scale of 2^-24 flushed to 0 there
+    # where a float64 call keeps it (train 1489's F1).
+    prescaled_query, left, _ = prescaled(query.astype(wide), scale)
     raw = _grouped(second.astype(wide), kv_heads)
     second_key = _padded(second_key, tile, wide)
     query, key = _grouped(prescaled_query.astype(wide), kv_heads), _padded(key, tile, wide)

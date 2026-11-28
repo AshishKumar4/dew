@@ -999,6 +999,41 @@ def test_a_subnormal_term_decays_and_raises_before_it_rounds():
     # Past fp32's largest, its infinity, no NaN of the exact value's difference (round 2 of the confirm).
     assert float(attention_parallax.exp_scaled(jnp.float32(1.0), jnp.float32(0.0), 128)) == float("inf")
 
+def test_exp_scaleds_derivative_meets_its_powers_before_it_rounds():
+    """`attention_parallax.exp_scaled`'s derivative along its exponent, forward and reverse: at `2^-149 ·
+    2^149` (a value of 1) a unit direction is 1 and a cotangent of `2^-100` pulls back `2^-100`, and at
+    `2^120 · 2^-120` a direction of `2^100` is `2^100`, the exact value times the direction, where the
+    halved form's derivative flushed the first to 0 and overflowed the second to infinity (train 1489's
+    F2)."""
+    def along_exponent(z, power, direction):
+        return jax.jvp(lambda e: attention_parallax.exp_scaled(z, e, power), (jnp.float32(0.0),),
+                       (jnp.float32(direction),))[1]
+
+    least = jnp.float32(2.0 ** -149)
+    assert float(along_exponent(least, 149, 1.0)) == 1.0
+    _, pull = jax.vjp(lambda e: attention_parallax.exp_scaled(least, e, 149), jnp.float32(0.0))
+    assert float(pull(jnp.float32(2.0 ** -100))[0]) == 2.0 ** -100
+    assert float(along_exponent(jnp.float32(2.0 ** 120), -120, 2.0 ** 100)) == 2.0 ** 100
+
+
+def test_a_float64_keys_query_takes_its_power_of_two_wide():
+    """Parallax with x64 on over an fp32 query of `2^-126` and float64 keys `0` and `2^150` at a scale of
+    `2^-24`: the query widened before its power of two, so the second key's logit is 1 and the output over
+    values 0 and 1 is `sigmoid(1)` in fp32, where the power taken in fp32 flushed the query's `2^-150` to 0
+    and both keys weighed a half (train 1489's F1)."""
+    width = 16
+    spans = template.spans(1, 2, 1)
+    with jax.enable_x64(new_val=True):
+        query = jnp.zeros((1, 1, 1, width), jnp.float32).at[..., 0].set(2.0 ** -126)
+        key = jnp.zeros((1, 2, 1, width), jnp.float64).at[0, 1, 0, 0].set(2.0 ** 150)
+        value = jnp.broadcast_to(jnp.asarray([0.0, 1.0], jnp.float32).reshape(1, 2, 1, 1), (1, 2, 1, width))
+        second = jnp.zeros((1, 1, 1, width), jnp.float32)
+        out = attention_parallax.attend(query, second, key, jnp.zeros((1, 2, 1, width), jnp.float32), value,
+                                        spans, scale=2.0 ** -24)
+    sigmoid = 1 / (1 + np.exp(-1.0))
+    np.testing.assert_array_equal(np.asarray(out), np.full((1, 1, 1, width), sigmoid, np.float32))
+
+
 def test_a_float64_second_product_keeps_its_keys_apart():
     """Parallax (`attention_parallax.attend`) with x64 on over fp32 queries, keys and values (zeros, and
     values 1 and -1) and float64 second queries and keys, a unit second query against second keys `2^24` and
