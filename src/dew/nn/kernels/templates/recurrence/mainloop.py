@@ -1155,7 +1155,7 @@ def launch_kernel(program, call: Call, *, out_type, grid, grid_names, blocks: di
                   after: tuple = (), consumers: int = 1, swizzles: dict[str, int] | None = None,
                   name: str | None = None, issues: bool = True, ringed: bool = False,
                   together: tuple[int, ...] = (), sums: tuple[int, ...] = (), reducing: bool = False,
-                  after_walks: tuple = ()):
+                  after_walks: tuple = (), read: dict[int, jax.ShapeDtypeStruct] | None = None):
     """`program(at, *refs, streams, staging, landing)` as a kernel over `grid`, `at` a tile's indices by the
     grid's axis names, run where `live(at, refs)` holds (a laid call's chunks and sequences are as many as its
     worst case, most of them empty): its streams' allocations (of `blocks`, `stages` deep, and of `once`'s
@@ -1167,7 +1167,9 @@ def launch_kernel(program, call: Call, *, out_type, grid, grid_names, blocks: di
     (`Held`). Where `template.planned` collects launches, the launch's record (`Launch`) and zeros. Its cost
     is its kernel's emission (`emission.costed`) over the `steps` its walk takes a tile, each of its consumer
     roles taking each on its share (`cost.Stated`: a sequence's chunks, a laid call's mean over its
-    sequences); `model` is the model's FLOPs a tile, which it declares to Dew's FLOP count apart
+    sequences), and its bytes each operand's and output's once, an operand it reads part of at the extent
+    `read` gives it by its position (a limbed call's memories, whose leading limb the output launch streams,
+    `Call.entered`); `model` is the model's FLOPs a tile, which it declares to Dew's FLOP count apart
     (`Family.kernel`'s `model_flops`). Its producer lowers to the registers its call's tiles certified for
     it (`Call.producers`, by its name; `resources.producer_floor` where none), and its programs launch with
     the registers its products assemble at least (`Held.entry`, `resources.Launch.entry`).
@@ -1236,6 +1238,10 @@ def launch_kernel(program, call: Call, *, out_type, grid, grid_names, blocks: di
                            grid_names=grid_names, persistent=persistent, producer=producer)
     entry.__name__ = name
 
+    def charged(arrays) -> list:
+        # Each operand's bytes once, an operand the launch reads part of at the extent it reads (`read`).
+        return [read.get(index, array) for index, array in enumerate(arrays)] if read else list(arrays)
+
     def launched(*arrays):
         laid = ({"grid": (programs,), "grid_names": ("programs",)} if persistent
                 else {"grid": grid, "grid_names": grid_names})
@@ -1246,7 +1252,7 @@ def launch_kernel(program, call: Call, *, out_type, grid, grid_names, blocks: di
         return family.kernel(entry, out_type=out_type, **laid, consumers=consumers, interpret=call.interpret,
                              name=name,
                              cost=Stated(steps * consumers * tiles,
-                                         stored(*arrays, *jax.tree.leaves(out_type))),
+                                         stored(*charged(arrays), *jax.tree.leaves(out_type))),
                              model_flops=int(model * tiles),
                              resident=found.programs if found else 1, registers=registers,
                              producer=producer, reducing_warpgroups=consumers * reducing)(*arrays)

@@ -453,6 +453,7 @@ def output_launch(q, k, h, corrected, prefix: tuple, taken, beta, call: Call, ti
     # Its kernel named `recurrence_output` as the profiles and the gate know it (`launch_kernel` names a
     # launch for the function its program is defined in, here `output_launch`).
     inputs = (q, k if scores is None else scores, h, corrected, *prefixes, taken)
+    # The memories charged as it streams them (`Call.entered`): a limbed call's leading limb alone.
     return launch_kernel(program, call, out_type=out_type, grid=(call.chunks, call.heads),
                          name="recurrence_output", grid_names=("chunks", "heads"), blocks=blocks, stages=1,
                          live=chunk_liveness(len(inputs) - 1), steps=steps, model=model,
@@ -463,5 +464,5 @@ def output_launch(q, k, h, corrected, prefix: tuple, taken, beta, call: Call, ti
                          # program a tile, its rows normalized past its walk (`mosaic.Walk.read`), which a
                          # persistent tile's walk takes none of.
                          persistent=normed is None, reduces=held.parts > 1 or normed is not None,
-                         swizzles=keys)(
+                         swizzles=keys, read={2: memories.shape(value_width)})(
         *inputs, beta, *(() if skip is None else (skip.astype(jnp.float32),)), *sides)
