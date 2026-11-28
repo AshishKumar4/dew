@@ -57,6 +57,7 @@ from dew.algebra import carry, cost, derive, linear_scan, program, ratios, scale
 from dew.algebra.forms import Derived, Refused, aval, environment, evaluate, scalar_case_batch
 from dew.nn import float_bits
 from dew.nn.derivatives import Protected, contracted, declared_tangent
+from dew.nn.kernels.generation import symbolic_tangent
 from dew.nn.kernels.templates.axes import laid
 from dew.nn.nested import nested
 from dew.nn.precision import (
@@ -69,7 +70,7 @@ from dew.nn.precision import (
     uncontracted,
     vanishing,
 )
-from dew.nn.programs import holes, read_by
+from dew.nn.programs import read_by
 
 Axes = tuple[str, ...]
 
@@ -1275,7 +1276,7 @@ def _exact_pairs(groups: tuple[tuple, ...]) -> tuple[jax.Array, ...]:
     of a portable walk's program (row 14108: 13k to 15k StableHLO ops each, 56k of a GLM-5 tiny walk's 65k
     in four of them, two a `_factored`)."""
     if len(groups) == 1:
-        return (_pair_sum(_pair_factors(*groups[0])),)
+        return (_exact_group(*groups[0]),)
     laid = [_laid_factors(*group) for group in groups]
     summed = _pair_sum(tuple(jnp.concatenate(parts, axis=-3) for parts in zip(*laid, strict=True)))
     edges = np.cumsum([factors[-1].shape[-3] for factors in laid])[:-1]
@@ -1294,31 +1295,20 @@ def _ordinary_pairs(left, right, decay, after) -> tuple[jax.Array, jax.Array]:
     return _portable_einsum("...ik,...jk->...ij", leading, trailing), tiny
 
 
-def _live(direction) -> bool:
-    return direction is not None and not isinstance(direction, SymbolicZero)
-
-
 def _portable_pair_jvp(primals, tangents):
-    """Each group's tangent its own exact sum's at its own factors (`_pair_factors`), whose transpose reduces
-    their broadcast axes before landing, a group none of whose operands moves a symbolic zero: laid with the
-    others' (`_laid_factors`), the earlier blocks' key decay landed a cotangent a key in fp32 before its sum
-    (two of 2^130 that cancel, landed apart, infinite), and a held group's zero tangent met an infinite
-    factor as NaN (head review of row 14108)."""
+    """Each group's tangent its own exact sum's at its own factors (`_pair_factors`), whose transpose sums the
+    earlier blocks' row decay's cotangents over the key positions before they land, a group none of whose
+    operands moves a symbolic zero (`generation.symbolic_tangent`): laid with the others' (`_laid_factors`),
+    that row-side decay landed a cotangent a key in fp32 first (two cancelling 2^130 landed as two
+    infinities), and a held group's zero tangent met an infinite factor as NaN (head review of row 14108)."""
     value = _portable_pairs(*primals)
-    moved = []
-    for group, directions, pairs in zip(primals, tangents, value, strict=True):
-        live = tuple(map(_live, directions))
-        if not any(live):
-            moved.append(SymbolicZero(jax.typeof(pairs).to_tangent_aval()))
-            continue
-        operands, fill = holes(group, live, is_leaf=lambda arg: arg is None)
+    return value, tuple(symbolic_tangent(_exact_group, group, directions, pairs)
+                        for group, directions, pairs in zip(primals, tangents, value, strict=True))
 
-        def exact(*active, fill=fill):
-            return _pair_sum(_pair_factors(*fill(active)))
 
-        moving = tuple(direction for direction, take in zip(directions, live, strict=True) if take)
-        moved.append(jax.jvp(exact, tuple(operands), moving)[1])
-    return value, tuple(moved)
+def _exact_group(left, right, decay, after):
+    """One group's exact sum at its own factors (`_pair_factors`)."""
+    return _pair_sum(_pair_factors(left, right, decay, after))
 
 
 @custom_vmap

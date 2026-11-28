@@ -1726,7 +1726,7 @@ def _held_still(forward: Callable, portable: Callable, kind: TangentKind) -> Cal
     return run
 
 
-def _symbolic_tangent(portable: Callable, operands, tangents, output):
+def symbolic_tangent(portable: Callable, operands, tangents, output):
     """`portable`'s tangent at `operands` along `tangents`, a tree like them whose symbolic zeros
     (`SymbolicZero`) hold their operands still (`_perturbed_tangent`)."""
     import jax
@@ -1796,7 +1796,7 @@ def linear_tangent(forward: Callable, backward: Callable, portable: Callable, *,
 
     def produced_jvp(primals, tangents):
         output, saved = produced(*primals)
-        moved = _symbolic_tangent(portable, primals, tangents, output)
+        moved = symbolic_tangent(portable, primals, tangents, output)
         # `saved` reaches only `pulled`, whose tangent reads the operands' instead.
         return (output, saved), (moved, zero_from_primal(saved))
 
@@ -1821,7 +1821,7 @@ def linear_tangent(forward: Callable, backward: Callable, portable: Callable, *,
             return whole if live is None else tuple(jax.tree.leaves(whole)[index] for index in live)
 
         value = pulled(saved, operands, cotangent, live)
-        return value, _symbolic_tangent(pullback, (operands, cotangent), (doperands, dcotangent), value)
+        return value, symbolic_tangent(pullback, (operands, cotangent), (doperands, dcotangent), value)
 
     pulled = pulled_by if traced else contracted("test_an_embedding_lookup_holds_every_order")(
         declared_tangent(kind, pulled_by, pulled_jvp, nondiff_argnums=(3,), symbolic_zeros=True))
