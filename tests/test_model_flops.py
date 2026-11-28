@@ -244,6 +244,31 @@ def test_a_loop_doing_no_product_costs_nothing_and_one_hiding_a_product_is_refus
         assert traced_flops(loop, *(_shaped(*shape) for shape in operands)) == flops
 
 
+@pytest.mark.mesh(devices=2)
+def test_a_high_level_operation_counts_its_expansion_in_the_context_it_was_staged_in():
+    """A linear map (`generation.linear_map`, a high-level operation) whose product places its output on an
+    Explicit mesh the counted function enters itself counts that product: its expansion is traced in its
+    equation's own context, the mesh among it, as JAX's lowering expands it (train 1493's review of theme 87:
+    traced apart from it, its placement named no mesh and the count failed)."""
+    from jax.sharding import AxisType, PartitionSpec
+
+    from dew.nn.kernels.generation import linear_map
+
+    mesh = jax.make_mesh((2,), ("rows",), axis_types=(AxisType.Explicit,), devices=jax.devices()[:2])
+
+    def apply(weight, x):
+        return jax.lax.dot_general(x, weight, (((1,), (0,)), ((), ())), out_sharding=PartitionSpec("rows", None))
+
+    def pullback(weight, cotangent):
+        return jax.lax.dot_general(cotangent, weight, (((1,), (1,)), ((), ())))
+
+    def counted(weight, x):
+        with jax.sharding.use_abstract_mesh(mesh.abstract_mesh):
+            return linear_map(apply, pullback, weight, x)
+
+    assert traced_flops(counted, _shaped(3, 5), _shaped(4, 3)) == 2 * 4 * 3 * 5
+
+
 def test_a_traced_program_counts_a_grouped_product_and_refuses_work_it_does_not_count():
     """A grouped product (`ragged_dot_general`, a mixture's experts on a CPU) counts each row against its own
     group's matrix, `2 x rows x depth x width` whatever the groups, and its gradient's two grouped products

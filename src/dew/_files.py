@@ -355,8 +355,10 @@ def _removed(tree: Path) -> None:
             _emptied(root, log)
         # Its name removed while the folder it named is held open, so no other folder takes its inode; one
         # no right of this process reads (a mode an earlier tree's restored on it) removed where it is empty.
-        # A save's own leftover, named for whoever clears it; the save's outcome is its own.
         _rmdir_held(None, os.fspath(tree), named, log)
+    except OSError as left:
+        # A save's own leftover, named for whoever clears it; the save's outcome is its own.
+        log.warning("could not remove a save's discarded tree %s: %s", tree, left)
     finally:
         os.close(root)
 

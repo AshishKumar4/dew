@@ -27,6 +27,7 @@ import optax
 from jax.custom_derivatives import SymbolicZero
 
 from dew.nn.derivatives import Protected, contracted, declared_tangent
+from dew.nn.float_bits import exact_power2
 from dew.nn.precision import at_least_fp32
 
 __all__ = ["brier", "cross_entropy", "entropy", "group_divergence", "kl_divergence", "label_derivative",
@@ -119,13 +120,14 @@ def _softmax_moved(probability: jax.Array, moving: jax.Array) -> jax.Array:
     low = jnp.where(pivoted & reached & ~top, low, 0)
     mass = _pair_sum(probability, jnp.zeros_like(probability), axis)
     # A row whose largest difference is below one weighed at a power of two that brings it to [1, 2) (at most
-    # 2^100, whose inverse is normal) and its quotients brought back: no weighed term or its residual falls
-    # below the normal range, which a CPU flushing subnormals reads as zero (train 1493's review: weights of
-    # 1/256 over differences of -2^-121, each term -2^-129, flushed, and a tangent of 2^-124 read zero). The
-    # power alone moves no bit of a term in range, and is constant to the derivatives.
+    # 2^100, whose inverse is normal) and its quotients brought back, so the row's largest terms are weighed
+    # at a normal scale, where a CPU flushing subnormals keeps them (train 1493's review: weights of 1/256
+    # over differences of -2^-121, each term -2^-129, flushed, and a tangent of 2^-124 read zero); a term far
+    # below the row's largest may still flush. The power alone moves no bit of a term in range, and is
+    # constant to the derivatives.
     largest = jnp.max(jnp.abs(high), axis=-1, keepdims=True)
     raised = jnp.where((largest > 0) & (largest < 1), jnp.minimum(1 - jnp.frexp(largest)[1], 100), 0)
-    power = jax.lax.stop_gradient(jnp.ldexp(jnp.ones_like(largest), raised))
+    power = jax.lax.stop_gradient(exact_power2(raised, largest.dtype))
     weighed_high, weighed_low = _weighed(probability, high * power, axis)
     held = jnp.isfinite(weighed_high)
     # A weighted sum past the range taken 2^-4 times smaller; one in range at its own scale.

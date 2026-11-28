@@ -279,9 +279,10 @@ def traced_flops[**Arguments, Result](function: Callable[Arguments, Result], *ar
     primitive of another library's)."""
     from dew.nn.kernels.generation import assumed
 
+    # Counted under the CPU it is traced for, so a high-level operation's expansion (`high_expansion`) is the
+    # one its trace staged (train 1493's review of theme 87).
     with assumed("cpu"):
-        traced = jax.make_jaxpr(function)(*arguments, **keywords)
-    return _program_flops(traced)
+        return _program_flops(jax.make_jaxpr(function)(*arguments, **keywords))
 
 
 def _program_flops(program: jaxpr_core.Jaxpr) -> float:
