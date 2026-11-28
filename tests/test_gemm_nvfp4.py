@@ -859,23 +859,26 @@ def test_an_nvfp4_product_over_operands_a_mesh_splits_decodes_its_matrix(group_s
     assert taken(split) == {"xla"}
 
 
-@INTERPRETS
-@pytest.mark.parametrize(("minifloat", "out_dtype"),
-                         [(bits.E4M3, jnp.float8_e4m3fn), (bits.E5M2, jnp.float8_e5m2)], ids=["e4m3", "e5m2"])
-def test_gemm_quantize_epilogue_matches_bits_encoded(minifloat, out_dtype):
-    """`quantized.gemm_quantized` encodes the GEMM accumulator via `bits.encode_form` bit-exact with
-    `bits.encoded` across E4M3 and E5M2, dividing by `tensor_scale` on encode and returning `(codes, scale)`
-    consistent with `NvFp4Block` (rows 8547, 12037, 12160)."""
+def the_quantize_epilogue_encodes_as_bits_encoded(minifloat: bits.Minifloat, interpret_on_cpu: bool = False
+                                                   ) -> None:
+    """`quantized.gemm_quantized` through the template encodes the GEMM accumulator via `bits.encode_form`
+    bit-exact with `bits.encoded`, dividing by `tensor_scale` on encode and returning `(codes, scale)`
+    consistent with `NvFp4Block` (rows 8547, 12037, 12160): interpreted, the form's evaluation
+    (`BitForm.traced`); compiled on a GPU, its PTX inline in the epilogue (`inline_forms.registers`, row
+    14105)."""
     rng = np.random.default_rng(17)
     lhs = jnp.asarray(rng.integers(-3, 4, size=(128, 128)), jnp.bfloat16)
     rhs = jnp.asarray(rng.integers(-3, 4, size=(128, 128)), jnp.bfloat16)
     acc = jnp.dot(lhs, rhs, preferred_element_type=jnp.float32)
     words = jax.lax.bitcast_convert_type(acc, jnp.uint32)
     expected_u8 = bits.encoded(words, minifloat).astype(jnp.uint8)
-    with generation.assumed("sm90"), generation.chosen(grouped_matmul="mosaic"):
-        got, scale = quantized.gemm_quantized(lhs, rhs, minifloat=minifloat, interpret_on_cpu=True)
+    with generation.chosen(grouped_matmul="mosaic"), generation.routes() as routes:
+        got, scale = quantized.gemm_quantized(lhs, rhs, minifloat=minifloat,
+                                              interpret_on_cpu=interpret_on_cpu)
         got_s, scale_s = quantized.gemm_quantized(lhs, rhs, minifloat=minifloat, tensor_scale=2.0,
-                                             interpret_on_cpu=True)
+                                                  interpret_on_cpu=interpret_on_cpu)
+    assert ("grouped_matmul", "mosaic") in {(route.choice, route.kernel) for route in routes}
+    out_dtype = quantized.minifloat_dtype(minifloat)
     assert isinstance(got, jax.Array) and got.dtype == out_dtype and float(scale) == 1.0
     got_u8 = jax.lax.bitcast_convert_type(got, jnp.uint8)
     np.testing.assert_array_equal(np.asarray(got_u8), np.asarray(expected_u8))
@@ -884,6 +887,15 @@ def test_gemm_quantize_epilogue_matches_bits_encoded(minifloat, out_dtype):
                              minifloat).astype(jnp.uint8)
     np.testing.assert_array_equal(np.asarray(jax.lax.bitcast_convert_type(got_s, jnp.uint8)),
                                   np.asarray(scaled_u8))
+
+
+@INTERPRETS
+@pytest.mark.parametrize("minifloat", [bits.E4M3, bits.E5M2], ids=["e4m3", "e5m2"])
+def test_gemm_quantize_epilogue_matches_bits_encoded(minifloat):
+    """The quantize epilogue's encode, interpreted on an H100's template, is `bits.encoded`
+    (`the_quantize_epilogue_encodes_as_bits_encoded`; its compiled PTX is tests/test_gpu_gemm.py's)."""
+    with generation.assumed("sm90"):
+        the_quantize_epilogue_encodes_as_bits_encoded(minifloat, interpret_on_cpu=True)
 
 
 @pytest.mark.parametrize("gpu", [pytest.param("sm80", marks=lowers("sm80")),

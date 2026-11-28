@@ -1789,8 +1789,9 @@ about it is an estimate.
   counterexample-guided synthesis, a replacement taken only where Z3 proves it equal on every value of the
   window's inputs. For the three encodes it finds the same program, 41 issues to 37 (`x != 0` as
   `min(x, 1)`, two adds as one IADD3, a select and a mask as one), its constants the minifloat's:
-  `encode_form`, proven against `encoded` on every fp32 word by its test, and its PTX run on the GPU against
-  its own evaluation. Windows of four steps into three found nothing further (2026-11-06, one round within
+  `encode_form`, proven against `encoded` on every fp32 word by its test, and its E4M3 and E5M2 PTX, inline
+  in the quantize epilogue compiled on an H100 and an A100, `encoded` bit for bit (tests/test_gpu_gemm.py's
+  encode cells). Windows of four steps into three found nothing further (2026-11-06, one round within
   its bounds). Whether its PTX beats the compiler's lowering of `encoded` is its consumer's measurement
   (sm80's FP8 and FP4 epilogue, row 3733).
 - **Decodes searched** (2026-11-06, the tool's `e4m3-decode-*`, `e5m2-decode-*` and `e8m0` references): an FP8
