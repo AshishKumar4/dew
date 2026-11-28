@@ -128,7 +128,7 @@ def _reach(below: jax.Array) -> jax.Array:
     none: held at `2 _NONE` before it is an integer, so a decay of `e^-1488522240` beside a power of two
     sums below every bound, where its `INT32_MIN` wrapped past them (train 1444's review)."""
     reach = jnp.maximum(jnp.floor(jax.lax.stop_gradient(below) * np.log2(np.e)) + 1, 2 * _NONE)
-    return jnp.where(jnp.isfinite(below), reach, -1051).astype(jnp.int32)
+    return jnp.where(jnp.isfinite(below), reach, _NONE).astype(jnp.int32)
 
 
 def _normalized(x: jax.Array) -> tuple[jax.Array, jax.Array]:
@@ -185,9 +185,9 @@ def _row_bounds(left: jax.Array, right: jax.Array, spans: KeySpans, tile: int) -
         start = index * tile
         seen = dense(spans, start + jnp.arange(tile))[:, None, None]
         bound = _pair_bound(left, jax.lax.dynamic_slice_in_dim(right, start, tile, axis=1))
-        return jnp.maximum(reached, jnp.max(jnp.where(seen, bound, -1153), axis=-1)), None
+        return jnp.maximum(reached, jnp.max(jnp.where(seen, bound, _NONE), axis=-1)), None
 
-    return _tiled(step, jnp.full(left.shape[:-1], -1153, jnp.int32), right.shape[1] // tile)[0]
+    return _tiled(step, jnp.full(left.shape[:-1], _NONE, jnp.int32), right.shape[1] // tile)[0]
 
 
 def _tiled(step: Callable, start, count: int):
@@ -567,10 +567,10 @@ def _landing(estimate: jax.Array, operand: jax.Array, axis: int | tuple[int, int
         summed = estimate.shape[2] * estimate.shape[3]
     live = estimate > _NONE
     # Over no term (a key's of no query, `Q = 0`) `_NONE`.
-    reached = jnp.max(jnp.where(live, paired, -1259), axis=axis, initial=-1259)
+    reached = jnp.max(jnp.where(live, paired, _NONE), axis=axis, initial=_NONE)
     # No landed term past `2^126` itself, whatever its operand (a zero operand bounds nothing: its terms'
     # `2^400` met it as `inf · 0`).
-    largest_term = jnp.max(jnp.where(live, estimate, -1259), axis=axis, initial=-1259)
+    largest_term = jnp.max(jnp.where(live, estimate, _NONE), axis=axis, initial=_NONE)
     return jnp.clip(jnp.minimum(HELD - (summed - 1).bit_length() - reached, 126 - largest_term), -250, 250)
 
 
@@ -638,13 +638,13 @@ def _summed_rows(terms: Callable, seed: jax.Array, tiles: int) -> tuple[jax.Arra
         total, reached = summed
         coefficient, below, power = terms(index)
         bound = jnp.where((coefficient != 0) & jnp.isfinite(below),
-                          _reach(below) + power + _exponent(coefficient), -1361)
+                          _reach(below) + power + _exponent(coefficient), _NONE)
         widest = jnp.maximum(reached, jnp.max(bound, axis=-1))
         lifted, before = jnp.clip(100 - widest, -600, 600), jnp.clip(100 - reached, -600, 600)
         part = jnp.sum(exp_scaled(coefficient, below, power + lifted[..., None]), axis=-1)
         return (power2(total, lifted - before) + part, widest), None
 
-    (total, reached), _ = _tiled(step, (seed, jnp.full(seed.shape, -1361, jnp.int32)), tiles)
+    (total, reached), _ = _tiled(step, (seed, jnp.full(seed.shape, _NONE, jnp.int32)), tiles)
     return total, -jnp.clip(100 - reached, -600, 600)
 
 
@@ -723,10 +723,10 @@ def derivative(query, second, key, second_key, value, spans: KeySpans, held: Mom
         values_coefficient, values_power = _values_coefficient(fraction, tau_power)
         values_coefficient = values_coefficient / row(over)
         second_coefficient = -delta / row(over)
-        reach = jnp.where(seen, _reach(below), -1451)
+        reach = jnp.where(seen, _reach(below), _NONE)
         terms = ((logit, common), (second_coefficient, delta_power), (values_coefficient, values_power))
         (logit_estimate, second_estimate, values_estimate) = (
-            jnp.where(seen & (coefficient != 0), reach + power + _exponent(coefficient), -1543)
+            jnp.where(seen & (coefficient != 0), reach + power + _exponent(coefficient), _NONE)
             for coefficient, power in terms)
         # Over the row's keys: `dq` and `dr`, each carried at its row's running power.
         on_rows = (_on_rows(dq, dq_power, logit, common, below, logit_estimate, keys),
