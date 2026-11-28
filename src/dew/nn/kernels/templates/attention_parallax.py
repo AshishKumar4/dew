@@ -52,7 +52,8 @@ is kept however far its factors lie apart; within one contraction (`dV = Σ w (1
 `dk2`), terms whose magnitudes span more than fp32's range relative to the row's largest (an `e^-160`
 beside 1 under a cotangent of `2^127`) are held to the template's own attention and plain fp32 softmax
 attention, which lose them alike (no exponent tiers; row 14033). Every higher order differentiates the
-dense reference (`reference`), whose tails read as the plain formula's (row 14007).
+dense reference (`reference`), whose tails read as the plain formula's (row 14007): a lifted term meets
+a tangent or cotangent at its own size, its power taken first (`_shifted`).
 
 It is XLA's alone: no launch of a Pallas mainloop (a GH200's Triton walk spilled at every backward tile and
 walked its forward 10 times the template's sdpa, M-NA-58b)."""
@@ -67,6 +68,8 @@ import jax.numpy as jnp
 import numpy as np
 from jax.custom_derivatives import zero_from_primal
 
+from dew.algebra import means
+from dew.algebra.windows import Units
 from dew.nn.derivatives import KernelGlue, contracted
 from dew.nn.kernels import generation
 from dew.nn.kernels.templates.attention import REFERENCE_PRECISION, KeySpans, dense, logit_scale, prescaled
@@ -91,8 +94,10 @@ class Moments(NamedTuple):
     largest logit `m` (-inf before any key) and the denominator `total` at it, the values' mean `mean`, the
     second products' mean `centre` as a pair `(hi, lo)` summing to it, in the row's units (`t̂`,
     `second_powers`), and their covariance with the values `spread · 2^spread_power`, a mantissa of at most
-    1 and its row's power of two, so a part's covariance past fp32's range is carried through a merge
-    whose shares bring it back (`merged`)."""
+    1 and its row's power of two, at least 0: a part's covariance past fp32's range carried through a
+    merge whose shares bring it back (`merged`), one below 1 held as it is (its power 0, a zero's too, so
+    a covariance that cancels bounds nothing after it), its tangent then the covariance's own (train 1444's
+    review)."""
 
     m: jax.Array
     total: jax.Array
@@ -111,8 +116,9 @@ def _exponent(x: jax.Array) -> jax.Array:
 
 def _reach(below: jax.Array) -> jax.Array:
     """The power of two a decay `e^below` (`below` at most 0, -inf none) lies below, int32, `_NONE` for
-    none."""
-    reach = jnp.floor(jax.lax.stop_gradient(below) * np.log2(np.e)) + 1
+    none: held at `2 _NONE` before it is an integer, so a decay of `e^-1488522240` beside a power of two
+    sums below every bound, where its `INT32_MIN` wrapped past them (train 1444's review)."""
+    reach = jnp.maximum(jnp.floor(jax.lax.stop_gradient(below) * np.log2(np.e)) + 1, 2 * _NONE)
     return jnp.where(jnp.isfinite(below), reach, _NONE).astype(jnp.int32)
 
 
@@ -147,21 +153,16 @@ def exp_scaled(z: jax.Array, exponent: jax.Array, power) -> jax.Array:
 
 def _pair_bound(left: jax.Array, right: jax.Array) -> jax.Array:
     """The power of two each product `left · rightᵀ` (`[B, Hk, G, Q, D]` by a tile's `[B, T, Hk, D]`) lies
-    below, int32 `[B, Hk, G, Q, T]` (`_NONE` for a zero operand): from the operands as mantissas and powers
-    (`_normalized`), so no bound overflows; a pair whose mantissas' products flush at most their least
-    normal's, times the width."""
-    left, right = jax.lax.stop_gradient(left), jax.lax.stop_gradient(right)
-    rows, row_power = _normalized(left)
-    keys, key_power = _normalized(right)
-    largest = jnp.max(_exponent(left), axis=-1)
-    key_largest = jnp.moveaxis(jnp.max(_exponent(right), axis=-1), 1, -1)[:, :, None, None]
-    products = float32_einsum("bhgqd,bkhd->bhgqk", jnp.abs(rows), jnp.abs(keys),
-                              precision=REFERENCE_PRECISION, preferred_element_type=rows.dtype)
+    below, int32 `[B, Hk, G, Q, T]` (`_NONE` for a pair of no nonzero term): its terms' exponents aligned,
+    `max_d e(l_d) + e(r_d)` (`_exponent`), and the width's, so the bound is its own pair's whatever the
+    rows' and keys' other entries: `r = [2^127, 2^-125]` against `(0, 2^127)` bounds its dot of 4 by 8,
+    where mantissas at the row's power flushed `2^-125` and a floor bounded it by `2^131` (train 1444's
+    review)."""
+    rows = _exponent(left)[..., None, :]
+    keys = jnp.moveaxis(_exponent(right), 1, 2)[:, :, None, None]
+    largest = jnp.max(rows + keys, axis=-1, initial=2 * _ABSENT)
     width = (left.shape[-1] - 1).bit_length()
-    bound = (row_power[..., None] + jnp.moveaxis(key_power, 1, -1)[:, :, None, None]
-             + jnp.maximum(_exponent(products), -126 + width))
-    present = (largest[..., None] > _ABSENT) & (key_largest > _ABSENT)
-    return jnp.where(present, bound, _NONE)
+    return jnp.where(largest > _ABSENT // 2, largest + width, _NONE)
 
 
 def _row_bounds(left: jax.Array, right: jax.Array, spans: KeySpans, tile: int) -> jax.Array:
@@ -177,9 +178,20 @@ def _row_bounds(left: jax.Array, right: jax.Array, spans: KeySpans, tile: int) -
         bound = _pair_bound(left, jax.lax.dynamic_slice_in_dim(right, start, tile, axis=1))
         return jnp.maximum(reached, jnp.max(jnp.where(seen, bound, _NONE), axis=-1)), None
 
-    start = jnp.full_like(left[..., 0], _NONE, dtype=jnp.int32)
-    found, _ = jax.lax.scan(step, start, jnp.arange(right.shape[1] // tile))
-    return found
+    return _tiled(step, jnp.full(left.shape[:-1], _NONE, jnp.int32), right.shape[1] // tile)[0]
+
+
+def _tiled(step: Callable, start, count: int):
+    """`jax.lax.scan(step, start, jnp.arange(count))` with its first step taken apart, so its carry is typed
+    as a step makes it from what it reads (on an Explicit mesh their placement, under a checked `shard_map`
+    their manual axes' variance), whichever operand is split: a value split alone, its query replicated,
+    failed the scan whose carry was seeded from the query (train 1444's review). The steps' outputs
+    stacked, None where a step gives none."""
+    carry, first = step(start, 0)
+    carry, rest = jax.lax.scan(step, carry, jnp.arange(1, count))
+    if first is None:
+        return carry, None
+    return carry, jax.tree.map(lambda one, more: jnp.concatenate([one[None], more]), first, rest)
 
 
 def second_powers(bounds: jax.Array) -> jax.Array:
@@ -226,7 +238,7 @@ def moments(logits: jax.Array, seconds: jax.Array, value: jax.Array, powers: jax
     tail_pairs = jnp.where(seen & tail, _reach(below) + valued, _NONE)
     raised = jnp.clip(126 - width - jnp.max(tail_pairs, axis=-1), 0, 241)[..., None]
     lifted = jnp.where(tail, exp_scaled(jnp.broadcast_to(1.0 / over, below.shape), below, raised), 0.0)
-    mean = weighed(jnp.where(tail, 0.0, weights), value) + power2(weighed(lifted, value), -raised)
+    mean = weighed(jnp.where(tail, 0.0, weights), value) + _shifted(weighed, lifted, value, -raised)
     hi = jax.lax.stop_gradient(jnp.sum(weights * seconds, axis=-1))
     lo = jnp.sum(weights * (seconds - hi[..., None]), axis=-1)
     apart = jnp.where(seen, (seconds - hi[..., None]) - lo[..., None], 0.0)
@@ -244,9 +256,51 @@ def moments(logits: jax.Array, seconds: jax.Array, value: jax.Array, powers: jax
     units = power + 1 - powers
     before = jnp.maximum(jnp.minimum(units, 0), -60)
     taken = exp_scaled(apart / over, below, (before - power)[..., None])
-    covariance = weighed(taken, value * 0.5) - jnp.sum(taken, axis=-1)[..., None] * (mean * 0.5)
-    spread, scaled = _normalized(covariance)
-    return Moments(jnp.max(logits, axis=-1), total, mean, (hi, lo), spread, scaled + units - before)
+
+    def covariance(shift):
+        return (_shifted(weighed, taken, value * 0.5, shift)
+                - _shifted(_row_summed, taken, mean * 0.5, shift))
+
+    # Its power from the covariance at the lifted units, the covariance then formed at that power
+    # (`_spread`).
+    spread_power = _spread_power(jax.lax.stop_gradient(covariance(0)), units - before)
+    spread = covariance((units - before - spread_power)[..., None])
+    return Moments(jnp.max(logits, axis=-1), total, mean, (hi, lo), spread, spread_power)
+
+
+def _row_summed(terms: jax.Array, rows: jax.Array) -> jax.Array:
+    """`Σ_k terms` of each row `[B, Hk, G, Q]` times its `rows` `[B, Hk, G, Q, Dv]`."""
+    return jnp.sum(terms, axis=-1)[..., None] * rows
+
+
+def _spread_power(covariance: jax.Array, power) -> jax.Array:
+    """`Moments.spread_power` of a covariance `covariance · 2^power` (`[..., Dv]`, `power` int32 `[...]`): its
+    row's power of two where that passes 1, else 0 (a zero's too)."""
+    _, scaled = _normalized(covariance)
+    held = jnp.any(covariance != 0, axis=-1)
+    return jnp.where(held, jnp.maximum(scaled + power, 0), 0)
+
+
+@functools.partial(jax.custom_jvp, nondiff_argnums=(0,))
+def _shifted(product: Callable, rows: jax.Array, by: jax.Array, shift) -> jax.Array:
+    """`product(rows, by) 2^shift`, `product` bilinear and `shift` integral, the power of a row (`rows`
+    `[..., K]` a row's terms, lifted for their products, `by` what they meet): its value the product's
+    before the power, so a lifted term keeps its product with a small value; its tangent each direction's
+    with the power taken first, `product(drows 2^shift, by) + product(rows 2^shift, dby)`, so a large
+    direction meets the terms at their own size: equal logits, second products `[1, -1]`, values 0 along
+    `[2^126, -2^126]` read the covariance's tangent `2^126`, where `2^60`-lifted terms met `2^125` before
+    their `2^-60` and overflowed (train 1444's review). Its tails' tangents so read as plain fp32's (Main's
+    ruling of 2026-11-27, row 14007)."""
+    return power2(product(rows, by), shift)
+
+
+@_shifted.defjvp
+def _shifted_tangent(product: Callable, primals, tangents):
+    """`_shifted`'s tangent: each direction's with the power taken first."""
+    rows, by, shift = primals
+    drows, dby, _ = tangents
+    taken = power2(rows, shift)
+    return _shifted(product, rows, by, shift), product(power2(drows, shift), by) + product(taken, dby)
 
 
 def merged(held: Moments, tile: Moments, powers: jax.Array) -> Moments:
@@ -254,16 +308,20 @@ def merged(held: Moments, tile: Moments, powers: jax.Array) -> Moments:
     merged denominator, as its fraction and power, decayed by its maximum's distance below the merged one
     and met by every moment it weighs before either rounds (`exp_scaled`); the covariances and the cross
     term `s_A s_B (c_A - c_B)(a_A - a_B)` summed at their common power and carried with it, so a part's
-    covariance past fp32's range comes back by its share (`2^254` by `e^-128`); the centre summed exactly
-    (`two_sum`); a part of no key weighs nothing."""
-    m = jnp.maximum(held.m, tile.m)
+    covariance past fp32's range comes back by its share (`2^254` by `e^-128`); the centre about the larger
+    share's (`_merged_centre`); the maximum, denominator and mean the algebra's law's (`means.merged_state`);
+    a part of no key, or of no covariance, weighs nothing in the covariance's power."""
+    # The softmax's state (maximum, denominator, mean) by the algebra's law of finished means
+    # (`means.merged_state`), the anchor its total lands at the merged maximum.
+    mean, total, m = means.merged_state(jnp.stack([held.mean, tile.mean]),
+                                        jnp.stack([held.total, tile.total]), jnp.stack([held.m, tile.m]),
+                                        Units(), 0)
     level = jnp.where(jnp.isfinite(m), m, 0.0)
 
     def below(part: Moments) -> jax.Array:
         return jnp.where(part.total > 0, part.m - level, 0.0)
 
     first, second = below(held), below(tile)
-    total = exp_scaled(held.total, first, 0) + exp_scaled(tile.total, second, 0)
     over = jnp.where(total > 0, total, 1.0)
     # Each part's share as its fraction and power of two (a share past 1 where its part's maximum lies
     # below the merged one: 128 at `e^-128`), applied with its decay after the fraction meets the moment.
@@ -272,21 +330,13 @@ def merged(held: Moments, tile: Moments, powers: jax.Array) -> Moments:
     def column(x):
         return x[..., None]
 
-    mean = (exp_scaled(column(share) * held.mean, column(first), column(own))
-            + exp_scaled(column(other) * tile.mean, column(second), column(theirs)))
-    # `c = c_B + s_A (c_A - c_B)` over the pairs, each word's difference weighed apart, the sum's rounding
-    # kept, so a part of no key leaves the other's pair exactly.
-    high, rounded = two_sum(held.centre[0], -tile.centre[0])
-    hi, dropped = two_sum(tile.centre[0], exp_scaled(share * high, first, own))
-    low = rounded + (held.centre[1] - tile.centre[1])
-    lo = dropped + tile.centre[1] + exp_scaled(share * low, first, own)
-    fraction, exponent = jnp.frexp(high + low)
+    (hi, lo), (fraction, exponent) = _merged_centre(held, tile, (share, own, first), (other, theirs, second))
     apart = held.mean * 0.5 - tile.mean * 0.5
     # The three terms' powers, each its decay's reach and its mantissa's bound: the largest their common
     # power, each term taken to it with its decay at once.
     cross_power = own + theirs + exponent + 1 - powers
-    estimates = (jnp.where(held.total > 0, _reach(first) + own + held.spread_power, _NONE),
-                 jnp.where(tile.total > 0, _reach(second) + theirs + tile.spread_power, _NONE),
+    estimates = (jnp.where(_spread_held(held), _reach(first) + own + held.spread_power, _NONE),
+                 jnp.where(_spread_held(tile), _reach(second) + theirs + tile.spread_power, _NONE),
                  jnp.where((held.total > 0) & (tile.total > 0) & (fraction != 0),
                            _reach(first + second) + cross_power + jnp.max(_exponent(apart), axis=-1), _NONE))
     common = functools.reduce(jnp.maximum, estimates)
@@ -296,8 +346,38 @@ def merged(held: Moments, tile: Moments, powers: jax.Array) -> Moments:
                            column(theirs + tile.spread_power - common))
               + exp_scaled(column(share * other * fraction) * apart, column(first + second),
                            column(cross_power - common)))
-    spread, scaled = _normalized(summed)
-    return Moments(m, total, mean, (hi, lo), spread, common + scaled)
+    spread_power = _spread_power(summed, common)
+    return Moments(m, total, mean, (hi, lo), power2(summed, column(common - spread_power)), spread_power)
+
+
+def _spread_held(part: Moments) -> jax.Array:
+    """Whether a part's rows hold a covariance (a zero's power bounds no merge, `Moments.spread`)."""
+    return (part.total > 0) & jnp.any(part.spread != 0, axis=-1)
+
+
+def _merged_centre(held: Moments, tile: Moments, held_share: tuple, tile_share: tuple):
+    """Two parts' centres merged (`merged`), each share `(fraction, power, decay)` of the merged
+    denominator: `c = c_L + s_S (c_S - c_L)` about the larger share's centre `c_L`, the smaller share `s_S`
+    its own (never `1 - s_L` rounded: logits `[0, -20]` over second products `[0, 2^100]` read `c` 0 where
+    it is `2.6e21`, train 1444's review), each word's difference weighed apart and the sum's rounding kept,
+    so a part of no key leaves the other's pair exactly; and `c_A - c_B` as its fraction and power of two."""
+    def scaled(fraction, power, decay):
+        return exp_scaled(fraction, decay, power)
+
+    smaller = scaled(*held_share) <= scaled(*tile_share)
+
+    def pick(held_part, tile_part):
+        return jnp.where(smaller, held_part, tile_part)
+
+    small_hi, small_lo = pick(held.centre[0], tile.centre[0]), pick(held.centre[1], tile.centre[1])
+    large_hi, large_lo = pick(tile.centre[0], held.centre[0]), pick(tile.centre[1], held.centre[1])
+    fraction, power, decay = (pick(mine, theirs) for mine, theirs in zip(held_share, tile_share, strict=True))
+    high, rounded = two_sum(small_hi, -large_hi)
+    hi, dropped = two_sum(large_hi, exp_scaled(fraction * high, decay, power))
+    low = rounded + (small_lo - large_lo)
+    lo = dropped + large_lo + exp_scaled(fraction * low, decay, power)
+    difference, exponent = jnp.frexp(high + low)
+    return (hi, lo), (jnp.where(smaller, difference, -difference), exponent)
 
 
 class _Call(NamedTuple):
@@ -366,32 +446,30 @@ def _tile(call: _Call, start, width: int) -> tuple[jax.Array, jax.Array, jax.Arr
                               preferred_element_type=left.dtype)
 
     seen = dense(call.spans, start + jnp.arange(width))[:, None, None]
-    logits = jnp.where(seen, products(call.query, key) * call.scale, -jnp.inf)
+    # A scale of 0 gives logits of 0, never an overflowing product times it (`inf · 0`, train 1444's review).
+    scaled = (jnp.zeros(seen.shape[:-1] + call.query.shape[3:4] + (width,), call.query.dtype)
+              if call.scale == 0 else products(call.query, key) * call.scale)
+    logits = jnp.where(seen, scaled, -jnp.inf)
     seconds = jnp.where(seen, products(call.second, second_key), 0.0)
     return logits, seconds, value, (key, second_key)
-
-
-def _empty(call: _Call, width: int) -> Moments:
-    """The moments of rows that have met no key, each seeded from the call's query (its batch's placement
-    and its manual axes' variance, as a scan over a sharded call carries them)."""
-    nothing = jnp.zeros_like(call.query[..., 0])
-    values = jnp.zeros_like(call.query[..., :1]) + jnp.zeros((width,), nothing.dtype)
-    return Moments(nothing - jnp.inf, nothing, values, (nothing, nothing), values,
-                   jnp.zeros_like(nothing, dtype=jnp.int32))
 
 
 def walk(query, second, key, second_key, value, spans: KeySpans, *, scale: float,
          tile: int = KEY_TILE) -> tuple[jax.Array, Moments]:
     """Parallax's forward (module docstring): its output `[B, Q, H, Dv]` in the query's dtype and each
     row's moments (`Moments`, the derivative's residuals), a key tile of `tile` at a time over every query,
-    each tile's moments merged into the rows' (`merged`)."""
+    each tile's moments merged into the rows' (`merged`), the first tile's the walk's start (its carry typed
+    as its steps make it, `_tiled`)."""
     call = _called(query, second, key, second_key, value, spans, scale, tile)
 
-    def step(held: Moments, index) -> tuple[Moments, None]:
+    def own(index) -> Moments:
         logits, seconds, values, _ = _tile(call, index * tile, tile)
-        return merged(held, moments(logits, seconds, values, call.powers), call.powers), None
+        return moments(logits, seconds, values, call.powers)
 
-    found, _ = jax.lax.scan(step, _empty(call, value.shape[-1]), jnp.arange(call.key.shape[1] // tile))
+    def step(held: Moments, index) -> tuple[Moments, None]:
+        return merged(held, own(index), call.powers), None
+
+    found, _ = jax.lax.scan(step, own(0), jnp.arange(1, call.key.shape[1] // tile))
     return _output(found, query.dtype), found
 
 
@@ -419,10 +497,11 @@ def _landing(estimate: jax.Array, operand: jax.Array, axis: int | tuple[int, int
         paired = estimate + largest[..., None]
         summed = estimate.shape[2] * estimate.shape[3]
     live = estimate > _NONE
-    reached = jnp.max(jnp.where(live, paired, _NONE), axis=axis)
+    # Over no term (a key's of no query, `Q = 0`) `_NONE`.
+    reached = jnp.max(jnp.where(live, paired, _NONE), axis=axis, initial=_NONE)
     # No landed term past `2^126` itself, whatever its operand (a zero operand bounds nothing: its terms'
     # `2^400` met it as `inf · 0`).
-    largest_term = jnp.max(jnp.where(live, estimate, _NONE), axis=axis)
+    largest_term = jnp.max(jnp.where(live, estimate, _NONE), axis=axis, initial=_NONE)
     return jnp.clip(jnp.minimum(HELD - (summed - 1).bit_length() - reached, 126 - largest_term), -250, 250)
 
 
@@ -485,7 +564,7 @@ def _summed_rows(terms: Callable, seed: jax.Array, tiles: int) -> tuple[jax.Arra
     `[B, Hk, G, Q, T]`, as a sum and its power of two `(s, P)`, `s 2^P` the whole: each term decayed whole
     (`exp_scaled`) at the row's running power, its largest term near `2^100`, the sum taken to a raised
     power exactly, so a term no factor of which fp32 holds alone keeps its value; `seed` the rows' zeros,
-    their placement the scan's."""
+    its walk's carry typed as its steps make it (`_tiled`)."""
     def step(summed, index):
         total, reached = summed
         coefficient, below, power = terms(index)
@@ -496,8 +575,7 @@ def _summed_rows(terms: Callable, seed: jax.Array, tiles: int) -> tuple[jax.Arra
         part = jnp.sum(exp_scaled(coefficient, below, power + lifted[..., None]), axis=-1)
         return (power2(total, lifted - before) + part, widest), None
 
-    (total, reached), _ = jax.lax.scan(step, (seed, jnp.full_like(seed, _NONE, dtype=jnp.int32)),
-                                       jnp.arange(tiles))
+    (total, reached), _ = _tiled(step, (seed, jnp.full(seed.shape, _NONE, jnp.int32)), tiles)
     return total, -jnp.clip(100 - reached, -600, 600)
 
 
@@ -541,7 +619,7 @@ def derivative(query, second, key, second_key, value, spans: KeySpans, held: Mom
     tiles = call.key.shape[1] // tile
     # `g · a` as the walk's own weights take each `g · v` (`Σ w g · v`, each decayed whole), so a tail
     # weight's `g · v` is kept where the held units flushed it (`_summed_rows`).
-    ga, ga_power = _summed_rows(gv, jnp.zeros_like(over), tiles)
+    ga, ga_power = _summed_rows(gv, jnp.zeros(over.shape, over.dtype), tiles)
 
     def paired(logits, seconds, moved):
         # A tile's `τ` as its fraction and power, and `δ = g · v - g · a` at each pair's own power `2^E`
@@ -561,7 +639,7 @@ def derivative(query, second, key, second_key, value, spans: KeySpans, held: Mom
 
     # `g · C = Σ w δ τ`, summed from the very terms the logits' coefficients take, where `g · C` from the
     # forward's covariance rounded apart from them and a row's coefficients summed short of 0.
-    against, against_power = _summed_rows(delta_tau, jnp.zeros_like(over), tiles)
+    against, against_power = _summed_rows(delta_tau, jnp.zeros(over.shape, over.dtype), tiles)
 
     def step(sums, index):
         (dq, dq_power), (dr, dr_power) = sums
@@ -589,9 +667,9 @@ def derivative(query, second, key, second_key, value, spans: KeySpans, held: Mom
         return on_rows, on_keys
 
     def carried(x):
-        return jnp.zeros_like(x), jnp.full_like(x[..., 0], 250, dtype=jnp.int32)
+        return jnp.zeros(x.shape, x.dtype), jnp.full(x.shape[:-1], 250, jnp.int32)
 
-    (dq, dr), per_tile = jax.lax.scan(step, (carried(call.query), carried(call.second)), jnp.arange(tiles))
+    (dq, dr), per_tile = _tiled(step, (carried(call.query), carried(call.second)), tiles)
 
     def keyed(x):
         # `[tiles, B, tile, Hk, D]` back to `[B, K, Hk, D]`.
@@ -636,11 +714,12 @@ def reference(query: jax.Array, second: jax.Array, key: jax.Array, second_key: j
               spans: KeySpans, *, scale: float | None = None) -> jax.Array:
     """Parallax (`attend`) in XLA ops over every key at once: one tile's moments (`moments`) of the whole
     call, differentiable at every order, the output in the query's dtype; a row that sees no key 0. Its
-    derivatives are autodiff's of the moments: its tail tiers' powers meet a cotangent after their products
-    and its `g · v` forms as the plain formula's does, so at a softmax tail under a large cotangent (`e^-128`
-    under `2^127`) a derivative reads 0 or overflows where float64's is a normal fp32, as the plain fp32
-    formula's does, every order finite within its contract (`test_parallax_holds_every_order`; Main's ruling
-    of 2026-11-27, row 14007); the walk's first derivative (`derivative`) holds them."""
+    derivatives are autodiff's of the moments: a lifted term meets a direction or cotangent at its own size,
+    its power taken first (`_shifted`), and its `g · v` forms as the plain formula's does, so at a softmax
+    tail under a large cotangent (`e^-128` under `2^127`) a derivative reads 0 or overflows where float64's
+    is a normal fp32, as the plain fp32 formula's does, every order finite within its contract
+    (`test_parallax_holds_every_order`; Main's ruling of 2026-11-27, row 14007); the walk's first derivative
+    (`derivative`) holds them."""
     scale = logit_scale(query.shape[-1], scale)
     keys = max(key.shape[1], 1)
     call = _called(query, second, key, second_key, value, spans, scale, keys)

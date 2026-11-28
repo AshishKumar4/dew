@@ -501,13 +501,15 @@ def _on_par_with_plain_fp32(operands, spans, cotangent, label: str, reference=_p
 
 def test_a_value_tails_logit_cotangents_keep_it():
     """A weight of `e^-128` over a value of `2^125` beside a key of weight 1 and value 0, a unit cotangent:
-    every cotangent on par with plain dense fp32 attention's against float64 (check 1), the query's and
-    keys' nonzero, `g · a` summed with each `g · v` decayed whole (`attention_parallax.derivative`), where
-    `e^-128` rounded to 0 first and the dominant key's logit cotangent, about `-2^127 e^-128`, read 0
-    (train 1407's review of 68a95bc01, held to check 1 by train 1423's)."""
+    every cotangent on par with its dense reference's (`attention_parallax.reference`) against float64
+    (check 1, Main's ruling on a tail's gradients), the query's and keys' nonzero, `g · a` summed with each
+    `g · v` decayed whole (`attention_parallax.derivative`), where `e^-128` rounded to 0 first and the
+    dominant key's logit cotangent, about `-2^127 e^-128`, read 0 (train 1407's review of 68a95bc01, held to
+    check 1 by train 1423's)."""
     *operands, spans = _witness((0.0, -128.0), (0.0, 0.0), (0.0, 2.0 ** 125))
     _on_par_with_plain_fp32(operands, spans, jnp.ones((1, 1, 1, 4), jnp.float32),
-                            "parallax's value tail's cotangents")
+                            "parallax's value tail's cotangents",
+                            reference=attention_parallax.reference)
 
 
 def test_a_tiles_covariance_past_fp32_comes_back_by_its_share():
@@ -562,13 +564,15 @@ def test_a_cotangents_large_entry_erases_no_live_pair():
 
 def test_a_tails_second_cotangent_lands_with_its_key():
     """Logits `[0, -128]`, a second query of 0 against second keys `[0, 2^127]`, values `[0, 1]`, a unit
-    cotangent: every cotangent on par with plain dense fp32 attention's against float64 (check 1), the
-    second query's `-4 · 2^127 e^-128 / (1 + e^-128)` nonzero, each term landed at its row's power with its
-    key before their product (`attention_parallax.derivative`), where `w δ` landed first flushed (train
-    1423's review)."""
+    cotangent: every cotangent on par with its dense reference's (`attention_parallax.reference`) against
+    float64 (check 1, Main's ruling on a tail's gradients), the second query's
+    `-4 · 2^127 e^-128 / (1 + e^-128)` nonzero, each term landed at its row's power with its key before
+    their product (`attention_parallax.derivative`), where `w δ` landed first flushed (train 1423's
+    review)."""
     *operands, spans = _witness((0.0, -128.0), (0.0, 2.0 ** 127), (0.0, 1.0), second=0.0)
     _on_par_with_plain_fp32(operands, spans, jnp.ones((1, 1, 1, 4), jnp.float32),
-                            "parallax's tail's second cotangent")
+                            "parallax's tail's second cotangent",
+                            reference=attention_parallax.reference)
 
 
 def test_a_querys_cotangent_takes_its_scale_before_its_power():
@@ -655,3 +659,144 @@ def test_a_large_explicit_scale_meets_a_landed_sum_with_its_power():
     out, pull = jax.vjp(attend, operands[0])
     (dquery,) = pull(jnp.ones_like(out))
     np.testing.assert_array_equal(np.asarray(dquery)[0, 0, 0, :2], [-(2.0 ** 98), 2.0 ** 98])
+
+
+def _tiled_keys(entries: dict[int, tuple[float, float, float]], count: int):
+    """One query of 0 over `count` keys of logit 0 (`_logits_of`), the keys at `entries`' places alone
+    visible, each `(logit, second key, value)` against a second query of 1, its value one channel."""
+    query, key = _logits_of([entries.get(place, (0.0,) * 3)[0] for place in range(count)])
+    seconds = [entries.get(place, (0.0,) * 3)[1] for place in range(count)]
+    values = [entries.get(place, (0.0,) * 3)[2] for place in range(count)]
+    valid = jnp.zeros((1, count), bool).at[0, jnp.asarray(sorted(entries))].set(True)
+    return (query, jnp.ones((1, 1, 1, 1), jnp.float32), key,
+            jnp.asarray(seconds, jnp.float32)[None, :, None, None],
+            jnp.asarray(values, jnp.float32)[None, :, None, None], template.spans(1, count, 1, valid=valid))
+
+
+def test_a_far_tiles_centre_is_its_own_share_of_its_second_product():
+    """Keys 0 and 128 (two tiles), logits `[0, -20]`, second products `[0, 2^100]`, values 0, a unit
+    cotangent: every cotangent on par with plain dense fp32 attention's against float64 (check 1), the
+    centre `e^-20 2^100 / (1 + e^-20)` merged about the larger share's (`attention_parallax._merged_centre`),
+    where `1 - s_A` rounded to 0 read it 0 and the dominant key's values' cotangent 1, not `2.6e21` (train
+    1444's review)."""
+    *operands, spans = _tiled_keys({0: (0.0, 0.0, 0.0), 128: (-20.0, 2.0 ** 100, 0.0)}, 129)
+    _on_par_with_plain_fp32(operands, spans, jnp.ones((1, 1, 1, 1), jnp.float32),
+                            "parallax's far tile's centre")
+
+
+def test_covariances_that_cancel_across_tiles_bound_no_later_merge():
+    """Equal logits over three tiles: second products `±2^200` (a second query of `2^100`) over values
+    `±2^100` whose two tiles' covariances `±2^300` cancel exactly, and a third tile of second products 0 and
+    values 3: the output their mean 1, the cancelled covariance's power cleared
+    (`attention_parallax.Moments.spread`), where it held `2^300` and took the mean to 0 (train 1444's
+    review)."""
+    big, value = 2.0 ** 100, 2.0 ** 100
+    entries = {0: (0.0, big, value), 1: (0.0, -big, -value), 128: (0.0, big, -value),
+               129: (0.0, -big, value), 256: (0.0, 0.0, 3.0), 257: (0.0, 0.0, 3.0)}
+    query, _, key, second_key, values, spans = _tiled_keys(entries, 258)
+    second = jnp.full((1, 1, 1, 1), 2.0 ** 100, jnp.float32)
+    out = attention_parallax.attend(query, second, key, second_key, values, spans)
+    np.testing.assert_array_equal(np.asarray(out), np.ones((1, 1, 1, 1), np.float32))
+
+
+def test_a_rows_tiny_entry_bounds_its_own_pair():
+    """A second query `[2^127, 2^-125]` against second keys `(0, 0)` and `(0, 2^127)`, equal logits, values
+    `[0, 1]`: second products `[0, 4]`, the output `1/2 - 1 = -1/2`, each pair bounded by its own entries'
+    exponents (`attention_parallax._pair_bound`), where mantissas at the row's power flushed `2^-125`,
+    bounded the row by `2^131` and took its query below fp32's normals (train 1444's review)."""
+    query = jnp.zeros((1, 1, 1, 4), jnp.float32)
+    key = jnp.zeros((1, 2, 1, 4), jnp.float32)
+    second = jnp.asarray([2.0 ** 127, 2.0 ** -125], jnp.float32)[None, None, None]
+    second_key = jnp.asarray([[0.0, 0.0], [0.0, 2.0 ** 127]], jnp.float32)[None, :, None]
+    value = jnp.asarray([0.0, 1.0], jnp.float32)[None, :, None, None]
+    out = attention_parallax.attend(query, second, key, second_key, value, template.spans(1, 2, 1))
+    np.testing.assert_array_equal(np.asarray(out)[0, 0, 0, 0], -0.5)
+
+
+@pytest.mark.parametrize("arm", ["walk", "reference"])
+def test_a_large_value_direction_meets_lifted_terms_at_their_size(arm):
+    """Equal logits, second products `[1, -1]`, values 0 along the direction `[2^126, -2^126]`: the
+    output's tangent `-2^126`, plain fp32's, each lifted term met at its size before the direction
+    (`attention_parallax._shifted`), where terms lifted by `2^60` met it first and overflowed (train
+    1444's review)."""
+    *operands, spans = _witness((0.0, 0.0), (1.0, -1.0), (0.0, 0.0))
+    attend = attention_parallax.attend if arm == "walk" else attention_parallax.reference
+    direction = jnp.broadcast_to(jnp.asarray([2.0 ** 126, -(2.0 ** 126)], jnp.float32)[None, :, None, None],
+                                 operands[4].shape)
+    _, tangent = jax.jvp(lambda value: attend(*operands[:4], value, spans), (operands[4],), (direction,))
+    np.testing.assert_array_equal(np.asarray(tangent), np.full((1, 1, 1, 4), -(2.0 ** 126), np.float32))
+
+
+def test_a_decay_past_int32_erases_no_dominant_term():
+    """Logits `[0, -1488522240]` over values `[1, 2^-100]`, second products 0, a unit cotangent: the far
+    weight 0, so the dominant logit's cotangent `g · (v - a)` is 0 and every key's too, its decay's power
+    held before it is an integer (`attention_parallax._reach`), where it wrapped past `INT32_MIN`, erased
+    `g · a` and read the dominant key's `1/2` (train 1444's review)."""
+    *operands, spans = _witness((0.0, -1488522240.0), (0.0, 0.0), (1.0, 2.0 ** -100))
+    out, pull = jax.vjp(lambda key: attention_parallax.attend(operands[0], operands[1], key, *operands[3:],
+                                                              spans), operands[2])
+    (dkey,) = pull(jnp.ones_like(out))
+    np.testing.assert_array_equal(np.asarray(dkey), np.zeros(operands[2].shape, np.float32))
+
+
+@pytest.mark.mesh(devices=2)
+def test_parallax_runs_under_a_checked_map_with_its_values_split_alone():
+    """Parallax and its derivative under a checked `shard_map` whose values and cotangent alone are split by
+    batch, its queries and keys replicated: on par with each batch's unsplit call against float64 (check
+    1), its scans' carries typed as their steps make them (`attention_parallax._tiled`), where carries
+    seeded from the query alone failed the scan (train 1444's review)."""
+    from jax.sharding import AxisType, PartitionSpec as P
+
+    mesh = jax.make_mesh((2,), ("data",), axis_types=(AxisType.Explicit,), devices=jax.devices()[:2])
+    spans = template.spans(8, 8, 1, causal=True)
+
+    def per_batch(attend):
+        def run(query, second, key, second_key, value, cotangent):
+            def call(*operands):
+                return jnp.concatenate([attend(*operands[:4], operands[4][row:row + 1], spans)
+                                        for row in range(2)])
+
+            out, pull = jax.vjp(call, query, second, key, second_key, value)
+            return out, *pull(cotangent)
+
+        return run
+
+    def mapped(query, second, key, second_key, value, cotangent):
+        local = jax.shard_map(lambda *operands: attention_parallax.attend(*operands, spans), mesh=mesh,
+                              in_specs=(P(), P(), P(), P(), P("data")), out_specs=P("data"))
+        out, pull = jax.vjp(local, query, second, key, second_key, value)
+        return out, *pull(cotangent)
+
+    def draw(seed):
+        return normal_draw([54, 29, seed], (1, 8, 2, 4), (1, 8, 2, 2), (1, 8, 1, 4), (1, 8, 1, 2),
+                           (2, 8, 1, 4), (2, 8, 2, 4))
+
+    assert_as_exact(jax.jit(mapped), jax.jit(per_batch(attention_parallax.attend)), draw,
+                    "parallax with its values split alone", seeds=FEWEST_SEEDS,
+                    truth_fn=jax.jit(per_batch(_plain)))
+
+
+def test_a_call_of_no_queries_pulls_back_zeros():
+    """No query over one key (`template.spans(0, 1, 1)`): every operand's cotangent zeros of its shape, a
+    key's landing over no query `_NONE` (`attention_parallax._landing`), where its maximum over no query
+    failed (train 1444's review)."""
+    operands = (jnp.zeros((1, 0, 1, 4), jnp.float32), jnp.zeros((1, 0, 1, 1), jnp.float32),
+                jnp.ones((1, 1, 1, 4), jnp.float32), jnp.ones((1, 1, 1, 1), jnp.float32),
+                jnp.ones((1, 1, 1, 4), jnp.float32))
+    spans = template.spans(0, 1, 1)
+    out, pull = jax.vjp(lambda *xs: attention_parallax.attend(*xs, spans), *operands)
+    for grad, operand in zip(pull(jnp.zeros_like(out)), operands, strict=True):
+        np.testing.assert_array_equal(np.asarray(grad), np.zeros(operand.shape, np.float32))
+
+
+@pytest.mark.parametrize("arm", ["walk", "reference"])
+def test_a_scale_of_zero_gives_logits_of_zero(arm):
+    """A scale of 0 over a query and keys of `2^100` (their product past fp32), values 1: the logits 0 and
+    the output 1, never the product times 0 (`inf · 0`, NaN; train 1444's review)."""
+    query = jnp.zeros((1, 1, 1, 4), jnp.float32).at[0, 0, 0, 0].set(2.0 ** 100)
+    key = jnp.zeros((1, 2, 1, 4), jnp.float32).at[0, :, 0, 0].set(2.0 ** 100)
+    second, second_key = jnp.zeros((1, 1, 1, 1), jnp.float32), jnp.zeros((1, 2, 1, 1), jnp.float32)
+    value = jnp.ones((1, 2, 1, 4), jnp.float32)
+    attend = attention_parallax.attend if arm == "walk" else attention_parallax.reference
+    out = attend(query, second, key, second_key, value, template.spans(1, 2, 1), scale=0.0)
+    np.testing.assert_array_equal(np.asarray(out), np.ones((1, 1, 1, 4), np.float32))
