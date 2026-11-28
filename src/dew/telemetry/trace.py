@@ -46,7 +46,8 @@ outfeed."""
 def moves_only(op: str) -> bool:
     """Whether the HLO op `op` (an opcode as XLA prints it) moves data and computes none, or runs half of one
     (`<op>-start`, `<op>-done`): a transfer (`TRANSFERS`) or a collective (`collective`) that reduces nothing
-    (`REDUCING`). An `async-start` is none, its wrapped op unnamed by its opcode."""
+    (`REDUCING`). An `async-start` is none, its wrapped op unnamed by its opcode: a reader names it first
+    (`benchmark._opcodes`, from its module's typed instructions)."""
     kind = collective(op)
     if kind is not None:
         return kind not in REDUCING
