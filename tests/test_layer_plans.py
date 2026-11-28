@@ -137,6 +137,20 @@ def test_a_candidate_inside_a_platform_choices_portable_branch_is_never_ranked()
                for found in planned.search for variant in found.variants)
     assert all(found.best is None and found.passed is None for found in planned.search)
 
+def test_today_weighs_the_branch_a_platform_choice_takes_where_the_step_lowers():
+    """A product in each branch of a platform choice (`_ported`): on an H100 the pass's bodies today are the
+    branch a CUDA lowering runs alone (`program.fused_bodies`' `platform`, `generation.lowering_platform`),
+    never the portable branch it does not launch (Train 1470's review: both branches' products were listed
+    as the step's)."""
+    jaxpr = jax.make_jaxpr(_ported)(*_shapes()).jaxpr
+    ((place, choice),) = [(at, eqn) for at, eqn in enumerate(jaxpr.eqns) if eqn.primitive is jax.lax.cond_p]
+    cuda = next(number for number, names in enumerate(choice.params["branches_platforms"])
+                if names is not None and "cuda" in names)
+    with generation.assumed("sm90"):
+        planned = layers.plan(jaxpr)
+    assert planned.today and {found.body for found in planned.today} == {f"step/cond@{place}.{cuda}"}
+
+
 def test_a_product_whose_variants_save_alike_takes_its_most_staged_as_its_best():
     """`Weighed.best` among variants saving the same seconds is the first, the one holding the most stages
     (`Weighed.variants`' order): a tie never reads a later, smaller region as the better plan."""
