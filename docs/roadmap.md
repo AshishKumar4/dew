@@ -22,7 +22,6 @@ This page is generated from the maintainers' findings ledger as each change land
 - Carried JAX fixes upstream. [4689, 4690, 4693, 4698, 5403, 5808, 5809, 5810, 5811, 5813, 5814, 5815, 5816, 5817, 5820, 5822, 5823, 5825, 5827, 5829, 5831, 5832, 5833, 5834, 5835, 5836, 5837, 5839, 5841, 5842, 5843, 5845, 5846, 5847, 5848, 10742]
 - Convolution repairs above their owner. [5665]
 - The attention forward's derivation ranking does not predict its time on most cells measured. [6216]
-- Log-linear attention 6.6x fla's forward on a GH200. [10525]
 - The recurrence suite's wall: every case within CI's group target. [12429]
 - Attention tests to the bible's §6 and §7 test rules. [12432, 12778, 12873, 13489]
 - The recurrence template refuses the gated delta net's training on sm120. [13064]
@@ -52,6 +51,7 @@ This page is generated from the maintainers' findings ledger as each change land
 - The suite's wall. [5478]
 - A 4B decision start's cold fit spends 152.8 s (template) and 162.2 s (vendor) in 12 traces of templates/report.py's certification program pulled_back…. [6593]
 - Pallas's interpreter compiles a thread map's body once per leased CPU client. [7087]
+- Log-linear attention 6.6x fla's forward on a GH200. [10525]
 
 ## Models and interop
 
