@@ -1660,6 +1660,25 @@ def rounding_alone():
         _MARKING.reset(held)
 
 
+@contextlib.contextmanager
+def rounding_as_compiled():
+    """Inside a `rounding_alone` block, a block traced as outside any (`uncontracted`), unmarked: code the
+    marked arithmetic calls that is not its own (a model a solver's step calls; review of train 1492's
+    fold). Outside a marked block, nothing changes."""
+    name = no_contract()
+    if name is None or not _MARKING.get():
+        yield
+        return
+    from jax.experimental.xla_metadata import set_xla_metadata
+
+    held = _MARKING.set(False)
+    try:
+        with set_xla_metadata(**{name: None}):  # a None value lifts the mark for the block
+            yield
+    finally:
+        _MARKING.reset(held)
+
+
 @_protected
 def two_sum(left, right):
     """`left + right` rounded, and exactly what the rounding dropped (Knuth's TwoSum). Each operand is read as
