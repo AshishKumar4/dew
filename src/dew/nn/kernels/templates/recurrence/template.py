@@ -661,13 +661,14 @@ class Mosaic(base.Template[mainloop.Tiles]):
     def _exhausted(self, ba: tokamax.BoundArguments, tiles: mainloop.Tiles, target: generation.GpuTarget,
                    *, training: bool) -> bool:
         """Whether a compile refused `tiles` past what its derivation's rungs answer: a kernel spilled
-        (`report.refused_at`), of the product `training` names (`_refused`), whose launch's producer can rise
-        no further, or would leave its tiles unheld (`_raised`), and whose launch walks no key block of its
-        own it can narrow (`_narrowed`)."""
+        (`report.refused_at`), of the product `training` names (`_refused`), that no next rung answers
+        (`_stepped`: a producer raised, a program fewer, a key block narrowed). Read apart from the ladder,
+        a launch that moves no registers, with no producer to raise, was exhausted at its first refusal
+        before its program fewer was asked, and its derivation took the next ring depth, planning the launch
+        alike, down to no tiles (Kimi's key-scores backward on an sm90 under JAX 0.12.1, row 14169)."""
         spilled = frozenset(kernel for kernel in report.refused_at(self, ba, tiles, target)
                             if _of(kernel, training))
-        return (bool(spilled) and self._raised(ba, tiles, spilled, target) is None
-                and self._narrowed(ba, tiles, spilled, target) is None)
+        return bool(spilled) and self._stepped(ba, tiles, spilled, target) is None
 
     def _plans(self, ba: tokamax.BoundArguments, tiles: mainloop.Tiles, target: generation.GpuTarget
                ) -> dict[str, frozenset[tuple[bool, mainloop.Launch]]]:
@@ -838,11 +839,11 @@ class Mosaic(base.Template[mainloop.Tiles]):
     def _stepped(self, ba: tokamax.BoundArguments, joined: mainloop.Tiles, spilled: frozenset[str],
                  target: generation.GpuTarget) -> mainloop.Tiles | None:
         """`joined`'s next rung for its `spilled` launches: their producers a rung down their ladders
-        (`_raised`), or, past a ladder's foot or where every rung left gives their consumers less
-        (`_consumers_spilled`), those launches a program fewer a multiprocessor with their producers at the
-        least again (`_fewer`), whose ladders then run at that residency; past one program, or on a launch
-        that moves no registers, one that walks a key block of its own at half of it (`_narrowed`); None
-        past those."""
+        (`_raised`), or, past a ladder's foot, where every rung left gives their consumers less
+        (`_consumers_spilled`) or on a launch that moves no registers, those launches a program fewer a
+        multiprocessor, a producer's at the least again (`_fewer`), whose ladders then run at that residency;
+        past one program, one that walks a key block of its own at half of it (`_narrowed`); None past
+        those."""
         if not self._consumers_spilled(ba, joined, spilled, target) and (
                 raised := self._raised(ba, joined, spilled, target)) is not None:
             return _limited(joined, producers=raised, residents=joined.residents, keys=joined.keys)
@@ -868,19 +869,31 @@ class Mosaic(base.Template[mainloop.Tiles]):
 
     def _fewer(self, ba: tokamax.BoundArguments, joined: mainloop.Tiles, spilled: frozenset[str],
                target: generation.GpuTarget) -> mainloop.Tiles | None:
-        """`joined` with its `spilled` launches whose producers' ladders ran out (`_moving`: a launch that
-        moves no registers has no ladder, and its tiles are refused as before) a program fewer a
-        multiprocessor than they plan now (`resources.Residents.fewer`), each the fewest its instances plan
-        (the training call's and the forward alone's, each at its own tiles), their producers at the least;
-        None where one plans one program already. Every role of a launch takes a larger share there, where
-        the assembler may hold what no rung of its producer's ladder gave its consumers (row 6718)."""
+        """`joined` with each of its `spilled` launches (each kernel's own, `_owners`) that plans more than
+        one program a multiprocessor a program fewer (`resources.Residents.fewer`), the fewest its instances
+        plan (the training call's and the forward alone's, each at its own tiles), the producers of those that
+        move registers (`_moving`) at the least; None where every one plans one program already. Every role of
+        a launch takes a larger share there, where the assembler may hold what no rung of its producer's
+        ladder gave its consumers (row 6718). A launch that moves no registers has no producer's ladder: held
+        to fewer programs, its compile takes the larger share its residency gives every thread
+        (`mainloop.launch_kernel`'s `min_blocks_per_sm`), where Kimi's key-scores backward on an sm90, three
+        `[C, C]` accumulators within 128 registers at two programs, spilled 176 bytes under JAX 0.12.1's
+        lowering and 0.12.0's held, and with no rung its training derived no tiles (row 14169). Each launch
+        steps on its own: one already at one program leaves the others' rungs to them."""
+        launches = (*self.launches(ba, joined, target, backward=True),
+                    *self.launches(ba, joined.forward or joined, target, backward=False))
+        owned = _owners(spilled, launches)
         planned: dict[str, int] = {}
-        for launch in self._moving(ba, joined, spilled, target):
-            planned[launch.name] = min(planned.get(launch.name, launch.resident), launch.resident)
-        residents = joined.residents.fewer(planned) if planned else None
-        if residents is None:
+        for launch in launches:
+            if launch.name in owned:
+                planned[launch.name] = min(planned.get(launch.name, launch.resident), launch.resident)
+        stepping = {name: programs for name, programs in planned.items() if programs > 1}
+        if not stepping:
             return None
-        return _limited(joined, producers=joined.producers.without(planned), residents=residents,
+        residents = joined.residents.fewer(stepping)
+        assert residents is not None, "every launch stepping plans more than one program"
+        moving = {launch.name for launch in self._moving(ba, joined, spilled, target)} & stepping.keys()
+        return _limited(joined, producers=joined.producers.without(moving), residents=residents,
                         keys=joined.keys)
 
     def _narrowed(self, ba: tokamax.BoundArguments, joined: mainloop.Tiles, spilled: frozenset[str],
@@ -910,7 +923,8 @@ class Mosaic(base.Template[mainloop.Tiles]):
         planned residency, which bounds a producer (past it the roles' moves invert and the assembler rejects
         the kernel), then a setmaxnreg step lower; each a launch whose program moves registers from its
         producer (`resources.moves_registers`, as its schedule does). None where none does or one is at its
-        ladder's foot (its tiles then refused, the next derived). A rung moves registers within a program's
+        ladder's foot, where `_stepped` asks a program fewer or a narrower key block next, the tiles refused
+        where neither answers (`_exhausted`). A rung moves registers within a program's
         pool, which its launch plans at the least (`mainloop.launch_kernel`): whether its roles hold is the
         assembler's, a compile that spills them refusing it."""
         family = bundle(target, _dtype(ba))
