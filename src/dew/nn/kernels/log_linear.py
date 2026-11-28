@@ -226,7 +226,8 @@ def _read(readers, held):
     readers' product with the memory, an overflowed reader's (an infinite one its finite query and weight
     formed) left out of the memory's gradient, so the product's transpose meets no infinite reader with
     another output's zero cotangent (`inf * 0`; train 1455's review), its read the plain product's where one
-    overflowed (formed apart, where any did: no call without one pays for it)."""
+    overflowed (formed apart, where any did: an unmapped call without one pays nothing for it; under `vmap`
+    the condition is batched, and both products are formed beside a select)."""
     def product(readers, held):
         return jnp.einsum('bgnretk,bgnrepk->bgnretp', readers, held, preferred_element_type=jnp.float32)
 
