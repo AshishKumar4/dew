@@ -204,10 +204,14 @@ def titans(query, key, value, weight, bias, theta, alpha, eta, state=None, *, ch
             # kept in its low part (`precision.two_sum`) and the pair renormalized, so the memory read, its
             # rounded value, holds steps below its last place as the memory's general path holds a chunk's
             # (`dew.nn.memory`; 79g's review: four writes of 0.98 into a memory of 2^25 left it as it was),
-            # and a decayed memory is the recurrence's own product, as exact as fla's reference.
+            # and a decayed memory is the recurrence's own product, as exact as fla's reference. The low part
+            # is a value alone, constant to the derivatives, whose tangent is the recurrence's own: an
+            # error-free transform's differentiated rounding error is its tangents' rounding, which the low
+            # part would carry into the memory's (4x the recurrence's error in the queries' gradient).
             forget = (1.0 - alpha)[..., None, None]
             total, dropped = precision.two_sum(forget * memory, momentum)
-            memory, low = precision.two_sum(total, forget * low + dropped)
+            memory, low = precision.two_sum(total, jax.lax.stop_gradient(forget * low + dropped))
+            low = jax.lax.stop_gradient(low)
             # A padded token leaves the memory and momentum as they were.
             carried = tuple(jnp.where(real[..., None, None], new, old)
                             for new, old in zip((memory, low, momentum), carried, strict=True))
