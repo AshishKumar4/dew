@@ -1913,6 +1913,36 @@ def test_a_portable_per_key_transpose_sums_opposite_cotangents_before_they_land(
     np.testing.assert_array_equal(pull(row, keys, decay, cotangent), np.zeros_like(row))
 
 
+def test_portable_pair_groups_in_one_call_are_each_groups_own_pairs():
+    """Two groups of pairs in one call (`scan._portable_pairs`: `_factored`'s own blocks, one decay a pair,
+    and its earlier ones, the row's and the key's apart), one repair decision and one exact sum for both (row
+    14108): where neither group's decayed factor flushes, each group's pairs are its own call's, bit for bit;
+    where the earlier blocks' key decayed to 2^-140 flushes, both groups' pairs are their exact sums, the
+    earlier blocks' 2^-40 kept, each as its own call's exact sum (`_exact_pairs`) takes it."""
+    own = (jnp.asarray([[[1.0, 2.0], [3.0, -1.0]]], jnp.float32),
+           jnp.asarray([[[0.5, 1.0], [2.0, 4.0]]], jnp.float32),
+           jnp.asarray([[[[1.0, 0.5], [-0.0, -0.0]], [[0.25, 1.0], [1.0, 0.75]]]], jnp.float32), None)
+
+    def earlier(key: float):
+        return (jnp.asarray([[[2.0 ** 100, 0.0], [1.0, 0.0]]], jnp.float32),
+                jnp.asarray([[[key, 0.0], [1.0, 0.0]]], jnp.float32),
+                jnp.ones((1, 2, 2), jnp.float32), jnp.asarray([[[key, 1.0], [1.0, 1.0]]], jnp.float32))
+
+    for key in (1.0, 2.0 ** -70):
+        groups = (own, earlier(key))
+        together = jax.jit(lambda *x: scan._portable_pairs(*x))(*own, *groups[1])
+        alone = [jax.jit(lambda *x: scan._portable_pairs(*x))(*group)[0] for group in groups]
+        if key == 1.0:
+            for joined, single in zip(together, alone, strict=True):
+                np.testing.assert_array_equal(joined, single)
+            continue
+        exact = [scan._exact_pairs((group,))[0] for group in groups]
+        for joined, sum_ in zip(together, exact, strict=True):
+            np.testing.assert_array_equal(joined, sum_)
+        np.testing.assert_array_equal(together[1], alone[1])
+        assert float(together[1][0, 0, 0]) == 2.0 ** -40
+
+
 @pytest.mark.parametrize("side", ["reader", "state"])
 def test_a_subnormal_read_scale_keeps_the_primal_and_pullback_in_range(side):
     scale = np.float32(2.0 ** -128)
