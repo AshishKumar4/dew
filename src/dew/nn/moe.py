@@ -48,6 +48,7 @@ from dew.mesh import (
     mesh_axes,
     spec_axes,
 )
+from dew.nn import categorical
 from dew.nn.dense import Dense, amax_history, noted_amax, packed_matrix
 from dew.nn.derivatives import KernelGlue, Protected, contracted, declared_tangent, with_tangents_formed_at
 from dew.nn.kernels.templates.gemm import launched_whole, rows_gathered_wide
@@ -213,9 +214,28 @@ def expert_softmax(logits: jax.Array) -> jax.Array:
     (`compensated_sum`) and divided by IEEE division (`divided`). A float32 sum of the exponentials in one
     running order left a softmax router's weights 1.74 times as far from float64 as torch's softmax, whose
     vectorized sum rounds less, over vLLM's grouped_topk (tests/test_router_source.py's `softmax`); summed
-    so, 0.66 times."""
+    so, 0.66 times. Differentiated as a softmax is (`categorical.softmax_tangent`), as PyTorch's softmax
+    backward takes it, never through its division, whose derivatives were most of a sparse decoder's
+    programs (row 12805: 258k of the 376k operations its test's programs held)."""
+    return _expert_softmax(logits)
+
+
+def _expert_probabilities(logits: jax.Array) -> jax.Array:
+    """`expert_softmax`'s value."""
     shifted = jnp.exp(logits - jax.lax.stop_gradient(jnp.max(logits, axis=-1, keepdims=True)))
     return divided(shifted, compensated_sum(shifted, (shifted.ndim - 1,))[..., None])
+
+
+def _expert_tangent(primals, tangents):
+    (logits,), (d_logits,) = primals, tangents
+    probability = _expert_softmax(logits)
+    return probability, categorical.softmax_tangent(probability, d_logits)
+
+
+_expert_softmax = contracted("test_an_expert_softmax_holds_every_order")(
+    declared_tangent(Protected(), _expert_probabilities, _expert_tangent))
+"""`expert_softmax`'s value with a softmax's tangent (`categorical.softmax_tangent`), its rule reading the
+probabilities again, so a second order meets the rule."""
 
 
 def renormalized_softmax(logits: jax.Array, indices: jax.Array) -> jax.Array:

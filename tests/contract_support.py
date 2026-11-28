@@ -545,6 +545,18 @@ def normal_draw(seed, *shapes, scale: float = 1.0, dtype=jnp.float32) -> tuple:
     return drawn_on_the_host(drawn, seed)
 
 
+def contract_draw(salt: int, shapes: tuple[tuple[int, ...], ...], cotangent: tuple[int, ...]):
+    """A drawn contract's inputs (`assert_drawn_contract`'s `inputs(seed, scale)`): standard normal primals
+    of `shapes` and their direction at `scale`, and a unit cotangent of shape `cotangent`, each its own
+    stream (`salt`, `salt + 1` and `salt + 2` beside the seed, `normal_draw`)."""
+    def inputs(seed, scale):
+        return (normal_draw((salt, seed), *shapes, scale=scale),
+                normal_draw((salt + 1, seed), *shapes, scale=scale),
+                normal_draw((salt + 2, seed), cotangent)[0])
+
+    return inputs
+
+
 def normal_drawn(salt: int, *shapes, dtype=jnp.float32):
     """A check-1 draw (`draw(seed)`) of standard normal arrays of `shapes` in `dtype`, a site's `salt`
     keeping its stream apart (`normal_draw`)."""
