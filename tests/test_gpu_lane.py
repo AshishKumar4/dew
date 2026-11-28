@@ -148,6 +148,21 @@ def test_the_gpu_lane_runs_a_files_gpu_marked_tests_alone(tmp_path, lane):
         assert outcomes["test_cpu"] == "passed" and why not in outcomes["test_gpu"], outcomes
 
 
+@pytest.mark.parametrize(("flags", "once"), [
+    ('--a=1 --xla_dump_to="/logs/two  spaces" --a=2', '--xla_dump_to="/logs/two  spaces" --a=2'),
+    ("--xla_dump_to='/x y' --b --xla_dump_to='/z'", "--b --xla_dump_to='/z'"),
+    ('--p="a \\" b" --q=1 --p=2', "--q=1 --p=2"),
+    ("  --x=1   --x=2  ", "--x=2"),
+    ("--x=1 stray --y=2", "--x=1 stray --y=2")])
+def test_a_flag_is_stated_once_whole_as_xla_reads_it(flags, once):
+    """Each XLA flag stated once, its last value, read whole as XLA reads XLA_FLAGS
+    (xla/parse_flags_from_env.cc): a quoted value holding spaces one flag, its quotes kept, a backslash
+    escaping a double quote within it; what follows a span that is no flag left as XLA leaves it, unread."""
+    import lane_environment
+
+    assert lane_environment._each_once(flags) == once
+
+
 def test_a_lane_configured_again_states_each_xla_flag_once():
     """The suite's environment (tests/lane_environment.py's `configured`), set again on an environment it
     set (a second import of the suite's conftest, or a child of a process that ran it): each XLA flag it sets
