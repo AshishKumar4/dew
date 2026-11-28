@@ -355,31 +355,38 @@ def _stored_arm(store: CompiledTruths, label: str, given_fn, arm, role: str, *, 
 
 def _library_checked(arm, given_fn, label: str):
     """`arm`, a site's arm its run compiles on its GPU (unprepared, unnamed, or at run), held to its library's
-    call where `given_fn` is a library arm (`truths_ahead.library_arm`) and it runs on a GPU
-    (`truths_ahead.library_checked`): each call's program compiled as the arm runs it (its `lower`, under its
-    switches: `Unrewritten`'s, a twin's as written), checked, and run, one compile a call's signature, no
-    prepare having made one (row 14096); `arm` as it is otherwise."""
+    call where `given_fn`, or the program a window loop or run-to-run declaration holds (as `_ahead_arm`
+    reads them), is a library arm (`truths_ahead.library_arm`) and it runs on a GPU
+    (`truths_ahead.library_checked`), no prepare having compiled it (row 14096); `arm` as it is otherwise."""
+    if isinstance(given_fn, _RunToRun):
+        return _RunToRun(_library_checked(arm.fn, given_fn.fn, label), given_fn.why)
+    if isinstance(given_fn, _Windowed):
+        return _Windowed(_library_checked(arm.fn, given_fn.fn, label))
     call = library_call(given_fn)
     if call is None or jax.default_backend() != "gpu":
         return arm
-    return _LibraryChecked(arm, call, label)
+    return _LibraryChecked(arm, given_fn, call, label)
 
 
 class _LibraryChecked:
-    """A library arm (`arm`, as the gate runs it) whose each call's executable, the arm's own program at the
-    call's signature (`arm_forms._signature`), is checked to call `call` and then run (`_library_checked`),
-    its other attributes the arm's."""
+    """A library arm (`arm`, as the gate runs it) checked to call `call` at each call's signature
+    (`arm_forms._signature`), once (`_library_checked`): where the arm is one program (its `lower`, under its
+    switches: `Unrewritten`'s, a twin's as written), that program compiled, checked and run; where it is a
+    pair (`arm_forms._Paired`, whose call picks its program), the library's program as given (`given_fn`)
+    compiled and checked, and the arm run, its other attributes the arm's."""
 
-    def __init__(self, arm, call: str, label: str):
-        self.arm, self.call, self.label, self.executables = arm, call, label, {}
+    def __init__(self, arm, given_fn, call: str, label: str):
+        self.arm, self.given_fn, self.call, self.label, self.executables = arm, given_fn, call, label, {}
 
     def __call__(self, *inputs):
         key = _signature(inputs)
         if key not in self.executables:
-            executable = self.arm.lower(*inputs).compile()
+            own = self.arm if callable(getattr(self.arm, "lower", None)) else None
+            executable = (self.given_fn if own is None else own).lower(*inputs).compile()
             library_checked(executable, self.call, self.label)
-            self.executables[key] = executable
-        return self.executables[key](*inputs)
+            self.executables[key] = None if own is None else executable
+        executable = self.executables[key]
+        return self.arm(*inputs) if executable is None else executable(*inputs)
 
     def __getattr__(self, name):
         return getattr(self.arm, name)
