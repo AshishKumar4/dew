@@ -926,7 +926,8 @@ def a_packed_nvfp4_call_placed_on_its_hosts_cpu_keeps_a_subnormal_scale():
                             jnp.full((2, 128), 2.0 ** -127, jnp.float32))
     rows, sizes = jnp.ones((256, 256), jnp.bfloat16), jnp.asarray([128, 128], jnp.int32)
     rows, bank, sizes = jax.device_put((rows, bank, sizes), cpu)
-    with generation.chosen(nvfp4="packed"):
+    # The interpreter's GPU stated, as every interpreted call states it; the process's default stays its GPU.
+    with generation.assumed("sm90"), generation.chosen(nvfp4="packed"):
         out = gemm.nvfp4_product(rows, bank, sizes, out_dtype=jnp.float32, interpret_on_cpu=True)
     np.testing.assert_array_equal(np.asarray(out), np.full((256, 128), 2.0 ** -119, np.float32))
 
