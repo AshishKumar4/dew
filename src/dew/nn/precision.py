@@ -931,9 +931,9 @@ def _no_groups(traced: core.Jaxpr, operands: tuple) -> jax.Array:
     traced aval's zeros as JAX forms a value's (`ad_util.zeros_like_aval`: its dtype, a float64 one's outside
     x64 too, its weakness and its placement each the aval's, an Explicit one a shape's evaluation drops
     beside an Auto axis), varying as its operands vary; an eager call's made on the mesh of devices its
-    operands lie on at the product's placement (train 1484's review: allocated at the abstract mesh outside
-    any mesh context, a two-device product's zeros were refused), else committed to the one device its
-    committed operands lie on, as their product would be. A constant, its derivative zero at every order
+    operands lie on (every operand of one product shares it) at the product's placement (train 1484's
+    review: allocated at the abstract mesh outside any mesh context, a two-device product's zeros were
+    refused), else committed to the one device its committed operands lie on, as their product would be. A constant, its derivative zero at every order
     (row 14112's reviews)."""
     from jax._src import ad_util
 
