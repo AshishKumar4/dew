@@ -605,9 +605,9 @@ def test_a_baseline_keeps_its_cells_by_their_fields_and_main_s_capped_cells_are_
     row = graded([same], before=kept(capped))
     assert row["exitCode"] == 0
     assert json.loads(json.dumps(row))["unprepared_cells"] == [
-        ["tests/test_gpu_vae.py::test_flow", "tests/test_gpu_vae.py", "two", None]]
+        ["tests/test_gpu_vae.py::test_flow", "tests/test_gpu_vae.py", "two", None, None]]
     assert ci.prepares.cells_of(json.loads(json.dumps(row))) == {
-        ("tests/test_gpu_vae.py::test_flow", "tests/test_gpu_vae.py", "two", None)}
+        ("tests/test_gpu_vae.py::test_flow", "tests/test_gpu_vae.py", "two", None, None)}
     assert graded([], before=kept(capped), found=json.loads(json.dumps(row)))["exitCode"] == 0
     sibling = {**same, "cell": "three"}
     assert graded([same, sibling], before=kept(capped))["new_unprepared"] == [ci.prepares.identity(sibling)]
@@ -1142,7 +1142,7 @@ def test_a_whole_cut_of_fields_and_older_identities_is_read_and_graded_apart(ci,
     monkeypatch.setattr(ci.run_keys, "head_commit", lambda: "head")
     monkeypatch.setattr(ci, "baseline_key", lambda commit, python, place, held: f"baseline/{place}")
     found = ci.prepares.before(ci, "3.12", "tests/test_gpu_a.py", "@prepare-sm90", time.monotonic() + 600)
-    assert found == {(*lookalike, None), older}
+    assert found == {(*lookalike, None, None), older}
     reached = {"test": "tests/test_gpu_a.py::test_flow[p]", "where": "a site", "error": "e",
                "cell": "q @ a site [c"}
     other = {"test": "tests/test_gpu_a.py::test_other", "where": "x", "error": "e"}
@@ -1172,12 +1172,17 @@ def test_a_commits_baseline_is_its_green_prepares_and_a_red_run_writes_none(ci, 
     fields = [["tests/test_gpu_a.py::t[p] @ " + ci.tier_wire().CAPPED + " [q", "a site", "c"]]
     assert ci.run_keys.baselined("3.12", place, "cls", "token",
                                  {"exitCode": 0, "unprepared": ["a @ x"], "unprepared_cells": fields})
-    assert ci.prepares.cells_of(json.loads(stored[baseline])) == {(*fields[0], None)}
+    assert ci.prepares.cells_of(json.loads(stored[baseline])) == {(*fields[0], None, None)}
     # Its kind kept too: a row's four fields published and read back whole.
     kinded = [[*fields[0], "flow"]]
     assert ci.run_keys.baselined("3.12", place, "cls", "token",
                                  {"exitCode": 0, "unprepared": ["a @ x"], "unprepared_cells": kinded})
-    assert ci.prepares.cells_of(json.loads(stored[baseline])) == {tuple(kinded[0])}
+    assert ci.prepares.cells_of(json.loads(stored[baseline])) == {(*kinded[0], None)}
+    # And its site: a row's five fields published and read back whole.
+    sited = [[*kinded[0], "out = merged(a)"]]
+    assert ci.run_keys.baselined("3.12", place, "cls", "token",
+                                 {"exitCode": 0, "unprepared": ["a @ x"], "unprepared_cells": sited})
+    assert ci.prepares.cells_of(json.loads(stored[baseline])) == {tuple(sited[0])}
 
 
 @pytest.mark.parametrize("taken", [True, False])
