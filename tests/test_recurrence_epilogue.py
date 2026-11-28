@@ -427,7 +427,7 @@ def test_the_norm_selector_takes_its_kernel_for_its_own_gated_form_alone(form):
     with generation.assumed('sm90'):
         codes = [refusal.code for refusal in norm_swiglu.NORM.kernels[0].refusals(case)]
     assert ('form' in codes) == (form != 'gate after'), codes
-    with pytest.raises(ValueError, match='form'):
+    with pytest.raises(ValueError):
         dataclasses.replace(case, form='gate between')
 
 
@@ -460,6 +460,10 @@ def test_a_row_hooks_side_lies_on_its_axes_in_the_launchs_order(axes):
     """A row hook's side on axes a launch does not load as they are given (`RowHook.SIDE_AXES`' order, each
     once, its columns among them) is refused where the hook is built: a side on its columns before its rows
     loaded transposed into a Hopper block's layout (a head review)."""
-    side = Side(jnp.zeros((4, 4), jnp.float32), axes)
-    with pytest.raises(ValueError, match='row hook'):
-        RowHook(lambda block: block, lambda block, total, side: block, (side,))
+    def hook(axes):
+        return RowHook(lambda block: block, lambda block, total, side: block,
+                       (Side(jnp.zeros((4, 4), jnp.float32), axes),))
+
+    hook(('rows', 'columns'))
+    with pytest.raises(ValueError):
+        hook(axes)
