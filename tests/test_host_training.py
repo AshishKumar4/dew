@@ -1750,6 +1750,14 @@ def test_a_fit_that_fails_placing_its_state_keeps_none_of_its_device_plan():
     with (assumed_on_cpu("sm90"), stand_in_gpus(jax.devices("cpu"), 80 * 2 ** 30), host_memory_stated(1e6),
           pytest.raises(jax.errors.JaxRuntimeError)):
         trainer.fit(streaming_data(), steps=1, log_every=100)
+    # JAX keeps each device's last effect token, a failed one too, which every later barrier in the process
+    # raises again (another test's): the devices' effects run once more, as a later program's do, leave none
+    # of the refused start's behind.
+    devices = jax.devices("cpu")
+    placed = NamedSharding(Mesh(np.asarray(devices), ("devices",)), P("devices"))
+    zeros = jax.device_put(jnp.zeros(len(devices)), placed)
+    jax.jit(lambda x: (jax.debug.callback(lambda: None), x)[1])(zeros)
+    jax.effects_barrier()
     choice = trainer.layout_choice
     assert choice is not None and choice.held and not choice.streams, choice
     gc.collect()
