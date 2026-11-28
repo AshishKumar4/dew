@@ -781,8 +781,8 @@ def test_an_aligned_segment_sum_sums_its_segments_over_a_checked_maps_devices():
 
 
 def checked_total(a, b, w):
-    """A checked `shard_map`'s summed `aligned_sum([(a, b)])` times `w` over two devices, `a` held whole beside
-    `b` and `w` split between them."""
+    """A checked `shard_map`'s summed `aligned_sum([(a, b)])` times `w` over two devices, `a` held whole
+    beside `b` and `w` split between them."""
     mesh = jax.sharding.Mesh(np.asarray(jax.devices()[:2]), ("data",))
     split, whole = jax.sharding.PartitionSpec("data"), jax.sharding.PartitionSpec()
 
