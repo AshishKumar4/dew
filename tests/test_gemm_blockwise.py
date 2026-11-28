@@ -567,6 +567,48 @@ def test_a_blockwise_fp8_epilogues_codes_and_scales_are_the_recipes():
                                   np.asarray(want_scales.T).view(np.uint32))
 
 
+def test_a_nan_among_normal_draws_scales_its_block_as_a_nan_maximum():
+    """A NaN among normal draws, one a row at its own column, through the blockwise FP8 recipe
+    (`projections.rows_quantized`) and the quantizing epilogue (`quantized.blockwise_fp8_epilogue`): each
+    1 x 128 block holding it takes a NaN maximum's scale (`fake_quant.fp8_block_scale`'s -0.0), every other
+    block a power of two, and the epilogue's codes and scales are the recipe's (row 14083's train 1477: the
+    recipe's float block maximum, which XLA:CPU's YNNPACK reduction takes, dropped the NaN beside normal
+    draws, 2.53 for a NaN block's maximum)."""
+    from dew.nn.kernels.templates.gemm import quantized
+
+    rng = np.random.default_rng(14083)
+    values = rng.normal(size=(64, 256)).astype(np.float32)
+    columns = (np.arange(64) * 37) % 256
+    values[np.arange(64), columns] = np.nan
+    acc = jnp.asarray(values)
+    _, codes, scales = quantized.blockwise_fp8_epilogue()(acc)
+    want_codes, want_scales = projections.rows_quantized(acc.astype(jnp.bfloat16))
+    held = np.asarray(want_scales).view(np.uint32)
+    holding = np.zeros((64, 2), bool)
+    holding[np.arange(64), columns // 128] = True
+    np.testing.assert_array_equal(held == 0x80000000, holding)
+    np.testing.assert_array_equal(np.asarray(codes).view(np.uint8), np.asarray(want_codes).view(np.uint8))
+    np.testing.assert_array_equal(np.asarray(quantized.stored(scales, (128, True))).view(np.uint32), held.T)
+
+
+def test_a_nan_in_a_weight_block_among_normal_draws_scales_that_block_alone():
+    """A bank of normal draws holding one NaN in each matrix, quantized 128 x 128 blocks at a time
+    (`projections.blocks_quantized`): the block holding it takes a NaN maximum's scale
+    (`fake_quant.fp8_block_scale`'s -0.0), every other block a power of two (row 14083's review: a float
+    block maximum, which XLA:CPU's YNNPACK reduction takes over both a block's axes, dropped the NaN)."""
+    rng = np.random.default_rng(14083)
+    w = rng.normal(size=(4, 256, 256)).astype(np.float32)
+    at = [(2, 130), (37, 5), (200, 211), (129, 128)]
+    for group, (row, column) in enumerate(at):
+        w[group, row, column] = np.nan
+    _, scales = projections.blocks_quantized(jnp.asarray(w, jnp.bfloat16))
+    held = np.asarray(scales).view(np.uint32)
+    holding = np.zeros(held.shape, bool)
+    for group, (row, column) in enumerate(at):
+        holding[group, row // 128, column // 128] = True
+    np.testing.assert_array_equal(held == 0x80000000, holding)
+
+
 @pytest.mark.parametrize("rows", [200, 256])
 def test_an_ungated_mlps_recipe_chain_is_its_two_recipe_projections_apart(rows):
     """Under a run's blockwise FP8 recipe, an ungated MLP's chain (`projections.recipe_chain`) of any rows

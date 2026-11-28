@@ -21,8 +21,16 @@ import jax.numpy as jnp
 import numpy as np
 
 from dew.nn.derivatives import Protected, contracted, declared_tangent
+from dew.nn.division import short_divide
 from dew.nn.fake_quant import E2M1_MAX, E4M3_MAX
-from dew.nn.float_bits import quiet_nan, raised_exactly, raw_fields
+from dew.nn.float_bits import (
+    largest_magnitude,
+    narrowed_float32,
+    quiet_nan,
+    raised_exactly,
+    raw_fields,
+    widened_exactly,
+)
 from dew.nn.kernels.templates.cost import Work
 from dew.nn.kernels.templates.product import NVFP4
 from dew.nn.precision import correctly_rounded_divide
@@ -984,20 +992,20 @@ def nvfp4_quantized(x: jax.Array) -> tuple[jax.Array, jax.Array, jax.Array]:
     return packed(codes.T, E2M1).T, scales, tensor
 
 
-def _encoded_amax(value, magnitude):
-    return jax.lax.bitcast_convert_type(jnp.max(magnitude), value.dtype)
+def _amax(value):
+    """A tensor's largest magnitude, its words' (`largest_magnitude` over every axis)."""
+    return largest_magnitude(value)
 
 
 def _amax_tangent(primals, tangents):
-    value, magnitude = primals
-    moved, _ = tangents
-    # Only the value needs the raw-word rule. The floating max keeps its original tie pullback.
+    (value,), (moved,) = primals, tangents
+    # The floating maximum's derivative, its tie pullback kept.
     _, tangent = jax.jvp(lambda value: jnp.max(jnp.abs(value)), (value,), (moved,))
-    return _nvfp4_amax(value, magnitude), tangent
+    return _nvfp4_amax(value), tangent
 
 
 _nvfp4_amax = contracted("test_an_nvfp4_tensor_scale_keeps_its_ordinary_maximum_derivative")(
-    declared_tangent(Protected(), _encoded_amax, _amax_tangent))
+    declared_tangent(Protected(), _amax, _amax_tangent))
 
 
 def nvfp4_tensor_scale(largest: jax.Array, quotient=None) -> jax.Array:
@@ -1023,6 +1031,21 @@ def nvfp4_given_scale(tensor) -> jax.Array:
     return jnp.asarray(tensor, jnp.float32)
 
 
+def _quotient_at(dtype):
+    """`nvfp4_coded`'s division of values of `dtype` to fp32: IEEE fp32 division's
+    (`correctly_rounded_divide`); at a float64 truth's width, the float32 values' float64 quotient rounded
+    once to fp32, each operand widened and the quotient narrowed on their bits (`widened_exactly`,
+    `narrowed_float32`: a subnormal kept, which a flushing convert drops; row 14083's review), the same value
+    (a quotient of 24-bit operands rounded to 53 bits, then to 24, rounds as once: 53 >= 2 x 24 + 2)."""
+    if dtype == jnp.float32:
+        return correctly_rounded_divide
+
+    def quotient(numerator, denominator):
+        # The float32 operand widened from its bits, which a flushing convert would zero (a subnormal scale).
+        return narrowed_float32(jnp.asarray(numerator, dtype) / widened_exactly(denominator, dtype))
+    return quotient
+
+
 def nvfp4_coded(x: jax.Array, tensor: jax.Array | None = None) -> tuple[jax.Array, jax.Array, jax.Array]:
     """A tile `x` `[depth, columns]` of float32 values as NVFP4: its E2M1 codes (`[depth, columns]` uint32,
     a code each), its block scales (`[depth / 16, columns]` float8_e4m3fn,
@@ -1034,37 +1057,55 @@ def nvfp4_coded(x: jax.Array, tensor: jax.Array | None = None) -> tuple[jax.Arra
     tile's values divided down, never by a product of the scales, which could fall below fp32's normals and
     flush a small tile's codes to zero (audit A24). Its decode (`nvfp4_decoded`) times `NVFP4_OWED` times the
     tensor scale is each value's rounding, as the GEMM epilogue's NVFP4 output stores it (row 4050). Each
-    quotient is IEEE fp32 division's on every backend (`quotient`), so a tile's codes and scales are the
-    rule's wherever it is quantized (row 5456: XLA's own division, a CPU's product by the reciprocal and a
-    GPU's approximate quotient, moved codes across an e2m1 midpoint and scales a step). `tensor`, a tensor
-    scale given in place of the tile's own (a delayed-scaling recipe's, row 12721), the rule otherwise the
-    same: a block past it saturates its scale at 448 and its codes at 6, as delayed scaling clips."""
-    def quotient(numerator, denominator):
-        # IEEE fp32 division (`correctly_rounded_divide`); at a float64 truth's width, the float32 values'
-        # float64 quotient rounded once to fp32, the same value (a quotient of 24-bit operands rounded to 53
-        # bits, then to 24, rounds as once: 53 >= 2 x 24 + 2).
-        if x.dtype == jnp.float32:
-            return correctly_rounded_divide(numerator, denominator)
-        return (jnp.asarray(numerator, x.dtype) / jnp.asarray(denominator, x.dtype)).astype(jnp.float32)
-
+    quotient is IEEE fp32 division's on every backend (`_quotient_at`; by a block scale or 6, the integer
+    `short_divide`), so a tile's codes and scales are the rule's wherever it is quantized (row 5456: XLA's
+    own division, a CPU's product by the reciprocal and a GPU's approximate quotient, moved codes across an
+    e2m1 midpoint and scales a step), each value divided by the tensor scale once (row 14083); a block's
+    scale rounded up as its ratio's words compare (`scales_rounded_up`). `tensor`, a tensor scale given in
+    place of the tile's own (a delayed-scaling recipe's, row 12721; zero, positive, infinite or NaN), the
+    rule otherwise the same: a block past it saturates its scale at 448 and its codes at 6, as delayed
+    scaling clips."""
+    quotient = _quotient_at(x.dtype)
     # Unsigned IEEE magnitudes are ordered as integers, including subnormals on an FTZ backend.
     words, sign, _, _ = raw_fields(x)
     magnitude = words ^ sign
-    if tensor is None:
-        largest = _nvfp4_amax(x, magnitude)
-        tensor = nvfp4_tensor_scale(largest, quotient)
-    else:
-        tensor = nvfp4_given_scale(tensor)
-    block_words = jnp.max(magnitude.reshape(-1, NVFP4.depth, x.shape[-1]), axis=1)
-    blocks = jax.lax.bitcast_convert_type(block_words, x.dtype)
-    ratio = quotient(quotient(blocks, tensor), np.float32(E2M1_MAX))
-    nearest = encoded(jax.lax.bitcast_convert_type(ratio, jnp.uint32), E4M3)
-
-    # The nearest rounded up where it fell below the ratio, never past the largest finite (448); each code's
-    # value the one decode of a block scale's (`scales_decoded`, row 8675).
-    codes = jnp.where(scales_decoded(nearest) < ratio,
-                      jnp.minimum(nearest + jnp.uint32(1), jnp.uint32(E4M3.largest)), nearest)
+    tensor = nvfp4_tensor_scale(_nvfp4_amax(x), quotient) if tensor is None else nvfp4_given_scale(tensor)
+    # Each value over the tensor scale once (row 14083): a block's largest magnitude's quotient is the
+    # largest of its quotients' magnitudes, one division keeping their order, a finite value's NaN quotient
+    # left out (a zero's 0/0 at a zero scale, every finite one's at a NaN scale); a block of them all zero's
+    # quotient, those scales' NaN; signed as the scale is, the quotient dividing it would give (row 14083's
+    # review), so no block divides apart (train 1468's: one reduction a block). Its words are compared with
+    # infinity's alone, never with zero: a compiler reads a magnitude's test for zero as a float's, which a
+    # flushing platform (XLA's CPU) passes at a subnormal.
+    over = quotient(x, tensor)
+    unsigned, infinity = np.uint32(0x7FFFFFFF), np.uint32(0x7F800000)
+    over_words = jax.lax.bitcast_convert_type(over, jnp.uint32) & unsigned
+    limits = jnp.finfo(x.dtype)
+    finite = magnitude < magnitude.dtype.type(((1 << limits.nexp) - 1) << limits.nmant)
+    counted = jnp.where((over_words > infinity) & finite, np.uint32(0), over_words)
+    peaks = jnp.max(counted.reshape(-1, NVFP4.depth, x.shape[-1]), axis=1)
+    zeros = jax.lax.bitcast_convert_type(quotient(jnp.zeros((), x.dtype), tensor), jnp.uint32) & unsigned
+    largest = jnp.where(peaks == 0, zeros, peaks) | (
+        jax.lax.bitcast_convert_type(tensor, jnp.uint32) & np.uint32(0x80000000))
+    ratio = short_divide(jax.lax.bitcast_convert_type(largest, jnp.float32), np.float32(E2M1_MAX))
+    codes = scales_rounded_up(encoded(jax.lax.bitcast_convert_type(ratio, jnp.uint32), E4M3), ratio)
     scales = jax.lax.bitcast_convert_type(codes.astype(jnp.uint8), jnp.float8_e4m3fn)
     each = jnp.repeat(scales_decoded(codes), NVFP4.depth, axis=0)
-    scaled = jnp.where(each > 0, quotient(quotient(x, tensor), jnp.where(each > 0, each, 1)), 0)
+    scaled = jnp.where(each > 0, short_divide(over, jnp.where(each > 0, each, 1)), 0)
     return encoded(jax.lax.bitcast_convert_type(scaled, jnp.uint32), E2M1), scales, tensor
+
+
+def scales_rounded_up(nearest: jax.Array, ratio: jax.Array) -> jax.Array:
+    """The least e4m3 code at or above each block's `ratio` (fp32), from its nearest code `nearest`
+    (`encoded`'s, or a kernel epilogue's cvt): stepped up where its value is below the ratio, never past
+    448's code, the two compared as words, as non-negative floats order as their bits: a ratio below fp32's
+    normals is above zero too, which a flushing comparison (XLA:CPU's) read as zero, leaving its block a
+    scale of zero (row 14083's review). A ratio whose sign is set or which is NaN (a negative, negative-zero
+    or NaN tensor scale's) codes its block's scale e4m3's NaN, 0x7F, which decodes no value. The one
+    statement `nvfp4_coded` and the GEMM epilogue (`quantized._nvfp4_quantize_epilogue`) round a block scale
+    by, so their stored bytes agree on every ratio."""
+    word = jnp.uint32
+    ratio_word = jax.lax.bitcast_convert_type(ratio, word)
+    below = jax.lax.bitcast_convert_type(scales_decoded(nearest), word) < ratio_word
+    rounded = jnp.where(below, jnp.minimum(nearest + word(1), word(E4M3.largest)), nearest)
+    return jnp.where(ratio_word > word(0x7F800000), word(E4M3.nan), rounded)
