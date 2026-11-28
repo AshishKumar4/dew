@@ -65,7 +65,13 @@ from dew.nn.kernels.formats import (
     e8m0_exponents,
 )
 from dew.nn.kernels.gemm_xla import XlaConfig, as_tuple, direct_dtype, xla_mainloop
-from dew.nn.kernels.grouped_cells import NVFP4_CELLS, NVFP4_DECODE_ROWS, PackedRows
+from dew.nn.kernels.grouped_cells import (
+    BLOCKWISE_CELLS,
+    NVFP4_CELLS,
+    NVFP4_DECODE_ROWS,
+    Blockwise,
+    PackedRows,
+)
 from dew.nn.kernels.templates import product as product_of
 from dew.nn.kernels.templates.axes import GROUPS
 from dew.nn.kernels.templates.gemm import (
@@ -1299,27 +1305,28 @@ BLOCKWISE_ROW = 'ledger 4518'
 class ScaledCase:
     """A scaled product as its selector reads it (`BLOCKWISE_FP8`, `MXFP8`, `NVFP4_BLOCK_OP`): the tile the
     template's launch plans for it on the target (`mosaic_gpu.gmm`'s `step_scales` or `mx_scales`), None
-    where it plans none."""
+    where it plans none, and the blockwise product it is (None for another launch), its `cell` with the
+    device's generation (`selection.Celled`, `BLOCKWISE_CELLS`)."""
 
     tile: tiling.Tiles | None
+    product: Blockwise | None = None
+
+    @property
+    def cell(self) -> tuple[str, Blockwise | None]:
+        return generation.device_generation(), self.product
 
 
+STEP_SCALED = selection.Kernel[ScaledCase]('mosaic', (selection.Requirement(
+    'planned', lambda case: case.tile is not None, "the template plans no step-scaled tile here: an FP8 "
+    "product on warpgroup MMA, its matrix K-major, a step 128 deep, its column scales each a column's or a "
+    "multiple of its tile's columns", BLOCKWISE_ROW),))
 BLOCKWISE_FP8: selection.Op[ScaledCase] = selection.Op(generation.Choice.BLOCKWISE_FP8, (
-    selection.Kernel('mosaic', (
-        selection.Requirement(
-            'planned', lambda case: case.tile is not None, "the template plans no step-scaled tile here: an "
-            "FP8 product on warpgroup MMA, its matrix K-major, a step 128 deep, its column scales each a "
-            "column's or a multiple of its tile's columns", BLOCKWISE_ROW),
-        selection.Requirement(
-            'measured', lambda case: False, "the step-scaled template awaits a qualified receipt at the "
-            "current head (M-NG-38: check 1 and its time against XLA's scaled blocks; M-NS-13 measured "
-            "its forwards 47-127x faster before the scaling contract changed)", BLOCKWISE_ROW,
-            kind='measured'))),
-    selection.Kernel('xla', (), generic=True)))
-"""A blockwise-scaled FP8 product's selector (`blockwise_fp8_product`): the template's exactly summed walk,
-each step's partial scaled before its add (`mosaic_gpu.gmm`'s `step_scales`), where named
-(`generation.chosen(blockwise_fp8='mosaic')`) and planned, its default pending a qualified receipt at the
-current head (M-NG-38); else the scaled blocks summed in XLA (`xla_products.step_scaled`)."""
+    STEP_SCALED, selection.Kernel('xla', (), generic=True)), lambda case: 'xla',
+    declared={cell: (STEP_SCALED, receipt) for cell, receipt in BLOCKWISE_CELLS.items()})
+"""A blockwise-scaled FP8 product's selector (`blockwise_fp8_product`): the scaled blocks summed in XLA
+(`xla_products.step_scaled`), but the template's walk (`STEP_SCALED`, `mosaic_gpu.gmm`'s `step_scales`)
+where a receipt timed that product faster (`grouped_cells.BLOCKWISE_CELLS`: M-NG-38c's on a GH200) or it is
+named (`generation.chosen(blockwise_fp8='mosaic')`), and it plans a tile."""
 
 
 def blockwise_fp8_product(lhs: jax.Array, kernel: jax.Array, group_sizes: jax.Array, row_scales: jax.Array,
@@ -1332,7 +1339,8 @@ def blockwise_fp8_product(lhs: jax.Array, kernel: jax.Array, group_sizes: jax.Ar
     weight block's, 1 a column's) before it is added, rounded once to `out_dtype`: DeepSeek-V3's
     blockwise FP8 product (1 x 128 activation tiles, 128 x 128 weight blocks; row 4518). Its forward alone:
     a recipe's gradients are their own FP8 products of requantized operands (row 2513). Its selector
-    (`BLOCKWISE_FP8`) runs the template's exactly summed walk where named, else XLA's."""
+    (`BLOCKWISE_FP8`) runs the template's exactly summed walk where named or a receipt timed the product
+    (`BLOCKWISE_CELLS`), else XLA's."""
     (out,) = _blockwise_fp8(lhs, kernel, group_sizes, row_scales, column_scales,
                             dtypes=(jnp.dtype(out_dtype),), interpret=interpret_on_cpu)
     return out
@@ -1401,7 +1409,11 @@ def _blockwise_fp8(lhs, kernel, group_sizes, row_scales, column_scales, *, dtype
         return _finished(portable(lhs, kernel, sizes, row_scales, column_scales), sides, epilogue, dtypes,
                          out_forms)
 
-    if selection.select(BLOCKWISE_FP8, ScaledCase(tile)).kernel == 'mosaic':
+    # The product a receipt may have timed (`Blockwise.of`): its launch's alone, of E4M3 codes and fp32
+    # scales read whole, no epilogue's several outputs nor one matrix.
+    product = None if several or dense else Blockwise.of(lhs, kernel, group_sizes, row_scales, column_scales,
+                                                         per)
+    if selection.select(BLOCKWISE_FP8, ScaledCase(tile, product)).kernel == 'mosaic':
         assert tile is not None, "the selector names the template where it plans a tile"
         return xla_products.dispatched(mosaic, portable_finished, interpret, lhs, kernel, group_sizes,
                                        row_scales, column_scales, *sides)
