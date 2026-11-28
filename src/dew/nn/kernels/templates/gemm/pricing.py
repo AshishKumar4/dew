@@ -13,7 +13,6 @@ from collections.abc import Callable
 from typing import TYPE_CHECKING, NamedTuple
 
 import jax.numpy as jnp
-import numpy as np
 
 from dew.nn.kernels import generation
 from dew.nn.kernels.templates import (
@@ -440,8 +439,6 @@ class SplitWalk:
     passes: float
     launch: float
     stored: float
-    drift_horizon: float = 0.0
-    drift_extra: float = 0.0
     partial_bytes: float = 0.0
     """One slice's fp32 partials of the output as its launch declares them (its rows padded, gathered or
     scattered), which a split launch holds `splits` of until their sum."""
@@ -459,16 +456,14 @@ class SplitWalk:
         slices, each step at its share of its multiprocessor's tensor rate (the programs a wave runs on each
         at once), or its multiprocessor's share of the operands' stream where that is longer: each
         multiprocessor streams at its share of the memory's rate, its programs' shares in turn, so a wave of
-        more programs than multiprocessors but not twice them streams two shares on some. For a `walks_scoped`
-        full-wave dense walk whose K-slice passes its L2 drift horizon (`drift_horizon`, `tail.snaked`, row
-        5363), steps past the horizon add the unshared L2-miss penalty (`drift_extra`). Priced at a rate
-        shared by programs instead, an A100's 2048 x 2048 decode product at 16 rows took a seven-way split
-        of its 16 tiles (112 programs on 108 multiprocessors) over the six-way swapped walk (96 programs),
-        which ran 0.88x its kernel time at the same DRAM bytes, 0.79x its call's (M-EM-45b-a100; the split
-        count's own share of that, M-EM-45c). Priced at the whole rate, two programs a multiprocessor read as
-        twice the part's peak: an RTX PRO 6000's dense 64 x 64 walks at two programs priced 0.21-0.23 of
-        their measured time (M-FS-9), where an underfilled wave, one program a multiprocessor, runs at the
-        whole rate."""
+        more programs than multiprocessors but not twice them streams two shares on some. Priced at a rate
+        shared by programs instead, an A100's 2048 x 2048 decode product at 16 rows took a seven-way split of
+        its 16 tiles (112 programs on 108 multiprocessors) over the six-way swapped walk (96 programs), which
+        ran 0.88x its kernel time at the same DRAM bytes, 0.79x its call's (M-EM-45b-a100; the split count's
+        own share of that, M-EM-45c). Priced at the whole rate, two programs a multiprocessor read as twice
+        the part's peak: an RTX PRO 6000's dense 64 x 64 walks at two programs priced 0.21-0.23 of their
+        measured time (M-FS-9), where an underfilled wave, one program a multiprocessor, runs at the whole
+        rate."""
         programs = self.output * splits
         running = unit_cost.busiest_programs(programs, self.wave, self.multiprocessors)
         slice_steps = -(-self.steps // splits)
@@ -476,11 +471,7 @@ class SplitWalk:
         # The busiest multiprocessor's programs' shares of the operands, at its share of the memory's rate.
         stream = unit_cost.streamed(self.operand_bytes / programs, running, self.bandwidth,
                                     self.multiprocessors) / self.step_seconds
-        base = max(busiest, stream)
-        if self.drift_horizon > 0.0 and slice_steps > self.drift_horizon:
-            waves = unit_cost.spread(programs, self.wave)
-            base += waves * (slice_steps - self.drift_horizon) * self.drift_extra
-        return base
+        return max(busiest, stream)
 
     def seconds(self, splits: int) -> float:
         """The call's time at `splits` slices a tile: its busiest program's walk, its epilogue's store of the
@@ -516,24 +507,12 @@ def split_walk(tiles: "Tiles", *, groups: int, rows: int, depth: int, width: int
     if step_seconds is None or bandwidth is None or output == 0:
         return None
     wave = unit_cost.wave(multiprocessors, tiles.programs)
-    drift_horizon, drift_extra = 0.0, 0.0
-    if (groups == 1 and target is not None and target.l2_bytes is not None
-            and family.walks_scoped and output >= wave):
-        row_idx, col_idx = tail_of.snaked(np.arange(wave), (grid_m, grid_n), 1, max(tiles.grid_block_n, 1))
-        row_bytes = tiles.block_m * tiles.block_k * itemsizes[0]
-        col_bytes = columns * tiles.block_k * itemsizes[1]
-        shared_step = len(np.unique(row_idx)) * row_bytes + len(np.unique(col_idx)) * col_bytes
-        unshared_step = wave * (row_bytes + col_bytes)
-        # M-FS-6 (A100 SXM, 40 MB L2): wave SMs drift past L2 reuse window after ~6x L2/shared_step steps.
-        drift_horizon = 6.0 * target.l2_bytes / max(shared_step, 1)
-        drift_extra = max(0.0, unshared_step / bandwidth / step_seconds - tiles.programs)
     held = groups * depth if partial_rows is None else partial_rows
     return SplitWalk(output, wave, steps, multiprocessors,
                      rows * (depth * itemsizes[0] + width * itemsizes[1]), bandwidth, step_seconds,
                      held * width * 4 / bandwidth / step_seconds,
                      0.0 if launch_seconds is None else launch_seconds / step_seconds,
                      held * width * stored / bandwidth / step_seconds,
-                     drift_horizon, drift_extra,
                      held * width * 4.0 if partial_bytes is None else partial_bytes, target)
 
 

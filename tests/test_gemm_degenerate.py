@@ -459,3 +459,42 @@ def test_an_eager_product_of_no_groups_lands_on_its_operands_device():
     out = xla_products.placed_ragged_dot(rows, bank, sizes, preferred_element_type=jnp.float32)
     assert out.devices() == {device} and out.committed
     np.testing.assert_array_equal(np.asarray(out), np.zeros((8, 128), np.float32))
+
+
+STACKED = {"no depth": (0, 8), "no width": (8, 0), "a layer's first groups": (64, 128)}
+"""A stacked bank's depth and width: none of either, and whole tiles'."""
+
+
+@pytest.mark.parametrize(("depth", "width"), STACKED.values(), ids=STACKED)
+def test_a_stacked_layers_call_is_the_call_over_its_layers_first_matrices(depth, width):
+    """A layer of a stacked `[layers, groups, depth, width]` bank picked by an index (`gemm`'s `layer`), its
+    call's groups fewer than a layer's (two of three): the call over that layer's first two matrices alone,
+    bit for bit, on each GPU's derivation as XLA's program; its rows' gradient that call's, and the stack's
+    that call's matrices' at the layer and zero at every other (a stack's layer read a layer's stored groups
+    apart, not the call's groups; head review of theme 27). With no depth or no width too: a stack of no
+    entries grouped by its layers' and groups' counts, none inferred."""
+    layers, groups, rows = 2, 3, 6
+    sizes, at = jnp.asarray([4, 1], jnp.int32), jnp.int32(1)
+    rng = np.random.default_rng(14192)
+    x = jnp.asarray(rng.integers(-2, 3, (rows, depth)), jnp.bfloat16)
+    stack = jnp.asarray(rng.integers(-2, 3, (layers, groups, depth, width)), jnp.bfloat16)
+    cotangent = jnp.asarray(rng.integers(-2, 3, (rows, width)), jnp.float32)
+
+    def stacked(x, stack):
+        return gemm.gemm(x, stack, sizes, layer=at, out_dtype=jnp.float32, interpret_on_cpu=True)
+
+    def alone(x, matrices):
+        return gemm.gemm(x, matrices, sizes, out_dtype=jnp.float32, interpret_on_cpu=True)
+
+    for gpu in ("xla", *RUNS):
+        chosen = {"grouped_matmul": "xla"} if gpu == "xla" else {}
+        with generation.assumed("sm90" if gpu == "xla" else gpu), generation.chosen(**chosen):
+            out, pull = jax.vjp(stacked, x, stack)
+            want, pull_alone = jax.vjp(alone, x, stack[1, :2])
+            (d_x, d_stack), (want_x, want_matrices) = pull(cotangent), pull_alone(cotangent)
+        np.testing.assert_array_equal(np.asarray(out), np.asarray(want), err_msg=gpu)
+        np.testing.assert_array_equal(np.asarray(d_x, np.float32), np.asarray(want_x, np.float32),
+                                      err_msg=gpu)
+        expected = np.zeros(stack.shape, np.float32)
+        expected[1, :2] = np.asarray(want_matrices, np.float32)
+        np.testing.assert_array_equal(np.asarray(d_stack, np.float32), expected, err_msg=gpu)

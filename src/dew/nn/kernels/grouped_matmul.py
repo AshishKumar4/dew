@@ -645,12 +645,16 @@ class _Mosaic(tiling.TilesTemplate, _GroupedLaunch[tiling.Tiles]):
         stages at least (a walk keeping one step's products in flight holds its slot while the next step's
         loads fill another), its blocks dividing the call's extents, its cluster at most the family's
         (`mosaic.Family.cluster`), and a one-dimensional side operand's block, copied untiled, at most one
-        copy's extent along its axis (`mosaic.Family.copy_extent`); none a compile of this process found
-        spilling (`report.refused`), so the derivation takes the next tile by its own rule."""
+        copy's extent along its axis (`mosaic.Family.copy_extent`), and on a GPU each side operand's axes in
+        the launch's order (`hooks.sides_in_order`); none a compile of this process found spilling
+        (`report.refused`), so the derivation takes the next tile by its own rule."""
         from .templates.axes import held as held_axes
         from .templates.gemm import mosaic_gpu, pricing, quantized
+        from .templates.gemm.hooks import sides_in_order
         family = next((bundle for group in self._groups(ba, target) for bundle in group
                        if bundle.name == config.family), None)
+        if not generation.tpu(target) and not sides_in_order(ba.arguments['hooks']):
+            return False
         if (family is None or config.cluster > family.cluster or not mosaic_gpu.pair_takes(config, family)
                 or (family.pairs_product and ba.arguments['interpret'])
                 or self._pair_refuses(ba, config, family) or self._pingpong_refuses(config, family)

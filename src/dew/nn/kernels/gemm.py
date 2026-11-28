@@ -75,6 +75,8 @@ from dew.nn.kernels.grouped_cells import (
 from dew.nn.kernels.templates import product as product_of
 from dew.nn.kernels.templates.axes import GROUPS
 from dew.nn.kernels.templates.gemm import (
+    as_given,
+    as_groups,
     epilogue_vjp,
     launched_whole,
     rows_gathered_wide,
@@ -197,9 +199,7 @@ def gemm(lhs: jax.Array, rhs: jax.Array | NvFp4 | TernaryWeights | Bf16Window,
     straight, compute = compute is not None, jnp.dtype(lhs.dtype if compute is None else compute)
     dense = group_sizes is None and layer is None
     before = _prologued(before, prologue_jvp)
-    paired = None if paired is None else _grouped(lhs, paired, group_sizes, layer)[0]
-    beside = tuple(_grouped(lhs, matrix, group_sizes, layer)[0] for matrix in beside)
-    rhs, group_sizes, first = _grouped(lhs, rhs, group_sizes, layer)
+    group_sizes, first = _grouped(lhs, rhs, group_sizes, layer)
     dtypes = tuple(jnp.dtype(dtype) for dtype in (out_dtypes or (out_dtype,) * (1 + len(beside))))
     several = out_dtypes is not None or bool(beside)
     plain = {'transpose_rhs': transpose_rhs, 'interpret_on_cpu': interpret_on_cpu, 'precision': precision,
@@ -210,6 +210,7 @@ def gemm(lhs: jax.Array, rhs: jax.Array | NvFp4 | TernaryWeights | Bf16Window,
 
     def value(lhs, rhs, group_sizes, prologue_arrays, epilogue_arrays, paired, first, gather, scatter,
               applied, beside, epilogue=after, dtypes=dtypes):
+        rhs, paired, beside = _matrices_grouped(rhs, paired, beside)
         if applied is not None:
             return _gemm(applied, rhs, group_sizes, None, (), (), epilogue, epilogue_arrays, epilogue_axes,
                          dtypes, several=several, paired=paired, first=first, scatter=scatter, **plain)
@@ -221,6 +222,7 @@ def gemm(lhs: jax.Array, rhs: jax.Array | NvFp4 | TernaryWeights | Bf16Window,
                  applied, beside):
         # `applied` is the prologue's operand formed (`gemm`): the derivative forms it from its operands.
         del applied
+        rhs, paired, beside = _matrices_grouped(rhs, paired, beside)
         config = XlaConfig(transpose_rhs, precision, compute if straight else None, dense)
         lhs = lhs if gather is None else rows_gathered_wide(lhs, gather)
         out = scattered(xla_mainloop(config, lhs if straight else lhs.astype(compute), rhs, group_sizes,
@@ -276,8 +278,10 @@ def _pulled(call: _Call, operands, cotangent, live, saved: tuple = ()) -> tuple:
                                                         call.epilogue_axes)
     dtypes, several, compute, plain = call.dtypes, call.several, call.compute, call.plain
     transpose_rhs = plain['transpose_rhs']
-    (tokens, rhs, group_sizes, prologue_arrays, epilogue_arrays, paired, first, gather, scatter, applied,
-     beside) = operands
+    (tokens, own_rhs, group_sizes, prologue_arrays, epilogue_arrays, own_paired, first, gather, scatter,
+     applied, own_beside) = operands
+    # The matrices as the launches read them, each kernel gradient given back in its matrix's own shape.
+    rhs, paired, beside = _matrices_grouped(own_rhs, own_paired, own_beside)
     # Gathered rows are read where they lie (row 1376), their cotangent summed back into the tokens.
     cotangent, read = _scattered_cotangent(cotangent, scatter, epilogue=epilogue, first=first)
     # The named outputs the forward kept (`gemm`'s `named`, an epilogue's) were stored where their rows
@@ -286,7 +290,7 @@ def _pulled(call: _Call, operands, cotangent, live, saved: tuple = ()) -> tuple:
     # The operands a reverse pass differentiates, by their place among the operands' leaves: a frozen
     # matrix's kernel gradient, or an operand no reverse pass reaches, is never formed.
     wanted = set(live)
-    held = {**plain, 'first': first}
+    options = {**plain, 'first': first}
     # The further matrices, a pair's or those side by side (`beside`, whose call has no hooks or tables, so
     # their leaves follow the rows' sizes as a pair's follows the sides), each a kernel gradient's.
     matrices = (rhs, *(() if paired is None else (paired,)), *beside)
@@ -298,7 +302,7 @@ def _pulled(call: _Call, operands, cotangent, live, saved: tuple = ()) -> tuple:
     d_accs, d_epilogue, narrow = _cotangents(tokens.astype(compute), matrices, group_sizes, prologue,
                                              prologue_arrays, prologue_axes, epilogue, epilogue_arrays,
                                              epilogue_axes, cotangents, dtypes, compute, acc_shape,
-                                             {**held, 'gather': gather},
+                                             {**options, 'gather': gather},
                                              dict(zip(call.named, saved, strict=True)), scatter=scatter)
     # Each accumulator's cotangent meets the forward's rounded operands as the portable program's
     # derivative has it: in `lhs`'s dtype where that holds it exactly (a cotangent no wider, passed
@@ -309,7 +313,8 @@ def _pulled(call: _Call, operands, cotangent, live, saved: tuple = ()) -> tuple:
         pulled_lhs = tokens if (gather is None or prologue is None) else tokens[gather]
         d_lhs, d_prologue, operand = _input_cotangents(pulled_lhs, d_products, matrices, group_sizes,
                                                        prologue, prologue_arrays, prologue_axes, compute,
-                                                       {**held, 'gather': read}, wide_rows=gather is not None)
+                                                       {**options, 'gather': read},
+                                                       wide_rows=gather is not None)
         if gather is not None:
             # Each token's routes summed wide, then rounded once to its dtype, as the packed kernel's
             # pullback sums them (row 12396: routes' 256 and -255.5, each rounded first, summed 0, not 0.5).
@@ -320,13 +325,14 @@ def _pulled(call: _Call, operands, cotangent, live, saved: tuple = ()) -> tuple:
     # remat policy that keeps the rows and the sides recomputes no product to form it.
     multiplied = ((operand, None, (), ()) if operand is not None
                   else (tokens, prologue, prologue_arrays, prologue_axes))
+    given = (own_rhs, *(() if own_paired is None else (own_paired,)), *own_beside)
     gradients = [None if place not in wanted
-                 else jnp.zeros(matrix.shape, matrix.dtype) if d_product is None
-                 else _kernel_gradient(multiplied[0], d_product, matrix, group_sizes, *multiplied[1:],
-                                       compute, work if not each else None,
-                                       {**held, 'tables': (gather, read)})
-                 for place, d_product, matrix, work, each in zip(places, d_products, matrices, works,
-                                                                 narrow, strict=True)]
+                 else jnp.zeros(own.shape, own.dtype) if d_product is None
+                 else as_given(_kernel_gradient(multiplied[0], d_product, matrix, group_sizes,
+                                                *multiplied[1:], compute, work if not each else None,
+                                                {**options, 'tables': (gather, read)}), own)
+                 for place, d_product, matrix, own, work, each in zip(places, d_products, matrices, given,
+                                                                      works, narrow, strict=True)]
     # Every parameter gradient formed in its stored dtype before the rows' cotangent leaves.
     d_sides = tuple(_as_cotangent(d, a) for d, a in zip(d_epilogue, epilogue_arrays, strict=True))
     d_lhs, (gradients, d_prologue, d_sides) = with_gradients_formed(d_lhs, (gradients, d_prologue, d_sides))
@@ -2472,24 +2478,20 @@ def _tupled(hook, *args) -> tuple:
     return as_tuple(hook(*args))
 
 
-def _grouped(lhs, rhs, group_sizes, layer=None):
-    """`rhs` with a group axis, the group sizes, and the matrix of it the first group reads (None: the
-    first): a dense product is one group of every row. A stacked `rhs` at `layer` (`gemm`) is its every
-    layer's groups as one axis, of which the call's groups, the layer's own, read the layer's from its
-    first, where they lie. Where the layer's sizes were spread over every layer's groups instead, a launch
-    tiled the stack's groups, most of them empty: at Qwen3-30B-A3B's 128 experts over 8 layers on an H100,
-    0.69 ms a decode step of grouped products over 1024 groups, and 0.32 summing their offsets
-    (OM-1342-cache-base-2474a6e4c)."""
-    sizes = (jnp.full((1,), lhs.shape[0], jnp.int32) if group_sizes is None
-             else group_sizes.astype(jnp.int32))
-    if layer is None:
-        return (rhs[None] if group_sizes is None else rhs), sizes, None
-    stack = rhs[:, None] if group_sizes is None else rhs
-    layers, groups = stack.shape[:2]
-    first = jnp.asarray(layer, jnp.int32) * groups
-    return stack.reshape(layers * groups, *stack.shape[2:]), sizes, first
+def _grouped(lhs, rhs, group_sizes, layer=None) -> tuple[jax.Array, jax.Array | None]:
+    """A call's group sizes (a dense product's one group of every row) and the matrix of its matrices
+    (`as_groups`, `rhs` held as given across its derivative) the first group reads, None for the first: a
+    stack's at `layer` (`gemm`) the layer's first, its stored groups a layer apart. Spread over every
+    layer's groups, a launch tiled the stack's, most empty: Qwen3-30B-A3B's 128 experts over 8 layers on an
+    H100, 0.69 ms a decode step over 1024 groups, 0.32 summing offsets (OM-1342-cache-base-2474a6e4c)."""
+    sizes = jnp.full((1,), lhs.shape[0], jnp.int32) if group_sizes is None else group_sizes.astype(jnp.int32)
+    stored = 1 if group_sizes is None else rhs.shape[1]
+    return sizes, None if layer is None else jnp.asarray(layer, jnp.int32) * stored
 
 
+def _matrices_grouped(rhs, paired, beside: tuple) -> tuple:
+    """A `gemm` call's matrices as its launches read them (`as_groups`): its own, its pair's, those beside."""
+    return as_groups(rhs), None if paired is None else as_groups(paired), tuple(map(as_groups, beside))
 
 
 def _routed(group_sizes: jax.Array, rows: int) -> jax.Array:

@@ -228,6 +228,18 @@ def hook_lowers(hook, tiles: tuple, target) -> bool:
     return _lowers(hook, tiles, (), lowering_rules(target), layout=_epilogue_layout(dtype, target))
 
 
+def sides_in_order(hooks: Hooks) -> bool:
+    """Whether each of `hooks`' side operands names the launch axes it follows in the order a Mosaic GPU
+    launch lays its own tile (`sides.in_launch_order`), which it loads the side's tile in and whose lowering
+    takes no transpose: an epilogue adding one on its columns before its rows found no layout in Mosaic GPU's
+    inference on wgmma (row 14207), so another route takes it (Triton's, which transposes a tile, or the
+    portable program)."""
+    from dew.nn.kernels.templates.gemm.sides import in_launch_order
+
+    return (all(in_launch_order(axes, 'prologue') for axes in hooks.prologue_axes)
+            and all(in_launch_order(axes, 'epilogue') for axes in hooks.epilogue_axes))
+
+
 def hooks_lower(ba, dtype, target) -> bool:
     """Whether `target`'s Mosaic launches take a bound launch's hooks (`_lowers`, `lowering_rules`), traced on
     128-wide tiles: the primitives a hook makes do not depend on its tile's extents."""
