@@ -454,7 +454,7 @@ class _Transpose:
         # The rows' gradient, typed and placed as the plain transpose's is (its devices' sums taken, as each
         # chunk's are; on its Explicit mesh where it has one, replicated too), so the loop's carry and the
         # branch it returns from keep its type.
-        zeros = placed_zeros(self.shape, jnp.float32, explicit_placement(jax.typeof(plain)))
+        zeros = placed_zeros(self.shape, jnp.float32, explicit_placement(jax.typeof(plain)), plain)
         out = varying_like(zeros, plain)
         return jax.lax.fori_loop(0, depth // chunk, pulled_chunk, out)
 
@@ -672,7 +672,7 @@ def _limbs(count: int, operands: tuple, columns: int, read: tuple) -> jax.Array:
                 None)
     spec = None if not meshes else jax.sharding.NamedSharding(
         meshes[0], jax.sharding.PartitionSpec(None, rows, None))
-    return placed_zeros((count, operands[0].shape[0], columns), jnp.int32, spec)
+    return placed_zeros((count, operands[0].shape[0], columns), jnp.int32, spec, *operands, *read)
 
 
 def _routed(tokens: jax.Array, gather: jax.Array, limbs: jax.Array,

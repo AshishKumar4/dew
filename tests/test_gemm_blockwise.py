@@ -591,6 +591,43 @@ def test_a_nan_among_normal_draws_scales_its_block_as_a_nan_maximum():
     np.testing.assert_array_equal(np.asarray(quantized.stored(scales, (128, True))).view(np.uint32), held.T)
 
 
+@pytest.mark.parametrize("jitted", [False, True], ids=["eager", "jitted"])
+def test_an_fp8_block_cast_scales_a_nan_among_normal_draws_as_a_nan_block(jitted):
+    """A NaN among normal draws, one a row at its own column, through the traced FP8 block cast
+    (`fake_quant.fp8_block_cast`, a frozen FP8 product's activation rows) at 1 x 128 blocks: each block
+    holding it takes a NaN scale and NaN codes, every other block a finite scale (row 14202: its float block
+    maximum, which XLA:CPU's YNNPACK reduction takes, dropped the NaN beside normal draws, as the blockwise
+    recipe's did, row 14083)."""
+    from dew.nn.fake_quant import fp8_block_cast
+
+    rng = np.random.default_rng(14202)
+    values = rng.normal(size=(64, 256)).astype(np.float32)
+    columns = (np.arange(64) * 37) % 256
+    values[np.arange(64), columns] = np.nan
+    cast = jax.jit(fp8_block_cast, static_argnums=1) if jitted else fp8_block_cast
+    codes, scales = cast(jnp.asarray(values), (1, 128))
+    holding = np.zeros((64, 2), bool)
+    holding[np.arange(64), columns // 128] = True
+    np.testing.assert_array_equal(np.isnan(np.asarray(scales)), holding)
+    np.testing.assert_array_equal(np.isnan(np.asarray(codes, np.float32)[np.arange(64), columns]),
+                                  np.ones(64, bool))
+
+
+def test_an_fp8_block_casts_scale_keeps_the_float_maximums_derivative():
+    """The traced FP8 block cast's scale (`fake_quant.fp8_block_cast`) at a block [[448, 0]]: 1, its tangent
+    along the 448 1/448 and its gradient there the same, the float maximum's derivative through its block
+    peak (`fake_quant.largest_peak`, row 14202), not a word maximum's zero."""
+    from dew.nn.fake_quant import fp8_block_cast
+
+    x = jnp.asarray([[448.0, 0.0]], jnp.float32)
+    direction = jnp.asarray([[1.0, 0.0]], jnp.float32)
+    value, tangent = jax.jvp(lambda x: fp8_block_cast(x, (1, 2))[1], (x,), (direction,))
+    np.testing.assert_array_equal(np.asarray(value), np.ones((1, 1), np.float32))
+    np.testing.assert_array_equal(np.asarray(tangent), np.full((1, 1), 1 / 448, np.float32))
+    gradient = jax.grad(lambda x: fp8_block_cast(x, (1, 2))[1].sum())(x)
+    np.testing.assert_array_equal(np.asarray(gradient), np.asarray([[1 / 448, 0.0]], np.float32))
+
+
 @pytest.mark.parametrize("dtype", [jnp.bfloat16, jnp.float8_e4m3fnuz])
 def test_a_nan_in_a_weight_block_among_normal_draws_scales_that_block_alone(dtype):
     """A bank of normal draws holding one NaN in each matrix, quantized 128 x 128 blocks at a time
@@ -650,6 +687,7 @@ def fp8_codes_convert_as_the_rounding_does():
     arithmetic (`fake_quant._round_e4m3fn`) bit for bit, at every E4M3 code, each midpoint between two and
     the float32s either side of it, the subnormal codes' range, both zeros, values past 448 and NaN (row
     14171). Run by tests/test_gpu_gemm.py's cells: a CPU's codes take the rounding alone."""
+    from dew.algebra import bits
     from dew.nn import fake_quant
 
     grid = np.unique(np.abs(np.arange(256, dtype=np.uint8).view(jnp.float8_e4m3fn).astype(np.float32)))
@@ -661,18 +699,23 @@ def fp8_codes_convert_as_the_rounding_does():
     # Past 448 (448 to 464 among them) the clip ahead of the convert takes each value to 448.
     past = np.concatenate([np.linspace(448, 464, 65, dtype=np.float32), [480.0, 1e9, np.inf]])
     every = np.concatenate([grid, midpoints, near, small, past, [0.0]])
-    values = jnp.asarray(np.concatenate([every, -every, [np.nan]]).astype(np.float32))
-    rounded = jax.jit(lambda x: fake_quant._round_e4m3fn(jnp.clip(x, -448, 448)))(values)
-    for excess in (False, True):
-        # Under XLA GPU's excess precision too, which deletes a bare f32 -> f8 -> f32 pair (its review).
-        converted = jax.jit(fake_quant.fp8_codes,
-                            compiler_options={"xla_allow_excess_precision": excess})(values)
-        _same_codes(converted, rounded)
-    # Its derivative the rounding's, zero, on a GPU as on a CPU (train 1495's review K-F1: the casts' own
-    # passed the tangent through, ones for zeros).
-    differentiated = jax.jit(lambda x, dx: jax.jvp(fake_quant.fp8_codes, (x,), (dx,)))
-    _, tangent = differentiated(values, jnp.ones_like(values))
-    np.testing.assert_array_equal(np.asarray(tangent), np.zeros(values.shape, np.float32))
+    values = np.concatenate([every, -every, [np.nan]]).astype(np.float32)
+    words = np.concatenate([values, np.zeros(-len(values) % bits.E4M3.codes_per_word, np.float32)])
+    # Both of the CUDA branch's forms: codes held four a word where the last axis holds whole words
+    # (`fake_quant._held_codes`, row 14171), and as codes where it does not.
+    for shaped in (words, np.concatenate([words, [np.float32(-448.0)]])):
+        shaped = jnp.asarray(shaped)
+        rounded = jax.jit(lambda x: fake_quant._round_e4m3fn(jnp.clip(x, -448, 448)))(shaped)
+        for excess in (False, True):
+            # Under XLA GPU's excess precision too, which deletes a bare f32 -> f8 -> f32 pair (its review).
+            converted = jax.jit(fake_quant.fp8_codes,
+                                compiler_options={"xla_allow_excess_precision": excess})(shaped)
+            _same_codes(converted, rounded)
+        # Its derivative the rounding's, zero, on a GPU as on a CPU (train 1495's review K-F1: the casts'
+        # own passed the tangent through, ones for zeros).
+        differentiated = jax.jit(lambda x, dx: jax.jvp(fake_quant.fp8_codes, (x,), (dx,)))
+        _, tangent = differentiated(shaped, jnp.ones_like(shaped))
+        np.testing.assert_array_equal(np.asarray(tangent), np.zeros(shaped.shape, np.float32))
 
 
 def test_the_converted_codes_derivative_is_the_roundings():
@@ -686,6 +729,23 @@ def test_the_converted_codes_derivative_is_the_roundings():
     np.testing.assert_array_equal(np.asarray(tangent), np.zeros(64, np.float32))
     np.testing.assert_array_equal(np.asarray(jax.grad(lambda x: fake_quant._converted(x).sum())(x)),
                                   np.zeros(64, np.float32))
+
+
+def test_codes_held_four_a_word_are_the_codes():
+    """Every E4M3 code (its 256 bytes: both zeros, +-448, the NaNs) held four to a word through the barrier
+    and read back (`fake_quant._held_codes`, row 14171) is its own byte, at its own place, under jit as
+    eager; a last axis no word holds, as it is; an empty block of whole words, empty (theme 26's review: an
+    empty leading axis inferred no word count, and the reshape raised)."""
+    from dew.nn import fake_quant
+
+    codes = jnp.asarray(np.arange(256, dtype=np.uint8).view(jnp.float8_e4m3fn).reshape(16, 16))
+    for held in (fake_quant._held_codes(codes), jax.jit(fake_quant._held_codes)(codes),
+                 jax.jit(fake_quant._held_codes)(codes[:, :15])):
+        np.testing.assert_array_equal(np.asarray(held).view(np.uint8),
+                                      np.asarray(codes[:, :held.shape[1]]).view(np.uint8))
+    empty = jnp.zeros((0, 1, 1, 128), jnp.float8_e4m3fn)
+    for held in (fake_quant._held_codes(empty), jax.jit(fake_quant._held_codes)(empty)):
+        assert held.shape == empty.shape and held.dtype == empty.dtype
 
 
 def _same_codes(converted, rounded):

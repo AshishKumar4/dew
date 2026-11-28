@@ -385,13 +385,13 @@ Dew: `prologue(tile, *side_tiles)` transforms each `[block_m, block_k]` tile of 
     _gmm_forms_refused(tiles, family_of(tiles, dtype), k, n, mx_scales, step_scales,
                        parts=(prologue, epilogue, paired, scales), transpose_rhs=transpose_rhs,
                        transpose_lhs=transpose_lhs, exact_sums=exact_sums)
-    (lhs, gather, scatter, joined, m, extent), unit = _gmm_walked(lhs, gather, scatter, joined, tiles, dtype,
-                                                                  transpose_lhs, dense, interpret)
+    walked, unit = _gmm_walked(lhs, gather, scatter, joined, tiles, dtype, transpose_lhs, dense, interpret)
+    lhs, gather, scatter, joined, m, extent, held = walked
     row_tile = tiles.block_m * tiles.cluster
     table = None if dense else row_tiles.grouped_table(group_sizes, m, row_tile, first, unit)
     step_scales, per = scales_of.walked(step_scales, n, block_n, extent)
-    prologue_operands = sides_extended(prologue_operands, prologue_axes, extent)
-    epilogue_operands = sides_extended(epilogue_operands, epilogue_axes, extent)
+    prologue_operands = sides_extended(prologue_operands, prologue_axes, held)
+    epilogue_operands = sides_extended(epilogue_operands, epilogue_axes, held)
     can_balance = dense and tiles.splits == 1 and not (beside or packed_format) and paired is scales is None
     tail = _dense_tail(tiles, dtype, (m, n, k), (lhs.dtype.itemsize, rhs.dtype.itemsize), multiprocessors,
                        balanced=can_balance and balanced, stored=quantized.stored_bytes(dtypes, forms))
@@ -1135,53 +1135,59 @@ def _gmm_walked(lhs, gather, scatter, joined, tiles: Tiles, dtype, transpose_lhs
     walked_rows = functools.partial(_walked_rows, tiles=tiles, transpose_lhs=transpose_lhs, dense=dense,
                                     bounded=family.bounded_loads and not interpret, unit=unit,
                                     least=tiles.block_m * tiles.cluster if family.copies_tiled_rows else 0)
-    lhs, gather, scatter, m, extent = walked_rows(lhs, gather, scatter)
+    lhs, gather, scatter, m, extent, held = walked_rows(lhs, gather, scatter)
     joined = None if joined is None else walked_rows(joined, None, None)[0]
-    return (lhs, gather, scatter, joined, m, extent), unit
+    return (lhs, gather, scatter, joined, m, extent, held), unit
 
 
 def _walked_rows(lhs, gather, scatter, tiles: Tiles, *, transpose_lhs: bool, dense: bool,
                  bounded: bool, unit: int = TMA_ROWS, least: int = 0) -> tuple:
-    """Dew: `gmm`'s rows as its schedule walks them: `lhs`, or a gathered product's table (`gather`, a pad
-    reading row 0 of the tokens, which stay as they are), padded to whole `unit`s of rows and to `least`
-    (`m` of them; `row_unit`: a TMA descriptor's 8; a tile's rows where its family stores whole tiles) and
-    extended to the schedule's extent where the family's loads past
-    the rows are not zeros (`bounded`), and a scattered product's table to the extent, its padded and
-    extended rows stored nowhere (`stores.Scattered`): `(lhs, gather, scatter, m, extent)`. The rows past
-    the routed ones, the padding among them, are a last group, whose tiles store zeros; a group's tiles
-    start at its first row (`tile_groups`), so a tile reads up to a tile's rows past the last group's first.
-    Where the loads read zeros past an operand's rows (TMA's) the operands stay as they are; elsewhere every
-    row-bearing operand is allocated to the extent, zeros past its rows, which a group's stores never reach
-    (a 128-row lhs of groups [120, 8] at 64-row tiles read rows 120 to 183 unpredicated on an A100,
-    cp.async's loads), as the interpreter's are, whose slices past an array clamp rather than read zeros. On
-    an H100 that copy was a kernel of its own each call, 0.035 to 0.33 ms beside a dense product of 0.34 to
-    2.4 (BREAKDOWN1-h100). A dense call's tiles start at whole row tiles, so it reads to its last tile's end
-    alone, no copy where its rows fill whole tiles: on an A100 that copy was 0.094 ms of Llama 3 8B o's
-    1.52 ms forward (BC-A100-EXTENT-AB1). A table is always extended: its threads read a tile's entries by
-    plain loads, which no TMA bounds (a gathered product's last tile read past an unextended table on a
-    GH200, CUDA_ERROR_ILLEGAL_ADDRESS, FS-4346-base-sm90)."""
+    """Dew: `gmm`'s rows as its schedule walks them: `lhs`, or a gathered product's table (`gather`; the
+    tokens stay as they are), `m` of them, padded to whole `unit`s of rows and to `least` (`row_unit`: a TMA
+    descriptor's 8; a tile's rows where its family stores whole tiles), a row tile reading up to a tile past
+    the last group's first row (`extent`, `row_tiles.row_extent`): `(lhs, gather, scatter, m, extent, held)`.
+    The rows past the routed ones, the padding among them, are a last group, whose tiles store zeros; a
+    group's tiles start at its first row (`tile_groups`), so a tile reads up to a tile's rows past the last
+    group's first. Where the loads read zeros past an operand's rows (TMA's) the operands stay as they are;
+    elsewhere every row-bearing operand is allocated to the extent, zeros past its rows, which a group's
+    stores never reach (a 128-row lhs of groups [120, 8] at 64-row tiles read rows 120 to 183 unpredicated
+    on an A100, cp.async's loads), as the interpreter's are, whose slices past an array clamp rather than
+    read zeros. On an H100 that copy was a kernel of its own each call, 0.035 to 0.33 ms beside a dense
+    product of 0.34 to 2.4 (BREAKDOWN1-h100). A dense call's tiles start at whole row tiles, so it reads to
+    its last tile's end alone, no copy where its rows fill whole tiles: on an A100 that copy was 0.094 ms of
+    Llama 3 8B o's 1.52 ms forward (BC-A100-EXTENT-AB1). The rows themselves are extended only where their
+    loads past them are not zeros: a scattered product's table alone takes the extent there (row 14177: an
+    MoE decode's down projection copied its 8 rows to 64).
+    Its gather table is normalized and extended to the extent (`_row_table`), a pad reading row 0 of the
+    tokens, and its scatter table extended with rows stored nowhere (`stores.Scattered`), so every step's
+    plain loads of their entries lie within them: an in-lane clamp of each entry instead spilled an H100
+    gathered input gradient's producer past setmaxnreg's least (theme 26's withdrawn 24f6ebfbc8)."""
     row_axis = 1 if transpose_lhs else 0
-    if gather is not None:
-        gather = _normalized_gather(gather, lhs.shape[row_axis])
     walked, axis = (lhs, row_axis) if gather is None else (gather, 0)
-    walked = rows_padded(walked, axis, unit)
-    walked = rows_extended(walked, axis, max(walked.shape[axis], least))
-    m = walked.shape[axis]
+    m = max(axes.whole(walked.shape[axis], unit), least)
     row_tile = tiles.block_m * tiles.cluster
     tabled = gather is not None or scatter is not None
     extent = (m if bounded and not tabled else axes.whole(m, row_tile) if dense
               else row_tiles.row_extent(m, row_tile, unit))
-    walked = rows_extended(walked, axis, extent)
+    held = m if bounded else extent
+    if gather is None:
+        lhs = rows_extended(lhs, row_axis, held)
+    else:
+        gather = _row_table(gather, lhs.shape[row_axis], extent)
     if scatter is not None:
         scatter = jnp.pad(scatter.astype(jnp.int32), (0, extent - scatter.shape[0]), constant_values=-1)
-    return (walked, None, scatter, m, extent) if gather is None else (lhs, walked, scatter, m, extent)
+    return lhs, gather, scatter, m, extent, held
 
 
-def _normalized_gather(table: jax.Array, rows: int) -> jax.Array:
-    """Normalize signed gather indices to `[0, rows - 1]` (`lhs[gather]` semantics) before native
-    row loads (`gathered.row_copies` sign-extends int32 indices to int64, row 5391)."""
+def _row_table(table: jax.Array, rows: int, extent: int) -> jax.Array:
+    """A gather table of `rows` tokens as a launch reads it, `gmm`'s and `tgmm`'s alike (train 1509's K-F2):
+    its signed entries normalized to `[0, rows - 1]` as `lhs[gather]` reads them (a negative one from the
+    end, every one clipped) before native row loads (`gathered.row_copies` sign-extends int32 indices to
+    int64, row 5391), and extended to `extent` entries, each pad reading the first token, so every step's
+    plain loads of its entries lie within it."""
     indices = table.astype(jnp.int32)
-    return jnp.clip(jnp.where(indices < 0, indices + rows, indices), 0, max(rows - 1, 0)).astype(jnp.int32)
+    normalized = jnp.clip(jnp.where(indices < 0, indices + rows, indices), 0, max(rows - 1, 0))
+    return rows_extended(normalized.astype(jnp.int32), 0, extent)
 
 
 def _tables_refused(gather, scatter, tiles: Tiles, family: mosaic.Family, *, dense: bool,
@@ -1879,8 +1885,8 @@ def tgmm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array, *, tiles: Tiles
     lhs, rhs = (rows_padded(operand, row_axis, multiple) if table is None else operand
                 for operand, table in zip((lhs, rhs), tables, strict=True))
     tables = tuple(
-        None if table is None else rows_padded(_normalized_gather(table, operand.shape[row_axis]),
-                                               0, math.lcm(8, block_k))
+        None if table is None else _row_table(table, operand.shape[row_axis],
+                                              axes.whole(table.shape[0], math.lcm(8, block_k)))
         for operand, table in zip((lhs, rhs), tables, strict=True))
     k = axes.whole(k, multiple)
     prologue_operands = sides_padded(prologue_operands, prologue_axes, multiple)

@@ -332,6 +332,101 @@ def test_a_jitted_product_of_no_groups_over_a_closed_over_bank_keeps_its_placeme
     np.testing.assert_array_equal(np.asarray(out), np.zeros((8, 128), np.float32))
 
 
+@pytest.mark.parametrize("dtype", [jnp.bfloat16, jnp.float16], ids=["bf16", "f16"])
+def test_an_eager_product_of_no_groups_holds_where_half_float_sums_are_refused(dtype):
+    """A ragged product of no groups over half-float rows and bank, called eagerly with
+    `jax_allow_f16_reductions` off (`xla_products.placed_ragged_dot`): its zeros +0 of the product's shape
+    and type, where the zeros read from their operands had summed half floats, which that flag refuses
+    (train 1509's K-F1)."""
+    from jax._src import config as jax_config
+
+    from dew.nn.kernels import xla_products
+
+    with jax_config.allow_f16_reductions(new_val=False):
+        out = xla_products.placed_ragged_dot(jnp.ones((8, 4), dtype), jnp.ones((0, 4, 128), dtype),
+                                             jnp.zeros((0,), jnp.int32))
+    assert out.dtype == dtype and out.shape == (8, 128)
+    got = np.asarray(out, np.float32)
+    np.testing.assert_array_equal(got, np.zeros_like(got))
+    assert not np.signbit(got).any()
+
+
+def test_an_eager_product_of_no_groups_over_bools_is_its_false_zeros():
+    """A ragged product of no groups over boolean rows and bank, called eagerly
+    (`xla_products.placed_ragged_dot`, no preferred dtype: JAX types it bool): its zeros false, of the
+    product's shape and type (theme 26's review: the zeros read from their operands summed bools, which a sum
+    takes not)."""
+    from dew.nn.kernels import xla_products
+
+    out = xla_products.placed_ragged_dot(jnp.ones((8, 4), jnp.bool_), jnp.ones((0, 4, 128), jnp.bool_),
+                                         jnp.zeros((0,), jnp.int32))
+    assert out.dtype == jnp.bool_ and out.shape == (8, 128)
+    assert not np.asarray(out).any()
+
+
+def _no_groups_derivatives(how, rows, bank, sizes):
+    """A ragged product of no groups' value and derivative taken eagerly by `how`: a JVP in both operands
+    (`jvp`; under `jax.disable_jit`, `jvp unjitted`) or a batch of two of its rows (`vmap`): `(value,
+    derivative)`."""
+    from dew.nn.kernels import xla_products
+
+    def product(rows, bank):
+        return xla_products.placed_ragged_dot(rows, bank, sizes, preferred_element_type=jnp.float32)
+
+    if how.startswith("jvp"):
+        moves = (jnp.ones_like(rows), jnp.ones_like(bank))
+        with jax.disable_jit(how == "jvp unjitted"):
+            return jax.jvp(product, (rows, bank), moves)
+    batched = jax.vmap(lambda rows: product(rows, bank))(jnp.stack([rows, rows]))
+    return batched[0], batched
+
+
+DERIVATIVES = ("jvp", "jvp unjitted", "vmap")
+"""Each eager transformation `_no_groups_derivatives` takes a product of no groups through."""
+
+
+@pytest.mark.mesh(devices=2)
+@pytest.mark.parametrize("how", DERIVATIVES)
+def test_an_eager_derivative_of_a_product_of_no_groups_lands_on_its_operands_mesh(how):
+    """A ragged product of no groups over a bank its two Explicit devices split by its width, its rows
+    holding a NaN and the infinities, transformed eagerly outside any mesh context
+    (`xla_products.placed_ragged_dot`): its value and its derivative (a tangent, a batch) +0 everywhere,
+    made on those devices, the value's columns split as the bank's (train 1493's review K-F1: an eager
+    `jax.jvp` made its zero tangent at the abstract mesh, on no device)."""
+    from jax.sharding import AxisType, NamedSharding, PartitionSpec
+
+    mesh = jax.make_mesh((2,), ("tensor",), (AxisType.Explicit,), devices=jax.devices()[:2])
+    held = jnp.ones((8, 4), jnp.float32).at[0, :3].set(jnp.asarray([jnp.nan, jnp.inf, -jnp.inf]))
+    rows = jax.device_put(held, NamedSharding(mesh, PartitionSpec()))
+    bank = jax.device_put(jnp.ones((0, 4, 128), jnp.float32),
+                          NamedSharding(mesh, PartitionSpec(None, None, "tensor")))
+    sizes = jax.device_put(jnp.zeros((0,), jnp.int32), NamedSharding(mesh, PartitionSpec()))
+    value, derivative = _no_groups_derivatives(how, rows, bank, sizes)
+    placed = value.sharding
+    assert isinstance(placed, NamedSharding) and placed.mesh == mesh and placed.spec[-1] == "tensor"
+    for each in (value, *jax.tree.leaves(derivative)):
+        assert each.devices() == set(mesh.devices.flat)
+        got = np.asarray(each)
+        np.testing.assert_array_equal(got, np.zeros_like(got))
+        assert not np.signbit(got).any()
+
+
+@pytest.mark.mesh(devices=2)
+@pytest.mark.parametrize("how", DERIVATIVES)
+def test_an_eager_derivative_of_a_product_of_no_groups_lands_on_its_operands_device(how):
+    """A ragged product of no groups over operands committed to the second of two devices, the first the
+    default, transformed eagerly (`xla_products.placed_ragged_dot`): its value and its derivative committed
+    to its operands' device, where JAX places a product of them (train 1493's review K-F1: under an eager
+    transformation its zeros were made uncommitted on the default device)."""
+    device = jax.devices()[1]
+    rows, bank, sizes = jax.device_put((jnp.ones((8, 4), jnp.float32), jnp.ones((0, 4, 128), jnp.float32),
+                                        jnp.zeros((0,), jnp.int32)), device)
+    value, derivative = _no_groups_derivatives(how, rows, bank, sizes)
+    for each in (value, *jax.tree.leaves(derivative)):
+        assert each.devices() == {device} and each.committed
+        np.testing.assert_array_equal(np.asarray(each), np.zeros(each.shape, np.float32))
+
+
 @pytest.mark.mesh(devices=2)
 def test_an_eager_product_of_no_groups_on_an_auto_mesh_lands_on_its_devices():
     """A ragged product of no groups called eagerly outside any mesh context over operands placed on a mesh

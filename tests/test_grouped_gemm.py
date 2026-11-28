@@ -35,7 +35,7 @@ from dew.nn.kernels import (
     tuning,
 )
 from dew.nn.kernels.templates import tail as tail_of
-from dew.nn.kernels.templates.gemm import mosaic_gpu, pricing, row_tiles, tiling
+from dew.nn.kernels.templates.gemm import mosaic_gpu, pricing, tiling
 from dew.nn.kernels.templates.gemm.hooks import ColumnLocal
 from dew.nn.kernels.templates.hooks import Hook, Side
 from dew.nn.moe import expert_projection
@@ -1047,23 +1047,6 @@ def test_a_cooperative_tile_stores_each_of_several_outputs():
 
     assert_as_exact(run, jax.jit(plain), draw, "a cooperative tile's two outputs", seeds=SEEDS,
                     truth_fn=truth)
-
-
-@pytest.mark.parametrize("sizes, row_tile", [([120, 8], 64), ([3, 200, 1, 0, 57], 128), ([0, 0, 13], 256),
-                                             ([64, 64], 64), ([7] * 9, 128)])
-def test_no_row_tile_reads_past_its_operands_allocation(sizes, row_tile):
-    """Every row tile `gmm`'s schedule takes (`row_tiles.tile_groups`, a group's tiles from its first row)
-    reads within the rows its operands are allocated to (`row_tiles.row_extent`): its first row plus the
-    tile's rows, unpredicated on an A100, stay inside the extent (row 1866 K3: groups [120, 8] at 64-row
-    tiles read rows 120 to 183 of a 128-row lhs)."""
-    rows = -(-sum(sizes) // row_tiles.TMA_ROWS) * row_tiles.TMA_ROWS
-    lengths = jnp.asarray([*sizes, rows - sum(sizes)], jnp.int32)
-    table = row_tiles.tile_groups(lengths, row_tile, -(-rows // row_tile) + len(sizes))
-    used = np.asarray(table.group_end > table.group_start)
-    reads = int((np.asarray(table.block_start)[used] + row_tile).max())
-    assert reads <= row_tiles.row_extent(rows, row_tile)
-    if sizes == [120, 8]:
-        assert reads > -(-rows // row_tile) * row_tile  # past the row-tile padding that held before
 
 
 @pytest.mark.parametrize("groups", [1, 4])

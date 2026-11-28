@@ -11,8 +11,10 @@ from __future__ import annotations
 
 import dataclasses
 import enum
+import functools
 import hashlib
 import itertools
+import operator
 from collections.abc import Iterator, Mapping, Sequence
 from typing import NamedTuple
 
@@ -20,17 +22,9 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from dew.nn.derivatives import Protected, contracted, declared_tangent
 from dew.nn.division import short_divide
-from dew.nn.fake_quant import E2M1_MAX, E4M3_MAX
-from dew.nn.float_bits import (
-    largest_magnitude,
-    narrowed_float32,
-    quiet_nan,
-    raised_exactly,
-    raw_fields,
-    widened_exactly,
-)
+from dew.nn.fake_quant import E2M1_MAX, E4M3_MAX, largest_peak
+from dew.nn.float_bits import narrowed_float32, quiet_nan, raised_exactly, raw_fields, widened_exactly
 from dew.nn.kernels.templates.cost import Work
 from dew.nn.kernels.templates.product import NVFP4
 from dew.nn.precision import correctly_rounded_divide
@@ -854,6 +848,11 @@ class Minifloat(NamedTuple):
         return 1 + self.exponent + self.mantissa
 
     @property
+    def codes_per_word(self) -> int:
+        """The codes a `WORD`-bit word holds (`packed`'s grouping, `fake_quant`'s held E4M3 codes')."""
+        return WORD // self.width
+
+    @property
     def largest_float32(self) -> int:
         """The largest finite code's value as fp32 bits: what a value past it saturates to."""
         exponent, fraction = self.largest >> self.mantissa, self.largest & ((1 << self.mantissa) - 1)
@@ -973,15 +972,17 @@ def encode_form(minifloat: Minifloat) -> BitForm:
     return BitForm(steps, (len(steps),), tuple(1 << bit for bit in range(WORD)))
 
 def packed[Words: (np.ndarray, jax.Array)](codes: Words, minifloat: Minifloat, xp=jnp) -> Words:
-    """`codes` (uint32 a code, `[..., n]`) packed into uint32 words along the last axis, `[..., n * width /
-    32]`: e4m3's and e5m2's four a word little-endian (code 0 in the low byte, as `cvt ...x2` pairs and a
-    bf16-ordered store give them), e2m1's eight as NVFP4's stored word (`NVFP4_BFLOAT16_FORM`'s encoder of
-    the word holding code `i` at bits `4 i`), the word `nvfp4_decoded` reads."""
-    per = 32 // minifloat.width
-    grouped = codes.reshape(*codes.shape[:-1], -1, per)
-    places = xp.arange(per, dtype=xp.uint32) * xp.uint32(minifloat.width)
-    # The codes' bits are disjoint, so their sum is their union.
-    natural = xp.sum(grouped << places, axis=-1, dtype=xp.uint32)
+    """`codes` (unsigned, a code each, `[..., n]`) packed into uint32 words along the last axis, `[..., n *
+    width / 32]`: e4m3's and e5m2's four a word little-endian (code 0 in the low byte, as `cvt ...x2` pairs
+    and a bf16-ordered store give them), e2m1's eight as NVFP4's stored word (`NVFP4_BFLOAT16_FORM`'s encoder
+    of the word holding code `i` at bits `4 i`), the word `nvfp4_decoded` reads. Each word its codes' shifts
+    and ors, unrolled over its places: an elementwise fusion forms whole words a thread (row 14171), the one
+    packing of codes into words (`fake_quant`'s held E4M3 codes too)."""
+    per = minifloat.codes_per_word
+    # Its words counted, not inferred: an empty leading axis infers none (theme 26's review).
+    grouped = codes.reshape(*codes.shape[:-1], codes.shape[-1] // per, per)
+    natural = functools.reduce(operator.or_, (grouped[..., place].astype(xp.uint32)
+                                              << xp.uint32(minifloat.width * place) for place in range(per)))
     return _parities(natural, NVFP4_BFLOAT16_FORM.encoder, xp) if minifloat == E2M1 else natural
 
 
@@ -990,22 +991,6 @@ def nvfp4_quantized(x: jax.Array) -> tuple[jax.Array, jax.Array, jax.Array]:
     (`[depth / 8, columns]` uint32, the stored order `nvfp4_decoded` reads)."""
     codes, scales, tensor = nvfp4_coded(x)
     return packed(codes.T, E2M1).T, scales, tensor
-
-
-def _amax(value):
-    """A tensor's largest magnitude, its words' (`largest_magnitude` over every axis)."""
-    return largest_magnitude(value)
-
-
-def _amax_tangent(primals, tangents):
-    (value,), (moved,) = primals, tangents
-    # The floating maximum's derivative, its tie pullback kept.
-    _, tangent = jax.jvp(lambda value: jnp.max(jnp.abs(value)), (value,), (moved,))
-    return _nvfp4_amax(value), tangent
-
-
-_nvfp4_amax = contracted("test_an_nvfp4_tensor_scale_keeps_its_ordinary_maximum_derivative")(
-    declared_tangent(Protected(), _amax, _amax_tangent))
 
 
 def nvfp4_tensor_scale(largest: jax.Array, quotient=None) -> jax.Array:
@@ -1069,7 +1054,8 @@ def nvfp4_coded(x: jax.Array, tensor: jax.Array | None = None) -> tuple[jax.Arra
     # Unsigned IEEE magnitudes are ordered as integers, including subnormals on an FTZ backend.
     words, sign, _, _ = raw_fields(x)
     magnitude = words ^ sign
-    tensor = nvfp4_tensor_scale(_nvfp4_amax(x), quotient) if tensor is None else nvfp4_given_scale(tensor)
+    tensor = (nvfp4_tensor_scale(largest_peak(None, x), quotient) if tensor is None
+              else nvfp4_given_scale(tensor))
     # Each value over the tensor scale once (row 14083): a block's largest magnitude's quotient is the
     # largest of its quotients' magnitudes, one division keeping their order, a finite value's NaN quotient
     # left out (a zero's 0/0 at a zero scale, every finite one's at a NaN scale); a block of them all zero's

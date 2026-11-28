@@ -364,9 +364,12 @@ def _block_walk(lhs: jax.Array, kernel: jax.Array, group_sizes: jax.Array, depth
     operand as the sum) that `finished` makes the sum, placed as the products'
     operands place it (`ragged_placement`); then the rows past the groups zero, selected once after every
     block, so a padded row's infinite scale leaves no NaN (row 13164). No contraction, or no group: zeros."""
+    from ..sharding import placed_zeros
+
     rows, groups, width = lhs.shape[0], kernel.shape[0], kernel.shape[2]
     placed = ragged_placement(((lhs, 0), (kernel, kernel.ndim - 1)))
-    zeros = jnp.zeros((rows, width), dtype, out_sharding=placed)
+    # Made where a product of the operands runs (`sharding.placed_zeros`, train 1493's K-F2), eagerly too.
+    zeros = placed_zeros((rows, width), dtype, placed, lhs, kernel)
 
     def aligned(value: jax.Array) -> jax.Array:
         # A `[rows, width]` operand gathered by its rows' groups from the matrices' side, placed as the sum

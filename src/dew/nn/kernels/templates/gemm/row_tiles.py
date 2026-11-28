@@ -12,9 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Dew: a grouped GEMM's row tiles (`mosaic_gpu.gmm`, `tgmm`): its call's tile table (`tile_groups`,
-`grouped_table`), each tile's group read from it (`GroupInfo`), the rows its schedule reads
-(`row_extent`), and a kernel gradient's runs of each group's rows (`sliced`)."""
+"""Dew: a grouped GEMM's row tiles (`mosaic_gpu.gmm`, `tgmm`): its call's tile table (`grouped_table`),
+each tile's group read from it (`GroupInfo`), the rows its schedule reads (`row_extent`), and a kernel
+gradient's runs of each group's rows (`sliced`)."""
 
 import dataclasses
 from typing import NamedTuple
@@ -25,13 +25,16 @@ from jax.experimental import pallas as pl
 
 from dew.nn.kernels import tables
 
+TMA_ROWS = 8
+"""The rows a TMA descriptor tiles by, to which `gmm` pads its rows and a group's first tile starts."""
+
 
 class TileGroup(NamedTuple):
-    """Dew: a row tile's entry in a grouped call's tile table (`grouped_table`, `tables.packed`): its group
-    (the lengths' index), the tile's first row, its group's first and past-last row, and the matrix it
-    multiplies (its group's, the unrouted rows' the last's, or a stack's from `first`); a tile no group
-    reaches, zeros. Its one declaration, which the table's writer and its reader (`GroupInfo.create`) take
-    their columns from."""
+    """Dew: a row tile's entry in a grouped call's tile table (`grouped_table`): its group (the sizes'
+    index), the tile's first row before its reader rounds it down to the rows its copies start at
+    (`GroupInfo.create`), its group's first and past-last row, and the matrix it multiplies (its group's, or
+    a stack's from `first`); a tile no group reaches, zeros. Its one declaration, which the table's writer
+    and its reader take their columns from."""
 
     group: tables.Column
     block_start: tables.Column
@@ -60,10 +63,16 @@ class GroupInfo:
         tile = jnp.int32(tile)
         entry = tables.unpacked(TileGroup, lambda column: table[tid, column])
         # Mosaic's copies and stores read a slice's start as a multiple of the rows its tiling takes
-        # (`row_unit`).
-        block_start = pl.multiple_of(entry.block_start, unit)
+        # (`row_unit`, a power of two), to which the tile's first row rounds down (`TileGroup`).
+        block_start = pl.multiple_of(lax.bitwise_and(entry.block_start, jnp.int32(-unit)), unit)
         actual_start = jnp.maximum(entry.group_start, block_start)
-        actual_end = jnp.minimum(entry.group_end, block_start + tile)
+        # No rows where its group ends before the tile's first (the unrouted rows' where the sizes reach
+        # them, `_one_tile`), and such a tile at row 0, as a slot no group reaches: an empty tile's finish
+        # reads its side rows from its origin unmasked on an A100 (head review of afa1aedcd8).
+        actual_end = jnp.maximum(jnp.minimum(entry.group_end, block_start + tile), actual_start)
+        empty = actual_end == actual_start
+        block_start = pl.multiple_of(jnp.where(empty, 0, block_start), unit)
+        actual_start, actual_end = (jnp.where(empty, 0, bound) for bound in (actual_start, actual_end))
         start_within_block = actual_start - block_start
         actual_size = actual_end - actual_start
         return cls(group_id=entry.group, block_start=block_start, actual_start=actual_start,
@@ -80,35 +89,95 @@ class GroupInfo:
                    matrix=jnp.int32(0))
 
 
-def tile_groups(lengths: jax.Array, tile: int, tiles: int, unit: int = 8,
-                first: jax.Array | None = None) -> TileGroup:
-    """Dew: each row tile's group info for `GroupInfo.create`, in XLA before the launch (`TileGroup`, packed
-    by `grouped_table`): of tiles `0` to `tiles`, the group (`lengths`' index), the tile's first row, its
-    group's first and past-last row, and its matrix (its group's, the last group's for the rows past the
-    routed ones `lengths` ends with, or from `first` a stack's); a tile no group reaches, zeros. A group's
-    tiles start at its first row (rounded down to the `unit` rows its family's copies start at, `row_unit`),
-    whole tiles after it, as CUTLASS's grouped GEMM tiles each group: a group of up to a tile's rows reads its
-    matrix once, where tiles on the product's own row grid read it once a tile the group touches (two for most
-    of Kimi Linear's 128-row experts at 128-row tiles). The tiles number at most `cdiv(rows, tile)` plus the
-    groups less one (a ceiling's sum exceeds the sum's ceiling by at most one a part). Upstream's
-    `GroupInfo.create` walked every group's length in every tile, unrolled: at 129 groups (Qwen3's 128
-    experts and the unrouted rows) two thirds of a down projection's instructions, and its global loads a
-    third of its stalls (NCU-full)."""
-    lengths = lengths.astype(jnp.int32)
-    ends = prefix_sums(lengths)
+def grouped_table(group_sizes: jax.Array, m: int, row_tile: int, first: jax.Array | None,
+                  unit: int = TMA_ROWS) -> jax.Array:
+    """A grouped call's tile table (`TileGroup`'s columns, int32 `[cdiv(m, row_tile) + groups, 5]`) over its
+    `m` padded rows at `row_tile`-row tiles. A group's tiles start at its first row (rounded down to the
+    `unit` rows its family's copies start at, `row_unit`), whole tiles after it, as CUTLASS's grouped GEMM
+    tiles each group: a group of up to a tile's rows reads its matrix once, where tiles on the product's own
+    row grid read it once a tile the group touches (two for most of Kimi Linear's 128-row experts at 128-row
+    tiles). Each entry is one masked sum over the groups, its group's terms alone, so XLA forms the table in
+    as few kernels as its sums nest: where every row lies in one tile (`m <= row_tile`: a decode step's),
+    a group's one tile is its own slot and each column a sum of the sizes, one reduction (`_one_tile`);
+    else its tiles are packed in the groups' order, the slots each group starts at a prefix sum of the
+    tiles before it, three (`_packed`). Upstream's `GroupInfo.create` walked every group's length in every
+    tile, unrolled: at 129 groups (Qwen3's 128 experts and the unrouted rows) two thirds of a down
+    projection's instructions, and its global loads a third of its stalls (NCU-full); XLA's table with an
+    argmax, gathers and a stack took six kernels a call (row 14177: a third of an MoE decode layer's
+    launches). The rows past the routed ones, a last group of the packed table's, whose tiles walk nothing
+    (`GroupInfo`'s group is the call's own)."""
+    sizes = group_sizes.astype(jnp.int32)
+    matrix = jnp.int32(0) if first is None else jnp.asarray(first, jnp.int32)
+    if m <= row_tile and sizes.shape[0]:
+        return _one_tile(sizes, m, matrix)
+    return _packed(sizes, m, row_tile, pl.cdiv(m, row_tile) + sizes.shape[0], unit, matrix)
+
+
+def _one_tile(sizes: jax.Array, m: int, first: jax.Array) -> jax.Array:
+    """`grouped_table`'s where every routed row lies in one row tile: each group's one tile at the group's
+    own slot, then the unrouted rows' (to `m`, whose tile stores zeros), its first row its group's (rounded
+    down by its reader), each column `TileGroup`'s summed over the sizes, `[groups + 1, 5]`: zeros where a
+    group routes no row; the unrouted rows' none where the sizes reach `m` (its end at or before its start,
+    which its reader takes as no rows)."""
+    groups = sizes.shape[0]
+    slot = jnp.arange(groups + 1, dtype=jnp.int32)[:, None, None]
+    term = jnp.arange(groups, dtype=jnp.int32)[None, None, :]
+    column = jnp.arange(len(TileGroup._fields), dtype=jnp.int32)[None, :, None]
+    unrouted = slot == groups
+    held = jnp.concatenate([sizes, jnp.zeros((1,), jnp.int32)])[:, None, None]
+    before = jnp.where(term < slot, sizes[None, None, :], 0)
+    once = jnp.where(term == 0, 1, 0)
+    through = before + jnp.where(term == slot, sizes[None, None, :], 0)
+    terms = _columned(column, TileGroup(
+        group=slot * once, block_start=before, group_start=before,
+        group_end=jnp.where(unrouted, m * once, through),
+        matrix=(jnp.minimum(slot, groups - 1) + first) * once))
+    return jnp.sum(jnp.where((held > 0) | unrouted, terms, 0), axis=2, dtype=jnp.int32)
+
+
+def _packed(sizes: jax.Array, m: int, tile: int, tiles: int, unit: int, first: jax.Array) -> jax.Array:
+    """`grouped_table`'s in general, `[tiles, 5]`: the groups' ends one prefix sum (`prefix_sums`); each
+    group's tiles' count and the slots it starts and ends at two more over its tiles; each slot's entry its
+    owning group's, summed over the groups (none owning it: zeros). The groups past `sizes` one more, the
+    rows to `m` past the routed ones."""
+    routed = prefix_sums(sizes)
+    total = routed[-1:] if sizes.shape[0] else jnp.zeros((1,), jnp.int32)
+    lengths = jnp.concatenate([sizes, jnp.maximum(m - total, 0)])
+    ends = jnp.concatenate([routed, jnp.maximum(m, total)])
     starts = ends - lengths
-    rows = jnp.int32(tile)
-    first_rows = starts // unit * unit
-    counts = lax.div(ends - first_rows + rows - 1, rows) * (lengths > 0)
-    firsts = prefix_sums(counts) - counts
-    tids = jnp.arange(tiles, dtype=jnp.int32)[:, None]
-    ours = (firsts[None] <= tids) & (tids < (firsts + counts)[None])
-    group = jnp.argmax(ours, axis=1).astype(jnp.int32)
-    found = jnp.any(ours, axis=1)
-    block_start = first_rows[group] + (tids[:, 0] - firsts[group]) * rows
-    matrix = jnp.minimum(group, lengths.shape[0] - 2) + (0 if first is None else first)
-    return TileGroup(*(jnp.where(found, column, 0)
-                       for column in (group, block_start, starts[group], ends[group], matrix)))
+    first_rows = lax.bitwise_and(starts, jnp.int32(-unit))
+    counts = _ceil_divided(ends - first_rows, tile) * (lengths > 0)
+    group = jnp.arange(lengths.shape[0], dtype=jnp.int32)
+    # Each group's last slot's next and its first: the tiles through it, and before it.
+    through = prefix_sums(counts)
+    before = through - counts
+    slot = jnp.arange(tiles, dtype=jnp.int32)[:, None, None]
+    owns = (before[None, None, :] <= slot) & (slot < through[None, None, :])
+    column = jnp.arange(len(TileGroup._fields), dtype=jnp.int32)[None, :, None]
+    entry = _columned(column, TileGroup(
+        group=group[None, None, :], block_start=first_rows + (slot - before[None, None, :]) * tile,
+        group_start=starts[None, None, :], group_end=ends[None, None, :],
+        matrix=jnp.minimum(group, lengths.shape[0] - 2)[None, None, :] + first))
+    return jnp.sum(jnp.where(owns, entry, 0), axis=2, dtype=jnp.int32)
+
+
+def _columned(column: jax.Array, values: TileGroup) -> tables.Column:
+    """Each of `values`' columns where `column` (an iota over `TileGroup`'s columns) is its own: selections by
+    comparison alone, which XLA fuses into the sum reading them (`jnp.select` picks by an argmax over its
+    conditions, a reduction and a selection of its own: two more kernels, row 14177's census)."""
+    *rest, last = values
+    for at in range(len(rest) - 1, -1, -1):
+        last = jnp.where(column == at, rest[at], last)
+    return last
+
+
+def _ceil_divided(values: jax.Array, divisor: int) -> jax.Array:
+    """Non-negative int32 `values` over `divisor`, rounded up: by a shift where `divisor` is a power of two,
+    which XLA fuses into the sums reading it, where it keeps an integer division apart (row 14177)."""
+    raised = values + (divisor - 1)
+    if divisor & (divisor - 1) == 0:
+        return lax.shift_right_logical(raised, jnp.int32(divisor.bit_length() - 1))
+    return lax.div(raised, jnp.int32(divisor))
 
 
 def prefix_sums(values: jax.Array) -> jax.Array:
@@ -119,23 +188,6 @@ def prefix_sums(values: jax.Array) -> jax.Array:
     count = values.shape[0]
     held = jnp.arange(count)[None, :] <= jnp.arange(count)[:, None]
     return jnp.sum(jnp.where(held, values[None, :], 0), axis=1, dtype=values.dtype)
-
-
-TMA_ROWS = 8
-"""The rows a TMA descriptor tiles by, to which `gmm` pads its rows and a group's first tile starts."""
-
-
-
-def grouped_table(group_sizes: jax.Array, m: int, row_tile: int, first: jax.Array | None,
-                   unit: int = TMA_ROWS) -> jax.Array:
-    """A grouped call's tile table (`tile_groups`) over its `m` padded rows at `row_tile`-row tiles: its
-    groups', then the rows past the routed ones a last group, whose tiles store zeros."""
-    g = group_sizes.shape[0]
-    lengths = jnp.concatenate([group_sizes.astype(jnp.int32),
-                               jnp.maximum(m - jnp.sum(group_sizes, dtype=jnp.int32), 0)[None]])
-    # Each tile's matrix is its group's, of the stack from `first` where given (`TileGroup.matrix`): the
-    # group itself stays the call's, which its validity and its side operands read.
-    return tables.packed(tile_groups(lengths, row_tile, pl.cdiv(m, row_tile) + g, unit, first))
 
 
 def sliced(group_sizes: jax.Array, block_k: int, splits: int) -> jax.Array:
@@ -152,7 +204,7 @@ def sliced(group_sizes: jax.Array, block_k: int, splits: int) -> jax.Array:
 
 def group_blocks(group_sizes: jax.Array, block_k: int) -> tuple:
     """Each group's first row, end, count of `block_k`-row blocks, and its first block's first row, from the
-    groups' one prefix sum (`prefix_sums`, as `tile_groups` reads them)."""
+    groups' one prefix sum (`prefix_sums`, as `grouped_table` reads them)."""
     group_sizes = group_sizes.astype(jnp.int32)
     group_ends = prefix_sums(group_sizes)
     group_starts = group_ends - group_sizes
