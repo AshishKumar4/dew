@@ -250,29 +250,75 @@ def _e2m1_values(codes: jax.Array) -> jax.Array:
 
 def _codes(words: jax.Array, dtype: DTypeLike = jnp.float32) -> jax.Array:
     """The codes' values of staged `words` (each its E2M1 value in `dtype`, `[depth, width]`) in the depths'
-    own order (`staged_rows` undone): `bits.nvfp4_codes`, the one word-to-code decode (row 8718). The staged
-    order permutes the depths within each `packed.NVFP4_GROUP`-deep group alone (its 16 words' 8 codes, code
-    `j` of word `w` depth `16 j + w`), so it is undone within each group, a transpose of its words and codes,
-    the groups where they lie: a depth an Explicit axis splits by whole groups keeps its placement, where a
-    gather across the depth had none (row 14097)."""
+    own order (`staged_rows` undone where each group lies, `_unstaged`): `bits.nvfp4_codes`, the one
+    word-to-code decode (row 8718)."""
+    return _unstaged(words, functools.partial(bits.nvfp4_codes, dtype=dtype), packed.NVFP4_GROUP,
+                     bits.E2M1.width, packed.nvfp4_staged_depth, "NVFP4")
+
+
+@functools.cache
+def _unstaging(depth: int, group: int, code_width: int, depth_fn, label: str) -> tuple[int, ...]:
+    """The order of a `depth`-deep staged matrix's axes `(group, word, code)` (its word rows' codes, as
+    `_staged_rows` reads them) along the depths' own order: by the stride of the depth `depth_fn` declares
+    on each, the largest first, so codes reshaped `[groups, words, codes, ...]` and transposed so lie in the
+    depths' order, each group where it lay. Refused unless that transposition puts every staged code of
+    every group at the very depth `_staged_rows` gives it, each depth once (a declaration no transposition
+    of those axes states, which no reshape undoes; the review of row 14097's respin)."""
+    rows = _staged_rows(depth, group, code_width, depth_fn, label)
+    shape = (depth // group, group * code_width // 32, 32 // code_width)
+    origin = depth_fn(0, 0, 0)
+    strides = [depth_fn(*unit) - origin for unit in np.eye(3, dtype=np.int64)]
+    order = tuple(int(axis) for axis in np.argsort(strides)[::-1])
+    laid = rows.reshape(shape).transpose(order).reshape(-1)
+    if order[0] != 0 or not np.array_equal(laid, np.arange(depth)):
+        raise ValueError(f"{depth_fn.__name__} is no transposition of a staged group's words and codes")
+    return order
+
+
+def _unstaged(words: jax.Array, codes_of, group: int, code_width: int, depth_fn, label: str) -> jax.Array:
+    """`codes_of(words)` (`[depth, width]`, the codes of staged `words`, `[depth * code_width / 32, width]`,
+    each word's in turn) in the depths' own order: each `group`-deep group's staged order undone where the
+    group lies, a transposition of its words and codes read from the depth `depth_fn` declares
+    (`_unstaging`), the one statement of the order its packing, native decode and form digest read
+    (`_staged_rows`). A depth an Explicit axis splits by whole groups keeps its placement; mesh axes that cut
+    a group (a 256-deep matrix split four ways) are gathered off the words while their groups are undone,
+    and the codes split by them again after, where a gather across the depth had no placement and a
+    reshape put them on fewer groups than devices (row 14097, train 1466's review)."""
+    from dew.mesh import mesh_axes
     from dew.nn.sharding import explicit_spec
 
-    codes = bits.nvfp4_codes(words, dtype)
-    depth, width = codes.shape
-    if depth % packed.NVFP4_GROUP:
-        raise ValueError(f"an NVFP4 matrix's depth is whole {packed.NVFP4_GROUP}-deep groups, not {depth}")
-    # A group's codes as the staged order lays them (`packed.nvfp4_staged_depth`): its words, a block's
-    # depth of them, by each word's codes.
-    grouped = (depth // packed.NVFP4_GROUP, formats_of.NVFP4.depth, 32 // bits.E2M1.width, width)
-    # A split depth's placement stated where its reshapes split and join it, by whole groups; any other
-    # placement JAX keeps through them itself.
-    placed = explicit_spec(codes)
+    depth, width = words.shape[0] * 32 // code_width, words.shape[1]
+    # Its depth whole groups and its declaration a transposition of them, checked at this depth.
+    order = (*_unstaging(depth, group, code_width, depth_fn, label), 3)
+    groups = depth // group
+    grouped = (groups, group * code_width // 32, 32 // code_width, width)
+
+    def unstage(codes: jax.Array, whole: jax.sharding.NamedSharding | None = None) -> jax.Array:
+        # `whole`, a depth split by whole groups, stated where the reshapes split and join it; any other
+        # placement JAX keeps through them itself.
+        if whole is None:
+            return jnp.transpose(codes.reshape(grouped), order).reshape(depth, width)
+        split, columns = whole.spec
+        held = codes.reshape(grouped, out_sharding=jax.sharding.NamedSharding(
+            whole.mesh, jax.sharding.PartitionSpec(split, None, None, columns)))
+        return jnp.transpose(held, order).reshape(depth, width, out_sharding=whole)
+
+    placed = explicit_spec(words)
     if placed is None or placed.spec[0] is None:
-        return jnp.swapaxes(codes.reshape(grouped), 1, 2).reshape(depth, width)
-    split = jax.sharding.NamedSharding(placed.mesh, jax.sharding.PartitionSpec(
-        placed.spec[0], None, None, placed.spec[1]))
-    held = jnp.swapaxes(codes.reshape(grouped, out_sharding=split), 1, 2)
-    return held.reshape(depth, width, out_sharding=placed)
+        return unstage(codes_of(words))
+    splitting, columns = mesh_axes(placed.spec[0]), placed.spec[1]
+    # The leading mesh axes whose devices together divide the groups split them whole; any after them cut.
+    kept: list[str] = []
+    for name in splitting:
+        if groups % math.prod(placed.mesh.shape[axis] for axis in (*kept, name)):
+            break
+        kept.append(name)
+    if len(kept) == len(splitting):
+        return unstage(codes_of(words), placed)
+    entry = None if not kept else kept[0] if len(kept) == 1 else tuple(kept)
+    whole = jax.sharding.NamedSharding(placed.mesh, jax.sharding.PartitionSpec(entry, columns))
+    codes = codes_of(jax.sharding.reshard(words, whole))
+    return jax.sharding.reshard(unstage(codes, whole if kept else None), placed)
 
 
 def _staged_words(codes, xp=jnp):
@@ -632,9 +678,11 @@ class TernaryWeights(_Packed):
         batch = math.prod(batches)
         if batch == 0 or width == 0 or wdepth == 0:
             return jnp.zeros((*batches, depth, width), dtype)
-        inv = np.argsort(ternary_staged_rows(depth))
+        # Each matrix's codes unstaged where each group lies (`_unstaged`), as an NVFP4 matrix's are.
         flat = words.reshape(batch, width, wdepth)
-        decoded = jax.vmap(lambda w: ternary_codes(w.T, jnp.float32)[inv])(flat)
+        decoded = jax.vmap(lambda w: _unstaged(w.T, functools.partial(ternary_codes, dtype=jnp.float32),
+                                               packed.TERNARY_GROUP, 2, packed.ternary_staged_depth,
+                                               "ternary weight"))(flat)
         return decoded.reshape(*batches, depth, width).astype(dtype)
 
     def decoded(self, dtype=jnp.bfloat16) -> jax.Array:

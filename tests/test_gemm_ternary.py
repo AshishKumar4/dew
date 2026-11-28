@@ -70,6 +70,29 @@ def test_ternary_weights_pack_decode_and_stage_match_bitwise():
     assert d_empty.shape == (16, 0)
 
 
+@pytest.mark.parametrize("devices", [2, 4], ids=["whole groups a device", "groups cut by the devices"])
+@pytest.mark.mesh(devices=4)
+def test_a_depth_split_ternary_matrix_decodes_on_an_explicit_mesh(devices):
+    """A 512-deep ternary matrix whose depth an Explicit 'tensor' axis splits (its words' last axis: two
+    devices each a whole 256-deep group, or four each half a group), jitted: its codes are the unsplit
+    matrix's, placed by the same depth. Each group's staged order is undone where it lies, as an NVFP4
+    matrix's (`formats._unstaged`; row 14097's class, train 1466's review: a gather across the split depth
+    had no placement)."""
+    from jax.sharding import AxisType, PartitionSpec
+
+    rng = np.random.default_rng(14098)
+    weights = formats.TernaryWeights.of(jnp.asarray(rng.standard_normal((512, 64)), jnp.float32))
+    expected = np.asarray(weights.unscaled(jnp.float32))
+    mesh = jax.make_mesh((devices,), ("tensor",), axis_types=(AxisType.Explicit,),
+                         devices=jax.devices()[:devices])
+    with jax.set_mesh(mesh):
+        deep = PartitionSpec(None, "tensor")
+        placed = dataclasses.replace(weights, words=jax.device_put(weights.words, deep))
+        codes = jax.jit(lambda each: each.unscaled(jnp.float32))(placed)
+    assert jax.typeof(codes).sharding.spec[0] == "tensor"
+    np.testing.assert_array_equal(np.asarray(codes), expected)
+
+
 @pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16, jnp.float16, jnp.float64])
 def test_decoded_ternary_keeps_the_sign_and_bits_of_a_subnormal_scale(dtype):
     values = np.tile(np.asarray([[-1, -1], [0, 0], [1, 1], [0, 0]], np.float32), (64, 1))

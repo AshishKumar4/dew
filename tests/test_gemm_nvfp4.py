@@ -1226,40 +1226,66 @@ def test_an_nvfp4_products_gathered_gradient_keeps_far_routes_apart_and_routes_n
     np.testing.assert_array_equal(np.asarray(d_none), np.zeros((1, 512), np.float32))
 
 
-@pytest.mark.mesh(devices=3)
-def test_a_depth_split_nvfp4_matrix_decodes_and_projects_on_an_explicit_mesh():
-    """A dense NVFP4 matrix 768 deep whose depth an Explicit 'tensor' axis splits three ways (its words' and
-    scales' last axis, whole 128-deep groups a device), jitted: its decode is the codes' values, placed by
-    the same depth, and its projection of rows split by that depth, forward, is the product written plainly
-    over its values, exactly over small integers. The staged order is undone within each group where it
-    lies (row 14097: a gather across the split depth had no placement, its trace raised)."""
+@pytest.mark.parametrize("depth, devices", [(768, 3), (256, 4)],
+                         ids=["whole groups a device", "groups cut by the devices"])
+@pytest.mark.mesh(devices=4)
+def test_a_depth_split_nvfp4_projection_decodes_and_pulls_back_on_an_explicit_mesh(depth, devices):
+    """A dense NVFP4 matrix whose depth an Explicit 'tensor' axis splits (its words' and scales' last axis:
+    768 deep three ways, whole 128-deep groups a device; 256 deep four ways, each device half a group),
+    jitted: its decode is the codes' values placed by the same depth, its values (`packed_values`) the
+    unsplit matrix's, and its projection of rows split by that depth, forward and the rows' gradient, the
+    product written plainly over its values, exactly over small integers. Each group's staged order is
+    undone where it lies, the devices that cut a group gathered off its words while it is (row 14097: a
+    gather across the split depth had no placement; train 1466's review: the four-way split met a reshape
+    of two groups, which JAX refused)."""
     from jax.sharding import AxisType, PartitionSpec
 
     from dew.nn.kernels.templates import product
     from dew.quantization import packed_values
 
-    depth = 768
     rng = np.random.default_rng(14097)
     codes = jnp.asarray(rng.integers(-2, 3, (depth, 128)), jnp.float32)
     blocks = depth // product.NVFP4.depth
     matrix = formats.NvFp4.of(codes, jnp.ones((blocks, 128), jnp.float8_e4m3fn), jnp.float32(2.0 ** -8))
     values = np.asarray(packed_values(matrix), np.float64)
     rows = rng.integers(-3, 4, (8, depth)).astype(np.float32)
-    mesh = jax.make_mesh((3,), ("tensor",), axis_types=(AxisType.Explicit,))
+    cotangent = rng.integers(-3, 4, (8, 128)).astype(np.float32)
+    mesh = jax.make_mesh((devices,), ("tensor",), axis_types=(AxisType.Explicit,),
+                         devices=jax.devices()[:devices])
 
     @jax.jit
-    def run(x, matrix):
-        out = gemm.nvfp4_product(x, matrix, out_dtype=jnp.float32)
-        return matrix.decoded(), jax.reshard(out, PartitionSpec())
+    def run(x, matrix, cotangent):
+        out, pull = jax.vjp(lambda x: gemm.nvfp4_product(x, matrix, out_dtype=jnp.float32), x)
+        return (matrix.decoded(), jax.reshard(packed_values(matrix), PartitionSpec()),
+                jax.reshard(out, PartitionSpec()), jax.reshard(pull(cotangent)[0], PartitionSpec()))
 
     with jax.set_mesh(mesh):
         deep = PartitionSpec(None, "tensor")
         placed = formats.NvFp4(jax.device_put(matrix.words, deep), jax.device_put(matrix.scales, deep),
                                jax.device_put(matrix.scale, PartitionSpec()))
-        decoded, out = run(jax.device_put(jnp.asarray(rows, jnp.bfloat16), deep), placed)
+        decoded, found, out, grad = run(jax.device_put(rows, deep), placed,
+                                        jax.device_put(cotangent, PartitionSpec()))
     assert jax.typeof(decoded).sharding.spec[0] == "tensor"
     np.testing.assert_array_equal(np.asarray(decoded, np.float64), np.asarray(matrix.decoded(), np.float64))
+    np.testing.assert_array_equal(np.asarray(found, np.float64), values)
     np.testing.assert_array_equal(np.asarray(out, np.float64), rows.astype(np.float64) @ values)
+    np.testing.assert_array_equal(np.asarray(grad, np.float64), cotangent.astype(np.float64) @ values.T)
+
+
+def test_a_staged_order_no_transposition_states_is_refused_its_portable_decode():
+    """The portable decode undoes a staged order by transposing each group's words and codes
+    (`formats._unstaging`), so a declaration that no such transposition states is refused at the depth it
+    decodes, not decoded wrong: NVFP4's own order with words 0 and 1 of code 0 exchanged in the third group
+    alone, which the first two groups' strides cannot show (the review of row 14097's respin)."""
+    from dew.nn.kernels.templates.gemm import packed
+
+    def exchanged(group, word, code):
+        depth = packed.nvfp4_staged_depth(group, word, code)
+        moved = (group == 2) & (code == 0) & (word < 2)
+        return np.where(moved, depth + 1 - 2 * word, depth)
+
+    with pytest.raises(ValueError):
+        formats._unstaging(768, packed.NVFP4_GROUP, bits.E2M1.width, exchanged, "NVFP4")
 
 
 def _small_integer_projection(seed: int) -> tuple:
