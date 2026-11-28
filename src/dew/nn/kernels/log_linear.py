@@ -246,11 +246,12 @@ def _transposed_spec(spec: str, side: int) -> str:
 
 
 def _signs(x):
-    """`x`'s stored signs, `(positive, negative, NaN)` masks: a value's sign field and its nonzero stored
-    fields (`scan.stores_zero`: a subnormal a flushing comparison reads as zero is no zero)."""
-    _, sign, _, _ = float_bits.raw_fields(x)
+    """`x`'s stored signs, `(positive, negative, NaN)` masks: a value's sign field and its nonzero exponent
+    or fraction fields (`float_bits.raw_fields`: a subnormal a flushing comparison reads as zero is no
+    zero)."""
+    _, sign, biased, fraction = float_bits.raw_fields(x)
     nan = jnp.isnan(x)
-    stored = ~scan.stores_zero(x) & ~nan
+    stored = ((biased != 0) | (fraction != 0)) & ~nan
     return stored & (sign == 0), stored & (sign != 0), nan
 
 

@@ -76,10 +76,14 @@ def _raw_word(x: jax.Array) -> jax.Array:
 
 
 def stored_zero(x: jax.Array) -> jax.Array:
-    """Whether an IEEE value stores either zero, rather than a subnormal a comparison may flush."""
-    words = _raw_word(x)
-    magnitude = (1 << (jnp.finfo(x.dtype).bits - 1)) - 1
-    return (words & words.dtype.type(magnitude)) == 0
+    """Whether an IEEE value stores either zero, rather than a subnormal a comparison may flush, read from its
+    exponent and fraction fields apart (`raw_fields`): its magnitude bits masked and compared against zero
+    were folded by a compiler to a float compare, which a flushing CPU reads a subnormal as zero by (train
+    1466's head review). A complex value's both parts."""
+    if jnp.iscomplexobj(x):
+        return stored_zero(jnp.real(x)) & stored_zero(jnp.imag(x))
+    _, _, biased, fraction = raw_fields(x)
+    return (biased == 0) & (fraction == 0)
 
 
 def raw_fields(x: jax.Array) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
