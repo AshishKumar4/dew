@@ -486,8 +486,13 @@ All accuracy checks are the [accuracy gate](testing.md)'s, with no tolerance of 
     Code: a fact from its one source):
     `program`'s static arguments by JAX's own inference, `nn.programs`' precision presets by JAX's own
     conversion.
-- **XLA keeps** fusion and code generation; it does not reassociate floating-point math by default, so chosen forms
-  reach it intact.
+- **XLA keeps** fusion and code generation, and its algebraic simplifier and constant folding still rewrite some
+  floating-point forms the pass hands it (tests/arm_arithmetic.py's `AS_WRITTEN`: `(A/B)/C` as `A/(B*C)`, a
+  division by a broadcast through its reciprocal, a constant folded into a scale), so a chosen form is not
+  guaranteed to reach code generation as chosen. Two things hold that: a candidate is admitted by its error as
+  XLA compiles it (`generate.admits`, the gate running each form through the compile point), and a form whose
+  roundings must stand as written holds them itself, a `Protected` span's error-free transforms and an
+  `optimization_barrier` where no marking stands in for one (`dew.nn.blocks`' Fourier table).
 
 ## 5. Prior art
 
