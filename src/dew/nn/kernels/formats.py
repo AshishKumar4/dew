@@ -254,11 +254,12 @@ def _codes(words: jax.Array, dtype: DTypeLike = jnp.float32) -> jax.Array:
     # A split depth's placement stated where its reshapes split and join it, by whole groups; any other
     # placement JAX keeps through them itself.
     placed = explicit_spec(codes)
-    deep = placed is not None and placed.spec[0] is not None
+    if placed is None or placed.spec[0] is None:
+        return jnp.swapaxes(codes.reshape(grouped), 1, 2).reshape(depth, width)
     split = jax.sharding.NamedSharding(placed.mesh, jax.sharding.PartitionSpec(
-        placed.spec[0], None, None, placed.spec[1])) if deep else None
+        placed.spec[0], None, None, placed.spec[1]))
     held = jnp.swapaxes(codes.reshape(grouped, out_sharding=split), 1, 2)
-    return held.reshape(depth, width, out_sharding=placed if deep else None)
+    return held.reshape(depth, width, out_sharding=placed)
 
 
 def _staged_words(codes, xp=jnp):
