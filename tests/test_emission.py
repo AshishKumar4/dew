@@ -593,6 +593,26 @@ def test_a_high_level_operation_counts_its_expansion_with_its_literal_operands_v
     assert emission.emitted(jaxpr, 1, None).roles[0].fixed.operations == 3 * 128
 
 
+def test_a_high_level_operations_constant_is_its_expansions_hoisted_out_of_a_walk():
+    """A high-level operation's expansion counts with the constants it closes over (its expansion's own,
+    `programs.high_expansion`): a map scaling a 128-wide row by the exponentials of a constant gain inside a
+    walk computes them once outside it, as the compiler hoists them, none a step (Train 1512's review)."""
+    gain = jnp.arange(128.0)
+
+    def scaled(residuals, moving):
+        return moving * jnp.exp(gain)
+
+    def walked(row, trips):
+        def step(index, row):
+            mosaic.step_index(index)
+            return generation.linear_map(scaled, scaled, None, row)
+
+        return lax.fori_loop(0, trips, step, row)
+
+    (role, _) = _emitted(walked, _ROW, _TRIPS).roles
+    assert (role.step(_exponentials), role.fixed.exponentials) == (0, 128)
+
+
 def test_a_semaphore_or_a_barrier_stores_no_bytes():
     """A launch's semaphores and barriers (extended dtypes of no data: a GEMM's tail flags, `pl.get_global`)
     store no bytes beside its data's (`cost.stored`), so a launch holding them states and footprints its data
@@ -1797,8 +1817,10 @@ def test_a_copy_its_predicate_or_a_loops_unproven_trip_guards_counts_no_read():
         def body(row, out, staged, barrier):
             _read(row, staged, barrier)
             for _ in range(3):
-                plgpu.copy_gmem_to_smem(row, staged, barrier, predicate=predicate(staged))
-                plgpu.barrier_wait(barrier)
+                # A false predicate skips the copy and its arrival alike, so its wait is the predicate's too.
+                flag = predicate(staged)
+                plgpu.copy_gmem_to_smem(row, staged, barrier, predicate=flag)
+                pl.when(flag)(functools.partial(plgpu.barrier_wait, barrier))
             _stored(staged, out)
 
         return body

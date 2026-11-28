@@ -1163,7 +1163,8 @@ def _expanded(equation) -> tuple[jax_core.Jaxpr, Sequence, Sequence[int]] | None
     if (inner := programs.called(equation)) is not None:
         return inner, (), every
     if (expansion := programs.high_expansion(equation)) is not None:
-        return expansion, (), [at for at in every if not isinstance(equation.invars[at], jax_core.Literal)]
+        return expansion, expansion.consts, [at for at in every
+                                             if not isinstance(equation.invars[at], jax_core.Literal)]
     if (made := scaled.MADE.get(equation.primitive)) is None:
         return None
     traced = jax.make_jaxpr(functools.partial(made[0], **equation.params))(*(v.aval for v in equation.invars))
