@@ -457,10 +457,8 @@ class InContextMemory(LinearProducts):
             read = self._decoded(heads, cached)
         elif tokens.max_segments > 1:
             read = self._stepped(heads, steps)[0]
-        elif (form := self._mini_batched(heads, steps)) is not None:
-            read = self._mini_batch(form, heads, steps, alpha)
         else:
-            read = self._chunked(heads, steps)
+            read = self._one_document(heads, steps, alpha, features)
         # A call over forks leaves the cache as it was, its count too (`_recurrent`).
         if counted is not None and tokens.forks is None:
             counted()
@@ -649,7 +647,7 @@ class InContextMemory(LinearProducts):
         laid = jax.tree.map(unfolded, steps._replace(places=places))._replace(
             real=real.reshape(batch * count, -1))
         if not decoded:
-            reads = self._chunked(heads, laid)
+            reads = self._one_document(heads, laid)
         elif self._recurrence() is not None:
             # The recurrence's state and kept share the cache holds, the chain its row's document continued
             # (`_stepped_from_recurrence`, as `_recurrent_decoded` reads it).
@@ -701,18 +699,27 @@ class InContextMemory(LinearProducts):
     """Each mini-batched kernel's form (`_mini_batched`) by the moving weights a head steps: TTT-Linear's
     memory and bias (`dew.nn.kernels.ttt`), Titans' memory alone (`dew.nn.kernels.titans`)."""
 
-    def _mini_batched(self, heads: tuple[_Head, ...], steps: _Steps) -> str | None:
+    def _mini_batched(self, heads: tuple[_Head, ...], features: int) -> str | None:
         """The mini-batched kernel this call of rows of one document runs (`_mini_batch`), or None where it
-        runs none: a linear residual memory with its layer norm (`ResidualMemory(hidden=None, norm=True)`)
-        on its given target, its layer norm slow and its linear map fast, each token reading its own step,
-        no orthogonalized step, on the l2 objective; TTT-Linear's (`ttt`) with its bias and no momentum or
-        retention, Titans' (`titans`) without its bias, any momentum and retention. Each head computes the
-        plain network: its weights its network's own (no adapter, no other collection), its linear map of
-        its input by the kernel its state moves (`linear_product`), no RNG stream drawn."""
+        runs none: Dew's own linear residual memory with its layer norm (`ResidualMemory(hidden=None,
+        norm=True)`, no subclass, whose function the kernels state) on Dew's own l2 objective (no subclass)
+        and its given target, its layer norm slow and its linear map fast, each token reading its own step,
+        no orthogonalized step; TTT-Linear's (`ttt`) with its bias and no momentum or retention, Titans'
+        (`titans`) without its bias, any momentum and retention. The kernels compute in at least float32,
+        so the layer's readout must too (its `dtype` None or that wide: a narrower one reads the state
+        rounded to it), its linear map at the run's precision and in no projection recipe (`recipe_takes`).
+        Each head computes the plain network: its weights its network's own (no adapter, no other
+        collection) and its product the linear map of its input by the kernel its state moves
+        (`linear_product`), which draws from no RNG stream a call may carry."""
+        from dew.nn.kernels import projections
+
         network = self.network
-        if not (isinstance(network, ResidualMemory) and network.hidden is None and network.norm
-                and self.objective.kind == "l2" and self.target == "given" and self.commit == "token"
-                and not self.orthogonalize and tuple(self.slow) == ("norm",) and steps.keys is None):
+        own = (type(network) is ResidualMemory and network.hidden is None and network.norm
+               and network.precision is None and type(self.objective) is Objective)
+        if not (own and self.objective.kind == "l2" and self.target == "given" and self.commit == "token"
+                and not self.orthogonalize and tuple(self.slow) == ("norm",)
+                and (self.dtype is None or jnp.dtype(self.dtype) == at_least_fp32(self.dtype))
+                and not projections.recipe_takes(features, features)):
             return None
         form = "ttt" if network.bias else "titans"
         if form == "ttt" and (self.momentum is not None or self.retention is not None):
@@ -723,36 +730,28 @@ class InContextMemory(LinearProducts):
                     for index, head in enumerate(heads))
         return form if plain else None
 
-    def _mini_batch(self, form: str, heads: tuple[_Head, ...], steps: _Steps,
-                    alpha: jax.Array) -> jax.Array:
-        """The readouts `[B, S, H, F]` of rows of one document on `form`'s kernel (`_mini_batched`): its real
-        tokens compacted to the front (`valid_order`), as the chunked path compacts them, so its
-        mini-batches are its chunks counted from its first real token, the compacted tail absent (`valid`),
-        each head's W_0 the state it enters, its layer norm's affine the inner loss's. The kernels take each
-        gradient at its mini-batch's start and step it at its own token's rate, as the general path does;
-        the l2 objective's half makes Titans' doubled write (`2 theta k u`) its rate halved, exactly. A
-        padding token's readout is the kernel's of an absent token, none the general path's own."""
+    def _mini_batch(self, form: str, heads: tuple[_Head, ...], steps: _Steps, alpha: jax.Array) -> jax.Array:
+        """The readouts `[B, S', H, F]` of compacted rows of one document (`_compacted`) on `form`'s kernel
+        (`_mini_batched`): its mini-batches its chunks, counted from its first real token, the compacted
+        tail absent (`valid`), each head's W_0 the state it enters, its layer norm's affine the inner
+        loss's. The kernels take each gradient at its mini-batch's start and step it at its own token's
+        rate, as the general path does, Titans' write `2 theta k u` at the l2 objective's coefficient (one),
+        and name and recompute their mini-batches as `_chunk`'s (`CARRY`, `CHUNK`)."""
         from dew.nn.kernels import titans, ttt
 
-        order, _ = valid_order(steps.real)
-        fields = (steps.query, steps.key, steps.value, steps.theta, steps.mu, alpha, steps.real)
-        query, key, value, theta, mu, alpha, real = (gather_positions(field, order) for field in fields)
         network = self.network
         assert isinstance(network, ResidualMemory)
         rows = [_rows(head.initial, steps.real)["down"] for head in heads]
         weight, bias = (jnp.stack([head.held["norm"][name] for head in heads]) for name in ("scale", "bias"))
         memory = jnp.stack([row["kernel"] for row in rows], axis=1)
-        eps = network.epsilon
         if form == "ttt":
             offset = jnp.stack([row["bias"] for row in rows], axis=1)[:, :, None]
-            read, _ = ttt.ttt_linear(query, key, value, weight, bias, theta, state=(memory, offset),
-                                     chunk=self.chunk, scale=1.0, eps=eps, valid=real)
-        else:
-            read, _ = titans.titans(query, key, value, weight, bias, theta / 2, alpha, mu,
-                                    state=(memory, jnp.zeros_like(memory)), chunk=self.chunk, eps=eps,
-                                    valid=real)
-        inverse = jnp.argsort(order, axis=1)
-        return jnp.take_along_axis(read, inverse.reshape(*inverse.shape, 1, 1), axis=1)
+            return ttt.ttt_linear(steps.query, steps.key, steps.value, weight, bias, steps.theta,
+                                  state=(memory, offset), chunk=self.chunk, scale=1.0, eps=network.epsilon,
+                                  valid=steps.real)[0]
+        return titans.titans(steps.query, steps.key, steps.value, weight, bias, steps.theta, alpha, steps.mu,
+                             state=(memory, jnp.zeros_like(memory)), chunk=self.chunk, eps=network.epsilon,
+                             valid=steps.real, coefficient=1.0)[0]
 
     # The function, token by token and chunk by chunk.
 
@@ -857,12 +856,26 @@ class InContextMemory(LinearProducts):
         carry, reads = jax.lax.scan(lambda held, step: self._token(held, step, heads), carry, sequence)
         return jnp.moveaxis(reads, 0, 1), carry
 
-    def _chunked(self, heads: tuple[_Head, ...], steps: _Steps) -> jax.Array:
-        """The readouts `[B, S, H, F]` of rows of one document, chunk by chunk (the module docstring)."""
-        batch, length = steps.real.shape
+    def _one_document(self, heads: tuple[_Head, ...], steps: _Steps, alpha: jax.Array | None = None,
+                      features: int | None = None) -> jax.Array:
+        """The readouts `[B, S, H, F]` of rows of one document: their real tokens compacted to the front
+        (`valid_order`), so a chunk counts from its row's first real token, run on a mini-batched kernel
+        where the memory's form has one (`_mini_batched`, the forgotten shares `alpha` `[B, S, H]` and the
+        views' width `features` given: a call's own rows, not a fork's) and chunk by chunk otherwise
+        (`_chunked`), each readout read back at its token."""
         order, _ = valid_order(steps.real)
-        gathered = jax.tree.map(lambda field: gather_positions(field, order), steps)
-        laid = jax.tree.map(lambda field: sequence_blocks(field, self.chunk, leading=True), gathered)
+        compacted = jax.tree.map(lambda field: gather_positions(field, order), steps)
+        form = None if alpha is None or features is None else self._mini_batched(heads, features)
+        reads = (self._chunked(heads, compacted) if form is None or alpha is None
+                 else self._mini_batch(form, heads, compacted, gather_positions(alpha, order)))
+        inverse = jnp.argsort(order, axis=1)
+        return jnp.take_along_axis(reads, inverse.reshape(*inverse.shape, 1, 1), axis=1)
+
+    def _chunked(self, heads: tuple[_Head, ...], steps: _Steps) -> jax.Array:
+        """The readouts `[B, S, H, F]` of compacted rows of one document (`_one_document`), chunk by chunk
+        (the module docstring)."""
+        batch, length = steps.real.shape
+        laid = jax.tree.map(lambda field: sequence_blocks(field, self.chunk, leading=True), steps)
         count = laid.real.shape[0]
         rows = tuple(_rows(head.initial, steps.real) for head in heads)
         carry = (rows, jax.tree.map(jnp.zeros_like, rows))
@@ -874,9 +887,7 @@ class InContextMemory(LinearProducts):
         if CHUNK in RECOMPUTED.get():
             chunk = jax.checkpoint(chunk, prevent_cse=False)
         _, reads = jax.lax.scan(chunk, carry, laid)
-        reads = jnp.moveaxis(reads, 0, 1).reshape(batch, count * self.chunk, *reads.shape[3:])[:, :length]
-        inverse = jnp.argsort(order, axis=1)
-        return jnp.take_along_axis(reads, inverse.reshape(*inverse.shape, 1, 1), axis=1)
+        return jnp.moveaxis(reads, 0, 1).reshape(batch, count * self.chunk, *reads.shape[3:])[:, :length]
 
     def _chunk(self, carry: tuple, step: _Steps, *, heads: tuple[_Head, ...]) -> tuple:
         """One chunk of every row: its gradients at its start, its states, its readouts `[B, C, H, F]`.

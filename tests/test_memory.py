@@ -33,7 +33,7 @@ from memory_support import (
 from reference_error import assert_as_exact, with_gradients
 
 from dew.batch import coordinates
-from dew.nn.inputs import AttentionMetadata, MixerCall
+from dew.nn.inputs import PLAIN_CALL, AttentionMetadata, MixerCall
 from dew.nn.memory import Gate, InContextMemory, Objective, ResidualMemory
 
 SEEDS = {"self-generated gradients": 512, "decoded gated_linear_attention": 32}
@@ -125,29 +125,6 @@ def test_the_chunk_parallel_memory_is_the_token_by_token_one(name):
                     truth_fn=written(module, dtype=jnp.float64))
 
 
-@pytest.mark.parametrize(("name", "kernel"), [("ttt_linear", "ttt_linear"), ("titans_linear", "titans")])
-def test_a_linear_residual_memory_of_one_document_runs_its_mini_batched_kernel(monkeypatch, name, kernel):
-    """TTT-Linear's and Titans' linear memories run a call of rows of one document on their mini-batched
-    kernels (`dew.nn.kernels.ttt.ttt_linear`, `dew.nn.kernels.titans.titans`), once a call over its heads,
-    and a packed call on the token path, which reaches neither."""
-    from dew.nn.kernels import titans, ttt
-
-    owner = ttt if kernel == "ttt_linear" else titans
-    original, called = getattr(owner, kernel), []
-
-    def reached(*args, **kwargs):
-        called.append(kernel)
-        return original(*args, **kwargs)
-
-    monkeypatch.setattr(owner, kernel, reached)
-    module = layer(name)
-    x, params = drawn(module)(0)
-    module.apply(params, x)
-    assert called == [kernel]
-    module.apply(params, x, packed(np.ones((ROWS, LENGTH), np.int32)))
-    assert called == [kernel]
-
-
 PADDED = ((np.arange(LENGTH)[None] >= np.asarray([0, 1, 3, 0, 5, 2, 0, 7])[:, None])
           & (np.arange(LENGTH)[None] < np.asarray([12, 12, 12, 10, 12, 12, 8, 12])[:, None]))
 """Each row's real tokens: rows left-padded by 1 to 7 tokens, two right-padded by 2 and 4, three whole."""
@@ -170,6 +147,47 @@ def test_a_mini_batched_memory_reads_padded_rows_as_the_token_path_does(name):
     assert_as_exact(real(applied(module, by_mask)), real(applied(module, by_tokens)), drawn(module),
                     f"{name} padded", seeds=MEMORY_SEEDS,
                     truth_fn=real(applied(layer(name, dtype=jnp.float64), by_tokens)))
+
+
+@pytest.mark.parametrize("name", ["ttt_linear", "titans_linear"])
+def test_a_mini_batched_memorys_gradients_are_the_token_paths(name):
+    """The gradients of a mini-batched memory's stream and of every parameter under a cotangent at its real
+    tokens, over rows padded left and right (`PADDED`), are the token path's over the same rows packed, on
+    par against that path in float64 (check 1): the route differentiates as the general path does."""
+    module = layer(name)
+    valid = jnp.asarray(PADDED)
+    by_mask = MixerCall(metadata=AttentionMetadata(coordinates=coordinates(valid=valid)))
+    by_tokens = packed(np.where(PADDED, 1, 0).astype(np.int32))
+    draw = drawn(module)
+
+    def draw_with_cotangent(seed: int):
+        cotangent = np.random.default_rng([1448, seed]).standard_normal((ROWS, LENGTH, WIDTH))
+        return *draw(seed), np.where(PADDED[..., None], cotangent, 0).astype(np.float32)
+
+    def run(memory, call):
+        return jax.jit(with_gradients(lambda x, params: memory.apply(params, x, call)))
+
+    assert_as_exact(run(module, by_mask), run(module, by_tokens), draw_with_cotangent, f"{name} gradients",
+                    seeds=MEMORY_SEEDS, truth_fn=run(layer(name, dtype=jnp.float64), by_tokens))
+
+
+def test_titans_linear_rate_takes_its_gradient_at_the_scale_the_token_path_does():
+    """Titans' linear memory's learned rate takes a finite gradient on its mini-batched kernel wherever the
+    token path's is finite: one float32 token, the memory at zero, the views `q = k = [1, 0]` and
+    `v = [3, -2]`, a rate of `2^-20` and an output cotangent `[2^125, -2^125]`, whose rate's cotangent is
+    `2^127`; the l2 objective's coefficient one rides the kernel's write, not the rate halved, whose
+    cotangent `2^128` overflowed (a head review)."""
+    module = InContextMemory(network=ResidualMemory(hidden=None, norm=True, bias=False, epsilon=1.0),
+                             slow=("norm",), project_query=False, project_key=False, output=False,
+                             learning_rate=Gate(scale=2.0**-20), chunk=1)
+    x = jnp.asarray([[[1.0, 0.0]]], jnp.float32)
+    params = jax.tree.map(jnp.zeros_like, module.init(jax.random.key(0), x))
+    params["params"]["v_proj"]["kernel"] = jnp.asarray([[3.0, -2.0], [0.0, 0.0]], jnp.float32)
+    params["params"]["head_0"]["norm"]["scale"] = jnp.ones((2,), jnp.float32)
+    cotangent = jnp.asarray([[[2.0**125, -(2.0**125)]]], jnp.float32)
+    for call in (PLAIN_CALL, packed(np.ones((1, 1), np.int32))):
+        _, pullback = jax.vjp(lambda held, call=call: module.apply(held, x, call), params)
+        assert all(np.isfinite(np.asarray(leaf)).all() for leaf in jax.tree.leaves(pullback(cotangent)))
 
 
 def test_packed_documents_read_as_each_alone():
@@ -238,23 +256,29 @@ def test_a_cached_prefill_starts_each_packed_document_afresh(name):
                     truth_fn=written(module, dtype=jnp.float64, segments=segments))
 
 
-def test_a_zero_step_reads_the_initial_network():
-    """With no step, every token reads the initial network over its query, as that network computes
-    it over the queries, on par against float64 (check 1): the update adds exact zeros."""
-    module = InContextMemory(network=ResidualMemory(hidden=4 * FEATURES), heads=HEADS,
-                             head_features=FEATURES, learning_rate=Gate(value=0.0), output=False,
-                             chunk=CHUNK)
+@pytest.mark.parametrize(("network", "dtype", "slow"), [
+    (ResidualMemory(hidden=4 * FEATURES), None, ()), (ResidualMemory(hidden=None), jnp.bfloat16, ("norm",))])
+def test_a_zero_step_reads_the_initial_network(network, dtype, slow):
+    """With no step, every token reads the initial network over its query at the layer's dtype, as that
+    network computes it over the queries, on par against float64 (check 1): the update adds exact zeros. A
+    bfloat16 linear residual memory, which its mini-batched kernel would read in float32, reads it in
+    bfloat16 (a head review)."""
+    module = InContextMemory(network=network, heads=HEADS, head_features=FEATURES, slow=slow, dtype=dtype,
+                             learning_rate=Gate(value=0.0), output=False, chunk=CHUNK)
 
-    def initial(x, params):
-        kernel = params["params"]["q_proj"]["kernel"].astype(x.dtype)
-        queries = (x @ kernel).reshape(-1, LENGTH, HEADS, FEATURES)
-        network = ResidualMemory(hidden=4 * FEATURES, dtype=x.dtype)
-        heads = [network.apply({"params": params["params"][f"head_{h}"]}, queries[:, :, h])
-                 for h in range(HEADS)]
-        return jnp.stack(heads, axis=2).reshape(-1, LENGTH, HEADS * FEATURES)
+    def initial_at(at):
+        def initial(x, params):
+            computed = at or x.dtype
+            kernel = params["params"]["q_proj"]["kernel"].astype(computed)
+            queries = (x.astype(computed) @ kernel).reshape(-1, LENGTH, HEADS, FEATURES)
+            at_dtype = network.clone(dtype=computed)
+            heads = [at_dtype.apply({"params": params["params"][f"head_{h}"]}, queries[:, :, h])
+                     for h in range(HEADS)]
+            return jnp.stack(heads, axis=2).reshape(-1, LENGTH, HEADS * FEATURES)
+        return initial
 
-    assert_as_exact(applied(module), jax.jit(initial), drawn(module), "zero-step memory", seeds=MEMORY_SEEDS,
-                    truth_fn=initial)
+    assert_as_exact(applied(module), jax.jit(initial_at(dtype)), drawn(module), "zero-step memory",
+                    seeds=MEMORY_SEEDS, truth_fn=initial_at(None))
 
 
 def test_an_orthogonalized_step_follows_the_paper_with_muons_iteration():
@@ -276,16 +300,16 @@ def test_an_orthogonalized_step_follows_the_paper_with_muons_iteration():
                     truth_fn=written(module, dtype=jnp.float64, gradient=gradient))
 
 
-def test_a_memory_recomputes_its_chunks_only_where_its_rung_names_them():
+@pytest.mark.parametrize("name", ["titans", "ttt_linear", "titans_linear"])
+def test_a_memory_recomputes_its_chunks_only_where_its_rung_names_them(name):
     """An in-context memory's training step recomputes each chunk from its carry in the backward only where
     the rung it runs under names its chunks (`residuals.recomputing`, `memory_chunk`: the heaviest
     rung's, `decoder_block.recomputed_inside`); under any other it keeps their values, the step's work its
     forward's and backward's alone (row 6577: recomputed under every rung, a Titans step that fit ran
-    31-41% slower)."""
-    from dew.nn.inputs import PLAIN_CALL
+    31-41% slower), on the general path and the mini-batched kernels alike."""
     from dew.nn.residuals import recomputing
 
-    module = layer("titans")
+    module = layer(name)
     params = jax.eval_shape(lambda: module.init(jax.random.key(0), jnp.zeros((1, LENGTH, WIDTH))))
     x = jax.ShapeDtypeStruct((ROWS, LENGTH, WIDTH), jnp.float32)
 
