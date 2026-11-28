@@ -487,10 +487,10 @@
 "tests/test_attention_mosaic_compile.py::test_the_forward_compiles_spill_free_as_its_model_decides[sm100-64-NONE-bfloat16-none]",
 "tests/test_attention_mosaic_compile.py::test_the_forward_compiles_spill_free_as_its_model_decides[sm100-64-SPLIT-bfloat16-none]",
 "tests/test_attention_mosaic_compile.py::test_the_forward_compiles_spill_free_as_its_model_decides[sm120-128-NONE-bfloat16-band-bias]",
-"tests/test_attention_mosaic_compile.py::test_the_forward_compiles_spill_free_as_its_model_decides[sm120-128-NONE-bfloat16-softcap-sinks-alibi]",
-"tests/test_attention_mosaic_compile.py::test_the_forward_compiles_spill_free_as_its_model_decides[sm120-128-OUTPUT-bfloat16-none]",
-"tests/test_attention_mosaic_compile.py::test_the_forward_compiles_spill_free_as_its_model_decides[sm120-128-SPLIT-bfloat16-none]",
-"tests/test_attention_mosaic_compile.py::test_the_forward_compiles_spill_free_as_its_model_decides[sm120-128-SPLIT-bfloat16-softcap]",
+"tests/test_attention_mosaic_compile.py::test_the_forward_compiles_spill_free_as_its_model_decides[sm120-128-NONE-bfloat16-sinks]",
+"tests/test_attention_mosaic_compile.py::test_the_forward_compiles_spill_free_as_its_model_decides[sm120-128-NONE-float16-none]",
+"tests/test_attention_mosaic_compile.py::test_the_forward_compiles_spill_free_as_its_model_decides[sm120-128-SPLIT-bfloat16-custom-vjp]",
+"tests/test_attention_mosaic_compile.py::test_the_forward_compiles_spill_free_as_its_model_decides[sm120-128-SPLIT-bfloat16-sinks]",
 "tests/test_attention_mosaic_compile.py::test_the_forward_compiles_spill_free_as_its_model_decides[sm120-128-SPLIT-float16-dropout]",
 "tests/test_attention_mosaic_compile.py::test_the_forward_compiles_spill_free_as_its_model_decides[sm120-256-OUTPUT-bfloat16-none]",
 "tests/test_attention_mosaic_compile.py::test_the_forward_compiles_spill_free_as_its_model_decides[sm120-64-NONE-bfloat16-none]",
@@ -539,6 +539,10 @@
 ],
 "tests/test_attention_mosaic_flops.py": [
 "tests/test_attention_mosaic_flops.py::test_the_mosaic_launches_state_the_models_attention_flops[causal]"
+],
+"tests/test_attention_parallax.py": [
+"tests/test_attention_parallax.py::test_a_value_tails_logit_cotangents_keep_it",
+"tests/test_attention_parallax.py::test_parallax_keeps_a_softmax_tails_output_on_par_with_its_reference[a softmax tail's second product]"
 ],
 "tests/test_attention_placed.py": [
 "tests/test_attention_placed.py::test_a_fused_walks_dq_ring_and_its_reducer_hold_every_property_in_every_interleaving[causal]",
@@ -1078,14 +1082,14 @@
 "tests/test_contracts_algebra.py::test_the_convex_mean_holds_every_order[jvp of grad, scanned]"
 ],
 "tests/test_contracts_attention.py": [
-"tests/test_contracts_attention.py::test_a_fused_attention_kernel_holds_every_order[template-near the largest-jvp of grad, nested jit]",
-"tests/test_contracts_attention.py::test_a_fused_attention_kernel_holds_every_order[template-near the largest-second jvp, remat]",
-"tests/test_contracts_attention.py::test_a_fused_attention_kernel_holds_every_order[template-near the least normal-jvp of grad, nested jit]",
-"tests/test_contracts_attention.py::test_a_fused_attention_kernel_holds_every_order[template-near the least normal-second jvp, remat]",
+"tests/test_contracts_attention.py::test_a_fused_attention_kernel_holds_every_order[template-near the largest-jvp of grad, remat]",
+"tests/test_contracts_attention.py::test_a_fused_attention_kernel_holds_every_order[template-near the least normal-first orders]",
+"tests/test_contracts_attention.py::test_a_fused_attention_kernel_holds_every_order[template-near the least normal-jvp of grad, scanned]",
+"tests/test_contracts_attention.py::test_a_fused_attention_kernel_holds_every_order[template-normal-first orders]",
 "tests/test_contracts_attention.py::test_a_fused_attention_kernel_holds_every_order[template-normal-jvp of grad, nested jit]",
 "tests/test_contracts_attention.py::test_a_fused_attention_kernel_holds_every_order[template-normal-jvp of grad, remat]",
 "tests/test_contracts_attention.py::test_a_fused_attention_kernel_holds_every_order[template-normal-jvp of grad]",
-"tests/test_contracts_attention.py::test_a_fused_attention_kernel_holds_every_order[template-normal-second jvp]",
+"tests/test_contracts_attention.py::test_a_fused_attention_kernel_holds_every_order[template-normal-second jvp, remat]",
 "tests/test_contracts_attention.py::test_a_giant_heads_clip_holds_every_order[grad of grad]",
 "tests/test_contracts_attention.py::test_a_giant_heads_clip_holds_every_order[second jvp]",
 "tests/test_contracts_attention.py::test_a_padded_merges_derivatives_are_the_laws[near the largest-jvp of grad, remat]",
@@ -1094,9 +1098,9 @@
 "tests/test_contracts_attention.py::test_a_padded_merges_derivatives_are_the_laws[normal-first orders]",
 "tests/test_contracts_attention.py::test_a_padded_merges_derivatives_are_the_laws[normal-jvp of grad, nested jit]",
 "tests/test_contracts_attention.py::test_a_padded_merges_derivatives_are_the_laws[normal-jvp of grad, scanned]",
-"tests/test_contracts_attention.py::test_a_padded_merges_derivatives_are_the_laws[normal-second jvp, remat]",
-"tests/test_contracts_attention.py::test_a_template_calls_value_tangent_is_finite_past_its_raw_products",
-"tests/test_contracts_attention.py::test_the_sparse_latent_kernel_holds_every_order[near the largest]",
+"tests/test_contracts_attention.py::test_a_padded_merges_derivatives_are_the_laws[normal-second jvp]",
+"tests/test_contracts_attention.py::test_parallax_holds_every_order[near the least normal]",
+"tests/test_contracts_attention.py::test_the_paged_decode_kernel_holds_every_order[near the largest]",
 "tests/test_contracts_attention.py::test_the_sparse_latent_kernel_holds_every_order[normal]"
 ],
 "tests/test_contracts_gemm.py": [
@@ -1942,9 +1946,6 @@
 ],
 "tests/test_gemm_syrk.py": [
 "tests/test_gemm_syrk.py::test_syrk_derives_square_super_tiles_and_compiles_spill_free[sm80]"
-],
-"tests/test_gemm_tcgen05.py": [
-"tests/test_gemm_tcgen05.py::test_tcgen05s_epilogues_hold_check_1[row scale-256x3]"
 ],
 "tests/test_gemm_template.py": [
 "tests/test_gemm_template.py::test_a_decode_steps_dense_product_runs_swapped_and_holds_check_1[2048-1024-False-sm90]",
@@ -3975,8 +3976,8 @@
 "tests/test_serving.py::test_a_server_scores_its_draws_as_a_full_forward_over_its_arithmetic[several-steps-over-pages]",
 "tests/test_serving.py::test_a_speculating_server_on_an_expert_mesh_drafts_what_one_device_drafts[exchange]",
 "tests/test_serving.py::test_a_speculating_server_on_an_expert_mesh_drafts_what_one_device_drafts[global]",
+"tests/test_serving.py::test_a_speculating_server_on_an_expert_mesh_refuses_a_block_that_leaves_no_distribution[exchange]",
 "tests/test_serving.py::test_a_speculating_server_over_an_adapter_set_reseeds_its_depths_under_each_rows_adapter",
-"tests/test_serving.py::test_a_text_server_serving_under_keeping_keeps_every_program_it_compiles",
 "tests/test_serving.py::test_host_task_and_server_preserve_nonzero_lora_branches",
 "tests/test_serving.py::test_repeated_requests_reuse_their_programs_and_read_back_only_results"
 ],
