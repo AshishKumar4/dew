@@ -33,7 +33,7 @@ from float64_terms import POWER, evaluated, evaluated_on, static, traced
 from reference_error import _of_float64, _site, _SiteTerms, _sizing_seeds, _truth_program
 from store_wire import COMPILED
 from tier_wire import stop_past_cap
-from truths_ahead import AT_RUN, CompiledTruths, arm_role, named
+from truths_ahead import AT_RUN, CompiledTruths, arm_role, library_checked, named
 
 from dew.parity_stages import staged_units
 
@@ -238,7 +238,7 @@ def _arm_program(programs: dict, held: dict, role: str, fn, inputs, *, reference
         with generation.routes() as reported, tuning.seen() as launched:
             out = traced_fn.trace(*inputs).out_info
         held[name] = {"constants": [], "tree": jax.tree.structure(out), "routes": list(reported),
-                      "launches": launched.held()}
+                      "launches": launched.held(), "library_call": getattr(fn, "library_call", None)}
         programs[name] = (Whole(traced_fn, held[name]), [*map(jax.typeof, leaves)])
         return out
     with generation.routes() as reported, tuning.seen() as launched:
@@ -342,12 +342,41 @@ def _stored_arm(store: CompiledTruths, label: str, given_fn, arm, role: str, *, 
     if at_run is not None:
         # Compiled on its GPU in the run, as its prepare stated (`_compile_arms`).
         store.unprepared(f"{label}: its {role} arm: {at_run}", AT_RUN)
-        return arm
+        return _library_checked(arm, given_fn, f"{label}: its {role} arm")
     if not store.holds(armed(label, written)):
         store.unprepared(f"{label}: its {role} arm ran unprepared: its prepare wrote the site's truths and "
                          "compiled none of its arms")
-        return arm
+        return _library_checked(arm, given_fn, f"{label}: its {role} arm")
     return _ahead_arm(given_fn, arm, functools.partial(store.ran, armed(label, written)), named_role)
+
+
+def _library_checked(arm, given_fn, label: str):
+    """`arm`, a site's arm its run compiles on its GPU (unprepared, or at run), its executable held to its
+    library's call where `given_fn` is a library arm (`generation_support.cublas_compiled`'s `library_call`)
+    and it runs on a GPU (`truths_ahead.library_checked`), checked once a draw's shapes on its own compile,
+    which no prepare made; `arm` as it is otherwise (row 14096)."""
+    call = getattr(given_fn, "library_call", None)
+    if call is None or jax.default_backend() != "gpu":
+        return arm
+    return _LibraryChecked(arm, given_fn, call, label)
+
+
+class _LibraryChecked:
+    """A library arm (`arm`, as the gate runs it) whose each call's program (`given_fn`'s, at the call's
+    shapes) is checked to call `call` before it runs (`_library_checked`), its other attributes the arm's."""
+
+    def __init__(self, arm, given_fn, call: str, label: str):
+        self.arm, self.given_fn, self.call, self.label, self.checked = arm, given_fn, call, label, set()
+
+    def __call__(self, *inputs):
+        shapes = tuple((np.shape(leaf), str(np.result_type(leaf))) for leaf in jax.tree.leaves(inputs))
+        if shapes not in self.checked:
+            library_checked(self.given_fn.lower(*inputs).compile(), self.call, self.label)
+            self.checked.add(shapes)
+        return self.arm(*inputs)
+
+    def __getattr__(self, name):
+        return getattr(self.arm, name)
 
 
 def _ahead_arm(given, compiled, call: Callable, role: str):

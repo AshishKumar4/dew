@@ -402,9 +402,31 @@ class CompiledTruths:
             if stored["stamp"] != self.stamp:
                 raise MissingTruth(f"{label}: its programs were compiled at {stored['stamp']}, not this "
                                    f"run's {self.stamp}")
-            self.read[label] = (AheadPrograms.load(site / PROGRAMS).loaded(),
-                                pickle.loads((site / HELD).read_bytes()))
+            programs = AheadPrograms.load(site / PROGRAMS).loaded()
+            held = pickle.loads((site / HELD).read_bytes())
+            for name, record in held.items():
+                # A library arm's executable, the one this run loads, held to its library's call (row 14096).
+                if record.get("library_call") is not None and jax.default_backend() == "gpu":
+                    library_checked(programs[name], record["library_call"], f"{label}: {name}")
+            self.read[label] = (programs, held)
         return self.read[label]
+
+
+def library_checked(executable: jax.stages.Compiled, call: str, label: str) -> None:
+    """`executable`, a library arm's (`generation_support.cublas_compiled`) as it runs, read by its
+    instructions as XLA's own schema reads them (`dew.telemetry.instrumentation.hlo_instructions`): it calls
+    the library's `call` (cuBLASLt's `__cublas$lt$matmul`) and runs no dot of XLA's own, fused or not, so no
+    lane flag or fusion choice gives it another GEMM; refused otherwise, naming what it calls. Checked on
+    the executable that runs, a prepared one as its run loads it (`CompiledTruths._site`), never on a
+    compile of its own beside it (row 14096)."""
+    from dew.telemetry.instrumentation import hlo_instructions
+
+    instructions = hlo_instructions(executable).values()
+    targets = {each.target for each in instructions} - {""}
+    if call not in targets:
+        raise AssertionError(f"{label}: the library arm calls {sorted(targets)}, no {call}")
+    if any(each.op == "dot" or "dot" in each.fused for each in instructions):
+        raise AssertionError(f"{label}: the library arm runs a dot of XLA's own")
 
 
 def compiled_memory(directory: Path, *, arms: bool = False) -> list[dict[str, int | str]]:
