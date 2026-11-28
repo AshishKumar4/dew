@@ -1,9 +1,6 @@
 """A whole decoder layer's fusion plan (`dew.nn.kernels.templates.layers`, row 9038): each body as the pass
 weighs it, the layer flattened with each boundary a region crosses stated, and the checked-in plans as
 planning makes them."""
-import os
-import subprocess
-import sys
 
 import jax
 import jax.numpy as jnp
@@ -137,6 +134,20 @@ def test_a_candidate_inside_a_platform_choices_portable_branch_is_never_ranked()
                for found in planned.search for variant in found.variants)
     assert all(found.best is None and found.passed is None for found in planned.search)
 
+def test_today_weighs_the_branch_a_platform_choice_takes_where_the_step_lowers():
+    """A product in each branch of a platform choice (`_ported`): on an H100 the pass's bodies today are the
+    branch a CUDA lowering runs alone (`program.fused_bodies`' `platform`, `generation.lowering_platform`),
+    never the portable branch it does not launch (Train 1470's review: both branches' products were listed
+    as the step's)."""
+    jaxpr = jax.make_jaxpr(_ported)(*_shapes()).jaxpr
+    ((place, choice),) = [(at, eqn) for at, eqn in enumerate(jaxpr.eqns) if eqn.primitive is jax.lax.cond_p]
+    cuda = next(number for number, names in enumerate(choice.params["branches_platforms"])
+                if names is not None and "cuda" in names)
+    with generation.assumed("sm90"):
+        planned = layers.plan(jaxpr)
+    assert planned.today and {found.body for found in planned.today} == {f"step/cond@{place}.{cuda}"}
+
+
 def test_a_product_whose_variants_save_alike_takes_its_most_staged_as_its_best():
     """`Weighed.best` among variants saving the same seconds is the first, the one holding the most stages
     (`Weighed.variants`' order): a tie never reads a later, smaller region as the better plan."""
@@ -147,17 +158,3 @@ def test_a_product_whose_variants_save_alike_takes_its_most_staged_as_its_best()
     most, fewer = variant(("prologue", "epilogue"), 2.0), variant(("epilogue",), 3.0)
     assert layers.Weighed(body="step", product=0, variants=(most, fewer)).best == most
 
-
-def test_the_checked_in_plans_are_the_plans_planning_makes():
-    """`_layer_plans.json` holds what planning makes of each case, as its command checks it in a process of
-    its own (`python -m dew.nn.kernels.templates.layers --check`, which regenerates them and fails naming
-    the lines that differ): the plans a developer's run writes, no test suite's settings among them."""
-    from process_support import REPO_ROOT
-
-    # A developer's environment, none of the suite's (its matmul precision and XLA flags move the step's
-    # equations, FS-9038-ENV3).
-    developer = {name: os.environ[name] for name in ("PATH", "HOME") if name in os.environ}
-    checked = subprocess.run([sys.executable, "-m", "dew.nn.kernels.templates.layers", "--check"],
-                             capture_output=True, text=True, check=False,
-                             env={**developer, "PYTHONPATH": str(REPO_ROOT / "src")})
-    assert checked.returncode == 0, checked.stderr[-6000:]

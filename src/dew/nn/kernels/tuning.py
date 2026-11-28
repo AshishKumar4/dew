@@ -1003,7 +1003,9 @@ class KernelOp(tokamax.Op):
             return found[1]
         key = self.traced(name, value)
         try:
-            refs = tuple(weakref.ref(leaf, lambda _, place=place: _TRACED.pop(place, None))
+            # The cache the callback drops its entry from bound as it is made: a leaf collected as the
+            # interpreter exits outlives the module's globals, `_TRACED` then None.
+            refs = tuple(weakref.ref(leaf, lambda _, place=place, held=_TRACED: held.pop(place, None))
                          for leaf in leaves)
         except TypeError:
             # A callable no weak reference holds: traced each time.
@@ -2135,11 +2137,13 @@ def _timings_of(observed: Observed) -> Timings | None:
 
 
 class Measurer(NamedTuple):
-    """The GPU a process measures launches on (`_settle`): its model (`kind`), its timing of a launch's
-    configs every call takes (`measured`, `_measured`'s) and its store of the timings (`store`,
-    `_store`'s)."""
+    """The GPU a process measures launches on (`_settle`): its model (`kind`, the store its picks key by), its
+    facts (`target`: the attached GPU's, which a launch is timed for only where its placement chose it,
+    `_chosen_for`), its timing of a launch's configs every call takes (`measured`, `_measured`'s) and its
+    store of the timings (`store`, `_store`'s)."""
 
     kind: str
+    target: generation.GpuTarget
     measured: Callable[[KernelOp, tokamax.BoundArguments, Sequence[Observed]], Timings]
     store: Callable[[str, Mapping[tuple[tokamax.Op, Hashable], tuple[dict[str, JSON], Timings]]], None]
 
@@ -2150,7 +2154,20 @@ def _measurer(measure: bool) -> Measurer | None:
     none."""
     if not (measure and _cache.measures_picks()):
         return None
-    return Measurer(get_default_device().device_kind, _measured, _store)
+    # The device that runs the timing, its own facts whatever the caller assumes or its mesh names.
+    device = get_default_device()
+    return Measurer(device.device_kind, generation.device_target(device), _measured, _store)
+
+
+def _chosen_for(placed: Placement, target: generation.GpuTarget) -> bool:
+    """Whether a launch traced at `placed` was chosen for `target`: the GPU its placement states
+    (`gpu_target` within it: the device it assumed, its facts its own, else its mesh's or the attached
+    one's) is `target`, its kernels compiled for it, not interpreted. A launch an assumed device chose (an
+    A100's tiles traced on an H100's host, no mesh naming it) is never timed on another GPU, nor its timings
+    stored in that GPU's picks (Train 1478's review)."""
+    with _placed_in(placed):
+        chosen = generation.gpu_target()
+    return (placed.assumption is None or not placed.assumption.interpreted) and chosen == target
 
 
 def _settle(found: Sequence[Observed], *, measurer: Measurer | None) -> int:
@@ -2180,7 +2197,9 @@ def _settle(found: Sequence[Observed], *, measurer: Measurer | None) -> int:
             group = calls[_distinct_key(observed)]
             fastest = None if (held := _timings_of(observed)) is None else _usable(held, group)
             fresh = None
-            if fastest is None and measuring is not None:
+            # Timed only where the placement it compiles at (its group's first call's, `_candidate_compiles`)
+            # chose it for the GPU attached.
+            if fastest is None and measuring is not None and _chosen_for(group[0].placed, measuring.target):
                 measured = measuring.measured(op, ba, group)
                 if not measured.prune_errors():
                     _log.warning("no config of %s compiled or ran; it keeps its heuristic: %s",
