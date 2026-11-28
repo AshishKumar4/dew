@@ -14,17 +14,21 @@ LIMIT_MIB = 16.0
 """The most the entries may weigh, in MiB: a package carries them to every install."""
 
 
-def weighed(entries: list[Path], limit_mib: float = LIMIT_MIB) -> int:
-    """What `entries` weigh, in bytes, refused past `limit_mib`."""
-    weight = sum(entry.stat().st_size for entry in entries)
-    if weight > limit_mib * 2**20:
-        raise SystemExit(f"the entries weigh {weight / 2**20:.2f} MiB, past {limit_mib} MiB")
-    return weight
+def weight(entries: list[Path]) -> int:
+    """What `entries` weigh, in bytes: each read once."""
+    return sum(entry.stat().st_size for entry in entries)
+
+
+def within(bytes_: int, limit_mib: float = LIMIT_MIB) -> int:
+    """`bytes_` (a set of entries' `weight`), refused past `limit_mib`."""
+    if bytes_ > limit_mib * 2**20:
+        raise SystemExit(f"the entries weigh {bytes_ / 2**20:.2f} MiB, past {limit_mib} MiB")
+    return bytes_
 
 
 if __name__ == "__main__":
     found = sorted(Path(sys.argv[1]).glob("*.json"))
-    weight = sum(entry.stat().st_size for entry in found)
-    print(json.dumps({"entries": len(found), "mib": round(weight / 2**20, 3), "limit_mib": LIMIT_MIB}),
+    weighs = weight(found)
+    print(json.dumps({"entries": len(found), "mib": round(weighs / 2**20, 3), "limit_mib": LIMIT_MIB}),
           flush=True)
-    weighed(found)
+    within(weighs)

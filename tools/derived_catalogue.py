@@ -29,7 +29,7 @@ import tempfile
 import time
 from pathlib import Path
 
-from derived_weight import LIMIT_MIB, weighed
+from derived_weight import LIMIT_MIB, weight, within
 
 from dew import _files
 from dew.nn.kernels import generation
@@ -129,13 +129,13 @@ def main() -> None:
                              f"{[(result['step'], result['generation']) for result in failed]}")
         derived = Path(cache) / "dew" / "algebra" / "derived"
         entries = sorted(derived.glob("*.json")) if derived.is_dir() else []
-        weight = weighed(entries, arguments.limit_mib)
+        weighs = within(weight(entries), arguments.limit_mib)
         # Written whole beside `--out` and put in its place in one call, refused where `--out` holds anything
         # but entries (`_foreign`).
         with _files.swapped(arguments.out, _foreign) as staged:
             for entry in entries:
                 shutil.copyfile(entry, staged / entry.name)
-    print(json.dumps({"entries": len(entries), "mib": round(weight / 2**20, 3), "pairs": len(results),
+    print(json.dumps({"entries": len(entries), "mib": round(weighs / 2**20, 3), "pairs": len(results),
                       "refused": sum("refused" in result for result in results),
                       "seconds": round(time.perf_counter() - began, 1), "out": str(arguments.out)}))
 
