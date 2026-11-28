@@ -169,6 +169,25 @@ def test_a_packed_row_ladder_starting_unaligned_is_refused(first, least):
         _packed_store(8, 64, 4, 16, transposed=False, first=first, least=least)()
 
 
+
+@INTERPRETS
+@pytest.mark.parametrize("chunk, first, refused", [(16, 0, False), (16, jnp.int32(0), True), (8, 0, True)],
+                         ids=["dense-64-byte-rows", "grouped-64-byte-rows", "dense-32-byte-rows"])
+def test_an_ordinary_row_ladder_starts_each_copy_at_an_aligned_shared_row(chunk, first, refused):
+    """An ordinary chunk's rows (fp32, `chunk` columns a row) copied in rungs down to one row: from a static
+    first row 0 each copy starts at a multiple of twice the smallest rung, so 64-byte rows start every copy
+    128 bytes aligned and store as any share does; a first row known only as it runs (a grouped tile's
+    group) and 32-byte rows from row 0 (a one-row rung at row 2, 64 bytes in) are refused as they trace, a
+    tensor copy's shared address being 128-byte aligned (row 14182: only packed chunks were held to it)."""
+    if refused:
+        with on_the_host(), pytest.raises(ValueError):
+            _packed_store(8, 64, 1, chunk, transposed=False, first=first, least=1)()
+        return
+    with on_the_host():
+        stored = np.asarray(_packed_store(8, 64, 1, chunk, transposed=False, first=first, least=1)())
+    expected = np.arange(64)[None, :] + 1000.0 * np.arange(8)[:, None]
+    np.testing.assert_array_equal(stored, expected)
+
 def test_a_packed_chunk_is_sought_within_the_tile_and_its_issuers_piece_alike():
     """A 96-column tile whose issuer emits 64 columns at once stages NVFP4 codes (two a byte) in chunks
     dividing both, 32 columns (16 bytes a row), not 64, which the tile's last 32 columns do not fill."""

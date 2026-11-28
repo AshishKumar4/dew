@@ -291,16 +291,26 @@ def _static(value, expected: int) -> bool:
 
 
 def _aligned_ladder(row_bytes: int, first, ladder: list) -> None:
-    """Refuse a chunk's row ladder (`store_rows`: copies of a power of two of rows from `first`, the smallest
-    `least`, `ladder`'s second) whose copies may start a shared row at no `copies.SHARED_ALIGNMENT` bytes, a
-    bulk tensor copy's shared address (the CUDA Programming Guide's asynchronous copies: "should be 128 byte
-    aligned"): a row of `row_bytes` that is no whole number of them starts aligned only at a static first row
-    0 and rungs of whole aligned rows (a dense call's 8-row least of a 16-byte NVFP4 scale row)."""
+    """Refuse a chunk's row ladder (`store_rows`: copies of a power of two of rows from `first`, the largest
+    `most`'s and the smallest `least`, `ladder`'s first two) whose copies may start a shared row at no
+    `copies.SHARED_ALIGNMENT` bytes, a bulk tensor copy's shared address (the CUDA Programming Guide's
+    asynchronous copies: "should be 128 byte aligned"). A rung of r rows starts at `first` plus the larger
+    rungs taken, each a multiple of 2r rows, so from a static first row 0 every copy starts at a multiple of
+    twice the ladder's smallest rung (at 0 where it has one rung): a dense tile's 64-byte rows in rungs down
+    to one row start aligned; a first row known only as it runs (a grouped tile's group) starts aligned only
+    where its rows are whole aligned units (row 14182: a grouped tile's 32-column bf16 chunk started its copy
+    64 bytes into a row)."""
+    most = ladder[0] if ladder else 1
     least = ladder[1] if len(ladder) > 1 else 1
-    aligned = least * row_bytes % copies.SHARED_ALIGNMENT == 0
-    if row_bytes % copies.SHARED_ALIGNMENT and not (_static(first, 0) and aligned):
-        raise ValueError(f"a chunk's {row_bytes}-byte rows copied from row {first} in rungs of {least} start "
-                         f"a tensor copy at no {copies.SHARED_ALIGNMENT}-byte shared address")
+    rungs, size = [], most
+    while size >= least:
+        rungs.append(1 << int(math.log2(size)))
+        size //= 2
+    step = 2 * rungs[-1] if len(rungs) > 1 else most
+    if row_bytes % copies.SHARED_ALIGNMENT and not (_static(first, 0)
+                                                    and step * row_bytes % copies.SHARED_ALIGNMENT == 0):
+        raise ValueError(f"a chunk's {row_bytes}-byte rows copied from row {first} in rungs of {least} to "
+                         f"{most} start a tensor copy at no {copies.SHARED_ALIGNMENT}-byte shared address")
 
 
 def transposed_rows(smem, value: jax.Array, o_gmem, row_start, column, *, write: Callable = written) -> None:
