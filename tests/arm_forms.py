@@ -461,10 +461,9 @@ class _Paired:
         return not self.pairing.with_ynn
 
     def __call__(self, *inputs, **options):
-        if self.pairing.with_ynn:
-            return self.plain(*inputs, **options)
-        compiled = self.ahead.get(_signature(inputs)) if self.ahead and not options else None
-        return (compiled or self.without)(*inputs, **options)
+        ahead = self.ahead and not options and not self.pairing.with_ynn
+        compiled = self.ahead.get(_signature(inputs)) if ahead else None
+        return (compiled or self.selected)(*inputs, **options)
 
     @property
     def selected(self) -> Callable:
