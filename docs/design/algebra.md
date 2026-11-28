@@ -1783,8 +1783,9 @@ about it is an estimate.
   its format's NaN code, and e2m1, which has none, as its largest finite code of the NaN's sign), proven
   exhaustively over every fp32 word against ml_dtypes' cast. Its form is found at
   development time by `tools/superoptimize_bits.py` (Z3 its dependency, not Dew's): the reference's jaxpr
-  traced into the vocabulary, then each window of up to three steps that only its last step leaves replaced
-  by a cheaper program of one or two, its operations, operands, immediates and tables unknowns, by
+  traced into the vocabulary (a shift by a value a logical one: an arithmetic one by a value is refused), then
+  each window of up to three steps that only its last step leaves and that reads at most three values from
+  outside it replaced by a cheaper program of one or two, its operations, operands, immediates and tables unknowns, by
   counterexample-guided synthesis, a replacement taken only where Z3 proves it equal on every value of the
   window's inputs. For the three encodes it finds the same program, 41 issues to 37 (`x != 0` as
   `min(x, 1)`, two adds as one IADD3, a select and a mask as one), its constants the minifloat's:

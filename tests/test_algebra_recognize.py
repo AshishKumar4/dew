@@ -60,6 +60,27 @@ def test_a_region_whose_call_makes_other_types_is_reported_refused():
     assert all(route.site.split(":")[0] != fusion.__name__ for route in refused)
 
 
+def test_a_bodys_recognition_is_its_families_own():
+    """A body's recognition (`recognize.recognized`) and each region's choice in it are held by the family
+    asked: a norm's body asked for the norms' families writes the norm, and asked again for a family of the
+    same anchor naming the same candidates, none of whose calls takes a kernel, writes none, where a
+    recognition held by the families' anchors, or a region's choice held by its structure and candidates
+    alone, returned the norm's to it."""
+    from dew.algebra import fusion, recognize
+
+    closed = jax.make_jaxpr(_norm_of)(jax.ShapeDtypeStruct((256, 256), jnp.bfloat16),
+                                      jax.ShapeDtypeStruct((256,), jnp.bfloat16))
+    index = fusion.Index(closed)
+    (norms, *others) = recognize.NORMS
+
+    def untaken(index, place):
+        return (candidate._replace(taken=lambda: False) for candidate in norms.candidates(index, place))
+
+    with generation.assumed("sm90"):
+        assert recognize.recognized(closed, index, recognize.NORMS)
+        assert recognize.recognized(closed, index, (recognize.Family(norms.anchor, untaken), *others)) == []
+
+
 def test_an_unwritten_regions_route_to_xla_is_reported_as_it_ran():
     """A region its compile point does not write (its call making other types than its own) reports every
     route its call took: one to a kernel of Dew's as refused (`fusion.UNWRITTEN`), and one its call took to
