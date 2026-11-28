@@ -1503,8 +1503,12 @@ def _fused_attention(query, key, value, bias, mask, causal, sliding_window, impl
             held = dict(zip(rest, given, strict=True))
             visible = with_key_starts(with_key_lengths(None, lengths, key.shape[-3]), held.get("starts"),
                                       key.shape[-3])
+            # Range-safe as the kernel forms its logits, its query prescaled before its products
+            # (`decode_attention`'s `prescaled`): a query and keys of 2^64 at width 64 have finite logits
+            # of 2^125 there, which raw products took to +inf and a value tangent to NaN (train 1473's
+            # review of 0d5ebab6a3).
             return reference_attention(query, key, value, mask=visible, sinks=held.get("sinks"),
-                                       softcap=softcap, scale_logits=True)
+                                       softcap=softcap, scale_logits=True, range_safe=True)
 
         # The kernel has no derivative, so both modes differentiate the attention it stands in for, the
         # sinks among its operands, at the kernel's arithmetic (IEEE products for fp32 operands, 16-bit

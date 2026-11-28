@@ -675,6 +675,29 @@ DECODE_DERIVATIVE_SEEDS = 8
 """The decode kernel's derivatives' declared check-1 seeds, sized by `seeds_for` paired on a GPU."""
 
 
+def a_decode_steps_value_tangent_is_finite_past_its_raw_products():
+    """A decode step through the decode kernel (`chosen(decode="decode")`) over a query and two keys of 2^64
+    in their first entry, width 64: the kernel's logits, its query prescaled before its products
+    (`decode_attention`'s `prescaled`), are 2^125 and finite, so the step's tangent along its values alone
+    is each row's mean of their tangents, its derivative's reference forming the logits as the kernel does
+    (`attention.range_safe`), where raw products took them to +inf and the tangent to NaN (train 1473's
+    review of 0d5ebab6a3)."""
+    width, keys = 64, 2
+    query = jnp.zeros((1, 1, 1, width), jnp.float32).at[..., 0].set(2.0 ** 64)
+    key = jnp.zeros((1, keys, 1, width), jnp.float32).at[..., 0].set(2.0 ** 64)
+    along = jnp.concatenate([jnp.ones((1, 1, 1, width), jnp.float32), jnp.full((1, 1, 1, width), 3.0)],
+                            axis=1)
+    lengths = jnp.asarray([keys], jnp.int32)
+
+    def step(value):
+        with chosen(decode="decode"):
+            return scaled_dot_product_attention(query, key, value, key_value_seq_lengths=lengths)
+
+    out, tangent = jax.jvp(step, (jnp.zeros((1, keys, 1, width), jnp.float32),), (along,))
+    assert np.isfinite(np.asarray(out)).all()
+    np.testing.assert_array_equal(np.asarray(tangent), np.full((1, 1, 1, width), 2.0, np.float32))
+
+
 def attention_the_decode_kernel_takes_differentiates_as_the_folded_attention():
     """A decode step's attention, its value the kernel's, differentiates as the folded attention it
     stands in for, in both modes: the value, query, key and value gradients, and the tangent, on par

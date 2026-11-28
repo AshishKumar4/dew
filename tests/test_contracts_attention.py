@@ -91,15 +91,13 @@ def test_a_fused_attention_kernel_holds_every_order(implementation, edge, taken)
     TPU), each differentiated at every order (`generation.linear_tangent`, row 2654): every order runs
     (forward mode, reverse mode, higher orders, remat, nested jit, scanned), finite wherever float64 is a
     normal float32 and the plain attention formula is, at queries, keys and values whose products near
-    float32's ends; the template's over an order set a case (`fused_kernel_cases`), its normal draws' check 1
-    over the fewest seeds (its mesh's program against the same order off it, one arithmetic placed twice)."""
+    float32's ends; the template's over an order set a case (`fused_kernel_cases`)."""
     def fused(query, key, value):
         return attention.scaled_dot_product_attention(query, key, value, implementation=implementation)
 
     assert_drawn_contract(fused, attention_inputs(2657, (1, 128, 2, 64)), EDGES[edge],
                           f"{implementation} attention {edge}", truth_fn=plain_attention,
-                          plain_fn=plain_attention, taking=None if taken is None else ORDER_SETS[taken],
-                          seeds=None if taken is None else FEWEST_SEEDS)
+                          plain_fn=plain_attention, taking=None if taken is None else ORDER_SETS[taken])
 
 
 def test_a_template_calls_value_tangent_is_finite_past_its_raw_products():
