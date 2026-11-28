@@ -35,6 +35,7 @@ from typing import ClassVar, Literal, NamedTuple, overload
 import jax
 import jax.numpy as jnp
 import numpy as np
+from jax._src import config as jax_config
 from jax.typing import DTypeLike
 from numpy.lib.array_utils import normalize_axis_tuple
 
@@ -1954,13 +1955,12 @@ def hook_program(name: str, hook, kinds: tuple[Kind, ...], dtypes: tuple[str, ..
     (`SITES`, `hooks.laid`), in its dtype in the kernels (`dtypes`); `differentiated`, a score hook's
     pullback too, so a hook whose derivative is its own rule (`jax.custom_vjp`) keys by that rule (a
     prologue's pullback runs past the kernels, `jax.vjp` of `prologued`). None or a traced key as it is. One
-    trace a kernel call (`tuning.one_call`) by these arguments, target, numerics and precision (K-F1)."""
+    trace a kernel call (`tuning.one_call`) by its arguments and the trace's context, its target's (K-F1)."""
     if hook is None or isinstance(hook, str):
         return hook
     call = tuning.call_scoped()
     place = ("hook_program", name, id(hook.source if isinstance(hook, tuning.Prepared) else hook), kinds,
-             tuple(map(str, dtypes)), differentiated, width, str(operand), generation.gpu_target(),
-             generation.numerics(), jax.config.jax_enable_x64, jax.config.jax_default_matmul_precision)
+             tuple(map(str, dtypes)), differentiated, width, str(operand), jax_config.trace_context())
     if call is not None and place in call:
         return call[place][1]
     tile = TRACED_TILE

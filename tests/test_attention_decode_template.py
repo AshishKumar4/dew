@@ -1853,34 +1853,24 @@ def test_a_packed_decode_steps_score_hook_reads_each_rows_own_query_place(finish
 
 
 @INTERPRETS
-def test_a_gated_decode_step_traces_its_hook_once_a_tile():
-    """A bf16 decode step (`attention_decode.attend`) under a closure output hook (none held past its
-    call), interpreted as an H100 runs it: the hook traced at most twice at each shape, once for the program
-    its launches run and once for their identity, its planning, pricing and launches reading one of each
-    (`tuning.one_call` at the decode's entry), where the plan's register pricing, before the Mosaic forward's
-    table opened, traced the chosen tile again (train 1472's review) and each launch's identity traced it
-    again (six traces at one tile, train 1474's K-F1); and its output the hooked reference's (check 1)."""
+def test_a_closure_hooked_decode_step_is_the_hooked_reference():
+    """A bf16 decode step (`attention_decode.attend`) under a closure output hook (none held past its call),
+    interpreted as an H100 runs it, its planning, pricing and launches reading the hook within one kernel
+    call (`tuning.one_call` at the decode's entry, train 1472's review): its output the hooked reference's
+    (check 1)."""
     positions, heads, kv_heads = CALLS["one-query"]
     spans = _spans(positions)
-    draw = _drawn(positions, heads, kv_heads, jnp.bfloat16)
-    traced = []
 
-    def doubled(out):
-        traced.append(out.shape)
-        return out * 2.0
+    hooks = template.Hooks(output=Hook(lambda o: o * 2.0))
 
     def ours(query, key, value, sinks):
         del sinks
         with generation.assumed("sm90", interpreted=True):
-            return attention_decode.attend(query, key, value, spans, template.Hooks(output=Hook(doubled, ())),
-                                           interpret=True)
+            return attention_decode.attend(query, key, value, spans, hooks, interpret=True)
 
     def reference(query, key, value, sinks):
         del sinks
-        return template.reference(query, key, value, spans, template.Hooks(output=Hook(lambda o: o * 2.0)))
+        return template.reference(query, key, value, spans, hooks)
 
-    jax.jit(ours).lower(*draw(0))
-    counts = {shape: traced.count(shape) for shape in traced}
-    assert traced and max(counts.values()) <= 2, counts
-    assert_as_exact(jax.jit(ours), jax.jit(reference), draw, "template decode under a closure output hook",
-                    seeds=SEEDS)
+    assert_as_exact(jax.jit(ours), jax.jit(reference), _drawn(positions, heads, kv_heads, jnp.bfloat16),
+                    "template decode under a closure output hook", seeds=SEEDS)

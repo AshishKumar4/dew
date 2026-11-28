@@ -275,24 +275,30 @@ class _Derived:
         return doubled(out)
 
 
-def test_a_hooks_key_in_one_call_is_each_targets_own():
-    """A hook that reads the GPU it is traced for (`generation.gpu_target`), keyed twice within one kernel
-    call (`tuning.one_call`), under an H100 and an A100: each target's key its own program's
-    (`attention.hook_program`), where a call's table held by the hook's arguments alone gave the A100 the
-    H100's (review of b949a0077a: a GH200's forward priced as the canonical H100)."""
+@pytest.mark.parametrize(("first", "second"), [(("sm90", False), ("sm80", False)),
+                                               (("sm90", True), ("sm90", False))],
+                         ids=["two targets", "interpreted and native"])
+def test_a_hooks_key_in_one_call_is_each_contexts_own(first, second):
+    """A hook that reads what it is traced for (the GPU, `generation.gpu_target`, and the platform its code is
+    chosen for, `generation.backend`), keyed twice within one kernel call (`tuning.one_call`) under two
+    assumptions, two GPUs or one GPU interpreted and native: each its own program's key
+    (`attention.hook_program`), where a call's table held by the hook's arguments alone gave the second the
+    first's (reviews of b949a0077a and a1e87e70dd: a GH200's forward priced as the canonical H100, natively,
+    beside its interpreted launch)."""
     def scaled(out):
-        return out * (2.0 if generation.gpu_target().generation == "sm90" else 3.0)
+        sm90 = generation.gpu_target().generation == "sm90"
+        return out * (2.0 if sm90 else 3.0) * (5.0 if generation.backend() == "gpu" else 7.0)
 
     @tuning.one_call
     def keyed():
         keys = []
-        for target in ("sm90", "sm80"):
-            with generation.assumed(target):
+        for target, interpreted in (first, second):
+            with generation.assumed(target, interpreted=interpreted):
                 keys.append(template.hook_program("output_mod", scaled, (), ()))
         return keys
 
-    hopper, ampere = keyed()
-    assert hopper != ampere
+    one, other = keyed()
+    assert one != other
 
 
 def test_an_epilogue_program_with_a_deferred_rule_is_never_held():
