@@ -343,7 +343,7 @@ def _identity(op, arguments: tokamax.BoundArguments, target: "generation.GpuTarg
     from dew.nn.kernels import tuning
 
     operands = tuple((name, described(name, value)) for name, value in sorted(arguments.arguments.items()))
-    return repr((hardware, tuning._identity(op, traced=False), operands))
+    return repr((hardware, tuning._identity(op), operands))
 
 
 def _digest(text: str) -> str:

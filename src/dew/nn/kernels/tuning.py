@@ -395,12 +395,12 @@ against them (`encoded`) and a stored object read by its tag (`decoded`)."""
 
 def _launch_json(ba: tokamax.BoundArguments) -> dict[str, JSON]:
     """A launch as JSON: its op as its picks name it (`_identity`) and its arguments, a hook among them
-    by its presence (`_traced`)."""
+    by what it computes (`KernelOp.identified`)."""
     op = ba.op
     hooks = op.HOOKS if isinstance(op, KernelOp) else ()
     return {"op": encoded(_identity(op)),
-            "arguments": {name: encoded(op.traced(name, value) if isinstance(op, KernelOp) and name in hooks
-                                        else value)
+            "arguments": {name: encoded(op.identified(name, value) if isinstance(op, KernelOp)
+                                        and name in hooks else value)
                           for name, value in ba.arguments.items()}}
 
 
@@ -961,7 +961,7 @@ class KernelOp(tokamax.Op):
     def _get_autotuning_cache_key(self, ba: tokamax.BoundArguments) -> Mapping[str, object]:
         key = super()._get_autotuning_cache_key(ba)
         return type(key)({name: bucketed(spec) if name in self.ROWS and spec is not None
-                          else self.traced(name, spec) if name in self.HOOKS else spec
+                          else self.identified(name, spec) if name in self.HOOKS else spec
                           for name, spec in key.items()})
 
     def padded(self, ba: tokamax.BoundArguments, config) -> float | None:
@@ -1339,17 +1339,16 @@ def _held_dtype(value) -> np.dtype:
     return jax.dtypes.canonicalize_dtype(np.asarray(value).dtype)
 
 
-def _identity(op: tokamax.Op, *, traced: bool = True) -> tokamax.Op:
-    """`op` as its picks name it: without the config and the vjp a call sets, its hook
-    fields by what they compute (`KernelOp.traced`, a tuning run's alone: `reading`, `seen`, `tune`, whose
-    picks persist under it across checkouts), or, not `traced`, as every launch's identity reads them
-    (`KernelOp.identified`, `report._identity`), tracing nothing; its `pulled` out of the repr that identity
-    reads, a launch's certification keying its reverse mode itself (`report.certified`)."""
+def _identity(op: tokamax.Op) -> tokamax.Op:
+    """`op` as its picks name it: without the config and the vjp a call sets, its hook fields by what they
+    compute, read once for each hook while it lives (`KernelOp.identified`: the same digest a tuning run's
+    picks persist under across checkouts and every launch's identity reads, `report._identity`, a model's
+    shared hooks traced once, row 14185); its `pulled` out of the repr that identity reads, a launch's
+    certification keying its reverse mode itself (`report.certified`)."""
     if not isinstance(op, KernelOp):
         return op.replace(config=None, vjp=None)
     fields = {field.name for field in dataclasses.fields(op)}
-    read = op.traced if traced else op.identified
-    hooks = {name: read(name, getattr(op, name)) for name in op.HOOKS if name in fields}
+    hooks = {name: op.identified(name, getattr(op, name)) for name in op.HOOKS if name in fields}
     return op.replace(config=None, vjp=None, **hooks)
 
 

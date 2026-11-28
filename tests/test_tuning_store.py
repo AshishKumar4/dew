@@ -605,6 +605,13 @@ def test_a_hook_is_traced_once_while_it_lives_under_one_configuration():
     whole = report._identity(hooked, hooked.bind(TILE, _Hooks(shared, (0,))), target)
     assert whole == report._identity(hooked, hooked.bind(TILE, _Hooks(shared, (0,))), target)
     assert whole != report._identity(hooked, hooked.bind(TILE, _Hooks(scaling(4.0), (0,))), target)
+    # A tuning run reads the same identities, traced no more: the op its picks name it by, its launch's
+    # pick key and stored entry, each hook argument among them (row 14185: each retraced every reached
+    # launch's hooks).
+    launch = hooked.keyed(hooked.bind(TILE, _Hooks(shared, (0,))))
+    with compiles.Compiles(None) as again:
+        read = (tuning._identity(hooked), launch.autotuning_cache_key, tuning._launch_json(launch))
+    assert _traced(again) == 0 and read[0] == tuning._identity(hooked)
 
     def drawing(tile):
         return tile + jax.random.bits(jax.random.key(0), tile.shape).astype(tile.dtype)
