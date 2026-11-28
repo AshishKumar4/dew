@@ -840,11 +840,12 @@ def test_a_softmaxs_tangent_of_a_replicated_direction_beside_split_probabilities
     axis, on par with the unsharded call's sum of both halves' from float64 (check 1: two programs, which
     XLA promises no common bits; train 1493's review), where its unsummed pullback reached JAX's replicated
     accumulator (train 1455's review)."""
-    from jax.sharding import NamedSharding, PartitionSpec
+    from jax.sharding import AxisType, NamedSharding, PartitionSpec
 
     from dew.nn import categorical
 
-    mesh = jax.make_mesh((2,), ("data",), devices=jax.devices()[:2])
+    # Auto, so the gate compiles each arm with no mesh context: the shard_map names its mesh.
+    mesh = jax.make_mesh((2,), ("data",), axis_types=(AxisType.Auto,), devices=jax.devices()[:2])
     rows, held = (NamedSharding(mesh, spec) for spec in (PartitionSpec("data"), PartitionSpec()))
 
     def summed(probability, weights, direction):
