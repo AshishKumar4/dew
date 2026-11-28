@@ -54,19 +54,23 @@ def _blocked(step, start, count):
 
 @pytest.mark.parametrize('variant', [
     'peeled', 'unpeeled', 'derivative_scan', 'two_steps', 'barrier', 'no_cpu_fusion', 'no_fusion', 'ynn',
+    'ordered', 'sentinel', 'no_while_simplifier',
 ])
 def test_check_arm_repeats(monkeypatch, variant):
     tiling = {'unpeeled': _scan, 'derivative_scan': _derivative_scan, 'two_steps': _two_steps,
               'barrier': _blocked}
     if variant in tiling:
         monkeypatch.setattr(attention_parallax, '_tiled', tiling[variant])
+    if variant == 'sentinel':
+        monkeypatch.setattr(attention_parallax, '_NONE', -1537)
     failures = []
     for make in (_covariance, _far):
         operands, spans = make()
         ops = (*operands, jnp.ones((1, 1, 1, 1), jnp.float32))
         run = jax.jit(tp._every_cotangent(attention_parallax.attend, spans))
         vanilla = jax.jit(tp._every_cotangent(tp._plain, spans))
-        disabled = {'no_cpu_fusion': 'cpu-instruction-fusion', 'no_fusion': 'fusion,cpu-instruction-fusion'}
+        disabled = {'no_cpu_fusion': 'cpu-instruction-fusion', 'no_fusion': 'fusion,cpu-instruction-fusion',
+                    'no_while_simplifier': 'while-loop-simplifier'}
         if variant in disabled:
             run = without_ynn(run, compiler_options={'xla_disable_hlo_passes': disabled[variant]})
         if variant == 'ynn':
@@ -80,7 +84,11 @@ def test_check_arm_repeats(monkeypatch, variant):
             previous = np.asarray(dew(*ops)[4]).ravel().view(np.uint32).copy()
             for attempt in range(160):
                 one = dew(*ops)
-                ref(*ops)
+                if variant == 'ordered':
+                    jax.block_until_ready(one)
+                other = ref(*ops)
+                if variant == 'ordered':
+                    jax.block_until_ready(other)
                 two = dew(*ops)
                 for result in (one, two):
                     actual = np.asarray(result[4]).ravel().view(np.uint32)
