@@ -30,6 +30,8 @@ from jax._src import (
     xla_metadata as jax_xla_metadata,
 )
 from jax._src.interpreters import partial_eval
+from jax._src.lax import lax as jax_lax_internal
+from jax._src.lax.control_flow import conditionals as jax_conditionals
 from jax._src.literals import TypedNdArray
 from jax._src.pallas.mpmd import mpmd_map_p
 from jax.core import ShapedArray, Tracer
@@ -488,6 +490,8 @@ def inlined(body: jcore.Jaxpr, operands: Sequence[jcore.Var | jcore.Literal],
 _LAX = jax.lax
 _EXTENDED = jax_primitives
 _XLA_METADATA = jax_xla_metadata
+_LAX_INTERNAL = jax_lax_internal
+_CONDITIONALS = jax_conditionals
 
 _KINDS: dict[str, tuple[tuple[ModuleType, tuple[str, ...]], ...]] = {
     # A call JAX lowers to its program in the caller (`called`): a `jit`'s, an evaluated jaxpr's, a
@@ -532,8 +536,10 @@ _KINDS: dict[str, tuple[tuple[ModuleType, tuple[str, ...]], ...]] = {
     "scatter": ((_LAX, ("scatter_add_p", "scatter_max_p", "scatter_min_p", "scatter_mul_p", "scatter_p",
                         "scatter_sub_p")),),
     # A value made from no operand: a counting sequence, a device's place along a mesh axis, an ordering
-    # token.
-    "generated": ((_LAX, ("axis_index_p", "create_token_p", "iota_p")),),
+    # token, an unwritten buffer, the index of the platform a program is lowered for (`platform_dependent`'s
+    # choice), the last two defined in JAX's private modules alone.
+    "generated": ((_LAX, ("axis_index_p", "create_token_p", "iota_p")), (_LAX_INTERNAL, ("empty_p",)),
+                  (_CONDITIONALS, ("platform_index_p",))),
 }
 """Each kind of operation the analyses of a program read, by the JAX primitives of it, named where JAX's
 public modules export them (`jax.lax`, `jax.extend.core.primitives`), or where JAX defines one it exports
@@ -730,7 +736,8 @@ def scatter(primitive: jcore.Primitive) -> bool:
 
 def generated(primitive: jcore.Primitive) -> bool:
     """Whether `primitive` makes its value from no operand and nothing outside the program (an `iota`, a
-    device's `axis_index`, an ordering token; `_KINDS`): a host callback reading no operand is none."""
+    device's `axis_index`, an ordering token, an unwritten buffer, a lowering's platform index; `_KINDS`): a
+    host callback reading no operand is none."""
     return _is("generated", primitive)
 
 
