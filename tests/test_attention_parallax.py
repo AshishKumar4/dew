@@ -1046,6 +1046,42 @@ def test_exp_scaleds_derivative_meets_its_powers_before_it_rounds():
     assert float(mixed) == 1.0
 
 
+def test_a_long_rows_second_cotangent_holds_every_tile_of_its_keys():
+    """Parallax's derivative over 8192 keys, one fp32 query, head and channel: queries and keys zero, a
+    second query of 1 against second keys and values alternating `+1` and `-1` under a cotangent of 1, the
+    second query's exact cotangent -1: each of its 64 key tiles lands at the whole walk's headroom
+    (`_landing` over every key), where a tile's own 128 keys landed each at `-2^122` and their sum overflowed
+    to `-inf` (train 1500's review)."""
+    keys = 8192
+    signs = jnp.where(jnp.arange(keys) % 2 == 0, 1.0, -1.0).reshape(1, keys, 1, 1)
+    zero = jnp.zeros((1, 1, 1, 1), jnp.float32)
+    operands = (zero, jnp.ones((1, 1, 1, 1), jnp.float32), jnp.zeros((1, keys, 1, 1), jnp.float32), signs,
+                signs)
+    spans = template.spans(1, keys, 1)
+    _, pull = jax.vjp(lambda *x: attention_parallax.attend(*x, spans, scale=1.0), *operands)
+    second = pull(jnp.ones((1, 1, 1, 1), jnp.float32))[1]
+    assert float(second[0, 0, 0, 0]) == -1.0
+
+
+def test_a_second_products_direction_is_taken_back_by_its_rows_power():
+    """Parallax's forward-mode tangent along its second query (`reference`'s, the derivative's higher
+    orders), one query over second keys `[2^124, -2^124]` of a second query 1 and values `[1, -1]`, whose
+    rows' power `2^-1` holds the products: along a unit direction it is the plain formula's `-2^124`, where
+    the direction's contraction read `-2^123`, its power not taken back (train 1500's review)."""
+    second_key = jnp.asarray([2.0 ** 124, -(2.0 ** 124)], jnp.float32).reshape(1, 2, 1, 1)
+    value = jnp.asarray([1.0, -1.0], jnp.float32).reshape(1, 2, 1, 1)
+    spans = template.spans(1, 2, 1)
+
+    def along(second):
+        return attention_parallax.attend(jnp.zeros((1, 1, 1, 1), jnp.float32), second,
+                                         jnp.zeros((1, 2, 1, 1), jnp.float32), second_key, value, spans,
+                                         scale=1.0)
+
+    one = jnp.ones((1, 1, 1, 1), jnp.float32)
+    tangent = jax.jvp(along, (one,), (one,))[1]
+    assert float(tangent[0, 0, 0, 0]) == -(2.0 ** 124)
+
+
 def test_a_float64_keys_query_takes_its_power_of_two_wide():
     """Parallax with x64 on over an fp32 query of `2^-126` and float64 keys `0` and `2^150` at a scale of
     `2^-24`: the query widened before its power of two, so the second key's logit is 1 and the output over
