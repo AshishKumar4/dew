@@ -230,7 +230,7 @@ def _banded_spans(spans: KeySpans, combine: Banded, places: jax.Array | None) ->
     hi = jnp.maximum(hi, lo)
     products = len(bands) + 1
     key_ids = None if spans.key_ids is None else jnp.concatenate([spans.key_ids] * products, axis=1)
-    return KeySpans(lo, hi, spans.query_ids, key_ids, products * count, "spans")
+    return KeySpans(lo, hi, spans.query_ids, key_ids, products * count, "spans", excluded=spans.excluded)
 
 
 def _copied_hooks(hooks: Hooks, products: int, count: int, *, wide: jnp.dtype | None = None) -> Hooks:

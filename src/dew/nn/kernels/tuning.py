@@ -1017,19 +1017,15 @@ class KernelOp(tokamax.Op):
         """`traced`, once a kernel call's making (`one_call`) for each value, this op's layouts and the
         trace's configuration, the value kept beside its key while the call lasts; each time outside one (a
         decode step's planning and launch read one trace of a closure hook, train 1472's review)."""
-        table = call_scoped()
-        if table is None:
-            return self.traced(name, value)
-        place = ("identified", type(self), name, id(value), jax_config.trace_context(),
-                 tuple((field.name, getattr(self, field.name)) for field in dataclasses.fields(self)
-                       if field.name not in (*self.HOOKS, "config", "vjp")))
+        key = ("identified", type(self), name,
+               tuple((field.name, getattr(self, field.name)) for field in dataclasses.fields(self)
+                     if field.name not in (*self.HOOKS, "config", "vjp")))
         try:
-            hash(place)
+            hash(key)
         except TypeError:
+            # An op whose fields hold a value no hash takes (a list its dataclass keeps) traces each time.
             return self.traced(name, value)
-        if place not in table:
-            table[place] = (value, self.traced(name, value))
-        return table[place][1]
+        return once_a_call(value, key, lambda: self.traced(name, value))
 
     def lowering(self, ba: tokamax.BoundArguments, config) -> tuple[Callable, tuple]:
         """The launch of `ba` at `config` as a resource derivation lowers it (never run), or with `config`
@@ -1838,6 +1834,24 @@ def one_call[**P, R](function: Callable[P, R]) -> Callable[P, R]:
 def call_scoped() -> dict | None:
     """The table of the kernel call being made (`one_call`), None outside one."""
     return _CALL_SCOPED.get()
+
+
+def once_a_call[R](held, key: tuple, build: Callable[[], R]) -> R:
+    """`build()` once a kernel call's making (`one_call`) for the object `held` (a hook, or a prepared
+    hook's source), its `key` and the trace's context (`jax_config.trace_context()`: the assumption and the
+    numerics a kernel is chosen in, as `_TRACED`'s identities are keyed), `held` kept beside its result while
+    the call lasts so its identity names no other object; outside a call `build()` each time. `key`, hashable,
+    holds everything `build` reads besides `held` and the context (the site, the operands' kinds, dtypes and
+    tile): a key missing one replays a build made for another (K-F5: an output hook's program keyed without
+    the context replayed one assumption's trace under another)."""
+    call = call_scoped()
+    if call is None:
+        return build()
+    place = (id(held), key, jax_config.trace_context())
+    found = call.get(place)
+    if found is None:
+        found = call[place] = (held, build())
+    return found[1]
 
 
 class Seen(list[Observed]):

@@ -11,10 +11,13 @@ tests/attention_oracle.py, which defines such a row as zero: on par (check 1)
 with the reference attention at the drawn dtype, fp32 and the GPU kernels'
 bf16, every entry sized by its float64 terms (`attention_on_par`). A row
 whose own key is cut but whose block runs on reads its block's later keys
-(`block_groups`).
+(`block_groups`). A row that sees keys but weighs none of them (each logit -inf, a bias's or a fill's) of a
+call that hides no key reads NaN, its derivative NaN, as jax.nn's softmax reads it, on the reference path
+and on every template mainloop alike; a masked call's reads zero (row 14116).
 """
 
 import contextlib
+import dataclasses
 
 import jax
 import jax.numpy as jnp
@@ -26,6 +29,14 @@ from attention_oracle import attention_on_par, exact_value_and_grads, kept, pack
 from reference_error import FEWEST_SEEDS
 
 from dew.nn.attention import scaled_dot_product_attention
+from dew.nn.kernels import generation
+from dew.nn.kernels.templates import (
+    attention as template,
+    attention_mosaic,
+    attention_portable,
+    attention_triton,
+)
+from dew.nn.kernels.templates.hooks import Hook, Side
 from dew.nn.precision import FP32_SUMS
 
 
@@ -180,3 +191,113 @@ def test_a_row_its_counted_places_bring_in_reach_reads_its_key():
     out = scaled_dot_product_attention(query, key, value, sliding_window=1,
                                        places=(jnp.asarray([[0, 0]]), jnp.asarray([[0]])))
     np.testing.assert_array_equal(np.asarray(out), 10.0)
+
+
+MASSLESS = (1, 40, 4, 2, 64, 64)
+"""A call's rows, queries, query heads, key heads, width and keys: two query heads a key head, the queries
+past none of the mainloops' tiles, so each pads them."""
+
+
+def _massless_operands():
+    """Zero queries and keys, values of one, and a bias of query head 1's row 3 at -inf on every key (a row
+    of no mass) and query head 2's row 5 on every other key: every weight a power of two, so each mainloop's
+    sums are exact, its outputs 1 or NaN, its gradients 0, multiples of 1/64 or NaN."""
+    batch, queries, heads, kv_heads, width, keys = MASSLESS
+    bias = np.zeros((batch, heads, queries, keys), np.float32)
+    bias[0, 1, 3] = -np.inf
+    bias[0, 2, 5, ::2] = -np.inf
+    return (jnp.zeros((batch, queries, heads, width), jnp.bfloat16),
+            jnp.zeros((batch, keys, kv_heads, width), jnp.bfloat16),
+            jnp.ones((batch, keys, kv_heads, width), jnp.bfloat16), jnp.asarray(bias))
+
+
+HALF = jnp.asarray([MASSLESS[-1] // 2], jnp.int32)
+"""A masked call's key lengths: each row's first half of the keys, a power of two of them."""
+
+FORMS = ("unmasked", "masked")
+"""A call of no mask, which reads a row of no mass NaN; one over `HALF` of its keys, which excludes it
+(`KeySpans.excluded`)."""
+
+
+def _reference_massless(form: str):
+    """The reference path's output and gradients (query, key, value, bias) of `_massless_operands` under a
+    cotangent of ones in `form` (`FORMS`): jax.nn's softmax op for op unmasked."""
+    def attend(query, key, value, bias):
+        return scaled_dot_product_attention(query, key, value, bias=bias,
+                                            key_value_seq_lengths=None if form == "unmasked" else HALF,
+                                            implementation="reference")
+
+    out, pull = jax.vjp(attend, *_massless_operands())
+    return out, *pull(jnp.ones_like(out))
+
+
+def _template_massless(mainloop: str, form: str):
+    """`mainloop`'s output and gradients of `_massless_operands` in `form`, the bias a tile parameter of its
+    score hook, its spans excluded as the dispatch's of the form are (`KeySpans.excluded`): the plain-JAX
+    mainloop's, or the Pallas-Triton one's or Mosaic's interpreted as the named GPU runs it."""
+    query, key, value, bias = _massless_operands()
+    batch, queries, _, _, _, keys = MASSLESS
+    spans = (dataclasses.replace(template.spans(queries, keys, batch), excluded=False) if form == "unmasked"
+             else template.spans(queries, keys, batch, lengths=HALF))
+    hooks = template.Hooks(score=Hook(template.Biased(), (Side(bias, template.Kind.TILE),)))
+    dout = jnp.ones(query.shape, query.dtype)
+    if mainloop == "portable":
+        tiles = attention_portable.Tiles(32, 32, 32)
+        out = attention_portable.xla_mainloop(tiles, query, key, value, spans, hooks)
+        grads = attention_portable.backward(tiles, query, key, value, spans, hooks, dout)
+    elif mainloop == "triton":
+        with generation.assumed("sm90", interpreted=True):
+            out = attention_triton.forward(query, key, value, spans, hooks, interpret=True)
+            grads = attention_triton.backward(query, key, value, spans, hooks, dout, interpret=True)
+    else:
+        with generation.assumed(mainloop.split()[1], interpreted=True):
+            out, *residuals = attention_mosaic.forward(query, key, value, spans, hooks,
+                                                       residuals=template.Kept.SPLIT, interpret=True)
+            grads = attention_mosaic.backward(query, key, value, spans, hooks, dout, residuals=residuals,
+                                              interpret=True)
+    return out, grads.query, grads.key, grads.value, grads.score_params[0]
+
+
+MAINLOOPS = ("portable", "triton", "mosaic sm90", "mosaic sm80")
+
+
+@pytest.mark.parametrize("form", FORMS)
+@pytest.mark.parametrize("mainloop", MAINLOOPS)
+def test_a_row_of_no_mass_reads_as_the_reference_path_on_every_mainloop(mainloop, form):
+    """A row whose bias is -inf at every key it sees, beside a padded call's rows and a row half of whose
+    keys a bias hides, on each template mainloop, as the reference path reads it: a row of no mass of a call
+    of no mask (its spans not excluded, as the dispatch's are) reads NaN, its query's gradient NaN and its key
+    head's every key and value gradient NaN, as jax.nn's softmax gives them; a masked call's (key lengths)
+    reads zero, every gradient finite. Every other entry is the reference path's bit for bit. The template
+    read zero for the unmasked call's row, so a written biased attention recognized onto it changed what the
+    program computed (row 14116)."""
+    found = _template_massless(mainloop, form)
+    expected = _reference_massless(form)
+    row = np.asarray(expected[0], np.float32)[0, 3, 1]
+    assert (row == 0).all() if form == "masked" else np.isnan(row).all()
+    for name, mine, theirs in zip(("output", "query", "key", "value", "bias"), found, expected, strict=True):
+        np.testing.assert_array_equal(np.asarray(mine, np.float32), np.asarray(theirs, np.float32),
+                                      err_msg=f"{mainloop} {name}")
+
+
+@pytest.mark.parametrize("masked", [False, True], ids=["unmasked", "masked"])
+def test_a_template_call_reads_a_row_of_no_mass_as_the_reference_path(masked):
+    """`_massless_operands` through the dispatch on the template (`implementation='template'`), unmasked and
+    over `HALF` of its keys: its output and its query's, key's, value's and bias's gradients the reference
+    path's bit for bit, the row of no mass NaN unmasked and zero masked, as the dispatch states its spans'
+    exclusion (`KeySpans.excluded`, row 14116)."""
+    def attended(implementation):
+        def attend(query, key, value, bias):
+            return scaled_dot_product_attention(query, key, value, bias=bias,
+                                                key_value_seq_lengths=HALF if masked else None,
+                                                implementation=implementation)
+
+        out, pull = jax.vjp(attend, *_massless_operands())
+        return out, *pull(jnp.ones_like(out))
+
+    found, expected = attended("template"), attended("reference")
+    row = np.asarray(found[0], np.float32)[0, 3, 1]
+    assert (row == 0).all() if masked else np.isnan(row).all()
+    for name, mine, theirs in zip(("output", "query", "key", "value", "bias"), found, expected, strict=True):
+        np.testing.assert_array_equal(np.asarray(mine, np.float32), np.asarray(theirs, np.float32),
+                                      err_msg=name)

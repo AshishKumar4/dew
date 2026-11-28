@@ -52,10 +52,10 @@ from dew.nn.kernels.templates.attention import (
     drops_in_place,
     kept,
     kept_value,
-    narrowing_settled,
     saturated,
     within,
 )
+from dew.nn.kernels.templates.narrowing import narrowing_settled
 from dew.nn.precision import (
     correctly_rounded_divide,
     float32_einsum,
@@ -138,6 +138,8 @@ class Forward:
     registered: bool = False
     """Whether its output is finished in a kernel's registers, a tile at once (a Mosaic forward's), where
     its narrowing settles the overflow midpoint alone (`midpoint_settled`)."""
+    excluded: bool = True
+    """Whether a row of no mass reads zero, its spans' exclusion (`KeySpans.excluded`, `massless_nan`)."""
 
     @property
     def reach(self) -> float:
@@ -198,6 +200,15 @@ class Forward:
         would rerun, `walked_launches`)."""
         return (self.keys == 0 or self.form == "spans" or self.score_mod is not None
                 or self.queries is not None)
+
+    @property
+    def massless_nan(self) -> bool:
+        """Whether a row of no mass (its every logit -inf) reads NaN, as jax.nn's softmax reads it: a call its
+        spans do not exclude (`KeySpans.excluded`: the dispatch's call that hides no key,
+        `reference_attention`'s rows it excludes none of; row 14116), of keys and from no state. An excluded
+        call's such row reads zero (`guarded`), a template call's by default, and so does one from a state
+        (a sink's), which `attention_kernels.keeps_reference_rows` keeps apart (`nan_massless`)."""
+        return not self.excluded and self.keys > 0 and not self.initial
 
     def power(self, x: jax.Array) -> jax.Array:
         """The exponential the logits are in, a key's weight and the factor a softmax state takes from one
@@ -509,6 +520,18 @@ def no_keys(total: jax.Array) -> jax.Array:
     subnormal totals on flushing lanes while non-flushing GPU kernels avoid `stop_gradient`, row 10849)."""
     return bodies.subnormals(lambda *, flushing: ~means.holding(total) if flushing else total == 0,
                              total.dtype)
+
+
+def nan_massless(spec: Forward, state: Partial) -> Partial:
+    """A whole walk's `state` as its finish takes it: where the call reads a row of no mass NaN
+    (`Forward.massless_nan`), each such row's total NaN, so its output, its residual denominator and every
+    weight its backward recomputes over that denominator are NaN as jax.nn's are (`inverse`, `output_of`,
+    `attention_gradient.dq_finish`); a padding row's sliced off with the call's. Its walk's rewalk test reads
+    the walk's state before it (`reached`). A split walk's slices are no whole walk: their merge finishes the
+    row."""
+    if not spec.massless_nan:
+        return state
+    return state._replace(total=jnp.where(no_keys(state.total), jnp.nan, state.total))
 
 
 def empty(rows: int, width: int, *, scaled: bool = False) -> Partial:
@@ -1712,44 +1735,6 @@ def tiles_walked[C](lo, hi, step: Callable[[jax.Array, C], C], carry: C, most: i
                               (jnp.int32(0), carry))[1]
 
 
-def plain_walk(spec: Forward, lo, hi, keys_at: Callable[[jax.Array], Keys], start: Partial, *,
-               most: int | None = None) -> Partial:
-    """A program's walk of its key tiles `lo` to `hi` (`keys_at(index)`, of at most `most`, `tiles_walked`)
-    from `start`, its sums compensated where its form takes them so (`compensated`, `settled`)."""
-    return settled(tiles_walked(lo, hi, lambda index, state: plain_step(spec, state, keys_at(index)),
-                                compensated(spec, start), most))
-
-
-def training_walk(spec: Forward, lo, hi, keys_at: Callable[[jax.Array], Keys],
-                  rows: Callable[[jax.Array], jax.Array], start: Partial, dropping: bool = False, *,
-                  most: int | None = None) -> Carry:
-    """A training forward's walk (`plain_walk`), its carry also holding the anchor key and the split
-    sums, from none (`training_step`)."""
-    nothing = jnp.zeros(start.total.shape, jnp.float32)
-    state, arg, own, others_total = tiles_walked(
-        lo, hi, lambda index, carry: training_step(spec, carry, keys_at(index), rows)[0],
-        (compensated(spec, start), no_argmax(start.total.shape[0], dropping), nothing, nothing), most)
-    return settled(state), arg, own, others_total
-
-
-def anchored_walk(spec: Forward, lo, hi, keys_at: Callable[[jax.Array], Keys], start: Partial, *,
-                  most: int | None = None) -> Carry:
-    """A training forward's walk (`training_walk`'s carry) at each row's maximum and anchor found before it:
-    a walk of `argmax` over the logits alone, then `anchored_step`s from `anchored`'s carry, as the Mosaic
-    training launch walks a peak walk's anchors; a quantized call's (`Forward.rounds`), whose weights round
-    at that maximum."""
-
-    def peaked(index, arg):
-        keys = keys_at(index)
-        return argmax(arg, keys.logits, keys.coords.k_pos)
-
-    arg = tiles_walked(lo, hi, peaked, no_argmax(start.total.shape[0]), most)
-    state, arg, own, others_total = tiles_walked(
-        lo, hi, lambda index, carry: anchored_step(spec, carry, keys_at(index)), anchored(spec, start, arg),
-        most)
-    return settled(state), arg, own, others_total
-
-
 def joined(carry: Carry, rows: Callable[[jax.Array], jax.Array], power: float = 1.0) -> Partial:
     """A training walk's state with its split sums joined, the anchor's term added back (`split_output`, kept
     at `power`, `kept`), the weighted values the output normalizes, at its rows' scale on the scaled walk."""
@@ -1871,13 +1856,14 @@ def merged(spec: Forward, stacked: Partial, axis: int) -> Partial:
 def output_of(acc: jax.Array, denominator: jax.Array, *, guarded: bool, held: DTypeLike | None = None
               ) -> jax.Array:
     """The weighted values `acc` over their denominator, any leading axes: zero for a query that saw nothing
-    where it may (`guarded`: a walk's whose row may see none, or one from a state); a subnormal ratio kept
-    where the arithmetic flushes one, and one past the dtype `held`'s largest held there (`quotient`)."""
+    where it may (`guarded`: a walk's whose row may see none, or one from a state), NaN where its denominator
+    is (`nan_massless`); a subnormal ratio kept where the arithmetic flushes one, and one past the dtype
+    `held`'s largest held there (`quotient`)."""
     if not guarded:
         return quotient(lambda sums: sums / expand(denominator, sums), acc, denominator, held=held)
     safe = jnp.where(denominator > 0, denominator, 1.0)
     out = quotient(lambda sums: sums / expand(safe, sums), acc, safe, held=held)
-    return jnp.where(expand(denominator > 0, acc), out, 0.0)
+    return jnp.where(expand(denominator > 0, acc), out, expand(_unheld(denominator), acc))
 
 
 def quotient(ratio: Callable[[jax.Array], jax.Array], acc: jax.Array, total: jax.Array, *,
@@ -2006,10 +1992,16 @@ def settled_store(spec: Forward, out: jax.Array, acc: jax.Array, divisor: jax.Ar
 
 def inverse(total: jax.Array) -> jax.Array:
     """Each query's `1 / total`, zero where it saw nothing (`means.holding` on flushing lanes, `total > 0`
-    in non-flushing GPU kernels where `stop_gradient` does not lower, row 10849)."""
+    in non-flushing GPU kernels where `stop_gradient` does not lower, row 10849), NaN where its total is
+    (a row of no mass its spans do not exclude, `nan_massless`)."""
     held = bodies.subnormals(lambda *, flushing: means.holding(total) if flushing else total > 0,
                              total.dtype)
-    return jnp.where(held, 1.0 / jnp.where(held, total, 1.0), 0.0)
+    return jnp.where(held, 1.0 / jnp.where(held, total, 1.0), _unheld(total))
+
+
+def _unheld(total: jax.Array) -> jax.Array:
+    """What a quotient over a `total` of no mass reads: zero, NaN where the total is NaN (`nan_massless`)."""
+    return jnp.where(total != total, total, 0.0)
 
 
 def hooked(score_mod: Callable, logits: jax.Array, q_pos, k_pos, params) -> jax.Array:

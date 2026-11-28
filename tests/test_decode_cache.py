@@ -8,10 +8,12 @@ from flax import linen as nn
 from model_support import TINY_DECODER, attending, rows_prefill_pause_and_resume
 
 from dew.batch import coordinates
+from dew.nn import programs
 from dew.nn.attention import scaled_dot_product_attention
 from dew.nn.attention_masks import causal_attention_mask
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.inputs import AttentionMetadata, MixerCall
+from dew.nn.kernels import generation
 from dew.nn.kv_cache import KVCache, KVSpec, cached_validity, open_kv_cache
 from dew.nn.linear import GatedDeltaNet
 from dew.nn.mla import MultiHeadLatentAttention
@@ -122,3 +124,43 @@ def test_a_packed_prompts_continuation_reads_its_last_document_alone(kind):
     other = continued(jax.random.randint(jax.random.key(3), (1, 4), 0, PACKED_VOCAB))
     for ours, theirs in zip(first, other, strict=True):
         assert ours.tobytes() == theirs.tobytes()
+
+
+def _kernels_branched(jaxpr) -> tuple[int, int]:
+    """How many native Pallas kernels (`programs.NATIVE_KERNELS`) `jaxpr` stages, at any depth outside the
+    kernels' own bodies (`programs.bodies`), and how many of those sit in the branches of a `cond` the
+    program takes as it runs: one whose index no `platform_index` gives (a lowering's choice of platform)."""
+    produced = {var: equation for equation in jaxpr.eqns for var in equation.outvars}
+    staged = branched = 0
+    for equation in jaxpr.eqns:
+        staged += equation.primitive in programs.NATIVE_KERNELS
+        index = (produced.get(equation.invars[0])
+                 if equation.invars and programs.computed(equation.invars[0]) else None)
+        platform = index is not None and index.primitive.name == "platform_index"
+        runs = equation.primitive.name == "cond" and not platform
+        for body in programs.bodies(equation):
+            found, within = _kernels_branched(body)
+            staged += found
+            branched += found if runs else within
+    return staged, branched
+
+
+@pytest.mark.parametrize("layout", [KVCache(), KVCache(page_size=16)], ids=["compact", "paged"])
+def test_a_decode_step_whose_kernel_takes_its_start_stages_it_unbranched(layout):
+    """A bf16 decode step of 16-wide heads over a cache that keeps its keys' documents, so each row reads
+    from its own document's first key (`_decode_masks`), on an H100 through the template's decode, which
+    takes a start (an unstarted step's preference, cuDNN over a compact cache, refuses one, so its branch
+    stays there): the step stages that kernel on no branch of whether a start narrows, where the branch
+    staged it twice a layer and the host waited on its predicate each layer of each step (57% of a
+    GH200's decode samples, row 6107)."""
+    model = CausalTransformer(vocab_size=37, **{**TINY_DECODER, "emb_features": 64, "max_seq_len": 64},
+                              dtype=jnp.bfloat16, kv_cache=layout)
+    ids = jnp.zeros((2, 6), jnp.int32)
+    params = model.init(jax.random.key(0), ids)
+    cache = model.init(jax.random.key(0), ids[:, :1], decode=True)["cache"]
+    _, state = model.apply({**params, "cache": cache}, ids, decode=True, mutable=["cache"])
+    with generation.assumed("sm90"), generation.chosen(decode="decode"):
+        step = jax.make_jaxpr(lambda params, state, token: model.apply(
+            {**params, **state}, token, decode=True, mutable=["cache"]))(params, state, ids[:, :1])
+    staged, branched = _kernels_branched(step.jaxpr)
+    assert staged and not branched, (staged, branched)

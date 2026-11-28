@@ -356,6 +356,8 @@ class TritonForward(AttentionLaunch, Template[Tiles]):
     largest: DTypeLike | None = None
     """The dtype whose largest its output is within, held there (`algebra.largest_of`, derived where the
     call's hooks are known, `_forward_call`); None where its output may pass it."""
+    excluded: bool = True
+    """Whether its spans exclude a row of no mass, which then reads zero, else NaN (`KeySpans.excluded`)."""
 
     def launched_ops(self, dtype) -> tuple["TritonForward", ...]:
         """The ops a call of values `dtype` launches (`_fwd`): this op, and where it walks unscaled and the
@@ -451,7 +453,8 @@ class TritonForward(AttentionLaunch, Template[Tiles]):
         spec = algebra.Forward(self.form, keys if self.keys is None else self.keys, ids, scale,
                                self.score_mod, self.natural, headroom, initial,
                                compensated=algebra.compensates(value.dtype), prescale=power,
-                               largest=self.largest, narrowed=algebra.narrowed_of(query.dtype))
+                               largest=self.largest, narrowed=algebra.narrowed_of(query.dtype),
+                               excluded=self.excluded)
         kernel = functools.partial(
             _forward_kernel, score_kinds=self.score_kinds, output_kinds=self.output_kinds, initial=initial,
             residuals=residuals, output_mod=self.output_mod, block_k=block_k, interpret=interpret)
@@ -764,7 +767,7 @@ def _forward_call(query: jax.Array, key: jax.Array, value: jax.Array, spans: Key
                        output_width=call.value.shape[-1],
                        scale=query.shape[3] ** -0.5 if scale is None else scale, form=spans.form,
                        keys=spans.keys, natural=natural,
-                       largest=algebra.largest_of(value.dtype, hooks))
+                       largest=algebra.largest_of(value.dtype, hooks), excluded=spans.excluded)
     return op, (call.query, call.key, call.value, call.start, call.end, call.query_ids, call.key_ids,
                 call.score_params, call.output_params, m0, total0, acc0), call.queries
 
@@ -1403,8 +1406,9 @@ def backward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans
     initial = hooks is not None and hooks.initial is not None
     # Values whose sums the forward may scale (`algebra.headroom`, `algebra.SCALED_WALK`) take D from the
     # split sums at their rows' scale (`attention_gradient.split_delta`), the pass their tiles are derived
-    # for, in either form.
-    split = split or algebra.headroom(value.dtype)
+    # for, in either form; so does a call whose row of no mass reads NaN (`KeySpans.excluded`), whose
+    # forward denominator carries it (a first pass recomputes it 0).
+    split = split or algebra.headroom(value.dtype) or not spans.excluded
     launch = functools.partial(_launch, split=split, natural=natural, accurate=accurate, initial=initial,
                                interpret=interpret)
     return gradients(launch, query, key, value, spans, hooks, dout, residuals, block=BLOCK, scale=scale,

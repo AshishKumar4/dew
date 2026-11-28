@@ -169,6 +169,8 @@ class _Mainloop[Config: (Tiles, BackwardTiles)](AttentionLaunch, Template[Config
     (`attention_decode`), whose walk the memory bounds."""
     per_span: int = 1
     """The queries each of the spans' intervals holds (`KeySpans.per_span`)."""
+    excluded: bool = True
+    """Whether its spans exclude a row of no mass, which then reads zero, else NaN (`KeySpans.excluded`)."""
 
     @property
     def score_types(self) -> tuple:
@@ -177,7 +179,7 @@ class _Mainloop[Config: (Tiles, BackwardTiles)](AttentionLaunch, Template[Config
 
     def spans(self, start, end, query_ids, key_ids) -> KeySpans:
         """The call's spans from its arrays and the op's static form, key count and queries an interval."""
-        return KeySpans(start, end, query_ids, key_ids, self.keys, self.form, self.per_span)
+        return KeySpans(start, end, query_ids, key_ids, self.keys, self.form, self.per_span, self.excluded)
 
     UNBUNDLED: ClassVar[str] = "the Mosaic mainloop has no bundle for {name} yet"
     """Why a launch runs on no device of a family it has no bundle of (`declined`)."""
@@ -1583,7 +1585,7 @@ def _forward_call(query: jax.Array, key: jax.Array, value: jax.Array, spans: Key
                        form=spans.form, keys=spans.keys,
                        scale=logit_scale(query.shape[3], scale), natural=natural,
                        out_dtype=None if out_dtype is None else jnp.dtype(out_dtype).name, masked=masked,
-                       splits=splits, subtracted=subtracted, per_span=spans.per_span,
+                       splits=splits, subtracted=subtracted, per_span=spans.per_span, excluded=spans.excluded,
                        parts=parts, rounds=hooks.rounds, scaled=scaled, bounded=bounded, in_key=in_key,
                        query_mod=hooks.query.fn,
                        query_kinds=kinds_of(hooks.query.sides),

@@ -35,19 +35,19 @@ from typing import ClassVar, Literal, NamedTuple, overload
 import jax
 import jax.numpy as jnp
 import numpy as np
-from jax._src import config as jax_config
 from jax.typing import DTypeLike
 from numpy.lib.array_utils import normalize_axis_tuple
 
 from dew._hashing import fmix32
 from dew.nn.aligned import aligned_sum
-from dew.nn.derivatives import Protected, contracted, surrogate
+from dew.nn.derivatives import Protected, contracted
 from dew.nn.fake_quant import straight_through
-from dew.nn.float_bits import binade_of, lowered_rounded, raised_exactly
+from dew.nn.float_bits import binade_of, raised_exactly
 from dew.nn.kernels import generation, tuning
 from dew.nn.kernels.templates import band, scaled_contraction
 from dew.nn.kernels.templates.axes import whole
 from dew.nn.kernels.templates.hooks import NO_HOOK, TRACED_TILE, Hook, Side, laid
+from dew.nn.kernels.templates.narrowing import narrowing_settled
 from dew.nn.nested import nested
 from dew.nn.precision import (
     at_least_fp32,
@@ -56,9 +56,7 @@ from dew.nn.precision import (
     float32_einsum,
     lowered_divide,
     power2,
-    split_bits,
     two_sum,
-    uncontracted,
 )
 
 DTYPES = (jnp.float32, jnp.bfloat16, jnp.float16)
@@ -97,13 +95,19 @@ class KeySpans:
     then `[B, Q // per_span]`: a key head's packed rows of one position (`attention_decode.packed`), or a
     call's every query where lengths and starts alone bound its keys (`spans`), which a program reads by
     position (`per_query` repeats them)."""
+    excluded: bool = dataclasses.field(default=True, metadata={"static": True})
+    """Whether a row of no mass (its every logit -inf) reads zero, Dew's exclusion, a template call's by
+    default (a score hook that masks a row's every key empties it); where not, a call whose spans hide no
+    logical key (the dispatch's call of no mask or of a finite fill, `dew.nn.attention.template_attention`;
+    a banded call's copies of its keys, `attention_products.selected`), NaN, as the reference path's jax.nn
+    softmax reads it (`attention_algebra.Forward.massless_nan`, row 14116)."""
 
     def per_query(self) -> "KeySpans":
         """These spans an interval a query (`per_span` 1)."""
         if self.per_span == 1:
             return self
         start, end = (jnp.repeat(bound, self.per_span, axis=1) for bound in (self.start, self.end))
-        return KeySpans(start, end, self.query_ids, self.key_ids, self.keys, self.form)
+        return dataclasses.replace(self, start=start, end=end, per_span=1)
 
 
 def within(keys: jax.Array, start: jax.Array, end: jax.Array,
@@ -122,17 +126,25 @@ def within(keys: jax.Array, start: jax.Array, end: jax.Array,
     return seen if ids is None else seen & (ids[0] == ids[1])
 
 
-def dense(spans: KeySpans) -> jax.Array:
-    """Whether each key is visible to each query (`within`), every one: `[B, Q, K]` boolean, by broadcasting
-    alone, so a batch-sharded call's spans take no gather."""
+def dense(spans: KeySpans, columns: jax.Array | None = None) -> jax.Array:
+    """Whether each key is visible to each query (`within`), every one, or each of `columns` (key indices, a
+    tile's, none past the call's keys visible): `[B, Q, K]` boolean, by broadcasting alone, so a
+    batch-sharded call's spans take no gather."""
     spans = spans.per_query()
-    keys = jnp.arange(spans.keys)[None, None, :]
-    ids = (None if spans.query_ids is None or spans.key_ids is None
-           else (spans.query_ids[:, :, None], spans.key_ids[:, None, :]))
+    every = columns is None
+    if not every and not spans.keys:
+        return jnp.zeros((*spans.start.shape[:2], columns.shape[0]), bool)
+    columns = jnp.arange(spans.keys) if every else columns
+    keys = columns[None, None, :]
+    key_ids = (spans.key_ids if every or spans.key_ids is None
+               else spans.key_ids[:, jnp.minimum(columns, spans.keys - 1)])
+    ids = (None if spans.query_ids is None or key_ids is None
+           else (spans.query_ids[:, :, None], key_ids[:, None, :]))
     # A run axis stays last (`within`), the keys' axis beside the queries'.
     start, end = ((spans.start[:, :, None, :], spans.end[:, :, None, :]) if spans.start.ndim == 3
                   else (spans.start[:, :, None], spans.end[:, :, None]))
-    return within(keys, start, end, ids)
+    visible = within(keys, start, end, ids)
+    return visible if every else visible & (keys < spans.keys)
 
 
 def reads(spans: KeySpans) -> jax.Array:
@@ -341,7 +353,8 @@ def _by_row(spans: KeySpans, causal: bool, *narrowings) -> KeySpans:
     queries = spans.start.shape[1]
     if spans.form != "spans" or queries <= 1 or causal or any(x is not None for x in narrowings):
         return spans
-    return KeySpans(spans.start[:, :1], spans.end[:, :1], None, None, spans.keys, spans.form, queries)
+    return dataclasses.replace(spans, start=spans.start[:, :1], end=spans.end[:, :1], query_ids=None,
+                               key_ids=None, per_span=queries)
 
 
 def _grouped(start: jax.Array, end: jax.Array, place: jax.Array, own: jax.Array,
@@ -1385,12 +1398,14 @@ def reference(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpan
     logits, the softmax from `hooks.initial` in fp32 (or the wider of the inputs' and the state's dtypes),
     the probabilities rounded to the values' dtype for their product, the output normalized in fp32 and
     `output_mod` applied before it rounds to the query's dtype. A query that sees no key and starts from
-    no state gives zeros. With `residuals`, also each query's running maximum `m` and denominator `total`
-    `[B, H, Q]` (natural log, unnormalized), in the softmax's dtype, a query that sees no key and starts
-    from no state holding 0 for both, so every residual is finite; a softmax resumed from them (`Initial`)
-    starts such a query from `m = -inf`. No hooks where `hooks` is None. `rounded_to`, where given, is the
-    dtype the probabilities round to in the values' stead: values a caller widened (its copies' gradients
-    summed wide) weighed as their own dtype's (`attention_products._widely`)."""
+    no state gives zeros where its spans exclude it (`KeySpans.excluded`); elsewhere one from no state that
+    weighs none of its keys (every logit -inf) gives NaN, as jax.nn's softmax does, its denominator NaN.
+    With `residuals`, also each query's
+    running maximum `m` and denominator `total` `[B, H, Q]` (natural log, unnormalized), in the softmax's
+    dtype, a query that sees no key and starts from no state holding 0 for both; a softmax resumed from them
+    (`Initial`) starts such a query from `m = -inf`. No hooks where `hooks` is None. `rounded_to`, where
+    given, is the dtype the probabilities round to in the values' stead: values a caller widened (its copies'
+    gradients summed wide) weighed as their own dtype's (`attention_products._widely`)."""
     hooks = Hooks() if hooks is None else hooks
     rounded_to = value.dtype if rounded_to is None else jnp.dtype(rounded_to)
     walked_initial(hooks.initial)
@@ -1416,6 +1431,10 @@ def reference(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpan
     p = jnp.exp(logits - safe[..., None])
     carried = jnp.where(jnp.isfinite(m0), jnp.exp(m0 - safe), 0)
     total = total0 * carried + jnp.sum(p, axis=-1)
+    # A row of no mass of a call its spans do not exclude (`KeySpans.excluded`) reads NaN, its value and its
+    # derivative, as jax.nn's softmax reads it (`attention_algebra.Forward.massless_nan`, row 14116): its
+    # sums over a NaN, which no other row's derivative meets.
+    massless = (total == 0) if not spans.excluded and spans.keys > 0 and hooks.initial is None else None
 
     def valued(weights: jax.Array, *, bound: float | None = None) -> jax.Array:
         # The weights narrowed to the values' dtype times the values, a query group's over its key head.
@@ -1439,11 +1458,18 @@ def reference(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpan
                    else grouped.astype(rounded_to).astype(grouped.dtype))
         return product(straight_through(grouped, rounded), value.astype(grouped.dtype))
 
+    def nan_massless(normalized: jax.Array, acc: jax.Array) -> jax.Array:
+        # A row of no mass its sums over a NaN, its derivative NaN through them (`massless`).
+        if massless is None:
+            return normalized
+        return jnp.where(massless[..., None], acc / jnp.where(massless, jnp.nan, 1.0)[..., None], normalized)
+
     drop = hooks.drop
     if hooks.rounds is not None:
         # The codes at the row's maximum (`Hooks.rounds`), its denominator the weights' own.
         acc = acc0 * carried[..., None] + valued(coded(p, hooks.rounds))
-        normalized = jnp.where(total[..., None] > 0, acc / jnp.where(total > 0, total, 1)[..., None], 0)
+        normalized = nan_massless(
+            jnp.where(total[..., None] > 0, acc / jnp.where(total > 0, total, 1)[..., None], 0), acc)
     elif drop is None:
         acc = acc0 * carried[..., None] + valued(p)
         normalized = jnp.where(total[..., None] > 0, acc / jnp.where(total > 0, total, 1)[..., None], 0)
@@ -1453,6 +1479,7 @@ def reference(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpan
         if hooks.output.fn is None and jnp.dtype(query.dtype).itemsize == 2:
             # Rounded to odd for its narrowing, as the kernels' quotients outside a register epilogue are.
             normalized = narrowing_settled(normalized, acc, total, query.dtype)
+        normalized = nan_massless(normalized, acc)
     else:
         # Normalized before the draw's multiplier narrows them, as the kernels take them: a kept weight's z
         # times its normalized weight stays in the values' range where z times the unnormalized one may not
@@ -1467,9 +1494,12 @@ def reference(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpan
 
         drawn = jax.vmap(jax.vmap(multiplier, in_axes=(None, 0)), in_axes=(0, None))(jnp.arange(batch),
                                                                                     jnp.arange(heads))
+        if massless is not None:
+            inverse = jnp.where(massless, jnp.nan, inverse)
         normalized = acc0 * (carried * inverse)[..., None] + valued((p * inverse[..., None]) * drawn,
                                                                    bound=drop.bound)
-
+    if massless is not None:
+        total = jnp.where(massless, jnp.nan, total)
     out = output_hooked(normalized, hooks.output.fn, hooks.output.sides)
     out = jnp.swapaxes(out.astype(query.dtype), 1, 2)
     return (out, safe, total) if residuals else out
@@ -1497,101 +1527,6 @@ def saturated(x: jax.Array, finite_operands: jax.Array, dtype=None) -> jax.Array
     largest = jnp.finfo(x.dtype if dtype is None else dtype).max
     past = finite_operands & (jnp.abs(x) > largest)
     return jnp.where(past, jnp.where(x > 0, largest, -largest).astype(x.dtype), x)
-
-
-def _narrowing_settled(out: jax.Array, acc: jax.Array, divisor: jax.Array, dtype: DTypeLike) -> jax.Array:
-    """`narrowing_settled`'s value."""
-    if out.dtype != jnp.float32:
-        return out
-    above = _remainder_sign(acc, out, divisor)
-    div_bits = jax.lax.bitcast_convert_type(divisor, jnp.int32)
-    positive = jax.lax.broadcast_in_dim((div_bits > 0) & (div_bits < 0x7F800000), acc.shape,
-                                        tuple(range(divisor.ndim)))
-    bits = jax.lax.bitcast_convert_type(out, jnp.int32)
-    # One fp32 ulp toward the exact quotient: up in magnitude where it lies past the rounded one's side, its
-    # side read from its sign bit (a subnormal's comparison with zero reads it as zero where the CPU treats
-    # subnormal operands as zero).
-    toward = jnp.where((above > 0) == (bits > 0), 1, -1).astype(jnp.int32)
-    odd = jax.lax.bitcast_convert_type(bits + toward, jnp.float32)
-    nudged = _between(bits, dtype) & (above != 0) & jnp.isfinite(out) & jnp.isfinite(acc) & positive
-    return jnp.where(nudged, odd, out)
-
-
-narrowing_settled = contracted("test_the_narrowing_settle_holds_every_order")(
-    surrogate(_narrowing_settled, lambda dtype, primals, tangents, value: tangents[0], nondiff_argnums=(3,)))
-"""`out`, the sums `acc` over `divisor` as the finish formed it (fp32; a recovered subnormal's bits,
-`attention_algebra.quotient`), rounded to odd where it narrows to the 16-bit `dtype`: where it lands exactly
-between two values of `dtype` (`_between`) and is not the exact quotient, one fp32 ulp toward it, so the
-narrowing rounds once as the exact quotient would: the exact output 65519.9995 of one kept key of 65504
-rounded to fp32's 65520, which tied to inf in fp16 (the base review of 545370f65, F3; row 9544). The side is
-the sign of `acc` less `out` times `divisor`, exact (`_remainder_sign`). A finite fp32 `out` over a positive
-divisor alone; any other, a held one (its dtype's largest, no tie) and a guarded zero as they are, selected,
-no arithmetic on them. Its derivative is `out`'s on every entry, nudged or not (`surrogate`). The bound left
-at fp32's resolution, as the fp32 reference's: `divisor` is the one rounded (a dropping call's total times
-its multiplier's rest, `dropped_total`), and the sums and exponentials before it round as the reference's
-do, so an exact output within their rounding of a boundary may narrow past it."""
-
-
-def _remainder_sign(acc: jax.Array, quotient: jax.Array, divisor: jax.Array) -> jax.Array:
-    """A value of the sign of `acc - quotient * divisor` (fp32, finite) at every 16-bit narrowing tie
-    (`_between`), exact with row-hoisted divisor scaling and splitting: `divisor` is scaled once per row into
-    `[1/4, 1/2)` and split into two exact 12-bit halves `(d_hi, d_lo)`. Every 16-bit tie `quotient` has at
-    most 12 significant bits (9 for bf16, 12 for fp16), so `q_scaled * d_hi` and `q_scaled * d_lo` are exact
-    in fp32 with no per-element bit splitting; tiny `|quotient| < 2^-100` is scaled up by `2^52` so every
-    intermediate stays normal down to `2^-149`. Flushing paths (`bodies.subnormals`) scale through bit
-    arithmetic (`raised_exactly`, `lowered_rounded`) so subnormal accumulators and quotients never flush,
-    while non-flushing GPU kernels use two power-of-two multiplies to avoid Triton register spills (row
-    11648)."""
-    from dew.nn.kernels.templates import bodies
-
-    shift = jnp.clip(binade_of(divisor), -149, 127) + 2
-    dims = tuple(range(divisor.ndim))
-
-    def expand(x: jax.Array) -> jax.Array:
-        return jax.lax.broadcast_in_dim(x, acc.shape, dims)
-    def scale_bits(x: jax.Array, power: jax.Array) -> jax.Array:
-        return jnp.where(power >= 0, raised_exactly(x, jnp.maximum(power, 0)),
-                         lowered_rounded(x, jnp.maximum(-power, 0)))
-
-    def compute(*, flushing: bool) -> jax.Array:
-        if flushing:
-            scaled = scale_bits(divisor, -shift)
-            bump = jnp.where(binade_of(quotient) < -100, jnp.int32(52), jnp.int32(0))
-            q_scaled = raised_exactly(quotient, bump)
-            acc_scaled = scale_bits(acc, bump - expand(shift))
-        else:
-            first = jnp.right_shift(shift + 1, 1)
-            second = shift - first
-            s1 = jax.lax.bitcast_convert_type(jnp.left_shift(127 - first, 23).astype(jnp.int32), jnp.float32)
-            s2 = jax.lax.bitcast_convert_type(jnp.left_shift(127 - second, 23).astype(jnp.int32), jnp.float32)
-            scaled = (divisor * s1) * s2
-            bump = jnp.where(jnp.abs(quotient) < np.float32(2.0 ** -100),
-                             np.float32(2.0 ** 52), np.float32(1.0))
-            q_scaled = quotient * bump
-            acc_scaled = (acc * (expand(s1) * bump)) * expand(s2)
-        (scaled,) = uncontracted(scaled)
-        unsigned, mask, _ = split_bits(np.float32)
-        d_hi = jax.lax.bitcast_convert_type(
-            jax.lax.bitcast_convert_type(scaled, unsigned) & np.array(mask, unsigned), jnp.float32)
-        d_lo = scaled - d_hi
-        return (acc_scaled - q_scaled * expand(d_hi)) - q_scaled * expand(d_lo)
-
-    return bodies.subnormals(compute, acc.dtype)
-
-def _between(bits: jax.Array, dtype: DTypeLike) -> jax.Array:
-    """Whether each fp32 value of `bits` (its int32 bits) lies exactly between two neighbouring values of the
-    16-bit `dtype`, the tie its narrowing rounds to even: the significand bits the narrowing drops (16 of
-    bf16's, 13 of fp16's normals, more below its least normal, 2^-14) are a one and zeros."""
-    found = jnp.finfo(dtype)
-    exponent = jnp.right_shift(bits, 23) & 0xFF
-    significand = (bits & 0x7FFFFF) | jnp.where(exponent > 0, 0x800000, 0)
-    dropped = 23 - (found.nmant)
-    if found.minexp > -126:
-        # Below the dtype's least normal its narrowing drops a bit more a binade, down to the significand's
-        # whole 24 (half the least subnormal, 2^-25 in fp16, its last tie).
-        dropped = dropped + jnp.clip(127 + found.minexp - exponent, 0, 24 - dropped)
-    half = jnp.left_shift(1, dropped - 1)
-    return (significand & (2 * half - 1)) == half
 
 
 def held_mean(acc: jax.Array, total: jax.Array, dtype, law) -> jax.Array:
@@ -1955,28 +1890,24 @@ def hook_program(name: str, hook, kinds: tuple[Kind, ...], dtypes: tuple[str, ..
     (`SITES`, `hooks.laid`), in its dtype in the kernels (`dtypes`); `differentiated`, a score hook's
     pullback too, so a hook whose derivative is its own rule (`jax.custom_vjp`) keys by that rule (a
     prologue's pullback runs past the kernels, `jax.vjp` of `prologued`). None or a traced key as it is. One
-    trace a kernel call (`tuning.one_call`) by its arguments and the trace's context, its target's (K-F1)."""
+    trace a kernel call by its arguments and the trace's context (`tuning.once_a_call`; K-F1, K-F5)."""
     if hook is None or isinstance(hook, str):
         return hook
-    call = tuning.call_scoped()
-    place = ("hook_program", name, id(hook.source if isinstance(hook, tuning.Prepared) else hook), kinds,
-             tuple(map(str, dtypes)), differentiated, width, str(operand), jax_config.trace_context())
-    if call is not None and place in call:
-        return call[place][1]
-    tile = TRACED_TILE
-    extents = {"queries": tile, "keys": tile, "width": width}
-    params = [jax.ShapeDtypeStruct(laid(SITES[name], tiled(kind), extents), dtype)
-              for kind, dtype in zip(kinds, dtypes, strict=True)]
-    positions = (jax.ShapeDtypeStruct((tile, 1), jnp.int32), jax.ShapeDtypeStruct((1, tile), jnp.int32))
-    square = jax.ShapeDtypeStruct((tile, tile), jnp.float32)
-    if name == "output_mod":
-        key = tuning.program(hook, jax.ShapeDtypeStruct((tile, width), jnp.float32), *params)
-    elif name in ("query_mod", "key_mod"):
-        key = tuning.program(hook, jax.ShapeDtypeStruct((tile, width), operand),
-                             jax.ShapeDtypeStruct((tile, 1), jnp.int32), *params)
-    elif not differentiated:
-        key = tuning.program(hook, square, *positions, *params)
-    else:
+
+    def traced() -> str | None:
+        tile = TRACED_TILE
+        extents = {"queries": tile, "keys": tile, "width": width}
+        params = [jax.ShapeDtypeStruct(laid(SITES[name], tiled(kind), extents), dtype)
+                  for kind, dtype in zip(kinds, dtypes, strict=True)]
+        positions = (jax.ShapeDtypeStruct((tile, 1), jnp.int32), jax.ShapeDtypeStruct((1, tile), jnp.int32))
+        square = jax.ShapeDtypeStruct((tile, tile), jnp.float32)
+        if name == "output_mod":
+            return tuning.program(hook, jax.ShapeDtypeStruct((tile, width), jnp.float32), *params)
+        if name in ("query_mod", "key_mod"):
+            return tuning.program(hook, jax.ShapeDtypeStruct((tile, width), operand),
+                                  jax.ShapeDtypeStruct((tile, 1), jnp.int32), *params)
+        if not differentiated:
+            return tuning.program(hook, square, *positions, *params)
         floating = floating_params(params)
 
         def pulled(s, q_pos, k_pos, *values):
@@ -1984,8 +1915,11 @@ def hook_program(name: str, hook, kinds: tuple[Kind, ...], dtypes: tuple[str, ..
             out, pull = jax.vjp(hooked, s, *(values[index] for index in floating))
             return out, pull(jnp.ones_like(out))
 
-        key = tuning.program(pulled, square, *positions, *params)
-    return key if call is None else call.setdefault(place, (hook, key))[1]  # the hook kept beside its key
+        return tuning.program(pulled, square, *positions, *params)
+
+    source = hook.source if isinstance(hook, tuning.Prepared) else hook
+    return tuning.once_a_call(source, ("hook_program", name, kinds, tuple(map(str, dtypes)), differentiated,
+                                       width, str(operand)), traced)
 
 
 class AttentionLaunch(tuning.KernelOp):

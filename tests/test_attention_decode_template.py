@@ -181,6 +181,38 @@ def test_a_decode_step_through_the_template_is_on_par_interpreted(call, hook, dt
 
 
 @INTERPRETS
+def test_a_decode_steps_start_of_its_first_key_reads_as_no_start_interpreted():
+    """A decode step through the template as an H100 runs it from each row's first key (`starts` 0, a row
+    holding one document, `AttentionMixer._attended`'s own start) reads bit for bit as the step of no start:
+    a step whose kernel takes a start runs the start as given, no branch on whether it narrows (row 6107; a
+    start past 0, `STARTS`, on par in `test_a_decode_step_through_the_template_is_on_par_interpreted`)."""
+    lengths = jnp.asarray(LENGTHS, jnp.int32)
+    query, key, value, _ = _drawn(1, 8, 2, jnp.bfloat16)(0)
+
+    def attend(starts):
+        with generation.assumed("sm90"):
+            return attention_decode.attend(query, key, value, template.spans(1, KEYS, 2, lengths=lengths,
+                                                                             starts=starts), interpret=True)
+
+    np.testing.assert_array_equal(np.asarray(attend(jnp.zeros(2, jnp.int32)), np.float32),
+                                  np.asarray(attend(None), np.float32))
+
+
+def test_a_route_keeps_a_hooked_step_that_reads_a_row_of_no_mass_nan_off_the_work_list():
+    """A decode step whose spans hide no key (`KeySpans.excluded` False: a row of no mass reads NaN) under an
+    output hook: the route declines the work list (`serves`), whose merge fuses the hook before such a row
+    is read, so the template's forward, which reads it NaN before its hook, takes it; the same step masked,
+    or hookless, the work list takes (row 14116)."""
+    query, key, _, _ = _drawn(1, 8, 2, jnp.bfloat16)(0)
+    hooks = template.Hooks(output=Hook(lambda o: jnp.where(jnp.isnan(o), 7.0, o)))
+    with generation.assumed("sm90"):
+        target = generation.gpu_target()
+        assert not attention_decode.serves(query, key, hooks, natural=False, target=target, excluded=False)
+        assert attention_decode.serves(query, key, hooks, natural=False, target=target)
+        assert attention_decode.serves(query, key, None, natural=False, target=target, excluded=False)
+
+
+@INTERPRETS
 def test_an_absorbed_mla_decode_step_of_576_wide_keys_and_512_wide_values_is_on_par_interpreted():
     """An absorbed MLA decode step (DeepSeek's: 16 query heads over one latent key head, its key the latent
     512 and rotary 64, its value the latent 512; kernel-templates.md §A row 25) through the template as an
@@ -689,9 +721,10 @@ def a_verify_block_through_the_route_is_on_par(drafts: int) -> None:
     from dew.nn.documents import CrossDocuments
 
     rows, keys = 2, 4096
-    held = jnp.asarray([keys - drafts, 1000], jnp.int32)
-    documents = CrossDocuments(jnp.ones((rows, drafts), jnp.int32),
-                               (jnp.arange(keys)[None] < (held + drafts)[:, None]).astype(jnp.int32))
+    # Host constants, so its GPU tier part's prepare computes nothing before its site (row 8074).
+    held = np.asarray([keys - drafts, 1000], np.int32)
+    documents = CrossDocuments(np.ones((rows, drafts), np.int32),
+                               (np.arange(keys)[None] < (held + drafts)[:, None]).astype(np.int32))
 
     def attended(implementation):
         def attend(query, key, value):
@@ -719,9 +752,11 @@ def a_paged_decode_step_of_small_pages_is_on_par(page: int) -> None:
     warpgroup's cp.async copies (`gathered.Ring`, row 4772), 32 query heads over 8 key heads over 4096 keys
     in a shuffled table: on par with the reference path over the pool gathered dense (check 1)."""
     keys, kv_heads = 4096, 8
-    spans = template.spans(1, keys, 2, lengths=jnp.asarray([keys, keys - 77], jnp.int32))
     per_row = keys // page
-    table = jnp.asarray(np.random.default_rng(page).permutation(2 * per_row).reshape(2, per_row), jnp.int32)
+    # Host constants and spans formed where its programs trace, so its GPU tier part's prepare computes
+    # nothing before its site (row 8074).
+    lengths = np.asarray([keys, keys - 77], np.int32)
+    table = np.random.default_rng(page).permutation(2 * per_row).reshape(2, per_row).astype(np.int32)
 
     def gathered(pool):
         rows = pool[:, table]
@@ -730,10 +765,12 @@ def a_paged_decode_step_of_small_pages_is_on_par(page: int) -> None:
     draw = functools.partial(_normals, (2, 1, 32, 128), (kv_heads, 2 * per_row, page, 128), jnp.bfloat16)
 
     def ours(query, key_pool, value_pool):
-        return attention_decode.attend(query, key_pool, value_pool, spans, table=table)
+        spans = template.spans(1, keys, 2, lengths=lengths)
+        return attention_decode.attend(query, key_pool, value_pool, spans, table=jnp.asarray(table))
 
     def reference(query, key_pool, value_pool):
-        return template.reference(query, gathered(key_pool), gathered(value_pool), spans)
+        return template.reference(query, gathered(key_pool), gathered(value_pool),
+                                  template.spans(1, keys, 2, lengths=lengths))
 
     assert_as_exact(jax.jit(ours), jax.jit(reference), draw, f"paged decode of {page}-key pages on a GPU",
                     seeds=SEEDS)

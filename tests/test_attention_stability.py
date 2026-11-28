@@ -57,6 +57,7 @@ from dew.nn.kernels.templates import (
     mosaic_sm90,
 )
 from dew.nn.kernels.templates.hooks import Hook
+from dew.nn.kernels.templates.narrowing import narrowing_settled
 
 PINS = {attention_triton.TritonForward: attention_triton.Tiles(32, 32, 4, 2),
         attention_triton.TritonBackward: attention_triton.BackwardTiles(32, 32, 4, 2, 4, 2)}
@@ -1431,7 +1432,7 @@ negative one; bf16's overflow midpoint, normal ties of either sign and one at it
 def test_a_quotient_narrows_to_16_bits_as_its_exact_value_does(dtype):
     """Sums over a divisor whose fp32 quotient rounds onto a 16-bit tie (`NARROWING_TIES`), and the sums an
     fp32 ulp either side of the tie's product with the divisor and on it where exact: the settled quotient
-    (`algebra.narrowing_settled`) narrows to `dtype` as the exact quotient rounds once, to the tie's nearer
+    (`narrowing.narrowing_settled`) narrows to `dtype` as the exact quotient rounds once, to the tie's nearer
     neighbour where it is not the tie and to the even one where it is, where the fp32 quotient's second
     rounding took a quotient below fp16's overflow midpoint to inf (row 9544), and so at the overflow
     midpoint does a register epilogue's settle of it alone (`algebra.midpoint_settled`); a held quotient,
@@ -1454,7 +1455,7 @@ def test_a_quotient_narrows_to_16_bits_as_its_exact_value_does(dtype):
     finite = np.isfinite(centre) & np.isfinite(acc) & (np.abs(acc) >= np.finfo(np.float32).tiny)
     acc, divisor, tie = acc[finite], divisor[finite], tie[finite]
     rounded = np.asarray(jnp.asarray(acc) / jnp.asarray(divisor))
-    settled = algebra.narrowing_settled(jnp.asarray(rounded), jnp.asarray(acc), jnp.asarray(divisor), narrow)
+    settled = narrowing_settled(jnp.asarray(rounded), jnp.asarray(acc), jnp.asarray(divisor), narrow)
     found = np.asarray(settled.astype(narrow).astype(jnp.float32), np.float64)
     exact = acc.astype(np.float64) / divisor.astype(np.float64)
 
@@ -1471,11 +1472,11 @@ def test_a_quotient_narrows_to_16_bits_as_its_exact_value_does(dtype):
     alone = algebra.midpoint_settled(jnp.asarray(rounded), jnp.asarray(acc), jnp.asarray(divisor), narrow)
     found = np.asarray(alone.astype(narrow).astype(jnp.float32), np.float64)
     np.testing.assert_array_equal(found[midpoint], expected[midpoint])
-    held = algebra.narrowing_settled(jnp.float32(jnp.finfo(narrow).max), jnp.float32(65522.0),
+    held = narrowing_settled(jnp.float32(jnp.finfo(narrow).max), jnp.float32(65522.0),
                                      jnp.float32(1.0), narrow)
     assert held == jnp.finfo(narrow).max
     if narrow == jnp.bfloat16:
-        settle_jit = jax.jit(lambda q, a, d: algebra.narrowing_settled(q, a, d, jnp.bfloat16))
+        settle_jit = jax.jit(lambda q, a, d: narrowing_settled(q, a, d, jnp.bfloat16))
         # Subnormal accumulator at exact BF16 tie (`divisor=2^-126`, `q=511/512`, `acc=511*2^-135`):
         # bit-based scaling keeps the remainder zero (even tie -> 1.0) rather than flushing `acc` to 0.
         sub_div = jnp.asarray([2.0 ** -126] * 3, jnp.float32)

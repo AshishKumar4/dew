@@ -19,6 +19,8 @@ interpreted and through the compile gate:
   and each kernel's requirements are what it takes on this GPU (test_kernels); a row that sees no key
   reads nothing on the fused kernels (test_attention_masked_rows). Flash's plain training step is the
   dense flow's, a user's.
+- Parallax's power scaling exact at fp32's subnormal boundary on a backend that keeps subnormals
+  (test_attention_parallax).
 - The Mosaic template on an H100, each test its own cells: its forward and backward over every call form,
   head width and hook it declares, its natural forward, a call over runs, a chunked prefill's backward, its
   one launch backward and a span call's (test_attention_mosaic, attention_inplace_operands); an fp16 call
@@ -42,6 +44,7 @@ import test_attention_decode_template as decode_template
 import test_attention_dropout as dropout
 import test_attention_masked_rows as masked_rows
 import test_attention_mosaic as mosaic
+import test_attention_parallax as parallax
 import test_attention_route as route
 import test_attention_stability as stability
 import test_contracts_attention as contracts
@@ -138,7 +141,8 @@ def test_the_attention_kernels_run_on_this_gpu(part):
                functools.partial(stability.default_is_finite, family, "mosaic two launches"), "sm90")
           for family in stability.hookless_families()),
         *(Cell(f"a step with a bias every row shares repeats bit for bit: {name}",
-               functools.partial(a_shared_bias_step_repeats_bit_for_bit, shape, kv_heads))
+               functools.partial(a_shared_bias_step_repeats_bit_for_bit, shape, kv_heads),
+               at_run="no check-1 site: six runs of one step its run computes and compares bit for bit")
           for name, shape, kv_heads in (("a tile of the logits", (2048, 2048), 8),
                                         ("a key bias", (1, 2048), 8),
                                         ("a tile of the logits over grouped heads", (2048, 2048), 2))),
@@ -444,3 +448,11 @@ def test_a_finished_split_merge_preserves_subnormal_initial_mass_on_this_gpu():
     """Row 10819: the Pallas `merged_finished` kernel on GPU preserves subnormal initial mass (`2^-127`)
     as `1.0` and truly empty rows as `0.0`."""
     test_merged.test_a_finished_split_merge_preserves_subnormal_initial_mass()
+
+
+@pytest.mark.compiles_at_run(reason="no check-1 site: exact values its run computes and compares")
+def test_a_subnormal_term_decays_and_raises_before_it_rounds_on_this_gpu():
+    """Parallax's power scaling (`attention_parallax.exp_scaled`) on a GPU, which keeps fp32 subnormals
+    where XLA's CPU flushes them: `0x00ffffff` raised by `2^253` is fp32's largest, where its halved form
+    rounded up to `2^-126` and overflowed (the confirm review of 0e164c5af8)."""
+    parallax.test_a_subnormal_term_decays_and_raises_before_it_rounds()

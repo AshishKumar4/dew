@@ -1099,6 +1099,34 @@ ahead of the reference path,
 whose scores are whole, where every kernel before it refuses the call."""
 
 
+def keeps_reference_rows(kernel: str, *, masked: bool, filled: bool, sunk: bool, biased: bool) -> bool:
+    """Whether every arm of the attention kernel named `kernel`, its forward and its derivatives, reads each
+    row of a call as the call's reference path does (`reference_attention`): a row of no mass (its every
+    logit -inf) NaN where that reads it NaN and zero where it excludes it (row 14116), for a call that hides
+    keys (`masked`), fills them (`filled`, `mask_fill`), has sinks (`sunk`) or a bias or score hook that can
+    put -inf on a row's every key (`biased`). The reference path for every call. No other for a fill or
+    sinks: a -inf fill's template call is its masked walk, whose row of no mass that sees a key reads zero,
+    and a sink's state is its own, its row of no mass zero where the reference's softmax over a -inf sink
+    reads NaN. The template for every other call (its spans' exclusion, `KeySpans.excluded`); every kernel
+    for a call neither masked nor biased, whose finite logits leave no row of no mass; xla's attention and
+    the inference route (the template's forward, xla's derivatives) for an unmasked call, jax.nn's softmax
+    op for op, whose finite masked floor reads a row that sees no key as its keys' mean; FlashAttention and
+    cuDNN for an unbiased call, which read a row of no mass zero as the reference's excluded rows read the
+    rows that see no key. Its rows are the logits -inf as written (a bias, a fill, a hidden key): finite
+    products that overflow are a range each kernel answers its own way (the template's prescaled products
+    keep finite what the reference's overflow). The one statement a rewrite onto a kernel reads
+    (`dew.algebra.recognize`)."""
+    if kernel == 'reference':
+        return True
+    if filled or sunk:
+        return False
+    if kernel == 'template' or not (masked or biased):
+        return True
+    if kernel in ('xla', 'inference'):
+        return not masked
+    return kernel in ('flash', 'flash_inference', 'cudnn') and not biased
+
+
 def reverse_only(kernel: str) -> bool:
     """Whether the attention kernel named `kernel`, either selector's (`ATTENTION`, `DECODE`), defines its
     reverse-mode derivative alone (`Kernel.reverse_only`)."""

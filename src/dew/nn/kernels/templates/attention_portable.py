@@ -252,7 +252,7 @@ def xla_mainloop(config: Tiles, query: jax.Array, key: jax.Array, value: jax.Arr
                            units=sums_units(hooks.drop, headroom=headroom,
                                                     initial=hooks.initial is not None),
                            largest=algebra.largest_of(value.dtype, hooks),
-                           narrowed=algebra.narrowed_of(query.dtype))
+                           narrowed=algebra.narrowed_of(query.dtype), excluded=spans.excluded)
     # A quantized call's weights round at each row's maximum, which its training walk finds first
     # (`attention_program.walk`), its residuals let go where the call keeps none.
     if not residuals and hooks.rounds is None:
@@ -702,6 +702,9 @@ def backward(config: Tiles, query: jax.Array, key: jax.Array, value: jax.Array, 
     initial = hooks is not None and hooks.initial is not None
     if hooks is not None and hooks.drop is not None and not split:
         raise ValueError("the first-pass D (split=False) takes no probability dropout; the split sums do")
+    # A call whose row of no mass reads NaN (`KeySpans.excluded`) takes D from the split sums, whose forward
+    # denominator carries it: a first pass recomputes it 0.
+    split = split or not spans.excluded
     launch = functools.partial(_launch, block_q=block_q, block_k=block_k, split=split, natural=natural,
                                accurate=accurate, initial=initial, drop=None if hooks is None else hooks.drop)
     return gradients(launch, query, key, value, spans, hooks, dout, residuals, block=pad, scale=scale,

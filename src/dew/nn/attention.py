@@ -474,7 +474,9 @@ def template_attention(query, key, value, causal: bool, sliding_window, *, sinks
     tile at a time and its gradient the tiles' pulled cotangents, a `SeparableBias` a query and a key
     parameter (FoX's); sinks are the softmax's initial state. A
     `fill` (`mask_fill`) is every hidden key's logit, a score hook after the rest (`template.Filled`), the
-    call walking every key. On
+    call walking every key; a call that hides no key, a fill's among them, reads a row of no mass NaN, as
+    jax.nn's softmax does (`KeySpans.excluded`); a -inf fill's call is the masked walk's, its rows that see
+    no key NaN past it (`_filled`). On
     a mesh it runs per shard (`on_attention_shards`), as the decode kernel does: the key heads repeat until
     the tensor axes split them, the sinks split with their heads, and the ids, lengths, starts, groups,
     validity and places with
@@ -522,6 +524,8 @@ def template_attention(query, key, value, causal: bool, sliding_window, *, sinks
         if fill is not None:
             score_mod, params = template.Filled.over(spans, fill, score_mod, params)
             spans = template.spans(queries, keys, batch)
+        # The reference path's exclusion (`reference_attention`'s `excluded`, `KeySpans.excluded`).
+        spans = dataclasses.replace(spans, excluded=spans.form != "full")
         hooks = template.Hooks(
             score=Hook(score_mod, params),
             initial=None if sinks is None else template.sinks(sinks, batch, queries, value.shape[-1]),

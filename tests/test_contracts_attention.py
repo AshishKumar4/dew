@@ -17,9 +17,11 @@ from dew.nn.kernels import generation
 from dew.nn.kernels.templates import (
     attention as template,
     attention_algebra as algebra,
+    attention_parallax,
     attention_quantized,
     merged,
 )
+from dew.nn.kernels.templates.narrowing import narrowing_settled
 from dew.nn.sharding import manual_map
 
 
@@ -217,13 +219,13 @@ def test_a_padded_merges_derivatives_are_the_laws(edge, taken):
 
 @pytest.mark.parametrize("edge", EDGES)
 def test_the_narrowing_settle_holds_every_order(edge):
-    """`attention.narrowing_settled` (a surrogate whose derivative is its quotient's on every entry): every
+    """`narrowing.narrowing_settled` (a surrogate whose derivative is its quotient's on every entry): every
     order finite wherever float64 is a normal float32 and the plain quotient is, the quotient's own, over
     drawn fp32 quotients of sums over a divisor of 3/2 as an fp16 output narrows them."""
     divisor = jnp.full((9,), 1.5, jnp.float32)
 
     def settled(out):
-        return template.narrowing_settled(out, out * divisor, divisor, jnp.float16)
+        return narrowing_settled(out, out * divisor, divisor, jnp.float16)
 
     def plain(out):
         return out
@@ -238,13 +240,13 @@ def test_the_narrowing_settle_holds_every_order(edge):
 
 
 def test_a_nudged_quotient_narrows_once_and_keeps_its_tangent():
-    """`attention.narrowing_settled` at an fp16 tie it nudges: the quotient 1 + 2^-11 formed of sums
+    """`narrowing.narrowing_settled` at an fp16 tie it nudges: the quotient 1 + 2^-11 formed of sums
     1 + 2^-11 - 2^-23 over a divisor 1 - 2^-24, whose exact value is below the tie, narrows to 1 as that
     value rounds once, and its tangent along the quotient is the quotient's own, 1 (the head review of
     fd1af38ac, F1: a nudged entry's tangent was none)."""
     tie = jnp.float32(1 + 2.0 ** -11)
     acc, divisor = jnp.float32(1 + 2.0 ** -11 - 2.0 ** -23), jnp.float32(1 - 2.0 ** -24)
-    settled, tangent = jax.jvp(lambda out: template.narrowing_settled(out, acc, divisor, jnp.float16), (tie,),
+    settled, tangent = jax.jvp(lambda out: narrowing_settled(out, acc, divisor, jnp.float16), (tie,),
                                (jnp.float32(1.0),))
     assert settled.astype(jnp.float16) == 1.0 and tangent == 1.0
 
@@ -331,6 +333,35 @@ def test_a_giant_heads_clip_holds_every_order(taken):
         assert_contract(clip, (x * scale,), (direction * scale,), cotangent, f"a head's clip {edge}",
                         plain_fn=plain, taking=ORDER_SETS[taken])
 
+
+def plain_parallax(query, second, key, second_key, value):
+    """Parallax written plainly (`attention_parallax`'s docstring): the softmax's weights each taken by
+    `1 + c - t`, `t` the second products, `c` their mean under the weights."""
+    logits = jnp.einsum("bqhd,bkhd->bhqk", query, key) * query.shape[-1] ** -0.5
+    weights = jax.nn.softmax(logits, axis=-1)
+    seconds = jnp.einsum("bqhd,bkhd->bhqk", second, second_key)
+    mean = jnp.sum(weights * seconds, axis=-1, keepdims=True)
+    return jnp.einsum("bhqk,bkhd->bqhd", weights * (1 + mean - seconds), value)
+
+
+@pytest.mark.parametrize("edge", EDGES)
+def test_parallax_holds_every_order(edge):
+    """Parallax (`attention_parallax.attend`: its forward and first derivative its key tiles' walks, every
+    higher order its reference's in XLA): every order runs, finite wherever float64 is a normal float32 and
+    the plain formula is, at queries, keys and values whose products near float32's ends."""
+    shape = (1, 16, 2, 16)
+    spans = template.spans(16, 16, 1)
+
+    def inputs(seed: int, scale: float) -> tuple:
+        return (normal_draw([13690, seed], *(shape,) * 5, scale=scale),
+                normal_draw([13691, seed], *(shape,) * 5, scale=scale),
+                normal_draw([13692, seed], shape)[0])
+
+    def parallax(query, second, key, second_key, value):
+        return attention_parallax.attend(query, second, key, second_key, value, spans)
+
+    assert_drawn_contract(parallax, inputs, EDGES[edge], f"parallax {edge}", truth_fn=plain_parallax,
+                          plain_fn=plain_parallax)
 
 
 def plain_scores(query, key):

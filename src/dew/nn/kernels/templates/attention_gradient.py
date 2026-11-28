@@ -476,8 +476,10 @@ def dq_finish(sums: DqSums, prior: jax.Array, state_total: jax.Array, peak0: jax
     takes must be the one whose cotangents do, not the first pass's; the fast form leaves dQ at the first
     pass's (`dq_issued`). Returns dQ, the refined `D - c` rounded and what its rounding lost (`two_sum`: a
     refinement below the rounded D's ulp, which an initial state's maximum's gradient reads, row 6302), the
-    denominator, the keys' share of the weights, and the hook gradients."""
-    total = state_total + sums.mass
+    denominator, the keys' share of the weights, and the hook gradients; a row the forward read NaN for its
+    lack of mass (its `prior` NaN, `algebra.nan_massless`) keeps its NaN denominator, which the dK/dV launch's
+    weights take."""
+    total = jnp.where(prior != prior, prior, state_total + sums.mass)
     ratio = jnp.where(total > 0, prior / jnp.where(total > 0, total, 1.0), 0.0)
     over = inverse(total)
     mass, residual = sums.mass * over, sums.residual * ratio
