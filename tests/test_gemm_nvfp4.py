@@ -559,8 +559,8 @@ def test_an_owed_power_past_float32s_is_owed_exactly_natively_and_in_software():
 
 
 def an_owed_products_native_fold_rounds_once_below_the_normals():
-    """On a GPU, whose float32 keeps subnormals (`factored.flushing`'s native platform),
-    `factored.owed_native` and `owed_exactly` owe 2^127 on a subnormal product past a factor whose folded
+    """On a GPU, `factored.owed_native` (a packed launch's epilogue's) and `owed_exactly` owe 2^127 on a
+    subnormal product past a factor whose folded
     multiplier overflows, rounding once: 2^-149 times 2.5 owed 2^127 is 5 2^-23, the product raised by the
     power before the factor's one rounding, where its product with the factor first, rounded on the
     subnormal grid, gave 2^-21 (train 1450's review). Run by tests/test_gpu_gemm.py's cells: this CPU
