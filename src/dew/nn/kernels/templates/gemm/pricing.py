@@ -6,7 +6,9 @@ wave (`balanced_tail`, `handoff_steps`, `fixes_up`)."""
 
 import contextlib
 import dataclasses
+import functools
 import math
+import operator
 from collections.abc import Callable
 from typing import TYPE_CHECKING, NamedTuple
 
@@ -112,16 +114,18 @@ def decode_seconds(tiles: "Tiles", decoded: tuple, rates: unit_cost.Rates) -> fl
     staged elements `copies` times over at its form's `work` (`Decoded`), its units overlapped with the
     products' and the shared bytes' as theirs are with each other: the integer pipes a packed matrix's decode
     takes beside the tensor cores, which a step's price had left out (row 14106, algebra.md 7.4's consumer
-    pricing a bit form through `Work`); 0 where no form states its work."""
+    pricing a bit form through `Work`). Both operands' decodes summed before their units are priced, as
+    they share each pipe; 0 where no form states its work. On an H100's legal packed tiles the decode is no
+    bottleneck: it ties the shared bytes at the narrowest, two consumers decoding 8 tokens' rows."""
     elements = (tiles.block_m * tiles.block_k, tiles.block_n * tiles.block_k)
-    seconds = 0.0
-    for count, form in zip(elements, decoded, strict=True):
-        stage = None if form is None else Decoded(*form)
-        if stage is None or stage.work is None:
-            continue
-        priced, _ = unit_cost.units(unit_cost.repeated(stage.work, count * stage.copies), rates)
-        seconds = max(seconds, *priced)
-    return seconds
+    stages = [(count, Decoded(*form)) for count, form in zip(elements, decoded, strict=True)
+              if form is not None]
+    works = [unit_cost.repeated(stage.work, count * stage.copies) for count, stage in stages
+             if stage.work is not None]
+    if not works:
+        return 0.0
+    priced, _ = unit_cost.units(functools.reduce(operator.add, works), rates)
+    return max(priced)
 
 
 def _tensor_rate(rates, issued) -> float | None:

@@ -950,13 +950,16 @@ def a_packed_nvfp4_prefills_finish_is_its_products_finished_apart():
     sizes = jnp.asarray([128, 128], jnp.int32)
 
     def product(route):
-        with generation.chosen(nvfp4=route):
-            return np.asarray(jax.jit(lambda x: gemm.nvfp4_product(x, bank, sizes, out_dtype=jnp.float32))(
+        with generation.chosen(nvfp4=route), tuning.seen() as launched:
+            out = np.asarray(jax.jit(lambda x: gemm.nvfp4_product(x, bank, sizes, out_dtype=jnp.float32))(
                 jnp.asarray(rows, jnp.bfloat16)))
+        return out, _packed_epilogues(launched)
 
     truth = np.concatenate([rows[group * 128:(group + 1) * 128].astype(np.float64) @ codes[group]
                             * scale[group].astype(np.float64) for group in range(2)]).astype(np.float32)
-    finished, apart = product("packed"), product("xla")
+    (finished, hooked), (apart, _) = product("packed"), product("xla")
+    # The packed call's launch took the finish in its epilogue (its review: else the finish was XLA's).
+    assert hooked and all(epilogue is not None for epilogue in hooked), hooked
     assert np.isfinite(truth).all()
     np.testing.assert_array_equal(apart.view(np.uint32), truth.view(np.uint32))
     np.testing.assert_array_equal(finished.view(np.uint32), apart.view(np.uint32))
@@ -1953,17 +1956,23 @@ def test_a_grouped_nvfp4_product_of_no_depth_is_zero(generation_name):
 
 def test_a_packed_steps_price_counts_its_decodes_integer_pipes():
     """A step whose NVFP4 operand its consumers decode (`pricing.step_seconds`, the form's work in its
-    `Decoded`, row 14106): where the decode's integer issues outlast its products and shared bytes (a
-    swapped decode of 8 tokens against its 128 decoded rows a step, an H100's ALU at 64 lanes a clock), the
-    step is priced above those; where the products outlast them (128 columns), at those alone, the decode's
-    pipes beside them."""
+    `Decoded`, row 14106): on an H100's narrowest legal packed tile (two consumers decoding a 256-deep stage
+    of 128 rows for 8 tokens, each weight's half byte and its block's scale stored) the decode ties the
+    shared bytes, so its price stands; and two operands' decodes on one pipe add, not overlap, each pipe's
+    work summed before the busiest is read (its review: a 64x64x256 step's two decodes 512 clocks, not
+    256)."""
+    from dew.nn.kernels.templates import cost
     from dew.nn.kernels.templates.gemm import packed, pricing
 
     h100, work = generation.gpu_target("sm90"), packed.nvfp4_decode_work()
+    stored = 0.5 + 1 / 16
+    narrow = tiling.Tiles(128, 8, 256, 2, 1, warpgroups=2, family="wgmma")
 
-    def priced(tiles, form):
-        return pricing.step_seconds(tiles, h100, (0.5, 2), (form, None), issued=jnp.bfloat16)
+    def priced(form):
+        return pricing.step_seconds(narrow, h100, (stored, 2), (form, None), issued=jnp.bfloat16)
 
-    narrow, wide = (tiling.Tiles(128, columns, 64, 2, 1, family="wgmma") for columns in (8, 128))
-    assert priced(narrow, pricing.Decoded(0, 1, work)) > priced(narrow, pricing.Decoded(0, 1))
-    assert priced(wide, pricing.Decoded(0, 1, work)) == priced(wide, pricing.Decoded(0, 1))
+    assert priced(pricing.Decoded(0, 1, work)) == priced(pricing.Decoded(0, 1))
+    rates, square = cost.rates(h100, device=False), tiling.Tiles(64, 64, 256, 2, 1, family="wgmma")
+    one = pricing.Decoded(2, 1, work)
+    alone = [pricing.decode_seconds(square, forms, rates) for forms in ((one, None), (None, one))]
+    assert pricing.decode_seconds(square, (one, one), rates) == pytest.approx(sum(alone))

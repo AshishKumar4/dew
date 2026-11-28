@@ -1171,10 +1171,10 @@ def nvfp4_product(lhs: jax.Array, matrix: NvFp4, group_sizes: jax.Array | None =
 
 def _packed_finish(launch, bound, bank: NvFp4, count: int, *, dense: bool, interpret_on_cpu: bool):
     """A bank's packed product finished in its launch's epilogue (row 13743): its experts' column scales and
-    the owed 2^8 (`factored.owed_native`, CUDA's alone), which after the launch gather each row's expert's
-    (M-NG-68t4: 735.8 us to 200.4). None for one scale all rows share (XLA's output conversion takes it
-    free; the epilogue's slowed the launch 0.5-1.6%), a decode's rows, interpreted, a TPU's or a placed
-    scale; a call placed on the CPU when it runs finishes there by `owed_exactly`."""
+    the owed 2^8 (`factored.owed_native`, CUDA's alone), the measured case, whose finish after the launch
+    gathers each row's expert's columns (M-NG-68t4: 735.8 us to 200.4). None elsewhere: a matrix's scale
+    (XLA's output conversion takes it free; the epilogue slowed it 0.5-1.6%), a bank's scalar scales (their
+    gather unmeasured), a decode's rows, interpreted, a TPU's or a placed scale."""
     if (dense or not bank.columned or bank.shape[0] < 2 or xla_products.interpreted(interpret_on_cpu)
             or generation.tpu(generation.gpu_target()) or count <= NVFP4_DECODE_ROWS
             or not launched_whole(bank.scale)):
