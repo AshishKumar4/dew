@@ -33,14 +33,7 @@ from dew.nn.aligned import aligned_sum
 from dew.nn.derivatives import KernelGlue, Protected, contracted, with_gradients_formed
 from dew.nn.kernels import launches
 from dew.nn.norms import OutputNorm, output_normed
-from dew.nn.precision import (
-    accurate_exp,
-    at_least_fp32,
-    compensated_add,
-    l2norm,
-    softplus,
-    stochastic_bf16,
-)
+from dew.nn.precision import accurate_exp, at_least_fp32, compensated_add, l2norm, softplus, stochastic_bf16
 
 from ..sharding import explicit_spec, grouped_heads, manual_map
 from . import chunked_launch, short_conv
