@@ -24,6 +24,10 @@ from dew.nn.kernels.templates.hooks import NO_HOOK, Hook, Side
 SEEDS = 8
 """The gathered product's check-1 seeds, the template's grouped products' count."""
 
+SIGNED_ENTRIES = np.asarray([-1, -200, 199, 230], np.int32)
+"""Table entries of 200 tokens a gather reads as `lhs[gather]` reads them (`mosaic_gpu._row_table`): the last
+token from the end, the first, the last, and past the last (clipped)."""
+
 
 def test_a_gathered_grouped_product_reads_each_row_where_its_table_says():
     """`a_gathered_product_is_on_par` on an H100, interpreted (each row a copy at its slot's swizzled row,
@@ -93,7 +97,8 @@ def a_gathered_product_is_on_par(interpret: bool = False, *, paired: bool = Fals
     def draw(seed):
         rng = np.random.default_rng(seed)
         tokens = rng.normal(size=(200, depth)).astype(jnp.bfloat16)
-        table = rng.permutation(np.concatenate([np.arange(150), rng.integers(0, 200, 106)])).astype(np.int32)
+        table = rng.permutation(np.concatenate([np.arange(150), rng.integers(0, 200, 102),
+                                                SIGNED_ENTRIES])).astype(np.int32)
         matrices = (rng.normal(size=(2, 4, depth, 256)) / np.sqrt(depth)).astype(jnp.bfloat16)
         slots = rng.permutation(256).astype(np.int32)
         return tokens, table, matrices, slots
@@ -398,7 +403,8 @@ def a_blackwells_gathered_product_is_its_gathered_rows_product(interpret_on_cpu:
     rng = np.random.default_rng(13)
     tokens = jnp.asarray(rng.integers(-1, 2, size=(200, 256)), jnp.bfloat16)
     matrices = jnp.asarray(rng.integers(-1, 2, size=(3, 256, 256)), jnp.bfloat16)
-    table = jnp.asarray(rng.integers(0, 200, 384), jnp.int32)
+    table = jnp.asarray(rng.permutation(np.concatenate([rng.integers(0, 200, 380), SIGNED_ENTRIES])),
+                        jnp.int32)
     slots = jnp.asarray(rng.permutation(384), jnp.int32)
     cotangent = jnp.asarray(rng.integers(-1, 2, size=(384, 256)), jnp.bfloat16)
     sizes = jnp.asarray([128, 0, 200], jnp.int32)
@@ -487,7 +493,7 @@ def test_a_gathered_products_table_covers_every_tile_its_schedule_walks():
     tiles = tiling.Tiles(128, 128, 64, 2, 1, warpgroups=2, family='wgmma')
     table = jnp.zeros((256,), jnp.int32)
     tokens = jnp.zeros((200, 128), jnp.bfloat16)
-    _, gathered, _, m, extent = mosaic_gpu._walked_rows(tokens, table, None, tiles, transpose_lhs=False,
+    _, gathered, _, m, extent, _ = mosaic_gpu._walked_rows(tokens, table, None, tiles, transpose_lhs=False,
                                                         dense=False, bounded=True)
     assert gathered.shape[0] == extent == row_tiles.row_extent(m, tiles.block_m) > m
 

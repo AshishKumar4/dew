@@ -42,10 +42,10 @@ from dew.algebra.shared_derived import (
     shared_component_10,
     shared_component_11,
     shared_component_19,
-    shared_component_26,
-    shared_component_33,
-    shared_component_39,
-    shared_component_40,
+    shared_component_27,
+    shared_component_34,
+    shared_component_41,
+    shared_component_42,
 )
 
 
@@ -239,8 +239,8 @@ def _scores_0(x1, x2, x3):
 
 
 def _selective_adjoint_0(x1, x2, x3, x4, x5, x6, x7, x8, x9):
-    v11, v13, v16 = shared_component_26(x1, x2, x3, x7, x5, x6, x9)
-    v18, v21, v22 = shared_component_39(x1, x5, x6, x3, x2, x4, x8, v11)
+    v11, v13, v16 = shared_component_27(x1, x2, x3, x7, x5, x6, x9)
+    v18, v21, v22 = shared_component_41(x1, x5, x6, x3, x2, x4, x8, v11)
     return (v13, v16, v18, v21, v22)
 
 
@@ -288,17 +288,17 @@ def _selective_dx_scale_0(x1, x2, x3):
 
 
 def _selective_lifted_adjoint_0(x1, x2, x3, x4, x5, x6, x7, x8, x9, x10):
-    v12, v14, v17 = shared_component_26(x1, x2, x3, x7, x10, x6, x9)
-    v19, v22, v23 = shared_component_39(x1, x5, x6, x3, x2, x4, x8, v12)
+    v12, v14, v17 = shared_component_27(x1, x2, x3, x7, x10, x6, x9)
+    v19, v22, v23 = shared_component_41(x1, x5, x6, x3, x2, x4, x8, v12)
     return (v14, v17, v19, v22, v23)
 
 
 def _selective_read_0(
         x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x12, x13, x14, x15, x16, x17, x18, x19, x20, x21, x22,
         x23, x24, x25, x26, x27, x28, x29, x30, x31, x32, x33, x34):
-    v35, v36, v37, v38, v39, v40, v41, v42 = shared_component_33(
+    v35, v36, v37, v38, v39, v40, v41, v42 = shared_component_34(
         x17, x1, x18, x2, x19, x3, x20, x4, x21, x5, x22, x6, x23, x7, x24, x8)
-    v43, v44, v45, v46, v47, v48, v49, v50 = shared_component_33(
+    v43, v44, v45, v46, v47, v48, v49, v50 = shared_component_34(
         x25, x9, x26, x10, x27, x11, x28, x12, x29, x13, x30, x14, x31, x15, x32, x16)
     v51 = lax.add_p.bind(v35, v36)
     v52 = lax.add_p.bind(v37, v38)
@@ -321,15 +321,15 @@ def _selective_read_0(
 
 
 def _selective_state_tangent_0(x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x12):
-    _, v16, v19 = shared_component_26(x3, x4, x5, x9, x12, x8, x11)
+    _, v16, v19 = shared_component_27(x3, x4, x5, x9, x12, x8, x11)
     v20 = lax.add_p.bind(x1, v16)
     v21 = lax.add_p.bind(x2, v19)
     return (v20, v21)
 
 
 def _selective_token_0(x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x12, x13, x14):
-    v17, v20 = shared_component_40(x13, x5, x6)
-    v23, v26 = shared_component_40(x13, x7, x8)
+    v17, v20 = shared_component_42(x13, x5, x6)
+    v23, v26 = shared_component_42(x13, x7, x8)
     v27 = lax.mul_p.bind(x13, x14, out_dtype=None)
     v30, v33 = shared_component_10(v17, x1, v27, x9, v20, x2, x10)
     v36, v39 = shared_component_10(v23, x3, v27, x11, v26, x4, x12)

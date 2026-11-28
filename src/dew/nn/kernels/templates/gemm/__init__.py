@@ -1,12 +1,14 @@
 """The grouped GEMM template's kernels: Pallas Mosaic GPU (`mosaic_gpu`) and TPU (`mosaic_tpu`), with the
 padding they and the Pallas-Triton dense kernels (`triton_dense`) lay their operands out in."""
 
+import math
 from collections.abc import Sequence
 
 import jax
 from jax import numpy as jnp
 from jax.core import Tracer
 
+from dew.nn.kernels.templates import copies
 from dew.nn.kernels.templates.axes import whole
 from dew.nn.sharding import automatic_axes, explicit_spec
 
@@ -36,9 +38,23 @@ def sides_padded(sides: Sequence[jax.Array], axes_of: Sequence[tuple[str, ...]],
 def sides_extended(sides: Sequence[jax.Array], axes_of: Sequence[tuple[str, ...]],
                    extent: int) -> tuple[jax.Array, ...]:
     """Each side operand (`sides_padded`'s) extended with zeros along the dimension that follows the rows to
-    `extent`, as the rows are; one that follows no rows as it is."""
-    return tuple(rows_extended(side, axes.index('rows'), extent) if 'rows' in axes else side
-                 for side, axes in zip(sides, axes_of, strict=True))
+    `extent`, as the rows are, or past it to the fewest rows whose strides a TMA copy of it takes
+    (`strided_rows`); one that follows no rows as it is."""
+    return tuple(rows_extended(side, axes.index('rows'), strided_rows(side, axes.index('rows'), extent))
+                 if 'rows' in axes else side for side, axes in zip(sides, axes_of, strict=True))
+
+
+def strided_rows(side: jax.Array, axis: int, extent: int) -> int:
+    """The fewest rows, `extent` at least, `side` takes along `axis` (its rows) for a TMA copy of it to
+    read it: every stride before its rows' a whole `copies.ROW_BYTES` (the toolkit's copy legality), each a
+    multiple of the rows' count times the bits of a row's dimensions past them. Train 1499's review K-F1: a
+    uint8 side of 128 columns by a decode's 8 rows, its rows its minor axis, held at those rows, had an
+    8-byte stride, which the copy refused, where the schedule's extent of 64 rows had padded it whole."""
+    if axis == 0:
+        return extent
+    unit = 8 * copies.ROW_BYTES
+    row_bits = math.prod(side.shape[axis + 1:]) * jax.dtypes.itemsize_bits(side.dtype)
+    return whole(extent, unit // math.gcd(unit, row_bits))
 
 
 def rows_permuted(x: jax.Array, permutation: jax.Array, axis: int = 0) -> jax.Array:

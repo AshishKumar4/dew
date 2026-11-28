@@ -118,8 +118,9 @@ def largest_magnitude(x: jax.Array, axis: int | tuple[int, ...] | None = None, *
     quantizing epilogue (`quantized._block_max`) read. Its derivative is a word's, zero: each reader takes it
     into a scale read from its bits (`fake_quant.fp8_block_scale`'s power of two, `formats.mxfp8_scale_bytes`'
     exponent), whose derivative is zero as the float maximum's was there, and `bits.nvfp4_coded`'s tensor
-    scale, a quotient of it, declares the maximum's own (`bits._nvfp4_amax`). A float64 one's words read in
-    x64 whatever x64 scope it is called in (outside one, a 64-bit word is two 32-bit ones)."""
+    scale and `fake_quant.fp8_block_cast`'s block scales, quotients of it, keep the maximum's own
+    (`fake_quant.largest_peak`). A float64 one's words read in x64 whatever x64 scope it is called in
+    (outside one, a 64-bit word is two 32-bit ones)."""
     with jax.enable_x64(new_val=True) if x.dtype == np.dtype(np.float64) else contextlib.nullcontext():
         peak = jnp.max(magnitude_words(x), axis=axis, keepdims=keepdims)
         return jax.lax.bitcast_convert_type(peak, x.dtype)

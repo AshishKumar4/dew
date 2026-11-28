@@ -195,6 +195,26 @@ def test_a_straight_through_rounding_holds_every_order(edge):
                     plain_fn=lambda x: x.astype(jnp.bfloat16).astype(x.dtype))
 
 
+@pytest.mark.parametrize("edge", EDGES)
+def test_a_largest_peak_holds_the_float_maximums_derivative_at_every_order(edge):
+    """`fake_quant.largest_peak` (a declared tangent): its value each row's largest magnitude by its words, a
+    NaN kept, its derivative the float maximum's, the cotangent shared among tied maxima as `jnp.max` shares
+    it, and every order finite wherever float64 is a normal float32 and the plain formula, the float
+    maximum of magnitudes as JAX writes it, is (row 14202)."""
+    from dew.nn.fake_quant import largest_peak
+
+    (x,) = normal_draw(14202, (4, 6), scale=EDGES[edge])
+    (direction,) = normal_draw(14203, x.shape, scale=EDGES[edge])
+    (cotangent,) = normal_draw(14204, (4,))
+    np.testing.assert_array_equal(np.asarray(largest_peak((1,), x)), np.asarray(jnp.max(jnp.abs(x), axis=1)))
+    assert np.isnan(np.asarray(largest_peak((1,), x.at[2, 3].set(jnp.nan)))[2])
+    tied = jnp.asarray([[3.0, -3.0, 1.0]], jnp.float32)
+    np.testing.assert_array_equal(np.asarray(jax.grad(lambda x: largest_peak((1,), x).sum())(tied)),
+                                  np.asarray([[0.5, -0.5, 0.0]], np.float32))
+    assert_contract(functools.partial(largest_peak, (1,)), (x,), (direction,), cotangent,
+                    f"a largest peak {edge}", plain_fn=lambda x: jnp.max(jnp.abs(x), axis=1))
+
+
 def plain_rms(x, epsilon: float = 1e-6):
     """x over its root mean square, the RMS norm as written."""
     return x / jnp.sqrt(jnp.mean(jnp.square(x), axis=-1, keepdims=True) + epsilon)

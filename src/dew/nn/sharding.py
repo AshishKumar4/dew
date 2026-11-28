@@ -50,6 +50,7 @@ import optax
 from flax import linen as nn
 from flax.typing import Initializer
 from jax._src import ad_util, config as jax_config, core as jax_core
+from jax._src.lax import lax as lax_internal
 from jax.core import ShapedArray
 
 from dew import _cache
@@ -69,6 +70,7 @@ from dew.mesh import (
     spec_axes,
 )
 from dew.nn.derivatives import formed_together_at
+from dew.nn.nested import staged
 
 if TYPE_CHECKING:
     from dew.nn.backbones.decoder_stack import DecoderBank, StackView
@@ -762,36 +764,51 @@ def placed_zeros(shape: tuple, dtype, sharding: jax.sharding.NamedSharding | Non
                  weak_type: bool = False) -> jax.Array:
     """Zeros of `shape` and `dtype` (a float64 one's outside x64 too; weak where `weak_type`), placed at
     `sharding`'s Explicit axes (a type's, or None) and made where they are read: Dew's one allocation of a
-    type's zeros (`precision._no_groups`, `factored`'s rescue; train 1490's review K-F2). Traced (JAX tracing,
-    or a tracer among `anchors`), under the placement's own abstract mesh, so it holds outside any mesh
-    context. Run eagerly, on the devices of `anchors`' named mesh, Explicit or Auto (the anchors of one
-    product share it), that concrete mesh entered for the allocation alone (an abstract mesh allocates on
-    none; JAX refuses one entered while tracing, where a jit's closure holds concrete anchors beside its
-    tracers: K-F1); else on the one device committed `anchors` lie on, committed there, as a product of them
-    would be; else JAX's default."""
-    leaves = jax.tree.leaves(anchors)
-    eager = jax_core.trace_state_clean() and not any(isinstance(leaf, jax_core.Tracer) for leaf in leaves)
-    meshes = [held for leaf in leaves if (held := concrete_mesh(leaf)) is not None] if eager else []
-    devices = {device for leaf in leaves if eager and isinstance(leaf, jax.Array) and leaf.committed
-               for device in leaf.devices()}
-    spec = None
-    if meshes:
-        # Its devices the mesh's, Explicit or Auto (its review); its placement `sharding`'s, any.
-        placed, spec = jax.set_mesh(meshes[0]), None if sharding is None else sharding.spec
-    elif sharding is not None and sharding.mesh.explicit_axes:
-        placed, spec = jax.sharding.use_abstract_mesh(sharding.mesh.abstract_mesh), sharding.spec
-    elif len(devices) == 1:
-        placed = jax.default_device(next(iter(devices)))
-    else:
-        placed = contextlib.nullcontext()
+    type's zeros (`precision._no_groups`, `factored`'s rescue, `xla_products._block_walk`; train 1490's
+    review K-F2). Within a staging trace (`nested.staged`: a jit's, a scan's, `jax.make_jaxpr`'s), a constant
+    under the placement's own abstract mesh, so it holds outside any mesh context and no mesh is entered
+    while JAX traces (train 1490's K-F1: a jit's closure holds concrete anchors beside its tracers). Run
+    eagerly, under an eager transformation too (`jax.jvp`, `jax.grad`, `jax.vmap`, `jax.disable_jit`), a
+    constant broadcast at the type's placement has no devices: an abstract mesh allocates on none, and an
+    eager `jax.jvp` makes a constant's symbolic zero tangent at that abstract mesh itself (train 1493's
+    K-F1, an empty Explicit bank outside `jax.set_mesh`). So there they are read from `anchors`
+    (`_read_none`): a sum over none of each one's values, there only for its placement and type, which
+    puts the zeros where a product of the anchors would lie (a named mesh's devices, Explicit or Auto; the
+    one device committed anchors lie on, committed there; else JAX's default) and gives them each
+    transformation's zero (a tangent the anchors' moves, a batch). It reads no value, so a NaN or an
+    infinity among them leaves the zeros +0."""
+    leaves = [leaf for leaf in jax.tree.leaves(anchors) if isinstance(leaf, jax.Array | jax_core.Tracer)
+              and not jnp.issubdtype(leaf.dtype, jax.dtypes.extended)]
+    explicit = sharding if sharding is not None and sharding.mesh.explicit_axes else None
+    spec = None if explicit is None else explicit.spec
+    placed = (contextlib.nullcontext() if explicit is None
+              else jax.sharding.use_abstract_mesh(explicit.mesh.abstract_mesh))
     narrowed = jax.dtypes.canonicalize_dtype(dtype) != jnp.dtype(dtype)
-    with jax.enable_x64(new_val=True) if narrowed else contextlib.nullcontext(), placed:
-        zero = ad_util.zeros_like_aval(ShapedArray((), jnp.dtype(dtype), weak_type=weak_type))
-        zeros = jax.lax.broadcast(zero, tuple(shape), out_sharding=spec)
-    if meshes or spec is not None or len(devices) != 1:
-        return zeros
-    # The one device's allocation, committed there without a copy.
-    return jax.device_put(zeros, devices.pop())
+    from dew.nn.precision import at_least_fp32  # it imports this module
+
+    # Its reads summed in a type every sum takes: no bool (theme 26's review: a product of bools' zeros), no
+    # float narrower than float32 (refused where `jax_allow_f16_reductions` is off: train 1509's K-F1).
+    named = jnp.dtype(dtype)
+    summed = (jnp.dtype(jnp.int32) if named == jnp.bool_
+              else at_least_fp32(named) if jnp.issubdtype(named, jnp.floating) else named)
+    with jax.enable_x64(new_val=True) if narrowed else contextlib.nullcontext():
+        # Made outside the placement's mesh: a constant of no mesh, which no eager call need place.
+        zero = ad_util.zeros_like_aval(ShapedArray((), summed, weak_type=weak_type))
+        with placed:
+            if not staged():
+                for leaf in leaves:
+                    zero = jax.lax.add(zero, _read_none(leaf, zero))
+            if summed != jnp.dtype(dtype):
+                zero = lax_internal._convert_element_type(zero, jnp.dtype(dtype), weak_type=weak_type)
+            return jax.lax.broadcast(zero, tuple(shape), out_sharding=spec)
+
+
+def _read_none(anchor, zero: jax.Array) -> jax.Array:
+    """A sum over none of `anchor`'s values, typed as `zero` is (its dtype and weakness): `anchor` broadcast
+    to no rows and summed, a zero that lies where `anchor` lies and moves as it does (`placed_zeros`)."""
+    typed = lax_internal._convert_element_type(jax.lax.broadcast(anchor, (0,)), zero.dtype,
+                                               weak_type=jax.typeof(zero).weak_type)
+    return jax.lax.reduce_sum(typed, tuple(range(jnp.ndim(anchor) + 1)))
 
 
 def explicit_placement(aval: ShapedArray) -> jax.sharding.NamedSharding | None:

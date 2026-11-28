@@ -17,7 +17,7 @@ import ml_dtypes
 import numpy as np
 from flax import linen as nn
 
-from dew.nn.derivatives import contracted, surrogate
+from dew.nn.derivatives import Protected, contracted, declared_tangent, surrogate
 from dew.nn.float_bits import exact_power2, largest_magnitude, raw_fields
 from dew.nn.precision import at_least_fp32, correctly_rounded_divide, divided
 
@@ -123,6 +123,28 @@ bf16 wherever the quantizer clamped far from `x`, and turn a -0 into +0. The est
 release is inference code and the paper names none."""
 
 
+def _peak(axis, x):
+    """`x`'s largest magnitude along `axis` by its words (`largest_magnitude`)."""
+    return largest_magnitude(x, axis)
+
+
+def _peak_tangent(axis, primals, tangents):
+    (x,), (moved,) = primals, tangents
+    # The float maximum's derivative, its tie pullback jnp.max's own (the cotangent shared among tied maxima).
+    _, tangent = jax.jvp(lambda x: jnp.max(jnp.abs(x), axis=axis), (x,), (moved,))
+    return largest_peak(axis, x), tangent
+
+
+largest_peak = contracted("test_a_largest_peak_holds_the_float_maximums_derivative_at_every_order")(
+    declared_tangent(Protected(), _peak, _peak_tangent, nondiff_argnums=(0,)))
+"""`x`'s largest magnitude along `axis` (an int, a tuple of them, or None for every axis): its words'
+(`float_bits.largest_magnitude`), exact at every width on every platform, a NaN above every magnitude
+where XLA:CPU's YNNPACK float maximum drops one (row 14083), with the float maximum's derivative, declared
+(row 14202): its tangent the moved maximum's, shared among tied maxima as `jnp.max`'s. A block scale read
+from it (`fp8_block_cast`'s, `algebra.bits.nvfp4_coded`'s tensor scale) keeps that scale's derivative,
+where a word maximum's alone is zero."""
+
+
 def fp8_block_scale(amax):
     """A block's power-of-two FP8 scale from its largest magnitude `amax` (act_quant with scale_fmt ue8m0,
     kernel.py:40-124): amax floored at `AMAX_FLOOR`, the scale the ceiling power of two of amax / 448; the
@@ -159,8 +181,32 @@ def _converted(clipped):
     ties it to 1.0); its derivative zero, the rounding's (`_round_e4m3fn`'s `lax.round`), where the casts'
     own would pass the tangent through (train 1495's review K-F1: `jvp` of `MxFp8.quantized(x).decoded()`
     on CUDA gave ones for zeros). A rounding's straight-through estimate is its caller's (`fp8_rounded`)."""
-    return jax.lax.stop_gradient(
-        jax.lax.optimization_barrier(clipped.astype(jnp.float8_e4m3fn)).astype(jnp.float32))
+    return jax.lax.stop_gradient(_held_codes(clipped.astype(jnp.float8_e4m3fn)).astype(jnp.float32))
+
+
+def _held_codes(codes):
+    """E4M3 `codes` through an optimization barrier (`fp8_codes`' CUDA branch), held four to a uint32 word,
+    a code's byte at its place's (little-endian, as a bitcast reads the word back), where the last axis holds
+    whole words, then read back by bitcasts: the fusion forming them writes words, which XLA's loop emitter
+    takes four a thread as it takes codes, so each thread forms sixteen codes and stores sixteen bytes. Codes
+    written as codes ran four a thread in 128-thread blocks: 7,340,032 blocks for a 256 x 7168 x 2048 bank's
+    natural codes, where its K-major codes' transposing fusion, the same arithmetic at 32 a thread, ran
+    917,504 (sm90 compile, probe e2365886982), 5.1 against 3.05 ms on a GH200 (M-NG-75; row 14171). A
+    `bitcast_convert_type` to words XLA folds into a bitcast of the codes, the emitter's unchanged (probe
+    7ef36fb389); the shifts and ors (`algebra.bits.packed`'s, the one packing of codes into words) keep the
+    words its output."""
+    from dew.algebra.bits import E4M3, packed  # it imports this module's constants
+    from dew.nn.sharding import explicit_spec
+
+    shape = codes.shape
+    placed = explicit_spec(codes)
+    if not shape or shape[-1] % E4M3.codes_per_word or (placed is not None and placed.spec[-1] is not None):
+        # A last axis of no whole words, or one an Explicit axis splits (its shards' words a reshape of the
+        # split axis JAX may refuse to place, the head review of 38e98e841), as codes.
+        return jax.lax.optimization_barrier(codes)
+    held = jax.lax.optimization_barrier(packed(jax.lax.bitcast_convert_type(codes, jnp.uint8), E4M3))
+    return jax.lax.bitcast_convert_type(jax.lax.bitcast_convert_type(held, jnp.uint8).reshape(shape),
+                                        jnp.float8_e4m3fn)
 
 
 def fp4_codes(values):
@@ -263,7 +309,7 @@ def fp8_blocks_on_host(weight, block: Block, *, rounded=np.asarray) -> tuple[np.
             f"with it")
     rows, cols = block_sides(block)
     codes, scale_inv = _cast_blocks(values, rows, cols, xp=np, divide=np.divide, rounded=rounded,
-                                    coded=np.asarray)
+                                    coded=np.asarray, peak=lambda axis, x: np.max(np.abs(x), axis=axis))
     # A contiguous copy: sliced off the padding, the codes are a view whose buffer a writer taking it would
     # read as the padded rows.
     return np.ascontiguousarray(codes), scale_inv
@@ -279,18 +325,19 @@ def fp8_block_cast(x, block: Block) -> tuple[jax.Array, jax.Array]:
     # then holds exactly: XLA GPU's default excess precision deletes a bare f32 -> E4M3 -> f32 convert pair,
     # and XLA:CPU converts a hoisted small loop's narrow floats through float16, rounding twice.
     return _cast_blocks(jnp.asarray(x, jnp.float32), rows, cols, xp=jnp, divide=correctly_rounded_divide,
-                        rounded=jnp.asarray, coded=fp8_codes)
+                        rounded=jnp.asarray, coded=fp8_codes, peak=largest_peak)
 
 
-def _cast_blocks(values, rows: int, cols: int, *, xp, divide, rounded, coded):
+def _cast_blocks(values, rows: int, cols: int, *, xp, divide, rounded, coded, peak):
     """The FP8 block cast of a float32 `values` matrix under `xp`, NumPy or jax.numpy, dividing by `divide`,
     rounding each block's scale by `rounded` and each value over it to E4M3 by `coded` before the cast:
-    `per_block_cast_to_fp8`'s rule, its 1e-4 amax floor `AMAX_FLOOR`. Its block maximum the float one's, whose
-    derivative the traced cast's scale keeps (a word maximum's is zero: the head review of a5929cace9)."""
+    `per_block_cast_to_fp8`'s rule, its 1e-4 amax floor `AMAX_FLOOR`. Each block's maximum is `peak(axis,
+    tiles)`'s: on the host NumPy's float one, which keeps a NaN; traced, `largest_peak`, which keeps it on
+    every backend and declares the float maximum's derivative, which the scale keeps (row 14202)."""
     height, width = values.shape
     padded = xp.pad(values, ((0, -height % rows), (0, -width % cols)))
     tiles = padded.reshape(padded.shape[0] // rows, rows, padded.shape[1] // cols, cols)
-    amax = xp.maximum(xp.max(xp.abs(tiles), axis=(1, 3)), xp.float32(AMAX_FLOOR))
+    amax = xp.maximum(peak((1, 3), tiles), xp.float32(AMAX_FLOOR))
     scale_inv = rounded(divide(amax, xp.float32(E4M3_MAX)))
     # One reciprocal per block, as the reference takes it.
     codes = coded(tiles * divide(xp.float32(1.0), scale_inv)[:, None, :, None]).astype(
