@@ -57,6 +57,43 @@ NO_HOOK = Hook()
 """No hook at a site."""
 
 
+@jax.tree_util.register_dataclass
+@dataclasses.dataclass(frozen=True)
+class RowHook:
+    """A row hook: an epilogue a launch runs over each of its tile's rows whole, where its tile's columns come
+    a block at a time (a recurrence's output launch's value blocks, `templates.recurrence.output`): its
+    `statistic(block_tile, *read_tiles) -> [rows]`, fp32 partials the launch sums across its walk's steps
+    (summation the only combiner: another combiner is another seam), and its `fn(block_tile, total,
+    *side_tiles) -> out_tile`, applied to each block past the walk with every block's total. Both static, as
+    `Hook.fn`, its `sides` (`Side`s on `SIDE_AXES`, a side's tile its block on the tile's rows and columns)
+    loaded at each block, the launch resolving each axis a side names (its head's where it names 'heads', the
+    block's columns its head's own) and none it does not. The launch owns the carry, the staging and the read
+    past the walk; a row hook holds no launch's facts. A launch keys its build by the two functions (each a
+    frozen dataclass of its form, so two forms key apart)."""
+
+    statistic: Callable = dataclasses.field(metadata={"static": True})
+    fn: Callable = dataclasses.field(metadata={"static": True})
+    sides: tuple[Side, ...] = ()
+    reads: tuple[int, ...] = dataclasses.field(default=(), metadata={"static": True})
+    """The sides its statistic reads, by their places in `sides` (its `fn` reads every one): a launch loads
+    no other at a step."""
+
+    TILE = ('rows', 'columns')
+    """The axes of a row hook's tile: a block's rows and columns."""
+
+    SIDE_AXES = ('rows', 'heads', 'columns')
+    """The axes a side lays its operand on: the tile's rows, the launch's heads and a head's columns."""
+
+    def __post_init__(self):
+        # A side's axes some of `SIDE_AXES` in its order, each once, its columns among them: a launch loads
+        # its tile in the block's own layout, rows before columns.
+        for side in self.sides:
+            if tuple(side.axes) != tuple(axis for axis in self.SIDE_AXES if axis in side.axes) \
+                    or 'columns' not in side.axes:
+                raise ValueError(f"a row hook's side lies on its columns and some of {self.SIDE_AXES} in "
+                                 f"that order, each once, not {side.axes}")
+
+
 def laid(tile: Sequence[str], axes: Sequence[str | None], extents: Mapping[str, int]) -> tuple[int, ...]:
     """The shape of a tile of a side operand on `axes` as a site whose tile is on `tile` lays it: along each
     of the tile's axes the side's extent there (`extents`) where it follows it, else one, so it broadcasts

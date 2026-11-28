@@ -40,57 +40,68 @@ sums over all of them."""
 
 
 def assert_split_as_whole(module, variables, row: str, seeds: int, site: str, *, width: int, shards: int = 4,
-                          tensor: int = 1):
+                          tensor: int = 1, forward: bool = False):
     """Under a sequence axis of `shards` (beside a tensor axis of `tensor`, which splits its heads where it
     divides them), `module` with `variables` runs the rows `SPLIT_ROWS[row]` as it runs them on one device: a
     padded slot neither reads nor advances the conv or the state, each real token's conv reading the real
     tokens before it in its document across gaps and shards, and padded slots emit zero. Output and input
     gradient are check 1's against the unsplit layer, from float64, over `seeds` draws of hidden states
-    `width` wide, and so are the parameters' gradients."""
+    `width` wide, and so are the parameters' gradients; `forward`, the output's tangent along a drawn
+    direction over the parameters instead (`assert_as_on_one_device`)."""
     valid, segments = SPLIT_ROWS[row]
     fields = {"valid": jnp.asarray(np.broadcast_to(valid, (SPLIT_BATCH, 32)))}
     if segments is not None:
         fields["segments"] = jnp.asarray(np.broadcast_to(segments, (SPLIT_BATCH, 32)), jnp.int32)
     call = MixerCall(AttentionMetadata(coordinates=coordinates(**fields)))
     split, draw = assert_as_on_one_device(module, variables, call, (SPLIT_BATCH, 32, width), seeds, site,
-                                          shards=shards, tensor=tensor)
+                                          shards=shards, tensor=tensor, forward=forward)
     assert not np.any(np.asarray(split(*draw(0))[0])[:, ~valid])
 
 
 def assert_as_on_one_device(module, variables, call: MixerCall, shape: tuple[int, int, int], seeds: int,
-                            site: str, *, shards: int = 4, tensor: int = 1):
+                            site: str, *, shards: int = 4, tensor: int = 1, forward: bool = False):
     """Under a sequence axis of `shards` and a tensor axis of `tensor`, `module` with `variables` called with
     `call` over hidden states of `shape` `[B, S, width]` computes as on one device: its output and its input's
-    and parameters' gradients check 1's against the same call on one device, from float64, over `seeds` draws.
-    Returns the call on the axis, `(hidden, cotangent) -> (output, parameters' gradient, hidden's gradient)`,
-    and the draw of a seed's `(hidden, cotangent)`."""
+    and parameters' gradients check 1's against the same call on one device, from float64, over `seeds` draws;
+    `forward`, its output and that output's tangent along a direction over every parameter (`jax.jvp`).
+    Returns the call on the axis, `(hidden, cotangent) -> (output, parameters' gradient, hidden's gradient)`
+    (`(hidden, *direction's leaves) -> (output, tangent)` where `forward`), and the draw of a seed's
+    operands."""
+    leaves, tree = jax.tree.flatten(variables)
+
     def draw(seed):
         rng = np.random.default_rng([0x5E9, seed])
-        return (rng.standard_normal(shape).astype(np.float32), rng.standard_normal(shape).astype(np.float32))
+        hidden = rng.standard_normal(shape).astype(np.float32)
+        if forward:
+            return (hidden, *(rng.standard_normal(np.shape(leaf)).astype(np.asarray(leaf).dtype)
+                              for leaf in leaves))
+        return hidden, rng.standard_normal(shape).astype(np.float32)
 
-    def pulled(model):
-        """The layer's output and its pullback of a cotangent, `model` over `params`, compiled once for
-        every draw."""
-        def run(params, hidden, cotangent):
+    def derived(model):
+        """The layer's output and its pullback of a cotangent (or its tangent along a direction over the
+        parameters, `forward`), `model` over `params`, compiled once for every draw."""
+        def run(params, hidden, *given):
+            if forward:
+                return jax.jvp(lambda params: model.apply(params, hidden, call), (params,),
+                               (jax.tree.unflatten(tree, given),))
             out, pull = jax.vjp(lambda params, hidden: model.apply(params, hidden, call), params, hidden)
-            return out, *pull(cotangent)
+            return out, *pull(*given)
         return jax.jit(run)
 
-    whole, split_run, wide = pulled(module), pulled(module), pulled(module.clone(dtype=jnp.float64))
+    whole, split_run, wide = derived(module), derived(module), derived(module.clone(dtype=jnp.float64))
     mesh = MeshSpec(sequence=shards, tensor=tensor).build(jax.devices()[:shards * tensor])
 
     @as_given
-    def split(hidden, cotangent):
+    def split(*given):
         with jax.set_mesh(mesh):
-            return split_run(variables, hidden, cotangent)
+            return split_run(variables, *given)
 
     @as_given
-    def truth(hidden, cotangent):
+    def truth(*given):
         with jax.enable_x64(new_val=True):
-            return wide(*widened((variables, hidden, cotangent)))
+            return wide(*widened((variables, *given)))
 
-    assert_as_exact(split, lambda hidden, cotangent: whole(variables, hidden, cotangent), draw, site,
-                    seeds=seeds, truth_fn=truth)
+    assert_as_exact(split, lambda *given: whole(variables, *given), draw, site, seeds=seeds, truth_fn=truth)
     return split, draw
 
 

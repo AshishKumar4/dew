@@ -32,7 +32,7 @@ from dew.nn.kernels.templates.recurrence.mainloop import (
     padded_widths,
     per_key_refusal,
 )
-from dew.nn.kernels.templates.recurrence.output import output_launch
+from dew.nn.kernels.templates.recurrence.output import Normed, output_launch
 from dew.nn.kernels.templates.recurrence.table import Table, turning_rows
 
 _OBSERVED: contextvars.ContextVar[list[Call] | None] = contextvars.ContextVar(
@@ -164,7 +164,8 @@ def forward(q, k, v, g, beta, h0=None, *, tiles: Tiles, starts=None, firsts=None
             rounded: bool = False, apart: int = 0, values_gated: bool = False, unit_pairs: bool = False,
             decay_bound: float | None = None,
                 ranged: bool = False, skip=None,
-            forked: ForkedTable | None = None, reads=None):
+            forked: ForkedTable | None = None, reads=None, normed: recurrence.OutputNorm | None = None,
+            gate=None, weight=None):
     """The chunked rule's forward on this mainloop: `(o [B, T, HV, Dv], final [B, HV, Dk, Dv])` for `q`, `k`
     `[B, T, H, Dk]`, `v` `[B, T, HV, Dv]`, the natural log decay `g`, a head's `[B, T, HV]` (the gated delta
     rule) or a key dimension's `[B, T, HV, Dk]` (Kimi delta attention), the write gate `beta` `[B, T, HV]` and
@@ -193,14 +194,16 @@ def forward(q, k, v, g, beta, h0=None, *, tiles: Tiles, starts=None, firsts=None
     given (`recurrence.Hooks.erase` 'read', the preconditioned delta rules'): `S' = (I - beta k b^T) D S +
     beta k v^T`, the system's rows and the weights the reads' (`beta b k^T`, `w = X (b beta exp g)`), the
     memory's writes and the scores the keys' (`_solved`; under a decay a key dimension `_paired` and
-    `_key_weighted`)."""
+    `_key_weighted`). Where `normed` (`recurrence.OutputNorm`) is given, the output leaves through the gated
+    RMS norm in the output launch's epilogue (`output.Normed`), its gate `gate` `[B, T, HV, Dv]` and `weight`
+    `[Dv]`, in the operands' dtype."""
     out, final, _ = kept_forward(q, k, v, g, beta, h0, starts=starts, firsts=firsts,
                                  max_segments=max_segments, scale=scale, delta=delta, tiles=tiles, wide=wide,
                                  family=family, interpret=interpret, keeps=False,
                                  rounded=rounded, apart=apart, values_gated=values_gated,
                                  unit_pairs=unit_pairs,
                                  decay_bound=decay_bound, ranged=ranged, skip=skip, forked=forked,
-                                 reads=reads)
+                                 reads=reads, normed=normed, gate=gate, weight=weight)
     return out, final
 
 
@@ -213,7 +216,8 @@ def kept_forward(q, k, v, g, beta, h0=None, *, tiles: Tiles, starts=None, firsts
                  decay_bound: float | None = None,
                      ranged: bool = False,
                  skip=None, forked: ForkedTable | None = None,
-                 reads=None) -> tuple[jax.Array, jax.Array, tuple]:
+                 reads=None, normed: recurrence.OutputNorm | None = None, gate=None,
+                 weight=None) -> tuple:
     """`forward`'s `(o, final)` and what the fast backward takes rather than compute again
     (`mainloop_backward.gradients`' `inverse` and `kept`): each chunk's inverse under a decay a head
     (`_solved`'s, None otherwise or where the call `keeps` none, `forward`'s), as fla's backward keeps its
@@ -221,7 +225,10 @@ def kept_forward(q, k, v, g, beta, h0=None, *, tiles: Tiles, starts=None, firsts
     a decay a key dimension its prefix, `(w, h, corrected, stored, prefix)`, which the port keeps unless a
     remat rung recomputes them (`residuals.RECOMPUTED`), the caller's choice: the prefix, kept as fla_kda
     keeps its decay's cumulative sum, spares the backward's intra walk its launch, Kimi Linear's 162 us of an
-    A100's 8056 us training (M-JS-212)."""
+    A100's 8056 us training (M-JS-212). Where `normed` is given (`forward`'s), the output is the epilogue's,
+    and where the call `keeps` its residuals `(normalized, read back)`: the output the norm read, in its
+    `read_in` dtype, which the norm's backward takes (`template.mosaic_rule`)."""
+    assert normed is None or skip is None or not delta, "an epilogue follows a skip the output launch adds"
     run = prepared(q, k, v, g, beta, h0, starts=starts, max_segments=max_segments, scale=scale, delta=delta,
                    tiles=tiles, family=family, interpret=interpret, keeps=keeps, firsts=firsts,
                    rounded=rounded, apart=apart, values_gated=values_gated, unit_pairs=unit_pairs,
@@ -232,10 +239,31 @@ def kept_forward(q, k, v, g, beta, h0=None, *, tiles: Tiles, starts=None, firsts
     # The skip in the launch that holds the values as given (`Call.gated_keys`); where they hold them gated,
     # added to the output after it, landed fp32 (the output rounded once).
     fused = skip if call.gated_keys else None
+    epilogue, sides = None, ()
+    if normed is not None:
+        # The norm a row hook over the head's real values (`recurrence.norm_row_hook`): its gate laid as the
+        # output's rows and heads are, its weight every head's, each padded to the launch's value width.
+        columns = call.value_width
+        assert gate is not None and weight is not None, "an epilogue reads its gate and weight"
+        hook = recurrence.norm_row_hook(normed, run.value_width, out_dtype,
+                                        run.laid(zero_padded(gate, 3, columns)).reshape(call.rows, call.heads,
+                                                                                         columns),
+                                        zero_padded(weight, 0, columns).astype(jnp.float32))
+        epilogue = Normed.of(hook, jnp.dtype(normed.read_in or jnp.float32).name, kept=keeps)
+        sides = tuple(side.value for side in hook.sides)
     o = output_launch(run.q, run.k, run.h, run.corrected, run.prefix, run.taken, run.beta, call, tiles,
-                      scale=run.scale, out_dtype=out_dtype, scores=run.scores, skip=fused)
+                      scale=run.scale, out_dtype=out_dtype, scores=run.scores, skip=fused, normed=epilogue,
+                      sides=sides)
     final = run.final
-    o = run.unlaid(o.reshape(call.rows, call.heads, call.value_width))[..., :run.value_width]
+
+    def unlaid(o):
+        return run.unlaid(o.reshape(call.rows, call.heads, call.value_width))[..., :run.value_width]
+
+    if epilogue is not None:
+        assert fused is not None or skip is None, "the epilogue follows the skip"
+        return (tuple(map(unlaid, o)) if epilogue.kept else unlaid(o)), final, (
+            run.a, (run.w, run.h, run.corrected, run.stored, run.prefix if call.per_key else None))
+    o = unlaid(o)
     if fused is None and skip is not None:
         o = recurrence.skip_added(o, skip, v, jnp.float32).astype(jnp.float32 if wide else run.dtype)
     assert final is not None, "a forward runs its states launch"

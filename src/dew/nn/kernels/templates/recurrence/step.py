@@ -28,7 +28,7 @@ from dew.nn.precision import (
     accurate_exp,
     activation_and_slope,
     logistic_value,
-    rms_weighted,
+    rms_of_total,
     softplus_series,
 )
 
@@ -136,8 +136,9 @@ def _launched(hooks: recurrence.Hooks, operands: recurrence.Step, *, dtype, fami
     (`tuning.lowered_once`), as a model's layers' identical steps share it."""
     given = recurrence.read(hooks, operands)
     state = given['state']
-    # A row's entry a head, `[rows, Hv]`, as the token's step takes its write gate and scalar decay.
-    for name in ('beta', 'gate') + (('log_decay',) if hooks.decay == 'scalar' else ()):
+    # A row's entry a head, `[rows, Hv]`, as the token's step takes its write gate and scalar decay (a key
+    # dimension's gates and decay a row's vector a head, `[rows, Hv, Dk]`, as they come).
+    for name in ('beta',) + (('gate', 'log_decay') if hooks.decay == 'scalar' else ()):
         if name in given:
             given[name] = given[name].reshape(state.shape[0], -1)
     rows, value_heads, key_width, value_width = state.shape
@@ -300,7 +301,7 @@ def _program(hooks, inputs, active_ref, state_out, moved, out_ref, scratch, *, b
         mosaic.synced(interpret)
         out = _stepped(hooks, state_ref, state_out, value, vectors, token.per_head(writes), token, halves,
                        interpret=interpret)
-        out = _epilogue(hooks, inputs, token, out, value, exchanged, interpret=interpret)
+        out = _epilogue(hooks, inputs, token, out, value, exchanged, dtype=out_ref.dtype, interpret=interpret)
         halves.first(lambda: token.stored(out_ref, out))
 
     @pl.when(active_ref[token.row] == 0)
@@ -441,13 +442,23 @@ def _gates(hooks, inputs, row, head, layout):
         """A head's entry (`[Hv]`), fp32."""
         return inputs[name][head].astype(jnp.float32)
 
+    def keyed(ref):
+        """A key dimension's vector of `ref` in `layout`, fp32."""
+        return plgpu.load(ref, layout=layout, optimized=False).astype(jnp.float32)
+
     one = jnp.float32(1.0)
     if hooks.gates is not None:
-        rate = softplus_series(scalar('gate') + headed('bias'))
-        if hooks.gates.limit is not None:
-            rate = jnp.clip(rate, *hooks.gates.limit)
-        decay = accurate_exp(-accurate_exp(headed('log_a')) * rate)
-        return decay, rate if hooks.gates.write == 'step' else logistic_value(scalar('beta'))
+        # The gates' one law (`recurrence.gate_law`) in registers: a head's gate, or each key dimension's
+        # over the head's rate.
+        if hooks.decay == 'vector':
+            gate, bias = keyed(inputs['gate'].at[row, head]), keyed(inputs['bias'].at[head])
+        else:
+            gate, bias = scalar('gate'), headed('bias')
+        beta = scalar('beta') if hooks.gates.write == 'sigmoid' else None
+        log_decay, write = recurrence.gate_law(hooks.gates, gate, headed('log_a'), bias, beta,
+                                               exp=accurate_exp, softplus_of=softplus_series,
+                                               logistic_of=logistic_value)
+        return accurate_exp(log_decay), write
     if hooks.rated:
         write = scalar('beta')
         return jnp.exp(headed('rate') * write), write
@@ -455,8 +466,7 @@ def _gates(hooks, inputs, row, head, layout):
     if hooks.decay == 'none':
         return one, write
     if hooks.decay == 'vector':
-        decay = plgpu.load(inputs['log_decay'].at[row, head], layout=layout, optimized=False)
-        return jnp.exp(decay.astype(jnp.float32)), write
+        return jnp.exp(keyed(inputs['log_decay'].at[row, head])), write
     return jnp.exp(scalar('log_decay')), write
 
 
@@ -590,21 +600,31 @@ def _tree_added(partials: tuple, index, term) -> tuple:
     return tuple(found)
 
 
-def _epilogue(hooks, inputs, token: _Token, out, value, exchanged, *, interpret: bool):
+def _epilogue(hooks, inputs, token: _Token, out, value, exchanged, *, dtype, interpret: bool):
     """The token's output past the update: its skip and its gated norm over the head's columns (a block of
     one head a warpgroup wide, `fits`), read back first in the norm's `read_in`, as
-    `recurrence.step_reference`'s epilogue (`recurrence.skipped`, `recurrence.normed`)."""
+    `recurrence.step_reference`'s epilogue (`recurrence.skipped`, `recurrence.normed`), a form rounding its
+    normalized rows rounding them to the output's `dtype`."""
     if hooks.skip:
         out = out + token.per_head([inputs['skip'][head].astype(jnp.float32) for head in token.heads]) * value
     if hooks.output is None:
         return out
-    if hooks.output.read_in is not None:
-        out = out.astype(hooks.output.read_in).astype(jnp.float32)
+    norm = hooks.output
+    if norm.read_in is not None:
+        out = out.astype(norm.read_in).astype(jnp.float32)
     gate = token.tile(inputs['z'])
     weight = plgpu.load(inputs['weight'].at[pl.ds(0, 1), token.columns], layout=token.block.layout,
                         optimized=False).astype(jnp.float32)
-    # As `precision.rms_statistics` takes it: the sum times the count's reciprocal, over a head's columns.
-    total = scan.summed((out * out).reshape(-1), exchanged, interpret=interpret)
-    mean = total * (1.0 / token.block.columns)
-    return rms_weighted(out, lax.rsqrt(mean + hooks.output.epsilon), weight=weight,
-                        gate=activation_and_slope(gate, hooks.output.activation)[0])
+
+    def activate(gate):
+        return activation_and_slope(gate, norm.activation)[0]
+
+    # Each form as the layers' gated norms compute it (`recurrence.gated_norm_rows`), its statistics as
+    # `precision.rms_statistics` takes them, over a head's columns (`rms_of_total`), its rows rounded to the
+    # token's output dtype where the form rounds them.
+    rows = recurrence.gated_rows(norm, out, gate, activate=activate)
+    total = scan.summed((rows * rows).reshape(-1), exchanged, interpret=interpret)
+    _, inverse = rms_of_total(total, token.block.columns, norm.epsilon)
+    rounded_in = dtype if norm.rounded else jnp.float32
+    return recurrence.gated_norm_rows(norm, rows, inverse, gate, weight, rounded_in,
+                                      activate=activate).astype(jnp.float32)

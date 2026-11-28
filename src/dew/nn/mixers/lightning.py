@@ -30,7 +30,6 @@ import jax.numpy as jnp
 import numpy as np
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
-from jax.ad_checkpoint import checkpoint_name
 
 from dew.nn.activations import logistic, silu
 from dew.nn.dense import Dense
@@ -43,7 +42,7 @@ from dew.nn.linear import Heads, fork_start, forked_scan, over_sequence, sequenc
 from dew.nn.mixer_base import MixerBase, MixerContext
 from dew.nn.norms import RMSNorm
 from dew.nn.precision import at_least_fp32, float32_dot_general
-from dew.nn.residuals import Residual
+from dew.nn.residuals import Residual, recurrence_output
 
 LIGHTNING = recurrence.Hooks(decay='scalar', delta=False)
 """The recurrence's form: one log decay a head, no delta rule, no write gate, no scale."""
@@ -202,7 +201,7 @@ class LightningAttention(nn.Module):
                 # The memory kept in the cache's dtype, as it always was.
                 kept(held, final.astype(held.value.dtype), STATE)
         # The recurrence's output under both names a remat policy reads it by (`RESIDUALS`).
-        out = checkpoint_name(checkpoint_name(out, Residual.SCAN), Residual.CONTEXT)
+        out = recurrence_output(out)
         out = self.norm(out.reshape(batch, length, self.features).astype(qkv.dtype))
         return self.out_proj(logistic(self.output_gate(x)) * out)
 

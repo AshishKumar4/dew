@@ -454,8 +454,8 @@ class NormCase:
     and whether it is `empty`; whether its weight is a vector over the features (`scale_fits`), a
     residual branch is the input's shape and dtype (`branch_fits`) and a gate its shape
     (`gate_fits`), and its operands' mesh placement fits (`placed`); whether an activation the kernel does
-    not apply follows it (`activated`: none `elementwise`), its statistics are fp32's, and a gated norm's
-    `activation` (None for a plain one)."""
+    not apply follows it (`activated`: none `elementwise`), its statistics are fp32's, a gated norm's
+    `activation` (None for a plain one) and its `form` (`GATED_FORMS`)."""
     dtypes: tuple[np.dtype, ...]
     width: int
     empty: bool
@@ -466,6 +466,11 @@ class NormCase:
     activated: bool
     fp32_statistics: bool
     activation: str | None
+    form: str = 'gate after'
+
+    def __post_init__(self):
+        if self.form not in GATED_FORMS:
+            raise ValueError(f"a gated norm's form is one of {GATED_FORMS}, not {self.form!r}")
 
     @property
     def cell(self) -> tuple[str, "NormRows"]:
@@ -483,8 +488,14 @@ class NormRows(NamedTuple):
     narrow: bool
 
 
+GATED_FORMS = ('gate after', 'gate after, rounded', 'gate first', 'gate first, rounded')
+"""A gated norm's forms (`dew.nn.kernels.recurrence.OutputNorm`): its gate after the weighted norm
+(Qwen3-Next's) or before the norm (Mamba-2's), its weight wide or after the normalized rows round to the
+output's dtype. The kernel computes the first alone."""
+
+
 def norm_case(x, scale, dtype, axes, *, branch=None, gate=None, epilogue=None, fp32_statistics=True,
-              activation=None) -> NormCase:
+              activation=None, form: str = 'gate after') -> NormCase:
     """The `NormCase` of a norm over `x` and its weight `scale`, a residual `branch`, a `gate` and an
     activation after it (`epilogue`, None for none). A branch adds in `x`'s dtype, as the stream's own add
     does; a gate is read in fp32 whatever its float dtype, as the XLA arithmetic widens it."""
@@ -497,7 +508,7 @@ def norm_case(x, scale, dtype, axes, *, branch=None, gate=None, epilogue=None, f
         gate_fits=gate is None or gate.shape == x.shape,
         placed=_placed((x, scale, branch, gate), _shard_spec(axes, x), whole_last=True),
         activated=epilogue is not None and not elementwise(epilogue, x.shape),
-        fp32_statistics=fp32_statistics, activation=activation)
+        fp32_statistics=fp32_statistics, activation=activation, form=form)
 
 
 NORM_SUPPORTS: tuple[Requirement[NormCase], ...] = (
@@ -510,6 +521,9 @@ NORM_SUPPORTS: tuple[Requirement[NormCase], ...] = (
                 row=INHERENT),
     Requirement('gate_activation', lambda case: case.activation in (None, 'silu', 'sigmoid'),
                 lambda case: f"the gated kernel gates by silu or sigmoid, not {case.activation!r}",
+                row=INHERENT),
+    Requirement('form', lambda case: case.form == 'gate after',
+                lambda case: f"the gated kernel gates after the norm and weighs wide, not {case.form!r}",
                 row=INHERENT),
     *_dtype_requirements('RMSNorm', NormCase),
     Requirement('empty', lambda case: not case.empty, "RMSNorm needs nonempty rows with a feature axis",
@@ -584,10 +598,11 @@ def rms_kernel(implementation: str, x, scale, dtype, fp32_statistics: bool, *,
     return _selected(NORM, case, implementation)
 
 
-def gated_rms_kernel(implementation: str, x, gate, scale, dtype, activation: str, *, axes=None) -> str:
-    """Resolve the gated RMSNorm (`gated_rms_norm`) through the norm's selector (`NORM`); other gates
-    keep their XLA arithmetic."""
-    return _selected(NORM, norm_case(x, scale, dtype, axes, gate=gate, activation=activation),
+def gated_rms_kernel(implementation: str, x, gate, scale, dtype, activation: str, *, axes=None,
+                     form: str = 'gate after') -> str:
+    """Resolve the gated RMSNorm (`gated_rms_norm`) of `form` (`GATED_FORMS`) through the norm's selector
+    (`NORM`); other gates and forms keep their XLA arithmetic."""
+    return _selected(NORM, norm_case(x, scale, dtype, axes, gate=gate, activation=activation, form=form),
                      implementation)
 
 
