@@ -69,6 +69,8 @@ from dew.nn.inputs import (
 )
 from dew.nn.inspection import QK
 from dew.nn.joined import side_by_side
+from dew.nn.kernels import generation
+from dew.nn.kernels.generation import Route
 from dew.nn.kernels.selection import select
 from dew.nn.kernels.templates import attention as template, band
 from dew.nn.kv_cache import (
@@ -323,6 +325,19 @@ def _own_groups(groups: _Groups, metadata: AttentionMetadata | None, anchor, bat
     slots = None if anchor is None else fork_slots(metadata, batch, length, anchor[0])
     kept = _Groups(block_groups=groups.block_groups) if not decode or slots is not None else _Groups()
     return kept, slots
+
+
+class _StepRoute(NamedTuple):
+    """A plain decode step's route decided ahead of it (`CausalSelfAttention._step_route`): its pool's paged
+    kernel's where it keeps pages, and its attention call's where no paged kernel takes the step."""
+
+    paged: Route | None
+    gathered: Route | None
+
+    @property
+    def kernels(self) -> tuple[str | None, str | None]:
+        """The kernels the step runs, as two decisions are compared."""
+        return tuple(None if route is None else route.kernel for route in self)
 
 
 class _Masking(NamedTuple):
@@ -1753,18 +1768,22 @@ class CausalSelfAttention(nn.Module):
         if plain_step:
             at = jnp.asarray(positions).reshape(B, S)[:, 0]
             step = functools.partial(self._plain_step, append, query, key, value, at, sinks=sinks)
-            if (starts is not None and (self.ctx.sliding_window is None
-                                        or self.ctx.sliding_window >= key.shape[-3])
-                    and self._step_kernel(append, query, key, value, at, starts, sinks)
-                    != self._step_kernel(append, query, key, value, at, None, sinks)):
+            if starts is not None and (self.ctx.sliding_window is None
+                                       or self.ctx.sliding_window >= key.shape[-3]):
                 # A start that is the row's own document's alone (`_decode_masks`) narrows only a row
                 # holding several: a step whose rows hold one each runs as an unstarted step, through
                 # the kernels a start turns away (a TPU's paged kernel, cuDNN's). Where its kernel takes
                 # the start, a start of 0 narrows nothing and the step runs as given: no branch, whose
                 # predicate the host waited on each layer of each step (57% of a GH200's decode samples,
                 # row 6107), nor a second kernel compiled.
-                attention = nn.cond(jnp.any(starts > 0), lambda module: step(module, starts),
-                                    lambda module: step(module, None), self)
+                started, unstarted = (self._step_route(append, query, key, value, at, given, sinks)
+                                      for given in (starts, None))
+                if started.kernels == unstarted.kernels:
+                    attention = step(self, starts, route=started)
+                else:
+                    attention = nn.cond(jnp.any(starts > 0),
+                                        lambda module: step(module, starts, route=started),
+                                        lambda module: step(module, None, route=unstarted), self)
             else:
                 attention = step(self, starts)
         else:
@@ -1779,15 +1798,22 @@ class CausalSelfAttention(nn.Module):
         return attention
 
     @staticmethod
-    def _plain_step(append, query, key, value, positions, module, starts, *, sinks):
+    def _plain_step(append, query, key, value, positions, module, starts, *, sinks,
+                    route: _StepRoute | None = None):
         """A plain decode step of `module` (the layer): through the paged kernel where its device's takes
         the step (`_paged_kernel`), else through the layer's attention (`_decode_attention`), from each
-        row's first key `starts` where given."""
-        kernel = (None if append is None else
-                  module._paged_kernel(append.store, query[:, 0], starts is not None, sinks is not None))
+        row's first key `starts` where given; as `route` decided it where given (`_step_route`), reported
+        here."""
+        if route is None:
+            kernel = (None if append is None else
+                      module._paged_kernel(append.store, query[:, 0], starts is not None, sinks is not None))
+        else:
+            kernel = (None if route.paged is None
+                      else append.store.paged_of(generation.published(route.paged)))
         if kernel is not None:
             return module._paged(append, kernel, query, positions, starts, sinks)
-        return module._decode_attention(query, key, value, positions, starts, sinks)
+        return module._decode_attention(query, key, value, positions, starts, sinks,
+                                        route=None if route is None else route.gathered)
 
     def _mixed_positions(self, admitted: Admitted, valid) -> jax.Array:
         """Each token's slot in its row, `[1, tokens]`, -1 for padding: a
@@ -1923,27 +1949,26 @@ class CausalSelfAttention(nn.Module):
         return jnp.concatenate([out[:rows, :1].reshape(1, rows, *out.shape[2:]),
                                 out[rows:].reshape(1, pieces * width, *out.shape[2:])], axis=1)
 
-    def _step_kernel(self, append, query, key, value, positions, starts, sinks) -> tuple[str, str]:
-        """The kernel a plain decode step (`_plain_step`) runs from `starts`, decided and reported nowhere:
-        its pool's paged kernel where one takes the step (`_paged_kernel`), else its attention call's
-        (`dispatched_route`), each named with its path."""
-        kernel = (None if append is None else
-                  self._paged_kernel(append.store, query[:, 0], starts is not None, sinks is not None,
-                                     published=False))
-        if kernel is not None:
-            return "paged", kernel
+    def _step_route(self, append, query, key, value, positions, starts, sinks) -> _StepRoute:
+        """The route a plain decode step (`_plain_step`) takes from `starts`, decided and reported nowhere:
+        its pool's paged kernel's (`KVStore.paged_route`), and where none takes the step its attention
+        call's (`dispatched_route`)."""
+        paged = (None if append is None else
+                 self._paged_route(append.store, query[:, 0], starts is not None, sinks is not None))
+        if paged is not None and append.store.paged_of(paged) is not None:
+            return _StepRoute(paged, None)
         call = self._decode_call(positions, starts, sinks)
-        return "gathered", dispatched_route(query, key, value, **call).kernel
+        return _StepRoute(paged, dispatched_route(query, key, value, **call))
 
     def _decode_call(self, positions, starts, sinks) -> dict:
         """A decode step's attention call past its operands (`_decode_attention`)."""
         reads = jnp.maximum(positions + 1, 1)
-        return dict(dtype=self.ctx.dtype, precision=self.ctx.precision,
-                    force_fp32_for_softmax=self.ctx.force_fp32_for_softmax, causal=False,
-                    softcap=self.ctx.attn_logit_softcap, sinks=sinks,
-                    key_value_seq_lengths=reads.astype(jnp.int32), key_value_seq_starts=starts)
+        return {"dtype": self.ctx.dtype, "precision": self.ctx.precision,
+                "force_fp32_for_softmax": self.ctx.force_fp32_for_softmax, "causal": False,
+                "softcap": self.ctx.attn_logit_softcap, "sinks": sinks,
+                "key_value_seq_lengths": reads.astype(jnp.int32), "key_value_seq_starts": starts}
 
-    def _decode_attention(self, query, key, value, positions, starts=None, sinks=None):
+    def _decode_attention(self, query, key, value, positions, starts=None, sinks=None, route=None):
         """One query a row `[rows, 1, heads, head_dim]` over its row of the
         cache, whose token sits at `positions` `[rows]` (-1 for padding), from
         each row's first key under the layer's window, `starts` `[rows]`
@@ -1960,12 +1985,11 @@ class CausalSelfAttention(nn.Module):
         """
         # The core reads each key head's query heads as its query positions
         # (`decode_geometry.grouped_query`).
-        attention = scaled_dot_product_attention(query, key, value,
+        attention = scaled_dot_product_attention(query, key, value, route=route,
                                                  **self._decode_call(positions, starts, sinks))
         return checkpoint_name(attention, Residual.CONTEXT)
 
-    def _paged_kernel(self, store, query, windowed: bool, sunk: bool = False, *,
-                      published: bool = True) -> PagedKernel | None:
+    def _paged_kernel(self, store, query, windowed: bool, sunk: bool = False) -> PagedKernel | None:
         """The paged kernel a decode step's query `[rows, heads, head_dim]` reads the pool `store` through
         (`KVStore.decode`), as the paged selector chooses it (`PAGED`) for the step's one case
         (`KVStore.case`: the pool's widths, the layer's arithmetic and implementation), reported as the
@@ -1973,15 +1997,23 @@ class CausalSelfAttention(nn.Module):
         cache keeps no pages. A
         `windowed` step reads each row from its window's first key; a `sunk` one has sinks. A compact
         quantized cache's codes read as they lie where the template's decode takes them
-        (`template_quantized`), no dequantized copy of the cache a step. Unless `published`, reported
-        nowhere (a step's kernel read ahead of it, `_step_kernel`)."""
+        (`template_quantized`), no dequantized copy of the cache a step."""
         if store.layout.page_size is None and store.layout.quantized is None:
             return None
-        return store.paged_kernel(query, softcap=self.ctx.attn_logit_softcap,
-                                  arithmetic=reference_only(query, self.ctx.dtype, self.ctx.precision,
-                                                            self.ctx.force_fp32_for_softmax),
-                                  named=chosen_attention(), windowed=windowed, sinks=sunk,
-                                  published=published)
+        return store.paged_kernel(query, **self._paged_case(query), windowed=windowed, sinks=sunk)
+
+    def _paged_route(self, store, query, windowed: bool, sunk: bool) -> Route | None:
+        """`_paged_kernel`'s route, reported nowhere (`KVStore.paged_route`), None where the cache keeps no
+        pages."""
+        if store.layout.page_size is None and store.layout.quantized is None:
+            return None
+        return store.paged_route(query, **self._paged_case(query), windowed=windowed, sinks=sunk)
+
+    def _paged_case(self, query) -> dict:
+        """The layer's facts a paged step's case reads past its window and sinks (`KVStore.case`)."""
+        return {"softcap": self.ctx.attn_logit_softcap, "named": chosen_attention(),
+                "arithmetic": reference_only(query, self.ctx.dtype, self.ctx.precision,
+                                             self.ctx.force_fp32_for_softmax)}
 
     def _decode_masks(self, positions, rows: int, key_length: int, valid, history: dict[str, jax.Array]
                       ) -> tuple[jax.Array, jax.Array | None]:

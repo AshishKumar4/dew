@@ -524,9 +524,7 @@ def template_attention(query, key, value, causal: bool, sliding_window, *, sinks
         if fill is not None:
             score_mod, params = template.Filled.over(spans, fill, score_mod, params)
             spans = template.spans(queries, keys, batch)
-        # The reference path's exclusion (`reference_attention`'s `excluded`): a masked call reads a row of
-        # no mass zero; one that hides no key, a finite fill's among them, NaN, as jax.nn's softmax does (row
-        # 14116).
+        # The reference path's exclusion (`reference_attention`'s `excluded`, `KeySpans.excluded`).
         spans = dataclasses.replace(spans, excluded=spans.form != "full")
         hooks = template.Hooks(
             score=Hook(score_mod, params),

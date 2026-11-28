@@ -97,15 +97,10 @@ class KeySpans:
     position (`per_query` repeats them)."""
     excluded: bool = dataclasses.field(default=True, metadata={"static": True})
     """Whether a row of no mass (its every logit -inf) reads zero, Dew's exclusion, a template call's by
-    default (a score hook that masks a row's every key empties it); where not, a call whose spans hide no key
-    ('full': the dispatch's call of no mask or of a finite fill, `dew.nn.attention.template_attention`), NaN,
-    as the reference path's jax.nn softmax reads it (`attention_algebra.Forward.massless_nan`, row
-    14116)."""
-
-    def __post_init__(self):
-        if not self.excluded and self.form != "full":
-            raise ValueError("only a call whose spans hide no key reads a row of no mass NaN: a hidden key's "
-                             "walk is skipped where jax.nn's NaN weights reach it")
+    default (a score hook that masks a row's every key empties it); where not, a call whose spans hide no
+    logical key (the dispatch's call of no mask or of a finite fill, `dew.nn.attention.template_attention`;
+    a banded call's copies of its keys, `attention_products.selected`), NaN, as the reference path's jax.nn
+    softmax reads it (`attention_algebra.Forward.massless_nan`, row 14116)."""
 
     def per_query(self) -> "KeySpans":
         """These spans an interval a query (`per_span` 1)."""
@@ -1439,7 +1434,7 @@ def reference(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpan
     # A row of no mass of a call its spans do not exclude (`KeySpans.excluded`) reads NaN, its value and its
     # derivative, as jax.nn's softmax reads it (`attention_algebra.Forward.massless_nan`, row 14116): its
     # sums over a NaN, which no other row's derivative meets.
-    massless = (total == 0) if not spans.excluded and spans.keys > 0 and hooks.initial is None else None
+    massless = (total == 0) if not spans.excluded and spans.keys > 0 else None
 
     def valued(weights: jax.Array, *, bound: float | None = None) -> jax.Array:
         # The weights narrowed to the values' dtype times the values, a query group's over its key head.

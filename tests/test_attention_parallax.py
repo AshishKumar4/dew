@@ -1000,20 +1000,33 @@ def test_a_subnormal_term_decays_and_raises_before_it_rounds():
     assert float(attention_parallax.exp_scaled(jnp.float32(1.0), jnp.float32(0.0), 128)) == float("inf")
 
 def test_exp_scaleds_derivative_meets_its_powers_before_it_rounds():
-    """`attention_parallax.exp_scaled`'s derivative along its exponent, forward and reverse: at `2^-149 ·
-    2^149` (a value of 1) a unit direction is 1 and a cotangent of `2^-100` pulls back `2^-100`, and at
-    `2^120 · 2^-120` a direction of `2^100` is `2^100`, the direction met by the value's significand before
-    its powers, where the halved form's derivative flushed the first to 0 and overflowed the second to
-    infinity (train 1489's F2)."""
-    def along_exponent(z, power, direction):
-        return jax.jvp(lambda e: attention_parallax.exp_scaled(z, e, power), (jnp.float32(0.0),),
-                       (jnp.float32(direction),))[1]
+    """`attention_parallax.exp_scaled`'s derivative along its exponent, forward, reverse and mixed, each
+    direction or cotangent met by every power at once, rounded where the answer is: at `2^-149 · 2^149` a
+    unit direction is 1 and a cotangent of `2^-100` pulls back `2^-100`; at `2^120 · 2^-120` a direction of
+    `2^100` is `2^100`; at `1.5 · 2^-2` a direction of `3 · 2^126` is `9 · 2^123`; at `1.5 · 2^-1` a
+    cotangent of `1.5 · 2^-126` pulls back `1.125 · 2^-126` on a backend that flushes subnormals; and the
+    derivative along `z` of the one along the exponent at `2^-149` is 1. The halved form's derivative
+    flushed the first, overflowed the second (train 1489's F2), and forms that met the direction before the
+    powers overflowed the third and fourth and flushed the fifth (its confirm review)."""
+    def along(z, power, direction):
+        return float(jax.jvp(lambda e: attention_parallax.exp_scaled(jnp.float32(z), e, power),
+                             (jnp.float32(0.0),), (jnp.float32(direction),))[1])
 
-    least = jnp.float32(2.0 ** -149)
-    assert float(along_exponent(least, 149, 1.0)) == 1.0
-    _, pull = jax.vjp(lambda e: attention_parallax.exp_scaled(least, e, 149), jnp.float32(0.0))
-    assert float(pull(jnp.float32(2.0 ** -100))[0]) == 2.0 ** -100
-    assert float(along_exponent(jnp.float32(2.0 ** 120), -120, 2.0 ** 100)) == 2.0 ** 100
+    def pulled(z, power, cotangent):
+        _, pull = jax.vjp(lambda e: attention_parallax.exp_scaled(jnp.float32(z), e, power), jnp.float32(0.0))
+        return float(pull(jnp.float32(cotangent))[0])
+
+    assert along(2.0 ** -149, 149, 1.0) == 1.0
+    assert pulled(2.0 ** -149, 149, 2.0 ** -100) == 2.0 ** -100
+    assert along(2.0 ** 120, -120, 2.0 ** 100) == 2.0 ** 100
+    assert along(1.5, -2, 3 * 2.0 ** 126) == 9 * 2.0 ** 123
+    assert pulled(1.5, -1, 1.5 * 2.0 ** -126) == 1.125 * 2.0 ** -126
+    def along_exponent(z):
+        one, zero = jnp.float32(1.0), jnp.float32(0.0)
+        return jax.jvp(lambda e: attention_parallax.exp_scaled(z, e, 0), (zero,), (one,))[1]
+
+    mixed = jax.jvp(along_exponent, (jnp.float32(2.0 ** -149),), (jnp.float32(1.0),))[1]
+    assert float(mixed) == 1.0
 
 
 def test_a_float64_keys_query_takes_its_power_of_two_wide():

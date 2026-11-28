@@ -53,7 +53,7 @@ from dew.nn.derivatives import KernelGlue, contracted, with_gradients_formed_at
 from dew.nn.fake_quant import E4M3_MAX
 from dew.nn.host_memory import fetched, fetched_at, on_host, placed_like, stored_at
 from dew.nn.kernels import decode_attention, generation
-from dew.nn.kernels.generation import INHERENT, Choice, backend
+from dew.nn.kernels.generation import INHERENT, Choice, Route, backend
 from dew.nn.kernels.selection import Kernel, Op, Requirement, decided, select
 from dew.nn.kernels.templates.hooks import Hook
 from dew.nn.precision import EXACT_FLOAT32, at_least_fp32, declares_fp32_products, divided, float32_einsum
@@ -1109,16 +1109,28 @@ class KVStore:
 
     def paged_kernel(
         self, query: jax.Array, *, softcap: float | None, arithmetic: bool, named: str,
-        windowed: bool = False, sinks: bool = False, published: bool = True,
+        windowed: bool = False, sinks: bool = False,
     ) -> PagedKernel | None:
         """The paged kernel the selector gives a decode step's query over this pool (`PAGED`, over its one
-        `case`), reported as the step's route, which `decode` runs, unless `published` (a step's kernel read
-        ahead of it, `selection.decided`); None where no paged kernel takes it and the layer reads the
-        gathered rows itself."""
-        case = self.case(query, softcap=softcap, arithmetic=arithmetic, named=named, windowed=windowed,
-                         sinks=sinks)
-        kernel = (select if published else decided)(PAGED, case).kernel
+        `case`), reported as the step's route, which `decode` runs; None where no paged kernel takes it and
+        the layer reads the gathered rows itself."""
+        kernel = select(PAGED, self.case(query, softcap=softcap, arithmetic=arithmetic, named=named,
+                                         windowed=windowed, sinks=sinks)).kernel
         return kernel if _is_paged_kernel(kernel) else None
+
+    def paged_route(
+        self, query: jax.Array, *, softcap: float | None, arithmetic: bool, named: str,
+        windowed: bool = False, sinks: bool = False,
+    ) -> Route:
+        """`paged_kernel`'s route, reported nowhere (`selection.decided`): a step's decision read ahead of
+        it, which the step then runs and reports (`generation.published`)."""
+        return decided(PAGED, self.case(query, softcap=softcap, arithmetic=arithmetic, named=named,
+                                        windowed=windowed, sinks=sinks))
+
+    @staticmethod
+    def paged_of(route: Route) -> PagedKernel | None:
+        """The paged kernel `route` names (`paged_route`'s), None where the layer reads the gathered rows."""
+        return route.kernel if _is_paged_kernel(route.kernel) else None
 
     def _value_width(self) -> int:
         """The width the pool stores each value at (the keys' where the values are the keys)."""

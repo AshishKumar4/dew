@@ -491,13 +491,28 @@ def _certified_stream(op: attention_mosaic.MosaicForward, ba, target: generation
     return found if isinstance(found, attention_mosaic.Tiles) else None
 
 
+def _massless_read(spec: algebra.Forward, out: jax.Array, stacked: jax.Array, initial: Initial | None, *,
+                   queries: int, heads: int) -> jax.Array:
+    """A merge's finished `out` `[B, T, heads, Dv]` (`merged.merged_finished`), each row of no mass NaN where
+    the call reads it so (`algebra.Forward.massless_nan`): no slice's denominator (`stacked[1]`
+    `[B, KV, S, R]`) and no initial state's mass beside them, the merge's own finish reading such a row
+    zero."""
+    if not spec.massless_nan:
+        return out
+    empty = jnp.all(stacked[1][..., :queries] == 0, axis=2)
+    if initial is not None:
+        empty &= ((initial.total == 0) | (initial.m == -jnp.inf))[..., :queries]
+    rows = ungrouped_rows(jnp.swapaxes(empty, 1, 2)[..., None], heads)
+    return jnp.where(rows, jnp.nan, out)
+
+
 def _spec(query: jax.Array, spans: KeySpans, hooks: Hooks, *, scale: float | None) -> algebra.Forward:
     """The call's form as the template's forward builds it (`attention_mosaic_forward.folded_form`), its fold
     of raw products (`algebra.Forward.subtracted`): the units its finished rows' maxima are in
     (`algebra.finished_form`), which its merge takes."""
     spec, _ = folded_form(spans.form, spans.keys, ids=spans.query_ids is not None, dtype=query.dtype,
                           width=query.shape[3], scale=scale, natural=False, score_mod=hooks.score.fn,
-                          subtracted=True, initial=hooks.initial is not None)
+                          subtracted=True, initial=hooks.initial is not None, excluded=spans.excluded)
     return algebra.finished_form(spec)
 
 
@@ -614,14 +629,16 @@ def _planned_step(query: jax.Array, key: jax.Array, value: jax.Array, spans: Key
             assert isinstance(walked_out, attention_mosaic.SplitOutput)
             padded, stacked = walked_out.padded, walked_out.stacked
         if branch == "finished":
-            return merged.merged_finished(spec, padded, stacked, queries=queries, width=width,
-                                          out_dtype=query.dtype, out_heads=heads, initial=initial,
-                                          output=hooks.output)
+            out = merged.merged_finished(spec, padded, stacked, queries=queries, width=width,
+                                         out_dtype=query.dtype, out_heads=heads, initial=initial,
+                                         output=hooks.output)
+            return _massless_read(spec, out, stacked, initial, queries=queries, heads=heads)
         if branch == "state":
             state = algebra.merged_state(spec, padded, stacked[0], stacked[1], initial)
         else:
             state = merged.merged_split(spec, padded, stacked, queries=queries, width=width, initial=initial)
         if finished:
+            state = algebra.nan_massless(spec, state)
             return ungrouped_rows(algebra.finish(spec, state, initial=True, normalized=True)[0],
                                   heads).astype(query.dtype)
         return _unpacked_state(resumable(spec, state), heads)

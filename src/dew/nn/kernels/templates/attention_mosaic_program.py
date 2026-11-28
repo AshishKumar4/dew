@@ -2076,12 +2076,14 @@ def output_program(hook: Callable | None, kinds: tuple[Kind, ...], dtypes: tuple
     1444's reviews); any other traced each call."""
     if hook is None or not callable(hook):
         return None
-    # Within a call (`tuning.one_call`), one program a hook's source, tile and trace context: its pricing and
-    # its emission take a prepared hook (`tuning.Prepared`) apart, one wrapper each, its dtypes each as it
-    # names them.
+    from dew.algebra import fusion
+
+    # Within a call (`tuning.one_call`), one program a hook's source, tile and choice context (the held
+    # program's own key, `_held_program`): its pricing and its emission take a prepared hook
+    # (`tuning.Prepared`) apart, one wrapper each, its dtypes each as it names them.
     source = hook.source if isinstance(hook, tuning.Prepared) else hook
     named = tuple(jnp.dtype(dtype).name for dtype in dtypes)
-    return tuning.once_a_call(source, ("output_program", kinds, named, tile),
+    return tuning.once_a_call(source, ("output_program", kinds, named, tile, fusion.choice_context()),
                               lambda: _held_program(hook, kinds, dtypes, tile))
 
 

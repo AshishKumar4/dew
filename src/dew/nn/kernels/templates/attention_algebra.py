@@ -203,12 +203,12 @@ class Forward:
 
     @property
     def massless_nan(self) -> bool:
-        """Whether a row of no mass (its every logit -inf: a bias's, a fill's, or no key it sees) reads NaN,
-        as jax.nn's softmax reads it: a call its spans do not exclude (`KeySpans.excluded`: the dispatch's
-        call of no mask or of a fill, `reference_attention`'s rows it excludes none of; row 14116), of keys
-        and from no state. An excluded call's such row reads zero (`guarded`), a template call's by default
-        (`nan_massless`)."""
-        return not self.excluded and self.keys > 0 and not self.initial
+        """Whether a row of no mass (its every logit -inf, and its initial state's mass none: a sink of
+        -inf's) reads NaN, as jax.nn's softmax reads it: a call its spans do not exclude
+        (`KeySpans.excluded`: the dispatch's call that hides no key, `reference_attention`'s rows it
+        excludes none of; row 14116), of keys. An excluded call's such row reads zero (`guarded`), a template
+        call's by default (`nan_massless`)."""
+        return not self.excluded and self.keys > 0
 
     def power(self, x: jax.Array) -> jax.Array:
         """The exponential the logits are in, a key's weight and the factor a softmax state takes from one

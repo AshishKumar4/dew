@@ -280,17 +280,24 @@ def test_a_row_of_no_mass_reads_as_the_reference_path_on_every_mainloop(mainloop
                                       err_msg=f"{mainloop} {name}")
 
 
-@pytest.mark.parametrize("implementation", ["reference", "template"])
-def test_a_filled_row_that_sees_no_key_reads_nan(implementation):
-    """A packed call under a mask fill of -inf (`mask_fill`, a written program's `where(mask, logits, -inf)`),
-    its last query a padding row that sees no key: that row's every logit is the fill, so it reads NaN as
-    jax.nn's softmax does, on the reference path and on the template (`template.Filled`, whose call hides no
-    key); its documents' rows read their keys' mean (row 14116)."""
-    query, key, value = (jnp.zeros((1, 4, 1, 8), jnp.float32), jnp.zeros((1, 4, 1, 8), jnp.float32),
-                         jnp.arange(32, dtype=jnp.float32).reshape(1, 4, 1, 8))
-    ids = jnp.asarray([[1, 1, 2, 0]], jnp.int32)
-    out = np.asarray(scaled_dot_product_attention(query, key, value, segment_ids=ids, mask_fill=-np.inf,
-                                                  implementation=implementation))
-    rows = np.asarray(value)[0]
-    assert np.isnan(out[0, 3]).all()
-    np.testing.assert_array_equal(out[0, :3], np.stack([(rows[0] + rows[1]) / 2] * 2 + [rows[2]]))
+@pytest.mark.parametrize("masked", [False, True], ids=["unmasked", "masked"])
+def test_a_template_call_reads_a_row_of_no_mass_as_the_reference_path(masked):
+    """`_massless_operands` through the dispatch on the template (`implementation='template'`), unmasked and
+    over `HALF` of its keys: its output and its query's, key's, value's and bias's gradients the reference
+    path's bit for bit, the row of no mass NaN unmasked and zero masked, as the dispatch states its spans'
+    exclusion (`KeySpans.excluded`, row 14116)."""
+    def attended(implementation):
+        def attend(query, key, value, bias):
+            return scaled_dot_product_attention(query, key, value, bias=bias,
+                                                key_value_seq_lengths=HALF if masked else None,
+                                                implementation=implementation)
+
+        out, pull = jax.vjp(attend, *_massless_operands())
+        return out, *pull(jnp.ones_like(out))
+
+    found, expected = attended("template"), attended("reference")
+    row = np.asarray(found[0], np.float32)[0, 3, 1]
+    assert (row == 0).all() if masked else np.isnan(row).all()
+    for name, mine, theirs in zip(("output", "query", "key", "value", "bias"), found, expected, strict=True):
+        np.testing.assert_array_equal(np.asarray(mine, np.float32), np.asarray(theirs, np.float32),
+                                      err_msg=name)

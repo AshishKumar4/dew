@@ -1406,8 +1406,9 @@ def backward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans
     initial = hooks is not None and hooks.initial is not None
     # Values whose sums the forward may scale (`algebra.headroom`, `algebra.SCALED_WALK`) take D from the
     # split sums at their rows' scale (`attention_gradient.split_delta`), the pass their tiles are derived
-    # for, in either form.
-    split = split or algebra.headroom(value.dtype)
+    # for, in either form; so does a call whose row of no mass reads NaN (`KeySpans.excluded`), whose
+    # forward denominator carries it (a first pass recomputes it 0).
+    split = split or algebra.headroom(value.dtype) or not spans.excluded
     launch = functools.partial(_launch, split=split, natural=natural, accurate=accurate, initial=initial,
                                interpret=interpret)
     return gradients(launch, query, key, value, spans, hooks, dout, residuals, block=BLOCK, scale=scale,
