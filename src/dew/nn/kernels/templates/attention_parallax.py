@@ -161,9 +161,13 @@ def exp_scaled(z: jax.Array, exponent: jax.Array, power) -> jax.Array:
     # powers together, decay's and `power`, held within `±400` after they meet, never apart (a decay of
     # -9744 beside a power of 13862 is `2^-195`, where either held alone read infinity).
     fraction = jnp.where(jnp.abs(whole) < 2.0 ** 16, ln2_remainder(decay, whole), 0.0)
-    lifted = (z * 0.5) * accurate_exp(fraction)
-    powers = jnp.clip(jnp.asarray(power, jnp.float32) + whole + 1, -400.0, 400.0).astype(jnp.int32)
-    return jnp.where(finite, power2(lifted, powers), 0.0)
+    # `z` as its mantissa in [1/2, 1) and its own power of two, read from its bits (`frexp`, a subnormal's
+    # too), so `z e^f` stays inside [1/2, 2) and its power joins the rest before any rounding: halving `z`
+    # first rounded `2^-149` to 0, which `2^149` then raised to 0, not 1 (train 1478's K-F2).
+    _, own = jnp.frexp(jax.lax.stop_gradient(z))
+    lifted = power2(z, -own) * accurate_exp(fraction)
+    powers = jnp.clip(jnp.asarray(power, jnp.float32) + whole + own.astype(jnp.float32), -400.0, 400.0)
+    return jnp.where(finite, power2(lifted, powers.astype(jnp.int32)), 0.0)
 
 
 def _pair_bound(left: jax.Array, right: jax.Array) -> jax.Array:
@@ -516,7 +520,9 @@ def _padded(x: jax.Array, tile: int, wide) -> jax.Array:
 def _called(query, second, key, second_key, value, spans: KeySpans, scale: float, tile: int) -> _Call:
     """A call's operands as its walks read them (`_Call`), its keys padded to whole tiles of `tile`."""
     kv_heads = key.shape[2]
-    wide = _wide(query, value)
+    # Every operand's dtype: a float64 second product's keys rounded to fp32 tie where they differ (train
+    # 1478's K-F1: `[2^24, 2^24 + 1]` read 0 where 0.5 is).
+    wide = _wide(query, second, key, second_key, value)
     prescaled_query, left, _ = prescaled(query, scale)
     raw = _grouped(second.astype(wide), kv_heads)
     second_key = _padded(second_key, tile, wide)

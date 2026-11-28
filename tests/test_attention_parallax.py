@@ -980,3 +980,37 @@ def test_a_second_product_direction_is_centred_before_the_values(arm):
     _, tangent = jax.jvp(lambda second_key: attend(query, second, key, second_key, value, spans),
                          (second_key,), (direction,))
     np.testing.assert_array_equal(np.asarray(tangent), np.full((1, 1, 1, 4), -(2.0 ** 126), np.float32))
+
+
+def test_a_subnormal_term_decays_and_raises_before_it_rounds():
+    """`attention_parallax.exp_scaled` of fp32's least subnormal, `2^-149`, undecayed and raised by `2^149`,
+    is 1, and a tile's one key at logit 0 with a second product of `2^-149` has that centre (`moments`): its
+    mantissa and power read from its bits, every power applied at once, where halving it first rounded it to
+    0 (train 1478's K-F2)."""
+    least = jnp.float32(2.0 ** -149)
+    assert float(attention_parallax.exp_scaled(least, jnp.float32(0.0), 149)) == 1.0
+    logits = jnp.zeros((1, 1, 1, 1, 1), jnp.float32)
+    seconds = jnp.full((1, 1, 1, 1, 1), least, jnp.float32)
+    found = attention_parallax.moments(logits, seconds, jnp.ones((1, 1, 1, 4), jnp.float32),
+                                       jnp.zeros((1, 1, 1, 1), jnp.int32))
+    assert float(found.centre[0][0, 0, 0, 0] + found.centre[1][0, 0, 0, 0]) == 2.0 ** -149
+
+
+def test_a_float64_second_product_keeps_its_keys_apart():
+    """Parallax (`attention_parallax.attend`) with x64 on over fp32 queries, keys and values (zeros, and
+    values 1 and -1) and float64 second queries and keys, a unit second query against second keys `2^24` and
+    `2^24 + 1`: the two keys' weights 1/2 each taken by `1 + c - t`, `c = 2^24 + 1/2`, its output
+    `3/4 - 1/4 = 1/2` in the query's fp32, every operand's dtype the walk's (`_wide`), where the second
+    products rounded to fp32 tied and read 0 (train 1478's K-F1)."""
+    width = 16
+    spans = template.spans(1, 2, 1)
+    with jax.enable_x64(new_val=True):
+        query = jnp.zeros((1, 1, 1, width), jnp.float32)
+        key = jnp.zeros((1, 2, 1, width), jnp.float32)
+        value = jnp.broadcast_to(jnp.asarray([1.0, -1.0], jnp.float32).reshape(1, 2, 1, 1), (1, 2, 1, width))
+        second = jnp.zeros((1, 1, 1, width), jnp.float64).at[..., 0].set(1.0)
+        second_key = jnp.zeros((1, 2, 1, width), jnp.float64).at[0, :, 0, 0].set(
+            jnp.asarray([2.0 ** 24, 2.0 ** 24 + 1], jnp.float64))
+        out = attention_parallax.attend(query, second, key, second_key, value, spans)
+    assert out.dtype == jnp.float32
+    np.testing.assert_array_equal(np.asarray(out), np.full((1, 1, 1, width), 0.5, np.float32))
