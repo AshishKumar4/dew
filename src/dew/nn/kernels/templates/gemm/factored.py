@@ -164,14 +164,14 @@ def _scaled_value(raised: int, product: jax.Array, factor: jax.Array) -> jax.Arr
 
 
 def owed_native(product: jax.Array, factor: jax.Array, *, raised: int) -> jax.Array:
-    """`owed_exactly`'s value in a packed launch's epilogue alone (`gemm._packed_finish`, its kernel's
-    float32 keeping subnormals; tests/test_gemm_nvfp4.py's GPU cells hold it to the exact finish), rounded
-    once: the plain multiply, the factor and the owed power of two one multiplier where that is finite (a
-    subnormal factor raised exactly), else the product times the power of two, exact (a subnormal product raised; one it overflows is one whose owed product past a factor
-    of 2**(128 - raised) overflows too), then times the factor, rounded once (train 1450's review: the
-    product times the factor first rounded a subnormal one on the subnormal grid before the power raised
-    it). A power past fp32's (`raised` 128 or more, which no float32 multiplier holds) is
-    `lowered_product`'s one rounding in integer arithmetic."""
+    """`owed_exactly`'s value in a packed launch's epilogue alone (`gemm._packed_finish`, its kernel's float32
+    keeping subnormals; tests/test_gemm_nvfp4.py's GPU cells hold it to the exact finish), rounded once: the
+    plain multiply, the factor and the owed power of two one multiplier where that is finite (a subnormal
+    factor raised exactly), else the product times the power of two, exact (a subnormal product raised; one it
+    overflows is one whose owed product past a factor of 2**(128 - raised) overflows too), then times the
+    factor, rounded once (train 1450's review: the product times the factor first rounded a subnormal one on
+    the subnormal grid before the power raised it). A power past fp32's (`raised` 128 or more, which no
+    float32 multiplier holds) is `lowered_product`'s one rounding in integer arithmetic."""
     # The side's columns broadcast to the accumulator's tile explicitly (an epilogue's `[columns]` factor).
     product, factor = jnp.broadcast_arrays(product, jnp.asarray(factor, product.dtype))
     if not raised:
