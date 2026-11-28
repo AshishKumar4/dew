@@ -255,7 +255,7 @@ class VmemRings(mosaic.Family[dict, Streams, jax.Array]):
         # A program a core, its operands and outputs left in HBM for its walks' copies; no cluster, and no
         # view prefetched ahead of a wait (a GPU's dependent launch); its compiler holds its values, no
         # register budget (`budgets_registers`).
-        del reducing_warpgroups, resident, model_flops, registers, producer, shared, tmem, moves
+        del reducing_warpgroups, resident, registers, producer, shared, tmem, moves
         del reduces
         if prefetched is not None:
             raise NotImplementedError("a TPU program is launched after the last; nothing is prefetched ahead")
@@ -304,7 +304,9 @@ class VmemRings(mosaic.Family[dict, Streams, jax.Array]):
                 operands[at][...] = added
             return jax.tree.unflatten(structure, written[:len(outputs)])
 
-        return emission.costed(launched, cost)
+        # Its call declares the model's share of its work as a GPU family's does (`mosaic.checked`).
+        return mosaic.checked(emission.costed(launched, cost), name or self.name, model_flops=model_flops,
+                              moves=False, out_type=out_type)
 
     def program_index(self, name: str, *, fresh: bool = False) -> jax.Array:
         # Pallas TPU numbers a grid's axes: `name`'s place among the launch's (`kernel`'s `grid_names`), a

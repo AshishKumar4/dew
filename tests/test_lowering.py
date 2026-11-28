@@ -360,6 +360,37 @@ def test_a_tpu_grouped_gemm_states_its_cost_to_the_flop_count():
     assert (flops.hardware, flops.unsized) == (2 * GMM, 0)
 
 
+def test_a_tpu_launch_declares_the_models_share_of_its_work():
+    """A launch on a TPU core (the MXU bundle's) declares the model's share of the work its cost states, as a
+    GPU family's does (`mosaic.checked`'s frontend attribute): lowered for a TPU on this CPU, its kernel call
+    and the FLOP count read the model's 123 of its stated 1,000, not its hardware's (a grouped product's
+    padded tiles no model work; row 14181's GEMM launches stating their walks)."""
+    from jax.experimental.pallas import tpu as pltpu
+
+    from dew.nn.kernels.lowered import kernel_calls
+    from dew.nn.kernels.templates import bundles
+    from dew.telemetry.instrumentation import hlo_flops
+
+    row = jax.ShapeDtypeStruct((8, 128), jnp.float32)
+
+    def step(x):
+        launch = bundles.named("mxu", jnp.bfloat16, None).kernel(
+            lambda x_ref, out_ref: pltpu.sync_copy(x_ref, out_ref), out_type=(row,), grid=(1,),
+            grid_names=("i",), consumers=1, interpret=False,
+            cost=pl.CostEstimate(flops=1000, transcendentals=0, bytes_accessed=8192), model_flops=123)
+        return launch(x)
+
+    device = jax.sharding.AbstractDevice(device_kind=TARGETS["v5e"].device_kind, num_cores=1, platform="tpu")
+    mesh = jax.sharding.AbstractMesh((1,), ("data",), axis_types=(jax.sharding.AxisType.Auto,),
+                                     abstract_device=device)
+    with assumed("v5e"), jax.sharding.use_abstract_mesh(mesh):
+        lowered = jax.jit(step).trace(row).lower(lowering_platforms=("tpu",))
+    assert [(call.kind, call.model_flops, call.flops) for call in kernel_calls(lowered)] == [
+        ("mosaic_tpu", 123, 1000)]
+    flops = hlo_flops(lowered.as_text(dialect="hlo"))
+    assert flops is not None and (flops.model, flops.hardware) == (123, 1000)
+
+
 def test_every_pallas_kernel_a_measured_cell_runs_has_a_lowering_probe():
     """A Pallas kernel a selector's measured cell runs on some GPU (`Op.declared`) is one this file lowers
     for that GPU on a CPU: a new cell needs its kernels in FAMILIES, so no Triton lowering first runs in a
