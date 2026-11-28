@@ -1099,7 +1099,8 @@ TARGETS = {target.generation: target for target in (
               # over N 64 to 256; a warpgroup barrier round trip 140.0 ns; a tile copied by TMA from device
               # memory past an L2 eviction 476.5 ns and 12.90 ps a byte over 4 to 64 KiB (from L2, 199.5 ns
               # and 13.71 ps), every fit within 2.5%.
-              measured={'NVIDIA RTX PRO 6000 Blackwell': Measured(
+              # The Server Edition's alone: the Workstation parts' memory and clocks are their own.
+              measured={'NVIDIA RTX PRO 6000 Blackwell Server Edition': Measured(
                   product=(38.08e-9, 3.607e-9), barrier=140.0e-9, copy=(476.5e-9, 12.90e-12))},
               # PCIe Gen5 x16 (the Server Edition's datasheet, 128 GB/s both ways).
               host_links={'NVIDIA RTX PRO 6000 Blackwell': 64e9}),
