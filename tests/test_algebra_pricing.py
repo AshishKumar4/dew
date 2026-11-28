@@ -230,6 +230,29 @@ def test_device_memory_is_priced_at_the_parts_measured_stream():
     assert memory_rate("a Hopper part no one measured", 2.0e12) == 2.0e12
 
 
+def test_a_dies_step_latencies_are_its_parts_at_its_clock_and_a_parts_memory_its_own():
+    """A step's latencies are a die's at its clock (`GpuTarget.clocked`), every part of it at that clock
+    reading them: an A100-SXM4's 40 GB and 80 GB parts alike (one GA100 at one 1410 MHz boost), its PCIe
+    part, of another power limit, none; a part's memory its own (`GpuTarget.measured`): the 40 GB part's
+    stream, which its 80 GB part does not read. A Workstation RTX PRO 6000, of another clock and power than
+    the Server Edition measured, reads none of its latencies, nor a GH200 an H100 SXM's (row 14183: each was
+    carried to every part of its generation)."""
+    def facts(kind):
+        target = generation.gpu_target(kind)
+        return (target.step_seconds, target.kernel_step_seconds, target.product_latency,
+                target.barrier_seconds), target.fixed_seconds
+
+    sxm40, sxm80, pcie = (facts(kind) for kind in ("NVIDIA A100-SXM4-40GB", "NVIDIA A100-SXM4-80GB",
+                                                   "NVIDIA A100 PCIe"))
+    assert sxm40[0] == sxm80[0] and sxm40[0][1] is not None and pcie[0] == (None,) * 4
+    assert sxm40[1] is not None and sxm80[1] is None
+    server, workstation = (facts(f"NVIDIA RTX PRO 6000 Blackwell {edition} Edition")
+                           for edition in ("Server", "Workstation"))
+    assert None not in server[0] and workstation[0] == (None,) * 4
+    assert generation.gpu_target("NVIDIA GH200 480GB").kernel_step_seconds is None
+    assert generation.gpu_target("NVIDIA H100 80GB HBM3").kernel_step_seconds is not None
+
+
 @pytest.mark.parametrize("tpu", ["v5e", "v6e"])
 def test_a_tpus_program_is_rewritten_by_the_rates_it_states(tpu):
     """A TPU's target states its MXU's rate and not its vector or transcendental units' (`cost.cheaper`): a

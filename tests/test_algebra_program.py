@@ -1220,7 +1220,8 @@ def test_a_template_walks_chain_is_priced_at_its_parts_measured_latencies():
     chain = kernel_cost.Chain(span=1, products=4, columns=4 * 128, barriers=2)
     chained = kernel_cost.walked(kernel_cost.Work(flops=1.0, chains=(chain,)), target)
     spanned = kernel_cost.walked(kernel_cost.Work(flops=1.0, span=1), target)
-    expected = target.kernel_step_seconds + 4 * fixed + 512 * per_column + 2 * barrier
+    # Its span's one reduction at the die's step, none where the GH200's own is unmeasured (row 14183).
+    expected = (target.kernel_step_seconds or 0.0) + 4 * fixed + 512 * per_column + 2 * barrier
     assert_computes_the_oracle(np.float64(chained), np.float64(expected), "the chain's seconds", roundings=8)
     assert chained > 4 * spanned
     copied, per_byte = GH200_LATENCIES["copy"]
