@@ -67,14 +67,11 @@ def published_release(directory: str | Path, write: Callable[[Path], None], *, f
     (`foreign_entries`) is refused, those named. A pool's processes agree where each writes, then their
     writes, then the publisher's replacement, in turn: a process that fails at any of them is heard by the
     others at the next round any takes, after which none takes another (`_coordination._unheard`). A pool's
-    process that publishes none (`writes_weights`) writes in place, to a destination of its own; a location
-    with a scheme (`gs://`, `s3://`), which has no rename, is built whole in a private local directory and
-    then put into the store a file at a time where it holds nothing (`_uploaded_release`), never written
-    under a local path its name would make; and a `fresh` directory, one its caller
-    made empty and private for this write alone and publishes itself, is written in place."""
-    if is_uri(str(directory)):
-        _uploaded_release(str(directory), write)
-        return
+    process that publishes none (`writes_weights`) writes in place, to a destination of its own; and a
+    `fresh` directory, one its caller
+    made empty and private for this write alone and publishes itself, is written in place. A location with
+    a scheme is refused before anything is written (`refused_store`)."""
+    refused_store(str(directory))
     root = Path(directory)
     in_place = fresh or not writes_weights()
     with contextlib.ExitStack() as staged:
@@ -84,35 +81,15 @@ def published_release(directory: str | Path, write: Callable[[Path], None], *, f
         agreed_reading(staged.close)
 
 
-def _uploaded_release(location: str, write: Callable[[Path], None]) -> None:
-    """`published_release` at a store's `location` (a `<scheme>://` URI): refused where the store holds
-    anything there already, before anything is written, as a store has no rename to replace an earlier
-    release in one generation (row 14124: a `gs://` destination taken as a local path was written under
-    `gs:/` on the local disk, its export reported as published); else built whole by `write` in a private
-    local directory and each of its files put into the store where nothing is (`dew.data.storage.Store`'s
-    `put_if_absent`), its weights before the files that name them, in the pool's rounds as a local
-    release's (`agreed_reading`)."""
-    from dew.data.storage import Store
-
-    def staging(held: contextlib.ExitStack) -> Path:
-        fs, path = Store(location).resolve()
-        if fs.exists(path) and fs.ls(path):
-            raise FileExistsError(f"{location} holds a release already, which a store cannot replace in one "
-                                  f"generation; export to an empty location")
-        return Path(held.enter_context(tempfile.TemporaryDirectory(ignore_cleanup_errors=True)))
-
-    with contextlib.ExitStack() as staged:
-        target = agreed_reading(lambda: staging(staged))
-        agreed_reading(lambda: write(target))
-
-        def uploaded() -> None:
-            files = sorted((entry for entry in target.rglob("*") if entry.is_file()),
-                           key=lambda entry: (entry.suffix == ".json", entry.as_posix()))
-            for entry in files:
-                Store(f"{location.rstrip('/')}/{entry.relative_to(target).as_posix()}").put_if_absent(
-                    entry.read_bytes())
-
-        agreed_reading(uploaded)
+def refused_store(destination: str) -> None:
+    """Refuse a release whose `destination` is a store's location (a `<scheme>://` URI, `gs://`, `s3://`),
+    before anything is written: a store has no rename, so no release there is published in one generation
+    (`dew._files.swapped`), and a URI taken as a local path loses its `//` and is written on this host's disk
+    under a name its export then reports as the store's (row 14124). Write it to a local directory and copy
+    that whole, or publish it to the Hub (`Pretrained.push_to_hub`)."""
+    if is_uri(destination):
+        raise ValueError(f"{destination} is a store's location, where no release is published whole; export "
+                         f"to a local directory and copy it there, or push it to the Hub")
 
 
 @contextlib.contextmanager
@@ -320,10 +297,10 @@ class ReleasePlan:
         refused, those entries named. A pool's process that reads its share and publishes none
         (`writes_weights`) writes the release's small files in place, to a destination of its own
         (`saved_sources.export_run` discards one the pool shares), every process agreeing its setup, its
-        writes and the publisher's replacement in turn; a location with a scheme, which has no rename, is
-        written file by file; and a `fresh` directory, one its caller made empty and private for this write
-        alone, which it publishes itself (a cache release's staging, `saved_sources.export_run`), is written
-        in place."""
+        writes and the publisher's replacement in turn; a location with a scheme is refused before anything
+        is written (`refused_store`); and a `fresh` directory, one its caller made empty and private for this
+        write alone, which it publishes itself (a cache release's staging, `saved_sources.export_run`), is
+        written in place."""
         published_release(directory, lambda target: self._write(target, max_shard_size), fresh=fresh)
 
     def _write(self, root: Path, max_shard_size: int | str) -> None:

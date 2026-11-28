@@ -35,7 +35,7 @@ from dew._coordination import (
     reading_home,
     seen_by_every_process,
 )
-from dew._files import is_uri, staged, write_atomically
+from dew._files import staged, write_atomically
 from dew._records import JSON, json_value, mapped_strings, strings_of
 from dew.checkpoints import RUN_FILE
 from dew.registry import from_record, to_record, trust_sources, trusts_source
@@ -76,21 +76,16 @@ def export_run(run: SavedRun, destination: str | Path, *, ema: bool | None = Non
     saved run it holds (`HELD_FILE`); another replaces the release in one call (`ReleasePlan.write`).
     Every process returns once the release is published, the pool agreeing its commit (ledgers 2874,
     2992)."""
-    from dew.interop.releases import pooled_destination
+    from dew.interop.releases import pooled_destination, refused_store
 
-    shared = False
+    # A store's location refused by every process of a pool alike, before any round of its export or a write
+    # (`refused_store`, row 14124), each process naming its own destination.
+    for named_by in from_every_process(str(destination)):
+        refused_store(named_by)
+    named, shared = Path(destination), False
     if publishes is None:
-        # A store's location every process names alike is one the pool shares; a local one, where every
-        # process names one directory and sees it as one.
-        located, named = str(destination), Path(destination)
-
-        def alike() -> bool:
-            if is_uri(located):
-                return len(set(from_every_process(located))) == 1
-            return (len(set(from_every_process(named.name))) == 1
-                    and all(seen_by_every_process(str(named.parent))))
-
-        shared = jax.process_count() > 1 and alike()
+        shared = (jax.process_count() > 1 and len(set(from_every_process(named.name))) == 1
+                  and all(seen_by_every_process(str(named.parent))))
         publishes = not shared or jax.process_index() == 0
     # Restored before the writer reads its tensors home, each as the writer reaches it.
     plan = run_plan(run, ema=ema, mesh=mesh, layout=layout)

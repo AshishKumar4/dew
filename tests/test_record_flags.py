@@ -94,12 +94,27 @@ def test_a_flag_set_to_its_members_default_over_a_recipes_value_takes_it():
     """A rollout flag given its member's default over a recipe that binds another value runs the default
     the command line asked for (row 14127: `--rollout.train-ratio 1024.0`, `DreamerRollout`'s own, over a
     recipe's 16.0 kept 16.0, the flag dropped as unchanged from its default); a flag left unset keeps the
-    recipe's value, and one set elsewhere takes its own."""
+    recipe's value, and one set elsewhere takes its own. The rollout built takes what the record states."""
     from dew.objectives.rl.dreamer import DreamerRollout
 
     recipe = EnvRunConfig(rollout=RolloutConfig(functools.partial(DreamerRollout, train_ratio=16.0)))
     default = DreamerRollout.__dataclass_fields__["train_ratio"].default
     for args, ratio in ((["--rollout.train-ratio", str(default)], default), ([], 16.0),
                         (["--rollout.train-ratio", "64.0"], 64.0)):
-        parsed = EnvRunConfig.cli(args, default=recipe)
-        assert parsed.rollout.fields.get("train_ratio", default) == ratio
+        rollout = EnvRunConfig.cli(args, default=recipe).rollout
+        assert rollout.fields.get("train_ratio", default) == ratio
+        assert rollout.arguments.get("train_ratio", default) == ratio
+
+
+@pytest.mark.parametrize("ratio", [16.0, 64.0])
+def test_a_flagged_records_fields_set_and_cleared_are_its_record_alike(ratio):
+    """A flagged rollout's arguments set (`with_fields`) and cleared (`without_fields`) are the plain record's
+    so set and cleared: a value a flag can state set over a flag at its default is kept, and one cleared is
+    the member's default again, not the flag's (row 14127's review)."""
+    plain, flagged = RolloutConfig(), RolloutConfig().flagged()
+    expected = to_record(plain.with_fields(train_ratio=ratio), RolloutConfig)
+    for record in (plain, flagged):
+        stated = record.with_fields(train_ratio=ratio)
+        assert to_record(stated, RolloutConfig) == expected
+        cleared = stated.without_fields("train_ratio")
+        assert to_record(cleared, RolloutConfig) == to_record(plain, RolloutConfig)

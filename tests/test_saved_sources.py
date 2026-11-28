@@ -116,12 +116,12 @@ def test_a_decision_run_whose_head_holds_no_backbone_of_its_family_exports_as_it
 
 
 @pytest.mark.shared_setup("native_release_run")
-def test_a_run_exported_to_a_store_is_published_there_and_written_nowhere_on_the_local_disk(
-        native_release_run, tmp_path, monkeypatch):
-    """`dew export <run> <store URI>` publishes the release in the store, every file the one a local export
-    writes, and nothing under a local path the URI's name would make; a second export to the same location
-    is refused before anything is written (row 14124: `gs://bucket/x` taken as a path was written under
-    `gs:/bucket/x` on the local disk, the export reported as published there)."""
+def test_a_run_exported_to_a_store_is_refused_before_anything_is_written(native_release_run, tmp_path,
+                                                                        monkeypatch):
+    """`dew export <run> <store URI>` is refused before anything is written, the store and this host's disk
+    alike, as a store has no rename to publish a release whole; a local destination exports (row 14124:
+    `gs://bucket/x` taken as a path was written under `gs:/bucket/x` on the local disk, the export reported
+    as published in the store)."""
     import uuid
 
     from dew._cli.main import main
@@ -130,18 +130,13 @@ def test_a_run_exported_to_a_store_is_published_there_and_written_nowhere_on_the
     root, _, source, _ = native_release_run
     monkeypatch.setenv("XDG_CACHE_HOME", str(root / "cache"))
     monkeypatch.chdir(tmp_path)
-    local, remote = tmp_path / "local", f"memory://export-{uuid.uuid4().hex}"
-    assert main(["export", str(source), str(local)]) == 0
-    assert main(["export", str(source), remote]) == 0
-    written = {entry.relative_to(local).as_posix(): entry.read_bytes() for entry in local.rglob("*")
-               if entry.is_file()}
-    assert {name: Store(f"{remote}/{name}").read() for name in written} == written
-    fs, path = Store(remote).resolve()
-    assert len(fs.find(path)) == len(written)
-    assert not (tmp_path / "memory:").exists()
-    with pytest.raises(FileExistsError):
+    remote = f"memory://export-{uuid.uuid4().hex}"
+    with pytest.raises(ValueError):
         main(["export", str(source), remote])
-    assert len(fs.find(path)) == len(written)
+    fs, path = Store(remote).resolve()
+    assert not fs.exists(path) and not list(tmp_path.iterdir())
+    assert main(["export", str(source), str(tmp_path / "local")]) == 0
+    assert (tmp_path / "local").is_dir()
 
 
 @pytest.mark.shared_setup("native_release_run")

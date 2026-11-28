@@ -2226,12 +2226,20 @@ class Bound(ABC):
 
     def with_fields(self, **changed: Configured) -> Self:
         """This record with `changed` among the arguments it states, over those it stated."""
-        return dataclasses.replace(self, bound=functools.partial(self.member, **{**self.fields, **changed}))
+        return self._rebound({**self.fields, **changed})
 
     def without_fields(self, *names: str) -> Self:
         """This record stating none of `names`, each then the member's default or the caller's."""
-        kept = {name: value for name, value in self.fields.items() if name not in names}
-        return dataclasses.replace(self, bound=functools.partial(self.member, **kept))
+        return self._rebound({name: value for name, value in self.fields.items() if name not in names})
+
+    def _rebound(self, fields: Mapping[str, Configured]) -> Self:
+        """This record stating `fields` as its arguments: a command line's subcommand (`record_flags`) by its
+        kind's own record so bound, flagged again, so a value a flag states is the flag's (its `bound` holds
+        none such, `record_flags`), not a stale binding a flag at its default would drop (row 14127)."""
+        if "_alias" in vars(type(self)):
+            recorded = self.recorded()
+            return dataclasses.replace(recorded, bound=functools.partial(self.member, **fields)).flagged()
+        return dataclasses.replace(self, bound=functools.partial(self.member, **fields))
 
     def recorded(self) -> Bound:
         """This record as its kind's own class holds it, where it is a command line's subcommand
