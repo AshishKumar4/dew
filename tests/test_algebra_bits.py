@@ -701,6 +701,28 @@ def test_a_float64_narrowing_is_exact_on_this_cpu_its_transpose_too():
     np.testing.assert_array_equal(np.asarray(direct).view(np.uint32), expected.view(np.uint32))
 
 
+def test_the_exact_widening_and_narrowing_transpose_each_other_at_the_wider_width():
+    """The float64 narrowing and float32's exact widening are each other's transposes, each summing where
+    the wider sum is exact (train 1468's review): the narrowing batched over a shared operand widens each
+    float32 cotangent before the batch's sum, two of 2^127 summing to float64's 2^128, not to float32's
+    infinity first; and `widened_exactly`'s transpose into float32 is the exact narrowing, a float64
+    cotangent of 2^-140 the float32 subnormal this CPU's convert flushed to zero."""
+    from dew.nn.float_bits import narrowed_float32, widened_exactly
+
+    with jax.enable_x64(new_val=True):
+        batched = jax.vmap(narrowed_float32, in_axes=None, axis_size=2)
+        _, pull = jax.vjp(batched, jnp.float64(1.0))
+        (summed,) = jax.jit(pull)(jnp.full((2,), 2.0 ** 127, jnp.float32))
+        _, back = jax.vjp(lambda x: widened_exactly(x, jnp.float64), jnp.ones((3,), jnp.float32))
+        (narrowed,) = jax.jit(back)(jnp.full((3,), 2.0 ** -140, jnp.float64))
+    # Pulled back outside x64 too: the batch's float64 cotangents summed as float64 (its review).
+    (outside,) = pull(jnp.full((2,), 2.0 ** 127, jnp.float32))
+    for found in (summed, outside):
+        assert found.dtype == jnp.float64 and float(found) == 2.0 ** 128
+    assert narrowed.dtype == jnp.float32
+    np.testing.assert_array_equal(np.asarray(narrowed), np.full(3, 2.0 ** -140, np.float32))
+
+
 @pytest.mark.mesh(devices=2)
 def test_a_float64_narrowing_runs_over_a_reduced_explicit_placement():
     """`float_bits.narrowed_float32` of a float64 operand an Explicit placement holds reduced over 'data'

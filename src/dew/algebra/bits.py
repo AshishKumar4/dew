@@ -1066,14 +1066,22 @@ def nvfp4_coded(x: jax.Array, tensor: jax.Array | None = None) -> tuple[jax.Arra
         tensor = nvfp4_tensor_scale(_nvfp4_amax(x, magnitude), quotient)
     else:
         tensor = nvfp4_given_scale(tensor)
-    # Each value over the tensor scale once (row 14083): a block's largest magnitude's quotient is read at
-    # a lane holding that magnitude, signed as the scale is, the quotient dividing it would give (a zero
-    # scale's infinity, or its NaN where the block is zero; row 14083's review), so no block divides apart.
+    # Each value over the tensor scale once (row 14083): a block's largest magnitude's quotient is the
+    # largest of its quotients' magnitudes, one division keeping their order, a finite value's NaN quotient
+    # left out (a zero's 0/0 at a zero scale, every finite one's at a NaN scale); a block of them all zero's
+    # quotient, those scales' NaN; signed as the scale is, the quotient dividing it would give (row 14083's
+    # review), so no block divides apart (train 1468's: one reduction a block). Its words are compared with
+    # infinity's alone, never with zero: a compiler reads a magnitude's test for zero as a float's, which a
+    # flushing platform (XLA's CPU) passes at a subnormal.
     over = quotient(x, tensor)
-    held = magnitude.reshape(-1, NVFP4.depth, x.shape[-1])
-    at_largest = held == jnp.max(held, axis=1, keepdims=True)
-    over_words = (jax.lax.bitcast_convert_type(over, jnp.uint32) & np.uint32(0x7FFFFFFF)).reshape(held.shape)
-    largest = jnp.max(jnp.where(at_largest, over_words, np.uint32(0)), axis=1) | (
+    unsigned, infinity = np.uint32(0x7FFFFFFF), np.uint32(0x7F800000)
+    over_words = jax.lax.bitcast_convert_type(over, jnp.uint32) & unsigned
+    limits = jnp.finfo(x.dtype)
+    finite = magnitude < magnitude.dtype.type(((1 << limits.nexp) - 1) << limits.nmant)
+    counted = jnp.where((over_words > infinity) & finite, np.uint32(0), over_words)
+    peaks = jnp.max(counted.reshape(-1, NVFP4.depth, x.shape[-1]), axis=1)
+    zeros = jax.lax.bitcast_convert_type(quotient(jnp.zeros((), x.dtype), tensor), jnp.uint32) & unsigned
+    largest = jnp.where(peaks == 0, zeros, peaks) | (
         jax.lax.bitcast_convert_type(tensor, jnp.uint32) & np.uint32(0x80000000))
     ratio = short_divide(jax.lax.bitcast_convert_type(largest, jnp.float32), np.float32(E2M1_MAX))
     codes = scales_rounded_up(encoded(jax.lax.bitcast_convert_type(ratio, jnp.uint32), E4M3), ratio)

@@ -219,8 +219,9 @@ def narrowed_float32(x: jax.Array) -> jax.Array:
     subnormal to zero; past the largest finite an infinity, an infinity its own, a NaN a quiet one. The
     narrowing is a linear map (`generation.linear_map`), as `widened_exactly`'s widening is: its tangent
     the tangent narrowed alike, a cast's derivative (an NVFP4 tensor scale's at a float64 truth's width:
-    row 14083's review), its transpose the cotangent widened exactly (`_widened_back`, whose transpose is
-    this narrowing). It reads `x` in x64 whatever x64 scope it is called in."""
+    row 14083's review), its transpose the cotangent widened exactly (`widened_exactly`, whose transpose from
+    float64 to float32 is this narrowing), so every order of reverse mode rounds on the bits. It reads `x`
+    in x64 whatever x64 scope it is called in."""
     from dew.nn.kernels.generation import linear_map
 
     def apply(_, moving):
@@ -230,34 +231,18 @@ def narrowed_float32(x: jax.Array) -> jax.Array:
 
     def pullback(_, cotangent):
         # The cotangent widened from its bits, a subnormal float32 one kept, which a flushing convert zeroes
-        # (train 1455's review), placed as it is.
-        return _widened_back(cotangent)
+        # (train 1455's review), placed as it is, into float64 whatever scope a pullback runs in. A batch's
+        # cotangents each widened before they are summed, in float64 (no `summed_first`: two of 2^127 summed
+        # in float32 first were an infinity, not 2^128; train 1468's review).
+        with jax.enable_x64(new_val=True):
+            return widened_exactly(cotangent, jnp.float64)
 
     # Outside x64 a float64 array asked for as float64 is converted to float32 first, whose bits the
     # narrowing then reads as a float64's (train 1461's review: 1.0 made in x64 and narrowed after it, 0).
     with jax.enable_x64(new_val=True):
         x = jnp.asarray(x, jnp.float64)
         narrowed = jax.typeof(x).update(dtype=jnp.dtype(jnp.float32), weak_type=False)
-        return linear_map(apply, pullback, (), x, out_aval=narrowed, summed_first=True)
-
-
-def _widened_back(cotangent: jax.Array) -> jax.Array:
-    """`narrowed_float32`'s transpose: a float32 `cotangent` widened exactly into float64 on its bits (as
-    `widened_exactly` widens), a linear map whose own transpose is `narrowed_float32`, so every order of
-    reverse mode rounds on the bits (the review of row 14083: `widened_exactly`'s transpose, a convert, zeroed
-    a subnormal at reverse over reverse). Its float64 result is typed in x64 whatever scope a pullback runs
-    in; its own pullback, `narrowed_float32`, reads its float64 cotangent in x64 itself."""
-    from dew.nn.kernels.generation import linear_map
-
-    wide = np.dtype(np.float64)
-
-    def apply(_, moving):
-        return _bitwise(lambda part: _widened_bits(part, wide), moving, wide=True)
-
-    with jax.enable_x64(new_val=True):
-        widened = jax.typeof(cotangent).update(dtype=wide, weak_type=False)
-        return linear_map(apply, lambda _, back: narrowed_float32(back), (), cotangent, out_aval=widened,
-                          summed_first=True)
+        return linear_map(apply, pullback, (), x, out_aval=narrowed)
 
 
 def _narrowed_bits(x: jax.Array) -> jax.Array:
@@ -347,7 +332,10 @@ def widened_exactly(x: jax.typing.ArrayLike, dtype: DTypeLike) -> jax.Array:
 
     The widening is a linear map (`generation.linear_map`). Its transpose casts the cotangent back to `x`'s
     type (`cast_back`), so a product's linear map that widens its operands transposes it however JAX
-    reaches it. Its result is strongly typed, as an explicit conversion's is."""
+    reaches it; a float32's from float64 through the exact narrowing first (`narrowed_float32`, whose own
+    transpose is this widening), so every order of reverse mode rounds on the bits, a subnormal kept where a
+    flushing convert zeroed it (row 14083's review; train 1468's: one exact widening, the pair's). Its
+    result is strongly typed, as an explicit conversion's is."""
     if not isinstance(x, jax.Array | np.ndarray) or not _widens(jnp.dtype(x.dtype), jnp.dtype(dtype)):
         return jnp.asarray(x, dtype)
     # The destination as JAX resolves an explicit request (x64, or its explicit dtypes allowed without it).
@@ -363,9 +351,13 @@ def widened_exactly(x: jax.typing.ArrayLike, dtype: DTypeLike) -> jax.Array:
         # Traced where JAX evaluates the map, which may lie outside its caller's x64 scope (`float64_sum`'s).
         return _bitwise(lambda part: _widened_bits(part, resolved), moving,
                         wide=resolved == np.dtype(np.float64))
+    exact = source.dtype == np.dtype(np.float32) and resolved == np.dtype(np.float64)
+
+    def pullback(_, cotangent):
+        return cast_back(narrowed_float32(cotangent) if exact else cotangent, source)
     # Its type strong, as an explicit conversion's: a weak one would yield to a strong float32 it meets.
-    return linear_map(apply, lambda _, cotangent: cast_back(cotangent, source), (), x,
-                      out_aval=source.update(dtype=resolved, weak_type=False), summed_first=True)
+    return linear_map(apply, pullback, (), x, out_aval=source.update(dtype=resolved, weak_type=False),
+                      summed_first=True)
 
 
 def _bitwise(fn, moving: jax.Array, *, wide: bool) -> jax.Array:
