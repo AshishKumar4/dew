@@ -1086,12 +1086,12 @@ def test_a_small_tiles_cotangent_keeps_its_size_beside_a_cancelling_tile():
 
 def test_a_second_keys_pullback_restores_its_rows_power_after_the_values():
     """The dense call's pullback along its second keys (`reference`'s, the derivative's higher orders):
-    second keys `[2^124, -2^124]` of a second query 1 over constant values `2^-10` under a cotangent of
-    `2^127` pull back exactly 0, the rows' power `2^-1` restored once the values met the cotangent, where
-    restored on the cotangent first it doubled `2^127` to infinity and the centring read NaN (train 1500's
-    fix's review)."""
+    second keys `[2^124, -2^124]` of a second query 1 over constant values 1 under a cotangent of `2^127`
+    pull back exactly 0, the rows' power `2^-1` restored once the values met the cotangent and the row
+    centred it, where restored on the cotangent, or before the centring, it doubled `2^127` to infinity
+    and read NaN (train 1500's fix's reviews)."""
     second_key = jnp.asarray([2.0 ** 124, -(2.0 ** 124)], jnp.float32).reshape(1, 2, 1, 1)
-    value = jnp.full((1, 2, 1, 1), 2.0 ** -10, jnp.float32)
+    value = jnp.ones((1, 2, 1, 1), jnp.float32)
     one = jnp.ones((1, 1, 1, 1), jnp.float32)
     spans = template.spans(1, 2, 1)
     _, pull = jax.vjp(lambda second_key: attention_parallax.reference(
@@ -1117,6 +1117,25 @@ def test_a_second_products_direction_is_taken_back_by_its_rows_power():
     one = jnp.ones((1, 1, 1, 1), jnp.float32)
     tangent = jax.jvp(along, (one,), (one,))[1]
     assert float(tangent[0, 0, 0, 0]) == -(2.0 ** 124)
+
+
+def test_a_second_products_direction_meets_small_values_before_its_rows_power():
+    """The dense call's tangent along its second query: a second query `2^8` against second keys
+    `[2^119, -2^119]` (products `±2^127`, the rows' power `2^-4`) over values `[2^-10, -2^-10]` along
+    `2^10` is the plain formula's `-2^119`, the centred direction met by the values before the power
+    restores it, where restored first it read infinity (train 1500's fix's review)."""
+    second_key = jnp.asarray([2.0 ** 119, -(2.0 ** 119)], jnp.float32).reshape(1, 2, 1, 1)
+    value = jnp.asarray([2.0 ** -10, -(2.0 ** -10)], jnp.float32).reshape(1, 2, 1, 1)
+    spans = template.spans(1, 2, 1)
+
+    def along(second):
+        return attention_parallax.attend(jnp.zeros((1, 1, 1, 1), jnp.float32), second,
+                                         jnp.zeros((1, 2, 1, 1), jnp.float32), second_key, value, spans,
+                                         scale=1.0)
+
+    second = jnp.full((1, 1, 1, 1), 2.0 ** 8, jnp.float32)
+    tangent = jax.jvp(along, (second,), (jnp.full((1, 1, 1, 1), 2.0 ** 10, jnp.float32),))[1]
+    assert float(tangent[0, 0, 0, 0]) == -(2.0 ** 119)
 
 
 def test_a_float64_keys_query_takes_its_power_of_two_wide():
