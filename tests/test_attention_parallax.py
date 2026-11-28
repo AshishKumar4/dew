@@ -1000,14 +1000,15 @@ def test_a_subnormal_term_decays_and_raises_before_it_rounds():
     assert float(attention_parallax.exp_scaled(jnp.float32(1.0), jnp.float32(0.0), 128)) == float("inf")
 
 def test_exp_scaleds_derivative_meets_its_powers_before_it_rounds():
-    """`attention_parallax.exp_scaled`'s derivative along its exponent, forward, reverse and mixed, each
-    direction or cotangent met by every power at once, rounded where the answer is: at `2^-149 · 2^149` a
-    unit direction is 1 and a cotangent of `2^-100` pulls back `2^-100`; at `2^120 · 2^-120` a direction of
-    `2^100` is `2^100`; at `1.5 · 2^-2` a direction of `3 · 2^126` is `9 · 2^123`; at `1.5 · 2^-1` a
-    cotangent of `1.5 · 2^-126` pulls back `1.125 · 2^-126` on a backend that flushes subnormals; and the
-    derivative along `z` of the one along the exponent at `2^-149` is 1. The halved form's derivative
-    flushed the first, overflowed the second (train 1489's F2), and forms that met the direction before the
-    powers overflowed the third and fourth and flushed the fifth (its confirm review)."""
+    """`attention_parallax.exp_scaled`'s derivative, forward, reverse, joint and mixed, rounded where the
+    answer is: at `2^-149 · 2^149` a unit direction along the exponent is 1 and a cotangent of `2^-100`
+    pulls back `2^-100`, where the halved form of a subnormal flushed it (train 1489's F2); at `1.5 · 2^-2`
+    a direction of `3 · 2^126` is `9 · 2^123`; at `1.5 · 2^-1` a cotangent of `1.5 · 2^-126` pulls back
+    `1.125 · 2^-126` on a backend that flushes subnormals; at `2^126 · 2^-124` a cotangent of `3 · 2^124`
+    pulls back `3 · 2^126`; at `2^-64 · 2^128` the directions `(1, -2^64)` along `z` and the exponent cancel
+    to 0; and the derivative along `z` of the one along the exponent at `2^-149` is 1. Forms that met the
+    direction before the powers, or each direction apart, overflowed or flushed these (the confirm
+    reviews)."""
     def along(z, power, direction):
         return float(jax.jvp(lambda e: attention_parallax.exp_scaled(jnp.float32(z), e, power),
                              (jnp.float32(0.0),), (jnp.float32(direction),))[1])
@@ -1018,9 +1019,13 @@ def test_exp_scaleds_derivative_meets_its_powers_before_it_rounds():
 
     assert along(2.0 ** -149, 149, 1.0) == 1.0
     assert pulled(2.0 ** -149, 149, 2.0 ** -100) == 2.0 ** -100
-    assert along(2.0 ** 120, -120, 2.0 ** 100) == 2.0 ** 100
     assert along(1.5, -2, 3 * 2.0 ** 126) == 9 * 2.0 ** 123
     assert pulled(1.5, -1, 1.5 * 2.0 ** -126) == 1.125 * 2.0 ** -126
+    assert pulled(2.0 ** 126, -124, 3 * 2.0 ** 124) == 3 * 2.0 ** 126
+    primals, directions = (jnp.float32(2.0 ** -64), jnp.float32(0.0)), (jnp.float32(1.0), jnp.float32(-(2.0 ** 64)))
+    joint = jax.jvp(lambda z, e: attention_parallax.exp_scaled(z, e, 128), primals, directions)[1]
+    assert float(joint) == 0.0
+
     def along_exponent(z):
         one, zero = jnp.float32(1.0), jnp.float32(0.0)
         return jax.jvp(lambda e: attention_parallax.exp_scaled(z, e, 0), (zero,), (one,))[1]

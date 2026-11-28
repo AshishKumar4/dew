@@ -81,7 +81,7 @@ from jax.custom_derivatives import zero_from_primal
 from dew.algebra import means
 from dew.algebra.windows import Units
 from dew.nn.derivatives import KernelGlue, Protected, contracted, declared_tangent, surrogate
-from dew.nn.float_bits import binade_of, raised_exactly
+from dew.nn.float_bits import raised_exactly
 from dew.nn.kernels import generation
 from dew.nn.kernels.templates.attention import REFERENCE_PRECISION, KeySpans, dense, logit_scale, prescaled
 from dew.nn.precision import accurate_exp, float32_einsum, ln2_remainder, power2, two_sum
@@ -147,8 +147,8 @@ def exp_scaled(z: jax.Array, exponent: jax.Array, power) -> jax.Array:
     `2^254`, `2^-115`, where applying the power after the decay read 0. Its value takes a tiny fp32 `z` from
     its bits (`raised_exactly`), so a subnormal is no operand a flushing multiply reads (XLA's CPU), and
     halves only `|z| >= 1` against `e^f`'s overflow: halving `2^-149` first read it 0, which `2^149` then
-    raised to 0, not 1 (train 1478's K-F2). Its derivative along `z` the halved form's, along the exponent
-    the lifted form's (`_exp_scaled_tangent`), the value the exact one's (`_exact`)."""
+    raised to 0, not 1 (train 1478's K-F2). Its derivative the halved form's (`_exp_scaled_tangent`), the
+    value the exact one's (`_exact`)."""
     exponent = jnp.broadcast_to(exponent, jnp.shape(z))
     return _exp_scaled(z, exponent, jnp.broadcast_to(jnp.asarray(power, jnp.float32), jnp.shape(z)))
 
@@ -182,49 +182,30 @@ def _exact(z: jax.Array, exponent: jax.Array, power: jax.Array) -> jax.Array:
 
 
 def _halved(z: jax.Array, exponent: jax.Array, power: jax.Array) -> jax.Array:
-    """`exp_scaled` in its halved form, `z / 2` taken by `e^f` and every power at once: its derivative along
-    `z`, which JAX takes of it."""
+    """`exp_scaled` in its halved form, `z / 2` taken by `e^f` and every power at once, a tiny `z`
+    (`|z| < 2^-100`) raised by `2^64` in its stead (from its bits, `raised_exactly`, which no flushing
+    multiply reads), its power among the powers: its derivative, which JAX takes of it, both directions
+    summed before the powers, so a cancelling pair cancels, and a tiny `z`'s direction kept from flushing,
+    its derivative along `z` at most `2^64`."""
     finite, whole, fraction = _decay_parts(exponent)
-    return jnp.where(finite, _decayed(z * 0.5, accurate_exp(fraction), power + whole + 1.0), 0.0)
-
-
-def _lifted(z: jax.Array) -> tuple[jax.Array, jax.Array]:
-    """`z` as `l 2^k` with `l` exact and `k` held: `|z| >= 1` its significand halved (`|l|` within `[1/2,
-    1)`, `k` its binade plus one), `|z| < 2^-100` raised by `2^64` (a tiny fp32 `z` read from its bits,
-    `raised_exactly`, which no flushing multiply reads), else `z` itself (`k` 0); an infinity or a NaN as it
-    is. `l`'s derivative `2^-k` is at most `2^64`, so a higher order's direction along `z` stays in range."""
-    held = jax.lax.stop_gradient(z)
-    finite = jnp.isfinite(held)
-    binade = binade_of(held) if jnp.dtype(z.dtype) == jnp.float32 else jnp.frexp(held)[1] - 1
-    tiny = jnp.where(jnp.abs(held) < 2.0 ** -100, -64, 0)
-    k = jnp.where(finite & (jnp.abs(held) >= 1), binade + 1, tiny)
-    exact = power2(held, -k)
+    tiny = jnp.abs(jax.lax.stop_gradient(z)) < 2.0 ** -100
+    lifted = z * jnp.where(tiny, 2.0 ** 64, 0.5)
     if jnp.dtype(z.dtype) == jnp.float32:
-        exact = jnp.where(k < 0, raised_exactly(held, jnp.maximum(-k, 0)), exact)
-    scaled = power2(z, -k)
-    return jnp.where(finite, scaled + jax.lax.stop_gradient(exact - scaled), z), k
-
-
-def _lifted_decay(z: jax.Array, exponent: jax.Array, power: jax.Array) -> jax.Array:
-    """`exp_scaled` of `z` lifted (`_lifted`), its power among the powers, every power applied at once: its
-    derivative along the exponent, which JAX takes of it, a direction met by the lifted `z` and `e^f` alone
-    (at most 2) before the powers, and a cotangent by the powers before them (JAX's transpose)."""
-    finite, whole, fraction = _decay_parts(exponent)
-    lifted, lift = _lifted(z)
-    return jnp.where(finite, _decayed(lifted, accurate_exp(fraction), power + whole + lift), 0.0)
+        exact = jnp.where(tiny, raised_exactly(jax.lax.stop_gradient(z), jnp.int32(64)), lifted)
+        lifted = lifted + jax.lax.stop_gradient(exact - lifted)
+    return jnp.where(finite, _decayed(lifted, accurate_exp(fraction),
+                                      power + whole + jnp.where(tiny, -64.0, 1.0)), 0.0)
 
 
 def _exp_scaled_tangent(primals, tangents):
-    """`exp_scaled`'s tangent beside the rule's own value, so a higher order meets the rule again: along `z`
-    the halved form's (`_halved`), along the exponent the lifted form's (`_lifted_decay`), each JAX's own
-    derivative, linear in its direction and transposed by JAX: `2^120 · 2^-120` along `2^100` is `2^100`,
-    `2^-149 · 2^149` along 1 is 1, `1.5 · 2^-2` along `3 · 2^126` is `9 · 2^123`, where the halved form's
-    overflowed, flushed and a significand's overflowed."""
-    z, exponent, power = primals
-    along_z, along_exponent, _ = tangents
-    _, moved = jax.jvp(lambda z: _halved(z, exponent, power), (z,), (along_z,))
-    _, decayed = jax.jvp(lambda exponent: _lifted_decay(z, exponent, power), (exponent,), (along_exponent,))
-    return _exp_scaled(*primals), moved + decayed
+    """`exp_scaled`'s tangent: the halved form's, JAX's own derivative of it (`_halved`), beside the rule's
+    own value, so a higher order meets the rule again: `2^-149 · 2^149` along its exponent is 1, where the
+    halved form of a subnormal flushed it 0. Its order is fixed, as JAX transposes it: a direction meets `z /
+    2` before the powers and a cotangent the powers first, so `2^120 · 2^-120` along `2^100` overflows
+    where the reverse of `3 · 2^124` at `2^126 · 2^-124` does not; a declared transpose
+    (`generation.linear_map`) read NaN past the second order of `attend`."""
+    _, tangent = jax.jvp(_halved, primals, tangents)
+    return _exp_scaled(*primals), tangent
 
 
 _exp_scaled = contracted("test_parallax_holds_every_order")(
