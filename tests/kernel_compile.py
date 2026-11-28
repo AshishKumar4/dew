@@ -137,6 +137,9 @@ class Report:
     read as `reports` makes it (row 9719: each consumer branched on `kind`)."""
     index: str | None = None
     """XLA uniquification suffix (`assembled.Binary.index`) where a second cubin shares `(kernel, launch)`."""
+    spilled_in: tuple[str, ...] | None = ()
+    """The roles its spill stood in, as its binary states them (`assembled.Binary.spilled_in`): the build's
+    whose run judged it (`_Rebuilt`), which a ladder steps its launch down by (`spill_roles`)."""
 
     @property
     def traced(self) -> str:
@@ -221,7 +224,7 @@ def reports(estimates: dict[str, str], binaries: list[assembled.Binary],
             threads=binary.threads if binary is not None else None,
             decreased=binary.decreased if binary is not None else None,
             raised=binary.raised if binary is not None else None,
-            kind="mosaic_gpu"))
+            kind="mosaic_gpu", spilled_in=binary.spilled_in if binary is not None else ())),
     for name in sorted(triton_found):
         binary = triton_found[name]
         tmem_known = binary.uses_tmem is False
@@ -679,7 +682,7 @@ def gate_generations(dtype=jnp.bfloat16, *, stated: bool = False, scoped: bool =
     return tuple(Gated(name) for _, name in found)
 
 
-def compile_mosaic_kernels(cases, generation: str) -> list[dict]:
+def compile_mosaic_kernels(cases, generation: str, builds: tuple[str, ...] | None = None) -> list[dict]:
     """Each Mosaic GPU case (`name`, `call()` giving the kernel and abstract operands) compiled as
     `compile_kernels` compiles Triton's, for a compile-only device of the CUDA `generation`, with Mosaic's
     own reports dumped (`_dumped`): its name, the generation's shared-memory and tensor-memory limits
@@ -697,7 +700,7 @@ def compile_mosaic_kernels(cases, generation: str) -> list[dict]:
     if _BINARY_CAPABILITY and _BINARY_CAPABILITY[0] != wanted and apart_records.RECORDS not in os.environ:
         return compiled_apart(wanted, test, call)
     _BINARY_CAPABILITY[:] = _BINARY_CAPABILITY or [wanted]
-    found = _compiled_here(cases, generation)
+    found = _compiled_here(cases, generation, builds)
     if apart_records.RECORDS in os.environ:
         apart_records.written(Path(os.environ[apart_records.RECORDS]), test, call, found)
     elif _undumped(found):
@@ -924,17 +927,23 @@ def _compiled_reports(modules: Mapping[str, str], generation: str, build: str) -
     return found
 
 
-def _compiled_here(cases, generation: str) -> list[dict]:
+def _compiled_here(cases, generation: str, builds: tuple[str, ...] | None = None) -> list[dict]:
     """`compile_mosaic_kernels`' records, compiled in this process: each case run once a build its
-    generation's GPUs run (`judged_builds`; this process's own compiler's first, `_ordered_builds`), its
+    generation's GPUs run (`judged_builds`; this process's own compiler's first, `_ordered_builds`), or once
+    each of `builds` among them (a gate stepping a build's launches down by that build's spills alone), its
     launches certified as that build's assembler certifies them (this process's compiler's own, or that
     build's ptxas's, `_Rebuilt`) and the program its derivations select judged under that build alone, as a
     GPU running it runs it: the first run the record, every other beside it (`record['builds']`, row
-    10766)."""
+    10766), each beside another named by its build. Another build's run names what its
+    ptxas rejected (`rejected`) apart from what it could not judge for want of PTX (`unjudged`), and the
+    Triton kernels its ptxas never assembled, their figures this process's compile's (`unqualified`)."""
+    ordered = _ordered_builds(generation)
+    if builds is not None and not set(builds) <= set(ordered):
+        raise ValueError(f"{generation}'s GPUs run {ordered} under this environment, not {builds}")
     found: list[dict] = []
     for case in cases:
         runs: dict[str, dict] = {}
-        for build in _ordered_builds(generation):
+        for build in (ordered if builds is None else tuple(build for build in ordered if build in builds)):
             run = _header(case, generation)
             if runs:
                 run["name"] = f"{case.name} under {build}"
@@ -944,7 +953,10 @@ def _compiled_here(cases, generation: str) -> list[dict]:
             _run(case, generation, run, build, judge=rebuilt or _Bound(),
                  earlier={each["lowered"]: each for each in runs.values() if "lowered" in each})
             if rebuilt is not None:
-                run["unjudged"] = rebuilt.unjudged
+                run["unjudged"], run["rejected"] = rebuilt.unjudged, rebuilt.rejected
+                run["unqualified"] = sorted({*rebuilt.unqualified, *(
+                    assembled.launch_name(kernel["kernel"], kernel["launch"])
+                    for kernel in run.get("kernels", ()) if kernel["kind"] != "mosaic_gpu")})
             runs[build] = run
         record, *others = runs.values()
         record["builds"] = dict(zip(list(runs)[1:], others, strict=True))
@@ -1017,6 +1029,16 @@ def _judged(build: str, judge: report.Judge | None) -> Iterator[None]:
         return
     with report.refusals(), report.judging(build, judge):
         yield
+
+
+def each_build(generation: str) -> Iterator[str]:
+    """Each CUDA build `generation`'s GPUs run here (`judged_builds`, this process's compiler's first), its
+    block within refusals of its own (`report.refusals`): a gate that steps launches down by their spills
+    steps each build's by that build's alone (`compile_mosaic_kernels`' `builds`), so a build that holds keeps
+    the tiles it derived where another steps down (Train 1470's review)."""
+    for build in _ordered_builds(generation):
+        with report.refusals():
+            yield build
 
 
 def _ordered_builds(generation: str) -> tuple[str, ...]:
@@ -1105,12 +1127,16 @@ class _Rebuilt(_Bound):
     Mosaic GPU kernel of the PTX printed of its module that build's binary (`_assembly`), its launch's own
     facts (its name, launch, caller and shared bytes) its compile's: its verdict (`assembled.Binary.refused`),
     its SASS, register raises and decreases that build's. A kernel of no PTX printed here (its module
-    compiled before the gate's) or one that build does not assemble is left as compiled and named
-    (`unjudged`): its case runs again in a process of its own (`_undumped`)."""
+    compiled before the gate's) is left as compiled and named (`unjudged`): its case runs again in a process
+    of its own (`_undumped`); one whose PTX that build's ptxas rejects is named with its report's tail
+    (`rejected`), a failure of the case, never a retry; a Triton kernel, no PTX of which Mosaic printed, is
+    that build's assembly of none and is named (`unqualified`)."""
 
     build: str
     generation: str
     unjudged: list[str] = dataclasses.field(default_factory=list)
+    rejected: dict[str, str] = dataclasses.field(default_factory=dict)
+    unqualified: list[str] = dataclasses.field(default_factory=list)
 
     def __call__(self, kernels: dict[str, tuple[str | None, assembled.Binary]]
                  ) -> dict[str, tuple[str | None, assembled.Binary]]:
@@ -1118,12 +1144,17 @@ class _Rebuilt(_Bound):
         return {name: (module, self._assembled(module, binary)) for name, (module, binary) in kernels.items()}
 
     def _assembled(self, module: str | None, binary: assembled.Binary) -> assembled.Binary:
+        name = assembled.launch_name(binary.kernel, binary.launch)
         if binary.kind != "mosaic_gpu":
             # A Triton kernel: no print of its PTX is read, its compiling build's verdict alone.
+            self.unqualified.append(name)
             return binary
-        rebuilt = None if module not in PTX else _assembly(module, self.generation, self.build).binary
-        if rebuilt is None:
-            self.unjudged.append(assembled.launch_name(binary.kernel, binary.launch))
+        if module not in PTX:
+            self.unjudged.append(name)
+            return binary
+        made = _assembly(module, self.generation, self.build)
+        if (rebuilt := made.binary) is None:
+            self.rejected[name] = made.text[-400:]
             return binary
         return dataclasses.replace(rebuilt, kernel=binary.kernel, launch=binary.launch, caller=binary.caller,
                                    shared=binary.shared, index=binary.index)
@@ -1167,6 +1198,22 @@ def runs(found: list[dict]) -> list[dict]:
     runs, as its build assembles it, which the gate's checks hold."""
     return [{**each, "builds": {}} for record in found
             for each in (record, *record.get("builds", {}).values())]
+
+
+def spills(found: list[dict]) -> dict[str, set[str]]:
+    """Each run of `found`'s records (`runs`: every build's) that spills, by its name, with the kernels that
+    spill there: a check of spills reads every build's, a spill one build's alone among them."""
+    every = {run["name"]: {kernel["kernel"] for kernel in run.get("kernels", ()) if kernel.get("spilled")}
+             for run in runs(found)}
+    return {name: kernels for name, kernels in every.items() if kernels}
+
+
+def spill_roles(found: list[dict]) -> dict[str, tuple[str, ...] | None]:
+    """The roles each spilling kernel of `found`'s runs (`runs`) spilled in, as its run's build judged it
+    (`Report.spilled_in`), by kernel: a ladder steps by them, never by this process's binaries' where another
+    build's run spilled."""
+    return {kernel["kernel"]: None if kernel["spilled_in"] is None else tuple(kernel["spilled_in"])
+            for run in runs(found) for kernel in run.get("kernels", ()) if kernel.get("spilled")}
 
 
 def failing_runs(record: dict) -> list[dict]:
@@ -1219,10 +1266,13 @@ def _run_failures(record: dict, *, traced_models: bool = False) -> list[str]:
 
 
 def _unjudged(run: dict) -> list[str]:
-    """Each kernel `run`'s build judged none of (`_Rebuilt.unjudged`: no PTX of its module dumped here), its
-    run's verdicts, and so its selection, not its build's."""
-    return [f"{run['name']}: {kernel} not judged under {run.get('build')}, no PTX of its module dumped"
-            for kernel in run.get("unjudged", ())]
+    """Each kernel `run`'s build judged none of: no PTX of its module dumped here (`_Rebuilt.unjudged`), or
+    PTX that build's ptxas rejects (`_Rebuilt.rejected`, its report's tail): its run's verdicts, and so its
+    selection, not its build's (`_run_failures`, `_route_failures` alike)."""
+    return [*(f"{run['name']}: {kernel} not judged under {run.get('build')}, no PTX of its module dumped"
+              for kernel in run.get("unjudged", ())),
+            *(f"{run['name']} {kernel}: {run.get('build')}'s ptxas rejects its certification's PTX: {text}"
+              for kernel, text in run.get("rejected", {}).items())]
 
 
 def producer_failures(found: list[dict]) -> list[str]:
