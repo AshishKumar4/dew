@@ -150,9 +150,6 @@ def test_the_attention_kernels_run_on_this_gpu(part):
           for name, softcap in (("plain", None), ("softcap", decode.SOFTCAP))),
         Cell("the decode kernel's attention differentiates as the folded attention",
              decode.attention_the_decode_kernel_takes_differentiates_as_the_folded_attention),
-        Cell("a decode step's value tangent is finite past its raw products",
-             decode.a_decode_steps_value_tangent_is_finite_past_its_raw_products,
-             at_run="no check-1 site: one tangent its run computes and compares exactly"),
         Cell("a decode call naming cuDNN differentiates under deterministic ops",
              decode.a_decode_call_naming_cudnn_differentiates_under_deterministic_ops),
         *(Cell(f"a verify block of {drafts} through the route is on par",
@@ -161,6 +158,11 @@ def test_the_attention_kernels_run_on_this_gpu(part):
         *(Cell(f"a paged decode step of {page}-key pages is on par",
                functools.partial(decode_template.a_paged_decode_step_of_small_pages_is_on_par, page))
           for page in decode_template.served_small_pages()),
+        # A new cell goes last: a cell's part is its place's (`parted`), and one placed between others moves
+        # every cell after it into another part, whose prepare record main's does not match (train 1482).
+        Cell("a decode step's value tangent is finite past its raw products",
+             decode.a_decode_steps_value_tangent_is_finite_past_its_raw_products,
+             at_run="no check-1 site: one tangent its run computes and compares exactly"),
     ], part, KERNEL_PARTS))
 
 
