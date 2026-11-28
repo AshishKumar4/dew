@@ -42,6 +42,10 @@ PREPARE_BY = "DEW_TIER_PREPARE_BY"
 test or flow cell (`past_cap`): its group's time, less what its process's end takes, so the programs it
 prepared are kept rather than lost to its task's kill (tools/armada/prepares.py's `process`). Unset or
 empty (a part's prepare clears one it inherits), no cap."""
+LABELED = "label:"
+"""What starts an unprepared site's identity that is its Check 1 label (tests/truths_ahead.py's `unprepared`),
+where one is no line's source text: a grade compares two sites of one kind alone (tools/armada/prepares.py's
+`knowing`)."""
 CAPPED = "its group's prepare time cap"
 """Where a test or cell left unprepared by its prepare's cap is recorded (`UNPREPARED`, `DEFERRED`): named
 unprepared and run unprepared on its GPU as any is, but no red of its row (prepares.py's `graded`): a cap is

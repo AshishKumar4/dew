@@ -499,6 +499,60 @@ def test_a_cell_moved_by_an_edit_above_it_is_main_s_cell_and_a_new_one_beside_it
     assert elsewhere["new_unprepared"] == [f"{test} @ src/dew/nn/attention.py:86"]
 
 
+def test_two_sites_opening_on_one_line_are_two_cells_by_their_labels(ci, tmp_path):
+    """A test's unprepared sites are told apart by their Check 1 labels (tests/truths_ahead.py's `unprepared`,
+    `site`), never by their line's text alone: two multiline calls opening on one line, `assert_as_exact(`
+    each, are two cells, and a run that leaves the second where main left the first is red for it (train
+    1497's F1)."""
+    test = "tests/test_gpu_attention.py::test_merged"
+    frames = [(str(Path(__file__).resolve().parent / "test_gpu_attention.py"), 83)]
+    for label in ("merged forward", "merged backward"):
+        truths_ahead.unprepared(tmp_path / label.replace(" ", "-"), test, frames, f"{label}: not reached",
+                                site=label)
+    (first,), (second,) = (json.loads((tmp_path / name / tier_wire.UNPREPARED).read_text())["reasons"]
+                           for name in ("merged-forward", "merged-backward"))
+    at = "tests/test_gpu_attention.py:83"
+    assert (first["where"], first["site"]) == (at, f"{tier_wire.LABELED}merged forward")
+    assert (second["where"], second["site"]) == (at, f"{tier_wire.LABELED}merged backward")
+    main = {(test, first["where"], None, "site", first["site"])}
+    found = {"name": "3.12:tests/test_gpu_attention.py#5/25@prepare-sm90", "exitCode": 0, "output": ""}
+    left = {"test": test, "where": second["where"], "error": second["error"], "kind": "site",
+            "site": second["site"]}
+    [row] = ci.prepares.graded([found], {"tests/test_gpu_attention.py": [left]}, main, "sm90",
+                               lambda named: ci.grading.owning(ci.parsed_row(named)[1]), ci.grading.STALE,
+                               ci.tier_wire().CAPPED)
+    assert row["new_unprepared"] == [f"{test} @ tests/test_gpu_attention.py:83"]
+
+
+def test_a_label_and_a_line_s_text_are_two_kinds_of_site_never_compared(ci):
+    """A site's identity is its Check 1 label (tests/tier_wire.py's `LABELED`) or, in a baseline written
+    before labels were kept, its line's text: two kinds a grade never compares (prepares.py's `knowing`), so a
+    site unchanged since an older baseline stays green; two labels are compared, an A→B swap red; and a flow's
+    cell is its label (`cell`) whatever its site says (train 1498's F1)."""
+    name = "3.12:tests/test_gpu_attention.py#5/25@prepare-sm90"
+    test = "tests/test_gpu_attention.py::test_merged"
+    where = "tests/test_gpu_attention.py:83"
+    labeled = ci.tier_wire().LABELED
+
+    def graded(records, before):
+        found = {"name": name, "exitCode": 0, "output": ""}
+        [row] = ci.prepares.graded([found], {"tests/test_gpu_attention.py": records}, before, "sm90",
+                                   lambda named: ci.grading.owning(ci.parsed_row(named)[1]),
+                                   ci.grading.STALE, ci.tier_wire().CAPPED, label_prefix=labeled)
+        return row
+    site = {"test": test, "where": where, "error": "e", "kind": "site", "site": f"{labeled}merged forward"}
+    old_site = {(test, where, None, "site", "assert_as_exact(")}
+    assert graded([site], old_site)["exitCode"] == 0
+    swapped = {(test, where, None, "site", f"{labeled}merged backward")}
+    assert graded([site], swapped)["new_unprepared"] == [f"{test} @ {where}"]
+    flow = {"test": test, "where": where, "error": "e", "kind": "flow", "cell": "merged forward",
+            "site": f"{labeled}merged forward"}
+    old_flow = {(test, where, "merged forward", "flow", "assert_as_exact(")}
+    assert graded([flow], old_flow)["exitCode"] == 0
+    other_flow = {(test, where, "merged backward", "flow", f"{labeled}merged backward")}
+    assert graded([flow], other_flow)["new_unprepared"] == [f"{test} @ {where} [merged forward]"]
+
+
 def test_a_cell_its_prepares_cap_left_is_named_and_counted_but_reds_no_row(ci):
     """A cell a dry prepare's cap left unprepared (tests/tier_wire.py's `CAPPED`, its where exactly) is named
     among its row's unprepared and counted apart (`capped`, its output; kept as the row is reused), but no

@@ -818,7 +818,7 @@ def loaded(flow: ModelFlow) -> dict[str, Callable]:
         for name, why in on_device.items():
             kernels = reference_kernels() if name.endswith(" reference") else {}
             held[name] = jax.jit(functools.partial(_traced_under, named[name][0], kernels))
-            truths.unprepared(f"{flow.name} {name}: {why}", AT_RUN)
+            truths.unprepared(f"{flow.name} {name}: {why}", AT_RUN, site=f"{flow.name} {name}")
     return {name: as_given(lambda params, *inputs, program=program: jax.device_get(
                 program(*jax.tree.leaves(params), *inputs))) for name, program in held.items()}
 

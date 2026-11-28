@@ -177,7 +177,7 @@ def _deferred(label: str, error: BaseException, frames: list[tuple[str, int]],
     if not store.judged_its_zeros(error, tried_before):
         test = os.environ.get("PYTEST_CURRENT_TEST", "").rsplit(" (", 1)[0]
         truths_ahead.unprepared(store.directory, test, frames[::-1], f"{label}: {_raised(error)[:400]}",
-                                tier_wire.DEFERRED, cell=label)
+                                tier_wire.DEFERRED, cell=label, site=label)
         print(f"cell deferred to its run: {label}", flush=True)
     return True
 
