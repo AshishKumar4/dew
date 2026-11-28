@@ -1490,14 +1490,17 @@ PACKED_CHECKPOINT = Path(__file__).with_name("packed_checkpoint_worker.py")
 @pytest.mark.parametrize("mode", ["local_packed", "local_packed_lost"], ids=["held", "lost"])
 def test_a_pools_local_step_restores_its_packed_matrices_and_refuses_a_foreign_form(tmp_path, mode):
     """A pool's train state holding a frozen quantized collection (a bfloat16 window and an NVFP4 matrix,
-    each placed whole on the run's mesh) saved on the local tier alone and restored into its template: each
-    packed matrix its type, its form and every shard as written on every process, where process 1 lost its
-    local copy too (its matrices read from process 0's replica); a step whose window is under another
-    encoder's form is refused by every process, each holding its digest, as it reads it (row 13742)."""
+    each placed whole on the run's mesh) saved on the local tier alone at steps 1 and 2 and restored into
+    its template: each packed matrix its type, its form and every shard as written on every process, where
+    process 1 lost its local copy too (its matrices read from process 0's replica); the same step 2 with
+    its window under another encoder's form is refused by every process, each holding its digest, as it
+    reads it, where a control run's step 2 of the same matrices reads (row 13742; train 1431's review: the
+    refusal and its control differ in the digest alone)."""
     reports = run_pool(mode, tmp_path / "out", 2, script=PACKED_CHECKPOINT, run_dir=tmp_path / "run",
                        fsdp_size=2, local_dir=tmp_path / "local")
+    read = {"window": True, "nvfp4": True}
     for report in reports:
-        assert report == {"read": {"window": True, "nvfp4": True},
+        assert report == {"read": read, "control": read, "first": read,
                           "foreign": {"type": "ValueError", "phase": None, "named": None}}, report
 
 

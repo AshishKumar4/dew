@@ -69,11 +69,23 @@ def _read(written: dict, restored: dict) -> dict:
 def local_packed(args, *, lost: bool = False) -> dict:
     """A pool's train state holding a frozen quantized collection beside its own (its packed matrices
     placed whole on the run's mesh, so each process holds a replica of every shard), saved on the local tier
-    alone (`Checkpoints.save_local`) and restored into its template: each packed matrix as written on every
-    process. Then a step whose window is under another encoder's form, refused as every process reads it
-    (`process_support.refusal`). Where `lost`, process 1's local copy of each step is gone before its
-    restore, as a replaced host's is: its records, the foreign digest too, come from process 0's
-    replica."""
+    alone (`Checkpoints.save_local`) at steps 1 and 2 and each restored into its template, twice: a control
+    run whose step 2 holds the same matrices, each read as written on every process, and a run whose step 2
+    holds its window under another encoder's form, refused as every process reads it
+    (`process_support.refusal`): the two step 2 restores differ in the digest alone (train 1431's review:
+    a refusal of any other cause, a step's mismatch, would read alike). Where `lost`, process 1's local copy
+    of each step is gone before its restore, as a replaced host's is: its records, the foreign digest too,
+    come from process 0's replica."""
+    control = _local_steps(args, "control", lost, lambda packed: packed)
+    foreign = _local_steps(args, "foreign", lost, _foreign)
+    return {"read": control[1], "control": control[2], "foreign": foreign[2], "first": foreign[1]}
+
+
+def _local_steps(args, run: str, lost: bool, second) -> dict:
+    """`local_packed`'s run `run` (its own persistent and local directories): steps 1 (the packed matrices)
+    and 2 (`second` of them) saved on the local tier and restored in turn, each restore's report: the
+    matrices it read as written (`_read`), or its refusal (`process_support.refusal`, its message beside a
+    step 1's)."""
     import shutil
 
     import jax
@@ -84,7 +96,15 @@ def local_packed(args, *, lost: bool = False) -> dict:
     from dew._coordination import PeerFailure
     from dew.quantization import QUANTIZATION
 
-    def saved(step: int, held: dict):
+    local_dir = Path(args.local_dir) / run
+    trainer = build_trainer(args.name, str(Path(args.run_dir) / run), args.fsdp_size,
+                            local_dir=str(local_dir), local_every=1)
+    checkpoints = trainer.checkpoints
+    assert checkpoints is not None
+    placed, _, _ = trainer.place()
+    packed = _packed(NamedSharding(trainer.device_mesh, PartitionSpec()))
+    reports = {}
+    for step, held in ((1, packed), (2, second(packed))):
         # Saved on the local tier alone, the managers closed after it (`Checkpoints.close`: a closed one
         # reopens on its next use); where `lost`, process 1's copy then gone, as a replaced host's is, so
         # its restore reads process 0's replica (`Checkpoints._recovered`).
@@ -94,30 +114,16 @@ def local_packed(args, *, lost: bool = False) -> dict:
             checkpoints.save_local(step, written, None)
         if lost:
             if jax.process_index() == 1:
-                shutil.rmtree(Path(args.local_dir) / "process1")
-            multihost_utils.sync_global_devices(f"local copy {step} lost")
-        return written
-
-    trainer = build_trainer(args.name, args.run_dir, args.fsdp_size, local_dir=args.local_dir, local_every=1)
-    checkpoints = trainer.checkpoints
-    assert checkpoints is not None
-    placed, _, _ = trainer.place()
-    packed = _packed(NamedSharding(trainer.device_mesh, PartitionSpec()))
-    state = saved(1, packed)
-    try:
-        with checkpoints:
-            restored, _ = checkpoints.restore(_template(state), 1)
-    except (ValueError, PeerFailure) as error:
-        # Its message beside the refusal's type: a failing assertion shows what refused the read.
-        return {"read": {**refusal(error), "message": str(error)}, "foreign": None}
-    read = _read(packed, restored.variables[QUANTIZATION])
-    saved(2, _foreign(packed))
-    try:
-        with checkpoints:
-            checkpoints.restore(_template(state), 2)
-    except (ValueError, PeerFailure) as error:
-        return {"read": read, "foreign": refusal(error)}
-    return {"read": read, "foreign": None}
+                shutil.rmtree(local_dir / "process1")
+            multihost_utils.sync_global_devices(f"{run} local copy {step} lost")
+        try:
+            with checkpoints:
+                restored, _ = checkpoints.restore(_template(written), step)
+        except (ValueError, PeerFailure) as error:
+            reports[step] = refusal(error) if step == 2 else {**refusal(error), "message": str(error)}
+            continue
+        reports[step] = _read(held, restored.variables[QUANTIZATION])
+    return reports
 
 
 def local_packed_lost(args) -> dict:
