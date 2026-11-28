@@ -1069,10 +1069,7 @@ def nvfp4_coded(x: jax.Array, tensor: jax.Array | None = None) -> tuple[jax.Arra
     # Unsigned IEEE magnitudes are ordered as integers, including subnormals on an FTZ backend.
     words, sign, _, _ = raw_fields(x)
     magnitude = words ^ sign
-    if tensor is None:
-        tensor = nvfp4_tensor_scale(_nvfp4_amax(x), quotient)
-    else:
-        tensor = nvfp4_given_scale(tensor)
+    tensor = nvfp4_tensor_scale(_nvfp4_amax(x), quotient) if tensor is None else nvfp4_given_scale(tensor)
     # Each value over the tensor scale once (row 14083): a block's largest magnitude's quotient is the
     # largest of its quotients' magnitudes, one division keeping their order, a finite value's NaN quotient
     # left out (a zero's 0/0 at a zero scale, every finite one's at a NaN scale); a block of them all zero's

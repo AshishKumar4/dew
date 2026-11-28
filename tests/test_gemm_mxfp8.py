@@ -376,8 +376,8 @@ def test_a_largest_magnitude_is_ieees_maximum_of_magnitudes_at_every_width(dtype
 @pytest.mark.mesh(devices=2)
 @pytest.mark.parametrize("split", [0, 1])
 def test_a_largest_magnitude_is_placed_as_jaxs_maximum_is(split):
-    """`float_bits.largest_magnitude` along the columns of rows an Explicit axis splits by their rows or by the
-    columns it reduces, jitted: the values and the placement of `jnp.max(jnp.abs(x), 1)` (row 14083)."""
+    """`float_bits.largest_magnitude` along the columns of rows an Explicit axis splits by their rows or by
+    the columns it reduces, jitted: the values and the placement of `jnp.max(jnp.abs(x), 1)` (row 14083)."""
     from jax.sharding import NamedSharding, PartitionSpec
 
     from dew.nn.float_bits import largest_magnitude
