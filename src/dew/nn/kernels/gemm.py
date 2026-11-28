@@ -1129,20 +1129,20 @@ def nvfp4_product(lhs: jax.Array, matrix: NvFp4, group_sizes: jax.Array | None =
                   gather: jax.Array | None = None, *, layer: jax.Array | None = None, out_dtype,
                   interpret_on_cpu: bool = False) -> jax.Array:
     """`lhs · W` of an NVFP4 matrix `W` (`NvFp4`), its weights frozen (a quantized checkpoint's): `lhs`
-    rounded to bfloat16, each value of `W` decoded exactly to bfloat16 (`NvFp4.decoded`, its block's
-    scale applied, 2^8 owed), the products summed in fp32, each step's apart (`templates.product.promoted`,
-    row 4331), and the accumulator times the deferred factor
-    (`NvFp4.factor`) before the one rounding to `out_dtype`: the deferred factor is the epilogue's first
-    operation, ahead of any output hook (PLAN piece 10). Its selector (`NVFP4`) runs the template's mainloop
-    decoding each stage in place (`_packed`) where named, else decodes the matrix once a call (`gemm`).
-    With `group_sizes`, `matrix` is a bank of experts' matrices (`NvFp4`'s group axis, row 4516) and `lhs`
-    their sorted rows: each group's rows times its expert's matrix, each times its expert's factor, frozen
-    (no gradient reaches the bank), each tile decoding its group's expert's stages in place on the packed
-    kernel; with `gather` besides, its rows `lhs[gather]`, read where they lie (`gemm`'s `gather`). With
-    `layer` (a traced index) too, `matrix` is a stack of banks (`NvFp4.layer`: a scanned load's, row
+    rounded to bfloat16, each value of `W` decoded exactly to bfloat16 (`NvFp4.decoded`, its block's scale
+    applied, 2^8 owed), the products summed in fp32, each step's apart (`templates.product.promoted`, row
+    4331), and the accumulator times its tensor scale (one a column where it is, `NvFp4.columned`, row 13743)
+    and the decode's owed 2^8 (`bits.NVFP4_OWED`) before the one rounding to `out_dtype`: the deferred factor
+    is the epilogue's first operation, ahead of any output hook (PLAN piece 10). Its selector (`NVFP4`) runs
+    the template's mainloop decoding each stage in place (`_packed`) where named, else decodes the matrix once
+    a call (`gemm`). With `group_sizes`, `matrix` is a bank of experts' matrices (`NvFp4`'s group axis, row
+    4516) and `lhs` their sorted rows: each group's rows times its expert's matrix, each times its expert's
+    factor, frozen (no gradient reaches the bank), each tile decoding its group's expert's stages in place on
+    the packed kernel; with `gather` besides, its rows `lhs[gather]`, read where they lie (`gemm`'s `gather`).
+    With `layer` (a traced index) too, `matrix` is a stack of banks (`NvFp4.layer`: a scanned load's, row
     4861) read at that layer in place, as `gemm` reads a stacked matrix's (`gemm`'s `layer`): the packed
-    kernel's groups read the layer's matrices from its first where they lie in the stack, no slice of it
-    made, and elsewhere the layer's bank alone is decoded."""
+    kernel's groups read the layer's matrices from its first where they lie in the stack, no slice of it made,
+    and elsewhere the layer's bank alone is decoded."""
     if layer is not None and group_sizes is None:
         raise ValueError("a stack of banks' layer is a grouped call's")
     matrix.admitted()
@@ -1182,11 +1182,14 @@ def nvfp4_product(lhs: jax.Array, matrix: NvFp4, group_sizes: jax.Array | None =
         # product's, whatever precision the program defaults to (`decoded_product`).
         product = functools.partial(decoded_product, interpret_on_cpu=interpret_on_cpu)
         operands = (bank.decoded(), group_sizes, gather)
-    factor = bank.factor if group_sizes is None else jnp.repeat(
-        bank.factor, sizes, total_repeat_length=count)[:, None]
-    # Each row's (its group's) factor joins the sum as `factored` takes a row's: a cancelling cotangent
-    # under a factor past fp32's largest pulls back its finite sum, the bank decoded only where it does.
-    return factored(product, operands, factor, lhs, gather=gather,
+    # The tensor scale, frozen: the matrix's, its columns' (`columned`), or a bank's each group's, which each
+    # row takes from its group in `factored`, no row's kept; the decode's owed 2^8 apart from it, both in the
+    # one rounding (`factored`'s `owed`), so no scale past 2^120 overflows the factor they make (train 1403's
+    # review). A cancelling cotangent under a factor past fp32's largest pulls back its finite sum, the bank
+    # decoded only where it does.
+    scale = jax.lax.stop_gradient(jnp.asarray(bank.scale, jnp.float32))
+    return factored(product, operands, scale, lhs, gather=gather,
+                    groups=None if group_sizes is None else sizes, owed=bits.NVFP4_OWED, least=NvFp4.LEAST,
                     wide=interpreted_wide(interpret_on_cpu),
                     wide_operands=(bank, group_sizes), prepared=decoded_operands).astype(out_dtype)
 

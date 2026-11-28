@@ -61,6 +61,7 @@ import test_fed_walks as fed_walks
 import test_gemm_blockwise as gemm_blockwise
 import test_gemm_converted as gemm_converted
 import test_gemm_gather as gemm_gather
+import test_gemm_nvfp4 as gemm_nvfp4
 import test_gemm_nvfp4_chain as gemm_nvfp4_chain
 import test_gemm_paired as gemm_paired
 import test_gemm_tcgen05 as gemm_tcgen05
@@ -256,6 +257,9 @@ def _scale_edge_cells() -> tuple[Cell, ...]:
               ("kernel gradient", gemm_blockwise.an_e5m2_blockwise_kernel_gradient_at_fp32s_largest_is_finite,
                "blockwise fp8 tgmm"))
           for edge in gemm_blockwise.E5M2_EDGES),
+        Cell("an owed product's native fold rounds once below the normals",
+             gemm_nvfp4.an_owed_products_native_fold_rounds_once_below_the_normals, "sm90",
+             at_run=EXACT_OVERFLOW, native={"launch": "owed fold", "pass": "subnormal product"}),
     )
 
 
