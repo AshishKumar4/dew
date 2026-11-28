@@ -444,6 +444,11 @@ KERNEL_ASSUMED = _context(None)
 its generation and its facts where given them), keyed on as `KERNEL_TUNES` is, so a program traced for one
 device's launches traces again for another's."""
 
+KERNEL_JUDGED = _context(None)
+"""The CUDA build and the judge certification remakes its launches' kernels by in this thread
+(`dew.nn.kernels.templates.report.judging`), keyed on as `KERNEL_TUNES` is, so a program traced under one
+build's verdicts traces again under another's."""
+
 KERNEL_CHOICES = _context(())
 """The `(choice, kernel)` pairs `dew.nn.kernels.generation.chosen` holds in
 this thread, keyed on as `KERNEL_TUNES` is, so a program traced before a

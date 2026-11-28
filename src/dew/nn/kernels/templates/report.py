@@ -20,7 +20,7 @@ import re
 import threading
 from collections.abc import Callable, Hashable, Iterable, Iterator, Mapping, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
-from typing import TYPE_CHECKING, Literal, get_args, overload
+from typing import TYPE_CHECKING, Literal, Protocol, get_args, overload
 
 import jax
 import jax.numpy as jnp
@@ -642,9 +642,6 @@ class Certification:
 _CERTIFIED: dict[tuple, Certification] = {}
 """Each launch certified (`certified`), by its identity, config, device and product."""
 
-_COLLECTING: list[list[Certification]] = []
-"""The collectors open (`offered`), each taking every certification a launch's derivation asks for."""
-
 _UNCERTIFIED: dict[tuple, str] = {}
 """Each launch certification could not compile alone (`certified`), by its identity, config, device and
 product: why."""
@@ -954,13 +951,14 @@ def certified(op, arguments: tokamax.BoundArguments, config: Hashable) -> tuple[
     from dew.nn.kernels import tuning
 
     reverse = _reversed(op)
-    key = (_identity(op, arguments, generation.gpu_target()), config, device.id, device.device_kind, reverse)
+    # Apart by the judge remaking it (`judging`): a run's verdicts, its build's, no other's.
+    key = (_identity(op, arguments, generation.gpu_target()), config, device.id, device.device_kind, reverse,
+           _cache.KERNEL_JUDGED.value)
     with _GUARD:
         held = _CERTIFIED.get(key)
         if held is None and key in _UNCERTIFIED:
             return None
     if held is not None:
-        _offer(held)
         if not held.refused:
             _progressed(key)
         return held.refused
@@ -994,8 +992,11 @@ def certified(op, arguments: tokamax.BoundArguments, config: Hashable) -> tuple[
     if isinstance(verdict, dict):
         return _kept_certification(key, op, config, reverse, verdict, (stored,), device, read=True).refused
     unstored = (stored, lowered_key)
+    judged = _cache.KERNEL_JUDGED.value
     try:
-        kernels = _launch_binaries(lowered, modules)
+        # Compiled under its judge's watch (`Judge.compiling`), which reads what this compile alone prints.
+        with contextlib.nullcontext() if judged is None else judged[1].compiling():
+            kernels = _launch_binaries(lowered, modules)
     except jax.errors.JaxRuntimeError as error:
         _uncertified_launch(key, op, config, error)
         return None
@@ -1030,17 +1031,19 @@ def _uncertified_launch(key: tuple, op, config: Hashable, error: Exception) -> N
 def _kept_certification(key: tuple, op, config: Hashable, reverse: bool, kernels: dict,
                         stored: tuple[str | None, ...], device, *, read: bool = False) -> "Certification":
     """A launch's certification recorded once a process (`certifications`): its kernels `read` back from the
-    picks' store, else compiled here, their verdict stored for the GPU model by each of `stored`'s keys that
-    found none (None where no key states the installation's code)."""
+    picks' store, else compiled here (as the build judging them assembles them, `judging`), their verdict
+    stored for the GPU model by each of `stored`'s keys that found none (None where no key states the
+    installation's code)."""
     from dew.nn.kernels import tuning
 
+    if not read and (judged := _cache.KERNEL_JUDGED.value) is not None:
+        kernels = judged[1](kernels)
     for each in stored:
         if each is not None:
             tuning.store_verdict(verdict_target(device), each, kernels)
     found = Certification(type(op).__name__, config, reverse, kernels, read, device)
     with _GUARD:
         _CERTIFIED[key] = found
-    _offer(found)
     if not found.refused:
         _progressed(key)
     return found
@@ -1144,25 +1147,26 @@ def certifications() -> tuple[Certification, ...]:
 
 
 @contextlib.contextmanager
-def offered() -> Iterator[list[Certification]]:
-    """Each certification a launch's derivation asks for while within (`certified`), on any thread, in
-    order: one held in this process already again each time (a compile gate's case reads its own offers,
-    those an earlier case certified among them); none kept once it closes."""
-    found: list[Certification] = []
-    with _GUARD:
-        _COLLECTING.append(found)
-    try:
-        yield found
-    finally:
-        with _GUARD:
-            _COLLECTING[:] = [each for each in _COLLECTING if each is not found]
+def judging(build: str, judge: "Judge") -> Iterator[None]:
+    """Within the block, each launch certified here is compiled under `judge`'s watch (`Judge.compiling`) and
+    judged by it, which remakes its kernels' binaries as JAX's CUDA `build` assembles them (a compile gate's,
+    from the PTX Mosaic printed as it compiled): its verdict that build's, certified apart from every other
+    judge's (`certified`'s key, its identity), and a program traced within traces again
+    (`dew._cache.KERNEL_JUDGED`), its derivations stepping by those verdicts as a GPU running that build
+    steps (row 10766)."""
+    with _cache.KERNEL_JUDGED((build, judge)):
+        yield
 
 
-def _offer(found: Certification) -> None:
-    """`found` asked for: taken by each collector open (`offered`)."""
-    with _GUARD:
-        for collecting in _COLLECTING:
-            collecting.append(found)
+class Judge(Protocol):
+    """What certification judges its launches' kernels by within `judging`: a compile watched
+    (`compiling`, a launch's alone, failing or not), then its kernels remade (`__call__`, of a compile that
+    held)."""
+
+    def compiling(self) -> contextlib.AbstractContextManager[None]: ...
+
+    def __call__(self, kernels: dict[str, tuple[str | None, "Binary"]]
+                 ) -> dict[str, tuple[str | None, "Binary"]]: ...
 
 
 def uncertified() -> dict[tuple, str]:
