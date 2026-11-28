@@ -1727,8 +1727,12 @@ def _held_still(forward: Callable, portable: Callable, kind: TangentKind) -> Cal
 
 
 def symbolic_tangent(portable: Callable, operands, tangents, output):
-    """`portable`'s tangent at `operands` along `tangents`, a tree like them whose symbolic zeros
-    (`SymbolicZero`) hold their operands still (`_perturbed_tangent`)."""
+    """`portable(*operands)`'s tangent along `tangents`, for a custom JVP rule declared with symbolic zeros:
+    `operands` a tree (a call's arguments, None leaves dropped as JAX flattens them) and `tangents` a tree
+    like it whose `SymbolicZero` leaves hold their operands still, the moving operands alone perturbed, so a
+    held one's zero direction never meets an infinite factor (`_perturbed_tangent`); with none moving,
+    `output`'s symbolic zero (`zero_from_primal`). A kernel's portable tangent (`linear_tangent`) and a
+    group's exact sum's (`dew.algebra.scan._portable_pair_jvp`) alike."""
     import jax
     from jax.custom_derivatives import SymbolicZero
 
