@@ -688,6 +688,12 @@ def _path(module: str) -> Path:
     return origin.with_name(f"{origin.stem}_derived.py")
 
 
+GENERATION_MATMUL = "highest"
+"""The precision of a product that states none while generation selects, prints and admits forms
+(`jax.default_matmul_precision`): the precision the written modules state, whatever the generating
+process's default. A product that states its own precision keeps it."""
+
+
 def generate(*, check: bool = False) -> tuple[Generated, ...]:
     """Every declaring module's declarations generated into its module, all together (their components share
     one helper module, `_shared`), or, with `check`, regenerated in memory and compared: raises where a
@@ -703,13 +709,15 @@ def generate(*, check: bool = False) -> tuple[Generated, ...]:
         if (module := qualified.rsplit(".", 1)[0]) in DECLARING:
             by_module.setdefault(module, []).append(qualified)
     sets = tuple(found.name for found in rules.admitted(accurate=False, dev=True))
-    found = {module: [one for qualified in declared for one in _chosen(qualified, DECLARATIONS[qualified])]
-             for module, declared in by_module.items()}
-    emitted, factored = _emitted(found)
-    texts = {module: _written(module, found[module], by_module[module], emitted[module], factored)
-             for module in by_module}
-    for module, (_, admitted) in texts.items():
-        _admit_components(module, found[module], admitted)
+    with jax.default_matmul_precision(GENERATION_MATMUL):
+        found = {module: [one for qualified in declared
+                          for one in _chosen(qualified, DECLARATIONS[qualified])]
+                 for module, declared in by_module.items()}
+        emitted, factored = _emitted(found)
+        texts = {module: _written(module, found[module], by_module[module], emitted[module], factored)
+                 for module in by_module}
+        for module, (_, admitted) in texts.items():
+            _admit_components(module, found[module], admitted)
     made, stale = [], []
     writes = [(_path(module), text, tuple(by_module[module])) for module, (text, _) in texts.items()]
     package = _path(DECLARING[0]).parent

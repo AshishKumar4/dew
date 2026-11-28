@@ -51,8 +51,11 @@ def on_its_platform():
 
 def test_the_written_modules_are_what_generation_writes(on_its_platform):
     """Every declaring module's generated module, regenerated in memory, is the one written (`--check`): a
-    changed rule, declaration or chooser lands as a reviewed diff of generated code."""
-    made = generate.generate(check=True)
+    changed rule, declaration or chooser lands as a reviewed diff of generated code. Regenerated with no
+    product precision configured, as a bare `python -m dew.algebra.generate` runs it: what is written does
+    not depend on the suite's configured highest."""
+    with jax.default_matmul_precision(None):
+        made = generate.generate(check=True)
     assert {name for found in made for name in found.declarations} == set(generate.DECLARATIONS)
 
 
