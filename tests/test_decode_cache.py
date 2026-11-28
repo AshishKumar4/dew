@@ -8,10 +8,10 @@ from flax import linen as nn
 from model_support import TINY_DECODER, attending, rows_prefill_pause_and_resume
 
 from dew.batch import coordinates
+from dew.nn import programs
 from dew.nn.attention import scaled_dot_product_attention
 from dew.nn.attention_masks import causal_attention_mask
 from dew.nn.backbones.causal_transformer import CausalTransformer
-from dew.nn import programs
 from dew.nn.inputs import AttentionMetadata, MixerCall
 from dew.nn.kernels import generation
 from dew.nn.kv_cache import KVCache, KVSpec, cached_validity, open_kv_cache
