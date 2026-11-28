@@ -440,6 +440,29 @@ def test_a_memorys_mini_batches_are_recomputed_where_the_rung_recomputes_the_chu
     assert recomputed_bytes < stored_bytes, (recomputed_bytes, stored_bytes)
 
 
+@pytest.mark.parametrize('form', sorted(FORMS))
+def test_a_memorys_readout_is_recomputed_with_its_chunks(form):
+    """Where the run's rung recomputes the memory's chunks (`residuals.memory_chunks`), the residuals its
+    gradient saves past its arguments (`jax.ad_checkpoint.saved_residuals`) hold none of its readout's
+    LayerNorm over the call's own tokens: the readout is formed in each mini-batch's step, recomputed with
+    it, every value of it laid on the mini-batches' padded tokens (train 1498's review: formed after the walk,
+    its normalized readouts and roots over the call's tokens were kept for the backward)."""
+    from jax._src.ad_checkpoint import saved_residuals
+
+    from dew.nn.residuals import MEMORY_RESIDUALS, recomputing
+
+    *given, states, _ = operands(form, jnp.float32)(1)
+    memory = functools.partial(FORMS[form][0], chunk=CHUNK)
+
+    def total(*arguments):
+        return sum(jnp.sum(x) for x in jax.tree.leaves(memory(*arguments)))
+
+    with recomputing((MEMORY_RESIDUALS[1],)):
+        kept = [jnp.shape(aval) for aval, source in saved_residuals(total, *given, states)
+                if not source.startswith("from the argument")]
+    assert LENGTH % CHUNK and not [shape for shape in kept if LENGTH in shape], kept
+
+
 def test_a_memorys_residual_survives_an_affine_its_bias_cancels():
     """Titans over one fp32 token, its query `e0` reading a memory whose first row is `(1, -1)` (its readout
     `(1, -1)`, normed to itself at `eps` 2^-30), no key, value or rates, an affine weight of 2^25 and bias
