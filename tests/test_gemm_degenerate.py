@@ -225,8 +225,10 @@ def test_a_ragged_batch_product_of_no_groups_is_its_batched_dot():
                                      preferred_element_type=jnp.float32)
 
     rows, bank = jnp.full((2, 1, 1), 2.0, jnp.float32), jnp.full((2, 1, 1), 3.0, jnp.float32)
-    out, gradients = jax.jit(lambda *pair: (batched(*pair), jax.grad(lambda *pair: batched(*pair).sum(), (0, 1))(
-        *pair)))(rows, bank)
+    def summed(*pair):
+        return batched(*pair).sum()
+
+    out, gradients = jax.jit(lambda *pair: (batched(*pair), jax.grad(summed, (0, 1))(*pair)))(rows, bank)
     np.testing.assert_array_equal(np.asarray(out), np.full((2, 1, 1), 6.0, np.float32))
     np.testing.assert_array_equal(np.asarray(gradients[0]), np.full((2, 1, 1), 3.0, np.float32))
     np.testing.assert_array_equal(np.asarray(gradients[1]), np.full((2, 1, 1), 2.0, np.float32))
@@ -245,8 +247,9 @@ def test_a_jitted_ragged_product_of_no_groups_reads_its_mode():
 
     rows_mode = jax.lax.RaggedDotDimensionNumbers(dot_dimension_numbers=(((1,), (1,)), ((), ())),
                                                   lhs_ragged_dimensions=(0,), rhs_group_dimensions=(0,))
-    zeros = precision.ragged(jitted(rows_mode), jnp.ones((8, 4), jnp.float32), jnp.ones((0, 4, 128), jnp.float32),
-                             jnp.zeros((0,), jnp.int32), preferred_element_type=jnp.float32)
+    zeros = precision.ragged(jitted(rows_mode), jnp.ones((8, 4), jnp.float32),
+                             jnp.ones((0, 4, 128), jnp.float32), jnp.zeros((0,), jnp.int32),
+                             preferred_element_type=jnp.float32)
     np.testing.assert_array_equal(np.asarray(zeros), np.zeros((8, 128), np.float32))
     batch_mode = jax.lax.RaggedDotDimensionNumbers(dot_dimension_numbers=(((2,), (1,)), ((0,), (0,))),
                                                    lhs_ragged_dimensions=(0,), rhs_group_dimensions=())

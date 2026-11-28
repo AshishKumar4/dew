@@ -898,7 +898,8 @@ def ragged(product: Callable[..., jax.Array], *operands, preferred_element_type:
     contraction aborted the process; a bank of no experts on a GH200). Every ragged product Dew forms passes
     here (`accumulated`'s, `xla_products.placed_ragged_dot`'s, the fuser's dot as written)."""
     *multiplied, sizes = operands
-    if not jnp.shape(sizes)[-1] and (traced := _grouped(product, operands, preferred_element_type)) is not None:
+    traced = None if jnp.shape(sizes)[-1] else _grouped(product, operands, preferred_element_type)
+    if traced is not None:
         return _no_groups(traced, operands)
     if summed_wide and _sums_in_float64(*multiplied):
         return _summed_wide(product, preferred_element_type, *operands, counts=1)
@@ -906,7 +907,7 @@ def ragged(product: Callable[..., jax.Array], *operands, preferred_element_type:
 
 
 def _grouped(product: Callable[..., jax.Array], operands: tuple,
-             preferred_element_type) -> core.ClosedJaxpr | None:
+             preferred_element_type) -> core.Jaxpr | None:
     """The ragged dot `product` of `operands` traced (`jax.make_jaxpr`), where its group sizes count its
     rows: its rows' ragged axis one it keeps or contracts (JAX's ragged non-contracting and contracting
     modes). None where that axis is a batch axis (its ragged-batch mode), a batched dot whatever its sizes,
@@ -914,8 +915,9 @@ def _grouped(product: Callable[..., jax.Array], operands: tuple,
     operands of 2s and 3s batched on their ragged axis are two 6s at sizes of no groups, not zeros). Its
     dimension numbers read at any depth of the program (`programs.equations`: a product jitted or wrapped);
     a product that binds no ragged dot is refused."""
-    traced = jax.make_jaxpr(functools.partial(product, preferred_element_type=preferred_element_type))(*operands)
-    numbers = next((equation.params["ragged_dot_dimension_numbers"] for equation in equations(traced.jaxpr)
+    bound = functools.partial(product, preferred_element_type=preferred_element_type)
+    traced = jax.make_jaxpr(bound)(*operands)
+    numbers = next((equation.params["ragged_dot_dimension_numbers"] for equation in equations(traced)
                     if "ragged_dot_dimension_numbers" in equation.params), None)
     if numbers is None:
         raise ValueError(f"precision.ragged multiplies a ragged dot, and {product!r} binds none")
@@ -924,7 +926,7 @@ def _grouped(product: Callable[..., jax.Array], operands: tuple,
     return None if ragged_axis in batch_axes else traced
 
 
-def _no_groups(traced: core.ClosedJaxpr, operands: tuple) -> jax.Array:
+def _no_groups(traced: core.Jaxpr, operands: tuple) -> jax.Array:
     """A ragged dot of no groups' zeros (`traced`, its program, `_grouped`'s), typed as the product is: its
     traced aval's zeros as JAX forms a value's (`ad_util.zeros_like_aval`: its dtype, a float64 one's outside
     x64 too, its weakness and its placement each the aval's, an Explicit one a shape's evaluation drops
