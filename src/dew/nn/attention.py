@@ -1592,12 +1592,11 @@ def attention_kernel(query, key, value, dtype=None, precision=None,
     """Dispatch one whole-sequence attention call to the kernel it names,
     differentiable in forward mode under `forward_mode_attention`.
 
-    'auto' resolves here, once, against this call's shapes and backend, and
-    `_attention_kernel` runs the call on the kernel it resolved to. A query
-    row that sees no key comes back zero whichever kernel ran
-    (`visible_rows`), inside a sequence exchange too; under a `mask_fill` it
-    reads what the fill gives it (`_filled`). `range_safe` asks its logits range-safe
-    (`AttentionCase.range_safe`); a given `route` runs as it is, and `deciding` collects it (`_routed`).
+    'auto' resolves here, once, against this call's shapes and backend, and `_attention_kernel` runs the call
+    on the kernel it resolved to. A query row that sees no key comes back zero whichever kernel ran
+    (`visible_rows`), inside a sequence exchange too; under a `mask_fill` it reads what the fill gives it
+    (`_filled`). `range_safe` asks its logits range-safe (`AttentionCase.range_safe`, the reference path's
+    and the template's); a given `route` runs as it is, and `deciding` collects it (`_routed`).
     """
     if sliding_window is not None and sliding_window < 1:
         raise ValueError(f"sliding_window must be positive, got {sliding_window}")
