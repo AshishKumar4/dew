@@ -15,7 +15,7 @@ from jax.interpreters import ad, batching, mlir
 
 from dew.nn.binades import over_denominator, stood_in
 from dew.nn.derivatives import Protected, bound_span, contracted
-from dew.nn.float_bits import exact_power2, float_bits, lowered_rounded, raw_fields
+from dew.nn.float_bits import exact_power2, float_bits, lowered_rounded, quiet_nan_bits, raw_fields
 from dew.nn.programs import UNROUNDED, register_entrywise
 
 
@@ -103,6 +103,51 @@ def _divided(numerator: jax.typing.ArrayLike, denominator: jax.typing.ArrayLike,
     magnitude = jnp.where(field >= 255, jnp.inf, jnp.where(field >= 1, normal, subnormal))
     signed = jnp.where(negative, -magnitude, magnitude)
     return jnp.where(special, plain, signed)
+
+
+def short_divide(numerator: jax.typing.ArrayLike, denominator: jax.typing.ArrayLike) -> jax.Array:
+    """`correctly_rounded_divide`'s quotient, bit for bit (a NaN float32's quiet one), where `denominator` is
+    a positive normal fp32 of at most four significant bits (an e4m3 value, e2m1's largest): in integer
+    arithmetic, about 50 operations where the division takes 140 (row 14083: an NVFP4 coding's block ratios
+    and codes, a step's coding as many times as its call sites). The numerator's significand (`raw_fields`, a
+    subnormal's its fraction), its leading bit moved to bit 30, over the denominator's four bits as integers:
+    a 27- or 28-bit quotient and its remainder, rounded once at the result's place, ties to even, on the
+    subnormal grid below the normals, past the largest an infinity. A zero or infinite numerator is its own
+    quotient, a NaN float32's quiet one, read off its bits (no float division of the tile). Its integer steps
+    carry no derivative: a coding's quotients, whose codes have none."""
+    word = jnp.uint32
+    numerator, denominator = jnp.broadcast_arrays(jnp.asarray(numerator, jnp.float32),
+                                                  jnp.asarray(denominator, jnp.float32))
+    bits, sign, biased, fraction = raw_fields(numerator)
+    biased = biased.astype(jnp.int32)
+    significand = fraction | jnp.where(biased > 0, word(0x800000), word(0))
+    lead = jax.lax.clz(significand)
+    top = significand << (lead - word(1))
+    _, _, divisor_biased, divisor_fraction = raw_fields(denominator)
+    divisor = (divisor_fraction >> word(20)) | word(8)
+    whole, rest = jax.lax.div(top, divisor), jax.lax.rem(top, divisor)
+    # `whole` holds the quotient's 27 or 28 leading bits (`wide`); `field` its biased exponent: the
+    # numerator's (a subnormal's as one), less the divisor's and the leading bit's move.
+    wide = (whole >= word(1 << 27)).astype(jnp.int32)
+    field = jnp.maximum(biased, 1) - divisor_biased.astype(jnp.int32) - lead.astype(jnp.int32) + wide + 134
+    # 24 bits kept for a normal result, fewer on the subnormal grid; a shift past the quotient's bits keeps
+    # none, its rounding half past them too.
+    shift = jnp.minimum(3 + wide + jnp.maximum(1 - field, 0), 31).astype(word)
+    kept = whole >> shift
+    dropped = whole - (kept << shift)
+    half = word(1) << (shift - word(1))
+    up = (dropped > half) | ((dropped == half) & ((rest != 0) | ((kept & word(1)) == word(1))))
+    # The rounded significand added to the exponent field below it, its carry the rounding's own (into the
+    # next binade, from the subnormals to the least normal, from the largest to the infinity).
+    rounded = ((jnp.clip(field, 1, 254) - 1).astype(word) << word(23)) + kept + up.astype(word)
+    # A zero or infinite numerator is its own quotient by a positive finite divisor, a NaN float32's quiet
+    # one, whatever its sign or payload, as `float_bits.rounded_binary` gives it (so a coding's NaN lanes
+    # encode alike at either width and in a GEMM epilogue's software division: row 14083's review).
+    nan = (biased == 255) & (fraction != 0)
+    special = (biased == 255) | ((biased == 0) & (fraction == 0))
+    own = jnp.where(nan, word(quiet_nan_bits(jnp.float32)), bits)
+    value = jnp.where(special, own, jnp.where(field >= 255, word(0x7F800000), rounded) | sign)
+    return jax.lax.bitcast_convert_type(value, jnp.float32)
 
 
 def _significand_quotient(numerator: jax.Array, denominator: jax.Array) -> tuple[jax.Array, jax.Array]:

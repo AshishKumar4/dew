@@ -603,6 +603,84 @@ def test_gemm_quantized_nvfp4_block_matches_bits_nvfp4_coded_and_lowers(gpu: str
             x_s, w_s, s_s).lower(lowering_platforms=("cuda",))
 
 
+def test_a_block_whose_ratio_is_subnormal_takes_the_least_scale_in_both_routes():
+    """A block of values at fp32's least normal under a tensor scale of 1, its ratio over 6 below the
+    normals, takes e4m3's least subnormal scale (0x01), the least at or above its ratio, its codes zero, in
+    `formats.NvFp4Block.quantized` and the GEMM epilogue (`quantized.gemm_quantized`) alike on this CPU, whose
+    flushing comparison read the ratio as zero and gave the block a scale of zero (row 14083's review:
+    `bits.scales_rounded_up` compares words)."""
+    x = jnp.eye(64, dtype=jnp.bfloat16)
+    w = np.ones((64, 64), np.float32)
+    w[0, :16] = 2.0 ** -126
+    w = jnp.asarray(w, jnp.bfloat16)
+    one = jnp.float32(1)
+    ref = formats.NvFp4Block.quantized(jax.lax.dot(x, w, preferred_element_type=jnp.float32), one)
+    got = jax.jit(lambda a, b, s: quantized.gemm_quantized(a, b, minifloat=formats.NvFp4Block,
+                                                           tensor_scale=s))(x, w, one)
+    for block in (ref, got):
+        assert np.asarray(block.scales).view(np.uint8)[0, 0] == 0x01
+        assert not np.asarray(block.codes).view(np.uint8)[0, :16].any()
+    for found, expected in ((got.scales, ref.scales), (got.codes, ref.codes)):
+        np.testing.assert_array_equal(np.asarray(found).view(np.uint8), np.asarray(expected).view(np.uint8))
+
+
+def test_every_route_codes_a_blocks_scale_alike_at_its_edges():
+    """Each route quantizing an NVFP4 operand codes the same block scales on this CPU, whose float32
+    arithmetic flushes subnormals (row 14083's review): a block whose largest accumulator is subnormal
+    (2^-140) at a tensor scale of 1, through the GEMM epilogue outside a kernel and `NvFp4Block.quantized`,
+    both its least subnormal scale 0x01, and at a negative, negative-zero or NaN scale every block's scale
+    e4m3's NaN, 0x7F (`bits.scales_rounded_up`); at float32 width and a float64
+    truth's, a block of fp32's least normal at a scale of 3 (0x01) and one of 2^-124 at a subnormal scale
+    of 2^-127 (8 over 6, 0x3B: 1.375), a zero scale's NaN lanes coded alike at both widths and in the
+    epilogue, and the tensor scale's derivative in the block's largest, 1/2688."""
+    acc = np.zeros((4, 32), np.float32)
+    acc[0, 0] = 2.0 ** -140
+    acc[1:, :] = 1.0
+
+    def epilogue(acc, scale):
+        codes, scales = quantized._nvfp4_quantize_epilogue(acc, jnp.broadcast_to(scale, (acc.shape[0],)))
+        return formats.NvFp4Block.encoded(codes, scales[..., ::16], scale)
+
+    def coded(acc, scale):
+        return formats.NvFp4Block.quantized(acc, scale)
+
+    for scale in (np.float32(1), np.float32(-1), np.float32(-0.0), np.float32(np.nan)):
+        found = [jax.jit(route)(acc, jnp.float32(scale)) for route in (epilogue, coded)]
+        for operand in found:
+            scales, codes = (np.asarray(each).view(np.uint8) for each in (operand.scales, operand.codes))
+            if scale > 0:
+                assert scales[0, 0] == 0x01, scales
+            else:
+                # A negative, negative-zero or NaN scale codes every block's scale NaN, its codes zero.
+                assert (scales == bits.E4M3.nan).all() and not codes.any(), (scale, scales, codes)
+        for each in ("scales", "codes"):
+            np.testing.assert_array_equal(*(np.asarray(getattr(operand, each)).view(np.uint8)
+                                            for operand in found))
+    with jax.enable_x64(new_val=True):
+        # A zero scale: a block of a value beside zeros at 448, its zeros' quotients NaN, one code at either
+        # width and in the epilogue, whatever sign the platform's 0/0 takes.
+        found = [jax.jit(route)(acc.astype(dtype), jnp.float32(0)) for route, dtype in
+                 ((epilogue, np.float32), (coded, np.float32), (coded, np.float64))]
+        for each in ("scales", "codes"):
+            first, *others = (np.asarray(getattr(operand, each)).view(np.uint8) for operand in found)
+            for other in others:
+                np.testing.assert_array_equal(other, first)
+        for value, scale, code in ((2.0 ** -126, 3.0, 0x01), (2.0 ** -124, 2.0 ** -127, 0x3B)):
+            for dtype in (jnp.float32, jnp.float64):
+                block = jnp.full((4, 32), value, dtype)
+                assert block.dtype == dtype
+                operand = jax.jit(coded)(block, jnp.float32(scale))
+                assert (np.asarray(operand.scales).view(np.uint8) == code).all(), (value, dtype)
+        largest = np.zeros((16, 2), np.float64)
+        largest[3, 1] = 2688.0
+        for dtype in (jnp.float32, jnp.float64):
+            moved = np.zeros_like(largest)
+            moved[3, 1] = 1.0
+            _, slope = jax.jvp(lambda x: bits.nvfp4_coded(x)[2], (jnp.asarray(largest, dtype),),
+                               (jnp.asarray(moved, dtype),))
+            assert np.asarray(slope, np.float32) == np.float32(1 / 2688), (dtype, slope)
+
+
 def test_ternary_weights_checkpoint_restore_verifies_form_and_scale(tmp_path):
     """Checkpoint restore (`formats.restored`) restores a matching `TernaryWeights` bank, its words and scale,
     beside a concrete bank the checkpoint holds none of, kept as supplied; and refuses one stored under

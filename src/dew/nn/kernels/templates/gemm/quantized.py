@@ -16,6 +16,7 @@ import jax.numpy as jnp
 from flax.typing import PrecisionLike
 
 from dew.algebra import bits
+from dew.nn.float_bits import raw_fields
 from dew.nn.kernels import launches
 from dew.nn.kernels.templates import inline_forms, product as product_formats
 
@@ -68,9 +69,14 @@ def _block_max(acc: jax.Array, block: int) -> jax.Array:
     kernel (or for a tile of no whole blocks, a launch identity's probe of a narrower one) one row reduction
     a block (`_blocks_reduced`), elsewhere one reduction of the blocks' view."""
     rows, columns = acc.shape
-    magnitude = jnp.abs(acc)
     if _EPILOGUE_LAYOUT.get() is None and columns % block == 0:
-        return jnp.repeat(jnp.max(magnitude.reshape(rows, columns // block, block), axis=-1), block, axis=1)
+        # Its magnitudes' words reduced at its own width, as the quantizer reduces them (`bits.nvfp4_coded`):
+        # a float maximum a flushing platform takes (XLA's CPU) read a subnormal accumulator as zero (row
+        # 14083's review), and a float64 one narrowed first overflowed (train 1455's: 2^128 to infinity).
+        words, sign, _, _ = raw_fields(acc)
+        peaks = jnp.max((words ^ sign).reshape(rows, columns // block, block), axis=-1)
+        return jnp.repeat(jax.lax.bitcast_convert_type(peaks, acc.dtype), block, axis=1)
+    magnitude = jnp.abs(acc)
     block_id = _block_ids(acc.shape, block)
     peaks = jnp.zeros_like(acc)
     for group, peak in enumerate(_blocks_reduced(magnitude, block, jnp.float32(0.0))):
@@ -136,8 +142,7 @@ def _nvfp4_quantize_epilogue(acc: jax.Array, tensor_scale: jax.Array) -> tuple[j
     ratio = _divided(_divided(block_max, ts), float(E2M1_MAX))
     nearest_f8 = encode_tile(ratio, bits.E4M3)
     nearest = jax.lax.bitcast_convert_type(nearest_f8, jnp.uint8).astype(jnp.uint32)
-    scale_u32 = jnp.where(bits.scales_decoded(nearest) < ratio,
-                          jnp.minimum(nearest + jnp.uint32(1), jnp.uint32(bits.E4M3.largest)), nearest)
+    scale_u32 = bits.scales_rounded_up(nearest, ratio)
     each = bits.scales_decoded(scale_u32)
     pos = each > jnp.float32(0.0)
     safe_each = jnp.where(pos, each, jnp.float32(1.0))
@@ -562,7 +567,8 @@ def gemm_quantized(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array | None
             raise ValueError(
                 f"gemm_quantized(NvFp4Block) requires width divisible by {product_formats.NVFP4.depth}, "
                 f"got {width}")
-        ts = jnp.asarray(1.0 if tensor_scale is None else tensor_scale, jnp.float32)
+        # The one boundary every given scale passes, as `NvFp4Block.quantized`'s does.
+        ts = bits.nvfp4_given_scale(1.0 if tensor_scale is None else tensor_scale)
         out = gemm(lhs, rhs, group_sizes, transpose_rhs=transpose_rhs,
                    epilogue=Hook(quantize_nvfp4_epilogue(),
                                  (Side(jnp.broadcast_to(ts, (lhs.shape[0],)), ('rows',)),)),

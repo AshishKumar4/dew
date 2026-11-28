@@ -557,6 +557,70 @@ def _holds_its_least_scales_and_rounding(x, scales, tensor, decoded):
     np.testing.assert_array_equal(decoded, rounded * np.repeat(least, 16, axis=0))
 
 
+def _short_divisors() -> np.ndarray:
+    """Every positive finite e4m3 value as fp32 (its subnormals and 448 among them), e2m1's largest, and
+    four-bit significands at fp32's least and largest binades and between."""
+    table = np.arange(1, 0x7F, dtype=np.uint8).view(ml_dtypes.float8_e4m3fn).astype(np.float32)
+    edges = [np.ldexp(np.float32(significand), exponent) for significand in (1, 1.125, 1.5, 1.875)
+             for exponent in (-126, -125, -100, 100, 126, 127)]
+    return np.concatenate([table, [np.float32(6)], np.asarray(edges, np.float32)])
+
+
+def _fp32_words() -> np.ndarray:
+    """fp32 values over every exponent field (zeros, subnormals, infinities and NaNs among them) and both
+    signs: fractions at their edges and alternating, each odd divisor's multiples (exact quotients, which tie
+    on the subnormal grid), and random words."""
+    fractions = [0, 1, 2, 3, 0x400000, 0x400001, 0x7FFFFF, 0x7FFFFE, 0x555555, 0x2AAAAA]
+    fractions += [multiple * odd << shift for odd in range(3, 16, 2) for multiple in (1, 3, 7)
+                  for shift in (0, 12, 19) if multiple * odd << shift < 1 << 23]
+    fields = np.arange(256, dtype=np.uint32) << np.uint32(23)
+    words = (fields[:, None] | np.asarray(fractions, np.uint32)[None, :]).ravel()
+    drawn = np.random.default_rng(14083).integers(0, 1 << 31, 1 << 14, dtype=np.uint32)
+    words = np.concatenate([words, drawn])
+    return np.concatenate([words, words | np.uint32(0x80000000)]).view(np.float32)
+
+
+def test_a_short_division_is_the_correctly_rounded_division():
+    """`division.short_divide` of fp32 values over every exponent field and both signs (`_fp32_words`) by
+    every positive finite e4m3 value, 6, and four-bit divisors at fp32's least and largest binades is IEEE
+    fp32 division's quotient, NumPy's float64 quotient rounded once to fp32 (53 >= 2 x 24 + 2), bit for bit:
+    on the subnormal grid, at its ties, past the largest and from zeros and infinities of either sign, a NaN
+    where it is one (row 14083: the integer division `bits.nvfp4_coded` takes by a block scale and by 6)."""
+    from dew.nn.division import short_divide
+
+    numerators, divisors = _fp32_words()[None, :], _short_divisors()[:, None]
+    with np.errstate(over="ignore", invalid="ignore", divide="ignore"):
+        expected = (numerators.astype(np.float64) / divisors.astype(np.float64)).astype(np.float32)
+    nan = np.isnan(expected)
+    found = [np.asarray(run(numerators, divisors))
+             for run in ran_here(short_divide, "fp32 values over four-bit divisors, short divisions")]
+    for quotient in found:
+        np.testing.assert_array_equal(np.isnan(quotient), nan)
+        np.testing.assert_array_equal(quotient.view(np.uint32)[~nan], expected.view(np.uint32)[~nan])
+
+
+def test_a_block_scale_rounds_up_to_the_least_e4m3_at_or_above_its_ratio():
+    """`bits.scales_rounded_up` of each fp32 ratio of `_fp32_words` from its nearest e4m3 code
+    (`bits.encoded`) is, for a non-negative ratio (zero, subnormals and infinity among them), the least e4m3
+    code at or above it, 448's past it: a subnormal ratio takes the least subnormal scale, not the zero a
+    flushing comparison read it as (row 14083's review); for a NaN or a ratio of sign set (a negative zero
+    among them), e4m3's NaN code 0x7F; in NumPy's table and jitted alike."""
+    values = _fp32_words()
+    words = values.view(np.uint32)
+    table = np.arange(0x7F, dtype=np.uint8).view(ml_dtypes.float8_e4m3fn).astype(np.float32)
+    invalid = np.isnan(values) | np.signbit(values)
+    least = np.minimum(np.searchsorted(table, np.where(invalid, 0, values)), bits.E4M3.largest)
+    expected = np.where(invalid, bits.E4M3.nan, least).astype(np.uint32)
+
+    def rounded_up(words):
+        ratio = jax.lax.bitcast_convert_type(words, jnp.float32)
+        return bits.scales_rounded_up(bits.encoded(words, bits.E4M3), ratio)
+
+    found = [np.asarray(run(words)) for run in ran_here(rounded_up, "block scales rounded up")]
+    for codes in found:
+        np.testing.assert_array_equal(codes, expected)
+
+
 def test_a_small_nonzero_tile_keeps_its_nvfp4_codes():
     """A tile of small normal values, whose largest over 6 * 448 is no normal fp32, quantizes to codes that
     decode to the values' rounding (`bits.nvfp4_quantized`, then `nvfp4_decoded` times `NVFP4_OWED` and the
@@ -603,3 +667,58 @@ def test_a_one_operand_lop3_reads_its_immediate_as_both_other_operands():
         minterms = (held << 2) | (other << 1) | other
         expected = np.sum(((np.uint32(table) >> minterms) & 1) << lanes, axis=-1, dtype=np.uint64)
         np.testing.assert_array_equal(form.decoded(words)[0], expected, err_msg=f"table {table:#04x}")
+
+
+def test_a_float64_narrowing_is_exact_on_this_cpu_its_transpose_too():
+    """`float_bits.narrowed_float32` of float64 values whose float32 rounding is subnormal keeps them, where
+    this CPU's convert flushes them, and its transpose widens a subnormal float32 cotangent (2^-149)
+    exactly, not to the zero a convert back gives (train 1455's review), under x64."""
+    from dew.nn.float_bits import narrowed_float32
+
+    with jax.enable_x64(new_val=True):
+        values = jnp.asarray([2.0 ** -140, -(2.0 ** -149) * 1.5, 3.0], jnp.float64)
+        narrowed = jax.jit(narrowed_float32)(values)
+        expected = np.asarray([2.0 ** -140, -(2.0 ** -148), 3.0], np.float64).astype(np.float32)
+        np.testing.assert_array_equal(np.asarray(narrowed).view(np.uint32), expected.view(np.uint32))
+        _, pull = jax.vjp(narrowed_float32, values)
+        least = np.uint32(1).view(np.float32)
+        (back,) = jax.jit(pull)(jnp.full((3,), least, jnp.float32))
+        assert back.dtype == jnp.float64
+        np.testing.assert_array_equal(np.asarray(back), np.full(3, 2.0 ** -149))
+
+
+@pytest.mark.mesh(devices=2)
+def test_a_float64_narrowing_runs_over_a_reduced_explicit_placement():
+    """`float_bits.narrowed_float32` of a float64 operand an Explicit placement holds reduced over 'data'
+    (each device a part of its sum), forward and its tangent, jitted: each device's part narrowed on its
+    bits (train 1455's review: a bit operation has no rule for a reduced placement, its trace raised)."""
+    from jax.sharding import AxisType, NamedSharding, PartitionSpec
+
+    from dew.nn.float_bits import narrowed_float32
+
+    mesh = jax.make_mesh((2,), ("data",), axis_types=(AxisType.Explicit,), devices=jax.devices()[:2])
+    with jax.enable_x64(new_val=True), jax.set_mesh(mesh):
+        values = jax.device_put(jnp.asarray([[1.5, 2.0 ** -140], [3.0, -4.0]], jnp.float64),
+                                NamedSharding(mesh, PartitionSpec(None, None, reduced={"data"})))
+        narrowed, slope = jax.jit(lambda x: jax.jvp(narrowed_float32, (x,), (x,)))(values)
+    expected = np.asarray([[1.5, 2.0 ** -140], [3.0, -4.0]], np.float64).astype(np.float32)
+    for found in (narrowed, slope):
+        np.testing.assert_array_equal(np.asarray(found).view(np.uint32), expected.view(np.uint32))
+
+
+def test_an_mxfp8_epilogues_float64_accumulator_keeps_its_scale():
+    """The MXFP8 epilogue outside a kernel over a float64 accumulator (XLA's, under x64) reads each block's
+    largest at its own width, as `MxFp8.quantized` does: a block of 2^128, finite in float64, takes scale
+    byte 0xF7 (2^120), where its float32 narrowing overflowed to infinity and the NaN byte 0xFF (train
+    1455's review)."""
+    from dew.nn.kernels import formats
+    from dew.nn.kernels.templates.gemm import quantized
+
+    with jax.enable_x64(new_val=True):
+        acc = np.ones((2, 32), np.float64)
+        acc[0] = 2.0 ** 128
+        _, scales = jax.jit(quantized._mxfp8_quantize_epilogue)(jnp.asarray(acc))
+        expected = formats.MxFp8.quantized(jnp.asarray(acc)).scales
+    stored = np.asarray(scales).view(np.uint8)
+    assert (stored[0] == 0xF7).all(), stored
+    np.testing.assert_array_equal(stored[:, ::32], np.asarray(expected).view(np.uint8))

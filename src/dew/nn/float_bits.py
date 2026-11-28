@@ -213,6 +213,51 @@ def rounded_binary(sign: jax.Array, significand: jax.Array, exponent: jax.Array,
     return jax.lax.bitcast_convert_type(bits.astype(f"uint{limits.bits}"), dtype)
 
 
+def narrowed_float32(x: jax.Array) -> jax.Array:
+    """A float64 `x` rounded once to the nearest float32, ties to even, below the least normal on the
+    subnormal grid (`rounded_binary` on its bits), where a flushing platform's convert (XLA's CPU) drops a
+    subnormal to zero; past the largest finite an infinity, an infinity its own, a NaN a quiet one. The
+    narrowing is a linear map (`generation.linear_map`), as `widened_exactly`'s widening is: its tangent
+    the tangent narrowed alike, a cast's derivative (an NVFP4 tensor scale's at a float64 truth's width:
+    row 14083's review), its transpose the cotangent widened exactly (`widened_exactly`)."""
+    from dew.nn.kernels.generation import linear_map
+
+    x = jnp.asarray(x, jnp.float64)
+    source = jax.typeof(x)
+
+    def apply(_, moving):
+        # Traced where JAX evaluates the map, which may lie outside its caller's x64 scope; a reduced or
+        # unreduced placement's each device's part (train 1455's review: no bit operation has its rule).
+        return _bitwise(_narrowed_bits, moving, wide=True)
+
+    def pullback(_, cotangent):
+        # The cotangent widened from its bits (`widened_exactly`), a subnormal float32 one kept, which a
+        # flushing convert zeroes (train 1455's review), placed as it is, in x64 whatever scope a pullback
+        # runs in.
+        with jax.enable_x64(new_val=True):
+            return widened_exactly(cotangent, jnp.float64)
+
+    narrowed = source.update(dtype=jnp.dtype(jnp.float32), weak_type=False)
+    return linear_map(apply, pullback, (), x, out_aval=narrowed, summed_first=True)
+
+
+def _narrowed_bits(x: jax.Array) -> jax.Array:
+    """`narrowed_float32`'s rounding of float64 `x` on its bits."""
+    _, sign, biased, fraction = raw_fields(x)
+    significand = fraction | jnp.where(biased > 0, np.uint64(1 << 52), np.uint64(0))
+    # Its 32 leading bits of 53 and whether any below them is set, which decides a tie alone.
+    top = (significand >> np.uint64(21)).astype(jnp.uint32)
+    tail = ((significand & np.uint64((1 << 21) - 1)) != 0).astype(jnp.int32)
+    exponent = jnp.maximum(biased.astype(jnp.int32), 1) - 1075 + 21
+    special = biased == 0x7FF
+    # A normal's leading bit is bit 31 of `top`, its last place 23 below it, or the least subnormal's (no
+    # float64 subnormal rounds to a nonzero float32): no search for it.
+    limits = jnp.finfo(jnp.float32)
+    last = jnp.maximum(exponent + 31 - limits.nmant, limits.minexp - limits.nmant)
+    return rounded_binary((sign >> np.uint64(32)).astype(jnp.uint32), top, exponent, jnp.float32, tail=tail,
+                          last=last, infinite=special & (fraction == 0), nan=special & (fraction != 0))
+
+
 def quiet_nan_bits(dtype: DTypeLike) -> int:
     """The bits of `dtype`'s positive quiet NaN, an IEEE binary format: its exponent all ones and its
     mantissa's leading bit alone (`0x7FC00000` for float32), the NaN a cast of one gives."""
@@ -297,21 +342,27 @@ def widened_exactly(x: jax.typing.ArrayLike, dtype: DTypeLike) -> jax.Array:
 
     def apply(_, moving):
         # Traced where JAX evaluates the map, which may lie outside its caller's x64 scope (`float64_sum`'s).
-        with jax.enable_x64(new_val=True) if resolved == np.dtype(np.float64) else contextlib.nullcontext():
-            sharding = jax.typeof(moving).sharding
-            if isinstance(sharding, jax.sharding.NamedSharding) and (
-                    sharding.spec.reduced or sharding.spec.unreduced):
-                axes = frozenset(sharding.spec.reduced) | frozenset(sharding.spec.unreduced)
-                spec = sharding.spec.update(partitions=())
-                with jax.sharding.use_abstract_mesh(sharding.mesh.abstract_mesh):
-                    return jax.shard_map(
-                        lambda part: _widened_bits(part, resolved),
-                        mesh=sharding.mesh, in_specs=spec, out_specs=spec,
-                        axis_names=axes, check_vma=False)(moving)
-            return _widened_bits(moving, resolved)
+        return _bitwise(lambda part: _widened_bits(part, resolved), moving,
+                        wide=resolved == np.dtype(np.float64))
     # Its type strong, as an explicit conversion's: a weak one would yield to a strong float32 it meets.
     return linear_map(apply, lambda _, cotangent: cast_back(cotangent, source), (), x,
                       out_aval=source.update(dtype=resolved, weak_type=False), summed_first=True)
+
+
+def _bitwise(fn, moving: jax.Array, *, wide: bool) -> jax.Array:
+    """`fn(moving)`, a map on its bits (`widened_exactly`'s, `narrowed_float32`'s), in x64 where `wide`
+    whatever x64 scope a map is traced in; over an Explicit placement holding reduced or unreduced axes,
+    each device's own part (`shard_map`), as no bit operation has a rule for them."""
+    with jax.enable_x64(new_val=True) if wide else contextlib.nullcontext():
+        sharding = jax.typeof(moving).sharding
+        if isinstance(sharding, jax.sharding.NamedSharding) and (
+                sharding.spec.reduced or sharding.spec.unreduced):
+            axes = frozenset(sharding.spec.reduced) | frozenset(sharding.spec.unreduced)
+            spec = sharding.spec.update(partitions=())
+            with jax.sharding.use_abstract_mesh(sharding.mesh.abstract_mesh):
+                return jax.shard_map(fn, mesh=sharding.mesh, in_specs=spec, out_specs=spec, axis_names=axes,
+                                     check_vma=False)(moving)
+        return fn(moving)
 
 
 def cast_back(cotangent: jax.Array, source: ShapedArray) -> jax.Array:
