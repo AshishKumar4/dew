@@ -337,7 +337,8 @@ class _StepRoute(NamedTuple):
     @property
     def kernels(self) -> tuple[str | None, str | None]:
         """The kernels the step runs, as two decisions are compared."""
-        return tuple(None if route is None else route.kernel for route in self)
+        return (None if self.paged is None else self.paged.kernel,
+                None if self.gathered is None else self.gathered.kernel)
 
 
 class _Masking(NamedTuple):
@@ -1998,22 +1999,18 @@ class CausalSelfAttention(nn.Module):
         `windowed` step reads each row from its window's first key; a `sunk` one has sinks. A compact
         quantized cache's codes read as they lie where the template's decode takes them
         (`template_quantized`), no dequantized copy of the cache a step."""
-        if store.layout.page_size is None and store.layout.quantized is None:
-            return None
-        return store.paged_kernel(query, **self._paged_case(query), windowed=windowed, sinks=sunk)
+        route = self._paged_route(store, query, windowed, sunk)
+        return None if route is None else store.paged_of(generation.published(route))
 
     def _paged_route(self, store, query, windowed: bool, sunk: bool) -> Route | None:
         """`_paged_kernel`'s route, reported nowhere (`KVStore.paged_route`), None where the cache keeps no
         pages."""
         if store.layout.page_size is None and store.layout.quantized is None:
             return None
-        return store.paged_route(query, **self._paged_case(query), windowed=windowed, sinks=sunk)
-
-    def _paged_case(self, query) -> dict:
-        """The layer's facts a paged step's case reads past its window and sinks (`KVStore.case`)."""
-        return {"softcap": self.ctx.attn_logit_softcap, "named": chosen_attention(),
-                "arithmetic": reference_only(query, self.ctx.dtype, self.ctx.precision,
-                                             self.ctx.force_fp32_for_softmax)}
+        return store.paged_route(query, softcap=self.ctx.attn_logit_softcap,
+                                 arithmetic=reference_only(query, self.ctx.dtype, self.ctx.precision,
+                                                           self.ctx.force_fp32_for_softmax),
+                                 named=chosen_attention(), windowed=windowed, sinks=sunk)
 
     def _decode_masks(self, positions, rows: int, key_length: int, valid, history: dict[str, jax.Array]
                       ) -> tuple[jax.Array, jax.Array | None]:
