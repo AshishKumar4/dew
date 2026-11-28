@@ -1978,35 +1978,51 @@ def test_a_server_on_an_expert_mesh_draws_what_one_device_draws(dispatch, decode
         assert_same_draws(ticket.result(), row)
 
 
-@pytest.mark.mesh(devices=4)
-@pytest.mark.parametrize("dispatch", ["global", "exchange"])
-def test_a_speculating_server_on_an_expert_mesh_drafts_what_one_device_drafts(dispatch):
-    """Speculative blocks served on an expert mesh: each block's draws are checked before the next block's
-    model call, which runs the mixture's dispatch (the exchange in a shard_map), and every request draws
-    what its lone call draws on one device, several steps a call; a block whose draws leave no distribution
-    is refused by its check through that call."""
+def speculating_expert_tasks(dispatch: str) -> tuple[TextGeneration, TextGeneration]:
+    """A one-layer decoder of a four-expert mixture beside a draft layer, greedy in speculative blocks of
+    three: its lone task on one device, and its task over the same weights placed on an expert mesh of
+    four, its mixture dispatching as `dispatch`."""
     model = CausalTransformer(vocab_size=VOCAB, emb_features=16, num_layers=1, num_heads=2, head_dim=8,
                               mlp_features=32, max_seq_len=128, dtype="float32", num_nextn_predict_layers=1,
                               mixture=Mixture(experts=4, top_k=2, dispatch="global"))
     params = nn.unbox(jax.jit(model.init)(jax.random.key(0), jnp.ones((1, 2), jnp.int32)))
     sampling = Sampling(temperature=0, eos_token_ids=EOS, strategy=Speculative(block=3))
     lone = TextGeneration(model, params, RunProcessor(Digits()), sampling=sampling)
-    alone = [lone(prompt, budget, key=index)
-             for index, (prompt, budget) in enumerate(zip(PROMPTS, BUDGETS, strict=True))]
     with boxed(decoder_axes(model)):
         placed = place(params, MeshSpec(expert=4), Layout(min_shard=1, tolerance=1.0))
     served = TextGeneration(model.clone(mixture=Mixture(experts=4, top_k=2, dispatch=dispatch)), placed,
                             RunProcessor(Digits()), sampling=sampling)
+    return lone, served
+
+
+@pytest.mark.mesh(devices=4)
+@pytest.mark.parametrize("dispatch", ["global", "exchange"])
+def test_a_speculating_server_on_an_expert_mesh_drafts_what_one_device_drafts(dispatch):
+    """Speculative blocks served on an expert mesh: each block's draws are checked before the next block's
+    model call, which runs the mixture's dispatch (the exchange in a shard_map), and every request draws
+    what its lone call draws on one device, several steps a call."""
+    lone, served = speculating_expert_tasks(dispatch)
+    alone = [lone(prompt, budget, key=index)
+             for index, (prompt, budget) in enumerate(zip(PROMPTS, BUDGETS, strict=True))]
     server, tickets = served_alongside(served, slots=8, admission=8, decode_steps=4)
     assert_sharded(served.variables["params"], server.mesh)
     for ticket, row in zip(tickets, [*alone, alone[2]], strict=True):
         assert_same_draws(ticket.result(), row)
 
+
+@pytest.mark.mesh(devices=4)
+@pytest.mark.parametrize("dispatch", ["global", "exchange"])
+def test_a_speculating_server_on_an_expert_mesh_refuses_a_block_that_leaves_no_distribution(dispatch):
+    """A speculative block whose draws leave no distribution is refused on an expert mesh by its check
+    through the call that drew it, several steps a call: a test apart from the draws', each compiling a
+    server of its own (together 362 s in train 1436's CI, row 14077)."""
+    _, served = speculating_expert_tasks(dispatch)
+
     def undefined(state, scores):
         return jnp.full_like(scores, -jnp.inf)
 
     refused = dataclasses.replace(served, sampling=dataclasses.replace(
-        sampling, logits=(jax.tree_util.Partial(undefined),)))
+        served.sampling, logits=(jax.tree_util.Partial(undefined),)))
     failing = Server.from_task(refused, slots=8, capacity=128, decode_steps=4)
     failing.submit(PROMPTS[0], BUDGETS[0], key=0)
     with pytest.raises(checkify.JaxRuntimeError):
