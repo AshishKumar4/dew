@@ -280,7 +280,7 @@ def blocks_quantized(w: jax.Array, *, k_major: bool = False) -> tuple[jax.Array,
     rows = largest_magnitude(read.reshape(groups, depth, width // edge, edge), -1)
     amax = largest_magnitude(rows.reshape(groups, depth // edge, edge, width // edge), 2)
     scale = fake_quant.fp8_block_scale(amax.astype(at_least_fp32(w.dtype)))
-    tiles = w.reshape(groups, depth // edge, edge, width)
+    tiles = read.reshape(groups, depth // edge, edge, width)
     tiles = tiles.reshape(groups, depth // edge, edge, width // edge, edge)
     spread = scale[:, :, None, :, None]
     if k_major:
