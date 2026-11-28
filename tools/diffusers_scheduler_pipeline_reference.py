@@ -2,8 +2,8 @@
 pipeline's own Flax UNet and text tower supply the predictions, "dog" unconditioned and "cat" at guidance 3,
 and Diffusers' PyTorch schedulers the updates, four steps from a given noise (`walk`), in float32 or in
 float64: the Flax pipeline at float64 as tools/native_diffusion_worker.py builds it (`flax_precision.float64`
-over diffusers_pipeline_reference's WIDENED), each scheduler with its module's float32 read as float64
-(`diffusers_wan_reference.float64_scheduler`). The timetable includes PNDM's PRK/PLMS warmup and LMS's
+over diffusers_pipeline_reference's WIDENED), each scheduler its class's independent float64 oracle
+(tools/float64_schedulers.py). The timetable includes PNDM's PRK/PLMS warmup and LMS's
 sigma-zero interval. tools/native_diffusion_worker.py's `native-grid-<name>` sites run it in that cohort's
 environment (tools/reference_releases.py); tools/check_native_diffusion.py's `check_grids` holds Dew's walk
 over each scheduler's own grid to it.
@@ -11,9 +11,7 @@ over each scheduler's own grid to it.
 
 from __future__ import annotations
 
-import contextlib
 import json
-import sys
 from pathlib import Path
 
 import numpy as np
@@ -61,28 +59,21 @@ def guided(pipe, params):
 def walk(name: str, base: Path, pipeline, noise: np.ndarray, wide: bool) -> np.ndarray:
     """Grid `name`'s walk of `base`'s SD pipeline (`pipeline`: its Flax pipeline and parameters, at float64
     where `wide`) from `noise` (channels last), its last latents channels last."""
-    import diffusers
     import jax.numpy as jnp
     import torch
+    from float64_schedulers import oracle_of
 
-    module = sys.modules[getattr(diffusers, SCHEDULERS[name][0]).__module__]
-    if wide:
-        from diffusers_wan_reference import float64_scheduler
-
-        scope = float64_scheduler(module)
-    else:
-        scope = contextlib.nullcontext()
     predict = guided(*pipeline)
     dtype = torch.float64 if wide else torch.float32
-    with scope:
-        walked = scheduler(name, base)
-        walked.set_timesteps(STEPS)
-        value = torch.from_numpy(np.ascontiguousarray(noise.transpose(0, 3, 1, 2))).to(dtype)
-        value = value * walked.init_noise_sigma
-        for time in walked.timesteps:
-            model_input = walked.scale_model_input(torch.cat([value, value]), time)
-            prediction = predict(jnp.asarray(model_input.numpy()), jnp.asarray(time.numpy()))
-            value = walked.step(torch.from_numpy(np.array(prediction)), time, value).prev_sample
+    # At float64 the class's independent oracle (tools/float64_schedulers.py), its tables its own.
+    walked = oracle_of(scheduler(name, base)) if wide else scheduler(name, base)
+    walked.set_timesteps(STEPS)
+    value = torch.from_numpy(np.ascontiguousarray(noise.transpose(0, 3, 1, 2))).to(dtype)
+    value = value * walked.init_noise_sigma
+    for time in walked.timesteps:
+        model_input = walked.scale_model_input(torch.cat([value, value]), time)
+        prediction = predict(jnp.asarray(model_input.numpy()), jnp.asarray(time.numpy()))
+        value = walked.step(torch.from_numpy(np.array(prediction)), time, value).prev_sample
     return value.permute(0, 2, 3, 1).numpy()
 
 

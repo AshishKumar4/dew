@@ -176,10 +176,10 @@ def test_the_precision_seams_hold_every_order(edge):
 
 @pytest.mark.parametrize("edge", EDGES)
 def test_a_straight_through_rounding_holds_every_order(edge):
-    """`fake_quant.straight_through` (a declared surrogate): its value the rounded operand's bit for bit, a
+    """`derivatives.straight_through` (a declared surrogate): its value the rounded operand's bit for bit, a
     negative zero kept, and every order finite wherever float64 is a normal float32 and the plain formula,
     the rounding as JAX writes it, is."""
-    from dew.nn.fake_quant import straight_through
+    from dew.nn.derivatives import straight_through
 
     (x,) = normal_draw(2654, (5, 4), scale=EDGES[edge])
     (direction,) = normal_draw(2655, x.shape, scale=EDGES[edge])

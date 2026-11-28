@@ -47,22 +47,23 @@ class Oracle(nn.Module):
         return jnp.sin(value) * 0.07 + time[:, None] * 0.001
 
 
-def oracle_walk(scheduler, initial, dtype):
-    """diffusers' walk of `initial` [ROWS, 3] under the oracle model, at `dtype`."""
+def oracle_walk(scheduler, name: str, initial, dtype):
+    """diffusers' walk of `initial` [ROWS, 3] under the oracle model, at `dtype`, of `scheduler` (the class
+    `name` or its oracle): the walk the recorder
+    takes (`scheduler_cases.calls`, tools/native_diffusion_edges_reference.py), its last latent."""
     import torch
+    from scheduler_cases import Case, calls
 
     scheduler.set_timesteps(STEPS)
     x = torch.as_tensor(np.asarray(initial)).to(dtype) * scheduler.init_noise_sigma
-    for time in scheduler.timesteps:
-        model_input = scheduler.scale_model_input(x, time)
-        prediction = torch.sin(model_input) * 0.07 + time.to(dtype) * 0.001
-        x = scheduler.step(prediction, time, x).prev_sample
+    for call in calls(scheduler, Case(name), x):
+        x = call.after
     return x.numpy()
 
 
 def check_schedule(ref, case):
     import diffusers
-    from diffusers_wan_reference import float64_scheduler
+    from float64_schedulers import oracle_of
 
     config = json.loads(str(ref[case + ".config"]))
     policy = SourceSchedule.from_config(config)
@@ -100,14 +101,15 @@ def check_schedule(ref, case):
     def reference(initial, jitter):
         import torch
 
-        return oracle_walk(source.from_config(drawn(jitter)), initial, torch.float32)
+        return oracle_walk(source.from_config(drawn(jitter)), source.__name__, initial, torch.float32)
 
     @as_given
     def truth(initial, jitter):
         import torch
 
-        with float64_scheduler(sys.modules[source.__module__]):
-            return oracle_walk(source.from_config(drawn(jitter)), initial, torch.float64)
+        # The class's independent float64 oracle (tools/float64_schedulers.py), the library untouched.
+        return oracle_walk(oracle_of(source.from_config(drawn(jitter))), source.__name__, initial,
+                           torch.float64)
 
     # The walk's schedule is built from each draw's jittered table on the host, and the reference is torch's.
     assert_as_exact(as_given(dew), as_given(reference), draw, f"{case} walk", seeds=SEEDS[case],

@@ -76,16 +76,8 @@ from jax.custom_derivatives import SymbolicZero
 from dew._cache import INTERCEPTED, QUANTIZED_TRACE
 from dew.batch import Coordinates, unboxed
 from dew.nn.dense import QUANTIZATION, _contractions, _linear_site, packed_matrix, packed_ternary
-from dew.nn.derivatives import contracted, surrogate, with_tangents_formed
-from dew.nn.fake_quant import (
-    E2M1_MAX,
-    E4M3_MAX,
-    fp4_codes,
-    fp8_block_cast,
-    fp8_blocks_on_host,
-    fp8_codes,
-    straight_through,
-)
+from dew.nn.derivatives import contracted, straight_through, surrogate, with_tangents_formed
+from dew.nn.fake_quant import E2M1_MAX, E4M3_MAX, fp4_codes, fp8_block_cast, fp8_blocks_on_host, fp8_codes
 from dew.nn.kernels.generation import linear_map
 from dew.nn.kernels.options import owned_program
 from dew.nn.precision import (

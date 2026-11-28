@@ -26,7 +26,7 @@ and chat template - and, over drawn prompts and latents, records each
 prompt's states alone (`encoded`) and the unmodified pipeline's walk of each
 from its latents, the walked latents and the decoded images
 (`pipeline_walked`), in float32 and, each component its float64 twin and the
-scheduler's own tables widened, in float64.
+scheduler its class's float64 oracle (tools/float64_schedulers.py), in float64.
 
 Each site is recorded over check 1's seeds by `recorded_references.record_case`
 in summary mode (`SEEDED`): the count its evidence resolves and each seed's
@@ -57,7 +57,7 @@ import torch
 from diffusers_reference_helpers import perturb, recording, saved_pipeline
 from reference_releases import commit
 
-from _dew_torch.precision import float64, float64_twin
+from _dew_torch.precision import float64_twin
 
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE = ROOT / "tests" / "fixtures" / "hf" / "qwen-image-2.1-source"
@@ -266,12 +266,13 @@ def pipeline_walked(pipe, inputs: dict[str, np.ndarray], dtype) -> dict[str, np.
 def record_seeds(record: dict, models: Mapping[str, torch.nn.Module], pipe) -> dict[str, np.ndarray]:
     """Check 1's recordings over seeds (`record_case`), over tests/qwen_image_draws.py's draws of the
     fixture's `record`, in float32, the reference, and on the float64 twin (`float64_twin`, the pipeline's
-    scheduler tables widened by `float64_scheduler`), the truth: each case's walk (`walked`) summarized,
-    its truth's sketch the test's own float64 path is held to, and the prompts' encoding (`encoded`) and
-    the pipeline's walk (`pipeline_walked`) whole, the truth the test reads, as no float64 path of the
-    test's would be one program (the pipeline's host loop, its tokenizer) whose roundings it counts."""
-    from diffusers.schedulers import scheduling_flow_match_euler_discrete
-    from diffusers_wan_reference import float64_scheduler
+    scheduler its class's independent float64 oracle, tools/float64_schedulers.py), the truth: each case's
+    walk (`walked`) summarized, its truth's sketch the test's own float64 path is held to, and the prompts'
+    encoding (`encoded`) and the pipeline's walk (`pipeline_walked`) whole, the truth the test reads, as no
+    float64 path of the test's would be one program (the pipeline's host loop, its tokenizer) whose
+    roundings it counts."""
+    from diffusers_reference_helpers import float64_paired
+    from float64_schedulers import oracle_of
     from qwen_image_draws import case_draw, pipeline_draw
     from recorded_references import record_case
 
@@ -280,25 +281,20 @@ def record_seeds(record: dict, models: Mapping[str, torch.nn.Module], pipe) -> d
         model = models[name]
         twin = float64_twin(model)
 
-        def evaluate(inputs, model=model, twin=twin, case=case):
-            narrow = walked(model, case, inputs, torch.float32)
-            with float64():
-                return narrow, walked(twin, case, inputs, torch.float64)
+        def case_walked(model, inputs, dtype, case=case):
+            return walked(model, case, inputs, dtype)
 
-        arrays.update(record_case(f"{name} walk", case_draw(record, name), evaluate, store_inputs=False,
-                                  summary=True))
+        arrays.update(record_case(f"{name} walk", case_draw(record, name),
+                                  float64_paired(case_walked, model, twin), store_inputs=False, summary=True))
     twin = copy.deepcopy(pipe)
     for component_name, component in pipe.components.items():
         if isinstance(component, torch.nn.Module):
             setattr(twin, component_name, float64_twin(component))
+    twin.scheduler = oracle_of(pipe.scheduler)
 
     for site, run in (("prompt encoding", encoded), ("pipeline walk", pipeline_walked)):
-        def evaluate_pipeline(inputs, run=run):
-            narrow = run(pipe, inputs, torch.float32)
-            with float64(), float64_scheduler(scheduling_flow_match_euler_discrete):
-                return narrow, run(twin, inputs, torch.float64)
-
-        arrays.update(record_case(site, pipeline_draw(record), evaluate_pipeline, store_inputs=False))
+        arrays.update(record_case(site, pipeline_draw(record), float64_paired(run, pipe, twin),
+                                  store_inputs=False))
     return arrays
 
 

@@ -1,9 +1,10 @@
 {
- "bytes": 65101283,
+ "bytes": 256930573,
  "license": "Apache-2.0",
- "path": "recordings/38c9275fca7a6aa5d5240416824585106dff6078671a7519a66039572dbb0200.npz",
+ "origin": "github",
+ "path": "c6b80ec136cace32198c880a0ee32681feca1b26754bbb101a9eab274b013889.npz",
  "reference": "huggingface/diffusers 0.39.0",
- "repo": "dewml/fixtures",
- "revision": "6178df084e1d5e3377215d48f19af3b181ee0fed",
- "sha256": "38c9275fca7a6aa5d5240416824585106dff6078671a7519a66039572dbb0200"
+ "repo": "AshishKumar4/dew-fixtures",
+ "revision": "store-1",
+ "sha256": "c6b80ec136cace32198c880a0ee32681feca1b26754bbb101a9eab274b013889"
 }

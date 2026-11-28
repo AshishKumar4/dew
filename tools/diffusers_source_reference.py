@@ -13,9 +13,10 @@ the repeated stage rows the two-evaluation classes take.
 What lands per case: the saved config, the beta table, the source timesteps and
 sigmas, its `init_noise_sigma`, the latent after every grid interval and the
 vector-Jacobian product of the last one against a fixed cotangent through the
-whole trajectory. The float64 walk widens every floating scheduler table
-before doing arithmetic; its gradient is stored in float64. Both precisions
-start from the same float32 input and cotangent.
+whole trajectory. The float64 walk is the class's independent oracle's
+(tools/float64_schedulers.py), every table its own in float64, the library
+untouched; its gradient is stored in float64. Both precisions start from the
+same float32 input and cotangent.
 
 The model is the same closed form on both sides, a function of the scaled model
 input and the model time, so the comparison is of scheduler policy alone. A
@@ -32,6 +33,8 @@ and torchsde==0.2.6:
         tests/fixtures/diffusers/source_rounding.npz
     PYTHONPATH=src python tools/diffusers_source_reference.py seeds \
         tests/fixtures/diffusers/source_seeds.npz
+    PYTHONPATH=src python tools/diffusers_source_reference.py sde \
+        tests/fixtures/diffusers/oracle_sde.npz
 
 `cases NAME...` records those cases alone into the stored record and keeps
 every other array as it is, so a case added later leaves the cases another
@@ -40,16 +43,16 @@ machine's float32 rounding recorded untouched.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import sys
 import tempfile
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, field, replace
+from dataclasses import replace
 from pathlib import Path
 from types import ModuleType
-from typing import Any
-from unittest.mock import patch
+from typing import Any, NamedTuple
 
 os.environ["JAX_PLATFORMS"] = "cpu"
 
@@ -61,267 +64,50 @@ from diffusers_reference_helpers import (
     scheduler_module,
     step_noise as step_noise,
 )
-from diffusers_wan_reference import float64_scheduler
-from recorded_draws import Tape
+from float64_oracle import threshold_bound
+from float64_schedulers import ORACLES
+from float64_tables import PNDM
+from scheduler_cases import CASES, GUIDANCE_SCALE, LABEL, SEED, STEPS, VP, Case, calls, guided, walked
 
 from dew.diffusion.schedules.common import GeneralizedNoiseScheduler
 from dew.diffusion.schedules.source import SourceSchedule
 
 FIXTURES = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "diffusers"
 SHAPE = (2, 3, 4)
-STEPS = 5
-DISTILLED_STEPS = 4
-SEED = 11
-GUIDANCE_SCALE = 3.0
-LABEL = 0.7
 
 TWO_STAGE = ("HeunDiscreteScheduler", "KDPM2DiscreteScheduler",
              "KDPM2AncestralDiscreteScheduler", "DPMSolverSDEScheduler")
 
 
-@dataclass(frozen=True)
-class Case:
-    """One published scheduler file: the class, the config it was written with,
-    and the number of steps the walk asks for."""
-
-    scheduler: str
-    config: Mapping[str, Any] = field(default_factory=dict)
-    steps: int = STEPS
-    guidance: float | None = None
-
-
-def oracle(model_input: torch.Tensor, time: torch.Tensor, label: float = 0.0) -> torch.Tensor:
-    """The model both sides run: a bounded nonlinear function of the scaled
-    input and the model time, so the trajectory and its Jacobian depend on
-    every scheduler decision and on nothing else."""
-    scalar = torch.as_tensor(time, dtype=torch.float64)
-    return torch.sin(model_input) * 0.07 + scalar * 0.001 + label
-
-
-class RecordedBrownian:
-    """The source's own `BrownianTreeNoiseSampler`, recorded.
-
-    The real sampler runs, over the interval the scheduler prepares and from
-    the seed its config pins, and every query it makes is kept with the
-    normalized draw it answered. The native walk then integrates those exact
-    draws, so both sides follow one `torchsde` path and the comparison is of
-    the update algebra, the stage placement and the query bounds. Dew's own
-    bridge is not in this loop; its identities are checked separately.
-    """
-
-    real = None
-    calls: list[tuple[float, float]] = []
-    draws: list[np.ndarray] = []
-    bounds: tuple[float, float] = (0.0, 0.0)
-    transform_is_identity = False
-
-    def __init__(self, x, sigma_min, sigma_max, seed=None, transform=lambda value: value):
-        RecordedBrownian.transform_is_identity = bool(
-            transform(torch.as_tensor(2.0)).item() == 2.0)
-        RecordedBrownian.bounds = (float(sigma_min), float(sigma_max))
-        RecordedBrownian.calls = []
-        RecordedBrownian.draws = []
-        assert RecordedBrownian.real is not None
-        self.inner = RecordedBrownian.real(x, sigma_min, sigma_max, seed, transform)
-
-    def __call__(self, sigma, sigma_next):
-        value = self.inner(sigma, sigma_next)
-        RecordedBrownian.calls.append((float(sigma), float(sigma_next)))
-        RecordedBrownian.draws.append(value.detach().numpy().astype(np.float64))
-        return value
-
-
-def walk(scheduler, module: ModuleType, case: Case, x: torch.Tensor,
-         noises: list[np.ndarray]) -> tuple[list[torch.Tensor], list[np.ndarray]]:
-    """Every scheduler call the walk makes, keeping the latent at each grid
-    interval's end: one call per interval, two for the classes that evaluate
-    the model at an interpolated stage, and PNDM's own warmup timetable."""
+def walk(scheduler, module: ModuleType | None, case: Case, x: torch.Tensor, noises: list[np.ndarray]
+         ) -> tuple[list[torch.Tensor], list[np.ndarray]]:
+    """Every scheduler call the walk makes (`calls`), its model the case's, under the pipeline's
+    classifier-free guidance where it states one (`guided`: Diffusers' own `rescale_noise_cfg`), keeping the
+    latent at each grid interval's end: one call per interval, two for the classes that evaluate the model
+    at an interpolated stage, and PNDM's own warmup timetable. A library class's draws are `noises`, fed to
+    its `module` (`fed_noise`); an oracle's (no module) its own tape."""
     times = scheduler.timesteps
     last = len(times) - 1
     latents, inputs = [], []
-    with fed_noise(module, noises):
-        for index, time in enumerate(times):
-            model_input = scheduler.scale_model_input(x, time)
-            inputs.append(model_input.detach().numpy().astype(np.float32))
-            output = oracle(model_input, time)
-            if case.scheduler == "PNDMScheduler":
-                x = scheduler.step(output, int(time), x).prev_sample
-            else:
-                x = scheduler.step(output, time, x).prev_sample
-            if case.scheduler in TWO_STAGE:
-                if index % 2 == 1 or index == last:
-                    latents.append(x)
-            else:
-                latents.append(x)
+    model = guided(case, rescale_noise_cfg)
+    with fed_noise(module, noises) if module is not None else contextlib.nullcontext():
+        for call in calls(scheduler, case, x, model):
+            inputs.append(call.model_input.detach().numpy().astype(np.float32))
+            if case.scheduler not in TWO_STAGE or call.at % 2 == 1 or call.at == last:
+                latents.append(call.after)
     if case.scheduler == "PNDMScheduler":
         latents = (latents[1:] if scheduler.config.skip_prk_steps
                    else [latents[3], latents[7], latents[11]] + latents[12:])
     return latents, inputs
 
 
-def guided_walk(scheduler, module: ModuleType, case: Case, x: torch.Tensor,
-                noises: list[np.ndarray]) -> tuple[list[torch.Tensor], list[np.ndarray]]:
-    """The same walk under the pipeline's classifier-free guidance: both raw
-    predictions, the guided combination, the source's own `rescale_noise_cfg`
-    and only then the scheduler's conversion."""
-    # The guidance-rescale helper under test lives among the pipelines, which
-    # import the transformers names `restore_transformers_names` puts back.
+def rescale_noise_cfg():
+    """Diffusers' own guidance rescale (`rescale_noise_cfg`), from its pipelines, which import the
+    transformers names `restore_transformers_names` puts back."""
     restore_transformers_names()
     from diffusers.pipelines.stable_diffusion_xl.pipeline_stable_diffusion_xl import rescale_noise_cfg
 
-    latents, inputs = [], []
-    with fed_noise(module, noises):
-        for time in scheduler.timesteps:
-            model_input = scheduler.scale_model_input(x, time)
-            inputs.append(model_input.detach().numpy().astype(np.float32))
-            conditional = oracle(model_input, time, LABEL)
-            unconditional = oracle(model_input, time)
-            output = unconditional + GUIDANCE_SCALE * (conditional - unconditional)
-            assert case.guidance is not None
-            output = rescale_noise_cfg(output, conditional, guidance_rescale=case.guidance)
-            x = scheduler.step(output, time, x).prev_sample
-            latents.append(x)
-    return latents, inputs
-
-
-VP = dict(num_train_timesteps=1000, beta_start=0.00085, beta_end=0.012,
-          beta_schedule="scaled_linear")
-EDM = dict(sigma_min=0.002, sigma_max=80.0, sigma_data=0.5, num_train_timesteps=1000)
-
-CASES: Mapping[str, Case] = {
-    # DDIM and PNDM: rounded model times over a fixed training stride, the
-    # clip the default already applies, thresholding, and the trailing
-    # zero-terminal-SNR velocity pairing those checkpoints ship.
-    "ddim.default": Case("DDIMScheduler", VP),
-    "ddim.trailing_zero_snr_v": Case("DDIMScheduler", dict(
-        VP, timestep_spacing="trailing", rescale_betas_zero_snr=True,
-        prediction_type="v_prediction", clip_sample=False, set_alpha_to_one=False)),
-    "ddim.threshold": Case("DDIMScheduler", dict(
-        VP, clip_sample=False, thresholding=True, dynamic_thresholding_ratio=0.9,
-        sample_max_value=1.5, timestep_spacing="linspace")),
-    "pndm.default": Case("PNDMScheduler", VP),
-    "pndm.plms_linspace": Case("PNDMScheduler", dict(
-        VP, skip_prk_steps=True, timestep_spacing="linspace", steps_offset=1)),
-    # DDPM: the grid's own previous-timestep policy, both fixed variances and
-    # the two x_0 limits, with epsilon recomputed from the limited x_0.
-    "ddpm.default": Case("DDPMScheduler", VP),
-    "ddpm.large_trailing": Case("DDPMScheduler", dict(
-        VP, variance_type="fixed_large", timestep_spacing="trailing", clip_sample=False)),
-    "ddpm.threshold_v": Case("DDPMScheduler", dict(
-        VP, thresholding=True, prediction_type="v_prediction", timestep_spacing="linspace",
-        clip_sample=False)),
-    "ddpm.small_log": Case("DDPMScheduler", dict(VP, variance_type="fixed_small_log")),
-    # A leading grid ends at index 0, where the source adds no noise at all.
-    "ddpm.large_leading": Case("DDPMScheduler", dict(
-        VP, variance_type="fixed_large", timestep_spacing="leading", clip_sample=False)),
-    # LMS, Euler, Euler ancestral and Heun: paired VE grids, the three sigma
-    # transformations over the interpolated subset, and Heun's clipped stages.
-    "lms.default": Case("LMSDiscreteScheduler", VP),
-    "lms.karras_leading": Case("LMSDiscreteScheduler", dict(
-        VP, use_karras_sigmas=True, timestep_spacing="leading")),
-    "lms.exponential_v": Case("LMSDiscreteScheduler", dict(
-        VP, use_exponential_sigmas=True, prediction_type="v_prediction")),
-    "euler.default": Case("EulerDiscreteScheduler", VP),
-    # A linspace grid ends at the table's first sigma, which sigma_min appends
-    # again: the last interval has no length.
-    "euler.linspace_min": Case("EulerDiscreteScheduler", dict(VP, final_sigmas_type="sigma_min")),
-    "euler.beta_trailing_min": Case("EulerDiscreteScheduler", dict(
-        VP, use_beta_sigmas=True, timestep_spacing="trailing", final_sigmas_type="sigma_min")),
-    "euler.zero_snr_v": Case("EulerDiscreteScheduler", dict(
-        VP, rescale_betas_zero_snr=True, prediction_type="v_prediction",
-        timestep_spacing="trailing")),
-    "euler_ancestral.default": Case("EulerAncestralDiscreteScheduler", VP),
-    "euler_ancestral.leading_zero_snr_v": Case("EulerAncestralDiscreteScheduler", dict(
-        VP, timestep_spacing="leading", rescale_betas_zero_snr=True,
-        prediction_type="v_prediction")),
-    "heun.default": Case("HeunDiscreteScheduler", VP),
-    "heun.karras_clip": Case("HeunDiscreteScheduler", dict(
-        VP, use_karras_sigmas=True, clip_sample=True, clip_sample_range=0.8)),
-    # KDPM2 and DPMSolverSDE: the stage rows between grid points.
-    "kdpm2.default": Case("KDPM2DiscreteScheduler", VP),
-    "kdpm2.karras_leading_v": Case("KDPM2DiscreteScheduler", dict(
-        VP, use_karras_sigmas=True, timestep_spacing="leading", prediction_type="v_prediction")),
-    "kdpm2_ancestral.default": Case("KDPM2AncestralDiscreteScheduler", VP),
-    "kdpm2_ancestral.exponential": Case("KDPM2AncestralDiscreteScheduler", dict(
-        VP, use_exponential_sigmas=True)),
-    # The tree's entropy is the config's, so the recorded path is reproducible.
-    "dpm_sde.default": Case("DPMSolverSDEScheduler", dict(VP, noise_sampler_seed=SEED)),
-    "dpm_sde.karras_v": Case("DPMSolverSDEScheduler", dict(
-        VP, use_karras_sigmas=True, prediction_type="v_prediction",
-        noise_sampler_seed=SEED + 1)),
-    # The log-SNR classes: spacing variants, lambda clipping, every sigma
-    # transformation, both terminal sigmas and the epsilon-domain algorithms.
-    "dpm_multi.default": Case("DPMSolverMultistepScheduler", VP),
-    "dpm_multi.karras": Case("DPMSolverMultistepScheduler", dict(VP, use_karras_sigmas=True)),
-    "dpm_multi.cosine_clipped": Case("DPMSolverMultistepScheduler", dict(
-        VP, beta_schedule="squaredcos_cap_v2", lambda_min_clipped=-5.1)),
-    "dpm_multi.cosine_exponential": Case("DPMSolverMultistepScheduler", dict(
-        VP, beta_schedule="squaredcos_cap_v2", use_exponential_sigmas=True)),
-    "dpm_multi.exponential_trailing": Case("DPMSolverMultistepScheduler", dict(
-        VP, use_exponential_sigmas=True, timestep_spacing="trailing", solver_order=3)),
-    "dpm_multi.eps_threshold": Case("DPMSolverMultistepScheduler", dict(
-        VP, algorithm_type="dpmsolver", final_sigmas_type="sigma_min", thresholding=True,
-        solver_type="heun", timestep_spacing="trailing")),
-    "dpm_multi.beta_leading": Case("DPMSolverMultistepScheduler", dict(
-        VP, use_beta_sigmas=True, timestep_spacing="leading", euler_at_final=True)),
-    "dpm_single.default": Case("DPMSolverSinglestepScheduler", VP),
-    "dpm_single.karras_order3": Case("DPMSolverSinglestepScheduler", dict(
-        VP, solver_order=3, use_karras_sigmas=True, final_sigmas_type="sigma_min",
-        lower_order_final=False)),
-    "dpm_single.exponential_zero": Case("DPMSolverSinglestepScheduler", dict(
-        VP, use_exponential_sigmas=True, solver_type="heun", lambda_min_clipped=-5.1)),
-    "deis.default": Case("DEISMultistepScheduler", VP),
-    "deis.karras_trailing": Case("DEISMultistepScheduler", dict(
-        VP, use_karras_sigmas=True, timestep_spacing="trailing", solver_order=3)),
-    "deis.threshold_v": Case("DEISMultistepScheduler", dict(
-        VP, thresholding=True, prediction_type="v_prediction")),
-    "unipc.default": Case("UniPCMultistepScheduler", VP),
-    "unipc.beta_eps_bh1": Case("UniPCMultistepScheduler", dict(
-        VP, use_beta_sigmas=True, predict_x0=False, solver_type="bh1",
-        final_sigmas_type="sigma_min", solver_order=3)),
-    "unipc.zero_snr_v_leading": Case("UniPCMultistepScheduler", dict(
-        VP, rescale_betas_zero_snr=True, prediction_type="v_prediction",
-        timestep_spacing="leading", disable_corrector=[0])),
-    # The same classes on flow sigmas, as SANA ships DPM-Solver++ and Wan
-    # UniPC: the shifted flow path, velocity read as a clean prediction, and
-    # each class's own terminal sigma.
-    "dpm_multi.flow": Case("DPMSolverMultistepScheduler", dict(
-        VP, use_flow_sigmas=True, flow_shift=3.0, prediction_type="flow_prediction")),
-    "dpm_multi.flow_sde_order3_sigma_min": Case("DPMSolverMultistepScheduler", dict(
-        VP, use_flow_sigmas=True, flow_shift=5.0, prediction_type="flow_prediction",
-        algorithm_type="sde-dpmsolver++", solver_order=3, final_sigmas_type="sigma_min")),
-    "unipc.flow": Case("UniPCMultistepScheduler", dict(
-        VP, use_flow_sigmas=True, flow_shift=5.0, prediction_type="flow_prediction")),
-    "unipc.flow_order3_sigma_min": Case("UniPCMultistepScheduler", dict(
-        VP, use_flow_sigmas=True, flow_shift=3.0, prediction_type="flow_prediction",
-        solver_order=3, final_sigmas_type="sigma_min")),
-    # EDM: its own sigma convention, both schedules and the signed c_out.
-    "edm.default": Case("EDMDPMSolverMultistepScheduler", EDM),
-    "edm.exponential_v_threshold": Case("EDMDPMSolverMultistepScheduler", dict(
-        EDM, sigma_schedule="exponential", prediction_type="v_prediction", thresholding=True,
-        final_sigmas_type="sigma_min", algorithm_type="sde-dpmsolver++")),
-    # The distilled schedules: the original grid, the selection out of it, and
-    # the clip that runs before the consistency boundary.
-    "lcm.default": Case("LCMScheduler", VP, steps=DISTILLED_STEPS),
-    # Zero-terminal-SNR leaves alpha exactly zero at the table's last index,
-    # where the distilled grid starts, so epsilon has no finite clean
-    # prediction there and the checkpoints that ship it predict velocity.
-    "lcm.clip_original_25": Case("LCMScheduler", dict(
-        VP, clip_sample=True, clip_sample_range=0.9, original_inference_steps=25,
-        rescale_betas_zero_snr=True, prediction_type="v_prediction"), steps=DISTILLED_STEPS),
-    "tcd.default": Case("TCDScheduler", VP, steps=DISTILLED_STEPS),
-    "tcd.original_20_v": Case("TCDScheduler", dict(
-        VP, original_inference_steps=20, prediction_type="v_prediction"),
-        steps=DISTILLED_STEPS),
-    # Guidance rescaling through the pipeline order, over a thresholding
-    # scheduler so the conversion order is observable.
-    "cfg.epsilon": Case("DPMSolverMultistepScheduler", dict(
-        VP, thresholding=True, dynamic_thresholding_ratio=0.9), guidance=0.7),
-    "cfg.velocity": Case("DPMSolverMultistepScheduler", dict(
-        VP, prediction_type="v_prediction", algorithm_type="dpmsolver",
-        final_sigmas_type="sigma_min", thresholding=True), guidance=0.5),
-    "cfg.zero_rescale": Case("DPMSolverMultistepScheduler", dict(VP), guidance=0.0),
-}
+    return rescale_noise_cfg
 
 
 def native_bounds(config: Mapping[str, object], steps: int) -> tuple[float, float]:
@@ -341,7 +127,11 @@ def grid_times(scheduler, case: Case) -> np.ndarray:
     stage classes interleave a stage row between points."""
     times = scheduler.timesteps.numpy().astype(np.float64)
     if case.scheduler == "PNDMScheduler":
-        return np.asarray(scheduler._timesteps, np.float64)[::-1].copy()
+        # Its grid's own points, re-derived from its config by its oracle, whose timetable is the library's.
+        rederived = PNDM(torch.float64, **case.config)
+        rederived.set_timesteps(case.steps)
+        assert torch.equal(rederived.timesteps, scheduler.timesteps.to(torch.int64)), case
+        return rederived.grid_points[::-1].astype(np.float64)
     if case.scheduler == "HeunDiscreteScheduler":
         return np.concatenate([times[:1], times[1::2]])
     if case.scheduler in TWO_STAGE:
@@ -349,64 +139,61 @@ def grid_times(scheduler, case: Case) -> np.ndarray:
     return times
 
 
-class ReplayBrownian:
-    """The draws `RecordedBrownian` kept, answered again in the same order."""
-
-    def __init__(self, x, sigma_min, sigma_max, seed=None, transform=lambda value: value):
-        self.tape = Tape(RecordedBrownian.draws)
-        self.dtype = x.dtype
-
-    def __call__(self, sigma, sigma_next):
-        return torch.tensor(self.tape.next(), dtype=self.dtype)
-
-
-def trajectory_gradient(module: ModuleType, case: Case, initial: torch.Tensor,
-                        cotangent: torch.Tensor, dtype: torch.dtype,
-                        noises: list[np.ndarray] | None = None) -> np.ndarray:
-    """One walk's VJP on identical inputs, cotangent and random draws."""
-    scheduler = getattr(module, case.scheduler)(**case.config)
-    scheduler.set_timesteps(case.steps)
+def built(module: ModuleType, case: Case, dtype: torch.dtype):
+    """The scheduler a walk at `dtype` steps: the unmodified library class at float32, through its public
+    interface alone, and at float64 the class's independent oracle (tools/float64_schedulers.py, held to the
+    library by tests/test_float64_schedulers.py), every table its own in float64 (testing.md, row 13738)."""
     if dtype == torch.float64:
-        for attribute, value in vars(scheduler).items():
-            if isinstance(value, torch.Tensor) and value.is_floating_point():
-                setattr(scheduler, attribute, value.to(dtype))
+        return ORACLES[case.scheduler](torch.float64, **case.config)
+    return getattr(module, case.scheduler)(**case.config)
+
+
+def trajectory(module: ModuleType, case: Case, initial: torch.Tensor, cotangent: torch.Tensor,
+               dtype: torch.dtype, noises: list[np.ndarray] | None = None) -> dict[str, np.ndarray]:
+    """One walk on identical inputs, cotangent and random draws: its latent at each grid interval's end
+    (`after <i>`), or a guided walk's last alone (`final`), as the guided pipeline returns it, and the
+    VJP of its last latent against `cotangent` (`grad`), the scheduler `built` for `dtype`."""
+    scheduler = built(module, case, dtype)
+    scheduler.set_timesteps(case.steps)
     x = initial.detach().to(dtype)
     x.requires_grad_(True)
+    # The library's draws fed to its module; an oracle's its own tape, no module touched.
+    library = module if dtype != torch.float64 else None
     if case.scheduler == "DPMSolverSDEScheduler":
-        # A changed grid queries another point of a rough Brownian path.
-        # Replay the same draws to compare arithmetic rather than paths.
-        with patch.object(module, "BrownianTreeNoiseSampler", ReplayBrownian):
-            latents, _ = walk(scheduler, module, case, x, [])
+        # The library walks its own seeded tree untouched; the oracle the answers that tree gives the same
+        # walk (`brownian`), so both follow one path and the comparison is of their arithmetic.
+        if library is None:
+            scheduler.draws = list(brownian(module, case, initial.detach().float()).draws)
+        latents, _ = walk(scheduler, None, case, x, [])
     else:
         noises = step_noise(SHAPE, len(scheduler.timesteps), np.float64) if noises is None else noises
-        runner = guided_walk if case.guidance is not None else walk
-        latents, _ = runner(scheduler, module, case, x, noises)
+        scheduler.draws = list(noises)
+        latents, _ = walk(scheduler, library, case, x, noises)
     (gradient,) = torch.autograd.grad((latents[-1] * cotangent.to(dtype)).sum(), x)
-    return gradient.numpy()
+    kept = ({"final": latents[-1]} if case.guidance is not None
+            else {f"after {index}": latent for index, latent in enumerate(latents)})
+    return {**{leaf: latent.detach().numpy() for leaf, latent in kept.items()}, "grad": gradient.numpy()}
 
 
 def threshold_clearance(module: ModuleType, case: Case, initial: torch.Tensor,
                         noises: list[np.ndarray]) -> float:
     """How far the float64 walk from `initial` keeps clear of its dynamic thresholding's discontinuities,
-    relative to the bound's scale: at every step, each entry of the predicted sample from the per-sample
-    clip bound `s`, and the unclamped quantile from the clamp's bounds, 1 and `sample_max_value`. An entry
-    within rounding of either is clipped, or its bound clamped, in one precision and not the other."""
-    scheduler = getattr(module, case.scheduler)
-    seen = []
-    original = scheduler._threshold_sample
-
-    def recording(self, sample):
-        seen.append((sample.detach().clone(), self.config.dynamic_thresholding_ratio,
-                     self.config.sample_max_value))
-        return original(self, sample)
-
-    with patch.object(scheduler, "_threshold_sample", recording), float64_scheduler(module):
-        trajectory_gradient(module, case, initial, torch.zeros_like(initial), torch.float64, noises)
+    relative to the bound's scale: at every step, each entry of the predicted sample (the oracle's own,
+    before it thresholds it: `float64_oracle.Oracle.observed`) from the per-sample clip bound `s`, and
+    the unclamped quantile from the clamp's bounds, 1 and `sample_max_value`. An entry within rounding of
+    either is clipped, or its bound clamped, in one precision and not the other."""
+    seen: list[torch.Tensor] = []
+    with torch.no_grad():
+        scheduler = built(module, case, torch.float64)
+        scheduler.set_timesteps(case.steps)
+        scheduler.draws = list(noises)
+        scheduler.observed = seen
+        walk(scheduler, None, case, initial.detach().to(torch.float64), noises)
+    ratio, top = scheduler.config.dynamic_thresholding_ratio, scheduler.config.sample_max_value
     margins = [1.0]
-    for sample, ratio, top in seen:
+    for sample in seen:
         flat = sample.reshape(sample.shape[0], -1).abs().double()
-        raw = torch.quantile(flat, ratio, dim=1)
-        bound = raw.clamp(1, top)[:, None]
+        raw, bound = threshold_bound(flat, ratio, top)
         margins.append(float(((flat - bound).abs() / bound).min()))
         margins.append(float(torch.minimum((raw - 1).abs(), (raw - top).abs()).min() / top))
     return min(margins)
@@ -422,25 +209,31 @@ within rounding of it whatever the draw (float64 walk, 3 seeds: step 2 holds 2 t
 the bound, step 3 22 to 58, step 4 33 to 69, the closest 3e-7, where steps 0 and 1 keep every entry 9e-4
 clear). Two steps keep both regimes, its quantile clamped at `sample_max_value` and inside the clamp, and
 their draws clear (`threshold_clearance`); the long walk's arithmetic is the unthresholded DDIM cases'."""
-SEEDED_CASES = tuple(name for name in CASES if name != "cfg.epsilon" and not name.startswith("dpm_sde."))
-"""Every case whose trajectory gradient check 1 holds over seeds (`seeds`), an independent initial state and
-cotangent each: all but CFG epsilon, whose rounding sits in its per-sample reductions and is averaged over
-pixel orders (`rounding`), and DPMSolverSDE, whose walk integrates the draws its own Brownian tree answers."""
+SEEDED_CASES = tuple(name for name in CASES if not name.startswith("dpm_sde."))
+"""Every case whose walk check 1 holds over seeds (`seeds`), an independent initial state and cotangent each:
+all but DPMSolverSDE, whose walk integrates the draws its own Brownian tree answers. CFG epsilon's seeds hold
+its walk alone: its gradient's rounding sits in its per-sample reductions and is averaged over pixel orders
+(`rounding`)."""
+FORWARD_ONLY = ("cfg.epsilon",)
+"""The seeded cases whose seeds hold their walk and not its gradient (SEEDED_CASES)."""
 
 
 def seeds(destination: Path) -> None:
-    """Each seeded case's trajectory gradient over the seeds check 1 draws (`record_case`): a seed's
-    initial state of SEEDED_SHAPE at the scheduler's `init_noise_sigma` and its cotangent, the float32 VJP
-    from it and the float64 one, the per-step draws Dew's solver makes at its key 0 fed to both, the count
-    confirmed paired with Dew's own walk (tests/diffusion_support.py's `source_final`), over the case's
-    steps or SEEDED_STEPS', which `<case>.steps` records. A thresholding case's draw
+    """Each seeded case's walk over the seeds check 1 draws (`record_case`): a seed's initial state of
+    SEEDED_SHAPE at the scheduler's `init_noise_sigma` and its cotangent, the float32 walk from it and the
+    float64 one (`trajectory`: its latents and, outside FORWARD_ONLY, its VJP), each kept whole: Dew's
+    float64 walk reads its schedule's float32 tables, so it is no truth of the source's. The per-step draws
+    Dew's
+    solver makes at its key 0 fed to both, the count confirmed paired with Dew's own walk
+    (tests/diffusion_support.py's `source_walked`), over the case's steps or SEEDED_STEPS', which
+    `<case>.steps` records. A thresholding case's draw
     clears its clip by `selection_margins.MARGIN` (`threshold_clearance`): a seed takes its first draw that
     does (`selection_margins.clearing`)."""
     import diffusers
     import jax
 
     sys.path.insert(0, str(FIXTURES.parents[1]))
-    from diffusion_support import source_final
+    from diffusion_support import source_walked
     from recorded_references import provenance, record_case, save
     from selection_margins import MARGIN, clearing
 
@@ -458,7 +251,8 @@ def seeds(destination: Path) -> None:
         prior = float(scheduler.init_noise_sigma)
         schedule = SourceSchedule.from_config(config)
         process, times = schedule.sampling(case.steps)
-        final = source_final(schedule, process, times, case.guidance, LABEL, GUIDANCE_SCALE)
+        walked = source_walked(schedule, process, times, case.guidance, LABEL, GUIDANCE_SCALE,
+                               gradient=name not in FORWARD_ONLY)
 
         def seeded(seed, prior=prior):
             generator = torch.Generator().manual_seed(seed)
@@ -473,22 +267,106 @@ def seeds(destination: Path) -> None:
 
             draw = clearing(seeded, clears)
 
-        def evaluate(inputs, case=case, module=module):
+        def evaluate(inputs, case=case, module=module, name=name):
             initial, cotangent = (torch.from_numpy(inputs[key]) for key in ("x_T", "cotangent"))
-            single = trajectory_gradient(module, case, initial, cotangent, torch.float32, noises)
-            with float64_scheduler(module):
-                wide = trajectory_gradient(module, case, initial, cotangent, torch.float64, noises)
-            return {"grad": single}, {"grad": wide}
-
-        def dew(inputs, final=final):
-            return {"grad": jax.vjp(final, inputs["x_T"])[1](inputs["cotangent"])[0]}
+            single = trajectory(module, case, initial, cotangent, torch.float32, noises)
+            wide = trajectory(module, case, initial, cotangent, torch.float64, noises)
+            if name in FORWARD_ONLY:
+                single.pop("grad"), wide.pop("grad")
+            return single, wide
 
         # Sized paired, as check 1's verdict pairs Dew with the reference: the reference compared with itself
         # across draws did not resolve DDIM's thresholding within 512 seeds, its per-draw errors spanning 36x.
-        arrays.update(record_case(name, draw, evaluate, dew=jax.jit(dew)))
+        arrays.update(record_case(name, draw, evaluate, dew=jax.jit(walked)))
         arrays[f"{name}.steps"] = np.asarray(case.steps)
     version = diffusers.__version__
     command = f"python tools/diffusers_source_reference.py seeds {destination}"
+    save(destination, {**arrays, "provenance": provenance("diffusers", version, "cpu", command,
+                                                          torch=torch.__version__)},
+         reference=f"huggingface/diffusers {version}", license="Apache-2.0")
+
+
+SDE_CASES = tuple(name for name in CASES if name.startswith("dpm_sde."))
+"""The DPMSolverSDE cases, whose walks draw from torchsde's Brownian tree, which the test extra does not
+install: their oracle is held to these recordings (`sde`)."""
+
+
+class Brownian(NamedTuple):
+    """DPMSolverSDE's Brownian path over a walk (`brownian`): each query's ends, its answers, the tree's
+    bounds."""
+
+    intervals: np.ndarray
+    draws: np.ndarray
+    bounds: tuple[float, float]
+
+
+def brownian(module: ModuleType, case: Case, x_T: torch.Tensor) -> Brownian:
+    """The answers DPMSolverSDE's Brownian tree gives its walk from `x_T`, drawn apart from the walk: the
+    module's public `BrownianTreeNoiseSampler` built as the scheduler builds its own (the walk's first
+    sample, the least positive and the greatest of its published sigmas, the config's
+    `noise_sampler_seed`, the identity transform) and asked at each step's ends as its `step` asks, in its
+    arithmetic: a first stage to the midpoint of its sigmas' logs, a second from the interval's start to its
+    end, none onto sigma 0. The library's own walk, untouched, asks its own tree the same: an oracle walking
+    these answers follows its path (tests/test_float64_schedulers.py holds it to that walk)."""
+    scheduler = getattr(module, case.scheduler)(**case.config)
+    scheduler.set_timesteps(case.steps)
+    sigmas = scheduler.sigmas
+    bounds = (sigmas[sigmas > 0].min().item(), sigmas.max().item())
+    tree = module.BrownianTreeNoiseSampler(x_T, *bounds, case.config["noise_sampler_seed"])
+    intervals, answers, second = [], [], False
+    for index in range(len(scheduler.timesteps)):
+        sigma, after = (sigmas[index - 1], sigmas[index]) if second else (sigmas[index], sigmas[index + 1])
+        if after == 0:
+            continue
+        start, end = sigma.log().neg(), after.log().neg()
+        reached = end if second else start + (end - start) * 0.5
+        asked = (start.neg().exp(), reached.neg().exp())
+        intervals.append(tuple(float(end) for end in asked))
+        answers.append(tree(*asked).numpy().astype(np.float64))
+        second = not second
+    return Brownian(np.asarray(intervals, np.float64), np.stack(answers), bounds)
+
+
+def sde(destination: Path) -> None:
+    """Each DPMSolverSDE case's unmodified float32 walk over the seeds check 1 draws (`record_case`, judged:
+    the arm its oracle's check 1 judges in tests/test_float64_schedulers.py), from a seed's x_T at the
+    scheduler's `init_noise_sigma` (`recorded_inputs.normals`), its latent after each step
+    (`scheduler_cases.walked`), the library run untouched; beside the inputs, the answers its Brownian tree
+    gives that walk, drawn apart from it (`brownian`): the oracle's float32 walk on them the reference,
+    its float64 walk the truth (row 13738)."""
+    import diffusers
+
+    sys.path.insert(0, str(FIXTURES.parents[1]))
+    from recorded_inputs import normals
+    from recorded_references import provenance, record_case, save
+
+    torch.set_num_threads(2)
+    arrays: dict[str, np.ndarray] = {}
+    for name in SDE_CASES:
+        case, module = CASES[name], scheduler_module(CASES[name].scheduler)
+        probe = getattr(module, case.scheduler)(**case.config)
+        probe.set_timesteps(case.steps)
+        prior = float(probe.init_noise_sigma)
+
+        def draw(seed, prior=prior):
+            return {"x_T": normals([0x5DE, seed], SHAPE) * np.float32(prior)}
+
+        def replayed(inputs, dtype, case=case):
+            scheduler = ORACLES[case.scheduler](dtype, **case.config)
+            scheduler.draws = list(inputs["draws"])
+            return walked(scheduler, case, torch.from_numpy(inputs["x_T"]).to(dtype))
+
+        def evaluate(inputs, case=case, module=module, replayed=replayed):
+            x_T = torch.from_numpy(inputs["x_T"])
+            with torch.no_grad():
+                latents = walked(getattr(module, case.scheduler)(**case.config), case, x_T)
+            made = {"draws": brownian(module, case, x_T).draws}
+            return latents, replayed({**inputs, **made}, torch.float64), made
+
+        arrays.update(record_case(f"{name} oracle", draw, evaluate, judged=True,
+                                  dew=lambda inputs, replayed=replayed: replayed(inputs, torch.float32)))
+    version = diffusers.__version__
+    command = f"python tools/diffusers_source_reference.py sde {destination}"
     save(destination, {**arrays, "provenance": provenance("diffusers", version, "cpu", command,
                                                           torch=torch.__version__)},
          reference=f"huggingface/diffusers {version}", license="Apache-2.0")
@@ -519,9 +397,8 @@ def rounding(destination: Path) -> None:
                 return value.reshape(SHAPE[0], -1)[:, order].reshape(SHAPE)
             initial, cotangent = (torch.tensor(moved(stored[f"{name}.{field}"]))
                                   for field in ("x_T", "cotangent"))
-            single = trajectory_gradient(module, case, initial, cotangent, torch.float32)
-            with float64_scheduler(module):
-                wide = trajectory_gradient(module, case, initial, cotangent, torch.float64)
+            single = trajectory(module, case, initial, cotangent, torch.float32)["grad"]
+            wide = trajectory(module, case, initial, cotangent, torch.float64)["grad"]
             scale = float(np.sqrt(np.mean(np.square(truth))))
             assert distance(wide, moved(truth)) <= 1e-12 * scale, (
                 "the float64 VJP must commute with the order")
@@ -555,26 +432,24 @@ def run(name: str, case: Case) -> dict[str, np.ndarray]:
     cotangent = torch.randn(SHAPE, generator=generator, dtype=torch.float64).float().double()
     arrays: dict[str, np.ndarray] = {}
     if case.scheduler == "DPMSolverSDEScheduler":
-        RecordedBrownian.real = module.BrownianTreeNoiseSampler
-        with patch.object(module, "BrownianTreeNoiseSampler", RecordedBrownian):
-            latents, inputs = walk(scheduler, module, case, x_T, [])
-        assert RecordedBrownian.transform_is_identity, "the source transform is the identity"
+        # The library walks its own seeded tree untouched; its path's queries and answers drawn apart
+        # (`brownian`), the ones Dew's walk integrates.
+        latents, inputs = walk(scheduler, None, case, x_T, [])
+        path = brownian(module, case, x_T)
         low, high = native_bounds(config, case.steps)
-        assert abs(RecordedBrownian.bounds[0] - low) < 1e-5 * low, (
-            f"{name}: the source tree starts at {RecordedBrownian.bounds[0]}, Dew prepares {low}")
-        assert abs(RecordedBrownian.bounds[1] - high) < 1e-5 * high, (
-            f"{name}: the source tree ends at {RecordedBrownian.bounds[1]}, Dew prepares {high}")
-        arrays["intervals"] = np.asarray(RecordedBrownian.calls, np.float64)
-        arrays["noise"] = np.stack(RecordedBrownian.draws)
-        arrays["bounds"] = np.asarray(RecordedBrownian.bounds, np.float64)
+        assert abs(path.bounds[0] - low) < 1e-5 * low, (
+            f"{name}: the source tree starts at {path.bounds[0]}, Dew prepares {low}")
+        assert abs(path.bounds[1] - high) < 1e-5 * high, (
+            f"{name}: the source tree ends at {path.bounds[1]}, Dew prepares {high}")
+        arrays["intervals"] = path.intervals
+        arrays["noise"] = path.draws
+        arrays["bounds"] = np.asarray(path.bounds, np.float64)
     else:
         noises = step_noise(SHAPE, len(scheduler.timesteps), np.float64)
-        runner = guided_walk if case.guidance is not None else walk
-        latents, inputs = runner(scheduler, module, case, x_T, noises)
+        latents, inputs = walk(scheduler, module, case, x_T, noises)
     assert len(latents) == case.steps, (name, len(latents), case.steps)
-    single = trajectory_gradient(module, case, x_T, cotangent, torch.float32)
-    with float64_scheduler(module):
-        gradient = trajectory_gradient(module, case, x_T, cotangent, torch.float64)
+    single = trajectory(module, case, x_T, cotangent, torch.float32)["grad"]
+    gradient = trajectory(module, case, x_T, cotangent, torch.float64)["grad"]
     arrays.update({
         "x_T": x_T.detach().numpy().astype(np.float32),
         "latents": np.stack([latent.detach().numpy() for latent in latents]).astype(np.float32),
@@ -732,6 +607,8 @@ if __name__ == "__main__":
         rounding(Path(sys.argv[2]))
     elif sys.argv[1:2] == ["seeds"]:
         seeds(Path(sys.argv[2]))
+    elif sys.argv[1:2] == ["sde"]:
+        sde(Path(sys.argv[2]))
     elif sys.argv[1:2] == ["cases"]:
         main(sys.argv[2:])
     else:

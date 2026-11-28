@@ -9,9 +9,19 @@ import jax.numpy as jnp
 import numpy as np
 from flax import struct
 
-from dew.nn.programs import on_host
+from dew.nn.precision import at_least_fp32
 
-from .common import _check_endpoint_domain, _push
+from .common import (
+    _apart,
+    _check_endpoint_domain,
+    _column,
+    _moved,
+    _push,
+    _shifted,
+    _solved_levels,
+    _split,
+    _weighted,
+)
 
 
 class UniPCState(NamedTuple):
@@ -62,17 +72,15 @@ def _unipc_weights(rks: list[np.float64], hh: np.float64, B_h: np.float64, order
 
 _CORRECTED = ("x", "last_x", "previous", "update")
 """A corrector row's leading columns, each weighing its term in `UniPC.step`: the sample, the sample before
-the step, the previous output and this output's change from it; the history's differences from the
-previous output follow, older first."""
+the step moved by the previous output (less the row's last column, its shift, times that output;
+`_shifted`), the previous output and this output's change from it; the history's differences from
+the previous output follow, older first, then the previous output's weight unshifted (`Moved.kept`) and
+the shift last."""
 
 _PREDICTED = ("x", "denoised", "eps")
-"""A predictor row's leading columns: the corrected sample, the clean prediction and the noise; the
-history's differences from this output follow, older first."""
-
-
-def _column(names: tuple[str, ...], name: str) -> int:
-    """`name`'s column in a row that leads with `names`."""
-    return names.index(name)
+"""A predictor row's leading columns: the corrected sample moved by this output (less the row's shift
+times it), the clean prediction and the noise; the history's differences from this output follow, older
+first, then this output's weight unshifted (`Moved.kept`) and the shift last."""
 
 
 def _history(names: tuple[str, ...], k: int) -> int:
@@ -80,13 +88,14 @@ def _history(names: tuple[str, ...], k: int) -> int:
     return len(names) + k - 1
 
 
-def _unipc_tables(alpha: np.ndarray, sigma: np.ndarray, solver: UniPC) -> tuple[np.ndarray, np.ndarray]:
+def _unipc_tables(alpha: np.ndarray, sigma: np.ndarray, lambdas: np.ndarray,
+                  solver: UniPC) -> tuple[np.ndarray, np.ndarray]:
     """Every interval's UniPC update as coefficients, in float64 on the host.
 
-    Each depends only on the grid's rates and the order it is taken at, so
-    lambda, h, e^h - 1 and the weight systems are solved once here rather
-    than in float32 inside the walk, where Diffusers' scheduler also solves
-    them. `corrector[j, p]` corrects the sample at grid point j with order
+    Each depends only on the grid's rates (`_solved_levels`) and the order it
+    is taken at, so lambda, h, e^h - 1 and the weight systems are solved once
+    here rather than in float32 inside the walk, where Diffusers' scheduler
+    also solves them. `corrector[j, p]` corrects the sample at grid point j with order
     p: weights on the sample, the last predictor's sample, m_{j-1}, the
     difference m_j - m_{j-1} and the history's differences
     m_{j-1-k} - m_{j-1}; p = 0 keeps the sample. `predictor[j, q-1]` steps
@@ -103,11 +112,9 @@ def _unipc_tables(alpha: np.ndarray, sigma: np.ndarray, solver: UniPC) -> tuple[
     """
     order, predict_x0 = solver.order, solver.predict_x0
     # An endpoint's lambda is infinite: log(0) at sigma 0 or alpha 0.
-    with np.errstate(divide="ignore"):
-        lambdas = np.log(alpha) - np.log(sigma)
     intervals = alpha.shape[0] - 1
-    corrector = np.zeros((max(intervals, 0), order + 1, len(_CORRECTED) + order - 1))
-    predictor = np.zeros((max(intervals, 0), order, len(_PREDICTED) + order - 1))
+    corrector = np.zeros((max(intervals, 0), order + 1, len(_CORRECTED) + order + 1))
+    predictor = np.zeros((max(intervals, 0), order, len(_PREDICTED) + order + 1))
     corrector[:, :, _column(_CORRECTED, "x")] = 1.0
     here = _column(_PREDICTED, "denoised" if predict_x0 else "eps")
 
@@ -127,9 +134,10 @@ def _unipc_tables(alpha: np.ndarray, sigma: np.ndarray, solver: UniPC) -> tuple[
             B_h = b_h(hh)
             rhos = _unipc_weights(rks, hh, B_h, p, predictor=False)
             head = alpha[j] if predict_x0 else sigma[j]
-            row[_column(_CORRECTED, "last_x")] = (sigma[j] / sigma[j - 1] if predict_x0
-                                                  else alpha[j] / alpha[j - 1])
-            row[_column(_CORRECTED, "previous")] = -head * np.expm1(hh)
+            (row[_column(_CORRECTED, "last_x")], row[_column(_CORRECTED, "previous")], row[-1],
+             row[-2]) = _shifted(
+                sigma[j] / sigma[j - 1] if predict_x0 else alpha[j] / alpha[j - 1], -head * np.expm1(hh),
+                alpha[j - 1] if predict_x0 else sigma[j - 1])
             row[_column(_CORRECTED, "update")] = -head * B_h * rhos[-1]
             for k in range(1, p):
                 row[_history(_CORRECTED, k)] = -head * B_h * rhos[k - 1] / rks[k - 1]
@@ -141,8 +149,9 @@ def _unipc_tables(alpha: np.ndarray, sigma: np.ndarray, solver: UniPC) -> tuple[
                 if predict_x0 or alpha[j] == 0:
                     row[_column(_PREDICTED, "denoised")] = alpha[j + 1]
                 else:
-                    row[_column(_PREDICTED, "x")] = alpha[j + 1] / alpha[j]
-                    row[_column(_PREDICTED, "eps")] = -alpha[j + 1] * sigma[j] / alpha[j]
+                    (row[_column(_PREDICTED, "x")], row[_column(_PREDICTED, "eps")], row[-1],
+                     row[-2]) = _shifted(
+                        alpha[j + 1] / alpha[j], -alpha[j + 1] * sigma[j] / alpha[j], sigma[j])
                 continue
             h = np.float64(1.0) if alpha[j] == 0 else lambdas[j + 1] - lambdas[j]
             hh = -h if predict_x0 else h
@@ -152,9 +161,9 @@ def _unipc_tables(alpha: np.ndarray, sigma: np.ndarray, solver: UniPC) -> tuple[
                 row[_column(_PREDICTED, "denoised")] = alpha[j + 1]
                 row[_column(_PREDICTED, "eps")] = sigma[j + 1]
             else:
-                row[_column(_PREDICTED, "x")] = (sigma[j + 1] / sigma[j] if predict_x0
-                                                 else alpha[j + 1] / alpha[j])
-                row[here] = -head * np.expm1(hh)
+                row[_column(_PREDICTED, "x")], row[here], row[-1], row[-2] = _shifted(
+                    sigma[j + 1] / sigma[j] if predict_x0 else alpha[j + 1] / alpha[j], -head * np.expm1(hh),
+                    alpha[j] if predict_x0 else sigma[j])
             if q > 1:
                 rks = [(lambdas[j - k] - lambdas[j]) / h for k in range(1, q)] + [np.float64(1.0)]
                 rhos = _unipc_weights(rks, hh, B_h, q, predictor=True)
@@ -207,42 +216,42 @@ class UniPC:
             source=corrects_source and (not self.predict_x0 or self.solver_type == "bh1"),
             target=not self.lower_order_final and self.order > 1 and times.shape[0] > 2,
             reason="UniPC corrector/predictor requires finite log-SNR at this endpoint")
-        with on_host():
-            alpha, sigma = process.sampler_schedule.rates(jnp.asarray(times))
+        alpha, sigma, lambdas = _solved_levels(process, times)
         # The tables hold every division a walk takes: one over an interval of no length is not finite.
         with np.errstate(divide="ignore", invalid="ignore"):
-            corrector, predictor = _unipc_tables(np.asarray(alpha, np.float64), np.asarray(sigma, np.float64),
-                                                 self)
+            corrector, predictor = _unipc_tables(alpha, sigma, lambdas, self)
         if not (np.isfinite(corrector).all() and np.isfinite(predictor).all()):
             raise ValueError("two points of the grid have one noise level, an interval of no length that "
                              "UniPC's corrector or higher orders divide by; take fewer steps, another "
                              "spacing or a lower order")
+        dtype = at_least_fp32(x.dtype)
         return UniPCState(jnp.zeros((self.order, *x.shape), x.dtype), x, jnp.zeros((), jnp.int32),
                           jnp.zeros((), jnp.int32), jnp.asarray(times.shape[0] - 1, jnp.int32),
-                          jnp.asarray(times, jnp.float32), jnp.asarray(corrector, jnp.float32),
-                          jnp.asarray(predictor, jnp.float32))
+                          jnp.asarray(times, jnp.float32), jnp.asarray(_split(corrector, dtype)),
+                          jnp.asarray(_split(predictor, dtype)))
 
     def step(self, x, t, t_next, denoised, eps, state, key, process, denoise):
-        def weighted(row: jax.Array, terms: list[jax.Array]) -> jax.Array:
-            total = row[0] * terms[0]
-            for index in range(1, len(terms)):
-                total = total + row[index] * terms[index]
-            return total
-
         interval = jnp.argmin(jnp.abs(state.grid - t.reshape(-1)[0]))
         here = denoised if self.predict_x0 else eps
         history = [state.outputs[-k] for k in range(1, self.order + 1)]
         row = state.corrector[interval, state.last_order]
         previous = history[0]
-        corrected = {"x": x, "last_x": state.last_x, "previous": previous, "update": here - previous}
-        x = weighted(row, [*(corrected[name] for name in _CORRECTED),
-                           *(older - previous for older in history[1:])])
+        width = row.shape[0]
+        corrected = {"x": x, "last_x": _moved(state.last_x, previous, row, width - 1,
+                                               _column(_CORRECTED, "previous"), width - 2),
+                     "previous": previous,
+                     "update": _apart(here, previous)}
+        x = _weighted(row, [*(corrected[name] for name in _CORRECTED),
+                           *(_apart(older, previous) for older in history[1:])])
         this_order = (jnp.minimum(self.order, state.steps - state.taken) if self.lower_order_final
                       else self.order)
         this_order = jnp.minimum(this_order, state.taken + 1)
         row = state.predictor[interval, this_order - 1]
-        predicted = {"x": x, "denoised": denoised, "eps": eps}
-        next_x = weighted(row, [*(predicted[name] for name in _PREDICTED),
-                                *(older - here for older in history[:self.order - 1])])
+        width = row.shape[0]
+        predicted = {"x": _moved(x, here, row, width - 1,
+                                 _column(_PREDICTED, "denoised" if self.predict_x0 else "eps"), width - 2),
+                     "denoised": denoised, "eps": eps}
+        next_x = _weighted(row, [*(predicted[name] for name in _PREDICTED),
+                                *(_apart(older, here) for older in history[:self.order - 1])])
         return next_x, state._replace(outputs=_push(state.outputs, here), last_x=x, last_order=this_order,
                                       taken=state.taken + 1)

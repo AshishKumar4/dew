@@ -6,28 +6,101 @@ import jax.numpy as jnp
 from flax import struct
 from jax import lax
 
-from dew.diffusion.schedules import expand
-from dew.diffusion.schedules.common import ancestral_variance
-from dew.nn.precision import divided, summed_once
+from dew.diffusion.schedules import RectifiedFlow, expand
+from dew.diffusion.schedules.common import ancestral_step
+from dew.nn.derivatives import straight_through
+from dew.nn.kernels.generation import linear_map
+from dew.nn.precision import divided, summed_once, two_sum
 from dew.nn.programs import on_host
+from dew.nn.sharding import summed_like
 
 from .common import _check_gaps, _grid_levels, _history_gaps, _push, _sigma_integrator, _unit_noise
 
 
-def _euler_step(x, denoised, source, target):
+def _flowed_value(x, coefficient, denoised, dt, sigma_t):
+    """x + (dt / sigma_t) (x - coefficient denoised), its rounding held (`_flowed`)."""
+    # The source's x + derivative dt, its difference taken at half scale where x or x_0 nears the float's
+    # range (their difference past it, the step finite as DDIM's form is, `_euler_step`; a normal value halved
+    # would flush to zero on a device that flushes subnormals, 2^-126 less -2^-126 then 2^-126, not 0: train
+    # 1419's P0), and kept whole: its rounding carried beside it (`two_sum`), so a difference x_0's size
+    # cancels to x's small residual keeps it (1 from -1 + 2^-24, half of which rounds to 1, steps to 2^-25 as
+    # the DDIM form does; train 1389's P0). Each part is scaled by the step's fraction of its level, dt /
+    # sigma_t, rounded once, not divided by the level and multiplied by the interval, two roundings of the
+    # part's size: from 47/64 to 47/128 the fraction is -1/2 exactly, and 1 less its x_0 of -1 steps to 0, as
+    # DDIM does, not 2^-24 (train 1407's P0); the fraction is at most 1/2 here, so no part passes the float's
+    # range.
+    # Near the least normal, the other way: scaled up by the mantissa's span, so a difference of two
+    # normals, a subnormal, stays normal until the result is formed (2 2^-126 less 2.5 2^-126 halved onto
+    # 2 2^-126 is 2.25 2^-126, not 2 2^-126 with the half-step flushed; train 1419's review). The scaled
+    # sum is the step's, by a power of two exactly, divided back once.
+    float_format = jnp.finfo(x.dtype)
+    magnitude = jnp.maximum(jnp.abs(x), jnp.abs(coefficient * denoised))
+    up = jnp.asarray(2.0 ** (float_format.nmant + 1), x.dtype)
+    scale = jnp.where(magnitude >= 2.0 ** (float_format.maxexp - 3), jnp.asarray(0.5, x.dtype),
+                      jnp.where(magnitude < 2.0 ** (float_format.minexp + float_format.nmant + 1), up,
+                                jnp.asarray(1.0, x.dtype)))
+    high, low = two_sum(scale * x, -(scale * coefficient) * denoised)
+    fraction = divided(dt, sigma_t)
+    return (scale * x + high * fraction + low * fraction) / scale
+
+
+def _flowed(x, coefficient, denoised, dt, sigma_t):
+    """A near Euler update (a rectified flow's, a variance-exploding walk's high steps), x + (D / sigma_t) dt
+    of its operands' difference D = x - c x_0, its value compensated (`_flowed_value`) and its derivatives
+    the update's at every order (`straight_through`): a map linear in x and x_0 at the level's c, dt and
+    sigma_t (`linear_map`), each of its tangents formed in the source's own order, D over the level and then
+    the interval, so no fraction dt / sigma_t is formed nor its tangent (a target level's tangent of 2^115 at
+    sigma_t 2^-16 is a fraction's of 2^131, where the update's is 2^115; train 1461's P0), each tangent in
+    range wherever the source's is. D is formed whole where it is in range (x_0's tangent of 2^-125 from 1 to
+    1/2 steps x by 2^-126, where halving D first flushes each half; train 1452's P0), at half scale taken
+    twice where it is not (tangents 2^127 and -2^127), never weighed apart (2 2^127 less 2 2^127; train
+    1430's P0); it pulls a cotangent back as each operand's weight, which forms no difference, summed as its
+    operand broadcast (`sharding.summed_like`: a replicated prediction's beside a split sample's, train
+    1461's P0). Where the operands' tangents' difference itself passes the range (x' = 2^127 under x_0' =
+    -2^127), the source's x + ((x - x_0) / sigma_t) dt forms it too, so no order of the update is held finite
+    there (row 5426's ruling, tests/contract_support.py's `assert_contract`; train 1452's F3b)."""
+    level = (coefficient, dt, sigma_t, lax.stop_gradient(x), lax.stop_gradient(denoised))
+    applied = linear_map(_flowed_applied, _flowed_pulled, level, (x, denoised))
+    return straight_through(applied, lax.stop_gradient(_flowed_value(x, coefficient, denoised, dt, sigma_t)))
+
+
+def _flowed_applied(level, moving):
+    coefficient, dt, sigma_t, _, _ = level
+    x, denoised = moving
+    whole = x - coefficient * denoised
+    formed = jnp.isfinite(whole)
+    held = jnp.where(formed, whole, 0)
+    half = 0.5 * jnp.where(formed, 0, x) - (0.5 * coefficient) * jnp.where(formed, 0, denoised)
+    halved = divided(half, sigma_t) * dt
+    return x + jnp.where(formed, divided(held, sigma_t) * dt, halved + halved)
+
+
+def _flowed_pulled(level, cotangent):
+    coefficient, dt, sigma_t, x, denoised = level
+    # The transpose's own order, the interval first (a cotangent of 2^127 over sigma 1/2 passes the range,
+    # under the interval -1/8 first it does not; train 1461's review).
+    moved = divided(cotangent * dt, sigma_t)
+    return summed_like(cotangent + moved, x), summed_like(-(coefficient * moved), denoised)
+
+
+def _euler_step(x, denoised, source, target, *, flow: bool = False):
     """One Euler step of the probability-flow ODE, in sigma.
 
-    Returns `(x at the target level, the derivative, the x_0 coefficient,
-    the interval)`. A second-order method re-evaluates the derivative at the
-    end of this step and needs the coefficient and the interval it was taken
-    over. A step between equal levels, which a grid that ends where its
-    final sigma repeats takes (`final_sigmas_type="sigma_min"`), has no
-    length and leaves x as it is, as the source's `x + derivative * dt` does.
+    Returns `(x at the target level, the derivative, the x_0 coefficient, the interval)`. A second-order
+    method re-evaluates the derivative at the end of this step and needs the coefficient and the interval it
+    was taken over; `flow` where the process walks a rectified flow (`RectifiedFlow`). A step between equal
+    levels, which a grid that ends where its final sigma repeats takes (`final_sigmas_type="sigma_min"`), has
+    no length and leaves x as it is, as the source's `x + derivative * dt` does.
     """
     (alpha_t, sigma_t), (alpha_s, sigma_s) = source, target
     dt = sigma_s - sigma_t
-    # Equal levels make the numerator 0 too; any finite coefficient is scaled by the zero interval.
-    x_0_coeff = (alpha_t * sigma_s - alpha_s * sigma_t) / jnp.where(dt == 0, 1, dt)
+    # A rectified flow's (alpha = 1 - sigma) is one exactly: its secant would divide two rounded
+    # cross-products, 1 - 2^-24 from 47/64 to 47/128 (train 1407's P0). Elsewhere equal levels make the
+    # numerator 0 too, any finite coefficient scaled by the zero interval, divided as IEEE divides
+    # (`divided`): inside a walk's scan XLA takes the interval as a constant and multiplies by its rounded
+    # reciprocal.
+    x_0_coeff = (jnp.ones_like(dt) if flow
+                 else divided(alpha_t * sigma_s - alpha_s * sigma_t, jnp.where(dt == 0, 1, dt)))
     derivative = divided(x - x_0_coeff * denoised, sigma_t)
     # The source's x + derivative dt, summed as alpha_s x_0 + sigma_s eps, DDIM's form of it: from a
     # large sigma the source's sum cancels two terms of x's size (x is 4e4 at a zero-SNR sigma of
@@ -40,17 +113,17 @@ def _euler_step(x, denoised, source, target):
     # noise parts, each of x's size, back to x's small step (ledger 2541); a long step from a zero-SNR
     # sigma keeps the form above (ledger 3475).
     near = (alpha_t == alpha_s) & (2 * sigma_s >= sigma_t) & (sigma_s != 0)
-    stepped = jnp.where(near, x + derivative * dt, stepped)
+    # A rectified flow's levels (alpha = 1 - sigma, a source's FlowMatch schedule, `RectifiedFlow`) hold x
+    # as a convex sum of the clean sample and the noise, never larger than they, and its x_0 coefficient is
+    # one: between near levels (2 sigma_s >= sigma_t) the source's x + derivative dt cancels nothing, where
+    # the form above rounds x through x_0 and back (1.6x Diffusers' own walk's error from float64 over
+    # SD3's FlowMatch files, row 13654); a long step down (an exponential grid's last) keeps the form
+    # above, which the derivative's rounding at a small sigma the source's sum would carry.
+    walks_flow = flow & (2 * sigma_s >= sigma_t)
+    moved = _flowed(x, x_0_coeff, denoised, dt, sigma_t)
+    stepped = jnp.where(near | walks_flow, moved, stepped)
     return jnp.where(dt == 0, x, stepped), derivative, x_0_coeff, dt
 
-
-def _ancestral(sigma_t, sigma_s):
-    """k-diffusion's `get_ancestral_step` at eta 1: `(sigma_down, sigma_up)`,
-    the level a deterministic step goes down to and the fresh noise that
-    brings the marginal back to sigma_s, sigma_up capped at sigma_s as the
-    source caps it."""
-    sigma_up = jnp.minimum(sigma_s, ancestral_variance(sigma_t, sigma_s) ** 0.5)
-    return (sigma_s ** 2 - sigma_up ** 2) ** 0.5, sigma_up
 
 @struct.dataclass
 class Euler:
@@ -61,7 +134,8 @@ class Euler:
         return ()
 
     def step(self, x, t, t_next, denoised, eps, state, key, process, denoise):
-        stepped, _, _, _ = _euler_step(x, denoised, process.rates(t, like=x), process.rates(t_next, like=x))
+        stepped, _, _, _ = _euler_step(x, denoised, process.rates(t, like=x), process.rates(t_next, like=x),
+                                       flow=isinstance(process.sampler_schedule, RectifiedFlow))
         return stepped, state
 
 
@@ -81,7 +155,7 @@ class EulerAncestral:
         _sigma_integrator("EulerAncestral", process)
         _, sigma_t = process.rates(t, like=x)
         _, sigma_s = process.rates(t_next, like=x)
-        sigma_down, sigma_up = _ancestral(sigma_t, sigma_s)
+        sigma_down, sigma_up = ancestral_step(sigma_t, sigma_s)
         dx = (x - denoised) / sigma_t
         dW = _unit_noise(key, x) * sigma_up
         return x + dx * (sigma_down - sigma_t) + dW, state
@@ -147,15 +221,31 @@ class Heun:
         source = process.rates(t, like=x)
         target = process.rates(t_next, like=x)
         sigma_s = target[1]
-        x_euler, dx_0, x_0_coeff, dt = _euler_step(x, denoised, source, target)
+        x_euler, dx_0, x_0_coeff, dt = _euler_step(x, denoised, source, target,
+                                                   flow=isinstance(process.sampler_schedule, RectifiedFlow))
 
+        # A row corrects where its step reaches a positive sigma: a step of no length too, which leaves x as
+        # it is and reads both slopes for its derivative in its levels (`held` below).
         def corrected(operand):
             denoised_next, _ = denoise(x_euler, t_next)
             # When sigma reaches 0 there is no derivative there, so a row
             # there takes the Euler step.
             safe_sigma_s = jnp.where(sigma_s > 0, sigma_s, 1.0)
             dx_1 = (x_euler - x_0_coeff * denoised_next) / safe_sigma_s
-            return jnp.where(sigma_s > 0, x + 0.5 * (dx_0 + dx_1) * dt, x_euler)
+            # The source's mean, summed first; where the step has no length and the sum alone passes the
+            # range (two slopes of 2^127, of one sign), the lesser plus half their difference, which is in it,
+            # and no common factor XLA folds back into the sum; a sum in range as it is (two least normal
+            # slopes, whose halves a device flushes; review).
+            summed = 0.5 * (dx_0 + dx_1)
+            lesser = jnp.minimum(dx_0, dx_1)
+            between = lesser + 0.5 * (jnp.maximum(dx_0, dx_1) - lesser)
+            slope = jnp.where((dt == 0) & ~jnp.isfinite(summed), between, summed)
+            # A step of no length is x itself, its tangent in the levels its two slopes' mean, each read where
+            # it was (a guidance whose state moves between them, APG's momentum, reads two; review): a slope
+            # past the range adds none there, where its product with the zero interval was NaN (train 1474's
+            # P0: x 0 under a clean prediction of 2^127 at sigma 1/2, a slope of -2^128).
+            held = jnp.where(jnp.isfinite(slope) | (dt != 0), slope, 0.0)
+            return jnp.where(sigma_s > 0, x + held * dt, x_euler)
 
         # The last step of a trajectory to sigma 0 is the Euler one for every
         # row, so its corrector's model call is skipped, as KDPM2's is.
@@ -219,14 +309,19 @@ class KDPM2:
             positive = sigma_s > 0
             following = jnp.where(positive, sigma_s, sigma_t)
             if self.ancestral:
-                target, sigma_up = _ancestral(sigma_t, following)
-                sigma_mid = jnp.exp(jnp.log(sigma_t) + 0.5 * (jnp.log(target) - jnp.log(sigma_t)))
+                target, sigma_up = ancestral_step(sigma_t, following)
+                sigma_mid = jnp.sqrt(sigma_t) * jnp.sqrt(target)
             else:
                 target, sigma_up = following, 0.0
-                sigma_mid = jnp.exp(jnp.log(target) + 0.5 * (jnp.log(sigma_t) - jnp.log(target)))
+                sigma_mid = jnp.sqrt(target) * jnp.sqrt(sigma_t)
+            # The midpoint at the level its model reads: a level carried through a time comes back to the
+            # schedule's rounding of both, several ulps off where the grid is steep, and the source steps
+            # at the level it hands its model (row 13657).
+            t_mid = schedule.t_of_sigma(sigma_mid.reshape(-1))
+            sigma_mid = expand(schedule.sigmas(t_mid), x)
             dx = (x - denoised) / sigma_t
             x_mid = x + dx * (sigma_mid - sigma_t)
-            denoised_mid, _ = denoise(x_mid, schedule.t_of_sigma(sigma_mid.reshape(-1)))
+            denoised_mid, _ = denoise(x_mid, t_mid)
             stepped = x + (x_mid - denoised_mid) / sigma_mid * (target - sigma_t)
             if self.ancestral:
                 stepped = stepped + _unit_noise(key, x) * sigma_up
