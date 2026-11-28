@@ -269,6 +269,31 @@ def a_blockwise_kernel_gradients_portable_arm_sums_exactly():
                     truth_fn=_gradient_truth)
 
 
+def test_a_bank_quantized_by_blocks_is_each_blocks_codes_under_its_power_of_two_scale():
+    """`projections.blocks_quantized` of a bank of matrices whose 128 x 128 blocks span ten decades (one block
+    of zeros) is, computed on the host in NumPy, each block's values over its scale rounded to E4M3 (to
+    nearest, ties to even, clamped to 448) under its scale: the least power of two at or above its largest
+    magnitude, floored at 1e-4, times fp32's 1/448 (DeepGEMM's `per_block_cast_to_fp8` at ue8m0 scales, as
+    the kernels' `fast_round_scale` computes it), bit for bit (row 4518)."""
+    import ml_dtypes
+    from reference_error import ran_here
+
+    rng = np.random.default_rng(4518)
+    decades = 10.0 ** rng.integers(-6, 4, (2, 2, 1, 3, 1))
+    decades[0, 0, :, 0] = 0
+    w = (rng.standard_normal((2, 2, 128, 3, 128)) * decades).astype(np.float32).reshape(2, 256, 384)
+    tiles = w.reshape(2, 2, 128, 3, 128)
+    over = np.maximum(np.abs(tiles).max(axis=(2, 4), keepdims=True), np.float32(1e-4)) * np.float32(1 / 448)
+    fraction, exponent = np.frexp(over)
+    scale = np.ldexp(np.float32(1), np.where(fraction == 0.5, exponent - 1, exponent)).astype(np.float32)
+    codes = np.clip(tiles / scale, -448, 448).astype(ml_dtypes.float8_e4m3fn).reshape(w.shape)
+    # Every way run before any is judged (`ran_here`).
+    found = [run(w) for run in ran_here(projections.blocks_quantized, "a bank quantized by blocks")]
+    for found_codes, found_scales in found:
+        np.testing.assert_array_equal(np.asarray(found_codes).view(np.uint8), codes.view(np.uint8))
+        np.testing.assert_array_equal(np.asarray(found_scales), scale[:, :, 0, :, 0])
+
+
 def test_a_blockwise_fp8_projections_training_step_is_on_par():
     """On an H100, interpreted, one training step through the blockwise FP8 recipe
     (`projections.blockwise_fp8_projection`: its output and both gradients), the template named, on par with
