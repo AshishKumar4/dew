@@ -28,29 +28,28 @@ def factored(run: Callable, operands: tuple, factor: jax.Array, rows: jax.Array,
              finished: Callable | None = None) -> jax.Array:
     """`run(rows as bf16, *operands) * factor * owed`, linear in `rows`: `run` a product of bf16 rows (those
     `gather` reads where given, `gemm`'s `gather`, among `operands`), `factor` a packed matrix's fp32 scales
-    broadcast against its output (`formats.scale_factor`, an NVFP4 matrix's tensor scale): one a row's, one
-    a column's, one an entry's or one for all; with `groups` (the group sizes of the output's rows), one a
+    broadcast against its output (`formats.scale_factor`, an NVFP4 matrix's tensor scale): one a row's, one a
+    column's, one an entry's or one for all; with `groups` (the group sizes of the output's rows), one a
     group's (`[groups]`) or one a group's column (`[groups, width]`), which each row takes from its group
     where the product and its pullback read it (`_per_row`), no row's saved. `owed` is a power of two the
-    product owes besides (an NVFP4 decode's, `bits.NVFP4_OWED`), applied with the factor in its one
-    rounding (`owed_exactly`), never folded into a factor it would carry past fp32's largest (a tensor scale
-    of 2**122 under the decode's 2**8) or below its normals. `least`, the least magnitude of a nonzero
-    coefficient of the decoded matrix (`prepared`'s). `finished`, where given, `run` with the factor and the
-    owed power of two applied in its own finish (`finished(rows, *operands, factor, groups)`: a launch's
-    epilogue, `gemm.nvfp4_product`'s), which the product runs in their place. Its transpose is the plain
-    one, the cotangent times its
-    factor through `run`'s pullback, wherever that holds it: finite, and every nonzero product of a row's
-    route at least the plain transpose's least (`plain_least`); where it does not (a product past fp32's
-    largest, or one its bf16 parts or fp32's normals lose), the exact one (`_Transpose.moved`): each
-    product `cotangent * factor` and each
-    coefficient of the decoded matrix (`prepared(*wide_operands)`, its depth its axis -2) cut into integer
-    slices on grids of their own, each pair of slices multiplied by a bf16 GEMM whose fp32 sums are exact
-    integers (`wide`, the transpose over the rows `run` reads, a route each where gathered), the sums kept
-    in int32 limbs, added across routes into their tokens and across the devices that sum them, then
-    rounded once (`_rounded`). A product of a cotangent, factor or coefficient not finite is IEEE's: no
-    product overflows or flushes, so a scale of 2**126 under cotangents that cancel pulls back their
-    remainder, a subnormal one among them. A checked `shard_map`'s devices sum a cotangent only they vary
-    over before its pullback, and their partials after."""
+    product owes besides (an NVFP4 decode's, `bits.NVFP4_OWED`), applied with the factor in its one rounding
+    (`owed_exactly`), never folded into a factor it would carry past fp32's largest (a tensor scale of 2**122
+    under the decode's 2**8) or below its normals. `least`, the least magnitude of a nonzero coefficient of
+    the decoded matrix (`prepared`'s). `finished`, where given, `run` with the factor and the owed power of
+    two applied in its own finish (`finished(rows, *operands, factor, groups)`: a launch's epilogue,
+    `gemm.nvfp4_product`'s), which the product runs in their place. Its transpose is the plain one, the
+    cotangent times its factor through `run`'s pullback, wherever that holds it: finite, and every nonzero
+    product of a row's route at least the plain transpose's least (`plain_least`); where it does not (a
+    product past fp32's largest, or one its bf16 parts or fp32's normals lose), the exact one
+    (`_Transpose.moved`): each product `cotangent * factor` and each coefficient of the decoded matrix
+    (`prepared(*wide_operands)`, its depth its axis -2) cut into integer slices on grids of their own, each
+    pair of slices multiplied by a bf16 GEMM whose fp32 sums are exact integers (`wide`, the transpose over
+    the rows `run` reads, a route each where gathered), the sums kept in int32 limbs, added across routes into
+    their tokens and across the devices that sum them, then rounded once (`_rounded`). A product of a
+    cotangent, factor or coefficient not finite is IEEE's: no product overflows or flushes, so a scale of
+    2**126 under cotangents that cancel pulls back their remainder, a subnormal one among them. A checked
+    `shard_map`'s devices sum a cotangent only they vary over before its pullback, and their partials
+    after."""
     raised = round(math.log2(owed))
     if owed != 2.0 ** raised or raised < 0:
         raise ValueError(f"a product's owed factor is a power of two of at least 1, not {owed}")
