@@ -2,11 +2,13 @@
 its derivation takes the cheaper of (`MosaicBackward.derived`, row 12752)."""
 
 import dataclasses
+import math
 
 import pytest
 from test_attention_mosaic import _backward_call
 
 from dew.nn.kernels import generation
+from dew.nn.kernels.templates import attention_mosaic_derivation, cost
 
 pytestmark = pytest.mark.kernel
 
@@ -72,3 +74,20 @@ def test_a_launch_past_its_registers_or_at_a_rate_unstated_is_never_priced_whole
     assert blind.memory_rate is None
     _, _, _, candidates, prices, _ = _priced(("sm90", "Qwen3-8B"), target=blind)
     assert candidates and all(unpriced for unpriced, _ in prices), prices
+
+
+def test_a_portable_choice_reads_no_parts_l2_and_keys_the_facts_it_prices_at():
+    """An RTX PRO 6000's priced attention choice reads its generation's canonical facts with no L2 read
+    plateau, on the Server Edition measured at one (6.74 TB/s, M-FS-113) and on the Workstation part
+    measured at none alike: a part's L2 is its own (kernel-templates.md §6, Train 1508's F2), so both price
+    and key a choice at the same facts (`_choice_key` keys the rates and latencies `_priced` supplies)."""
+    server, workstation = (generation.gpu_target(f"NVIDIA RTX PRO 6000 Blackwell {edition} Edition")
+                           for edition in ("Server", "Workstation"))
+    assert server.l2_rate == 6.74e12 and workstation.l2_rate is None
+    priced = [attention_mosaic_derivation._priced(target) for target in (server, workstation)]
+    assert [cost.rates(facts, device=True).l2 for facts in priced] == [math.inf] * 2
+    keyed = [(facts.device_kind, facts.launch_seconds, cost.rates(facts, device=False),
+              cost.rates(facts, device=True), facts.kernel_step_seconds, facts.copy_latency)
+             for facts in priced]
+    assert keyed[0] == keyed[1]
+

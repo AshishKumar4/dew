@@ -1699,3 +1699,40 @@ def test_a_launchs_reads_past_its_buffers_whole_are_its_l2_traffic_priced_at_the
     assert g4_seconds.device == 2 * row / g4.memory_rate + row / g4.l2_rate
     assert h100_seconds.device == 2 * row / h100.memory_rate
     assert not any(g4_unpriced) and not any(h100_unpriced)
+
+
+def _l2_bytes(body, dtype=jnp.float32, elements: int = 128) -> float:
+    """The L2 bytes of a one-warpgroup launch running `body` over a row of `elements` of `dtype`, its output
+    alike, a shared buffer of the row and a barrier (`launch_work`, nothing stated)."""
+    row = jax.ShapeDtypeStruct((elements,), dtype)
+    launch = plgpu.kernel(body, out_type=row, num_threads=1, thread_name="wg",
+                          scratch_types=[plgpu.SMEM((elements,), dtype), plgpu.Barrier()])
+    (kernel,) = [equation for equation in programs.equations(jax.make_jaxpr(launch)(row).jaxpr)
+                 if equation.primitive.name in ("mpmd_map", "pallas_call")]
+    return emission.launch_work(kernel, Stated(steps=0, bytes_accessed=0)).l2_bytes
+
+
+def _read(row, staged, barrier, times: int = 1):
+    for _ in range(times):
+        plgpu.copy_gmem_to_smem(row, staged, barrier)
+        plgpu.barrier_wait(barrier)
+
+
+def test_a_launchs_l2_traffic_is_the_reads_every_arm_makes_at_its_buffers_packed_sizes():
+    """A launch's L2 traffic is a bound its reads guarantee: past a conditional its data decides, the reads
+    every arm makes (an arm reading its 512-byte row once more and one reading nothing add none: three
+    reads past its row and output, 512 bytes), and its buffers at the bytes they take, a packed FP4 row's
+    1,024 codes 512 bytes (three reads of it 512 past it and its output; Train 1508's F1 and F3)."""
+    def guarded(row, out, staged, barrier):
+        _read(row, staged, barrier, times=3)
+        lax.cond(staged[0] > 0, lambda: _read(row, staged, barrier), lambda: None)
+        plgpu.copy_smem_to_gmem(staged, out)
+        plgpu.wait_smem_to_gmem(0)
+
+    def thrice(row, out, staged, barrier):
+        _read(row, staged, barrier, times=3)
+        plgpu.copy_smem_to_gmem(staged, out)
+        plgpu.wait_smem_to_gmem(0)
+
+    assert _l2_bytes(guarded) == 512
+    assert _l2_bytes(thrice, jnp.float4_e2m1fn, 1024) == 512
