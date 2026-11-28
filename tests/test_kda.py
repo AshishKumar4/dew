@@ -338,6 +338,25 @@ def test_padded_rows_preserve_the_memory_and_the_history():
                         partial(oracle_chunk, chunk_size=4)))
 
 
+def test_an_idle_rows_rate_gradient_is_zero_whatever_its_rate():
+    """The layer over rows every token of which is padded (`valid`, a runtime mask), its rate `A_log` 100:
+    its loss's gradient by `A_log` exactly zero, a padded token's forget gate formed from zeros (`_decay`),
+    where `exp(100)`'s overflow met the padding's zero cotangent as NaN (train 1474's review)."""
+    from dew.batch import coordinates
+    from dew.nn.inputs import AttentionMetadata
+
+    module, _, variables = layer_and_params(-5.0)
+    params = dict(variables['params'], A_log=jnp.full_like(variables['params']['A_log'], 100.0))
+    x = jnp.asarray(np.random.RandomState(1474).randn(2, 6, E), jnp.float32)
+
+    def loss(params, valid):
+        call = MixerCall(AttentionMetadata(coordinates=coordinates(valid=valid)))
+        return jnp.sum(module.apply({**variables, 'params': params}, x, call))
+
+    found = jax.jit(jax.grad(loss))(params, jnp.zeros((2, 6), bool))
+    np.testing.assert_array_equal(np.asarray(found['A_log']), np.zeros_like(np.asarray(found['A_log'])))
+
+
 @pytest.mark.parametrize("layout", list(LAYOUTS))
 def test_documents_that_continue_another_read_its_memory_and_history_as_their_own_rows_do(layout):
     """Kimi delta attention over forks (`dew.batch.Forks`) gives each document's tokens, and the gradients

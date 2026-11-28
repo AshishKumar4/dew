@@ -174,16 +174,24 @@ class KimiDeltaAttention(nn.Module):
         value past 20 the gate's within float32's rounding)."""
         return recurrence.Gates(bound=self.lower_bound)
 
-    def _decay(self, x):
+    def _decay(self, x, valid=None):
         """`Glm5NextTextForgetGate.forward` (modeling_glm5_next.py:319-335): `[B, S, H, Dk]` in fp32
         (`at_least_fp32`), the recurrence's gate law (`_gates`, `recurrence.gated`) at the layer's own
         boundary: its rate exponentiated in its parameter's dtype, as the layer has always taken it, every
-        route (decode, chunked, sharded) handed the decay it forms."""
+        route (decode, chunked, sharded) handed the decay it forms. A padded token's (`valid`) gate formed
+        from zeros, its head's rate and bias among them, so it forms no `exp(A_log)` (a rate of `exp(100)`
+        met its zero cotangent as NaN in the rate's gradient: train 1474's review), its caller keeping its
+        memory."""
         B, S, _ = x.shape
         gate = self.f_b_proj(self.f_a_proj(x))
         gate = gate.astype(at_least_fp32(gate.dtype)).reshape(B, S, self.num_heads, self.head_dim)
         bias = jnp.reshape(self.dt_bias, (self.num_heads, self.head_dim))
-        decay, _ = recurrence.gated(self._gates, gate, self.A_log[:, None], bias, None)
+        log_a = self.A_log[:, None]
+        if valid is not None:
+            present = valid[:, :, None, None]
+            gate, log_a, bias = (jnp.where(present, operand, jnp.zeros((), operand.dtype))
+                                 for operand in (gate, log_a, bias))
+        decay, _ = recurrence.gated(self._gates, gate, log_a, bias, None)
         return decay
 
     @nn.nowrap
@@ -212,7 +220,7 @@ class KimiDeltaAttention(nn.Module):
         projected = jnp.concatenate(projections, axis=-1)
         wide = at_least_fp32(projected.dtype)
         taps = jnp.concatenate([conv()[0] for conv in (self.q_conv1d, self.k_conv1d, self.v_conv1d)])
-        g = self._decay(x)
+        g = self._decay(x, valid)
         beta = logistic(self.b_proj(x).astype(wide))
         if valid is not None:
             # exp(0) = 1 and beta = 0 preserve the memory across a padded slot.
