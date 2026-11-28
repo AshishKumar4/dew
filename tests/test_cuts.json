@@ -1682,6 +1682,10 @@
 "tests/test_docs_blocks.py::test_a_page_s_python_blocks_run_in_order[guides/evaluation.md]",
 "tests/test_docs_blocks.py::test_a_page_s_python_blocks_run_in_order[installation.md]"
 ],
+"tests/test_donated_decode.py": [
+"tests/test_donated_decode.py::test_a_generations_loop_updates_each_recurrent_state_in_place[plain]",
+"tests/test_donated_decode.py::test_a_launch_handed_a_gathered_copy_of_its_state_reads_apart"
+],
 "tests/test_dory.py": [
 "tests/test_dory.py::test_a_cached_greedy_continuation_reads_each_cache_as_vllm_keeps_it[per_loop-4]",
 "tests/test_dory.py::test_a_cached_greedy_continuation_reads_each_cache_as_vllm_keeps_it[per_loop-None]",
