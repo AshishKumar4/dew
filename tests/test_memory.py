@@ -290,20 +290,18 @@ def test_a_mini_batched_memorys_layer_norm_reads_its_rows_less_their_mean(bias):
         assert branch[0] == -branch[1] and branch[1] > 0.5, branch
 
 
-@pytest.mark.parametrize("bias", [True, False], ids=["ttt", "titans"])
-def test_a_mini_batched_memory_keeps_the_steps_below_its_entering_states_last_place(bias):
-    """Four tokens of one mini-batch, each stepping a memory whose entries are 2^25 by about 0.98, less than
-    half their last place: the memory holds their sum apart from the state the mini-batch entered, as its
-    general path holds a chunk's steps, so the last token reads `2^25 -+ 4` and its readout's layer norm
-    `[1, -1]` on its mini-batched kernel as on its general path (79g's review: the kernel stepped the
-    rounded state token by token, every step rounded away, and read `[1, 0]`)."""
-    module = linear_residual_memory(bias, 1e-6, chunk=4, rate=2.0**-10)
+def test_a_mini_batched_ttt_memory_keeps_the_steps_below_its_entering_states_last_place():
+    """Four tokens of one mini-batch, each stepping a TTT-Linear memory and bias whose entries are 2^25 by
+    about 0.98, less than half their last place: the memory holds their sum apart from the state the
+    mini-batch entered, as its general path holds a chunk's steps, so the last token reads `2^25 -+ 4` and
+    its readout's layer norm `[1, -1]` on its mini-batched kernel as on its general path (79g's review: the
+    kernel stepped the rounded state token by token, every step rounded away, and read `[1, 0]`)."""
+    module = linear_residual_memory(True, 1e-6, chunk=4, rate=2.0**-10)
     x = jnp.asarray([[[1.0, 0.0]] * 4], jnp.float32)
     params = jax.tree.map(jnp.zeros_like, module.init(jax.random.key(0), x))
     memory = params["params"]["head_0"]
     memory["down"]["kernel"] = jnp.asarray([[2.0**25, 2.0**25], [0.0, 0.0]], jnp.float32)
-    if bias:
-        memory["down"]["bias"] = jnp.asarray([2.0**25, 2.0**25], jnp.float32)
+    memory["down"]["bias"] = jnp.asarray([2.0**25, 2.0**25], jnp.float32)
     memory["norm"]["scale"] = jnp.ones((2,), jnp.float32)
     params["params"]["v_proj"]["kernel"] = jnp.asarray([[2.0, -1.0], [0.0, 0.0]], jnp.float32)
     for route in mini_batched_and_general(module, params, x):

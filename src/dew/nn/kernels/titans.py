@@ -15,11 +15,10 @@ x sum(g x)) / (D sigma)`, `sigma = sqrt(var + eps)`; fla's Titans reference writ
 
 `titans` takes a mini-batch at a time (docs/design/kernel-templates.md's C class: its orchestration outside
 the recurrence tile): its tokens' gradients at once at the memory entering it, then its tokens a step at a
-time, each writing its own and reading the pair it leaves, the memory a compensated pair within it that holds
-steps below its last place as the memory's general path does (`dew.nn.memory`), so no query meets a key (a
-live score of 2^70 by 2^70 overflowed beside a zero write) and no state is weighed after a read (a memory of
-2^70 forgotten whole read `0 * inf`). Documents are not packed: a mini-batch is the sequence's `chunk` tokens,
-which a document starting within one would split (fla's reference takes none either)."""
+time, each writing its own and reading the pair it leaves, so no query meets a key (a live score of 2^70 by
+2^70 overflowed beside a zero write) and no state is weighed after a read (a memory of 2^70 forgotten whole
+read `0 * inf`). Documents are not packed: a mini-batch is the sequence's `chunk` tokens, which a document
+starting within one would split (fla's reference takes none either)."""
 
 from __future__ import annotations
 
@@ -28,7 +27,7 @@ import functools
 import jax
 import jax.numpy as jnp
 
-from dew.nn import precision, sharding
+from dew.nn import sharding
 from dew.nn.aligned import aligned_sum
 from dew.nn.inputs import sequence_blocks
 from dew.nn.norms import row_shift
@@ -188,7 +187,7 @@ def titans(query, key, value, weight, bias, theta, alpha, eta, state=None, *, ch
         q, k, v, theta, alpha, eta, real = at
         gradient = real_gradients(k, v, k @ pair[0], real, weight, bias, eps)
 
-        def token(carried, along):
+        def token(pair, along):
             q, k, gradient, theta, alpha, eta, real = along
             # The write `2 theta k u` one exact product of the 2, the rate, the key and the gradient, rounded
             # once (`aligned_sum`), its transpose's alike: no partial product leaves the range its value does
@@ -198,29 +197,15 @@ def titans(query, key, value, weight, bias, theta, alpha, eta, state=None, *, ch
             # 2^127 doubled first overflowed, train 1461's).
             write = aligned_sum([[jnp.asarray(coefficient, theta.dtype), theta[..., None, None],
                                   k[..., :, None], gradient[..., None, :]]])
-            memory, low, momentum = carried
-            momentum = eta[..., None, None] * momentum - write
-            # The memory a compensated pair within the mini-batch: what each step's addition rounds away is
-            # kept in its low part (`precision.two_sum`) and the pair renormalized, so the memory read, its
-            # rounded value, holds steps below its last place as the memory's general path holds a chunk's
-            # (`dew.nn.memory`; 79g's review: four writes of 0.98 into a memory of 2^25 left it as it was),
-            # and a decayed memory is the recurrence's own product, as exact as fla's reference. The low part
-            # is a value alone, constant to the derivatives, whose tangent is the recurrence's own: an
-            # error-free transform's differentiated rounding error is its tangents' rounding, which the low
-            # part would carry into the memory's (4x the recurrence's error in the queries' gradient).
-            forget = (1.0 - alpha)[..., None, None]
-            total, dropped = precision.two_sum(forget * memory, momentum)
-            memory, low = precision.two_sum(total, jax.lax.stop_gradient(forget * low + dropped))
-            low = jax.lax.stop_gradient(low)
-            # A padded token leaves the memory and momentum as they were.
-            carried = tuple(jnp.where(real[..., None, None], new, old)
-                            for new, old in zip((memory, low, momentum), carried, strict=True))
-            return carried, jnp.einsum('bhk,bhkv->bhv', q, carried[0])
+            momentum = eta[..., None, None] * pair[1] - write
+            memory = (1.0 - alpha)[..., None, None] * pair[0] + momentum
+            # A padded token leaves the pair as it was.
+            pair = tuple(jnp.where(real[..., None, None], new, old)
+                         for new, old in zip((memory, momentum), pair, strict=True))
+            return pair, jnp.einsum('bhk,bhkv->bhv', q, pair[0])
 
         tokens = tuple(jnp.moveaxis(x, 2, 0) for x in (q, k, gradient, theta, alpha, eta, real))
-        entering = (pair[0], jnp.zeros_like(pair[0]), pair[1])
-        (memory, _, momentum), reads = jax.lax.scan(token, entering, tokens)
-        return (memory, momentum), reads
+        return jax.lax.scan(token, pair, tokens)
 
     keys, *rest = mini_batches(chunk, k, q, v, theta, alpha, eta, valid=valid)
     final, out = memory_chunks(mini_batch, states, (rest[0], keys, *rest[1:]))
