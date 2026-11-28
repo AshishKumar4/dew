@@ -645,6 +645,44 @@ def test_an_integer_bank_quantizes_as_its_widened_values(k_major):
         np.testing.assert_array_equal(np.asarray(got).view(np.uint8), np.asarray(want).view(np.uint8))
 
 
+def fp8_codes_convert_as_the_rounding_does():
+    """On a GPU, `fake_quant.fp8_codes`' conversion (XLA's float32 to E4M3FN and back) is its rounding by
+    arithmetic (`fake_quant._round_e4m3fn`) bit for bit, at every E4M3 code, each midpoint between two and
+    the float32s either side of it, the subnormal codes' range, both zeros, values past 448 and NaN (row
+    14171). Run by tests/test_gpu_gemm.py's cells: a CPU's codes take the rounding alone."""
+    from dew.nn import fake_quant
+
+    grid = np.unique(np.abs(np.arange(256, dtype=np.uint8).view(jnp.float8_e4m3fn).astype(np.float32)))
+    grid = grid[np.isfinite(grid)]
+    midpoints = (grid[:-1] + grid[1:]) / 2
+    near = np.concatenate([np.nextafter(points, direction) for points in (grid, midpoints)
+                           for direction in (-np.inf, np.inf)])
+    small = np.float32(2.0 ** -9) * np.linspace(0, 2, 4097, dtype=np.float32)
+    # Past 448 (448 to 464 among them) the clip ahead of the convert takes each value to 448.
+    past = np.concatenate([np.linspace(448, 464, 65, dtype=np.float32), [480.0, 1e9, np.inf]])
+    every = np.concatenate([grid, midpoints, near, small, past, [0.0]])
+    values = jnp.asarray(np.concatenate([every, -every, [np.nan]]).astype(np.float32))
+    rounded = jax.jit(lambda x: fake_quant._round_e4m3fn(jnp.clip(x, -448, 448)))(values)
+    for excess in (False, True):
+        # Under XLA GPU's excess precision too, which deletes a bare f32 -> f8 -> f32 pair (its review).
+        converted = jax.jit(fake_quant.fp8_codes,
+                            compiler_options={"xla_allow_excess_precision": excess})(values)
+        _same_codes(converted, rounded)
+
+
+def _same_codes(converted, rounded):
+    """`fp8_codes_convert_as_the_rounding_does`' comparison: the stored E4M3FN bytes alike, and every value
+    but a NaN's (whose payload no code stores) alike."""
+    for array in (converted, rounded):
+        assert np.asarray(array).dtype == np.float32
+    np.testing.assert_array_equal(np.asarray(converted.astype(jnp.float8_e4m3fn)).view(np.uint8),
+                                  np.asarray(rounded.astype(jnp.float8_e4m3fn)).view(np.uint8))
+    number = ~np.isnan(np.asarray(rounded))
+    np.testing.assert_array_equal(np.isnan(np.asarray(converted)), ~number)
+    np.testing.assert_array_equal(np.asarray(converted)[number].view(np.uint32),
+                                  np.asarray(rounded)[number].view(np.uint32))
+
+
 @pytest.mark.parametrize("rows", [200, 256])
 def test_an_ungated_mlps_recipe_chain_is_its_two_recipe_projections_apart(rows):
     """Under a run's blockwise FP8 recipe, an ungated MLP's chain (`projections.recipe_chain`) of any rows
