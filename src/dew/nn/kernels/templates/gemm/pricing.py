@@ -6,9 +6,11 @@ wave (`balanced_tail`, `handoff_steps`, `fixes_up`)."""
 
 import contextlib
 import dataclasses
+import functools
 import math
+import operator
 from collections.abc import Callable
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, NamedTuple
 
 import jax.numpy as jnp
 import numpy as np
@@ -61,6 +63,18 @@ def cluster_rows(block_m: int, cluster: int) -> int:
     return block_m * cluster
 
 
+class Decoded(NamedTuple):
+    """An operand's decoded stage (`step_shared_bytes`' and `step_seconds`' `decoded`): the decoded `itemsize`
+    its products read (0: decoded in registers into them, read from shared memory never), the `copies` of
+    the stage its consumers decode a step, and a staged element's decode `work` (`templates.cost.Work`, its
+    bit forms' issues by pipe, `BitForm.work`), None where its decode is unpriced. A plain `(itemsize,
+    copies)` pair reads as one with no work."""
+
+    itemsize: float
+    copies: int
+    work: unit_cost.Work | None = None
+
+
 def step_seconds(tiles: "Tiles", target, itemsizes: tuple[float, float],
                  decoded: tuple = (None, None), *, issued) -> float | None:
     """One step of `tiles` on one multiprocessor, in seconds, the unit the kernel gradient's split
@@ -70,8 +84,9 @@ def step_seconds(tiles: "Tiles", target, itemsizes: tuple[float, float],
     decoded before their products take) and its operands' bytes through its shared memory at
     that memory's rate (`templates.cost.rates`, each the architecture's a clock at the part's clock; their
     units overlapped, `cost.units`), a step's `step_shared_bytes` of operands of `itemsizes` (the left's
-    and the right's) in their `decoded` forms; None where the target states no tensor rate. A pair's step is
-    a CTA's: its rows by the pair's columns (`tile_columns`)."""
+    and the right's) in their `decoded` forms, and those forms' decodes on their busiest unit
+    (`decode_seconds`); None where the target states no tensor rate. A pair's step is a CTA's: its rows by
+    the pair's columns (`tile_columns`)."""
     rates = unit_cost.rates(target, device=False)
     tensor = _tensor_rate(rates, issued)
     shared = rates.shared
@@ -89,7 +104,28 @@ def step_seconds(tiles: "Tiles", target, itemsizes: tuple[float, float],
         dma = dma_bytes / target.memory_rate if target.memory_rate else 0.0
         vmem = (moved + 2 * tiles.block_m * columns * 4) / shared if shared is not None else 0.0
         return max(products, dma, vmem) + (target.kernel_step_seconds or 0.0)
-    return products if shared is None else max(products, moved / shared)
+    staged = () if shared is None else (moved / shared,)
+    return max(products, decode_seconds(tiles, decoded, rates), *staged)
+
+
+def decode_seconds(tiles: "Tiles", decoded: tuple, rates: unit_cost.Rates) -> float:
+    """A step's decodes (`step_seconds`), in seconds on the multiprocessor's busiest unit (`cost.units`: the
+    integer ALU, the FMA pipe's integer multiply-adds and the issue slots they take), each decoded operand's
+    staged elements `copies` times over at its form's `work` (`Decoded`), its units overlapped with the
+    products' and the shared bytes' as theirs are with each other: the integer pipes a packed matrix's decode
+    takes beside the tensor cores, which a step's price had left out (row 14106, algebra.md 7.4's consumer
+    pricing a bit form through `Work`). Both operands' decodes summed before their units are priced, as
+    they share each pipe; 0 where no form states its work. On an H100's legal packed tiles the decode is no
+    bottleneck: it ties the shared bytes at the narrowest, two consumers decoding 8 tokens' rows."""
+    elements = (tiles.block_m * tiles.block_k, tiles.block_n * tiles.block_k)
+    stages = [(count, Decoded(*form)) for count, form in zip(elements, decoded, strict=True)
+              if form is not None]
+    works = [unit_cost.repeated(stage.work, count * stage.copies) for count, stage in stages
+             if stage.work is not None]
+    if not works:
+        return 0.0
+    priced, _ = unit_cost.units(functools.reduce(operator.add, works), rates)
+    return max(priced)
 
 
 def _tensor_rate(rates, issued) -> float | None:
@@ -108,7 +144,7 @@ def step_shared_bytes(tiles: "Tiles", family: mosaic.Family, itemsizes: tuple[fl
     reads an instruction), each consumer its share of the rows and the matrix's block. A pair's CTA's half of
     the matrix is counted read by both CTAs' products (`Transport.pairs_product`): an assumption of this
     model, not a measured fact, which M-EM-35's pinned one-CTA arm against the derived pair tests (rows
-    5671, 5363). An operand whose stage is decoded (`decoded`, each operand's `(itemsize, copies)`, its
+    5671, 5363). An operand whose stage is decoded (`decoded`, each operand's `Decoded` form, its
     decode `packed.lanes`) is read from its stage by its decoders, `copies` times whole (`packed.decoding`:
     once where its consumers share the decode, `shared_decode`, each its columns; each consumer the whole
     stage where not), then written as `copies` stages of the decoded `itemsize` the products read (an NVFP4
@@ -124,7 +160,7 @@ def step_shared_bytes(tiles: "Tiles", family: mosaic.Family, itemsizes: tuple[fl
         if form is None:
             moved += count * staged * (1 + reads)
             continue
-        itemsize, copies = form
+        itemsize, copies, _ = Decoded(*form)
         moved += count * (staged + copies * (staged + itemsize) + itemsize * reads)
     return moved
 

@@ -68,6 +68,7 @@ import test_gemm_nvfp4_chain as gemm_nvfp4_chain
 import test_gemm_paired as gemm_paired
 import test_gemm_tcgen05 as gemm_tcgen05
 import test_gemm_template as gemm_template
+import test_gemm_ternary as gemm_ternary
 import test_gemm_widths as gemm_widths
 import test_grouped_gemm as grouped_gemm
 import test_mosaic_toolkit as mosaic_toolkit
@@ -261,6 +262,9 @@ def _scale_edge_cells() -> tuple[Cell, ...]:
               ("kernel gradient", gemm_blockwise.an_e5m2_blockwise_kernel_gradient_at_fp32s_largest_is_finite,
                "blockwise fp8 tgmm"))
           for edge in gemm_blockwise.E5M2_EDGES),
+        Cell("an int8-row ternary finish rounds once below the normals",
+             gemm_ternary.an_int8_rows_finish_rounds_once_below_the_normals, "sm90", at_run=EXACT_OVERFLOW,
+             native={"launch": "int8 finish", "pass": "subnormal product"}),
         Cell("an owed product's native fold rounds once below the normals",
              gemm_nvfp4.an_owed_products_native_fold_rounds_once_below_the_normals, "sm90",
              at_run=EXACT_OVERFLOW, native={"launch": "owed fold", "pass": "subnormal product"}),
@@ -270,6 +274,9 @@ def _scale_edge_cells() -> tuple[Cell, ...]:
         Cell("a packed NVFP4 call placed on its host's CPU keeps a subnormal column scale",
              gemm_nvfp4.a_packed_nvfp4_call_placed_on_its_hosts_cpu_keeps_a_subnormal_scale, "sm90",
              at_run=EXACT_OVERFLOW, native={"launch": "nvfp4 packed", "pass": "host-placed finish"}),
+        Cell("a packed NVFP4 prefill's finish is its products finished apart",
+             gemm_nvfp4.a_packed_nvfp4_prefills_finish_is_its_products_finished_apart, "sm90",
+             at_run=EXACT_OVERFLOW, native={"launch": "nvfp4 packed", "pass": "native finish"}),
     )
 
 
