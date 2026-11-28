@@ -327,6 +327,13 @@ def _own_groups(groups: _Groups, metadata: AttentionMetadata | None, anchor, bat
     return kept, slots
 
 
+def _decode_reads(positions: jax.Array) -> jax.Array:
+    """The keys each decode row reads `[rows]` int32: its filled slots before its token, whose slot is
+    `positions` (-1 for padding, which reads one key, so its unused output stays finite as the masked
+    kernels leave it)."""
+    return jnp.maximum(positions + 1, 1).astype(jnp.int32)
+
+
 class _StepRoute(NamedTuple):
     """A plain decode step's route decided ahead of it (`CausalSelfAttention._step_route`): its pool's paged
     kernel's where it keeps pages, and its attention call's where no paged kernel takes the step."""
@@ -1768,7 +1775,8 @@ class CausalSelfAttention(nn.Module):
                       and not self.projected_sinks)
         if plain_step:
             at = jnp.asarray(positions).reshape(B, S)[:, 0]
-            step = functools.partial(self._plain_step, append, query, key, value, at, sinks=sinks)
+            reads = _decode_reads(at)
+            step = functools.partial(self._plain_step, append, query, key, value, at, reads, sinks=sinks)
             if starts is not None and (self.ctx.sliding_window is None
                                        or self.ctx.sliding_window >= key.shape[-3]):
                 # A start that is the row's own document's alone (`_decode_masks`) narrows only a row
@@ -1777,7 +1785,7 @@ class CausalSelfAttention(nn.Module):
                 # the start, a start of 0 narrows nothing and the step runs as given: no branch, whose
                 # predicate the host waited on each layer of each step (57% of a GH200's decode samples,
                 # row 6107), nor a second kernel compiled.
-                started, unstarted = (self._step_route(append, query, key, value, at, given, sinks)
+                started, unstarted = (self._step_route(append, query, key, value, reads, given, sinks)
                                       for given in (starts, None))
                 if started.kernels == unstarted.kernels:
                     attention = step(self, starts, route=started)
@@ -1799,7 +1807,7 @@ class CausalSelfAttention(nn.Module):
         return attention
 
     @staticmethod
-    def _plain_step(append, query, key, value, positions, module, starts, *, sinks,
+    def _plain_step(append, query, key, value, positions, reads, module, starts, *, sinks,
                     route: _StepRoute | None = None):
         """A plain decode step of `module` (the layer): through the paged kernel where its device's takes
         the step (`_paged_kernel`), else through the layer's attention (`_decode_attention`), from each
@@ -1813,7 +1821,7 @@ class CausalSelfAttention(nn.Module):
                       else append.store.paged_of(generation.published(route.paged)))
         if kernel is not None:
             return module._paged(append, kernel, query, positions, starts, sinks)
-        return module._decode_attention(query, key, value, positions, starts, sinks,
+        return module._decode_attention(query, key, value, reads, starts, sinks,
                                         route=None if route is None else route.gathered)
 
     def _mixed_positions(self, admitted: Admitted, valid) -> jax.Array:
@@ -1878,8 +1886,8 @@ class CausalSelfAttention(nn.Module):
                                    self.sinks)
             decoded = checkpoint_name(decoded[:, None], Residual.CONTEXT)
         else:
-            decoded = self._decode_attention(query[0, :rows, None], *store.read(), positions[:rows], starts,
-                                             self.sinks)
+            decoded = self._decode_attention(query[0, :rows, None], *store.read(),
+                                             _decode_reads(positions[:rows]), starts, self.sinks)
         queries = query[0, rows:].reshape(pieces, width, *query.shape[2:])
         # A piece over a quantized or rotated cache reads its keys as the cache keeps them, from its row,
         # as its own prefill reads them back (`KVStore.read_rows`).
@@ -1950,7 +1958,7 @@ class CausalSelfAttention(nn.Module):
         return jnp.concatenate([out[:rows, :1].reshape(1, rows, *out.shape[2:]),
                                 out[rows:].reshape(1, pieces * width, *out.shape[2:])], axis=1)
 
-    def _step_route(self, append, query, key, value, positions, starts, sinks) -> _StepRoute:
+    def _step_route(self, append, query, key, value, reads, starts, sinks) -> _StepRoute:
         """The route a plain decode step (`_plain_step`) takes from `starts`, decided and reported nowhere:
         its pool's paged kernel's (`KVStore.paged_route`), and where none takes the step its attention
         call's (`dispatched_route`)."""
@@ -1958,20 +1966,19 @@ class CausalSelfAttention(nn.Module):
                  self._paged_route(append.store, query[:, 0], starts is not None, sinks is not None))
         if paged is not None and append.store.paged_of(paged) is not None:
             return _StepRoute(paged, None)
-        call = self._decode_call(positions, starts, sinks)
+        call = self._decode_call(reads, starts, sinks)
         return _StepRoute(paged, dispatched_route(query, key, value, **call))
 
-    def _decode_call(self, positions, starts, sinks) -> dict:
+    def _decode_call(self, reads, starts, sinks) -> dict:
         """A decode step's attention call past its operands (`_decode_attention`)."""
-        reads = jnp.maximum(positions + 1, 1)
         return {"dtype": self.ctx.dtype, "precision": self.ctx.precision,
                 "force_fp32_for_softmax": self.ctx.force_fp32_for_softmax, "causal": False,
                 "softcap": self.ctx.attn_logit_softcap, "sinks": sinks,
-                "key_value_seq_lengths": reads.astype(jnp.int32), "key_value_seq_starts": starts}
+                "key_value_seq_lengths": reads, "key_value_seq_starts": starts}
 
-    def _decode_attention(self, query, key, value, positions, starts=None, sinks=None, route=None):
+    def _decode_attention(self, query, key, value, reads, starts=None, sinks=None, route=None):
         """One query a row `[rows, 1, heads, head_dim]` over its row of the
-        cache, whose token sits at `positions` `[rows]` (-1 for padding), from
+        cache, reading its first `reads` `[rows]` keys (`_decode_reads`), from
         each row's first key under the layer's window, `starts` `[rows]`
         where it has one, with the layer's `sinks` `[heads]` where it has them.
 
@@ -1987,7 +1994,7 @@ class CausalSelfAttention(nn.Module):
         # The core reads each key head's query heads as its query positions
         # (`decode_geometry.grouped_query`).
         attention = scaled_dot_product_attention(query, key, value, route=route,
-                                                 **self._decode_call(positions, starts, sinks))
+                                                 **self._decode_call(reads, starts, sinks))
         return checkpoint_name(attention, Residual.CONTEXT)
 
     def _paged_kernel(self, store, query, windowed: bool, sunk: bool = False) -> PagedKernel | None:

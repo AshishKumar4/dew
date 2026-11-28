@@ -89,16 +89,20 @@ def _packed_output_params(params: tuple[Side, ...], *, heads: int, kv_heads: int
 
 
 def serves(query: jax.Array, key: jax.Array, hooks: Hooks | None, *, natural: bool,
-           target: generation.GpuTarget) -> bool:
+           target: generation.GpuTarget, excluded: bool = True) -> bool:
     """Whether a call's inference runs as this work list (`attend`) rather than the template's forward: its
     hooks pack (`packable`), its key heads divide its query heads, its form the fold's (the work list folds,
     its natural rewalk its own), and its packed rows a key head too few for the device's products to bound
     its walk (`attention_mosaic.streams`): a decode step's, a speculative verify block's. Its walk derives a
     config wherever the template's forward takes the call (`plan`). A verify block of 4 to 16 drafts a row
     through the forward took 1.1 to 5.9 ms where the work list took 30 us to 1.36 ms on an H100, its query
-    heads read the keys once a key head (ET-VERIFY-h100)."""
+    heads read the keys once a key head (ET-VERIFY-h100). A call that reads a row of no mass NaN (not
+    `excluded`, `KeySpans.excluded`) under an output hook walks whole: a merge's finish fuses the hook before
+    its rows of no mass are read (`_massless_read`)."""
     heads, kv_heads = query.shape[2], key.shape[2]
     if natural or heads % kv_heads or not packable(hooks):
+        return False
+    if not excluded and hooks is not None and hooks.output.fn is not None:
         return False
     batch, positions, _, width = query.shape
     rows = jax.ShapeDtypeStruct((batch, positions * (heads // kv_heads), kv_heads, width), query.dtype)
@@ -493,15 +497,13 @@ def _certified_stream(op: attention_mosaic.MosaicForward, ba, target: generation
 
 def _massless_read(spec: algebra.Forward, out: jax.Array, stacked: jax.Array, initial: Initial | None, *,
                    queries: int, heads: int) -> jax.Array:
-    """A merge's finished `out` `[B, T, heads, Dv]` (`merged.merged_finished`), each row of no mass NaN where
-    the call reads it so (`algebra.Forward.massless_nan`): no slice's denominator (`stacked[1]`
-    `[B, KV, S, R]`) and no initial state's mass beside them, the merge's own finish reading such a row
-    zero."""
-    if not spec.massless_nan:
+    """A merge's finished `out` `[B, T, heads, Dv]` (`merged.merged_finished`, of no output hook: `serves`),
+    each row of no mass NaN where the call reads it so (`algebra.Forward.massless_nan`, a call from no
+    `initial` state): no slice's denominator (`stacked[1]` `[B, KV, S, R]`), which the merge's own finish
+    reads zero."""
+    if not spec.massless_nan or initial is not None:
         return out
     empty = jnp.all(stacked[1][..., :queries] == 0, axis=2)
-    if initial is not None:
-        empty &= ((initial.total == 0) | (initial.m == -jnp.inf))[..., :queries]
     rows = ungrouped_rows(jnp.swapaxes(empty, 1, 2)[..., None], heads)
     return jnp.where(rows, jnp.nan, out)
 
@@ -612,8 +614,11 @@ def _planned_step(query: jax.Array, key: jax.Array, value: jax.Array, spans: Key
                              bounded=chosen.bounded, masked=hooks.output.fn is None)
             return ungrouped_rows(out, heads)
         stateless = dataclasses.replace(whole, initial=None, output=NO_HOOK)
+        # The slices' rows of no mass their merge reads (`_massless_read`, `nan_massless`), each slice's state
+        # as it is, one slice's too.
+        sliced = dataclasses.replace(row_spans, excluded=True)
         with tuning.pinned({attention_mosaic.MosaicForward: at.config}):
-            walked_out = launch(rows, key, value, row_spans, stateless, residuals=Kept.OUTPUT,
+            walked_out = launch(rows, key, value, sliced, stateless, residuals=Kept.OUTPUT,
                                 out_dtype=jnp.float32, splits=at.slices, scaled=chosen.scaled,
                                 bounded=chosen.bounded, masked=True)
         spec = merge_spec(rows, row_spans, whole, scale=scale)
@@ -638,7 +643,7 @@ def _planned_step(query: jax.Array, key: jax.Array, value: jax.Array, spans: Key
         else:
             state = merged.merged_split(spec, padded, stacked, queries=queries, width=width, initial=initial)
         if finished:
-            state = algebra.nan_massless(spec, state)
+            state = state if initial is not None else algebra.nan_massless(spec, state)
             return ungrouped_rows(algebra.finish(spec, state, initial=True, normalized=True)[0],
                                   heads).astype(query.dtype)
         return _unpacked_state(resumable(spec, state), heads)

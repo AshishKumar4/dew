@@ -53,8 +53,8 @@ from dew.nn.derivatives import KernelGlue, contracted, with_gradients_formed_at
 from dew.nn.fake_quant import E4M3_MAX
 from dew.nn.host_memory import fetched, fetched_at, on_host, placed_like, stored_at
 from dew.nn.kernels import decode_attention, generation
-from dew.nn.kernels.generation import INHERENT, Choice, Route, backend
-from dew.nn.kernels.selection import Kernel, Op, Requirement, decided, select
+from dew.nn.kernels.generation import INHERENT, Choice, Route, backend, published
+from dew.nn.kernels.selection import Kernel, Op, Requirement, decided
 from dew.nn.kernels.templates.hooks import Hook
 from dew.nn.precision import EXACT_FLOAT32, at_least_fp32, declares_fp32_products, divided, float32_einsum
 from dew.nn.protocols import computes_in
@@ -1114,9 +1114,8 @@ class KVStore:
         """The paged kernel the selector gives a decode step's query over this pool (`PAGED`, over its one
         `case`), reported as the step's route, which `decode` runs; None where no paged kernel takes it and
         the layer reads the gathered rows itself."""
-        kernel = select(PAGED, self.case(query, softcap=softcap, arithmetic=arithmetic, named=named,
-                                         windowed=windowed, sinks=sinks)).kernel
-        return kernel if _is_paged_kernel(kernel) else None
+        return self.paged_of(published(self.paged_route(query, softcap=softcap, arithmetic=arithmetic,
+                                                        named=named, windowed=windowed, sinks=sinks)))
 
     def paged_route(
         self, query: jax.Array, *, softcap: float | None, arithmetic: bool, named: str,

@@ -1099,21 +1099,23 @@ ahead of the reference path,
 whose scores are whole, where every kernel before it refuses the call."""
 
 
-def keeps_reference_rows(kernel: str, *, masked: bool, filled: bool) -> bool:
+def keeps_reference_rows(kernel: str, *, masked: bool, filled: bool, sunk: bool) -> bool:
     """Whether every arm of the attention kernel named `kernel`, its forward and its derivatives, reads each
     row of a call as the call's reference path does (`reference_attention`): a row of no mass (its every
     logit -inf) NaN where that reads it NaN and zero where it excludes it (row 14116), for a call that hides
-    keys (`masked`) or fills them (`filled`, `mask_fill`) or neither. The reference path for every call; the
-    template for a call of no fill (its spans' exclusion, `KeySpans.excluded`; a -inf fill's call is its
-    masked walk, whose row of no mass that sees a key reads zero); xla's attention and the inference route
-    (the template's forward, xla's derivatives) for a call of no mask and no fill, jax.nn's softmax op for
-    op; no other: FlashAttention and cuDNN read such a row zero, Triton's kernel and Splash take no bias. The
-    one statement a rewrite onto a kernel reads (`dew.algebra.recognize`)."""
+    keys (`masked`), fills them (`filled`, `mask_fill`) or has sinks (`sunk`), or none of them. The reference
+    path for every call; the template for a call of no fill and no sinks (its spans' exclusion,
+    `KeySpans.excluded`; a -inf fill's call is its masked walk, whose row of no mass that sees a key reads
+    zero, and a sink's state its own, a row of no mass from it zero where the reference's softmax over a
+    -inf sink reads NaN); xla's attention and the inference route (the template's forward, xla's
+    derivatives) for a call of none of them, jax.nn's softmax op for op; no other: FlashAttention and cuDNN
+    read such a row zero, Triton's kernel and Splash take no bias. The one statement a rewrite onto a kernel
+    reads (`dew.algebra.recognize`)."""
     if kernel == 'reference':
         return True
     if kernel == 'template':
-        return not filled
-    return kernel in ('xla', 'inference') and not masked and not filled
+        return not filled and not sunk
+    return kernel in ('xla', 'inference') and not masked and not filled and not sunk
 
 
 def reverse_only(kernel: str) -> bool:

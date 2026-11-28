@@ -1398,8 +1398,8 @@ def reference(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpan
     logits, the softmax from `hooks.initial` in fp32 (or the wider of the inputs' and the state's dtypes),
     the probabilities rounded to the values' dtype for their product, the output normalized in fp32 and
     `output_mod` applied before it rounds to the query's dtype. A query that sees no key and starts from
-    no state gives zeros where its spans exclude it (`KeySpans.excluded`); elsewhere one that weighs none of
-    its keys (every logit -inf, or none it sees) gives NaN, as jax.nn's softmax does, its denominator NaN.
+    no state gives zeros where its spans exclude it (`KeySpans.excluded`); elsewhere one from no state that
+    weighs none of its keys (every logit -inf) gives NaN, as jax.nn's softmax does, its denominator NaN.
     With `residuals`, also each query's
     running maximum `m` and denominator `total` `[B, H, Q]` (natural log, unnormalized), in the softmax's
     dtype, a query that sees no key and starts from no state holding 0 for both; a softmax resumed from them
@@ -1434,7 +1434,7 @@ def reference(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpan
     # A row of no mass of a call its spans do not exclude (`KeySpans.excluded`) reads NaN, its value and its
     # derivative, as jax.nn's softmax reads it (`attention_algebra.Forward.massless_nan`, row 14116): its
     # sums over a NaN, which no other row's derivative meets.
-    massless = (total == 0) if not spans.excluded and spans.keys > 0 else None
+    massless = (total == 0) if not spans.excluded and spans.keys > 0 and hooks.initial is None else None
 
     def valued(weights: jax.Array, *, bound: float | None = None) -> jax.Array:
         # The weights narrowed to the values' dtype times the values, a query group's over its key head.
