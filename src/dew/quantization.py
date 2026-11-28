@@ -1050,7 +1050,8 @@ def _cast(qwix: ModuleType, quotients: jax.Array, qtype: jax.typing.DTypeLike):
     clamped to its bound (`dew.nn.fake_quant.fp8_codes`, `fp4_codes`), and cast to `qtype` as a Qwix
     QArray of unit scale: a fixed range of the type's own bound gives a scale of exactly one (448 over
     E4M3's 448, 6 over E2M1's 6), so the cast takes values the type holds, exactly on every backend, and
-    the caller sets the real scale. The type's rounding is Dew's arithmetic, not the cast's: XLA:CPU
+    the caller sets the real scale. The type's rounding is Dew's (`fake_quant`'s arithmetic, or on CUDA its
+    E4M3 convert held by a barrier, bit for bit the same), not a bare cast's: XLA:CPU
     converts a hoisted small loop's float32 to E2M1 through float16, rounding twice (-0.25004873 to
     -0.25, then to -0, where E2M1's nearest is -0.5), and XLA GPU's default excess precision deletes a
     float32 -> narrow -> float32 convert pair (`dew.nn.fake_quant`). NVFP4 names its 16-wide blocks
