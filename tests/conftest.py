@@ -308,6 +308,14 @@ def pytest_runtest_setup(item):
     if jax.device_count() < needed:
         pytest.skip(f"needs a {needed}-device mesh; this run has "
                     f"{jax.device_count()} {jax.default_backend()} device(s)")
+    # A GPU tier part, its prepare and its run alike (`tier_wire.TRUTHS`), runs its files' gpu-marked tests
+    # alone: a file enters the tier where any of its tests is marked so (tools/armada/prepares.py's
+    # `tier_files`), and the rest are the CPU lane's, which runs them already, never the tier's twice over
+    # (1,568 of the tier's 1,862 tests, 2026-11-28), nor prepared on its compute-nothing device, where one
+    # that reads its devices failed the part's prepare (#4577's test_dc_ae.py, train 1448's
+    # test_bf16_window.py). A test whose GPU run matters says so with the mark.
+    if tier_wire.TRUTHS in os.environ and item.get_closest_marker("gpu") is None:
+        pytest.skip("the CPU lane's: a GPU tier part runs its files' gpu-marked tests alone")
     users = os.environ.get(lane_environment.USERS_ARITHMETIC) == "1"
     if item.get_closest_marker("gpu") and users != bool(item.get_closest_marker("users_process")):
         # A GPU test runs in the process of its variant alone (tests/model_flows.py): XLA parses a process's

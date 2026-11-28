@@ -111,6 +111,33 @@ def test_a_gpu_lane_given_the_whole_gpu_hands_its_files_jaxs_default_share(ci, t
     assert float(share) == float(ci.WHOLE_GPU)
 
 
+@pytest.mark.parametrize("phase", ["prepare", "run", "cpu lane"])
+def test_a_gpu_tier_part_runs_its_files_gpu_marked_tests_alone(tmp_path, phase):
+    """The suite's conftest: a GPU tier part (its store named, `tier_wire.TRUTHS`), its prepare and its run
+    alike, runs a file's gpu-marked tests alone and skips the rest as the CPU lane's, so a CPU test in a file
+    that also holds a GPU one is neither prepared on the tier's compute-nothing device (#4577, train 1448) nor
+    run on a GPU beside the CPU lane's run of it; the CPU lane, naming no store, runs them as ever."""
+    site = tmp_path / "test_mixed.py"
+    site.write_text("import pytest\n\n\n@pytest.mark.gpu\ndef test_gpu():\n    pass\n\n\n"
+                    "def test_cpu():\n    pass\n")
+    tests = Path(__file__).resolve().parent
+    environ = {key: value for key, value in os.environ.items()
+               if key not in (tier_wire.TRUTHS, tier_wire.PREPARE)}
+    environ["PYTHONPATH"] = os.pathsep.join([str(tests), os.environ.get("PYTHONPATH", "")])
+    if phase != "cpu lane":
+        environ[tier_wire.TRUTHS] = str(tmp_path / "truths")
+    if phase == "prepare":
+        environ[tier_wire.PREPARE] = "1"
+    # The GPU test deselected: here is no GPU; the CPU test's fate is the conftest's.
+    done = subprocess.run([sys.executable, "-m", "pytest", "-q", "-rs", "-p", "conftest", "-p",
+                           "no:cacheprovider", "--deselect", f"{site}::test_gpu", str(site)],
+                          cwd=tmp_path, env=environ, capture_output=True, text=True)
+    if phase == "cpu lane":
+        assert "1 passed" in done.stdout, done.stdout
+    else:
+        assert "1 skipped" in done.stdout and "the CPU lane's" in done.stdout, done.stdout
+
+
 def test_a_lanes_prepare_runs_on_the_cpu_what_its_run_will_hold_and_records_nothing(
         ci, tmp_path, monkeypatch, cache_worker):
     """A lane's prepare (`gpu-lane --prepare`) runs every file of its part, on the CPU under the prepare's
