@@ -713,7 +713,21 @@ def _of_its_inputs(label: str, name: str, fn, inputs, first) -> None:
         why = next(layer.why for layer in _layers(fn) if isinstance(layer, _RunToRun))
         _logged(label, 0, f"{name} not repeated: declared to vary from run to run ({why})", [])
         return
-    if (where := _same_bits(first, fn(*inputs))) is not None:
+    second = fn(*inputs)
+    if (where := _same_bits(first, second)) is not None:
+        if label.startswith("parallax's"):
+            def select(value):
+                return next(np.asarray(leaf).ravel().view(np.uint32)
+                            for path, leaf in jax.tree_util.tree_leaves_with_path(value)
+                            if jax.tree_util.keystr(path) == where)
+
+            left, right = select(first), select(second)
+            indices = np.flatnonzero(left != right)
+            examples = indices[:12]
+            following = [second, *(fn(*inputs) for _ in range(6))]
+            bits = [[hex(int(x)) for x in select(out)[examples]] for out in (first, *following)]
+            print(f"PLX-DIFF {label} {where} n={indices.size} indices={examples.tolist()} bits={bits}",
+                  flush=True)
         raise UnpairedDraw(f"{label}: {name} differs at {where} run again on the same inputs, so its output "
                            f"depends on more than them")
 
