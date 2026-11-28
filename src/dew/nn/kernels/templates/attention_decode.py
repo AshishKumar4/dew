@@ -466,6 +466,10 @@ def _stream_op(query, key, value, spans: KeySpans, hooks: Hooks | None, *, scale
     None) over `splits` slices (`in_key` its values' stream or the key's slot), and its bound arguments,
     deriving none."""
     masked = hooks is None or hooks.output.fn is None
+    if out_dtype is not None:
+        # A merge's slices (`Kept.OUTPUT`) keep each slice's state, a row of no mass the merge's to read
+        # (`_massless_read`): planned and launched as one op (`walked`'s pin).
+        spans = dataclasses.replace(spans, excluded=True)
     op, args = attention_mosaic._forward_call(query, key, value, spans, hooks, scale=scale, natural=False,
                                               out_dtype=out_dtype, masked=masked, splits=splits, table=table,
                                               sources=sources, subtracted=True, scales=scales,
@@ -615,8 +619,7 @@ def _planned_step(query: jax.Array, key: jax.Array, value: jax.Array, spans: Key
                              bounded=chosen.bounded, masked=hooks.output.fn is None)
             return ungrouped_rows(out, heads)
         stateless = dataclasses.replace(whole, initial=None, output=NO_HOOK)
-        # The slices' rows of no mass their merge reads (`_massless_read`, `nan_massless`), each slice's state
-        # as it is, one slice's too.
+        # Each slice's state as it is, as its plan's op takes them (`_stream_op`).
         sliced = dataclasses.replace(row_spans, excluded=True)
         with tuning.pinned({attention_mosaic.MosaicForward: at.config}):
             walked_out = launch(rows, key, value, sliced, stateless, residuals=Kept.OUTPUT,
