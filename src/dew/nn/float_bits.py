@@ -122,7 +122,17 @@ def largest_magnitude(x: jax.Array, axis: int | tuple[int, ...] | None = None, *
     x64 whatever x64 scope it is called in (outside one, a 64-bit word is two 32-bit ones)."""
     with jax.enable_x64(new_val=True) if x.dtype == np.dtype(np.float64) else contextlib.nullcontext():
         words, sign, _, _ = raw_fields(x)
-        return jax.lax.bitcast_convert_type(jnp.max(words ^ sign, axis=axis, keepdims=keepdims), x.dtype)
+        magnitude = words ^ sign
+        if jnp.dtype(x.dtype).name.endswith("fnuz"):
+            # A format with no -0 (FNUZ) holds its NaN in the sign bit alone, a magnitude word of zero: read
+            # above every finite one, and stored back as that NaN.
+            top, nan = np.iinfo(words.dtype).max, 1 << (jnp.finfo(x.dtype).bits - 1)
+            peak = jnp.max(jnp.where(words == nan, words.dtype.type(top), magnitude), axis=axis,
+                           keepdims=keepdims)
+            peak = jnp.where(peak == top, words.dtype.type(nan), peak)
+        else:
+            peak = jnp.max(magnitude, axis=axis, keepdims=keepdims)
+        return jax.lax.bitcast_convert_type(peak, x.dtype)
 
 
 def split_bits(dtype) -> tuple[type, int, int]:

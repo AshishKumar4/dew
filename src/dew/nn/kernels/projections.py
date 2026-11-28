@@ -263,10 +263,11 @@ def blocks_quantized(w: jax.Array, *, k_major: bool = False) -> tuple[jax.Array,
     scale (`[groups, depth / 128, width / 128]` fp32); the codes K-major (`[groups, width, depth]`, as a
     step-scaled product streams its matrix) where `k_major`. Each block's largest magnitude reduced at `w`'s
     own width in two contiguous passes (`float_bits.largest_magnitude`: each row's 128 columns, then each
-    block's 128 rows), apart from the codes, each value over its block's scale spread back over the block,
-    so no pass reads the matrix transposed but a K-major one's codes, written transposed as they are formed
+    block's 128 rows), apart from the codes, each value over its block's scale broadcast over the block, so
+    no pass reads the matrix transposed but a K-major one's codes, written transposed as they are formed
     (row 4518: one reduction over a block's both axes shared the codes' fp32 matrix, which XLA then wrote
-    through a 6.7 ms transposing fusion of an 8.8 ms quantization on a GH200, M-NG-67f)."""
+    through a 6.7 ms transposing fusion of an 8.8 ms quantization on a GH200, M-NG-67f). A depth an
+    Explicit axis splits in whole blocks keeps its split."""
     from dew.nn import fake_quant
     from dew.nn.float_bits import largest_magnitude
 
@@ -275,11 +276,11 @@ def blocks_quantized(w: jax.Array, *, k_major: bool = False) -> tuple[jax.Array,
     rows = largest_magnitude(w.reshape(groups, depth, width // edge, edge), -1)
     amax = largest_magnitude(rows.reshape(groups, depth // edge, edge, width // edge), 2)
     scale = fake_quant.fp8_block_scale(amax.astype(at_least_fp32(w.dtype)))
-    spread = jnp.repeat(jnp.repeat(scale, edge, axis=1), edge, axis=2)
-    wide = w.astype(at_least_fp32(w.dtype))
+    tiles, spread = w.reshape(groups, depth // edge, edge, width // edge, edge), scale[:, :, None, :, None]
     if k_major:
-        wide, spread = jnp.swapaxes(wide, 1, 2), jnp.swapaxes(spread, 1, 2)
-    return fake_quant.fp8_codes(wide / spread).astype(jnp.float8_e4m3fn), scale
+        tiles, spread = tiles.transpose(0, 3, 4, 1, 2), spread.transpose(0, 3, 4, 1, 2)
+    codes = fake_quant.fp8_codes(tiles.astype(at_least_fp32(w.dtype)) / spread)
+    return codes.reshape((groups, width, depth) if k_major else w.shape).astype(jnp.float8_e4m3fn), scale
 
 
 def _quantized_rows_product(rows, rows_scales, w, sizes, out_dtype, interpret) -> jax.Array:
