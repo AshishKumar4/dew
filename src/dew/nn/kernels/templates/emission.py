@@ -1532,8 +1532,8 @@ def launch_programs(kernel) -> int:
 
 def launch_work(kernel, stated: Stated) -> Work:
     """A kernel equation's work from its body's emission, a launch's: each unit's, a step's `stated.steps`
-    times and the rest each program's (`Emitted.issued`), the bytes it states its device's and the bytes its
-    copies read beyond them its L2's (`Work.l2_bytes`), its span the
+    times and the rest each program's (`Emitted.issued`), the bytes it states its device's and its copies'
+    bytes past its operands' and outputs' whole its L2's (`Work.l2_bytes`), its span the
     steps its longest program walks (`Stated.longest`, else their mean), and one kernel. Its cost
     estimate's (`_estimate`) and a step's price (`work_of`, `attention_decode.priced_step`) alike."""
     return _launched(kernel, stated)[0]
@@ -1555,11 +1555,14 @@ def _launched(kernel, stated: Stated) -> "Launched":
     # The steps on its critical path: its longest program's walk where it states one, else their mean.
     walked = stated.steps / programs if stated.longest is None else stated.longest
 
-    # Its operands' and outputs' bytes once (compulsory), and what its copies read beyond them again, in
-    # the L2 (row 14180: a tile's repeated reads of an operand other programs read).
+    # Its compulsory bytes the ones it states; its copies' bytes past every operand and output it holds,
+    # each whole once, read again from the L2 (row 14180: a tile's repeated reads of an operand other
+    # programs read). Past them, so at most its rereads: a write or a first read a statement omits is no
+    # reread, and an operand read in part only hides another's.
+    footprint = sum(_bytes(var.aval) for var in (*kernel.invars, *kernel.outvars))
     copied = counted.issued(lambda work: work.device_bytes, stated.steps, programs)
     work = Work(**{unit: issued(unit) for unit in ISSUED_UNITS if unit != "issue_excess"},
-                device_bytes=stated.bytes_accessed, l2_bytes=max(0.0, copied - stated.bytes_accessed),
+                device_bytes=stated.bytes_accessed, l2_bytes=max(0.0, copied - footprint),
                 span=walked, kernels=1, chains=counted.paths(walked))
     # Its walking roles' issue slots, the most one of them issues a step (`Work.issue_excess`).
     issuing = counted.issued(issue_slots, stated.steps, programs)

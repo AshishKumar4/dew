@@ -1659,33 +1659,38 @@ def test_an_atomic_add_counts_its_bytes_reduced_where_global_and_an_a100_prices_
     assert work.global_reductions in cost.units(work, cost.rates(hopper, device=False))[1]
 
 
-def test_a_launchs_copies_past_its_stated_bytes_are_its_l2_traffic_priced_at_the_l2():
-    """A launch's copies reading its row twice count twice its bytes (`emission.launch_work`); past the
-    bytes it states (its operands' and outputs' once, compulsory), they are its L2 traffic
-    (`Work.l2_bytes`), none where it states them all. That traffic prices at the part's measured L2 read
-    plateau (an RTX PRO 6000's, M-FS-113) beside its compulsory bytes at its stream, as one memory's two
-    levels, and at none where the part measured no L2 (row 14180)."""
-    def body(row, out, staged, barrier):
-        for _ in range(2):
-            plgpu.copy_gmem_to_smem(row, staged, barrier)
-            plgpu.barrier_wait(barrier)
-        plgpu.copy_smem_to_gmem(staged, out)
-        plgpu.wait_smem_to_gmem(0)
+def test_a_launchs_copies_past_its_buffers_whole_are_its_l2_traffic_priced_at_the_l2():
+    """A launch reading its 512-byte row twice and writing it once copies 1536 bytes, 512 past its row and
+    its output whole: its L2 traffic (`Work.l2_bytes`), whatever bytes it states its compulsory ones
+    (`Work.device_bytes`); reading it once copies none past them, though it states its row's bytes alone (a
+    write a statement omits is no reread). Its rereads price at the part's measured L2 read plateau (an RTX
+    PRO 6000's, M-FS-113) beside its stated bytes at its stream, one memory's two levels, and at none where
+    the part measured no L2 (row 14180)."""
+    def launched(reads: int):
+        def body(row, out, staged, barrier):
+            for _ in range(reads):
+                plgpu.copy_gmem_to_smem(row, staged, barrier)
+                plgpu.barrier_wait(barrier)
+            plgpu.copy_smem_to_gmem(staged, out)
+            plgpu.wait_smem_to_gmem(0)
 
-    launch = plgpu.kernel(body, out_type=_ROW, num_threads=1, thread_name="wg",
-                          scratch_types=[plgpu.SMEM((128,), jnp.float32), plgpu.Barrier()])
-    traced = jax.make_jaxpr(launch)(_ROW).jaxpr
-    (kernel,) = [equation for equation in programs.equations(traced)
-                 if equation.primitive.name in ("mpmd_map", "pallas_call")]
-    copied = emission.launch_work(kernel, Stated(steps=0, bytes_accessed=0)).l2_bytes
-    once = 2 * 128 * 4
-    assert copied > once
-    work = emission.launch_work(kernel, Stated(steps=0, bytes_accessed=once))
-    assert (work.device_bytes, work.l2_bytes) == (once, copied - once)
-    assert emission.launch_work(kernel, Stated(steps=0, bytes_accessed=int(copied))).l2_bytes == 0
+        launch = plgpu.kernel(body, out_type=_ROW, num_threads=1, thread_name="wg",
+                              scratch_types=[plgpu.SMEM((128,), jnp.float32), plgpu.Barrier()])
+        (kernel,) = [equation for equation in programs.equations(jax.make_jaxpr(launch)(_ROW).jaxpr)
+                     if equation.primitive.name in ("mpmd_map", "pallas_call")]
+        return kernel
+
+    row = 128 * 4
+    twice, once = launched(2), launched(1)
+    for stated in (0, row, 4 * row):
+        work = emission.launch_work(twice, Stated(steps=0, bytes_accessed=stated))
+        assert (work.device_bytes, work.l2_bytes) == (stated, row)
+    assert emission.launch_work(once, Stated(steps=0, bytes_accessed=row)).l2_bytes == 0
     g4, h100 = (generation.gpu_target(kind) for kind in ("NVIDIA RTX PRO 6000 Blackwell Server Edition",
                                                        "NVIDIA H100 80GB HBM3"))
-    traffic = Work(device_bytes=2.0 ** 30, l2_bytes=2.0 ** 33)
-    stream = 2.0 ** 30 / g4.memory_rate
-    assert cost.seconds(traffic, g4) == stream + 2.0 ** 33 / g4.l2_rate
-    assert cost.seconds(traffic, h100) == cost.seconds(Work(device_bytes=2.0 ** 30), h100)
+    work = emission.launch_work(twice, Stated(steps=0, bytes_accessed=2 * row))
+    (g4_seconds, g4_unpriced), (h100_seconds, h100_unpriced) = (
+        cost.units(work, cost.rates(target, device=True)) for target in (g4, h100))
+    assert g4_seconds.device == 2 * row / g4.memory_rate + row / g4.l2_rate
+    assert h100_seconds.device == 2 * row / h100.memory_rate
+    assert not any(g4_unpriced) and not any(h100_unpriced)

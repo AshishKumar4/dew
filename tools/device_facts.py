@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """A GPU's memory facts as its kernels meet them, measured rather than read off its datasheet (row 3612): the
-device seconds one kernel takes to stream N bytes from cold HBM, against N, and the fit `seconds = fixed +
-bytes / plateau` over them (a copy's over the sizes past the L2, whose writes it holds below); the same read
-of an array the L2 holds, warm, and its fit over 4 MiB to half the L2, where a launch's floor no longer
+device seconds one kernel takes to stream N bytes from cold HBM, against N, and the read's fit `seconds =
+fixed + bytes / plateau` over them (a copy's points kept unfitted: its timed interval ends before its writes
+leave the L2, an RTX PRO 6000's fit a fixed time below zero, M-FS-113); the same read of an array the L2
+holds, warm, and its fit over 4 MiB to half the L2, where a launch's floor no longer
 dominates it (the L2's plateau, the rate a tile's repeated reads meet: rows 12699, 14180); with the least
 kernel's seconds (a launch's floor on the device), and the wall
 seconds a launch adds to a program that runs kernels one after another and a hand-off's between two programs
@@ -143,10 +144,8 @@ def main() -> None:
         hop, _ = np.polyfit([count for count, _ in trips], [seconds for _, seconds in trips], 1)
         facts["handoff"] = {"seconds": float(hop), "points": [{"round_trips": count, "seconds": seconds}
                                                               for count, seconds in trips]}
-    for name, moved, least_bytes in (("read", 1, 0), ("copy", 2, l2_bytes)):
-        fixed, plateau = fitted([(row["bytes"] * moved, row[name]["seconds"]) for row in rows
-                                 if row["bytes"] >= least_bytes])
-        facts[name] = {"fixed_seconds": fixed, "plateau_bytes_per_second": plateau}
+    fixed, plateau = fitted([(row["bytes"], row["read"]["seconds"]) for row in rows])
+    facts["read"] = {"fixed_seconds": fixed, "plateau_bytes_per_second": plateau}
     fitting = [(point["bytes"], point["seconds"]) for point in held if point["bytes"] >= L2_FITTED]
     if len(fitting) > 1:
         fixed, plateau = fitted(fitting)

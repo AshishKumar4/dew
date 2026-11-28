@@ -149,10 +149,10 @@ class Work:
     conversions: float = 0.0
     device_bytes: float = dataclasses.field(default=0.0, metadata=_NOT_ISSUED)
     l2_bytes: float = dataclasses.field(default=0.0, metadata=_NOT_ISSUED)
-    """The bytes a launch's copies move beyond its operands' and outputs' once (`device_bytes`, compulsory):
-    a tile's repeated reads of an operand other programs read, met in the L2 (`GpuTarget.l2_rate`), the
-    device memory's own unit's rate a level up (`units`: row 14180, the two-level memory a launch's body
-    counts)."""
+    """The bytes a launch's copies move past its operands' and outputs' whole, each once
+    (`emission.launch_work`), so at most its rereads: a tile's repeated reads of an operand other programs
+    read, met in the L2 (`GpuTarget.l2_rate`), the device memory's own unit's rate a level up (`units`:
+    row 14180, the two-level memory a launch's body counts)."""
     shared_bytes: float = 0.0
     tf32_flops: float = 0.0
     span: float = dataclasses.field(default=0.0, metadata=_NOT_ISSUED)
@@ -296,6 +296,8 @@ def rates(target: generation.GpuTarget, *, device: bool) -> Rates:
                  integer=rate(architecture.integer_per_clock),
                  multiply_adds=rate(architecture.integer_multiply_adds_per_clock),
                  device=target.memory_rate if device else math.inf,
+                 # A part with no measured L2 prices its rereads at none, as every part did before row
+                 # 14180, rather than leave every candidate with rereads priced in part (`units`' second).
                  l2=(target.l2_rate or math.inf) if device else math.inf,
                  reductions=rate(architecture.global_reduction_bytes_per_clock), issue=issue,
                  fused=rate(vector) if held is None else math.inf)
