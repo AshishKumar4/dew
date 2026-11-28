@@ -226,10 +226,6 @@ def moments(logits: jax.Array, seconds: jax.Array, value: jax.Array, powers: jax
     seen, below, total, over = tile.seen, tile.below, tile.total, tile.over
     weights = tile.masses / over
 
-    def weighed(w, x):
-        return float32_einsum("bhgqk,bkhd->bhgqd", w, x, precision=REFERENCE_PRECISION,
-                              preferred_element_type=x.dtype)
-
     # The values' mean in two tiers: the weights fp32 holds normally as they are, and those below `e^-80`
     # raised by their row's power first (decayed whole, `exp_scaled`) and the power taken off their sum,
     # so a weight of `e^-128` over a value of `2^127` keeps its product, `2^127 e^-128`, where the weight
@@ -241,8 +237,8 @@ def moments(logits: jax.Array, seconds: jax.Array, value: jax.Array, powers: jax
     tail_pairs = jnp.where(seen & tail, _reach(below) + valued, _NONE)
     raised = jnp.clip(126 - width - jnp.max(tail_pairs, axis=-1), 0, 241)[..., None]
     lifted = jnp.where(tail, exp_scaled(jnp.broadcast_to(1.0 / over, below.shape), below, raised), 0.0)
-    mean = (weighed(jnp.where(tail, 0.0, weights), value)
-            + _shifted(weighed, lifted, value, -raised, 0, (0, 0)))
+    mean = (_weighed(jnp.where(tail, 0.0, weights), value)
+            + _shifted(_weighed, lifted, value, -raised, 0, (0, 0)))
     hi, lo, apart = tile.hi, tile.lo, tile.apart
     # Each value channel taken to its own largest power first (`_channel_powers`), so its values and mean
     # are at most 1 and one channel's `2^127` takes no other's `2^-124` below fp32's least (train 1444's
@@ -260,17 +256,12 @@ def moments(logits: jax.Array, seconds: jax.Array, value: jax.Array, powers: jax
     before = jnp.maximum(jnp.minimum(units, 0), -60)
     taken = exp_scaled(apart / over, below, (before - power)[..., None])
 
-    def covariance(terms, centred):
-        # `Σ ũ (v / 2 - a / 2)`, bilinear in the terms and the halved values and mean.
-        values, means = centred
-        return weighed(terms, values) - jnp.sum(terms, axis=-1)[..., None] * means
-
     # A key no query sees weighs nothing in the covariance: its value 0, never one past its channel's power.
     halves = (power2(jnp.where(visible, value, 0.0), -channels) * 0.5, power2(mean, -rows) * 0.5)
     # Its power from the covariance at the lifted units, the covariance then taken to it whole (`_shifted`).
     lift = (units - before)[..., None]
-    spread_power = _spread_power(jax.lax.stop_gradient(covariance(taken, halves)), lift + rows)
-    spread = _shifted(covariance, taken, halves, lift, rows - spread_power, ((channels, rows), rows))
+    spread_power = _spread_power(jax.lax.stop_gradient(_covariance(taken, halves)), lift + rows)
+    spread = _shifted(_covariance, taken, halves, lift, rows - spread_power, ((channels, rows), rows))
     return Moments(jnp.max(logits, axis=-1), total, mean, (hi, lo), spread, spread_power)
 
 
@@ -305,6 +296,21 @@ def _centred_tile(logits: jax.Array, seconds: jax.Array) -> _Tile:
     lo = jnp.sum(exp_scaled((seconds - hi[..., None]) / over, below, 0), axis=-1)
     apart = jnp.where(seen, (seconds - hi[..., None]) - lo[..., None], 0.0)
     return _Tile(seen, below, masses, total, over, hi, lo, apart)
+
+
+def _weighed(weights: jax.Array, value: jax.Array) -> jax.Array:
+    """A row's weights `[B, Hk, G, Q, K]` times a tile's values `[B, K, Hk, Dv]`, summed over the keys. A
+    module function, as `_shifted`'s product: a surrogate's held rule is keyed by its static arguments, which
+    a closure made each trace named apart only by an identity its garbage hands on (a mean's program
+    replayed for a covariance, train 1444's re-review's flake)."""
+    return float32_einsum("bhgqk,bkhd->bhgqd", weights, value, precision=REFERENCE_PRECISION,
+                          preferred_element_type=value.dtype)
+
+
+def _covariance(terms: jax.Array, centred: tuple[jax.Array, jax.Array]) -> jax.Array:
+    """`Σ ũ (v / 2 - a / 2)`, bilinear in the terms and the halved values and mean `centred` (`moments`)."""
+    values, means = centred
+    return _weighed(terms, values) - jnp.sum(terms, axis=-1)[..., None] * means
 
 
 def _channel_powers(value: jax.Array, seen: jax.Array) -> tuple[jax.Array, jax.Array, jax.Array]:
