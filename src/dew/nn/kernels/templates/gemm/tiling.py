@@ -10,7 +10,7 @@ import jax
 from jax import numpy as jnp
 
 from dew.nn.kernels import generation
-from dew.nn.kernels.templates import base, mosaic, resources, stores
+from dew.nn.kernels.templates import base, resources, stores
 
 GMM = "dew_gmm"
 """The name of a product's kernel (`gmm`), its producer's registers `Tiles.producers`' by it."""
@@ -163,10 +163,6 @@ class Tiles:
         return next((refusal for output in outputs if (refusal := stores.staging_refusal(
             columns, (output.dtype,), self.staging, piece=piece,
             packed=(output,) if output.divisor > 1 or output.transposed else ())) is not None), None)
-
-
-ACCUMULATOR_COLUMNS = mosaic.ACCUMULATOR_COLUMNS
-"""`mosaic.ACCUMULATOR_COLUMNS`: the least columns a tile's width steps by (`derivation`)."""
 
 
 CONSUMERS = 2
