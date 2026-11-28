@@ -53,15 +53,7 @@ from dew.nn.precision import (
     rounds_products,
 )
 from dew.nn.residuals import Residual, recomputed_memory
-from dew.nn.sharding import (
-    HEADS,
-    grouped_heads,
-    manual_map,
-    rows_like,
-    rows_spec,
-    shard_shapes,
-    varying_like,
-)
+from dew.nn.sharding import HEADS, grouped_heads, manual_map, rows_like, rows_spec, shard_shapes, varying_like
 
 from . import fla_gdn, fla_kda, generation, mamba_ssd, recurrence, recurrence_algebra as algebra
 from .chunked_launch import Forked, zero_padded
@@ -360,7 +352,7 @@ def chunk(hooks: recurrence.Hooks, operands: Chunk, *, chunk_size: int = CHUNK_S
 
 
 def _on_kernels(hooks: recurrence.Hooks, given: dict, laid: tuple, forked, *, erase: tuple, max_segments,
-                scale, chunk_size: int, work, dtype, readout: bool, apart: bool, normed: bool):
+                scale, chunk_size: int, work, dtype, readout: bool, apart: int, normed: bool):
     """`chunk`'s recurrence on the kernel the delta rule's selector gives each product (`GATED_DELTA`), over
     its `laid` operands `(query, key, value, g, beta, state, starts, firsts)`: the forms its kernels do not
     run hand over to the portable math there, reported as the call's route. A kernel's output unrounded, as
@@ -392,8 +384,8 @@ def _on_kernels(hooks: recurrence.Hooks, given: dict, laid: tuple, forked, *, er
     # Without the delta rule the template takes the skip, its output wide where an epilogue or the caller
     # reads it so (`chunk_forward.forward`).
     fused_wide = wide_out if hooks.delta else epilogue
-    forms = dict(max_segments=max_segments, scale=scale, rounded=rounded, values_gated=values_gated,
-                 unit_pairs=unit_pairs, decay_bound=decay_bound)
+    forms = {"max_segments": max_segments, "scale": scale, "rounded": rounded, "values_gated": values_gated,
+             "unit_pairs": unit_pairs, "decay_bound": decay_bound}
 
     def product_kernel(product: str, **fused) -> str:
         # A forward's or a training's epilogue in the template's output launch (`fused`: its norm, gate and

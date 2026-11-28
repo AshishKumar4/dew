@@ -69,9 +69,10 @@ def test_a_gated_delta_nets_norm_in_the_output_launch_is_on_par_with_the_portabl
     weights = jax.random.normal(jax.random.key(31), (1, 160, 64), jnp.float32)
 
     def sample(seed):
-        x = jax.random.normal(jax.random.key(37 + seed), (1, 160, 64)).astype(jnp.bfloat16)
+        drawn, initial = jax.random.split(jax.random.key(1967 + seed))
+        x = jax.random.normal(drawn, (1, 160, 64)).astype(jnp.bfloat16)
         with generation.chosen(gated_delta_rule='xla'):
-            return layer.init(jax.random.key(41 + seed), x), x
+            return layer.init(initial, x), x
 
     def stepped(layer, params, x):
         if not training:

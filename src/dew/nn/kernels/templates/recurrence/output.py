@@ -268,18 +268,20 @@ def _output_refs(refs, normed: Normed | None) -> tuple:
 
 
 def _normed_layout(normed: Normed | None, chunk: int, bv: int, value_width: int, staging: tuple,
-                   landing: dict, out_type) -> tuple:
-    """`output_launch`'s staging, landing and output type with its epilogue's (`normed`): the head's whole
-    value rows read back across the steps a staged tile of their own, and where its residual is kept, a
-    second output of the read-back rows, stored through a landing of its own."""
+                   landing: dict, out_type, gate, weight) -> tuple:
+    """`output_launch`'s staging, landing, output type and inputs past its own with its epilogue's
+    (`normed`): the head's whole value rows read back across the steps a staged tile of their own, and where
+    its residual is kept, a second output of the read-back rows, stored through a landing of its own; its
+    `gate` and its `weight` in fp32 inputs."""
     if normed is None:
-        return staging, landing, out_type
+        return staging, landing, out_type, ()
+    assert gate is not None and weight is not None, "an epilogue reads its gate and weight"
     read = jnp.dtype(normed.read)
     staging = (*staging, swizzling.plain((chunk, value_width), read))
     if normed.kept:
         out_type = (out_type, jax.ShapeDtypeStruct(out_type.shape, read))
         landing = {**landing, "kept": ((chunk, bv), read)}
-    return staging, landing, out_type
+    return staging, landing, out_type, (gate, weight.astype(jnp.float32))
 
 
 @building(lambda launch: ("recurrence_output",))
@@ -385,8 +387,8 @@ def output_launch(q, k, h, corrected, prefix: tuple, taken, beta, call: Call, ti
     # memory and local products: the model's.
     scored = 0 if call.per_key else 2 * chunk * chunk * width
     model = scored + 2 * chunk * (width + chunk) * value_width
-    staging, landing, out_type = _normed_layout(normed, chunk, bv, value_width, staging,
-                                                {"out": ((chunk, bv), out_dtype)}, out_type)
+    staging, landing, out_type, sides = _normed_layout(
+        normed, chunk, bv, value_width, staging, {"out": ((chunk, bv), out_dtype)}, out_type, gate, weight)
     swizzle = None if call.per_key else _output_swizzle(call, bv, staging, landing, normed=normed is not None)
     keys = None if swizzle is None else {f"keys{p}": swizzle for p in range(call.given.parts)}
     # Its kernel named `recurrence_output` as the profiles and the gate know it (`launch_kernel` names a
@@ -400,5 +402,4 @@ def output_launch(q, k, h, corrected, prefix: tuple, taken, beta, call: Call, ti
                          # A 16-bit call's takes no reduction (an A100's asked for its tiles' 49152 bytes
                          # alone).
                          persistent=True, reduces=held.parts > 1, swizzles=keys)(
-        *inputs, beta, *(() if skip is None else (skip.astype(jnp.float32),)),
-        *(() if normed is None else (gate, weight.astype(jnp.float32))))
+        *inputs, beta, *(() if skip is None else (skip.astype(jnp.float32),)), *sides)
