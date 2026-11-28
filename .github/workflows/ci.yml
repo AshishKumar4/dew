@@ -166,13 +166,17 @@ jobs:
         # not run), and printed where any is not green: a generation green with its artifacts lost (`artifactsLost`)
         # is no catalogue. Each generation's entries are moved to a directory named for it (armada's are by index),
         # and every one must hold one entry at least (tools/ci/package.sh checks it again before it builds).
-        # The generations, the catalogue's own (generation.TARGETS' CUDA ones), read in the commit's environment.
-        echo list | armada map --commit=${{ github.sha }} --items=- --json -- \
-          sh -c '.venv-$(tr -d "\n" < .python-version)/bin/python tools/derived_catalogue.py --list' \
-          > "$RUNNER_TEMP/listed.jsonl"
-        generations=$(jq -r 'select(has("index") and .kind == "ok" and .exitCode == 0) | .tail' \
-          "$RUNNER_TEMP/listed.jsonl" | grep -E '^sm[0-9]+[a-z]?$' | xargs)
+        # The generations, the catalogue's own (generation.TARGETS' CUDA ones), read in the commit's environment
+        # into a file of the task's artifacts, one a line: the task's output itself, never the tail of its log.
+        echo list | armada map --commit=${{ github.sha }} --items=- --artifacts="$RUNNER_TEMP/listed" --json -- \
+          sh -c '.venv-$(tr -d "\n" < .python-version)/bin/python tools/derived_catalogue.py --list > "$1/listed"' \
+          sh '{artifacts}' > "$RUNNER_TEMP/listed.jsonl"
+        listed=$(jq -r 'select(has("index") and .kind == "ok" and .exitCode == 0 and (.artifactsLost | not)
+          and .artifacts != null) | .artifacts' "$RUNNER_TEMP/listed.jsonl")
+        generations=$( [ -n "$listed" ] && grep -E '^sm[0-9]+[a-z]?$' "$listed/listed" | xargs)
         [ -n "$generations" ] || { cat "$RUNNER_TEMP/listed.jsonl"; echo "the catalogue listed no generation"; exit 1; }
+        [ "$(grep -cv '^$' "$listed/listed")" = "$(echo $generations | wc -w)" ] ||
+          { cat "$listed/listed"; echo "the catalogue listed a generation of no CUDA target's name"; exit 1; }
         echo "generations=$generations" >> "$GITHUB_OUTPUT"
         set +e
         printf '%s\n' $generations | armada map --commit=${{ github.sha }} --items=- --size=large \
