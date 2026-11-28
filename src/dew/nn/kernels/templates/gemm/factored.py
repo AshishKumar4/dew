@@ -523,8 +523,11 @@ class _Transpose:
         columns."""
         def counted(classes):
             for index, (rows, matrix) in enumerate(_nonfinite_terms(cotangent, factor, coefficients)):
-                counts = self.wide(rows.astype(jnp.bfloat16), matrix.astype(jnp.bfloat16), *rest)
                 held = jax.lax.dynamic_index_in_dim(classes, index, 0, keepdims=False)
+                # Placed as the class it updates, as a limb's sum is (train 1455's review: a depth split
+                # left the counts split where the classes were whole).
+                counts = _placed_like(self.wide(rows.astype(jnp.bfloat16), matrix.astype(jnp.bfloat16),
+                                                *rest), held)
                 classes = jax.lax.dynamic_update_index_in_dim(classes, _present(held, counts), index, 0)
             return classes
 
