@@ -74,7 +74,7 @@ from typing import ClassVar, NamedTuple, Protocol
 import jax
 import jax.numpy as jnp
 import numpy as np
-from jax.core import ShapedArray, Tracer
+from jax.core import ShapedArray
 from jax.custom_derivatives import SymbolicZero
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import triton as plgpu
@@ -361,57 +361,17 @@ class _Logical:
         traced = _traced(self.function, self.shape)
 
         def applied(y):
-            (out,) = _on_tile(traced, traced.consts, self.shape, y.shape, y)
+            (out,) = programs.on_tile(traced, traced.consts, self.shape, y.shape, y)
             return out
 
         def tangent(primals, tangents):
             derived = _tangents(self.function, self.shape)
-            out, tangent = _on_tile(derived, derived.consts, self.shape, primals[0].shape, *primals,
-                                    *tangents)
+            out, tangent = programs.on_tile(derived, derived.consts, self.shape, primals[0].shape, *primals,
+                                            *tangents)
             return out, tangent
 
         return contracted("test_the_fused_norms_and_products_hold_every_order")(
             declared_tangent(KernelGlue(), applied, tangent))(y)
-
-
-def _on_tile(jaxpr: core.Jaxpr, consts, logical: tuple, tile: tuple, *args) -> list:
-    """`jaxpr`, traced at the `logical` shape, evaluated on `args` of the `tile` shape as
-    `jax.core.eval_jaxpr` evaluates it: each equation bound by its primitive (`get_bind_params`), a shape
-    parameter that is the logical shape the tile's, and a program a parameter holds (a jit's, a custom
-    derivative's primal) retraced at the tile's shapes, the equation kept. Its values alone: `_Logical`
-    states the derivative."""
-    values = dict(zip(jaxpr.constvars, consts, strict=True)) | dict(zip(jaxpr.invars, args, strict=True))
-
-    def read(atom):
-        return atom.val if isinstance(atom, core.Literal) else values[atom]
-
-    def shaped(value):
-        return tuple(tile) if isinstance(value, tuple) and tuple(value) == logical else value
-
-    def retraced(program: core.Jaxpr):
-        avals = [jax.ShapeDtypeStruct(tile if aval.shape == logical else aval.shape, aval.dtype)
-                 for aval in program.in_avals if isinstance(aval, ShapedArray)]
-        return jax.make_jaxpr(
-            lambda *operands: _on_tile(program, program.consts, logical, tile, *operands))(*avals)
-
-    for equation in jaxpr.eqns:
-        given = [read(atom) for atom in equation.invars]
-        if equation.primitive is jax.lax.cond_p and not isinstance(given[0], Tracer):
-            # A conditional whose index is known (a predicate the activation closes over, a constant in its
-            # graph) is the branch it names, run on the tile: Pallas's Triton lowering takes a traced index
-            # alone (its rule reads the index's MLIR type; a constant has none).
-            branch = equation.params["branches"][int(np.asarray(given[0]))]
-            values.update(zip(equation.outvars, _on_tile(branch.jaxpr, branch.consts, logical, tile,
-                                                         *given[1:]), strict=True))
-            continue
-        # Each program it runs within it, a call's or each branch's (`programs.with_bodies`), retraced.
-        params = programs.with_bodies({key: shaped(value) for key, value in equation.params.items()},
-                                      retraced)
-        with equation.ctx.manager:
-            made = equation.primitive.bind(*given, **equation.primitive.get_bind_params(params))
-        outputs = made if equation.primitive.multiple_results else [made]
-        values.update(zip(equation.outvars, outputs, strict=True))
-    return [read(atom) for atom in jaxpr.outvars]
 
 
 def _runs(case) -> bool:
