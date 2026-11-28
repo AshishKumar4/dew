@@ -938,11 +938,14 @@ class _Counting:
         found = _Loop(_mean([steady.loops[-1].work, odd.loops[-1].work]), steady.loops[-1].marks)
         self.ended(found, walks=True)
         if ranged is not None and found.marks and not self.loops:
-            # The first and last trips each take their own work in place of a steady one's.
+            # The first and last trips each take their own work in place of a steady one's; its reads a bound
+            # every trip makes, so an end reading more than a steady trip adds none (one trip may be both
+            # ends: `Work.device_reads`).
             for at in _PLACES[1:]:
                 taken = (_mean([trip(at, parity).loops[-1].work for parity in (0, 1)]) if "at" in consulted
                          else found.work)
-                self.fixed = self.fixed + taken + repeated(found.work, -1)
+                ended = taken + repeated(found.work, -1)
+                self.fixed += dataclasses.replace(ended, device_reads=min(ended.device_reads, 0.0))
 
     def warps(self, equation, values: list, given: list[bool]) -> None:
         """A warpgroup's warps each running its role (`plgpu.warp_map`'s `mpmd_map`: tcgen05's load and

@@ -1744,3 +1744,30 @@ def test_a_launchs_l2_traffic_is_the_reads_every_path_makes_at_its_buffers_packe
 
     assert _l2_bytes(guarded(_read)) == _l2_bytes(guarded(looped)) == 512
     assert _l2_bytes(thrice, jnp.float4_e2m1fn, 1024) == 512
+
+
+def test_a_walks_end_trips_add_no_reads_past_a_steady_trips():
+    """A walk whose first and last trips each read the row three times and whose steady trip reads it as its
+    data decides counts its reads as every trip makes them, an end reading more than a steady trip adding
+    none, so a walk of one trip, both its ends at once, counts no reread it may not make: its one read before
+    the walk and the walk's none, no L2 traffic past its row and output (Train 1508's F1)."""
+    def body(row, out, staged, barrier):
+        _read(row, staged, barrier)
+        trips = staged[0].astype(jnp.int32)
+
+        def step(index, carry):
+            mosaic.step_index(index)
+            def thrice():
+                _read(row, staged, barrier, times=3)
+
+            def inner():
+                lax.cond(index + 1 < trips, lambda: lax.cond(staged[1] > 0, thrice, lambda: None), thrice)
+
+            lax.cond(index == 0, thrice, inner)
+            return carry
+
+        lax.fori_loop(0, trips, step, 0)
+        _stored(staged, out)
+
+    work = emission.launch_work(_row_kernel(body), Stated(steps=1, bytes_accessed=0))
+    assert work.l2_bytes == 0
