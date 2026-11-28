@@ -1286,8 +1286,8 @@ def _exact_pairs(groups: tuple[tuple, ...]) -> tuple[jax.Array, ...]:
 
 
 def _ordinary_pairs(left, right, decay, after) -> tuple[jax.Array, jax.Array]:
-    """One group's pairs by a dot of its decayed factors, and whether a decayed factor flushed (`_tiny_factor`),
-    which the exact sum then decides (`_pair_dispatch`)."""
+    """One group's pairs by a dot of its decayed factors, and whether a decayed factor flushed
+    (`_tiny_factor`), which the exact sum then decides (`_pair_dispatch`)."""
     if after is None:
         decayed = right[..., None, :, :] * decay
         tiny = jnp.any(_tiny_factor(right[..., None, :, :], decay, decayed))
@@ -1370,7 +1370,8 @@ def _factored(left, right, between, joined, issue: Callable, role: str, *, back:
     # The diagonal blocks' rows and keys are contiguous: reshaped (a reshape's transpose).
     own_left, own_right = (x.reshape(blocks, sub, x.shape[-1]) for x in (left, right))
     decay = jnp.stack([block(joined, first, first) for first in range(blocks)])
-    groups = [(own_left, own_right, decay, None)]
+    groups: list[tuple[jax.Array, jax.Array, jax.Array, jax.Array | None]] = [
+        (own_left, own_right, decay, None)]
     if earlier:
         rows = jnp.stack([own_left[first] for first, _ in earlier])
         keys = jnp.stack([own_right[start] for _, start in earlier])
@@ -1387,7 +1388,8 @@ def _factored(left, right, between, joined, issue: Callable, role: str, *, back:
     else:
         diagonal = _portable_einsum("...ik,...ijk->...ij", own_left, own_right[:, None] * decay)
         off = [issue(role, rows[place] * before[place], (keys[place] * after[place]).T)
-               for rows, keys, before, after in groups[1:] for place in range(len(earlier))]
+               for rows, keys, before, after in groups[1:] if after is not None
+               for place in range(len(earlier))]
     placed = {pair: place for place, pair in enumerate(earlier)}
     zeros = jnp.zeros((sub, sub), work)
     rows = [jnp.concatenate([off[placed[first, start]] if start < first else
