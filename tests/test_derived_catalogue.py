@@ -43,19 +43,31 @@ def test_a_step_compiled_ahead_asks_for_no_derivation_its_catalogue_lacks(tmp_pa
     assert asked and asked <= catalogue
 
 
-def test_a_staged_union_is_weighed_by_the_one_rule_a_generations_entries_are(tmp_path):
-    """What a package may carry (tools/derived_weight.py, the rule the catalogue weighs a generation's entries
-    by): run on a directory as a release's package step runs it on the union it staged (tools/ci/package.sh),
-    entries each under the limit refused where together they pass it, and within it, weighed."""
-    staged = tmp_path / "derived"
-    staged.mkdir()
-    for name in ("a", "b"):
-        (staged / f"{name}.json").write_bytes(b"x" * (9 * 2**20))
-    (staged / "notes.txt").write_bytes(b"x" * (9 * 2**20))  # Not an entry: never weighed.
-    weigh = [sys.executable, str(REPO_ROOT / "tools/derived_weight.py"), str(staged)]
-    past = subprocess.run(weigh, capture_output=True, text=True)
-    assert past.returncode == 1
-    assert json.loads(past.stdout) == {"entries": 2, "mib": 18.0, "limit_mib": 16.0}
-    (staged / "b.json").unlink()
-    within = subprocess.run(weigh, capture_output=True, text=True, check=True)
-    assert json.loads(within.stdout) == {"entries": 1, "mib": 9.0, "limit_mib": 16.0}
+def test_a_releases_generations_are_staged_as_one_union_weighed_once(tmp_path):
+    """The one staging of a release's derivations (tools/derived_weight.py `stage`, which tools/ci/package.sh
+    calls): generations each within the package's limit are refused where their union is past it; an entry two
+    generations hold alike is one entry, counted once; one name two generations hold differently is refused,
+    as is a generation holding none."""
+    derived = tmp_path / "derived"
+    for generation, names in (("sm80", ("a", "shared")), ("sm90", ("b", "shared"))):
+        (derived / generation).mkdir(parents=True)
+        for name in names:
+            (derived / generation / f"{name}.json").write_bytes(b"x" * (5 * 2**20))
+
+    def stage(into: str, *generations: str) -> subprocess.CompletedProcess:
+        return subprocess.run([sys.executable, str(REPO_ROOT / "tools/derived_weight.py"), "stage",
+                               str(tmp_path / into), str(derived), *generations],
+                              capture_output=True, text=True)
+    # Each 10 MiB; their union three entries, `shared` once: 15 MiB, within 16.
+    within = stage("within", "sm80", "sm90")
+    assert within.returncode == 0, within.stderr
+    assert json.loads(within.stdout) == {"generations": {"sm80": 2, "sm90": 2}, "entries": 3, "mib": 15.0,
+                                         "limit_mib": 16.0}
+    # A third generation, itself 5 MiB: the union past the limit, refused though each generation is within it.
+    (derived / "sm100").mkdir()
+    (derived / "sm100" / "c.json").write_bytes(b"x" * (5 * 2**20))
+    assert stage("past", "sm80", "sm90", "sm100").returncode == 1
+    (derived / "sm100" / "c.json").unlink()
+    assert stage("empty", "sm80", "sm100").returncode == 1
+    (derived / "sm90" / "shared.json").write_bytes(b"y" * (5 * 2**20))
+    assert stage("differs", "sm80", "sm90").returncode == 1
