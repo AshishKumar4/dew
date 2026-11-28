@@ -23,7 +23,6 @@ from arm_forms import (
     _own_function,
     _refuse_numpy_arms,
     _RunToRun,
-    _signature,
     _Windowed,
     _written_references,
     _written_role,
