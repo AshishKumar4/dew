@@ -22,7 +22,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from jax import lax
-from jax._src import ad_util, core as jax_core, hijax, pjit
+from jax._src import ad_util, core as jax_core, pjit
 from jax._src.lax import control_flow
 from jax._src.pallas import mpmd, pallas_call, primitives as pallas
 from jax._src.pallas.mosaic import primitives as tpu
@@ -894,7 +894,9 @@ class _Counting:
             return self.marked(params, values, given)
         elif (expanded := self.expanded(equation)) is not None:
             # The expansion's constants are its trace's own.
-            return self.run(expanded[0], values, expanded[1], given, [True] * len(expanded[1]))
+            inner, constants, taken = expanded
+            return self.run(inner, [values[at] for at in taken], constants, [given[at] for at in taken],
+                            [True] * len(constants))
         elif primitive not in _FREE:
             raise Unpriced(f"no rule prices {primitive} in a kernel's body")
         return unknown
@@ -1041,7 +1043,7 @@ class _Counting:
             total = total + work
         return total
 
-    def expanded(self, equation) -> tuple[jax_core.Jaxpr, Sequence] | None:
+    def expanded(self, equation) -> tuple[jax_core.Jaxpr, Sequence, Sequence[int]] | None:
         """`equation`'s expansion (`_expanded`), traced once for the count: a loop's trips and trials visit
         one, so its equations' sites (`hoist`) are one across them (the review of lane/toolkit 55ba7911d)."""
         if id(equation) not in self.expansions:
@@ -1147,26 +1149,25 @@ _REGIONS = {pallas.run_scoped_p: _Counting.scoped, lax.while_p: _Counting.loop, 
 where it leaves them unknown."""
 
 
-def _expanded(equation) -> tuple[jax_core.Jaxpr, Sequence] | None:
-    """The program an equation runs as it lowers, where it is one of JAX's primitives' own, and its
-    constants: a call's (`programs.called`); a high-level operation's expansion (`HiPrim`'s `to_lojax`: a
-    declared tangent's, a contraction whose transpose it states); the construct's own operation's value (the
+def _expanded(equation) -> tuple[jax_core.Jaxpr, Sequence, Sequence[int]] | None:
+    """The program an equation runs as it lowers, where it is one of JAX's primitives' own, its constants,
+    and the equation's operands it takes, in order: a call's (`programs.called`); a high-level operation's
+    expansion as JAX lowers it (`programs.high_expansion`: a declared tangent's, a contraction whose
+    transpose it states), its literal operands its own values; the construct's own operation's value (the
     algebra's law, `scaled.primitive`, as a kernel's lowering runs it: the decode merge's, `merged`). None
     for any other."""
     # The law's module read here: `dew.algebra` reads this module's counts as it is imported (`cost`).
     from dew.algebra import scaled
 
-    primitive, params = equation.primitive, equation.params
+    every = range(len(equation.invars))
     if (inner := programs.called(equation)) is not None:
-        return inner, ()
-    if primitive is hijax.call_hi_primitive_p:
-        expansion = functools.partial(primitive.to_lojax, **params)
-    elif (made := scaled.MADE.get(primitive)) is not None:
-        expansion = functools.partial(made[0], **params)
-    else:
+        return inner, (), every
+    if (expansion := programs.high_expansion(equation)) is not None:
+        return expansion, (), [at for at in every if not isinstance(equation.invars[at], jax_core.Literal)]
+    if (made := scaled.MADE.get(equation.primitive)) is None:
         return None
-    traced = jax.make_jaxpr(expansion)(*(v.aval for v in equation.invars))
-    return traced.jaxpr, traced.consts
+    traced = jax.make_jaxpr(functools.partial(made[0], **equation.params))(*(v.aval for v in equation.invars))
+    return traced.jaxpr, traced.consts, every
 
 
 def _platform_branch(platforms) -> int:

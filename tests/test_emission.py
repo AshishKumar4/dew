@@ -581,6 +581,18 @@ def test_a_prefetch_a_global_ref_and_a_scales_copy_are_priced_as_what_they_move(
     assert (work.shared_bytes, work.device_bytes, work.device_reads) == (128 * 4, 0, 0)
 
 
+def test_a_high_level_operation_counts_its_expansion_with_its_literal_operands_values():
+    """A high-level operation (`generation.linear_map`, a `HiPrim`) counts the program JAX lowers it to
+    (`programs.high_expansion`, the one expansion the FLOP count reads too), a literal operand its value: a
+    map doubling a 128-wide row over a literal three trips counts three trips' multiplies, 384, where its
+    operand's type alone would leave the trips its data's (Train 1512's review)."""
+    def doubled(trips, moving):
+        return lax.fori_loop(0, trips, lambda step, value: value * 2.0, moving)
+
+    jaxpr = jax.make_jaxpr(lambda row: generation.linear_map(doubled, doubled, 3, row))(_ROW).jaxpr
+    assert emission.emitted(jaxpr, 1, None).roles[0].fixed.operations == 3 * 128
+
+
 def test_a_semaphore_or_a_barrier_stores_no_bytes():
     """A launch's semaphores and barriers (extended dtypes of no data: a GEMM's tail flags, `pl.get_global`)
     store no bytes beside its data's (`cost.stored`), so a launch holding them states and footprints its data
