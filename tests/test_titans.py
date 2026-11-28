@@ -19,8 +19,11 @@ from dew.nn.kernels.ttt import ttt_linear
 
 ROWS, LENGTH, HEADS, WIDTH, CHUNK = 2, 40, 2, 16, 16
 """Two whole mini-batches of 16 tokens and a part one."""
-SEEDS = 16
-"""Each site's declared seeds."""
+SEEDS = {('titans', 'float32'): 32, ('titans', 'bfloat16'): 64,
+         ('ttt', 'float32'): 64, ('ttt', 'bfloat16'): 64}
+"""Each site's declared seeds, `seeds_for`'s paired count at the kernels whose mini-batches hold their steps
+apart from the state entering them (theme 79g: their errors' ratios to the token recurrence's spread wider
+than at 16 draws, where a step below the state's last place the recurrence rounds away the kernels keep)."""
 
 
 def _layer_normed(x, eps: float):
@@ -143,7 +146,8 @@ def test_the_mini_batches_are_as_exact_as_the_recurrence_a_token_at_a_time(form,
     memory and momentum, and TTT-Linear's memory and bias, each output read at its own rate and the state
     leaving at the mini-batch's last token's."""
     chunked, stepped = (jax.jit(with_gradients(functools.partial(fn, chunk=CHUNK))) for fn in FORMS[form])
-    assert_as_exact(chunked, stepped, operands(form, dtype), f'{form}, {jnp.dtype(dtype).name}', seeds=SEEDS)
+    assert_as_exact(chunked, stepped, operands(form, dtype), f'{form}, {jnp.dtype(dtype).name}',
+                    seeds=SEEDS[form, jnp.dtype(dtype).name])
 
 
 def _pair(*rows):
