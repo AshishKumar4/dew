@@ -39,11 +39,11 @@ from jax import lax
 from dew.algebra import _generated
 from dew.algebra.shared_derived import (
     shared_component_16,
-    shared_component_21,
-    shared_component_34,
+    shared_component_22,
     shared_component_35,
     shared_component_36,
-    shared_component_44,
+    shared_component_37,
+    shared_component_45,
 )
 
 
@@ -55,7 +55,7 @@ def _key_dropped_cotangents_0(x1, x2, x3, x4, x5, x6, x7, x8, x9):
 
 
 def _key_weights_0(x1, x2, x3):
-    v9, v15 = shared_component_35(
+    v9, v15 = shared_component_36(
         x2, x1, x3, (x1.shape[1],), (), (x1.shape[0], x1.shape[1]), (1,), (1, x1.shape[1]))
     return (v9, v15)
 
@@ -100,12 +100,12 @@ def _queries_cotangent_0(x1, x2, x3, x4, x5, x6, x7, x8):
         x3, shape=(x1.shape[0], x1.shape[1]), broadcast_dimensions=(0,), sharding=None)
     v10 = lax.sub_p.bind(x1, v9)
     v11 = lax.min_p.bind(v10, np.array(float.fromhex('0x0.0p+0'), dtype=jnp.dtype('float32')))
-    v12, v17, v18 = shared_component_21(v11, x4, (x1.shape[0],), (), (x1.shape[0], 1), (0,))
+    v12, v17, v18 = shared_component_22(v11, x4, (x1.shape[0],), (), (x1.shape[0], 1), (0,))
     v19 = lax.broadcast_in_dim_p.bind(
         np.array(float.fromhex('0x0.0p+0'), dtype=jnp.dtype('float32')), shape=(x1.shape[0], x1.shape[1]),
         broadcast_dimensions=(), sharding=None)
     v20 = lax.broadcast_in_dim_p.bind(x5, shape=(x1.shape[0], 1), broadcast_dimensions=(0,), sharding=None)
-    v26, = shared_component_36(x2, v20, x8, v19, x6, v17, v12, (x1.shape[0], 1), (0,))
+    v26, = shared_component_37(x2, v20, x8, v19, x6, v17, v12, (x1.shape[0], 1), (0,))
     v27 = lax.select_n_p.bind(x7, v19, v26)
     return (v12, v18, v27)
 
@@ -118,7 +118,7 @@ def _query_dropped_cotangents_0(x1, x2, x3, x4, x5, x6, x7, x8, x9):
 
 
 def _query_weights_0(x1, x2, x3):
-    v9, v15 = shared_component_35(
+    v9, v15 = shared_component_36(
         x2, x1, x3, (x1.shape[0],), (), (x1.shape[0], x1.shape[1]), (0,), (x1.shape[0], 1))
     return (v9, v15)
 
@@ -245,9 +245,9 @@ def key_dropped_cotangents(*operands, policy: str = 'default', target: str = 'sm
 
 _key_walk_factors_forms = _generated.Forms(single=False, cases={
     ('default', 'sm90', (((64, 32), 'float32'), ((32,), 'float32'))):
-        functools.partial(shared_component_34, p1=(0,), p3=(1, 32), p4=(1,)),
+        functools.partial(shared_component_35, p1=(0,), p3=(1, 32), p4=(1,)),
     ('default', 'sm90', (((128, 64), 'float32'), ((64,), 'float32'))):
-        functools.partial(shared_component_34, p1=(0,), p3=(1, 64), p4=(1,)),
+        functools.partial(shared_component_35, p1=(0,), p3=(1, 64), p4=(1,)),
 })
 
 
@@ -326,9 +326,9 @@ def query_dropped_cotangents(*operands, policy: str = 'default', target: str = '
 
 _query_walk_factors_forms = _generated.Forms(single=False, cases={
     ('default', 'sm90', (((32, 64), 'float32'), ((32,), 'float32'))):
-        functools.partial(shared_component_34, p1=(1,), p3=(32, 1), p4=(0,)),
+        functools.partial(shared_component_35, p1=(1,), p3=(32, 1), p4=(0,)),
     ('default', 'sm90', (((64, 128), 'float32'), ((64,), 'float32'))):
-        functools.partial(shared_component_34, p1=(1,), p3=(64, 1), p4=(0,)),
+        functools.partial(shared_component_35, p1=(1,), p3=(64, 1), p4=(0,)),
 })
 
 
@@ -352,9 +352,9 @@ def query_weights(*operands, policy: str = 'default', target: str = 'sm90'):
 
 _sink_state_forms = _generated.Forms(single=False, cases={
     ('default', 'sm90', (((1, 32, 8), 'float32'),)):
-        functools.partial(shared_component_44, p1=(0, 2, 1), p2=(1, 8, 32), p3=(), p4=(1, 8, 32, 64)),
+        functools.partial(shared_component_45, p1=(0, 2, 1), p2=(1, 8, 32), p3=(), p4=(1, 8, 32, 64)),
     ('default', 'sm90', (((2, 64, 16), 'float32'),)):
-        functools.partial(shared_component_44, p1=(0, 2, 1), p2=(2, 16, 64), p3=(), p4=(2, 16, 64, 64)),
+        functools.partial(shared_component_45, p1=(0, 2, 1), p2=(2, 16, 64), p3=(), p4=(2, 16, 64, 64)),
 })
 
 
