@@ -684,18 +684,21 @@ EDGES = "a correctly rounded division's edges"
 """The label of `divides_as_ieee_division_at_its_edges`'s arm over the edges, before its divider's."""
 
 
-def divides_as_ieee_division_at_its_edges(divider: str = ""):
-    """`correctly_rounded_divide` over `division_edges`, compiled for this backend: each quotient of normal
+def divides_as_ieee_division_at_its_edges(divider: str = "", divide=None):
+    """`divide` (`correctly_rounded_divide`, this backend's lowering of it, where none is given) over
+    `division_edges`, compiled for this backend: each quotient of normal
     operands IEEE division's, bit for bit (NumPy's float64 quotient rounded once to float32, which rounds as
     once: 53 >= 2 x 24 + 2), its overflows infinite and its subnormal quotients on their grid, ties to even,
     over divisors given as arrays and as constants (which the backend's division approximates), a subnormal
     operand's quotient its value's (row 13163); and each quotient of a zero, infinite or NaN operand IEEE
     division's, beside a subnormal one too. Its arms' labels end in
-    `divider`, a process's divider of its own (`APPROXIMATELY`), so one test's store holds both processes'."""
+    `divider`, a process's divider of its own (`APPROXIMATELY`) or a form's, so one test's store holds
+    each's."""
     from reference_error import ahead_arm
 
     from dew.nn.precision import correctly_rounded_divide
 
+    correctly_rounded_divide = divide or correctly_rounded_divide
     numerator, denominator = division_edges()
     # A finite nonzero operand, a subnormal one too: its quotient its value's (row 13163).
     valued = (numerator != 0) & np.isfinite(numerator) & (denominator != 0) & np.isfinite(denominator)
@@ -778,9 +781,49 @@ def approximately_divided():
                 raise
 
 
-def test_a_correctly_rounded_division_is_ieee_divisions_at_its_edges():
-    """On this CPU (`divides_as_ieee_division_at_its_edges`); the GPU tiers hold it there."""
-    divides_as_ieee_division_at_its_edges()
+@pytest.mark.parametrize("software", [False, True], ids=["this backend's lowering", "in software"])
+def test_a_correctly_rounded_division_is_ieee_divisions_at_its_edges(software):
+    """On this CPU (`divides_as_ieee_division_at_its_edges`): the primitive as this backend lowers it (in
+    float64), and its software form (`division.software_divide`), which every other backend and a Mosaic GPU
+    kernel lower it to; the GPU tiers hold it there."""
+    from dew.nn import division
+
+    if software:
+        divides_as_ieee_division_at_its_edges(", in software", division.software_divide)
+    else:
+        divides_as_ieee_division_at_its_edges()
+
+
+def test_a_batched_correctly_rounded_division_rounds_each_quotient_once():
+    """A division batched over its numerators' rows beside one row of divisors (its batching rule hands the
+    divisors of a unit axis) or beside one constant divisor, or over its divisors beside one numerator, and
+    one run eagerly, rounds each quotient once, IEEE division's (NumPy's float64 quotient rounded once to
+    float32): quotients
+    on a midpoint of the subnormal grid, `49 (2k + 1) 2^-149 / 98`, tie to even, where a division by a
+    broadcast taken as a product by the divisor's rounded reciprocal, even in float64, misses a third of the
+    ties (`147 * 2^-149 / 98` is `1.5 * 2^-149`, which rounds to `2^-148`)."""
+    from dew.nn.precision import correctly_rounded_divide
+
+    odd = 2 * np.arange(1 << 12) + 1
+    numerators = np.ldexp(49.0 * odd, -149).astype(np.float32)
+    numerators = np.concatenate([numerators, np.nextafter(numerators, np.float32(np.inf))])
+    divisor = np.float32(98)
+    expected = (numerators.astype(np.float64) / np.float64(divisor)).astype(np.float32)
+    rows = numerators.reshape(64, -1)
+    divided_by = {
+        "a row of divisors": jax.jit(jax.vmap(correctly_rounded_divide, in_axes=(0, None)))(
+            rows, np.full(rows.shape[1], divisor)),
+        "a constant": jax.jit(jax.vmap(lambda value: correctly_rounded_divide(value, divisor)))(numerators),
+        "eagerly": correctly_rounded_divide(numerators, divisor)}
+    for name, quotients in divided_by.items():
+        np.testing.assert_array_equal(np.asarray(quotients).reshape(-1).view(np.uint32),
+                                      expected.view(np.uint32), err_msg=name)
+    fifteen = np.float32(15 * 2.0 ** -149)
+    divisors = np.ldexp(np.asarray([2.0, 6.0, 10.0, 30.0, 3.0, 5.0]), np.arange(-2, 4)[:, None])
+    divisors = divisors.ravel().astype(np.float32)
+    over = jax.jit(jax.vmap(correctly_rounded_divide, in_axes=(None, 0)))(fifteen, divisors)
+    wanted = (np.float64(fifteen) / divisors.astype(np.float64)).astype(np.float32)
+    np.testing.assert_array_equal(np.asarray(over).view(np.uint32), wanted.view(np.uint32))
 
 
 def test_quantizer_division_rounds_midpoint_neighbours_as_ieee_division():
