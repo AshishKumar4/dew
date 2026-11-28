@@ -28,15 +28,28 @@ from jax.experimental import pallas as pl
 
 from dew._hashing import fmix32
 from dew.algebra.scan import Reads, turned
-from dew.nn.activations import logistic, silu
+from dew.nn.activations import GATE_ACTIVATIONS, logistic, silu
 from dew.nn.aligned import aligned_sum
 from dew.nn.derivatives import KernelGlue, Protected, contracted, with_gradients_formed
 from dew.nn.kernels import launches
-from dew.nn.precision import accurate_exp, at_least_fp32, compensated_add, l2norm, softplus, stochastic_bf16
+from dew.nn.kernels.templates.hooks import RowHook, Side
+from dew.nn.precision import (
+    accurate_exp,
+    activation_and_slope,
+    at_least_fp32,
+    compensated_add,
+    l2norm,
+    rms_of_total,
+    rms_statistics,
+    rms_weighted,
+    softplus,
+    stochastic_bf16,
+)
 
 from ..sharding import explicit_spec, grouped_heads, manual_map
 from . import chunked_launch, short_conv
-from .generation import linear_tangent
+from .generation import INHERENT, Choice, linear_tangent, published, routed
+from .selection import KernelRefused, Refusal, forced
 
 
 @dataclasses.dataclass(frozen=True)
@@ -88,10 +101,78 @@ class OutputNorm:
     where it names a dtype: the one the layer's input projection computes in, the projections' dtype,
     where its reference casts the scan's output before its norm (transformers' Qwen3-Next and Kimi
     `.to(query.dtype)`), as the layer's unfused token does. Normalized unrounded, a fused bf16 token sat
-    nearer float64 than its reference and apart from the layer's own unfused token (row 6963)."""
+    nearer float64 than its reference and apart from the layer's own unfused token (row 6963). Its form
+    (`gated_rows`, `gated_norm_rows`): the gate after the weighted norm (Qwen3-Next's, Kimi's, Falcon-H1's
+    `norm_before_gate`), or with `gate_first` before the norm (Mamba-2's `MambaRMSNormGated`); with
+    `rounded`, the normalized rows rounded to the output's dtype before the weight, in that dtype, multiplies
+    them (Mamba-2's weight not `scale_wide`)."""
     epsilon: float
     activation: str = 'silu'
     read_in: str | None = None
+    gate_first: bool = False
+    rounded: bool = False
+
+
+def gated_rows(norm: OutputNorm, rows, gate, *, activate):
+    """The rows `norm` normalizes: `rows` (wide) times `activate(gate)` (its gate's activation) where the gate
+    comes first (`OutputNorm.gate_first`), else as they are."""
+    return rows * activate(gate) if norm.gate_first else rows
+
+
+def gated_norm_rows(norm: OutputNorm, rows, inverse, gate, weight, dtype, *, activate):
+    """`norm`'s arithmetic past its statistics, in `dtype`: the gated rows (`gated_rows`) times their
+    `inverse` RMS and the `weight` (`precision.rms_weighted`, in the rows' dtype, or where `rounded` the
+    normalized rows rounded to `dtype` first and the weight taken in it), then where the gate comes after,
+    times `activate(gate)` in the rows' dtype, rounded once to `dtype`. The one form the layers' gated norms,
+    the recurrence's norm after its launches and its output launch's epilogue take (`norm_row_hook`)."""
+    wide = rows.dtype
+    if norm.rounded:
+        normed = rms_weighted(rows, inverse, weight=weight.astype(dtype), rounded=lambda x: x.astype(dtype))
+    else:
+        normed = rms_weighted(rows, inverse, weight=weight.astype(wide))
+    if not norm.gate_first:
+        normed = normed.astype(wide) * activate(gate)
+    return normed.astype(dtype)
+
+
+@dataclasses.dataclass(frozen=True)
+class _NormStatistic:
+    """An output norm's row statistic (`templates.hooks.RowHook.statistic`): a block's gated rows' sums of
+    squares, its gate activated as a kernel's body activates it (`activation_and_slope`)."""
+    norm: OutputNorm
+
+    def __call__(self, block, *gate):
+        # The gate read where it comes first alone (`norm_row_hook`'s `reads`).
+        rows = block * self._activate(gate[0].astype(block.dtype)) if self.norm.gate_first else block
+        return jnp.sum(rows * rows, axis=-1)
+
+    def _activate(self, gate):
+        return activation_and_slope(gate, self.norm.activation)[0]
+
+
+@dataclasses.dataclass(frozen=True)
+class _NormApplied(_NormStatistic):
+    """An output norm applied to a block past the walk (`templates.hooks.RowHook.fn`): its inverse RMS over
+    the head's `width` values from the rows' `total` (`precision.rms_of_total`), then `gated_norm_rows` in
+    `dtype`."""
+    width: int = 0
+    dtype: str = 'float32'
+
+    def __call__(self, block, total, gate, weight):
+        gate = gate.astype(block.dtype)
+        rows = gated_rows(self.norm, block, gate, activate=self._activate)
+        _, inverse = rms_of_total(total, self.width, self.norm.epsilon)
+        return gated_norm_rows(self.norm, rows, inverse[:, None], gate, weight[None, :].astype(block.dtype),
+                               jnp.dtype(self.dtype), activate=self._activate)
+
+
+def norm_row_hook(norm: OutputNorm, width: int, dtype, gate, weight) -> RowHook:
+    """`norm` as a launch's row epilogue (`templates.hooks.RowHook`): its statistic and its application to the
+    head's `width` values in `dtype`, its gate `[rows, columns]` and weight `[columns]` its sides, the
+    statistic reading the gate where it comes first alone."""
+    sides = (Side(gate, RowHook.TILE), Side(weight, ('columns',)))
+    return RowHook(_NormStatistic(norm), _NormApplied(norm, width, jnp.dtype(dtype).name), sides,
+                   reads=(0,) if norm.gate_first else ())
 
 
 @dataclasses.dataclass(frozen=True)
@@ -651,7 +732,22 @@ def output_normed(norm: OutputNorm, out, z, weight, dtype, work, *, axes=None):
     if norm.read_in is not None:
         out = out.astype(norm.read_in)
         out = out if at_least_fp32(out.dtype) == jnp.dtype(work) else out.astype(work)
-    return gated_rms_normalized(out, z, weight, norm.epsilon, dtype, norm.activation, axes=axes)
+    if not (norm.gate_first or norm.rounded):
+        return gated_rms_normalized(out, z, weight, norm.epsilon, dtype, norm.activation, axes=axes)
+    # The other forms XLA's alone (the fused gated norm gates after the norm and weighs wide): a call naming
+    # another kernel for the norm is refused, and the route reported (train 1473's head review).
+    refusal = Refusal('form', "the fused gated norm gates after the norm and weighs wide, not "
+                      f"{'the gate first' if norm.gate_first else 'the normalized rows rounded first'}",
+                      row=INHERENT)
+    named = forced(Choice.RMS_NORM)
+    if named not in (None, 'xla'):
+        raise KernelRefused(Choice.RMS_NORM, named, refusal, iter(()))
+    published(routed(Choice.RMS_NORM, kernel='xla', refusal=refusal, forced=named))
+    wide = at_least_fp32(out.dtype)
+    activate = GATE_ACTIVATIONS[norm.activation]
+    rows = gated_rows(norm, out.astype(wide), z.astype(wide), activate=activate)
+    return gated_norm_rows(norm, rows, rms_statistics(rows, norm.epsilon)[1], z.astype(wide), weight, dtype,
+                           activate=activate)
 
 
 def normed(hooks: Hooks, out, given: dict, work, *, dtype=None, axes=None):

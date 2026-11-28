@@ -29,7 +29,6 @@ from dew.nn.precision import (
     activation_and_slope,
     logistic_value,
     rms_of_total,
-    rms_weighted,
     softplus_series,
 )
 
@@ -302,7 +301,7 @@ def _program(hooks, inputs, active_ref, state_out, moved, out_ref, scratch, *, b
         mosaic.synced(interpret)
         out = _stepped(hooks, state_ref, state_out, value, vectors, token.per_head(writes), token, halves,
                        interpret=interpret)
-        out = _epilogue(hooks, inputs, token, out, value, exchanged, interpret=interpret)
+        out = _epilogue(hooks, inputs, token, out, value, exchanged, dtype=out_ref.dtype, interpret=interpret)
         halves.first(lambda: token.stored(out_ref, out))
 
     @pl.when(active_ref[token.row] == 0)
@@ -601,21 +600,31 @@ def _tree_added(partials: tuple, index, term) -> tuple:
     return tuple(found)
 
 
-def _epilogue(hooks, inputs, token: _Token, out, value, exchanged, *, interpret: bool):
+def _epilogue(hooks, inputs, token: _Token, out, value, exchanged, *, dtype, interpret: bool):
     """The token's output past the update: its skip and its gated norm over the head's columns (a block of
     one head a warpgroup wide, `fits`), read back first in the norm's `read_in`, as
-    `recurrence.step_reference`'s epilogue (`recurrence.skipped`, `recurrence.normed`)."""
+    `recurrence.step_reference`'s epilogue (`recurrence.skipped`, `recurrence.normed`), a form rounding its
+    normalized rows rounding them to the output's `dtype`."""
     if hooks.skip:
         out = out + token.per_head([inputs['skip'][head].astype(jnp.float32) for head in token.heads]) * value
     if hooks.output is None:
         return out
-    if hooks.output.read_in is not None:
-        out = out.astype(hooks.output.read_in).astype(jnp.float32)
+    norm = hooks.output
+    if norm.read_in is not None:
+        out = out.astype(norm.read_in).astype(jnp.float32)
     gate = token.tile(inputs['z'])
     weight = plgpu.load(inputs['weight'].at[pl.ds(0, 1), token.columns], layout=token.block.layout,
                         optimized=False).astype(jnp.float32)
-    # As `precision.rms_statistics` takes it, over a head's columns (`rms_of_total`).
-    total = scan.summed((out * out).reshape(-1), exchanged, interpret=interpret)
-    _, inverse = rms_of_total(total, token.block.columns, hooks.output.epsilon)
-    activated, _ = activation_and_slope(gate, hooks.output.activation)
-    return rms_weighted(out, inverse, weight=weight, gate=activated)
+
+    def activate(gate):
+        return activation_and_slope(gate, norm.activation)[0]
+
+    # Each form as the layers' gated norms compute it (`recurrence.gated_norm_rows`), its statistics as
+    # `precision.rms_statistics` takes them, over a head's columns (`rms_of_total`), its rows rounded to the
+    # token's output dtype where the form rounds them.
+    rows = recurrence.gated_rows(norm, out, gate, activate=activate)
+    total = scan.summed((rows * rows).reshape(-1), exchanged, interpret=interpret)
+    _, inverse = rms_of_total(total, token.block.columns, norm.epsilon)
+    rounded_in = dtype if norm.rounded else jnp.float32
+    return recurrence.gated_norm_rows(norm, rows, inverse, gate, weight, rounded_in,
+                                      activate=activate).astype(jnp.float32)

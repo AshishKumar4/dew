@@ -89,6 +89,10 @@ FORMED = [
     recurrence.Hooks(decay='vector', l2norm=True, gates=recurrence.Gates(bound=-5.0), output=NORMS[2]),
     recurrence.Hooks(decay='vector', gates=recurrence.Gates(limit=(0.0, 0.5))),
     recurrence.Hooks(decay='scalar', gates=recurrence.Gates(bound=-5.0)),
+    # Mamba-2's gated norm forms (`OutputNorm.gate_first`, `rounded`) in the step launch's epilogue.
+    recurrence.Hooks(decay='scalar', output=recurrence.OutputNorm(1e-6, 'silu', gate_first=True)),
+    recurrence.Hooks(decay='scalar',
+                     output=recurrence.OutputNorm(1e-6, 'silu', gate_first=True, rounded=True)),
 ]
 """The launch's other prologue values: Mamba2's step gates clipped with the skip, the gated delta rule's
 gates with a clipped step, a scale without the l2 norm and one under it, a rated decay with the
@@ -102,9 +106,9 @@ readout apart from its token's own write ('apart', row 7402), a decay a head's u
 (Kimi delta attention's bounded decay with its norm, a clipped step's) and a bounded decay a head's (row
 1967)."""
 
-FORMED_SEEDS = dict(zip(FORMED, (8, 16, 8, 8, 16, 16, 16, 16, 8, 8, 8, 16, 16, 16, 16), strict=True))
-"""The formed sites' seeds, sized independently by `seeds_for` on armada (2026-10-21; the last three
-2026-11-17)."""
+FORMED_SEEDS = dict(zip(FORMED, (8, 16, 8, 8, 16, 16, 16, 16, 8, 8, 8, 16, 16, 16, 16, 16, 16), strict=True))
+"""The formed sites' seeds, sized independently by `seeds_for` on armada (2026-10-21; the three before the
+norm forms 2026-11-17, the norm forms 16 as their unforked neighbours)."""
 
 BF16_SEEDS = {HOOKS[0]: 8, HOOKS[-1]: 16}
 """The bf16-state sites' seeds, sized by `seeds_for` on armada (2026-10-20), including every output."""

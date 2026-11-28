@@ -67,7 +67,7 @@ from dew.nn.flops import conv_flops, projection_flops, ssd_flops
 from dew.nn.inputs import PLAIN_CALL, MixerCall, coordinates_of
 from dew.nn.kernels import recurrence, recurrence_algebra
 from dew.nn.kernels.generation import triton_runs
-from dew.nn.kernels.recurrence import Hooks
+from dew.nn.kernels.recurrence import Hooks, OutputNorm, gated_norm_rows, gated_rows
 from dew.nn.kernels.recurrence_chunk import Chunk, chunk
 from dew.nn.kv_cache import Opened, compute_dtype
 from dew.nn.linear import (
@@ -89,7 +89,6 @@ from dew.nn.precision import (
     at_least_fp32,
     float32_dot_general,
     rms_statistics,
-    rms_weighted,
     softplus,
 )
 from dew.nn.residuals import Residual
@@ -199,7 +198,8 @@ class MambaRMSNormGated(nn.Module):
     cast-back values. `gate_after` norms first and gates the weighted norm, and `scale_wide` applies the
     weight in at least fp32 before the one cast, Falcon-H1's `FalconH1RMSNormGated` in either order
     (`norm_before_gate`, modeling_falcon_h1.py:256-282). The norm is the RMS norm's one arithmetic
-    (`rms_statistics`, `rms_weighted`) over each group, the gate broadcast over the norm's output."""
+    (`rms_statistics`, and the recurrence's output norm's `gated_norm_rows`) over each group, the gate
+    broadcast over the norm's output."""
 
     epsilon: float = 1e-5
     groups: int = 1
@@ -219,17 +219,16 @@ class MambaRMSNormGated(nn.Module):
         def grouped(value):
             return value.reshape(*value.shape[:-1], self.groups, -1)
 
-        y = x.astype(wide)
-        if not self.gate_after:
-            y = y * silu(gate.astype(wide))
-        # Weighted wide, or the normalized values cast back before the weight multiplies them.
-        weight, rounded = ((scale.astype(wide), None) if self.scale_wide
-                           else (scale.astype(dtype), lambda normalized: normalized.astype(dtype)))
-        y = rms_weighted(grouped(y), rms_statistics(grouped(y), self.epsilon)[1], weight=grouped(weight),
-                         rounded=rounded).reshape(y.shape)
-        if self.gate_after:
-            y = y.astype(wide) * silu(gate.astype(wide))
-        return y.astype(dtype)
+        # The recurrence's output norm's one arithmetic (`recurrence.gated_norm_rows`) over each group:
+        # weighted wide, or the normalized values cast back before the weight multiplies them.
+        # The input and the gate broadcast against each other first, so a gate of one column (or an input of
+        # fewer rows) grouped as the output is.
+        norm = OutputNorm(self.epsilon, gate_first=not self.gate_after, rounded=not self.scale_wide)
+        x, gate = jnp.broadcast_arrays(x.astype(wide), gate.astype(wide))
+        gate = grouped(gate)
+        rows = gated_rows(norm, grouped(x), gate, activate=silu)
+        return gated_norm_rows(norm, rows, rms_statistics(rows, self.epsilon)[1], gate, grouped(scale), dtype,
+                               activate=silu).reshape(x.shape)
 
 
 class Mamba2(nn.Module):

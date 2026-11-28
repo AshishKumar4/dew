@@ -239,16 +239,21 @@ def kept_forward(q, k, v, g, beta, h0=None, *, tiles: Tiles, starts=None, firsts
     # The skip in the launch that holds the values as given (`Call.gated_keys`); where they hold them gated,
     # added to the output after it, landed fp32 (the output rounded once).
     fused = skip if call.gated_keys else None
-    epilogue, sides = None, {}
+    epilogue, sides = None, ()
     if normed is not None:
-        epilogue = Normed(normed.epsilon, normed.activation, jnp.dtype(normed.read_in or jnp.float32).name,
-                          run.value_width, kept=keeps)
+        # The norm a row hook over the head's real values (`recurrence.norm_row_hook`), its sides laid over
+        # the output's `[R, HV * Dv]`: the gate as the output is, the weight each head's alike, each padded
+        # to the launch's value width.
         columns = call.value_width
-        sides = {"gate": run.laid(zero_padded(gate, 3, columns)).reshape(call.rows, -1),
-                 "weight": zero_padded(weight, 0, columns)}
+        hook = recurrence.norm_row_hook(normed, run.value_width, out_dtype,
+                                        run.laid(zero_padded(gate, 3, columns)).reshape(call.rows, -1),
+                                        jnp.tile(zero_padded(weight, 0, columns).astype(jnp.float32),
+                                                 call.heads))
+        epilogue = Normed.of(hook, jnp.dtype(normed.read_in or jnp.float32).name, kept=keeps)
+        sides = tuple(side.value for side in hook.sides)
     o = output_launch(run.q, run.k, run.h, run.corrected, run.prefix, run.taken, run.beta, call, tiles,
                       scale=run.scale, out_dtype=out_dtype, scores=run.scores, skip=fused, normed=epilogue,
-                      **sides)
+                      sides=sides)
     final = run.final
 
     def unlaid(o):

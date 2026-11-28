@@ -18,6 +18,7 @@ from dew.nn.kernels import generation, recurrence
 from dew.nn.kernels.recurrence_chunk import Chunk, chunk
 from dew.nn.kernels.templates.recurrence import mainloop, template
 from dew.nn.linear import GatedDeltaNet
+from dew.nn.mixers.mamba2 import MambaRMSNormGated
 
 LAYER_HOOKS = {
     'gated delta net': recurrence.Hooks(decay='scalar', gates=recurrence.Gates(), scale=KEY_WIDTH ** -0.5,
@@ -213,12 +214,20 @@ def epilogue_draw(seed: int):
             jax.nn.sigmoid(normal(1, 128, 2)), normal(1, 128, 2, 64), 1 + normal(64, scale=0.1))
 
 
-def epilogue_run(block: int, fused: bool, training: bool):
+NORM_FORMS = {
+    'norm before gate': {},
+    'gate before norm, weight rounded': {'gate_first': True, 'rounded': True},
+}
+"""The epilogue's norm forms (`recurrence.OutputNorm`): Qwen3-Next's and Kimi's, and Mamba-2's
+`MambaRMSNormGated`'s."""
+
+
+def epilogue_run(block: int, fused: bool, training: bool, form: dict | None = None):
     """The template's rule at the output launch's value `block` (`template.mosaic_rule`, interpreted off a
-    GPU) with the sigmoid-gated norm in its output launch (`fused`), or after its launches
-    (`recurrence.output_normed`): its output, or in `training` the gradients of its output's weighted sum by
-    every operand."""
-    norm = recurrence.OutputNorm(1e-6, 'sigmoid', read_in='bfloat16')
+    GPU) with the sigmoid-gated norm of `form` (`NORM_FORMS`) in its output launch (`fused`), or after its
+    launches (`recurrence.output_normed`): its output, or in `training` the gradients of its output's
+    weighted sum by every operand."""
+    norm = recurrence.OutputNorm(1e-6, 'sigmoid', read_in='bfloat16', **(form or {}))
     tiles = mainloop.Tiles(32, 1, block_o=block, chunk=64)
 
     def output(q, k, v, g, beta, z, weight):
@@ -235,16 +244,18 @@ def epilogue_run(block: int, fused: bool, training: bool):
     return jax.grad(lambda *x: jnp.sum(output(*x).astype(jnp.float32) * weights), argnums=tuple(range(7)))
 
 
+@pytest.mark.parametrize('form', NORM_FORMS.values(), ids=NORM_FORMS)
 @pytest.mark.parametrize('training', [False, True], ids=['forward', 'training'])
 @pytest.mark.parametrize('block', EPILOGUE_BLOCKS.values(), ids=EPILOGUE_BLOCKS)
-def test_the_output_launchs_norm_is_on_par_with_the_norm_after_it(block, training):
+def test_the_output_launchs_norm_is_on_par_with_the_norm_after_it(block, training, form):
     """The template's rule with the norm in its output launch (`epilogue_run`'s fused), at one value block
     and at two, its forward (the launch's epilogue) and its training (the norm's read-back kept and its
     gradient the norm's own before the fast backward's): on par from float64 with the same launches' norm
     after them (check 1, the float64 composition the truth), the launch taking the epilogue itself, no route
-    deciding it (train 1461's review)."""
+    deciding it (train 1461's review), each norm form (`NORM_FORMS`) the launch's row hook (train 1473's)."""
     # The truth's norm reads the exact output (a read-back dtype narrows the float64 truth).
-    hooks = recurrence.Hooks(decay='scalar', scale=0.125, output=recurrence.OutputNorm(1e-6, 'sigmoid'))
+    norm = recurrence.OutputNorm(1e-6, 'sigmoid', **form)
+    hooks = recurrence.Hooks(decay='scalar', scale=0.125, output=norm)
 
     def truth(*operands):
         with jax.enable_x64(new_val=True):
@@ -260,9 +271,9 @@ def test_the_output_launchs_norm_is_on_par_with_the_norm_after_it(block, trainin
             weights = np.random.default_rng(1967).standard_normal((1, 128, 2, 64))
             return jax.grad(lambda *x: jnp.sum(composed(*x) * weights), argnums=tuple(range(7)))(*wide)
 
-    fused, apart = (jax.jit(epilogue_run(block, kept, training)) for kept in (True, False))
-    assert_as_exact(fused, apart, epilogue_draw, f'the output launch norm at {block} {training=}', seeds=8,
-                    truth_fn=truth)
+    fused, apart = (jax.jit(epilogue_run(block, kept, training, form)) for kept in (True, False))
+    assert_as_exact(fused, apart, epilogue_draw, f'the output launch norm at {block} {training=} {form}',
+                    seeds=8, truth_fn=truth)
 
 
 @COMPILES_ON_CPU
@@ -356,3 +367,48 @@ def test_an_idle_chunks_rate_gradient_is_zero_whatever_its_rate():
 
     found = jax.jit(jax.grad(total))(jnp.full((1,), 100.0), jnp.asarray([[False, False]]))
     np.testing.assert_array_equal(np.asarray(found), np.zeros((1,), np.float32))
+
+
+MAMBA_FORMS = {'gate after wide': (False, False), 'gate after rounded': (False, True),
+               'gate first wide': (True, False), 'gate first rounded': (True, True)}
+"""`OutputNorm`'s `(gate_first, rounded)` forms, `MambaRMSNormGated`'s four."""
+
+
+@pytest.mark.parametrize('form', MAMBA_FORMS.values(), ids=MAMBA_FORMS)
+def test_an_output_norms_form_is_mamba2s_gated_norm_over_a_head(form):
+    """`recurrence.output_normed` over bf16 rows of two heads of 64 values, each `OutputNorm` form (the gate
+    first or after, the weight wide or the normalized rows rounded first): bit for bit `MambaRMSNormGated`
+    with a group a head (`groups` 2) in the matching form (`gate_after`, `scale_wide`), one arithmetic
+    (`recurrence.gated_norm_rows`) for the layers' gated norms and the launch's (train 1473's review)."""
+    gate_first, rounded = form
+    rng = np.random.default_rng(1473)
+    out, z = (jnp.asarray(rng.standard_normal((2, 3, 2, 64)), jnp.bfloat16) for _ in range(2))
+    weight = jnp.asarray(1 + rng.standard_normal(128) / 8, jnp.float32)
+    norm = recurrence.OutputNorm(1e-5, 'silu', gate_first=gate_first, rounded=rounded)
+    found = recurrence.output_normed(norm, out, z, weight.reshape(2, 64), jnp.bfloat16, jnp.float32)
+    layer = MambaRMSNormGated(1e-5, groups=2, gate_after=not gate_first, scale_wide=not rounded)
+    expected = layer.apply({'params': {'weight': weight}}, out.reshape(2, 3, 128), z.reshape(2, 3, 128))
+    np.testing.assert_array_equal(np.asarray(found.reshape(2, 3, 128), np.float32),
+                                  np.asarray(expected, np.float32))
+
+
+def test_a_norm_form_the_fused_kernel_lacks_is_xlas_alone():
+    """A gate-first norm (`OutputNorm.gate_first`, Mamba-2's form) after a chunked call: XLA's, its route
+    reported with the form's refusal, and refused where a call names the fused kernel for it
+    (`dew.kernels.use(rms_norm='pallas')`), never run as another kernel's arithmetic (train 1473's head
+    review)."""
+    from dew import kernels
+    from dew.nn.kernels.selection import KernelRefused
+
+    norm = recurrence.OutputNorm(1e-6, 'silu', gate_first=True)
+    out, z = (jnp.ones((1, 2, 1, 8), jnp.bfloat16) for _ in range(2))
+
+    def normed():
+        return recurrence.output_normed(norm, out, z, jnp.ones((8,), jnp.float32), jnp.bfloat16, jnp.float32)
+
+    with generation.routes() as found:
+        jax.eval_shape(normed)
+    assert [(route.kernel, route.refusal.code) for route in found
+            if route.choice == generation.Choice.RMS_NORM] == [('xla', 'form')], found
+    with kernels.use(rms_norm='pallas'), pytest.raises(KernelRefused, match='gates after the norm'):
+        jax.eval_shape(normed)
