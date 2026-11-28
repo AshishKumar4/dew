@@ -218,8 +218,9 @@ def _exp_scaled_tangent(primals, tangents):
     form's (`_raised`): `2^-149 · 2^149` along its exponent is 1, where `z / 2` flushed it 0 (train 1489's
     F2), a tiny `z`'s two directions meeting the powers apart. Its order is fixed, as JAX transposes it: a
     direction meets `z / 2` before the powers and a cotangent the powers first, so `2^120 · 2^-120` along
-    `2^100` overflows where the reverse of `3 · 2^124` at `2^126 · 2^-124` does not; a declared transpose
-    (`generation.linear_map`) read NaN past the second order of `attend`."""
+    `2^100` overflows where the reverse of `3 · 2^124` at `2^126 · 2^-124` does not, and a tiny `z`'s joint
+    directions at fp32's extremes overflow before they cancel; a declared transpose (`generation.linear_map`)
+    read NaN past the second order of `attend` (row 14203)."""
     z, exponent, power = primals
     along_z, along_exponent, along_power = tangents
     tiny = _tiny(jax.lax.stop_gradient(z))
