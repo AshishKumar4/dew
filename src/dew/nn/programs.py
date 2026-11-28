@@ -32,7 +32,7 @@ from jax._src import (
 from jax._src.interpreters import partial_eval
 from jax._src.literals import TypedNdArray
 from jax._src.pallas.mpmd import mpmd_map_p
-from jax.core import ShapedArray
+from jax.core import ShapedArray, Tracer
 from jax.experimental.pallas import pallas_call_p
 from jax.extend.backend import backends
 
@@ -967,3 +967,44 @@ def on_host() -> Iterator[None]:
         host = jax.local_devices(backend="cpu" if "cpu" in backends() else None)[0]
         with jax.ensure_compile_time_eval(), jax.default_device(host):
             yield
+
+
+def on_tile(jaxpr: jcore.Jaxpr, consts, logical: tuple, tile: tuple, *args) -> list:
+    """`jaxpr`, traced at the `logical` shape, evaluated on `args` of the `tile` shape as
+    `jax.core.eval_jaxpr` evaluates it: each equation bound by its primitive (`get_bind_params`), a shape
+    parameter that is the logical shape the tile's, and a program a parameter holds (a jit's, a custom
+    derivative's primal) retraced at the tile's shapes, the equation kept. Its values alone: a caller states
+    the derivative (`dew.nn.kernels.norm_swiglu`'s `_Logical`, a row kernel's epilogue on a tile of a row's
+    columns; `attention_mosaic_program.BlockPlan.sliced`, an output hook's program on a block of its tile's
+    columns)."""
+    values = dict(zip(jaxpr.constvars, consts, strict=True)) | dict(zip(jaxpr.invars, args, strict=True))
+
+    def read(atom):
+        return atom.val if isinstance(atom, jcore.Literal) else values[atom]
+
+    def shaped(value):
+        return tuple(tile) if isinstance(value, tuple) and tuple(value) == logical else value
+
+    def retraced(program: jcore.Jaxpr):
+        avals = [jax.ShapeDtypeStruct(tile if aval.shape == logical else aval.shape, aval.dtype)
+                 for aval in program.in_avals if isinstance(aval, ShapedArray)]
+        return jax.make_jaxpr(
+            lambda *operands: on_tile(program, program.consts, logical, tile, *operands))(*avals)
+
+    for equation in jaxpr.eqns:
+        given = [read(atom) for atom in equation.invars]
+        if equation.primitive is jax.lax.cond_p and not isinstance(given[0], Tracer):
+            # A conditional whose index is known (a predicate the activation closes over, a constant in its
+            # graph) is the branch it names, run on the tile: Pallas's Triton lowering takes a traced index
+            # alone (its rule reads the index's MLIR type; a constant has none).
+            branch = equation.params["branches"][int(np.asarray(given[0]))]
+            values.update(zip(equation.outvars, on_tile(branch.jaxpr, branch.consts, logical, tile,
+                                                        *given[1:]), strict=True))
+            continue
+        # Each program it runs within it, a call's or each branch's (`programs.with_bodies`), retraced.
+        params = with_bodies({key: shaped(value) for key, value in equation.params.items()}, retraced)
+        with equation.ctx.manager:
+            made = equation.primitive.bind(*given, **equation.primitive.get_bind_params(params))
+        outputs = made if equation.primitive.multiple_results else [made]
+        values.update(zip(equation.outvars, outputs, strict=True))
+    return [read(atom) for atom in jaxpr.outvars]

@@ -345,13 +345,15 @@ fitted to them, and a rule set ships only with measured receipts.
   product a plain dot (row 8996); so a plain JAX program compiled through Dew runs the templates its products
   match (row 3450). A search that weighs a region's variants itself (row 9038's whole-layer search) reads them,
   over one `fusion.Index` a body, through `fusion.regions` (each product region as the pass finds it, before `fused_program` sets aside those an
-  attention or recurrence region holds), `fusion.fewer` (every region of fewer of its stages, the region itself
+  attention or recurrence region holds; `fusion.eligible`, those it weighs, without them), `fusion.fewer` (every region of fewer of its stages, the region itself
   not among them, in the order the pass weighs them, one walk with it), `fusion.analyzed` (the analysis the pass
   weighs a region by) and `fusion.product_form` (a product's form), and reads the pass's own choice through
-  `fusion.decided` (its decision of a region) and `fusion.taken` (the region of a product it selects, before a
-  recognized attention's hold and its written call's type check) and the bodies it weighs regions in through
+  `fusion.decided` (its decision of a region, the analysis it priced it by held with it,
+  `RegionDecision.analysis`) and `fusion.taken` (the region of a product it selects, before its written call's
+  type check) and the bodies it weighs regions in through
   `program.fused_bodies` (each body it rewrites as a region of its own, as it reads it, weighed in the
-  context it weighs it in, a manual mesh's), never a copy of their rules. A
+  context it weighs it in, a manual mesh's; for a platform, a platform choice's branch its lowering runs
+  alone), never a copy of their rules. A
   region's written program, Dew's call traced over its inputs' types, is traced once a process for the region's
   identity in the context a kernel is chosen in (`fusion.choice_context`: the state a trace reads,
   `dew.nn.kernels.options.trace_context`, XLA's deterministic-ops flag among it, complete by default: a value it leaves
@@ -486,8 +488,13 @@ All accuracy checks are the [accuracy gate](testing.md)'s, with no tolerance of 
     Code: a fact from its one source):
     `program`'s static arguments by JAX's own inference, `nn.programs`' precision presets by JAX's own
     conversion.
-- **XLA keeps** fusion and code generation; it does not reassociate floating-point math by default, so chosen forms
-  reach it intact.
+- **XLA keeps** fusion and code generation, and its algebraic simplifier and constant folding still rewrite some
+  floating-point forms the pass hands it (tests/arm_arithmetic.py's `AS_WRITTEN`: `(A/B)/C` as `A/(B*C)`, a
+  division by a broadcast through its reciprocal, a constant folded into a scale), so a chosen form is not
+  guaranteed to reach code generation as chosen. Two things hold that: a candidate is admitted by its error as
+  XLA compiles it (`generate.admits`, the gate running each form through the compile point), and a form whose
+  roundings must stand as written holds them itself, a `Protected` span's error-free transforms and an
+  `optimization_barrier` where no marking stands in for one (`dew.nn.blocks`' Fourier table).
 
 ## 5. Prior art
 
@@ -1151,7 +1158,10 @@ chunk algorithm side by side:
 - a solve is linear in its given values, so the part of the system that reads the state is off it.
 
 The cheapest under the work-span model is the chunk's form, which `scan.py` evaluates and `carry.py`
-splits. At a kernel's chunk on an A100 or an H100 (64 tokens, 128 keys and values) the extraction is the
+splits; a forward substitution of values that read the entering state is priced past every form, its row
+walk over the state no equation of the program's language and so no split's, so the linearity's two solves
+are taken (a 128-wide gated delta net's chunk on an A10, an L4, a T4 or a B300, whose pricing had made the
+state's substitution the cheapest and its split refused). At a kernel's chunk on an A100 or an H100 (64 tokens, 128 keys and values) the extraction is the
 compact WY form with its inverse by doubling, the hand-written chunk's form. Both rule sets are proven
 sound over the reals from their declarations (tests/test_linear_scan.py), at every chunk size by
 induction: each identity holds exactly at a symbolic chunk of three tokens (so at one, two and three, each
@@ -1783,13 +1793,15 @@ about it is an estimate.
   its format's NaN code, and e2m1, which has none, as its largest finite code of the NaN's sign), proven
   exhaustively over every fp32 word against ml_dtypes' cast. Its form is found at
   development time by `tools/superoptimize_bits.py` (Z3 its dependency, not Dew's): the reference's jaxpr
-  traced into the vocabulary, then each window of up to three steps that only its last step leaves replaced
-  by a cheaper program of one or two, its operations, operands, immediates and tables unknowns, by
+  traced into the vocabulary (a shift by a value a logical one: an arithmetic one by a value is refused), then
+  each window of up to three steps that only its last step leaves and that reads at most three values from
+  outside it replaced by a cheaper program of one or two, its operations, operands, immediates and tables unknowns, by
   counterexample-guided synthesis, a replacement taken only where Z3 proves it equal on every value of the
   window's inputs. For the three encodes it finds the same program, 41 issues to 37 (`x != 0` as
   `min(x, 1)`, two adds as one IADD3, a select and a mask as one), its constants the minifloat's:
-  `encode_form`, proven against `encoded` on every fp32 word by its test, and its PTX run on the GPU against
-  its own evaluation. Windows of four steps into three found nothing further (2026-11-06, one round within
+  `encode_form`, proven against `encoded` on every fp32 word by its test, and its E4M3 and E5M2 PTX, inline
+  in the quantize epilogue compiled on an H100 and an A100, `encoded` bit for bit (tests/test_gpu_gemm.py's
+  encode cells). Windows of four steps into three found nothing further (2026-11-06, one round within
   its bounds). Whether its PTX beats the compiler's lowering of `encoded` is its consumer's measurement
   (sm80's FP8 and FP4 epilogue, row 3733).
 - **Decodes searched** (2026-11-06, the tool's `e4m3-decode-*`, `e5m2-decode-*` and `e8m0` references): an FP8

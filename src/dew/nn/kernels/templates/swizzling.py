@@ -181,32 +181,42 @@ def staging_of(ref) -> tuple[state_types.Transform, ...]:
     a `run_scoped` equation's parameter, so a ref states none of it as it traces: its allocation's staging
     is the one Dew noted as it allocated it (`run_scoped`, `launches.kernel`'s scratch, `noting`), the views
     on it composed after; none where Dew noted none."""
-    base, views = ref, ()
-    while isinstance(base, state_types.TransformedRef):
-        base, views = base.ref, (*base.transforms, *views)
-    selected, member = (views[:1], _member(views[0])) if views and _member(views[0]) else ((), None)
-    views = views[len(selected):]
-    noted = (_STAGING.get() or {}).get((id(base), member))
+    base, selected, views = _decomposed(ref)
+    noted = (_STAGING.get() or {}).get(_key(base, selected))
+    head = () if selected is None else (selected,)
     if noted is None or noted[0] is not base:
-        return (*selected, *views)
+        return (*head, *views)
     staging = noted[1]
     # A ref that states its staging itself (JAX 0.12.0's) holds it first among its transforms.
-    return (*selected, *(views if views[:len(staging)] == staging else (*staging, *views)))
+    return (*head, *(views if views[:len(staging)] == staging else (*staging, *views)))
 
 
-def _member(transform: state_types.Transform) -> tuple[int, int] | None:
-    """The member of a ref union a transform selects (`ExtractAliasedRef`: its group and byte offset), None
-    for any other transform."""
-    if isinstance(transform, plgpu_core.ExtractAliasedRef):
-        return transform.alias_group_idx, transform.offset
-    return None
+def _decomposed(ref) -> tuple[jax_core.Tracer, plgpu_core.ExtractAliasedRef | None,
+                              tuple[state_types.Transform, ...]]:
+    """`ref` as its base ref (the one a body's allocation handed it, under every view), the member of a ref
+    union it selects (`ExtractAliasedRef`, its first transform; None for a ref of its own) and the
+    transforms after it, outermost view last: what `noting` keys a ref's staging by and `staging_of` reads
+    it back by."""
+    base, transforms = ref, ()
+    while isinstance(base, state_types.TransformedRef):
+        base, transforms = base.ref, (*base.transforms, *transforms)
+    if transforms and isinstance(transforms[0], plgpu_core.ExtractAliasedRef):
+        return base, transforms[0], transforms[1:]
+    return base, None, transforms
+
+
+def _key(base: jax_core.Tracer, selected: plgpu_core.ExtractAliasedRef | None
+         ) -> tuple[int, tuple[int, int] | None]:
+    """A noted ref's key (`_STAGING`): its base's identity and the union member it is (its group and byte
+    offset), None for a ref of its own."""
+    return id(base), None if selected is None else (selected.alias_group_idx, selected.offset)
 
 
 _STAGING: contextvars.ContextVar[Mapping[tuple[int, tuple[int, int] | None],
                                          tuple[object, tuple[state_types.Transform, ...]]] | None] = (
     contextvars.ContextVar("dew_staging", default=None))
 """Each ref an allocation of the trace in progress made (`noting`), by its base ref's identity and the union
-member it is (`_member`, None for a ref of its own), with its base (so its identity is its own while it is
+member it is (`_key`, None for a ref of its own), with its base (so its identity is its own while it is
 noted) and its staging's undoing (`staging_of`); none outside any."""
 
 
@@ -221,12 +231,9 @@ def noting(allocated: Iterable[tuple[object, object]]) -> Iterator[None]:
         # A staged allocation's type alone states transforms (a barrier's, a TPU's, an accumulator's none).
         if not isinstance(kind, plgpu_core.GPUMemoryRef) or not (transforms := tuple(kind.transforms)):
             continue
-        base, selected = ref, ()
-        while isinstance(base, state_types.TransformedRef):
-            base, selected = base.ref, (*base.transforms, *selected)
-        member = _member(selected[0]) if selected else None
+        base, selected, _ = _decomposed(ref)
         aval = jax_core.ShapedArray(kind.shape, kind.dtype)
-        noted[id(base), member] = base, tuple(pallas_core.undo_transforms(aval, transforms))
+        noted[_key(base, selected)] = base, tuple(pallas_core.undo_transforms(aval, transforms))
     token = _STAGING.set(noted)
     try:
         yield

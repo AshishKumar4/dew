@@ -51,6 +51,7 @@ from dew.nn.kernels.templates.attention import (
     dropped_reach,
     drops_in_place,
     kept,
+    kept_value,
     narrowing_settled,
     saturated,
     within,
@@ -1946,7 +1947,7 @@ def finish(spec: Forward, state: Partial, *, initial: bool, output_mod: Callable
                        held=jnp.float32 if held else spec.largest)
         out = settled_store(spec, out, state.acc, state.total, hooked=output_mod is not None)
     if output_mod is not None:
-        out = output_mod(out, *output_params)
+        out = output_mod(out, *map(kept_value, output_params))
     return out, m, denominator
 
 
@@ -2191,28 +2192,12 @@ def narrowed(x: jax.Array, dtype) -> jax.Array:
     return part.astype(jnp.float32)
 
 
-def value_operands(exponentials: jax.Array, weights: jax.Array, dout: jax.Array,
-                   total: jax.Array, multiplier: jax.Array | None = None) -> tuple[jax.Array, jax.Array]:
-    """The operands `(a, b)` of a tile's share of dV, `aᵀ·b` `[block_k, Dv]` in fp32 (a mainloop's
-    transposed product, `cotangent_product`'s for dK): the unnormalized
-    weights `exp(s - m)` narrowed to the operands' dtype as the reference's forward rounds them, against
-    each query's `dout / total` in fp32, the reference's derivative's own order, so no small weight or
-    share is lost to normalizing first. bf16 alone takes FlashAttention's form, its normalized weights
-    `p` narrowed against the output's cotangent as it is, so the product stays on bf16's tensor cores: a
-    query's cotangents that cancel across a key still cancel, and a normalized weight below bf16's least
-    subnormal (about 9e-41) is dropped, which only a cotangent past about 1e28 would make count."""
-    dropped = multiplier is not None
-    if dropped:
-        exponentials, weights = exponentials * multiplier, weights * multiplier
-    if dout.dtype == jnp.bfloat16:
-        return value_weights(exponentials, weights, dout.dtype, dropped), dout
-    scaled = dout.astype(jnp.float32) * expand(inverse(total), dout)
-    return value_weights(exponentials, weights, dout.dtype, dropped), scaled
-
-
 def value_weights(exponentials: jax.Array, weights: jax.Array, dtype, dropped: bool = False) -> jax.Array:
-    """`value_operands`' left operand for an output cotangent of `dtype`: bf16's normalized weights narrowed,
-    else the unnormalized ones narrowed to `dtype` and held in fp32."""
+    """A tile's share of dV's left operand, `aᵀ·b` `[block_k, Dv]` against an output cotangent of `dtype`:
+    bf16's normalized weights narrowed (FlashAttention's form, so the product stays on bf16's tensor cores),
+    else the unnormalized weights `exp(s - m)` narrowed to `dtype` as the reference's forward rounds them and
+    held in fp32, against each query's `dout / total` in fp32, so no small weight is lost to normalizing
+    first."""
     if dtype == jnp.bfloat16:
         return weights.astype(dtype)
     if dropped:
@@ -2222,7 +2207,7 @@ def value_weights(exponentials: jax.Array, weights: jax.Array, dtype, dropped: b
 
 def value_parts(weights: jax.Array, dtype) -> Parts:
     """A tensor-core mainloop's dV left operand, `pᵀ·dO` against the output cotangent as it is in shared
-    memory (FlashAttention's form, `value_operands`' bf16 one): the normalized weights narrowed, bf16's as is,
+    memory (FlashAttention's form, `value_weights`' bf16 one): the normalized weights narrowed, bf16's as is,
     fp16's at a power of two of their row's (`weights_parts`), which keeps a weight down to 2^-24 of the
     row's largest where fp16's least subnormal (about 6e-8) would drop a normalized one."""
     return weights_parts(weights, dtype, rows=True)

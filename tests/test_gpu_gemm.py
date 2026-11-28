@@ -7,8 +7,9 @@ one process (`gpu_flow`), each cell its own file's property:
   check 1, on an H100 (test_gemm_template).
 - CUTLASS runs the grouped projection as exactly as XLA wherever it is chosen, over every grouping that
   routes a row (test_grouped_gemm).
-- The blockwise FP8 kernel gradient (rows contiguous, step scales) holds check 1 on an H100
-  (test_gemm_blockwise).
+- The blockwise FP8 kernel gradient (rows contiguous, step scales) holds check 1 on an H100, and the
+  products a receipt timed (a routed gate's forward and its input gradient's launch) hold check 1 unnamed
+  at their own extents (test_gemm_blockwise).
 - The template takes gpt-oss's 2880-wide projection, its ragged stores' one-row rungs, as exactly as XLA's
   (test_grouped_gemm; row 4474).
 - A ring streams tiles of their own trip counts, consumers feeding their own ring split a step, and every
@@ -19,6 +20,8 @@ one process (`gpu_flow`), each cell its own file's property:
   accumulator width and on a two-CTA pair, the pair also on extents no tile divides (test_gemm_tcgen05).
 - The NVFP4 product's packed kernel (its mainloop decoding each stage in place) holds every order on an
   H100 and an A100 (test_contracts_gemm).
+- The quantize epilogue's E4M3 and E5M2 encodes, `bits.encode_form`'s PTX inline in the compiled epilogue,
+  are `bits.encoded` bit for bit on an H100 and an A100 (test_gemm_nvfp4; row 14105).
 - A delayed NVFP4 MLP's chain on a Blackwell, its up projection's block-scaled epilogue storing the down
   projection's rows as codes two a byte and transposed block scales, is bitwise its projections apart,
   value and every gradient, gated and ungated (test_gemm_nvfp4_chain; rows 12721, 12743).
@@ -60,6 +63,7 @@ import test_fed_walks as fed_walks
 import test_gemm_blockwise as gemm_blockwise
 import test_gemm_converted as gemm_converted
 import test_gemm_gather as gemm_gather
+import test_gemm_nvfp4 as gemm_nvfp4
 import test_gemm_nvfp4_chain as gemm_nvfp4_chain
 import test_gemm_paired as gemm_paired
 import test_gemm_tcgen05 as gemm_tcgen05
@@ -70,9 +74,11 @@ import test_mosaic_toolkit as mosaic_toolkit
 import test_warpgroup_scan as warpgroup_scan
 from gpu_flow import Cell, cells_of, covering, in_parts, parted, run_cells, when
 from jax.experimental.pallas import fuser
+from kernel_compile import gate_generations
 from reference_error import ahead_arm, assert_as_exact
 from test_gemm_template import rms_norm as template_rms_norm
 
+from dew.algebra import bits
 from dew.nn.kernels import fused_gemm, generation
 from dew.nn.kernels.templates.gemm import tiling
 from dew.nn.norms import rms_normalized
@@ -241,6 +247,11 @@ def _scale_edge_cells() -> tuple[Cell, ...]:
         Cell("a blockwise FP8 product at large finite scales is finite",
              gemm_blockwise.a_blockwise_fp8_product_at_large_finite_scales_is_finite, "sm90",
              at_run=EXACT_OVERFLOW, native={"launch": "blockwise fp8 gmm", "pass": "step scaling"}),
+        *(Cell(f"a blockwise FP8 receipt cell holds check 1 unnamed ({name})",
+               functools.partial(gemm_blockwise.a_receipt_cells_blockwise_product_holds_check_1_unnamed,
+                                 name),
+               "sm90", mosaic=True, native={"launch": "blockwise fp8 gmm", "pass": f"receipt cell, {name}"})
+          for name in gemm_blockwise.RECEIPT_CELLS),
         *(Cell(f"an E5M2 blockwise {name} at fp32's largest is finite ({edge})",
                functools.partial(witness, edge), "sm90", at_run=EXACT_OVERFLOW,
                native={"launch": launch, "pass": f"e5m2 step scaling, {edge}"})
@@ -250,7 +261,27 @@ def _scale_edge_cells() -> tuple[Cell, ...]:
               ("kernel gradient", gemm_blockwise.an_e5m2_blockwise_kernel_gradient_at_fp32s_largest_is_finite,
                "blockwise fp8 tgmm"))
           for edge in gemm_blockwise.E5M2_EDGES),
+        Cell("an owed product's native fold rounds once below the normals",
+             gemm_nvfp4.an_owed_products_native_fold_rounds_once_below_the_normals, "sm90",
+             at_run=EXACT_OVERFLOW, native={"launch": "owed fold", "pass": "subnormal product"}),
+        Cell("a gathered packed NVFP4 bank is its values' product",
+             gemm_nvfp4.a_gathered_packed_nvfp4_bank_is_its_values_product, "sm90", mosaic=True,
+             at_run=EXACT_OVERFLOW, native={"launch": "nvfp4 packed", "pass": "gathered rows"}),
+        Cell("a packed NVFP4 call placed on its host's CPU keeps a subnormal column scale",
+             gemm_nvfp4.a_packed_nvfp4_call_placed_on_its_hosts_cpu_keeps_a_subnormal_scale, "sm90",
+             at_run=EXACT_OVERFLOW, native={"launch": "nvfp4 packed", "pass": "host-placed finish"}),
     )
+
+
+def _encode_cells() -> tuple[Cell, ...]:
+    """The quantize epilogue's FP8 encodes compiled, each `bits.encode_form`'s PTX inline in the epilogue
+    (`inline_forms.registers`), which the interpreter runs as the form's evaluation instead (algebra.md §7.3,
+    row 14105): on an H100's warpgroup MMA and an A100's mma.sync, each `bits.encoded` bit for bit."""
+    return tuple(
+        Cell(f"the quantize epilogue's {name} encode is bits.encoded's on {gpu}",
+             functools.partial(gemm_nvfp4.the_quantize_epilogue_encodes_as_bits_encoded, minifloat), gpu,
+             mosaic=gpu == "sm80", fault=INLINE_ENCODE, at_run=EXACT_CODES)
+        for gpu in ("sm90", "sm80") for name, minifloat in (("E4M3", bits.E4M3), ("E5M2", bits.E5M2)))
 
 
 def _syrk_and_tail_cells():
@@ -284,6 +315,11 @@ RING = "a ring's asynchronous slots, which the interpreter walks in one order"
 """Why the toolkit's rings stay on the GPU (the GEMM lane, 11-11)."""
 
 SHARED = "a collective cp.async pipeline's meets, which the interpreter takes as no-ops (row 5272)"
+
+MMA_SYNC = "mma.sync's products, which the interpreter sums by a dot (`mosaic_sm80.MmaIssuer.products`)"
+
+CONVERTED = ("a quantized stage's conversion in registers (its cvt, its packed int8 assembly), which the "
+             "interpreter computes in fp32 (row 8549)")
 """Why two mma.sync consumers' shared walk stays on an A100 (row 12652)."""
 
 CLUSTER = "a cluster's multicast of a shared block, which the interpreter loads whole in each program"
@@ -301,6 +337,13 @@ EXACT_OVERFLOW = "an exact finite value its run compiles and reads, no check-1 s
 """Why the blockwise FP8 overflow witness runs at its run (`Cell.at_run`): it asserts one exact value of a
 native launch, which a compile-only prepare's device cannot run (row 13257)."""
 
+INLINE_ENCODE = "an encode's PTX inline in a compiled epilogue, which the interpreter runs as its evaluation"
+"""Why the quantize epilogue's encode cells stay on the GPU (`_encode_cells`, row 14105)."""
+
+EXACT_CODES = "exact codes its run compiles and reads, no check-1 site for a prepare to compile ahead"
+"""Why the encode cells run their programs at run (`Cell.at_run`): each asserts every code bit for bit, a
+native launch's, which a compile-only prepare's device cannot run."""
+
 CUBLAS_BF16 = "cuBLASLt's dense bf16 product stored in bf16, which no CPU dot computes"
 """Why the XLA fallback's direct bf16 product stays on the GPU (the GEMM lane, 11-25)."""
 
@@ -315,7 +358,9 @@ balances: a 128 x 128 tile holds no merge (280 registers a thread, `MosaicTgmm.b
 
 def _toolkit_cells() -> list[Cell]:
     """The toolkit's rings and walks on the GPUs whose waits the interpreter takes as no-ops: an H100's rings
-    and reads, an A100's shared cp.async pipeline (each kept by name for its fault)."""
+    and reads, an A100's shared cp.async pipeline; and the products and conversions the interpreter computes
+    by a dot and in fp32: mma.sync's chained and row-bounded products, each generation's quantized stage
+    (each kept by name for its fault)."""
     return [
         *(Cell(f"a ring streams tiles of their own trip counts: {consumers} consumers",
                functools.partial(mosaic_toolkit.a_ring_streams_tiles_of_their_own_trip_counts_on_an_h100,
@@ -335,6 +380,19 @@ def _toolkit_cells() -> list[Cell]:
                # GPU copying by TMA (`lowers_as`; train 1378's sm90 prepare).
                "sm80", mosaic=True, fault=SHARED)
           for consumers, split in ((1, False), (2, False), (2, True))),
+        *(Cell(f"an accumulator feeds the next product: {rows} rows, {m_warps} warps",
+               functools.partial(mosaic_toolkit.an_accumulator_feeds_the_next_product_on_a_gpu, rows,
+                                 m_warps),
+               "sm80", fault=MMA_SYNC)
+          for rows, m_warps in mosaic_toolkit.CHAINED),
+        *(Cell(f"mma.sync products within a row bound: {m_warps} warps",
+               functools.partial(mosaic_toolkit.mma_sync_products_within_a_row_bound_on_a_gpu, m_warps),
+               "sm80", fault=MMA_SYNC)
+          for m_warps in mosaic_toolkit.BOUND_WARPS),
+        *(Cell(f"a quantized stage converts natively: {name}, {jnp.dtype(dtype).name}, scaled {scaled}",
+               functools.partial(mosaic_toolkit.a_quantized_stage_converts_natively, name, dtype, scaled),
+               name, fault=CONVERTED)
+          for name in gate_generations() for dtype in mosaic_toolkit.QUANTIZED for scaled in (True, False)),
     ]
 
 
@@ -399,7 +457,7 @@ def test_the_gemm_kernels_run_on_this_gpu(part):
                gemm_paired.a_chained_input_gradient_is_as_finite_as_its_products_sum, name,
                native={"launch": "chained", "generation": name, "case": "overflow"})
           for name in ("sm90", "sm100")),
-        *_scale_edge_cells(),
+        *_scale_edge_cells(), *_encode_cells(),
         *_converted_cells(),
         Cell("the blockwise FP8 kernel gradient is on par",
              gemm_blockwise.a_blockwise_kernel_gradient_is_on_par, "sm90", fault="red at 475913063"),

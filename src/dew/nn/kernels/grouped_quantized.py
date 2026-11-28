@@ -40,7 +40,8 @@ class MosaicPackedGmm(MosaicGmm):
     and dtype the bfloat16 matrix it decodes to, `[groups, depth, width]`), streamed as its words and block
     scales and each stage decoded in place into the consumer's buffers (`mosaic_gpu.gmm`'s `scales`), so its
     tile takes `packed.NVFP4_STEP`-deep steps, whole 64-column tiles, the decode's shared memory and
-    registers, and no cluster, split or hook. A decode-sized dense call runs swapped (`_swapped`, row 5387):
+    registers, and no cluster, split, prologue or pair; its epilogue the finished accumulator's, as any
+    launch's (its tensor scale's, row 13743). A decode-sized dense call runs swapped (`_swapped`, row 5387):
     the matrix the products' rows, each stage of it decoded in registers into their left operand, the call's
     rows the columns."""
 
@@ -80,9 +81,11 @@ class MosaicPackedGmm(MosaicGmm):
 
         dtype = ba.arguments['tokens'].dtype
         rows = ba.arguments['packed_rows']
+        # An epilogue's side operands staged as any launch's (the tensor scale its finish reads, row 13743).
         return mosaic_gpu.gmm_allocations(
             config, family, dtype=dtype, rhs_dtype=dtype if rows else jnp.uint32, transpose_rhs=True,
-            prologue_axes=(), prologue_dtypes=(), epilogue_axes=(), epilogue_dtypes=(),
+            prologue_axes=(), prologue_dtypes=(), epilogue_axes=ba.arguments['hooks'].epilogue_axes,
+            epilogue_dtypes=tuple(side.dtype for side in ba.arguments.get('epilogue_operands', ())),
             dtypes=(ba.arguments['out_dtype'],), packed=True, packed_rows=rows)
 
     def _legal(self, ba, config: tiling.Tiles, target) -> bool:

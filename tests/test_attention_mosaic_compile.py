@@ -18,10 +18,12 @@ from generation_support import COMPILES_FOR_TPU, COMPILES_ON_CPU, INTERPRETS, lo
 from jax.sharding import AbstractDevice, AbstractMesh, AxisType, Mesh
 from kernel_compile import (
     compile_mosaic_kernels,
+    failing_runs,
     gate_generations,
     lowered_for,
     mosaic_failures,
-    refused_across_build_failures,
+    runs,
+    spills,
 )
 from test_attention_mosaic import (
     BACKWARD_HOOKS,
@@ -39,9 +41,11 @@ from test_attention_mosaic import (
 from test_attention_template import CASES, ROWS, RUN_CASES, arguments, geometry as core_geometry
 from test_attention_triton import HOOKS, SCORE_HOOKS, gate_of, hooks_for, score_hooks
 
+from dew._devices import cuda_builds
 from dew.nn.attention import scaled_dot_product_attention
 from dew.nn.kernels import generation, tuning
 from dew.nn.kernels.templates import (
+    assembled,
     attention as template,
     attention_mosaic,
     attention_mosaic_derivation,
@@ -452,11 +456,14 @@ def test_a_decode_step_compiles_spill_free_at_its_plans_tiles(generation_name, w
     failed = mosaic_failures(found)
     if failed and stored == "int8":
         record = found[0]
-        offered = [cert for cert in record.get("certifications", ()) if cert["op"] == "MosaicForward"]
-        assert "derives no config" in record.get("error", ""), "\n".join(failed)
-        assert not record.get("uncertified"), record
-        assert offered and all(any(refused for _, _, refused in cert["kernels"].values())
-                               for cert in offered), "\n".join(failed)
+        # Refused as every build's GPUs refuse it, each build's run on its own judged evidence: no build's run
+        # lowers a program the gate failed.
+        for run in failing_runs(record):
+            offered = [cert for cert in run.get("certifications", ()) if cert["op"] == "MosaicForward"]
+            assert "derives no config" in run.get("error", ""), "\n".join(failed)
+            assert not run.get("uncertified") and not run.get("unjudged") and not run.get("rejected"), run
+            assert offered and all(any(refused for _, _, refused in cert["kernels"].values())
+                                   for cert in offered), "\n".join(failed)
     else:
         assert not failed, "\n".join(failed)
 
@@ -467,7 +474,9 @@ def test_a_public_fp32_decode_fallback_reports_every_plain_forward_kernels_resou
     """Row 7263: a public fp32 decode whose head width or GPU falls back to Pallas-Triton plain-forward
     kernels (`attention_route.attend`: sm80 64-wide, sm90/sm100 256-wide) reports every Triton kernel's
     shared bytes, registers, spills and TMEM usage through `compile_mosaic_kernels` / `mosaic_failures` with
-    zero unread fields."""
+    zero unread fields, in every build's run; a run of a build this process does not compile with names each
+    Triton kernel unqualified, its figures this process's compile's (Train 1470's review: an sm100's cuda13
+    run carried cuda12's figures as its own)."""
     from fla_gdn_support import KernelCase
     from kernel_compile import compile_mosaic_kernels, mosaic_failures
 
@@ -484,11 +493,18 @@ def test_a_public_fp32_decode_fallback_reports_every_plain_forward_kernels_resou
     with generation.assumed(generation_name):
         found = compile_mosaic_kernels([KernelCase("decode", lambda: (decode, (query, key, key)))],
                                        generation_name)
-    kernels = found[0]["kernels"]
-    assert kernels and all(k["kind"] == "triton" for k in kernels), kernels
-    names = {k["kernel"] for k in kernels}
-    assert "attention_forward" in names and "attention_forward_scaled" in names, names
-    assert all(not k["unread"] for k in kernels), kernels
+    for run in runs(found):
+        kernels = run["kernels"]
+        assert kernels and all(k["kind"] == "triton" for k in kernels), kernels
+        names = {k["kernel"] for k in kernels}
+        assert "attention_forward" in names and "attention_forward_scaled" in names, names
+        assert all(not k["unread"] for k in kernels), kernels
+        # Another build's run assembles no Triton kernel (no PTX of it printed): each of its program's is
+        # named unqualified (beside its certifications' own), its figures this process's compile's, never
+        # that build's evidence.
+        if run["build"] not in cuda_builds():
+            named = {assembled.launch_name(k["kernel"], k["launch"]) for k in kernels}
+            assert named <= set(run["unqualified"]), (named, run["unqualified"])
     failed = mosaic_failures(found)
     assert not failed, "\n".join(failed)
 
@@ -655,9 +671,10 @@ def _check_backward_case(generation_name: str, width: int, accurate: bool, hooks
         with generation.assumed(generation_name):
             beyond_found = compile_mosaic_kernels(
                 [KernelCase(f"beyond-{hooks}", lambda: op.lowering(ba, least))], generation_name)
-        assert beyond_found and all(record.get("shared", 0) > record["limit"]
-                                    or any(kernel.get("spilled") for kernel in record.get("kernels", ()))
-                                    for record in beyond_found), beyond_found
+        # Every build's run (`runs`) past its block or spilling: one build that holds it would derive it.
+        every = runs(beyond_found)
+        assert every and all(run.get("shared", 0) > run["limit"] or run["name"] in spills([run])
+                             for run in every), beyond_found
         return
     hooked = _gated_hooks(hooks, queries, width)
 
@@ -686,12 +703,15 @@ def _check_backward_case(generation_name: str, width: int, accurate: bool, hooks
         return
     if mandatory:
         assert not failed, "\n".join(failed)
-    assert record.get("exhausted"), "\n".join(failed)
-    assert not record.get("uncertified"), record
-    assert offered and all(any(refused for _, _, refused in cert["kernels"].values())
-                           for cert in offered), "\n".join(failed)
-    # Every offer refused under every build its GPUs run, none taken ungated where another build holds it.
-    assert not refused_across_build_failures(record), "\n".join(refused_across_build_failures(record))
+    # Declined as every build's GPUs decline it, each build's run on its own judged evidence: each run that
+    # fails exhausted its derivation, every config it offered refused, none taken ungated where another
+    # build holds a config (row 10766).
+    for run in failing_runs(record):
+        refusals = [cert for cert in run.get("certifications", ()) if cert["op"] == type(op).__name__]
+        assert run.get("exhausted"), "\n".join(failed)
+        assert not run.get("uncertified") and not run.get("unjudged") and not run.get("rejected"), run
+        assert refusals and all(any(refused for _, _, refused in cert["kernels"].values())
+                                for cert in refusals), "\n".join(failed)
 
 
 @COMPILES_ON_CPU

@@ -861,6 +861,50 @@ def test_a_runs_step_rows_read_the_steps_their_trees_prepare_compiled_ahead(gate
         assert handed == (str(tmp_path / "ahead" / "head") if tree == "head" else None), (tree, command)
 
 
+def test_a_base_and_head_checked_out_alike_each_compile_and_read_their_own_steps_ahead(
+        gate, tmp_path, monkeypatch):
+    """Two checkouts named alike (old/dew and new/dew) each compile their steps ahead into their arm's own
+    directory (its name in the run, base or head), and each arm's step rows read its own: keyed by the
+    checkout's directory name, the second arm's compile overwrote the first's, and both read one (row
+    14123)."""
+    from types import SimpleNamespace
+
+    standing_in_environments(gate, monkeypatch)
+    battery = gate.subprocess.run
+    trees = {name: locked_tree(tmp_path / side / "dew") for name, side in (("main", "old"), ("head", "new"))}
+    into = {}
+
+    def child(command, **kwargs):
+        if len(command) < 2 or Path(command[1]).name != "benchmark_step.py":
+            return battery(command, **kwargs)
+        if command[2:] == ["--help"]:
+            return subprocess.CompletedProcess(command, 0, "usage: [--compile-ahead DIR]", "")
+        into[kwargs["cwd"]] = command[command.index("--compile-ahead") + 1]
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    monkeypatch.setattr(gate.subprocess, "run", child)
+    ahead = tmp_path / "ahead"
+    args = SimpleNamespace(base=f"main={trees['main']}", head=f"head={trees['head']}", kind="a100",
+                           lock="cpu", environments=str(tmp_path / "environments"), out=str(ahead),
+                           only=["step lm-dense 4x1024"])
+    assert gate.ahead_battery(args) == 0
+    assert sorted(into.values()) == [str(ahead / "head"), str(ahead / "main")]
+    # Each arm's run reads its own arm's directory, the head's alone present.
+    monkeypatch.setattr(gate.subprocess, "run", battery)
+    _, rows = standing_in_environments(gate, monkeypatch)
+    (ahead / "head").mkdir(parents=True)
+    run = SimpleNamespace(base=f"main={trees['main']}", head=f"head={trees['head']}", rounds=1,
+                          only=["step lm-dense 4x1024"], claim=False, model="unused", flowers="unused",
+                          torch_python="", out=str(tmp_path / "gate.json"),
+                          environments=str(tmp_path / "environments"), ahead=str(ahead))
+    assert gate.run(run) == 0
+    stepped = [(tree, command) for tree, command, _ in rows
+               if len(command) > 1 and Path(command[1]).name == "benchmark_step.py"]
+    handed = {tree.parent.name: command[command.index("--ahead") + 1] if "--ahead" in command else None
+              for tree, command in stepped}
+    assert handed == {"new": str(ahead / "head"), "old": None}
+
+
 def test_a_filter_chooses_the_same_step_probes_to_compile_ahead_as_to_run(gate):
     """`--only` chooses a step probe by any of its rows' names (its step's, its peak's, its MFU's), the same
     for the prepare that compiles it ahead as for the run that measures it (`chosen`): a filter on an MFU

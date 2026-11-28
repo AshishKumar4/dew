@@ -24,7 +24,7 @@ import numpy as np
 from jax.custom_derivatives import zero_from_primal
 
 from dew.nn.derivatives import KernelGlue, contracted, with_gradients_formed
-from dew.nn.kernels import generation, selection
+from dew.nn.kernels import generation, selection, tuning
 from dew.nn.kernels.templates.attention import (
     ACCURATE,
     BLOCK,
@@ -74,9 +74,10 @@ the accurate products), which a run's numerics name for every template call in t
 (`generation.run_precision`, `Numerics.forms`)."""
 
 
+@tuning.one_call
 def attend(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks | None = None,
            *, scale: float | None = None, natural: bool | None = None, accurate: bool | None = None,
-           operand_dtype=None, in_key: bool = False) -> jax.Array:
+           operand_dtypes: tuple | None = None, in_key: bool = False) -> jax.Array:
     """Attention of `query` `[B, Q, H, D]` over `key` and `value` `[B, K, Hk, D]` and `[B, K, Hk, Dv]`.
 
     Each query reads the keys its `spans` leave it, under the score hooks and initial state of `hooks`. The
@@ -87,9 +88,10 @@ def attend(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, 
 
     `natural` and `accurate` name its form, each where None the one the run's numerics name
     (`generation.numerics().forms`, `FORMS`; 'accurate' takes both), else the default's.
-    `operand_dtype`, where the key and value arrive wider than the mainloops compute them (a sharding
-    wrapper's, so its partial gradients sum wide), narrows the operands to it and hands back the key's
-    and value's gradients unrounded, in their own dtype: the wrapper sums them and rounds once.
+    `operand_dtypes`, the key's and the value's `(key, value)` where they arrive wider than the mainloops
+    compute them (a wrapper's copies, so their partial gradients sum wide), narrows each to its own and
+    hands back the key's and value's gradients unrounded, in their own dtype: the wrapper sums them and
+    rounds once. The query is taken as it comes.
     `in_key` states `value` the key's leading columns (`key[..., :Dv]`, an absorbed latent attention's),
     which the Mosaic forward reads from the key's slot, the keys loaded once (`_Config.in_key`).
     """
@@ -98,8 +100,11 @@ def attend(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, 
     if hooks.output.fn is not None:
         raise ValueError("the attention route takes score hooks and the initial state; its backward takes "
                          "the output before an output hook, so the caller applies `output_mod` to the result")
-    config = _Config(scale, *run_forms(natural, accurate),
-                     None if operand_dtype is None else jnp.dtype(operand_dtype).name, in_key,
+    narrowed = None
+    if operand_dtypes is not None:
+        key_dtype, value_dtype = operand_dtypes
+        narrowed = (jnp.dtype(key_dtype).name, jnp.dtype(value_dtype).name)
+    config = _Config(scale, *run_forms(natural, accurate), narrowed, in_key,
                      jax.config.jax_default_matmul_precision)
     return _attend(config, query, key, value, spans, hooks)
 
@@ -190,7 +195,7 @@ class _Config:
     scale: float | None
     natural: bool
     accurate: bool
-    operand_dtype: str | None
+    operand_dtypes: tuple[str, str] | None
     in_key: bool = False
     """Whether the values are the keys' leading columns (`attention_mosaic.MosaicForward.in_key`): the
     Mosaic forward reads them from the key's slot; every other mainloop takes the value array as given."""
@@ -198,11 +203,11 @@ class _Config:
 
     def narrowed(self, query: jax.Array, key: jax.Array,
                  value: jax.Array) -> tuple[jax.Array, jax.Array, jax.Array]:
-        """The query, key and value at `operand_dtype` where it is given."""
-        if self.operand_dtype is None:
+        """The query as it comes, and the key and value each at its `operand_dtypes` where they are given."""
+        if self.operand_dtypes is None:
             return query, key, value
-        dtype = self.operand_dtype
-        return query.astype(dtype), key.astype(dtype), value.astype(dtype)
+        key_dtype, value_dtype = self.operand_dtypes
+        return query, key.astype(key_dtype), value.astype(value_dtype)
 
 
 def _on_gpu() -> bool:
@@ -389,7 +394,7 @@ def _attend_backward(config: _Config, saved: Residuals, operands: tuple, dout: j
     query, key, value, spans, hooks = operands
     grads = backward(*config.narrowed(query, key, value), spans, hooks, dout, residuals=saved,
                      scale=config.scale, natural=config.natural, accurate=config.accurate,
-                     rounded=config.operand_dtype is None)
+                     rounded=config.operand_dtypes is None)
     # The mainloops' gradients are of the query and key under their prologues, which each takes where it
     # loads them, of the operands as the forward took them (`narrowed`); the prologues' own pullbacks run
     # here, in XLA, beside their neighbours, at those operands.
@@ -469,7 +474,7 @@ def backward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans
     """The template's backward from the forward's `residuals` on the mainloop that takes it (`_mainloop`):
     the Mosaic mainloop's, else the Pallas-Triton one's, which takes what the Mosaic one declines for its
     resources, else the plain-JAX one's; its key's and value's gradients unrounded where the call narrowed
-    them (`rounded` False, `_Config.operand_dtype`). `interpret` runs the GPU mainloops on the CPU, as the
+    them (`rounded` False, `_Config.operand_dtypes`). `interpret` runs the GPU mainloops on the CPU, as the
     device in effect's (`generation.assumed`'s `interpreted`), where an interpreted call is chosen for."""
     walked_initial(hooks.initial)
     call = (query, key, value, spans, hooks, dout)

@@ -599,8 +599,21 @@ class Frozen(Mapping):
 
     __slots__ = ("_items",)
 
+    def __new__(cls, entries: Mapping | Iterable = ()):
+        # Made once: its items set here alone, as it is made, never again (`__setattr__`); `__init__` sets
+        # none, so a second one leaves it as it was.
+        made = super().__new__(cls)
+        object.__setattr__(made, "_items", MappingProxyType(dict(entries)))
+        return made
+
     def __init__(self, entries: Mapping | Iterable = ()):
-        self._items = MappingProxyType(dict(entries))
+        del entries  # its items, made with it (`__new__`)
+
+    def __setattr__(self, name: str, value) -> None:
+        raise TypeError(f"a Frozen mapping's {name} is never set")
+
+    def __delattr__(self, name: str) -> None:
+        raise TypeError(f"a Frozen mapping's {name} is never deleted")
 
     def __getitem__(self, key):
         return self._items[key]
@@ -1876,17 +1889,6 @@ def linear_tangent(forward: Callable, backward: Callable, portable: Callable, *,
 
     return contracted("test_an_embedding_lookup_holds_every_order")(
         declared_tangent(kind, bounding, bounded_jvp, symbolic_zeros=True))
-
-
-def unbroadcast(cotangent, shape: tuple[int, ...]):
-    """`cotangent`, of the shape an operand of `shape` was broadcast to, summed back to `shape`, as JAX pulls
-    a broadcast back."""
-    import jax
-    import jax.numpy as jnp
-
-    _, pulled = jax.vjp(lambda wide: jnp.broadcast_to(wide, cotangent.shape),
-                        jnp.zeros(shape, cotangent.dtype))
-    return pulled(cotangent)[0]
 
 
 def linear_map(apply: Callable, pullback: Callable, residuals, moving, *, out_aval=None,

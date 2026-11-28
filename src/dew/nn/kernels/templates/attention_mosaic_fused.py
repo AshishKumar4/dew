@@ -278,7 +278,7 @@ def _fused_step(walk: _Backward, resident: tuple, rows_of, staged, coords_of, wh
     coordinates (`coords_of(first query)`), a tile every query sees whole (`whole(index)`) unmasked, or
     each tile `masked` or not where the walk's segment says (a run of whole tiles, `whole_run`). Its
     weights and score cotangents staged in `staged`, whose transposes are dV's and dK's left operands
-    (`algebra.value_operands`, `cotangent_product`'s `aᵀ @ b`) issued into `accumulators` in place, and the
+    (`algebra.value_weights`, `cotangent_product`'s `aᵀ @ b`) issued into `accumulators` in place, and the
     cotangents times the resident keys the tile's dQ, added into dQ (`add_dq(first query, dQ)`)."""
     k_smem = resident[0]
     family, tiles = walk.program.family, walk.program.tiles

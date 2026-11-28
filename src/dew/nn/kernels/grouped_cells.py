@@ -11,6 +11,8 @@ import math
 from collections.abc import Mapping
 from typing import NamedTuple
 
+import jax.numpy as jnp
+
 
 class Made(enum.Enum):
     """What a grouped call makes (`Kind`): a forward product, its input gradient (the matrix read transposed),
@@ -489,3 +491,93 @@ MEASURED = _measured()
 prologue forms its rows: one of them is a cell of its own (`Kind.matrix` over `Kind.span`) where its winner
 is not its kind's route (`grouped_matmul.DECLARED`), its kind's otherwise (`grouped_matmul.GroupedCase.cell`);
 every other product its kind's."""
+
+
+class PackedRows(enum.Enum):
+    """An NVFP4 call's size as its receipts measure it (`gemm.PackedCase.cell`): decode-sized (at most
+    `NVFP4_DECODE_ROWS` rows, the packed matrix's bytes its time) or a prefill."""
+
+    DECODE = 'decode'
+    PREFILL = 'prefill'
+
+
+NVFP4_DECODE_ROWS = 64
+"""The most rows a decode-sized NVFP4 call has (`gemm.PackedCase.cell`): the receipts' largest decode row
+count."""
+
+PACKED_FASTER = ("W13-a100-4-M-NS-8b-a100 (base/kernels 8d23bb9872, CUPTI, arms rotated): Llama-3-8B's "
+                 "q/o, up and down projections at 1, 16 and 64 rows on an A100-SXM4-40GB, the packed kernel "
+                 "0.119-0.398 ms against the matrix decoded once a call's 0.309-1.418 (2.6-3.6x), its "
+                 "temporary memory 0.66-3.7 MB against 71-250 MB; at 4096 rows 4.4-4.7x slower, each row "
+                 "tile decoding the matrix again")
+"""The receipt behind the packed NVFP4 kernel's declared A100 cell (`NVFP4_CELLS`)."""
+PACKED_FASTER_SM90 = (
+    "W7-gh200-8-M-NS-8-h100 (base/kernels d4bb24d4f8, CUPTI, arms rotated): Llama-3-8B's q/o, up and down "
+    "projections at 1, 16 and 64 rows on a GH200, the packed kernel 0.059-0.193 ms against the matrix "
+    "decoded once a call's 0.142-0.505 (2.4x q/o, 4.5x up, 2.6x down), its temporary memory 0.2-3.7 MB "
+    "against 71-250 MB; at 4096 rows 5.2-5.3x slower, its stage decode unhidden under the products")
+"""The receipt behind the packed NVFP4 kernel's declared H100 cell (`NVFP4_CELLS`)."""
+
+NVFP4_CELLS: dict[tuple[str, PackedRows], str] = {
+    ('sm80', PackedRows.DECODE): PACKED_FASTER,
+    ('sm90', PackedRows.DECODE): PACKED_FASTER_SM90,
+}
+"""The NVFP4 product's declared cells (`gemm.NVFP4`), (device generation, call size) to the receipt by which
+the packed kernel runs them: a literal of them, which the selector reads and thresh's declared-set seam
+registers (.thresh/thresh.cue)."""
+
+
+class Blockwise(NamedTuple):
+    """A blockwise-scaled FP8 product as a receipt timed it (`BLOCKWISE_CELLS`, `gemm.ScaledCase`): its
+    `rows`, the `depth` its blocks' steps walk, its `width`, its `groups`' matrices and the columns a column
+    scale covers (`per`: a weight block's 128, or one), its launch's one for every output dtype (it stores
+    fp32, which XLA rounds after it)."""
+
+    rows: int
+    depth: int
+    width: int
+    groups: int
+    per: int
+
+    @classmethod
+    def of(cls, lhs, kernel, group_sizes, row_scales, column_scales, per: int) -> 'Blockwise | None':
+        """The product of these operands (`kernel` K-major, `[groups, width, depth]`, a column scale every
+        `per` columns) where the receipts' operands are theirs: E4M3 codes and fp32 scales, every one read
+        whole on every device as its launch reads it (`templates.gemm.launched_whole`); None for any other
+        (E5M2 codes, 16-bit scales, operands a mesh axis splits: a launch no receipt timed, or one that
+        cannot take them)."""
+        from dew.nn.kernels.templates.gemm import launched_whole
+
+        codes = lhs.dtype == kernel.dtype == jnp.float8_e4m3fn
+        scales = row_scales.dtype == column_scales.dtype == jnp.float32
+        if not (codes and scales and launched_whole(lhs, kernel, group_sizes, row_scales, column_scales)):
+            return None
+        return cls(lhs.shape[0], lhs.shape[1], kernel.shape[1], kernel.shape[0], per)
+
+
+M_NG_38C = ("M-NG-38c-gh200 (aa3869498, CUPTI medians, the template's A/A 0.997-1.002, check 1 green against "
+            "an independent float64 and per-block FP8 cuBLASLt in every cell, its six native scale-edge "
+            "cells passed): the template 0.020-0.038x XLA's arm of the same arithmetic "
+            "(xla_products.step_scaled), bfloat16 and float32 out alike")
+"""The receipt behind the blockwise FP8 product's cells (`BLOCKWISE_CELLS`, row 4518)."""
+
+ROUTED_GATE = Blockwise(8192, 7168, 2048, 256, 128)
+"""DeepSeek-V3's routed gate and up at 8192 rows over its 256 experts, a weight block's column scales."""
+ROUTED_DOWN = Blockwise(8192, 2048, 7168, 256, 128)
+"""DeepSeek-V3's routed down at 8192 rows (the gate's input gradient's launch extents)."""
+
+BLOCKWISE_CELLS: dict[tuple[str, Blockwise], str] = {
+    ('sm90', ROUTED_GATE): f"{M_NG_38C}: DeepSeek-V3's routed gate and up, 2626-2630 us against 87306-87388",
+    ('sm90', Blockwise(32768, 7168, 2048, 256, 128)):
+        f"{M_NG_38C}: DeepSeek-V3's routed gate and up, 6439-6545 us against 317330-317658",
+    ('sm90', ROUTED_DOWN): f"{M_NG_38C}: DeepSeek-V3's routed down, 2733-2824 us against 80877-80899",
+    ('sm90', Blockwise(32768, 2048, 7168, 256, 128)):
+        f"{M_NG_38C}: DeepSeek-V3's routed down, 6945-7311 us against 290202-290547",
+    ('sm90', Blockwise(8192, 2048, 768, 128, 128)):
+        f"{M_NG_38C}: Qwen3-30B-A3B's routed gate, 269-280 us against 7314-7316",
+}
+"""The blockwise FP8 products a receipt timed on a GH200, each its rows and matrices exactly (a product of
+others takes XLA's arm: kernel-templates.md §1, a cell over its timed rows), to the receipt by which the
+template's walk runs them (`gemm.BLOCKWISE_FP8`): the product's launch, whichever call makes it. The kernel
+gradient's walk (`gemm.blockwise_fp8_kernel_gradient`) and an epilogue's several outputs are other
+launches, untimed."""

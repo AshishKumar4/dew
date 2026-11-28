@@ -16,7 +16,7 @@ from reference_error import ahead_arm
 
 from dew.nn import precision, programs
 from dew.nn.kernels import generation
-from dew.nn.kernels.templates import cost, emission, mosaic
+from dew.nn.kernels.templates import cost, emission, mosaic, swizzling
 from dew.nn.kernels.templates.cost import Stated, Work
 
 _ROW = jax.ShapeDtypeStruct((128,), jnp.float32)
@@ -199,7 +199,7 @@ def test_a_scoped_bodys_results_resolve_the_roles_after_it():
     """A warpgroup's index a scoped body returns (`pl.run_scoped`'s) resolves the role's branch after it."""
     def walk(row, trips):
         def step(index, row):
-            role = pl.run_scoped(lambda scratch: lax.axis_index("wg"), plgpu.SMEM((8,), jnp.float32))
+            role = swizzling.run_scoped(lambda scratch: lax.axis_index("wg"), plgpu.SMEM((8,), jnp.float32))
             return lax.cond(role == 0, _one, _two, row, index)
 
         return lax.fori_loop(0, trips, step, row)
@@ -604,7 +604,7 @@ def test_a_warpgroup_waits_on_the_products_it_drains(allowed, waited):
             plgpu.wgmma_wait(allowed)
             return acc[...]
 
-        pl.run_scoped(scope, plgpu.ACC((64, 128), jnp.float32))
+        swizzling.run_scoped(scope, plgpu.ACC((64, 128), jnp.float32))
 
     assert _waits(body, plgpu.SMEM((64, 64), jnp.bfloat16, transforms=_SWIZZLED),
                   plgpu.SMEM((64, 128), jnp.bfloat16, transforms=_SWIZZLED)) == (waited,)
@@ -863,7 +863,7 @@ def test_a_steps_mask_of_a_runtime_value_counts_its_integer_operations_each_step
         mosaic.step_index(index)
         parity = index % 2
         if held == "scope":
-            return pl.run_scoped(lambda scratch: masked(row, parity), plgpu.SMEM((8,), jnp.float32))
+            return swizzling.run_scoped(lambda scratch: masked(row, parity), plgpu.SMEM((8,), jnp.float32))
         if held == "branch":
             return masked(row, lax.cond(parity == 0, lambda: 0, lambda: 1))
         return masked(row, parity)
@@ -954,7 +954,7 @@ def _row_reduced(laid_out, where: str = "inline", shape: tuple[int, int] = (64, 
             def scope():
                 out_ref[...] = rows(tile)
 
-            pl.run_scoped(scope)
+            swizzling.run_scoped(scope)
         else:
             out_ref[...] = jax.jit(rows)(tile) if where == "called" else rows(tile)
 
@@ -999,7 +999,6 @@ def test_a_replicated_rows_reduction_combines_each_copy(target):
     P2; Mosaic GPU's float `redux` is compute capability 10.x's alone, train 1286's review), assumed or
     placed on a compile-only mesh's abstract device unassumed, whose capability Mosaic GPU reads (the
     review of lane/toolkit 4d9a4198c)."""
-    from dew.nn.kernels.templates import swizzling
 
     def body(out_ref, smem):
         row = plgpu.layout_cast(smem[...], swizzling._row_layout((1, 64), jnp.float32))
@@ -1639,7 +1638,7 @@ def test_an_atomic_add_counts_its_bytes_reduced_where_global_and_an_a100_prices_
                 plgpu.atomic_add(smem, x_ref[...])
                 o_ref[...] = smem[...]
 
-            pl.run_scoped(scoped, plgpu.SMEM((64, 64), jnp.float32))
+            swizzling.run_scoped(scoped, plgpu.SMEM((64, 64), jnp.float32))
 
     launch = plgpu.kernel(body, out_type=tile, grid=(launched,), grid_names=("programs",))
     traced = jax.make_jaxpr(emission.costed(launch, Stated(steps=0, bytes_accessed=0)))(tile)

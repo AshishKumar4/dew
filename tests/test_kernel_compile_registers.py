@@ -1,6 +1,8 @@
 """The compile gate's reading of ptxas's notes: a kernel whose assembly ptxas notes a performance loss of
 fails it."""
 import dataclasses
+import functools
+from typing import ClassVar
 
 import jax
 import jax.numpy as jnp
@@ -10,7 +12,7 @@ from fla_gdn_support import KernelCase
 from generation_support import lowers
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
-from dew.nn.kernels.templates import assembled
+from dew.nn.kernels.templates import assembled, swizzling
 
 SERIALIZING = ("ptxas info    : (C7512) Potential Performance Loss: wgmma.mma_async instructions are "
                "serialized due to insufficient register resources for the function "
@@ -109,7 +111,6 @@ def _register_bound_product(depth: int):
     leaves its MMA pipeline short of registers: ptxas serializes it (FS-6456-SCAN5: C7511 spill-free at
     depth 128, C7512 at 64)."""
     from jax._src.pallas.mosaic_gpu import pallas_call as mosaic_pallas_call
-    from jax.experimental import pallas as pl
 
     swizzled = (plgpu.TilingTransform((8, 64)), plgpu.SwizzleTransform(128))
 
@@ -118,7 +119,7 @@ def _register_bound_product(depth: int):
             plgpu.wgmma(acc_ref, a_ref[...], b_ref)
             return acc_ref[...]
 
-        o_ref[...] = pl.run_scoped(scope, plgpu.ACC((64, 128), jnp.float32))
+        o_ref[...] = swizzling.run_scoped(scope, plgpu.ACC((64, 128), jnp.float32))
 
     return mosaic_pallas_call.pallas_call(
         kernel,
@@ -265,7 +266,6 @@ def test_report_binaries_distinguishes_sm100_tmem_mosaic_cubins_from_non_tmem_tr
     `uses_tmem=None` when `decoded=False`; each the least kernel of its kind, where an attention forward
     and an fp32 decode's four Triton kernels took 122 s (row 12717; the decode alone 66 s, FS-12717-TRITON1;
     these two 21 s, FS-12717-TMEM3)."""
-    import functools
 
     import numpy as np
     from jax.experimental import pallas as pl
@@ -302,92 +302,180 @@ def test_report_binaries_distinguishes_sm100_tmem_mosaic_cubins_from_non_tmem_tr
     assert triton_raw and all(b.uses_tmem is None for b in triton_raw), triton_raw
 
 
-class _Certified:
-    """A config certification as `refused_across_builds` reads one (`report.Certification`): its op and
-    config, each kernel's module and binary (only its kind read) by its name and launch, whether it was
-    refused, and whether its verdict was read back from the store."""
-
-    def __init__(self, config, kernels: dict[str, str], *, refused: bool, stored: bool = False,
-                 kind: str = "mosaic_gpu"):
-        self.op, self.config, self.stored = "MosaicGmm", config, stored
-        self.kernels = {name: (module, _Binary(kind)) for name, module in kernels.items()}
-        self.refused = (None,) if refused else ()
+def _run(name: str, spilled: int = 0, **fields) -> dict:
+    """A compile record of one H100 kernel ptxas assembled spilling `spilled` bytes at its launch's register
+    cap, its PTX dumped here."""
+    record = _assembled_record("k", kc.Assembled(160, spilled, ()))
+    kernel = {**record["kernels"][0], "dumped": True, "cap": 168}
+    return {**record, "name": name, "kernels": [kernel], **fields}
 
 
-@dataclasses.dataclass(frozen=True)
-class _Binary:
-    """A kernel's binary as `refused_across_builds` reads it: its kind, Mosaic GPU's or Triton's."""
-
-    kind: str
-
-
-def test_a_refused_config_a_build_would_hold_is_judged_under_every_build():
-    """Row 10766: each Mosaic GPU config certification refused is judged under every build its generation's
-    GPUs run (`kernel_compile.refused_across_builds`), by each kernel's verdict under that build: refused
-    where any kernel is, failed where any fails the gate's checks, else qualified; one no build judged here
-    (no PTX printed of a kernel of it) is unverified; an accepted config, and a Triton launch's (no print
-    of its PTX), are not judged; and a gate failure is each build's verdict but refused and qualified. A
-    kernel's PTX is the module printed as it certified, or, by its module, an earlier case's print, its
-    verdict read from the store or not."""
-    verdicts = {("tile a", "cuda13"): "qualified", ("tile a", "cuda12"): "refused",
-                ("tile b", "cuda13"): "refused", ("tile b", "cuda12"): "refused",
-                ("tile d", "cuda13"): "refused", ("tile d", "cuda12"): "refused",
-                ("tile f", "cuda13"): "failed: its machine code holds a finding",
-                ("tile f", "cuda12"): "refused",
-                ("tile g", "cuda13"): "qualified", ("tile h", "cuda13"): "refused",
-                ("tile g", "cuda12"): "failed: over its cap", ("tile h", "cuda12"): "qualified"}
-
-    def judge(build, name, ptx, binary, module):
-        del name, binary, module
-        return verdicts[ptx, build]
-
-    printed = {"k_a 0": "tile a", "k_b 0": "tile b", "k_d 0": "tile d", "k_f 0": "tile f", "k_g 0": "tile g",
-               "k_h 0": "tile h", "k_t 0": "tile t"}
-    certified = [_Certified("a", {"k_a 0": "m_a"}, refused=True),
-                 _Certified("b", {"k_b 0": "m_b"}, refused=True),
-                 _Certified("c", {"k_c 0": "m_c"}, refused=True),
-                 _Certified("d", {"k_d 0": "m_d"}, refused=True, stored=True),
-                 _Certified("e", {"k_e 0": "m_e"}, refused=False),
-                 _Certified("f", {"k_f 0": "m_f"}, refused=True),
-                 _Certified("gh", {"k_g 0": "m_g", "k_h 0": "m_h"}, refused=True),
-                 _Certified("t", {"k_t 0": "m_t"}, refused=True, kind="triton")]
-    judged = kc.refused_across_builds(certified, printed, ("cuda13", "cuda12"), judge)
-    assert {entry["config"]: entry["builds"] for entry in judged} == {
-        "'a'": {"cuda13": "qualified", "cuda12": "refused"},
-        "'b'": {"cuda13": "refused", "cuda12": "refused"},
-        "'c'": {"cuda13": "unverified", "cuda12": "unverified"},
-        "'d'": {"cuda13": "refused", "cuda12": "refused"},
-        "'f'": {"cuda13": "failed: its machine code holds a finding", "cuda12": "refused"},
-        # Two kernels: one refused refuses the config; one failing, the other qualified, fails it.
-        "'gh'": {"cuda13": "refused", "cuda12": "failed: over its cap"}}
-    failed = kc.refused_across_build_failures({"name": "a case", "refused_builds": judged})
-    assert len(failed) == 4 and all(any(f"'{config}'" in failure for config in ("c", "f", "gh"))
-                                    for failure in failed)
-    # A later case certifying the same module, which Mosaic printed once: its PTX read by its module.
-    again = kc.refused_across_builds([_Certified("a", {"k_a 0": "m_a"}, refused=True)], {}, ("cuda12",),
-                                     judge)
-    assert again[0]["builds"] == {"cuda12": "refused"}
+def test_each_builds_run_of_a_case_is_held_to_the_gates_checks():
+    """Row 10766: each build's run of a case (`record['builds']`, the program that build's derivations select,
+    as it assembles it) is held to the gate's checks as the case's first run is (`mosaic_failures`,
+    `failing_runs`), one of the first run's program (`same`) as much as one of its own: a build's evidence
+    failing them fails the case; a run whose kernel its build could not judge for want of its PTX
+    (`unjudged`) fails and runs the case again in a process of its own (`_undumped`)."""
+    clean, spilling = _run("k"), _run("k under cuda13", spilled=24, same="k")
+    assert kc.mosaic_failures([clean]) == [] and not kc._undumped([clean])
+    case = {**clean, "builds": {"cuda13": spilling}}
+    (failure,) = kc.mosaic_failures([case])
+    assert failure.startswith("k under cuda13")
+    assert [run["name"] for run in kc.failing_runs(case)] == ["k under cuda13"]
+    assert kc.mosaic_failures([{**clean, "builds": {"cuda13": _run("k under cuda13", same="k")}}]) == []
+    unjudged = {**clean, "builds": {"cuda13": _run("k under cuda13", same="k", unjudged=["k"])}}
+    assert kc._undumped([unjudged])
+    assert [run["name"] for run in kc.failing_runs(unjudged)] == ["k under cuda13"]
 
 
-def test_a_config_another_build_holds_is_held_to_the_gates_kernel_checks():
-    """A refused config's kernel as another build assembles it (`kernel_compile.alternate_verdict`): refused
-    where that build spills or serializes it too; else held to the gate's own checks of a settled kernel
-    (`Report.failure`), its launch's shared bytes its certifying compile's, its tensor memory its estimate's
-    and its registers, machine code, threads and raise that build's: qualified within them, failed over its
-    launch's register cap, on a machine code finding, or with no cubin of it to read."""
-    name = assembled.launch_name("k", "0")
-    estimate = "Resources(smem_scratch_bytes=1024, tmem_scratch_cols=0, tmem_collective_scratch_cols=0)"
-    certified = assembled.Binary("k", "0", 168, 0, "mosaic_gpu", shared=1024)
 
-    def cubin(**fields) -> assembled.Binary:
-        return assembled.Binary("k", "0", fields.pop("registers", 160), 0, "mosaic_gpu",
-                                **{"sass": (), "threads": 384, **fields})
+def test_a_spill_of_one_builds_run_alone_is_its_cases_spill():
+    """`kernel_compile.spills` reads every build's run of a case (`runs`): a case whose first run holds and
+    whose cuda13 run spills spills there alone, by that run's name, and one whose every run holds spills
+    nowhere (Train 1470's review: three checks read the first run's figures alone and missed a spill of
+    cuda13's)."""
+    clean = _run("k")
+    case = {**clean, "builds": {"cuda13": _run("k under cuda13", spilled=24, same="k")}}
+    assert kc.spills([case]) == {"k under cuda13": {"k"}}
+    assert kc.spills([{**clean, "builds": {"cuda13": _run("k under cuda13", same="k")}}]) == {}
 
-    def verdict(read, alternate):
-        return kc.alternate_verdict(name, read, alternate, certified, estimate, "", "sm90")
 
-    assert verdict(kc.Assembled(255, 24, ()), cubin()) == "refused"
-    assert verdict(kc.Assembled(160, 0, ()), cubin()) == "qualified"
-    assert "above its launch's" in verdict(kc.Assembled(200, 0, ()), cubin())
-    assert "machine code holds" in verdict(kc.Assembled(160, 0, ()), cubin(sass=("a finding",)))
-    assert "state no binary" in verdict(kc.Assembled(160, 0, ()), None)
+def test_another_builds_run_names_a_rejected_kernel_a_triton_one_and_one_of_no_ptx_apart():
+    """A build's judge (`kernel_compile._Rebuilt`) names each kernel it could not remake by why: a Mosaic
+    kernel whose PTX that build's ptxas rejects, with its report's tail (`rejected`), a failure of its run
+    naming the rejection and no retry of its case (`_undumped`); one of no PTX printed here (`unjudged`),
+    the retry's; and a Triton kernel, none of whose PTX Mosaic printed, its binary the compiling build's
+    (`unqualified`) (Train 1470's review: a rejection read as missing PTX and retried, and a cuda12 Triton
+    binary taken as cuda13's)."""
+    mosaic = assembled.Binary("k", "0123456789", 128, 0, "mosaic_gpu")
+    kernels = {"k": ("e" * 16, mosaic), "m": ("f" * 16, dataclasses.replace(mosaic, kernel="m")),
+               "t": (None, dataclasses.replace(mosaic, kernel="t", kind="triton"))}
+    kc.PTX["e" * 16] = "//\n.version 8.0\n.target sm_90a\n.address_size 64\nnot an instruction;\n"
+    judge = kc._Rebuilt("cuda12", "sm90")
+    try:
+        assert judge(kernels) == kernels
+    finally:
+        del kc.PTX["e" * 16]
+    k, m, t = (assembled.launch_name(name, mosaic.launch) for name in "kmt")
+    assert list(judge.rejected) == [k] and judge.rejected[k].strip()
+    assert (judge.unjudged, judge.unqualified) == ([m], [t])
+    run = {**_run("k under cuda12", build="cuda12"), "rejected": judge.rejected}
+    (failure,) = kc.mosaic_failures([run])
+    assert "ptxas rejects" in failure and not kc._undumped([run]) and kc._unjudged(run) == [failure]
+
+
+def test_a_ladder_steps_by_the_spill_roles_of_the_build_that_spilled():
+    """A kernel's report carries the roles its judged binary spilled in (`Report.spilled_in`, `reports`),
+    and a ladder reads them from its run's reports (`kernel_compile.spill_roles`), never from this process's
+    binaries, which another build's run did not spill in (Train 1470's review: a forked ladder stepped by the
+    host's clean roles where cuda13 alone spilled in its consumers)."""
+    judged = assembled.Binary("k", "0123456789", 128, 0, "mosaic_gpu", spilled_in=("consumers",))
+    (found,) = kc.reports({}, [judged])
+    assert found.spilled_in == ("consumers",)
+    run = {**_run("k under cuda13", spilled=24),
+           "binaries": [dataclasses.asdict(dataclasses.replace(judged, spilled_in=("producer",)))]}
+    run["kernels"] = [{**run["kernels"][0], "spilled_in": list(found.spilled_in)}]
+    assert kc.spill_roles([run]) == {"k": ("consumers",)}
+
+def test_a_certifications_ptx_is_the_one_its_own_compile_printed(tmp_path, monkeypatch):
+    """PTX modules Mosaic dumped of one kernel's name and launch, each under a name of its compile's own
+    numbering: a certification's bound to its own kernels' module, of the dumps its own compile wrote alone
+    (`kernel_compile._Bound`, `report.Judge.compiling`): a failed compile's dump none of a later one's, a
+    compile that printed none (Mosaic compiles a module once a process) binding none, a later certification's
+    written over an earlier one's file its own, two of one name in one compile neither's; a program's read
+    after its compile (`_read_printed`), apart from a certification's of its name."""
+    lowering, compiling = tmp_path / "lowering", tmp_path / "compiling"
+    for directory in (lowering, compiling):
+        directory.mkdir()
+    monkeypatch.setenv("MOSAIC_GPU_DUMP_TO", str(lowering))
+
+    def dumped(directory, number, body):
+        (directory / f"k_{number}.ptx").write_text(
+            f"//\n{kc.PTX_MODULE}\n.visible .entry k__l0123456789_mosaic_gpu_kernel(\n)\n{{\n{body}\n}}\n")
+
+    def certified(judge, module, *bodies):
+        with judge.compiling():
+            for number, body in bodies:
+                dumped(lowering, number, body)
+        judge({"k__l0123456789": (module, None)})
+
+    judge = kc._Bound()
+    with judge.compiling():
+        dumped(lowering, 1, "failed")  # a compile that failed: its judge never called
+    certified(judge, "a" * 16)  # its module compiled before: printed none
+    certified(judge, "b" * 16, (2, "certified"))
+    certified(judge, "c" * 16, (2, "later rung"))
+    certified(judge, "d" * 16, (3, "one"), (4, "other"))
+    dumped(compiling, 7, "compiled")
+    kc._read_printed(compiling.glob("*.ptx"), {"k__l0123456789": "e" * 16})
+    assert "a" * 16 not in kc.PTX and "d" * 16 not in kc.PTX
+    assert ("certified" in kc.PTX["b" * 16] and "later rung" in kc.PTX["c" * 16]
+            and "compiled" in kc.PTX["e" * 16])
+
+
+@lowers("sm90")
+def test_a_builds_rebuilt_kernel_is_that_builds_assembly_of_its_own_modules_ptx():
+    """A kernel remade as a build assembles it (`kernel_compile._Rebuilt`, the judge a build's run certifies
+    and reads its program by): its registers and notes of a loss that build's ptxas's of the PTX printed of
+    its module (`_assembly`), its launch's facts (its name, launch and shared bytes) its compile's; one of a
+    module no PTX of which printed here is left as compiled and named unjudged."""
+    shapes = (jax.ShapeDtypeStruct((64, 128), jnp.float16), jax.ShapeDtypeStruct((128, 128), jnp.float16))
+    (record,) = kc.compile_mosaic_kernels(
+        [KernelCase("register_bound", lambda: (_register_bound_product(128), shapes))], "sm90")
+    (found,) = record["binaries"]
+    binary = assembled.Binary(**{**found, "notes": tuple(assembled.AssemblerNote(**note)
+                                                         for note in found["notes"])})
+    (module,) = record["modules"].values()
+    for build in kc.judged_builds("sm90"):
+        judge = kc._Rebuilt(build, "sm90")
+        ((_, rebuilt),) = judge({"k": (module, binary)}).values()
+        read = kc._assembly(module, "sm90", build).read
+        codes = tuple(note.code for note in rebuilt.notes)
+        assert (rebuilt.registers, codes) == (read.registers, read.losses)
+        assert (rebuilt.kernel, rebuilt.launch, rebuilt.shared) == (
+            binary.kernel, binary.launch, binary.shared)
+        assert judge.unjudged == []
+    judge = kc._Rebuilt("cuda12", "sm90")
+    assert judge({"k": ("0" * 16, binary)}) == {"k": ("0" * 16, binary)}
+    assert judge.unjudged == [assembled.launch_name(binary.kernel, binary.launch)]
+
+
+@lowers("sm90")
+def test_a_case_runs_as_another_builds_verdicts_select_its_program():
+    """Row 10766: a case run as another build certifies its launches (`kernel_compile._run` under a judge,
+    `report.judging`) runs the program that build's derivations select, compiled and read as the case's own
+    run is: a judge refusing the derived config's kernels steps its launch past it to a program of its own,
+    the derived config certified refused there alone; one refusing nothing selects the case's own program,
+    compiling nothing (`same`)."""
+    from dew.nn.kernels import gemm, generation
+
+    bf16 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
+    shapes = (bf16((2048, 4096)), bf16((4096, 4096)))
+    case = KernelCase("dense", lambda: (lambda x, w: gemm.gemm(x, w, None, out_dtype=jnp.bfloat16), shapes))
+    class Refusing(kc._Bound):
+        """The first launch certified (the derived config's) spilling, every other as compiled."""
+
+        first: ClassVar[set[str]] = set()
+
+        def __call__(self, kernels):
+            kernels = super().__call__(kernels)
+            if not Refusing.first:
+                Refusing.first.update(module for module, _ in kernels.values())
+            return {name: (module, dataclasses.replace(binary, spilled=64) if module in Refusing.first
+                           else binary) for name, (module, binary) in kernels.items()}
+
+    with generation.chosen(grouped_matmul="mosaic"):
+        own = kc._header(case, "sm90")
+        kc._run(case, "sm90", own, "cuda12")
+        runs = {}
+        for name, judge in (("refusing", Refusing()), ("holding", kc._Bound())):
+            runs[name] = kc._header(case, "sm90")
+            kc._run(case, "sm90", runs[name], "cuda12", judge=judge, earlier={own["lowered"]: own})
+    assert "error" not in own and own["kernels"], own
+    refusing, holding = runs["refusing"], runs["holding"]
+    assert holding["same"] == own["name"] and holding["kernels"] == own["kernels"]
+    assert "same" not in refusing and refusing["lowered"] != own["lowered"]
+    assert refusing["kernels"] and kc.failing_runs(refusing) == [], kc.mosaic_failures([refusing])
+    verdicts = [any(refused for *_, refused in cert["kernels"].values())
+                for cert in refusing["certifications"]]
+    assert verdicts[0] and not verdicts[-1], refusing["certifications"]

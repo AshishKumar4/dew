@@ -19,7 +19,7 @@ from gathered_walks import gathered_kernel, tile_value
 from ring_protocol import Event, Violation, _Splat, explore, programs
 
 from dew.nn.kernels import generation
-from dew.nn.kernels.templates import mosaic_sm90, rings
+from dew.nn.kernels.templates import mosaic_sm90, rings, swizzling
 
 BLOCK = (64, 64)
 
@@ -891,7 +891,6 @@ def test_an_emitted_copy_of_a_slots_first_rows_holds_their_reads_alone(rows, ref
     committed and waited for, interpreted (`programs`): a read of rows within them held, a read of row 8 or
     of the slot whole refused (`cp_async_violations`), though every one of them shares the copy's alias
     location, the slot (`_located` widens a partial slice to it)."""
-    from jax.experimental import pallas as pl
     from jax.experimental.pallas import mosaic_gpu as plgpu
 
     def body(source_gmem, out_gmem):
@@ -900,7 +899,7 @@ def test_an_emitted_copy_of_a_slots_first_rows_holds_their_reads_alone(rows, ref
             plgpu.wait_gmem_to_smem(0)
             out_gmem[0] = ring[0, rows[0]:rows[1]][0, 0].astype(jnp.float32)
 
-        pl.run_scoped(scoped, plgpu.SMEM((2, 16, 64), jnp.bfloat16))
+        swizzling.run_scoped(scoped, plgpu.SMEM((2, 16, 64), jnp.bfloat16))
 
     kernel = plgpu.kernel(body, out_type=jax.ShapeDtypeStruct((1,), jnp.float32))
     (events,), _ = programs(kernel, jnp.zeros((16, 64), jnp.bfloat16), threads=1)
@@ -916,7 +915,6 @@ def test_a_copy_beside_a_pending_one_clashes_only_where_their_rows_meet(second, 
     waited for), interpreted (`programs`): rows 0:8 and 8:16 are apart, no clash, and once both land a read
     of a row of each is held; rows 0:8 and 4:12 meet and clash (`cp_async_violations`), though every pair
     shares one alias location, the slot (`_shares`)."""
-    from jax.experimental import pallas as pl
     from jax.experimental.pallas import mosaic_gpu as plgpu
 
     def body(source_gmem, out_gmem):
@@ -927,7 +925,7 @@ def test_a_copy_beside_a_pending_one_clashes_only_where_their_rows_meet(second, 
             plgpu.wait_gmem_to_smem(0)
             out_gmem[0] = (ring[0, 2][0] + ring[0, 9][0]).astype(jnp.float32)
 
-        pl.run_scoped(scoped, plgpu.SMEM((2, 16, 64), jnp.bfloat16))
+        swizzling.run_scoped(scoped, plgpu.SMEM((2, 16, 64), jnp.bfloat16))
 
     kernel = plgpu.kernel(body, out_type=jax.ShapeDtypeStruct((1,), jnp.float32))
     (events,), _ = programs(kernel, jnp.zeros((16, 64), jnp.bfloat16), threads=1)
@@ -942,7 +940,6 @@ def test_a_reshaped_view_read_whole_is_held_at_the_rows_it_views(rows, refused):
     a view of 8 of its rows reshaped flat and taken whole (`ring.at[0, lo:hi].reshape(512)[0:512]`): held
     where the view's rows are the copied ones and refused where they are not, the whole view's indexer no
     index of the slot's (`_extent`), never the slot's whole alias in their place."""
-    from jax.experimental import pallas as pl
     from jax.experimental.pallas import mosaic_gpu as plgpu
 
     def body(source_gmem, out_gmem):
@@ -951,7 +948,7 @@ def test_a_reshaped_view_read_whole_is_held_at_the_rows_it_views(rows, refused):
             plgpu.wait_gmem_to_smem(0)
             out_gmem[0] = ring.at[0, rows[0]:rows[1]].reshape(512)[0:512][0].astype(jnp.float32)
 
-        pl.run_scoped(scoped, plgpu.SMEM((2, 16, 64), jnp.bfloat16))
+        swizzling.run_scoped(scoped, plgpu.SMEM((2, 16, 64), jnp.bfloat16))
 
     kernel = plgpu.kernel(body, out_type=jax.ShapeDtypeStruct((1,), jnp.float32))
     (events,), _ = programs(kernel, jnp.zeros((16, 64), jnp.bfloat16), threads=1)
@@ -969,7 +966,6 @@ def test_a_read_through_a_nested_view_is_held_at_the_rows_it_reads(view, within,
     reads, the view's offset composed onto the slot's, are copied (row 2, rows 2:6, row 7 of a view from 4)
     and refused where they are not (row 9 of a view from 8, row 8 of a view from 4), though every one of
     them shares the copy's alias location, the slot (`cp_async_violations`, `_extent`)."""
-    from jax.experimental import pallas as pl
     from jax.experimental.pallas import mosaic_gpu as plgpu
 
     def body(source_gmem, out_gmem):
@@ -980,7 +976,7 @@ def test_a_read_through_a_nested_view_is_held_at_the_rows_it_reads(view, within,
             read = viewed[within] if isinstance(within, int) else viewed[within[0]:within[1]][0]
             out_gmem[0] = read[0].astype(jnp.float32)
 
-        pl.run_scoped(scoped, plgpu.SMEM((2, 16, 64), jnp.bfloat16))
+        swizzling.run_scoped(scoped, plgpu.SMEM((2, 16, 64), jnp.bfloat16))
 
     kernel = plgpu.kernel(body, out_type=jax.ShapeDtypeStruct((1,), jnp.float32))
     (events,), _ = programs(kernel, jnp.zeros((16, 64), jnp.bfloat16), threads=1)
@@ -995,10 +991,9 @@ def test_inlined_row_copies_into_a_slots_first_rows_hold_their_reads_alone(rows,
     of a 16-row slot's first 8 rows, committed (`gathered.CommitGroup`) and waited for, interpreted
     (`programs`): they write that view alone (its extent), so a read of rows within it is held and one of
     row 8 or of the slot whole refused (`cp_async_violations`)."""
-    from jax.experimental import pallas as pl
     from jax.experimental.pallas import mosaic_gpu as plgpu
 
-    from dew.nn.kernels.templates import gathered as gathered_rows, swizzling
+    from dew.nn.kernels.templates import gathered as gathered_rows
 
     transforms = swizzling.swizzle_transforms(jnp.bfloat16, 128)
 
@@ -1011,7 +1006,7 @@ def test_inlined_row_copies_into_a_slots_first_rows_hold_their_reads_alone(rows,
             plgpu.wait_gmem_to_smem(0)
             out_gmem[0] = ring[0, rows[0]:rows[1]][0, 0].astype(jnp.float32)
 
-        pl.run_scoped(scoped, plgpu.SMEM((2, 16, 64), jnp.bfloat16, transforms=transforms))
+        swizzling.run_scoped(scoped, plgpu.SMEM((2, 16, 64), jnp.bfloat16, transforms=transforms))
 
     kernel = plgpu.kernel(body, out_type=jax.ShapeDtypeStruct((1,), jnp.float32))
     (events,), _ = programs(kernel, jnp.zeros((16, 64), jnp.bfloat16), jnp.zeros((16,), jnp.int32), threads=1)

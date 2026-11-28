@@ -34,21 +34,10 @@ into=$tree/src/dew/algebra/derived
 mkdir -p "$into"
 if [ -n "${DEW_DERIVED:-}" ]; then
   [ -n "${DEW_GENERATIONS:-}" ] || { echo "package: DEW_DERIVED names no DEW_GENERATIONS it must hold"; exit 1; }
-  for generation in $DEW_GENERATIONS; do
-    found=0
-    for entry in "$DEW_DERIVED/$generation"/*.json; do
-      [ -e "$entry" ] || break
-      found=$((found + 1))
-      name=$(basename "$entry")
-      if [ -e "$into/$name" ]; then
-        cmp -s "$entry" "$into/$name" || { echo "package: derivation $name differs between generations"; exit 1; }
-      else
-        cp "$entry" "$into/$name"
-      fi
-    done
-    [ "$found" -gt 0 ] || { echo "package: DEW_DERIVED holds no derivation of $generation"; exit 1; }
-    echo "package: $generation: $found derivations"
-  done
+  # The generations' union staged and weighed by the one rule of what a package may carry (tools/derived_weight.py).
+  # shellcheck disable=SC2086 # Each generation its own word.
+  "$work/build/bin/python" tools/derived_weight.py stage "$into" "$DEW_DERIVED" $DEW_GENERATIONS ||
+    { echo "package: the release's derivations could not be staged"; exit 1; }
 fi
 (cd "$into" && ls) | sort > "$work/derived.txt"
 rm -rf "$dist"

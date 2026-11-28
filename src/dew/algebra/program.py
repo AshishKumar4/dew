@@ -11,6 +11,7 @@ import collections
 import contextlib
 import dataclasses
 import functools
+import itertools
 import math
 import threading
 import time
@@ -36,12 +37,12 @@ from dew.nn.derivatives import Activation, Algebra, KernelGlue, Surrogate, marke
 from dew.nn.kernels import generation
 from dew.nn.kernels.templates import report as kernel_report
 from dew.nn.programs import (
-    bodies,
     called,
     control_flow,
     inlined,
     is_inlined_call,
     live,
+    platform_branch,
     with_bodies,
     with_bodies_of,
     with_equations,
@@ -1145,13 +1146,14 @@ def run_within(graph: EGraph, ruleset, limits: tuple[int, int], name: str) -> Sa
 
 
 def reported(graph: EGraph, sized: int, saturated: Saturated, began: float,
-             after: float | None = None) -> AlgebraReport:
+             after: float | None = None, *, nodes: int | None = None) -> AlgebraReport:
     """A derivation's own saturation (`run_within`: a scan's token programs', its chunk's) as the report a
     region's rewrite makes, recorded with the kernels' (`kernel_report.record_rewrite`): its size as
-    registered, its limits, its iterations and rows, whether a limit stopped it, and its form's price."""
+    registered, its limits, its iterations and rows (`nodes`, where facts added after it are not its own;
+    `graph`'s now else), whether a limit stopped it, and its form's price."""
     return AlgebraReport(sized, tuple(saturated.fired), saturated.fired, saturated.limits,
-                         saturated.iterations, node_count(graph), saturated.limited, None, after,
-                         time.perf_counter() - began)
+                         saturated.iterations, node_count(graph) if nodes is None else nodes,
+                         saturated.limited, None, after, time.perf_counter() - began)
 
 
 def extracted[Price: Linear](graph: EGraph, bundle: terms.Term, model: DagCostModel[Price], *,
@@ -1215,18 +1217,46 @@ def _entry(equation: jcore.JaxprEqn) -> str | None:
     return "opened" if _opening(equation) is not None else None
 
 
+def _entered(equation: jcore.JaxprEqn, region: Callable[[jcore.Jaxpr, int, bool, bool], jcore.Jaxpr],
+             opened: Callable[[jcore.Jaxpr, int], jcore.Jaxpr]) -> dict:
+    """`equation`'s parameters with each body the pass enters (`_entry`) rebuilt, in the context it enters
+    them in (`_entering`), one slot at a time in the order `with_bodies` reads them, each by its slot's
+    number among them (one body two slots hold, two numbers): one the pass rewrites as a region of its own by
+    `region(body, number, cleaned, mapped)` (`cleaned`: its caller's dead-code elimination entered it,
+    `_read`; `mapped`: a manual mesh's, its scope its own), where the pass rewrites it at all (`_rewritable`,
+    else kept as it is); an opened Algebra span's by `opened(body, number)`, its math left to the region it
+    opens into (`_opened`). The parameters themselves for an opaque leaf. The one dispatch the pass's rewrite
+    (`_within`) and a search's walk of its bodies (`fused_bodies`) enter bodies by."""
+    entry = _entry(equation)
+    if entry is None:
+        return equation.params
+    cleaned = equation.primitive in partial_eval.dce_rules
+    slots = itertools.count()
+
+    def entered(body: jcore.Jaxpr) -> jcore.Jaxpr:
+        number = next(slots)
+        if entry == "opened":
+            return opened(body, number)
+        return region(body, number, cleaned, entry == "mapped") if _rewritable(body) else body
+
+    with _entering(equation, entry):
+        return with_bodies(equation.params, entered)
+
+
 def fused_bodies[Weighed](jaxpr: jcore.Jaxpr,
-                          weigh: Callable[[tuple[tuple[str, int, int], ...], jcore.Jaxpr], Weighed]
-                          ) -> list[Weighed]:
+                          weigh: Callable[[tuple[tuple[str, int, int], ...], jcore.Jaxpr], Weighed], *,
+                          platform: str | None = None) -> list[Weighed]:
     """`weigh` of each body the pass with kernels weighs product regions in (`fusion.fused_program`,
     `_rewritten`), each called in the context the pass weighs it in (a manual mesh's body and those within it
-    in the map's, `_entering`): `jaxpr` where it holds equations (`_passed`), and each body within it the
-    pass rewrites as a region of its own (`_entry`), each by its path from `jaxpr` (each step its equation's
-    primitive's name, its place and the body's number) and as the pass reads it (`_read`: its unread work
-    dropped, which the places a path names are of). An Algebra span opened into its caller weighs no body of
-    its own, its bodies' own walked; nor does an opaque leaf, nor a body the pass keeps as it is
-    (`_rewritable`). Windows are not derived: an Algebra span a window's form lands across stays open in its
-    caller, its products weighed there, which this walk does not see."""
+    in the map's): `jaxpr` where it holds equations (`_passed`), and each body within it the pass rewrites as
+    a region of its own, entered as the pass enters it (`_entered`), each by its path from `jaxpr` (each step
+    its equation's primitive's name, its place and the body's number among its equation's bodies) and as the
+    pass reads it (`_read`: its unread work dropped, which the places a path names are of). An Algebra span
+    opened into its caller weighs no body of its own, its bodies' own walked; nor does an opaque leaf, nor a
+    body the pass keeps as it is. Windows are not derived: an Algebra span a window's form lands across stays
+    open in its caller, its products weighed there, which this walk does not see. With `platform` (a
+    lowering's, `programs.lowering_platform`), a platform choice's branches but the one a program lowered for
+    it runs (`programs.platform_branch`) are passed by: the pass weighs every branch, a launch runs one."""
     weighed: list[Weighed] = []
 
     def walk(body: jcore.Jaxpr, path: tuple, *, cleaned: bool, own: bool) -> None:
@@ -1234,16 +1264,26 @@ def fused_bodies[Weighed](jaxpr: jcore.Jaxpr,
         if own:
             weighed.append(weigh(path, read))
         for place, equation in enumerate(read.eqns):
-            entry = _entry(equation)
-            if entry is None:
-                continue
-            with _entering(equation, entry):
-                for number, inner in enumerate(bodies(equation)):
-                    step = (*path, (equation.primitive.name, place, number))
-                    if entry == "opened":
-                        walk(inner, step, cleaned=True, own=False)
-                    elif _rewritable(inner):
-                        walk(inner, step, cleaned=equation.primitive in partial_eval.dce_rules, own=True)
+            if _entry(equation) is not None:
+                enter(equation, path, place)
+
+    def enter(equation: jcore.JaxprEqn, path: tuple, place: int) -> None:
+        # A platform choice's branch a lowering for `platform` runs, by its slot (its branches' own), the
+        # others passed by.
+        platforms = (equation.params.get("branches_platforms") if equation.primitive is jax.lax.cond_p
+                     else None)
+        runs = None if platform is None or platforms is None else platform_branch(platforms, platform)
+
+        def region(inner: jcore.Jaxpr, number: int, cleaned: bool, _mapped: bool) -> jcore.Jaxpr:
+            if runs is None or number == runs:
+                walk(inner, (*path, (equation.primitive.name, place, number)), cleaned=cleaned, own=True)
+            return inner
+
+        def opened(inner: jcore.Jaxpr, number: int) -> jcore.Jaxpr:
+            walk(inner, (*path, (equation.primitive.name, place, number)), cleaned=True, own=False)
+            return inner
+
+        _entered(equation, region, opened)
 
     if jaxpr.eqns:
         walk(jaxpr, (), cleaned=False, own=True)
@@ -1252,8 +1292,8 @@ def fused_bodies[Weighed](jaxpr: jcore.Jaxpr,
 
 @contextlib.contextmanager
 def _entering(equation: jcore.JaxprEqn, entry: str) -> Iterator[None]:
-    """The context the pass enters `equation`'s bodies in (`_within`, its `entry`): a manual mesh's within the
-    context the equation was recorded in (its abstract mesh among it: a map staged on a mesh of its own
+    """The context the pass enters `equation`'s bodies in (`_entered`, its `entry`): a manual mesh's within
+    the context the equation was recorded in (its abstract mesh among it: a map staged on a mesh of its own
     beside the caller's, JAX's replay of an equation, `JaxprEqn.ctx`) and the map's own (`_manual`); any
     other's in the caller's."""
     if entry != "mapped":
@@ -1273,26 +1313,17 @@ def _within(jaxpr: jcore.Jaxpr, accurate: bool, saturation: Saturation, kernels:
     an H100, nothing rewritten)."""
     changed = False
     equations = []
+    # A region's body rewritten in place (a manual mesh's in its own scope, `_entered`), an opened Algebra
+    # span's own bodies rewritten, its math left to the region it opens into (`_opened`).
+    def region(body: jcore.Jaxpr, _number: int, cleaned: bool, mapped: bool) -> jcore.Jaxpr:
+        scope = None if mapped else _scope
+        return _closed(body, accurate, saturation, kernels, _cleaned=cleaned, _scope=scope)
+
+    def opened(body: jcore.Jaxpr, _number: int) -> jcore.Jaxpr:
+        return _within(body, accurate, saturation, kernels, _scope=_scope)
+
     for equation in jaxpr.eqns:
-        cleaned = equation.primitive in partial_eval.dce_rules
-        entry = _entry(equation)
-        if entry == "mapped":
-            # A manual mesh's body, each device's program, rewritten in its own context (`_entering`).
-            with _entering(equation, entry):
-                params = with_bodies(
-                    equation.params,
-                    lambda body, c=cleaned: _closed(body, accurate, saturation, kernels, _cleaned=c))
-        elif entry == "region":
-            params = with_bodies(
-                equation.params,
-                lambda body, c=cleaned: _closed(body, accurate, saturation, kernels, _cleaned=c,
-                                                _scope=_scope))
-        elif entry == "opened":
-            # Its body's own bodies rewritten, its math left to the region it opens into (`_opened`).
-            params = with_bodies(equation.params,
-                                 lambda body: _within(body, accurate, saturation, kernels, _scope=_scope))
-        else:
-            params = equation.params
+        params = _entered(equation, region, opened)
         if any(params[name] is not value for name, value in equation.params.items()):
             equation = with_bodies_of(equation, params)
             changed = True
@@ -1464,8 +1495,8 @@ _STRUCTURAL_CLOSED: collections.OrderedDict[Hashable, Held[_Body]] = collections
 
 
 def _rewritable(closed: jcore.Jaxpr) -> bool:
-    """Whether the pass rewrites `closed` (`_closed`): not a body whose constants another holds (an open
-    jaxpr) or that reads a value of no shape."""
+    """Whether the pass rewrites a region's body `closed` (`_entered`, `_closed`): not a body whose constants
+    another holds (an open jaxpr) or that reads a value of no shape, which it keeps as it is."""
     return (len(closed.consts) == len(closed.constvars)
             and all(isinstance(aval, ShapedArray) for aval in closed.in_avals))
 
@@ -1474,10 +1505,7 @@ def _closed(closed: jcore.Jaxpr, accurate: bool, saturation: Saturation, kernels
             *, _cleaned: bool = False, _scope: _Scope | None = None) -> jcore.Jaxpr:
     """A body's program rewritten, over the same inputs, weak types included, and the same outputs, the same
     object for every call site and retrace of one body (`_REWRITTEN`), the body itself where nothing
-    changes; a body whose constants another holds (an open jaxpr), or that reads a value of no shape, as it
-    is."""
-    if not _rewritable(closed):
-        return closed
+    changes: one the pass rewrites (`_rewritable`, which `_entered` reads before it calls here)."""
     scope = _scope_for(accurate, saturation, kernels) if _scope is None else _scope
     rewrites = _REWRITTEN.setdefault(closed, collections.OrderedDict())
     # With kernels, the context the substitutions are decided in too (the derivation's: the mesh, the target

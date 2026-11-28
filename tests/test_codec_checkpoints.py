@@ -317,8 +317,9 @@ def test_a_packed_matrixs_non_finite_products_are_ieees():
     NaNs; and the classification read off the operands' bits where a float32 multiply would flush a
     subnormal first (XLA's CPU, row 11795): a bfloat16 `0x0001` times -inf is -inf, +inf times float32
     `0x00000001` is +inf, in either order of finite and infinite."""
+    from dew.nn.float_bits import owed_product
     from dew.nn.kernels.formats import NvFp4
-    from dew.quantization import _product_rounded, packed_values
+    from dew.quantization import packed_values
 
     codes = np.zeros((256, 2), np.float32)
     codes[1, 0], codes[2, 0] = 1.5, -6.0
@@ -330,6 +331,6 @@ def test_a_packed_matrixs_non_finite_products_are_ieees():
     subnormal = jax.lax.bitcast_convert_type(jnp.asarray([1], jnp.uint16), jnp.bfloat16)
     infinite = jnp.asarray([np.inf], jnp.bfloat16)
     for value, scale, expected in ((subnormal, -np.inf, 0xFF800000), (infinite, tiny, 0x7F800000)):
-        got = _product_rounded(value, jnp.asarray(scale, jnp.float32), 8)
+        got = owed_product(value, jnp.asarray(scale, jnp.float32), 8)
         assert np.asarray(got).view(np.uint32)[0] == expected
 

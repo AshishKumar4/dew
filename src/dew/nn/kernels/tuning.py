@@ -73,6 +73,7 @@ import tokamax
 from jax._src import config as jax_config, mesh as mesh_lib
 from jax.extend import core as jax_core
 from jax.extend.backend import get_default_device
+from tokamax._src import config as tokamax_config
 
 from dew import _cache, _coordination, _records
 from dew._facts import Held
@@ -483,8 +484,15 @@ def _picks_json(device_kind: str, entries: list[dict[str, JSON]]) -> str:
 
 
 def _entry(ba: tokamax.BoundArguments, timings: Timings) -> dict[str, JSON]:
-    """One launch's stored entry (`dumps_picks`): the launch, its derived config and its timings."""
-    return {**_launch_json(ba), "derived": encoded(ba.heuristics_config), "timings": _timings_json(timings)}
+    """One launch's stored entry (`dumps_picks`): the launch, its derived config (`_described`) and its
+    timings."""
+    return {**_described(ba), "timings": _timings_json(timings)}
+
+
+def _described(ba: tokamax.BoundArguments) -> dict[str, JSON]:
+    """A launch as its stored entry states it, its timings aside: the launch and its derived config, read at
+    the placement its caller holds (`_placed_in`)."""
+    return {**_launch_json(ba), "derived": encoded(ba.heuristics_config)}
 
 
 @dataclasses.dataclass(frozen=True)
@@ -531,6 +539,10 @@ class _Picks(dict):
 
 
 _PICKS: dict[tuple[tokamax.Op, str], _Picks] = {}
+_TIMINGS: dict[tuple[tokamax.Op, str], _Picks] = {}
+"""Every timing that ran of each op's launches on each GPU model, by key, as its store holds them or this
+process measured them: what a settlement chooses its picks from (`_timings_of`), kept apart from the picks
+launches read (`_PICKS`), which a settlement replaces with the one its calls take."""
 _LOADED: set[str] = set()
 _LOADING = threading.Lock()
 _READING = contextvars.ContextVar("dew_reading_picks", default=False)
@@ -942,6 +954,7 @@ class KernelOp(tokamax.Op):
             if kind not in _LOADED:
                 for key, picks in _stored_picks(kind).items():
                     _PICKS.setdefault(key, _Picks()).update(picks)
+                    _TIMINGS.setdefault(key, _Picks()).update(picks)
                 _LOADED.add(kind)
             return _PICKS.setdefault((_identity(self), kind), _Picks())
 
@@ -983,8 +996,8 @@ class KernelOp(tokamax.Op):
                            if field.name not in (*self.HOOKS, "config", "vjp")))
             hash(place)
         except TypeError:
-            # A part no hash holds (an array): traced each time.
-            return self.traced(name, value)
+            # A part no hash holds (an array, a closure over a list): traced once a call (`one_call`).
+            return self._traced_once(name, value)
         found = _TRACED.get(place)
         if found is not None and all(ref() is leaf for ref, leaf in zip(found[0], leaves, strict=True)):
             return found[1]
@@ -997,6 +1010,24 @@ class KernelOp(tokamax.Op):
             return key
         _TRACED[place] = (refs, key)
         return key
+
+    def _traced_once(self, name: str, value) -> str | None:
+        """`traced`, once a kernel call's making (`one_call`) for each value, this op's layouts and the
+        trace's configuration, the value kept beside its key while the call lasts; each time outside one (a
+        decode step's planning and launch read one trace of a closure hook, train 1472's review)."""
+        table = call_scoped()
+        if table is None:
+            return self.traced(name, value)
+        place = ("identified", type(self), name, id(value), jax_config.trace_context(),
+                 tuple((field.name, getattr(self, field.name)) for field in dataclasses.fields(self)
+                       if field.name not in (*self.HOOKS, "config", "vjp")))
+        try:
+            hash(place)
+        except TypeError:
+            return self.traced(name, value)
+        if place not in table:
+            table[place] = (value, self.traced(name, value))
+        return table[place][1]
 
     def lowering(self, ba: tokamax.BoundArguments, config) -> tuple[Callable, tuple]:
         """The launch of `ba` at `config` as a resource derivation lowers it (never run), or with `config`
@@ -1417,11 +1448,50 @@ def _timeable(op: KernelOp, ba: tokamax.BoundArguments, config: Hashable) -> boo
     return op.pinnable(ba, completed) and not report.certified(op, ba, completed)
 
 
-def _measured(op: KernelOp, ba: tokamax.BoundArguments) -> Timings:
-    """Every candidate config of `ba`'s launch (`_candidates`), each compiled on a thread and timed alone: the
-    device time its device reads for the launch's own kernels (`dew.telemetry.benchmark.device_time`: CUPTI's
-    on a GPU, a profiler capture's ops on a TPU), each run behind an eviction, so every config starts with its
-    operands out of a GPU's cache (`benchmark.eviction`, none on a TPU)."""
+def _candidate_compiles[Compiled](op: KernelOp, ba: tokamax.BoundArguments, calls: Sequence[Observed],
+                                  compiled: Callable[[Hashable], Compiled]
+                                  ) -> dict[Hashable, concurrent.futures.Future[Compiled]]:
+    """`compiled` of each config of `ba`'s launch (`_measurable`), each on a thread of the process's compile
+    slots (`report.compile_threads`) at the first call's placement (the context's where none), the caller's
+    trace context carried in (`_cache.carried`: a pool's thread starts with none), every compile done as
+    this returns."""
+    configs = _measurable(op, ba, calls)
+    placed = calls[0].placed if calls else Placement.current()
+    with _placed_in(placed):
+        entered = _cache.carried()
+
+    def at(config):
+        with entered(), _placed_in(placed):
+            return compiled(config)
+
+    with concurrent.futures.ThreadPoolExecutor(report.compile_threads()) as pool:
+        return {config: pool.submit(at, config) for config in configs}
+
+
+def _measurable(op: KernelOp, ba: tokamax.BoundArguments, calls: Sequence[Observed]) -> list[Hashable]:
+    """The configs of `ba`'s launch the tuner times: of its space each of `calls` reads at its own placement
+    (`autotuning_configs`, its derivation and variants its GPU's), in the first's order, those every call
+    takes as its pick (`_takes`) and may time (`_timeable`, a certification that may compile, asked of the
+    configs the spaces and legality leave alone); of its space in the context where no call is given."""
+    if not calls:
+        return [config for config in ba.autotuning_configs if _timeable(op, ba, config)]
+    return [config for config in _takes(calls) if all(_timeable_at(call, config) for call in calls)]
+
+
+def _timeable_at(call: Observed, config: Hashable) -> bool:
+    """`_timeable` of `call`'s keyed launch at its placement."""
+    with _placed_in(call.placed):
+        return _timeable(call.op, call.keyed, config)
+
+
+def _measured(op: KernelOp, ba: tokamax.BoundArguments, calls: Sequence[Observed] = ()) -> Timings:
+    """Every candidate config of `ba`'s launch its `calls` may time and take (`_measurable`, each read at its
+    call's placement, its GPU's facts its own), each compiled on a thread at the first call's placement (its
+    context carried into the thread, `_cache.carried`, where a pool's worker started with none) and timed
+    alone on the device attached: the device time it reads for the launch's own kernels
+    (`dew.telemetry.benchmark.device_time`: CUPTI's on a GPU, a profiler capture's ops on a TPU), each run
+    behind an eviction, so every config starts with its operands out of a GPU's cache
+    (`benchmark.eviction`, none on a TPU). No `calls`: the context's own placement and space."""
     from dew.telemetry.benchmark import CuptiHeld, NoKernels, behind, device_time, eviction
 
     arrays, fill = materialized(op, ba)
@@ -1458,10 +1528,8 @@ def _measured(op: KernelOp, ba: tokamax.BoundArguments) -> Timings:
 
     timings: dict[Hashable, tokamax.BenchmarkData | Exception] = {}
     read = {}
-    configs = _candidates(op, ba)
-    # As many as the process's compile slots, whose compiles they wait on (`report.compile_threads`).
-    with concurrent.futures.ThreadPoolExecutor(report.compile_threads()) as pool:
-        futures = {config: pool.submit(compiled, config) for config in configs}
+    futures = _candidate_compiles(op, ba, calls, compiled)
+    configs = list(futures)
     # The device reads every run, the flush's own first. CUPTI takes one subscriber, a TPU one capture, so
     # where a profile capture holds it, from the first run or any later one,
     # the launch keeps its heuristic until a later compile.
@@ -1498,10 +1566,6 @@ def _benchmarks(read: Mapping) -> dict[Hashable, tokamax.BenchmarkData]:
             for config, (runs, lowering, compiling) in read.items()}
 
 
-def _config(fastest: Timings | None) -> Hashable:
-    return None if fastest is None else fastest.fastest_config
-
-
 Keyed = dict[tuple[tokamax.Op, Hashable], tuple[tokamax.BoundArguments, Timings]]
 """Launches by their op and cache key, each with its timings (`_keyed`)."""
 
@@ -1535,10 +1599,11 @@ def _launch_key(ba: tokamax.BoundArguments) -> tuple[tokamax.Op, Hashable]:
 
 
 def _kernel_launches(launches: Keyed):
-    """`launches`' launches of Dew's kernels, each `(op, key, fastest config's timing)`."""
+    """`launches`' launches of Dew's kernels, each `(op, key, timings)`: every config of it that ran, so a
+    settlement takes the fastest each of its calls takes (`_usable`), its launch the fastest of all."""
     for (op, key), (_, timings) in launches.items():
         if isinstance(op, KernelOp) and timings.prune_errors():
-            yield op, key, timings.prune()
+            yield op, key, timings.prune_errors()
 
 
 def _read(path: str) -> tuple[Keyed, list]:
@@ -1596,19 +1661,26 @@ def _stored_picks(kind: str) -> dict[tuple[tokamax.Op, str], _Picks]:
     return picks
 
 
-def _store(device_kind: str, fresh: Mapping[tuple[tokamax.Op, Hashable], dict[str, JSON]]) -> None:
-    """Merge the `fresh` entries (`_entry`), by their launches' keys (`_launch_key`), into the stored picks
-    for GPUs of `device_kind`, one writer at a time, a launch's newer timings replacing its older. Every other
-    entry is kept as it was written: one this checkout does not read (`_read`), and one it reads, whose
-    derived config is the one its timings were measured beside and whose hooks are their traced keys, which
-    no derivation takes (M-FS-106). The file is replaced whole (`write_atomically`), so no reader on the
-    shared filesystem sees a part of it."""
+def _store(device_kind: str, fresh: Mapping[tuple[tokamax.Op, Hashable], tuple[dict[str, JSON], Timings]]
+           ) -> None:
+    """Merge the `fresh` launches (each as its entry states it, `_described`, and the timings just measured),
+    by their keys (`_launch_key`), into the stored picks for GPUs of `device_kind`, one writer at a time: a
+    launch's fresh timings merged into those the store holds as it is written, each config measured again
+    replaced, and encoded once, so a writer that measured a narrower space keeps what another stored since it
+    read. Every other entry is kept as it was written: one this checkout does not read (`_read`), and one it
+    reads, whose derived config is the one its timings were measured beside and whose hooks are their traced
+    keys, which no derivation takes (M-FS-106). The file is replaced whole (`write_atomically`), so no reader
+    on the shared filesystem sees a part of it."""
     path = _cache.kernel_picks_path(device_kind)
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with filelock.FileLock(path + '.lock'):
         ours, foreign = _partitioned(path)
-        kept = {key: entry for key, entry, _ in ours}
-        entries = [*(entry for key, entry in kept.items() if key not in fresh), *fresh.values(), *foreign]
+        kept = {key: (entry, timings) for key, entry, (_, timings) in ours}
+        # Only what ran merges: a config that failed again never erases its stored timing.
+        merged = [{**described, "timings": _timings_json(Timings({**kept[key][1], **timings.prune_errors()})
+                                                         if key in kept else timings.prune_errors())}
+                  for key, (described, timings) in fresh.items()]
+        entries = [*(entry for key, (entry, _) in kept.items() if key not in fresh), *merged, *foreign]
         write_atomically(path, _picks_json(device_kind, entries))
 
 
@@ -1739,6 +1811,34 @@ class Observed(NamedTuple):
         return self.op, self.keyed
 
 
+_CALL_SCOPED: contextvars.ContextVar[dict | None] = _cache.untraced(
+    contextvars.ContextVar("call_scoped", default=None))
+"""What a kernel call's making has read once (`one_call`, `call_scoped`): a call's own, which no trace reads
+to make its program (`_cache.untraced`), so no trace kept past the call is keyed by it."""
+
+
+def one_call[**P, R](function: Callable[P, R]) -> Callable[P, R]:
+    """`function`, a kernel call's whole making (its route's choice, its config's derivation and pricing,
+    its launch's emission), within which `call_scoped` is one table: a hook a launch reads traced once
+    across them, where each traced it (train 1452's and 1461's reviews), nothing of it held past the
+    outermost call."""
+    @functools.wraps(function)
+    def within(*args: P.args, **kwargs: P.kwargs) -> R:
+        outer = _CALL_SCOPED.get()
+        token = _CALL_SCOPED.set({} if outer is None else outer)
+        try:
+            return function(*args, **kwargs)
+        finally:
+            _CALL_SCOPED.reset(token)
+
+    return within
+
+
+def call_scoped() -> dict | None:
+    """The table of the kernel call being made (`one_call`), None outside one."""
+    return _CALL_SCOPED.get()
+
+
 class Seen(list[Observed]):
     """The launches traced under `seen`, each as it was observed (`Observed`), in the order they traced."""
 
@@ -1834,7 +1934,7 @@ def tuned(lower: Callable[[], jax.stages.Lowered], *, measure: bool = False) -> 
         _agreed_reach(reached)
         if measure and not reached.launches and reached.foreign:
             raise Untunable(reached.foreign)
-        _settle(reached.launches, measure=measure)
+        _settle(reached.observed, measurer=_measurer(measure))
         if _cache.KERNEL_TUNES.get_global() != tunes:
             # A config changed: the program lowered again, its reach its own.
             with seen() as found:
@@ -1851,14 +1951,19 @@ Mosaic TPU."""
 class Reach(NamedTuple):
     """What a run of a lowered step may launch (`reach`)."""
 
-    launches: list[Observed]
-    """Each distinct traced launch of Dew's whose kernel a run may reach (`_distinct`), as first traced, each
-    with its placement, at which `tune` settles it: the launches `tune` settles and `tools/kernel_picks.py`
-    counts."""
+    observed: tuple[Observed, ...]
+    """Every reached launch as observed: each call of one launch, at each placement and with its own
+    arguments, which its pick must hold for (`_settle`)."""
     foreign: tuple[str, ...]
     """The kernels a run may reach of a compiler the tuner times (`TUNED_COMPILERS`) that no launch of Dew's
     traced (no launch's digest on the call, `KernelCall.launched`), each named with its compiler: another
     library's (tokamax's Triton, JAX's Splash attention on a TPU), outside the tuner."""
+
+    @property
+    def launches(self) -> list[Observed]:
+        """Each distinct launch reached (`_distinct`), as first traced: the launches `tune` settles and
+        `tools/kernel_picks.py` counts."""
+        return _distinct(self.observed)
 
 
 def reach(found: Seen, lowered: jax.stages.Lowered) -> Reach:
@@ -1885,21 +1990,33 @@ def reach(found: Seen, lowered: jax.stages.Lowered) -> Reach:
     reached = [observed for observed in found if observed.digest is not None and (
         observed.digest in called or ((launch := report.traced(observed.digest)) is not None
                                       and (launch.identity, launch.config) in named))]
-    return Reach(_distinct(reached), tuple(foreign))
+    return Reach(tuple(reached), tuple(foreign))
 
 
 def _agreed_reach(reached: Reach, agree: Callable[[str, Callable[[], list]], list] = _coordination.agreed_same
                   ) -> None:
     """Refuse, on every process alike (`_coordination.PoolDiffers`, `agree`'s), a reach the pool's processes
     do not share: each launch as the store names it (`_launch_json`: its op's whole identity and its
-    arguments, in order), the GPU models its placements name (`_mesh_kind`) and the foreign kernels. A
+    arguments, in order) with each of its calls, by its own signature (`_call_signature`: a row count its key
+    buckets) and the facts of the placement it traced at (`_placement_facts`): a pick is held to each
+    (`_takes`), so a process calling it otherwise decides otherwise; the GPU models its placements name
+    (`_mesh_kind`) and the foreign kernels. A
     process's cached picks may lower another arm of a decided conditional than its peers', one reaching a
     launch the others do not, where the one reaching none would return before the settlement its peers wait
     at (`_settle`'s agreement); a process failing to state its own (a launch no JSON names) fails every
     process. Agreed, what follows (`_one_kind`, `Untunable`) raises on every process or none."""
-    agree("a tuning run's reach", lambda: [
-        [_launch_json(observed.keyed) for observed in reached.launches],
-        sorted({_mesh_kind(observed.placed) for observed in reached.launches}), list(reached.foreign)])
+    def stated() -> list:
+        calls = _calls(reached.observed)
+
+        def named(observed: Observed) -> list:
+            called = calls[_distinct_key(observed)]
+            return [_launch_json(observed.keyed),
+                    sorted({(signature, _placement_facts(placed)) for placed, signature in called})]
+
+        return [[named(observed) for observed in reached.launches],
+                sorted({_mesh_kind(observed.placed) for observed in reached.launches}), list(reached.foreign)]
+
+    agree("a tuning run's reach", stated)
 
 
 def _one_kind(placements: Iterable[Placement]) -> str | None:
@@ -1918,20 +2035,136 @@ def _distinct(found: Sequence[Observed]) -> list[Observed]:
     settles; one launch traced for two models is two, which `_one_kind` refuses."""
     distinct: dict[tuple[str, tokamax.Op, Hashable], Observed] = {}
     for observed in found:
-        key = (_mesh_kind(observed.placed), _identity(observed.keyed.op), observed.keyed.autotuning_cache_key)
-        distinct.setdefault(key, observed)
+        distinct.setdefault(_distinct_key(observed), observed)
     return list(distinct.values())
 
 
-def _settle(found: Sequence[Observed], *, measure: bool) -> int:
+def _distinct_key(observed: Observed) -> tuple[str, tokamax.Op, Hashable]:
+    """A launch's key once a GPU model (`_distinct`): its store's model, its op as its picks name it and its
+    cache key."""
+    return _mesh_kind(observed.placed), _identity(observed.keyed.op), observed.keyed.autotuning_cache_key
+
+
+def _calls(found: Sequence[Observed]) -> dict[tuple[str, tokamax.Op, Hashable], dict[tuple[Placement, str],
+                                                                                    Observed]]:
+    """Each distinct launch's calls (`_distinct_key`), as first traced, one of each placement and call
+    signature (`_call_signature`), by them: a launch of one key called at several (a region of a step making
+    its axes explicit, a target assumed with another's facts, another shape bucketed to its key), whose pick
+    each must take (`_takes`)."""
+    calls: dict[tuple[str, tokamax.Op, Hashable], dict[tuple[Placement, str], Observed]] = {}
+    for observed in found:
+        key = observed.placed, _call_signature(observed)
+        calls.setdefault(_distinct_key(observed), {}).setdefault(key, observed)
+    return calls
+
+
+def _call_signature(observed: Observed) -> str:
+    """A call as the store names a launch (`_launch_json`), what its taking a pick reads: its key's op and
+    hooks (their traced keys, the same on every process, `KernelOp.keyed`, none traced again) and every other
+    argument its own, its operands at their own shapes however nested (a row count its key buckets, a
+    gathered table's length within a tuple)."""
+    own, hooks = observed.arguments.arguments, observed.op.HOOKS
+    arguments = {name: value if name in hooks or name not in own else shapes(own[name])
+                 for name, value in observed.keyed.arguments.items()}
+    return json.dumps(_launch_json(tokamax.BoundArguments(observed.keyed.op, arguments)), sort_keys=True)
+
+
+def _placement_facts(placed: Placement) -> str:
+    """The facts of the GPU a launch traced at `placed` was chosen for (`_placed_in`: its assumed target's
+    and its concrete devices' own), stated as a pool's processes compare them (`_agreed_reach`)."""
+    from dew import _facts
+
+    with _placed_in(placed):
+        return repr(_facts.stated(generation.gpu_target()))
+
+
+def _usable(timings: Timings, calls: Sequence[Observed]) -> Timings | None:
+    """The fastest of `timings` that ran at a config every one of `calls` takes as its pick (`_takes`),
+    pruned to it; None where none does: a pick one call could not take would fall back to its own derivation
+    there (`KernelOp.taken`), its config another than its peers'."""
+    ran = timings.prune_errors()
+    held = Timings({config: ran[config] for config in _takes(calls, list(ran))})
+    return held.prune() if held else None
+
+
+def _takes(calls: Sequence[Observed], configs: Sequence[Hashable] | None = None) -> list[Hashable]:
+    """Those of `configs` (the first call's space in its order where None) every one of `calls` takes as its
+    pick, as `KernelOp.taken` reads one at the call's placement: in its key's space there (`_pick`; each space
+    read once, every space's before any legality), and taken by the call's own arguments
+    (`KernelOp.pinnable`)."""
+    spaces = []
+    for call in calls:
+        with _placed_in(call.placed):
+            spaces.append(list(call.keyed.autotuning_configs))
+    held = [set(space) for space in spaces]
+    common = [config for config in (spaces[0] if configs is None else configs)
+              if all(config in space for space in held)]
+    return [config for config in common if all(_legal(call, config) for call in calls)]
+
+
+def _legal(call: Observed, config: Hashable) -> bool:
+    """Whether `call`'s own arguments take `config` at its placement (`KernelOp.pinnable`)."""
+    with _placed_in(call.placed):
+        return call.op.pinnable(call.arguments, config)
+
+
+def _effective(call: Observed) -> Hashable | None:
+    """The pick `call` takes at its placement, as `KernelOp.taken` reads one (`_pick`, legal by its own
+    arguments); None where it takes its own derivation."""
+    with _placed_in(call.placed):
+        pick = _pick(call.keyed)
+        return None if pick is None or not call.op.pinnable(call.arguments, pick.fastest_config) else (
+            pick.fastest_config)
+
+
+def _timings_of(observed: Observed) -> Timings | None:
+    """Every timing that ran of `observed`'s launch on its GPU model (`_TIMINGS`: its store's and this
+    process's measurements, whatever pick a settlement installed since), else its cached pick's, whichever
+    its space at its placement holds (`_pick` would read none where its fastest is not), which `_usable`
+    filters by every call; none where tokamax's cache is ignored (`--tokamax_ignore_autotuning_cache`), as
+    a launch's own read takes none."""
+    if tokamax_config.ignore_autotuning_cache.value:
+        return None
+    kind, (op, key) = _mesh_kind(observed.placed), _launch_key(observed.keyed)
+    observed.op.get_autotuning_cache(kind)  # its store read in
+    if (held := _TIMINGS.get((op, kind), {}).get(key)) is not None:
+        return held
+    with _placed_in(observed.placed):
+        stored = observed.keyed.cached_autotuning_data
+    return stored if isinstance(stored, Timings) else None
+
+
+class Measurer(NamedTuple):
+    """The GPU a process measures launches on (`_settle`): its model (`kind`), its timing of a launch's
+    configs every call takes (`measured`, `_measured`'s) and its store of the timings (`store`,
+    `_store`'s)."""
+
+    kind: str
+    measured: Callable[[KernelOp, tokamax.BoundArguments, Sequence[Observed]], Timings]
+    store: Callable[[str, Mapping[tuple[tokamax.Op, Hashable], tuple[dict[str, JSON], Timings]]], None]
+
+
+def _measurer(measure: bool) -> Measurer | None:
+    """This process's measurer (`Measurer`) where `measure` and it has its GPU to itself
+    (`_cache.measures_picks`): its attached GPU's, timing and storing as a run does; None where it measures
+    none."""
+    if not (measure and _cache.measures_picks()):
+        return None
+    return Measurer(get_default_device().device_kind, _measured, _store)
+
+
+def _settle(found: Sequence[Observed], *, measurer: Measurer | None) -> int:
     """Take process 0's configs for the keyed launches `found`, each read, checked and stored at its own
     placement (`Observed.placed`: its mesh and the target assumed as it traced, whose facts its picks are
     held to) and keyed by its GPU's model (`_one_kind`; a store of another GPU's picks is no pick of theirs),
-    on every process, process 0 measuring a launch without a pick where `measure` and it has its GPU to
-    itself, that GPU (a launch traced for another, a compile-only GPU's, measured on none): its picks, and
+    on every process, process 0 measuring a launch without a pick on its `measurer`'s GPU where that is the
+    launch's GPU model (a launch traced for another, a compile-only GPU's, measured on none): its picks, and
     for a launch it has none for the heuristic, which every process launches there and none stores, so the
-    launch stays unmeasured. Each distinct launch is decided, and measured, once. Returns how many still
-    have no pick."""
+    launch stays unmeasured. Each distinct launch is decided, and measured, once, its pick one every
+    call of it takes (`_usable`, read from every config its store measured that ran; measured, among the
+    configs each may time and take, `_measured`), and the launch lowered again where any call's pick
+    changed (`_effective`). Returns how many still have a call without a pick."""
+    calls = {key: list(group.values()) for key, group in _calls(found).items()}
     found = _distinct(found)
     kind = _one_kind(observed.placed for observed in found)
     if kind is None:
@@ -1941,26 +2174,35 @@ def _settle(found: Sequence[Observed], *, measure: bool) -> int:
         if jax.process_index() != 0:
             return None
         decisions, timed = [], {}
-        measuring = measure and _cache.measures_picks() and kind == get_default_device().device_kind
-        for observed, fastest in zip(found, _picked(found), strict=True):
+        measuring = measurer if measurer is not None and measurer.kind == kind else None
+        for observed in found:
             op, ba = observed.launch
-            timings = None
-            if fastest is None and measuring:
-                timings = _measured(op, ba)
-                if not timings.prune_errors():
+            group = calls[_distinct_key(observed)]
+            fastest = None if (held := _timings_of(observed)) is None else _usable(held, group)
+            fresh = None
+            if fastest is None and measuring is not None:
+                measured = measuring.measured(op, ba, group)
+                if not measured.prune_errors():
                     _log.warning("no config of %s compiled or ran; it keeps its heuristic: %s",
-                                 type(op).__name__, next(iter(timings.values()), None))
+                                 type(op).__name__, next(iter(measured.values()), None))
                     continue
-                fastest = timings.prune()
+                # Merged into those held, each config measured again replaced: this group's space is narrower
+                # than another's whose pick the held timings still give. The store merges what was measured
+                # alone into what it holds as it is written (`_store`), another writer's since kept.
+                fresh = measured.prune_errors()
+                timings = Timings({**(held.prune_errors() if held is not None else {}), **fresh})
+                identity, key = _launch_key(ba)
+                _TIMINGS.setdefault((identity, kind), _Picks())[key] = timings
+                fastest = _usable(timings, group)
             if fastest is None:
                 continue
             # Each entry made at its launch's placement, the derived config it carries its GPU's (`_entry`).
             with _placed_in(observed.placed):
                 decisions.append(_entry(ba, fastest))
-                if timings is not None:
-                    timed[_launch_key(ba)] = _entry(ba, timings)
-        if timed:
-            _store(kind, timed)
+                if fresh is not None:
+                    timed[_launch_key(ba)] = _described(ba), fresh
+        if timed and measuring is not None:
+            measuring.store(kind, timed)
         return _picks_json(kind, decisions)
 
     text = _coordination.broadcast_from_process_zero(_coordination.agreed("settling kernel configs", decided))
@@ -1969,9 +2211,9 @@ def _settle(found: Sequence[Observed], *, measure: bool) -> int:
         (op, key): fastest for op, key, fastest in _kernel_launches(picked)}
 
     def launched() -> list[Hashable]:
-        # The configs the launches take, as the trace read them; tokamax's ignore-cache setting keeps
+        # The config every reached call takes, as the trace read it; tokamax's ignore-cache setting keeps
         # the picks None.
-        return [_config(fastest) for fastest in _picked(found)]
+        return [_effective(call) for group in calls.values() for call in group]
 
     traced = launched()
     for op, ba in (observed.launch for observed in found):
@@ -1984,17 +2226,7 @@ def _settle(found: Sequence[Observed], *, measure: bool) -> int:
     if any(_coordination.from_every_process(changed)):
         # A program lowered again traces again, with the picks it now reads.
         _cache.KERNEL_TUNES.set_global(_cache.KERNEL_TUNES.get_global() + 1)
-    return sum(fastest is None for fastest in _picked(found))
-
-
-def _picked(found: Sequence[Observed]) -> list[Timings | None]:
-    """Each launch of `found`'s pick (`_pick`), read at its own placement (`_placed_in`), against its GPU's
-    facts."""
-    picks = []
-    for observed in found:
-        with _placed_in(observed.placed):
-            picks.append(_pick(observed.keyed))
-    return picks
+    return sum(any(_effective(call) is None for call in group) for group in calls.values())
 
 
 @contextlib.contextmanager
