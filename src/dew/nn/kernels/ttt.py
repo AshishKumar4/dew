@@ -21,7 +21,7 @@ import jax
 import jax.numpy as jnp
 
 from dew.nn.aligned import aligned_sum
-from dew.nn.kernels.titans import mini_batches, prepared_operands, read_out, real_gradients
+from dew.nn.kernels.titans import absent_zeroed, mini_batches, prepared_operands, read_out, real_gradients
 
 
 def _rated_prefixes(k, update, eta, real):
@@ -50,18 +50,20 @@ def _rated_prefixes(k, update, eta, real):
 
 
 def ttt_linear(query, key, value, weight, bias, eta, state=None, *, chunk: int = 16, scale=None,
-               eps: float = 1e-6):
+               eps: float = 1e-6, valid=None):
     """TTT-Linear a mini-batch of `chunk` tokens at a time: `query`, `key` and `value` `[B, T, H, D]`, the
     inner loss's LayerNorm affine `weight` and `bias` `[H, D]`, the learning rate `eta` `[B, T, H]` and
     `state` the entering `(W, b)` (`[B, H, D, D]`, `[B, H, 1, D]`; zeros where None); the output
     `[B, T, H, D]` in the operands' dtype and the final `(W, b)` in `at_least_fp32` of it, which every
-    step computes in."""
+    step computes in. A token `valid` (`[B, T]`) marks absent is none: its operands zero
+    (`titans.absent_zeroed`), the state as it was."""
     dtype = jnp.result_type(query, key, value)
     # TTT's memory `[D, Dv]` and bias `[1, Dv]`; its queries scaled.
     shapes = ((key.shape[-1], value.shape[-1]), (1, value.shape[-1]))
     scale = key.shape[-1] ** -0.5 if scale is None else scale
     q, k, v, (weight, bias), (eta,), states = prepared_operands(
         query, key, value, weight, bias, (eta,), state, shapes, scale)
+    q, k, v, eta = absent_zeroed(valid, q, k, v, eta)
 
     def mini_batch(entering, at):
         memory, offset = entering
@@ -78,6 +80,6 @@ def ttt_linear(query, key, value, weight, bias, eta, state=None, *, chunk: int =
         return tuple(state - jnp.where(last[:, :, None, None] >= 0, rated, 0.0)
                      for state, rated in zip(entering, leaving, strict=True)), jnp.moveaxis(out, 2, 0)
 
-    keys, *rest = mini_batches(chunk, k, q, v, eta)
+    keys, *rest = mini_batches(chunk, k, q, v, eta, valid=valid)
     final, out = jax.lax.scan(mini_batch, states, (rest[0], keys, *rest[1:]))
     return read_out(out, k.shape[2], weight, bias, eps, dtype), final

@@ -50,15 +50,31 @@ def inner_gradient(k, v, km, weight, bias, eps: float):
     return gradient
 
 
-def mini_batches(chunk: int, keys, *operands):
+def mini_batches(chunk: int, keys, *operands, valid=None):
     """`keys` and each of `operands` `[B, H, T, ...]` as `[N, B, H, chunk, ...]`, their tokens past the last
     whole chunk zero (`inputs.sequence_blocks`), and which tokens are real, `[N, B, H, chunk]`, placed and
     varying as the keys, which write the states (an Explicit mesh's rows; a checked `shard_map`'s axes: a
-    mask of the queries' varied the states where only the queries did, train 1455's review)."""
+    mask of the queries' varied the states where only the queries did, train 1455's review), a token
+    `valid` (`[B, T]`) marks absent none."""
     def batched(x):
         return jnp.moveaxis(sequence_blocks(jnp.moveaxis(x, 2, 1), chunk, leading=True), 3, 2)
 
-    return (*map(batched, (keys, *operands)), batched(jnp.ones_like(keys[..., 0], dtype=bool)))
+    real = jnp.ones_like(keys[..., 0], dtype=bool)
+    if valid is not None:
+        real = real & jnp.asarray(valid, bool)[:, None]
+    return (*map(batched, (keys, *operands)), batched(real))
+
+
+def absent_zeroed(valid, *operands) -> tuple:
+    """`operands` (`[B, H, T, ...]`) zero at the tokens `valid` (`[B, T]`) marks absent, as they are where it
+    is None, so an absent token's operands meet no product: a caller's padding (an in-context memory's
+    compacted rows' tails, `dew.nn.memory`) holds any value, whose overflow met its zero cotangent as
+    NaN."""
+    if valid is None:
+        return operands
+    present = jnp.asarray(valid, bool)[:, None]
+    return tuple(jnp.where(present.reshape(*present.shape, *(1,) * (x.ndim - 3)), x, jnp.zeros((), x.dtype))
+                 for x in operands)
 
 
 def real_gradients(k, v, readout, real, weight, bias, eps: float):
@@ -125,7 +141,7 @@ def prepared_operands(query, key, value, weight, bias, gates, state, shapes, sca
 
 
 def titans(query, key, value, weight, bias, theta, alpha, eta, state=None, *, chunk: int = 16,
-           eps: float = 1e-6):
+           eps: float = 1e-6, valid=None):
     """Titans' linear memory a mini-batch of `chunk` tokens at a time: `query`, `key` and `value`
     `[B, T, H, D]`, the inner loss's LayerNorm affine `weight` and `bias` `[H, D]`, the learning rate
     `theta`, forgetting `alpha` and momentum `eta` `[B, T, H]`, and `state` the entering `(M, S)`
@@ -137,12 +153,15 @@ def titans(query, key, value, weight, bias, theta, alpha, eta, state=None, *, ch
     elsewhere moves the memory later inner gradients are taken at, padding none). An intentional divergence
     from fla's reference, which pads it and gives its last padded slot the last real token's gates
     (fla/ops/titans/naive.py:332-342 at 413ad2c), decaying the state again (one real token at `alpha` 1/2 in
-    a mini-batch of two keeps a quarter of the memory where the recurrence keeps half)."""
+    a mini-batch of two keeps a quarter of the memory where the recurrence keeps half). A token `valid`
+    (`[B, T]`) marks absent is none: its operands zero (`absent_zeroed`), its readout what the walk reads,
+    the state as it was."""
     dtype = jnp.result_type(query, key, value)
     # Titans' memory and momentum each `[D, Dv]`.
     shapes = ((key.shape[-1], value.shape[-1]),) * 2
     q, k, v, (weight, bias), (theta, alpha, eta), states = prepared_operands(
         query, key, value, weight, bias, (theta, alpha, eta), state, shapes)
+    q, k, v, theta, alpha, eta = absent_zeroed(valid, q, k, v, theta, alpha, eta)
 
     def mini_batch(pair, at):
         q, k, v, theta, alpha, eta, real = at
@@ -168,6 +187,6 @@ def titans(query, key, value, weight, bias, theta, alpha, eta, state=None, *, ch
         tokens = tuple(jnp.moveaxis(x, 2, 0) for x in (q, k, gradient, theta, alpha, eta, real))
         return jax.lax.scan(token, pair, tokens)
 
-    keys, *rest = mini_batches(chunk, k, q, v, theta, alpha, eta)
+    keys, *rest = mini_batches(chunk, k, q, v, theta, alpha, eta, valid=valid)
     final, out = jax.lax.scan(mini_batch, states, (rest[0], keys, *rest[1:]))
     return read_out(out, k.shape[2], weight, bias, eps, dtype), final

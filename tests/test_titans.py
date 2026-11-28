@@ -346,6 +346,34 @@ def test_a_later_tokens_overflowing_update_leaves_an_earlier_read_as_it_is():
     np.testing.assert_array_equal(np.asarray(out)[0, 0], np.zeros((1, 2), np.float32))
 
 
+@pytest.mark.parametrize('memory', ['titans', 'ttt'])
+def test_a_calls_absent_tail_leaves_it_the_call_on_its_real_tokens(memory):
+    """Titans' or TTT-Linear's fp32 call over five tokens of two heads in mini-batches of two, its last two
+    absent (`valid`) and holding `2^120` in every operand: its outputs at its real tokens and its final state
+    bit for bit the call over its three real tokens alone, an absent token's operands zeroed before any
+    product (an in-context memory's compacted rows' tails, rows 1448/1449's consumer)."""
+    rng = np.random.default_rng(1448)
+
+    def normal(*shape):
+        return jnp.asarray(rng.standard_normal(shape) / 4, jnp.float32)
+
+    q, k, v = (normal(1, 5, 2, 4) for _ in range(3))
+    gates = [jnp.asarray(rng.uniform(0.05, 0.3, (1, 5, 2)), jnp.float32)
+             for _ in range(3 if memory == 'titans' else 1)]
+    affine = (1 + normal(2, 4), normal(2, 4))
+    run = functools.partial(titans if memory == 'titans' else ttt_linear, chunk=2)
+
+    def junk(x):
+        return x.at[:, 3:].set(2.0 ** 120)
+
+    found, found_state = run(*map(junk, (q, k, v)), *affine, *map(junk, gates),
+                             valid=jnp.asarray([[True, True, True, False, False]]))
+    expected, expected_state = run(q[:, :3], k[:, :3], v[:, :3], *affine, *(gate[:, :3] for gate in gates))
+    np.testing.assert_array_equal(np.asarray(found)[:, :3], np.asarray(expected))
+    for state, alone in zip(found_state, expected_state, strict=True):
+        np.testing.assert_array_equal(np.asarray(state), np.asarray(alone))
+
+
 def test_titans_partial_mini_batch_leaves_the_state_its_last_token_does():
     """Titans over one token in a mini-batch of two, its key, value and affine bias zero (no write), its
     momentum entering zero, under `alpha` 1/2: its memory leaving half the entering one and its momentum
