@@ -482,7 +482,7 @@ def _factor_cotangents(shape: tuple[tuple[int, ...], ...], spec: tuple, factors,
     2^-23)(1 - 2^-23)` beside `-1` summed to 0, not `-2^-46` (train 1461's review). The pullback of a declared
     rule (`generation.linear_map`'s, `traced_tangent`), its value alone: reverse mode past it takes `apply`'s
     declared derivatives."""
-    from dew.nn.sharding import varying
+    from dew.nn.sharding import varying, varying_like
 
     gradients = []
     for place in live:
@@ -497,9 +497,11 @@ def _factor_cotangents(shape: tuple[tuple[int, ...], ...], spec: tuple, factors,
                     products, held = _cotangent_term(others, spot, axis, given, factor.shape)
                     terms.append(products)
                     laid.append(held)
-        # The manual axes its terms vary over and the factor does not, its digits pooled over them.
+        # The manual axes its terms vary over and the factor does not, its digits pooled over them; and those
+        # the factor varies over that its terms do not, the cotangent of each shard its own (a pooled sum's
+        # transpose, its cotangent replicated beside a replicated weight: train 1470's review).
         excess = tuple(sorted(varying(terms) - jax.typeof(factor).mat.varying))
-        summed = _aligned_terms(terms, tuple(laid), excess)
+        summed = varying_like(_aligned_terms(terms, tuple(laid), excess), factor)
         gradients.append(_placed_as(summed.astype(factor.dtype), jax.typeof(factor)))
     return gradients
 
