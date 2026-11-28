@@ -22,6 +22,7 @@ from dew import _cache
 from dew._facts import Held
 
 from .programs import (
+    bodies,
     branches,
     called,
     cumulative,
@@ -268,10 +269,11 @@ def traced_flops[**Arguments, Result](function: Callable[Arguments, Result], *ar
     mixture's experts on a CPU) counts its rows' products, each against its own group's matrix. An
     operation that does no product (an entrywise or positionwise one, one that moves entries, a reduction,
     a cumulative one, a scatter, one that reads no operand: `dew.nn.programs`' facts, as JAX states them)
-    costs nothing here, as does a while loop whose body and condition do none, whatever its trips. Any other
-    is refused by name, never counted as nothing: a while loop's trips where it does a product, a kernel
-    launch's work (`opaque`), and an operation no fact states does no product (a linear solve, a
-    factorization, a primitive of another library's)."""
+    costs nothing here where no program it runs does a product (a scatter's updater), as does a while loop
+    whose body and condition do none, whatever its trips. Any other is refused by name, never counted as
+    nothing: a while loop's trips where it does a product, a scatter's updater's, a kernel launch's work
+    (`opaque`), and an operation no fact states does no product (a linear solve, a factorization, a
+    primitive of another library's)."""
     from dew.nn.kernels.generation import assumed
 
     with assumed("cpu"):
@@ -324,6 +326,10 @@ def _program_flops(program: jaxpr_core.Jaxpr) -> float:
         elif not _productless(equation):
             raise MissingFlopsCount(f"{primitive.name} does work no traced count states: it is no product "
                                     "counted here, and no fact states it does none")
+        elif any(_program_flops(body) for body in bodies(equation)):
+            # A program it runs of its own, a scatter's updater (`jax.lax.scatter_apply`'s function), as
+            # many times as its trace does not show (81f's review).
+            raise MissingFlopsCount(f"{primitive.name} runs a program of products its trace does not count")
     return total
 
 

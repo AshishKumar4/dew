@@ -117,9 +117,8 @@ def test_a_traced_program_counts_its_products_convolutions_scans_and_branches():
     """A traced count is two FLOPs a multiply-add of each product and convolution the program runs: a batched
     matrix product's, a strided convolution's of its output's elements by its kernel's taps and inputs, a
     scan's body times its length, a branch's costliest arm, a platform choice's the branch an accelerator
-    runs, a gradient's backward products beside its forward's, a while loop doing no product nothing (an
-    empty convolution in it none); a while loop doing one, drawing one from the host or binding a primitive no
-    fact states beside a key, and a linear solve, whose run programs a trace does not tell, are refused."""
+    runs, a gradient's backward products beside its forward's; a while loop doing one and a linear solve,
+    whose run programs a trace does not tell, are refused."""
     def shaped(*shape):
         return jax.ShapeDtypeStruct(shape, jnp.float32)
 
@@ -157,53 +156,79 @@ def test_a_traced_program_counts_its_products_convolutions_scans_and_branches():
     assert traced_flops(gradient, shaped(5, 7), shaped(3, 5)) == 2 * (2 * 3 * 5 * 7)
     with pytest.raises(MissingFlopsCount):
         traced_flops(lambda x: jax.lax.while_loop(lambda c: c.sum() < 9, lambda c: c @ c, x), shaped(2, 2))
-    def halved(x, w):
-        return jax.lax.while_loop(lambda c: jnp.sum(c) > 1, lambda c: c / 2, x) @ w
-
-    # A loop doing no product costs nothing, whatever its trips: the product after it alone counts.
-    assert traced_flops(halved, shaped(2, 3), shaped(3, 4)) == 2 * 2 * 3 * 4
-
-    from jax.experimental import io_callback
-
-    # A loop whose body draws a product from the host, a callback reading no operand, is refused (81f's
-    # review: an operandless equation was taken for an `iota`).
-    def called_back(x):
-        def body(c):
-            return c + io_callback(lambda: np.ones((2, 2), np.float32) @ np.ones((2, 2), np.float32),
-                                   jax.ShapeDtypeStruct((2, 2), jnp.float32))
-        return jax.lax.while_loop(lambda c: jnp.sum(c) < 9, body, x)
-
-    with pytest.raises(MissingFlopsCount):
-        traced_flops(called_back, shaped(2, 2))
-
-    # A primitive no fact states, given a PRNG key beside the value it multiplies, is refused in a loop too:
-    # what JAX states of its own key operations is read by their identity, never off a key operand (81f's
-    # review).
-    from test_program_facts import named
-
-    keyed = named("keyed_product", lambda x, key: x @ x, operands=2)
-
-    def keyed_loop(x):
-        key = jax.random.key(0)
-        return jax.lax.while_loop(lambda c: jnp.sum(c) < 9, lambda c: keyed.bind(c, key), x)
-
-    with pytest.raises(MissingFlopsCount):
-        traced_flops(keyed_loop, shaped(2, 2))
-
-    def empty(x, kernel):
-        def body(c):
-            return c[0] + jax.lax.conv_general_dilated(x, kernel, (1,), "VALID"), c[1] + 1
-
-        return jax.lax.while_loop(lambda c: c[1] < 3, body, (jnp.zeros((1, 0, 3)), 0))[0]
-
-    # A loop's empty convolution, of no output features, costs nothing, never a division by none.
-    assert traced_flops(empty, shaped(1, 1, 3), shaped(0, 1, 1)) == 0
-
     def solved(b):
         return jax.lax.custom_linear_solve(lambda x: jnp.eye(2) @ x, b, solve=lambda mv, b: b, symmetric=True)
 
     with pytest.raises(MissingFlopsCount):
         traced_flops(solved, shaped(2))
+
+
+def _shaped(*shape):
+    return jax.ShapeDtypeStruct(shape, jnp.float32)
+
+
+def _halved(x, w):
+    return jax.lax.while_loop(lambda c: jnp.sum(c) > 1, lambda c: c / 2, x) @ w
+
+
+def _emptied(x, kernel):
+    def body(c):
+        return c[0] + jax.lax.conv_general_dilated(x, kernel, (1,), "VALID"), c[1] + 1
+
+    return jax.lax.while_loop(lambda c: c[1] < 3, body, (jnp.zeros((1, 0, 3)), 0))[0]
+
+
+def _called_back(x):
+    from jax.experimental import io_callback
+
+    def body(c):
+        return c + io_callback(lambda: np.ones((2, 2), np.float32) @ np.ones((2, 2), np.float32),
+                               jax.ShapeDtypeStruct((2, 2), jnp.float32))
+
+    return jax.lax.while_loop(lambda c: jnp.sum(c) < 9, body, x)
+
+
+def _keyed(x):
+    from test_program_facts import named
+
+    keyed = named("keyed_product", lambda x, key: x @ x, operands=2)
+    key = jax.random.key(0)
+    return jax.lax.while_loop(lambda c: jnp.sum(c) < 9, lambda c: keyed.bind(c, key), x)
+
+
+def _scattered(x):
+    def updated(value):
+        # Each update the dot of its value stacked twice with itself, a product the scatter's updater runs.
+        pair = jnp.stack([value, value])
+        return jnp.dot(pair, pair)
+
+    def body(c):
+        values, step = c
+        return jax.lax.scatter_apply(values, jnp.zeros((1, 1), jnp.int32), updated,
+                                     jax.lax.ScatterDimensionNumbers((), (0,), (0,))), step + 1
+
+    return jax.lax.while_loop(lambda c: c[1] < 3, body, (x, 0))[0]
+
+
+@pytest.mark.parametrize(("loop", "operands", "flops"), [
+    (_halved, ((2, 3), (3, 4)), 2 * 2 * 3 * 4),
+    (_emptied, ((1, 1, 3), (0, 1, 1)), 0),
+    (_called_back, ((2, 2),), None),
+    (_keyed, ((2, 2),), None),
+    (_scattered, ((4,),), None),
+], ids=["halved", "empty convolution", "host callback", "keyed primitive", "scatter updater"])
+def test_a_loop_doing_no_product_costs_nothing_and_one_hiding_a_product_is_refused(loop, operands, flops):
+    """A while loop whose programs do no product costs nothing whatever its trips (an exact sum's digit walk
+    in a softmax's derivative, train 1489's suspect run): a loop halving its carry, the product after it
+    alone counted, and a loop of an empty convolution, of no output features, which costs nothing, never a
+    division by none. One hiding a product is refused (81f's review): a host callback reading no operand, a
+    primitive no fact states beside a PRNG key (each operation read by its primitive's identity, never off its
+    operands), and a scatter whose updater runs a product."""
+    if flops is None:
+        with pytest.raises(MissingFlopsCount):
+            traced_flops(loop, *(_shaped(*shape) for shape in operands))
+    else:
+        assert traced_flops(loop, *(_shaped(*shape) for shape in operands)) == flops
 
 
 def test_a_traced_program_counts_a_grouped_product_and_refuses_work_it_does_not_count():
