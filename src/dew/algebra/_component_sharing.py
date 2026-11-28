@@ -152,35 +152,54 @@ class _Span:
     """Whether its run ends the body, whose return statement follows its last binding."""
     normal: _Fragment = dataclasses.field(default_factory=_Fragment)
     statements: list[Binding] = dataclasses.field(default_factory=list)
+    counts: list[tuple[int, int]] = dataclasses.field(default_factory=list)
+    """Its fragment's arguments and bound names after each of its statements: a statement's normal form
+    reads only those before it, so the span at any width it has reached is a prefix of each."""
 
-    def extend(self, nodes: tuple[Binding | str, ...], width: int) -> tuple[Binding, ...]:
+    def extend(self, nodes: tuple[Binding | str, ...], width: int) -> Binding:
+        """Its normal form `width` statements wide, its last statement (normalized at most once)."""
         for index in range(self.first + len(self.statements), self.first + width):
             node = nodes[index]
             assert isinstance(node, Binding)
             self.statements.append(self.normal.binding(node))
-        return tuple(self.statements)
+            self.counts.append((len(self.normal.arguments), len(self.normal.bound)))
+        return self.statements[width - 1]
 
-    def snapshot(self) -> _Copy:
-        return _Copy(self.name, self.first, tuple(self.statements), tuple(self.normal.arguments),
-                     tuple(self.normal.bound), frozenset(self.normal.separate),
-                     frozenset(self.normal.statics))
+    def snapshot(self, width: int) -> _Copy:
+        """Its copy `width` statements wide, its fragment's state as it was there."""
+        arguments, bound = self.counts[width - 1]
+        return _Copy(self.name, self.first, tuple(self.statements[:width]),
+                     tuple(self.normal.arguments[:arguments]), tuple(self.normal.bound)[:bound],
+                     frozenset(i for i in self.normal.separate if i < arguments),
+                     frozenset(i for i in self.normal.statics if i < arguments))
 
 
-def _spans(bodies: dict[str, Body]) -> list[_Span]:
+def _spans(bodies: dict[str, Body], made: dict[str, tuple[Body, list[_Span]]]) -> list[_Span]:
+    """Every body's candidate spans, in its order and the bodies': a body `made` holds as it is now keeps
+    the spans an earlier search made of it, their statements normalized so far (`_Span.extend` only appends:
+    a span's normal form at a width is its own whatever search reads it), a changed or new body's made
+    afresh and held."""
     candidates = []
     for name, body in bodies.items():
-        runs = itertools.groupby(enumerate(body.statements), key=lambda numbered: _eligible(numbered[1]))
-        for eligible, group in runs:
-            if not eligible:
-                continue
-            starts = [index for index, _ in group]
-            end = starts[-1] + 1
-            tail = end == len(body.statements)
-            whole = starts[0] == 0 and tail
-            minimum = _MIN_WHOLE if whole else _MIN_TAIL if tail else _MIN_SHARED
-            candidates.extend(_Span(name, start, end - start, whole and start == 0, tail)
-                              for start in starts[:len(starts) - minimum + 1])
+        held = made.get(name)
+        if held is None or held[0] is not body:
+            held = made[name] = (body, list(_body_spans(name, body)))
+        candidates.extend(held[1])
     return candidates
+
+
+def _body_spans(name: str, body: Body) -> Iterator[_Span]:
+    runs = itertools.groupby(enumerate(body.statements), key=lambda numbered: _eligible(numbered[1]))
+    for eligible, group in runs:
+        if not eligible:
+            continue
+        starts = [index for index, _ in group]
+        end = starts[-1] + 1
+        tail = end == len(body.statements)
+        whole = starts[0] == 0 and tail
+        minimum = _MIN_WHOLE if whole else _MIN_TAIL if tail else _MIN_SHARED
+        yield from (_Span(name, start, end - start, whole and start == 0, tail)
+                    for start in starts[:len(starts) - minimum + 1])
 
 
 def _disjoint(entries: list[_Span], width: int) -> list[_Span]:
@@ -193,21 +212,30 @@ def _disjoint(entries: list[_Span], width: int) -> list[_Span]:
     return chosen
 
 
-def _largest(bodies: dict[str, Body]) -> tuple[_Copy, ...]:
-    candidates = _spans(bodies)
+def _largest(bodies: dict[str, Body], made: dict[str, tuple[Body, list[_Span]]]) -> tuple[_Copy, ...]:
+    """The disjoint copies of one span's normal form that save the most statements, widening the spans
+    whose forms another span shares a statement at a time. A width's groups refine the last's by each
+    span's next statement (`_Span.extend`'s last), the first width's by its first: two spans' normal forms
+    are equal where their forms one statement narrower were and their next statements are, so a group is
+    read by its parent's number and one statement, never its whole form again (hashing whole forms at every
+    width and renormalizing every span at every search took the generation check from 49 s to 102 s)."""
+    # Each span's group one statement wide, by its first statement: the widths below refine it.
+    firsts: dict[Binding, int] = {}
+    candidates = [(firsts.setdefault(span.extend(bodies[span.name].statements, 1), len(firsts)), span)
+                  for span in _spans(bodies, made)]
     best: tuple[_Copy, ...] = ()
     saved = 0
     for width in range(_MIN_WHOLE, _MAX_SHARED + 1):
-        by_body: dict[tuple[Binding, ...], list[_Span]] = defaultdict(list)
-        for span in candidates:
+        by_body: dict[tuple[int, Binding], list[_Span]] = defaultdict(list)
+        for group, span in candidates:
             if span.available >= width:
-                by_body[span.extend(bodies[span.name].statements, width)].append(span)
+                by_body[group, span.extend(bodies[span.name].statements, width)].append(span)
         candidates = []
-        for entries in by_body.values():
+        for group, entries in enumerate(by_body.values()):
             copies = _disjoint(entries, width)
             if len(copies) < 2:
                 continue
-            candidates.extend(entries)
+            candidates.extend((group, span) for span in entries)
             if width < _MIN_SHARED:
                 # Below a shared span's width, only a whole body, or a run ending one, which its return
                 # statement completes to six statements as rendered.
@@ -215,7 +243,7 @@ def _largest(bodies: dict[str, Body]) -> tuple[_Copy, ...]:
                           and (span.whole or (span.tail and width >= _MIN_TAIL))]
             avoided = width * (len(copies) - 1)
             if avoided > saved:
-                best, saved = tuple(span.snapshot() for span in copies), avoided
+                best, saved = tuple(span.snapshot(width) for span in copies), avoided
         if not candidates:
             break
     return best
@@ -314,7 +342,8 @@ def shared(source: dict[str, Body], *, reserved: Collection[str] = ()) -> dict[s
     forms = dict(source)
     occupied = set(source).union(reserved)
     numbers = itertools.count()
-    while copies := _largest(forms):
+    made: dict[str, tuple[Body, list[_Span]]] = {}
+    while copies := _largest(forms, made):
         first = copies[0]
         width = len(first.statements)
         suffixes = [_live(forms[found.name], found.first + width) for found in copies]

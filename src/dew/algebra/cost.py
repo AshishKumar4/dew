@@ -15,12 +15,12 @@ from typing import Protocol
 import jax
 import jax.numpy as jnp
 import numpy as np
-from egglog import DagCostModel, EGraph, get_callable_args
+from egglog import DagCostModel, EGraph
 
 from dew._cache import ALGEBRA
 from dew.algebra.extract import Level
 from dew.algebra.rules import BOUND_AS, CONTRACTED, dtype as dtype_fact, param_dtype, shape
-from dew.algebra.terms import RESCALE, Region, Term, integer, key, text
+from dew.algebra.terms import RESCALE, Region, Term, args_of, integer, key, text
 from dew.nn import programs
 from dew.nn.kernels import generation
 from dew.nn.kernels.templates import cost as kernel_cost
@@ -173,7 +173,10 @@ def work(graph: EGraph, node, region: Region, held: dict | None = None,
     result's dtype, a reduction's at a vector lane's four bytes an element, `LANE_BYTES`),
     and elementwise work fused into a kernel none, its values in the registers. Priced on `on` (the
     schedule's target), else the process's."""
-    if (args := get_callable_args(node, Term.leaf)) is not None:
+    # Each branch reads the node's constructor (`terms.args_of`: a reference compared, no argument decoded)
+    # and decodes the arguments of the one it is alone: a call no branch prices (a bundle of roots, a vector)
+    # decodes none.
+    if (args := args_of(node, Term.leaf)) is not None:
         # The leaf's own shape from its region (a callback may read no table at a node it was not given).
         leaf = key(Term.leaf(args[0]))
         extent = region.extents.get(leaf)
@@ -187,7 +190,7 @@ def work(graph: EGraph, node, region: Region, held: dict | None = None,
         equation = outside.equation
         return read + _operation_work(equation.primitive, [atom.aval for atom in equation.invars],
                                       [variable.aval for variable in equation.outvars], equation.params, on)
-    if (args := get_callable_args(node, Term.reduce)) is not None:
+    if (args := args_of(node, Term.reduce)) is not None:
         operand = shape_of(graph, args[0], held)
         if operand is None:
             return Work(kernels=1.0)
@@ -197,7 +200,7 @@ def work(graph: EGraph, node, region: Region, held: dict | None = None,
         in_dt = dtype_of(graph, args[0], held)
         return (_priced(primitive, params, [operand], unreduced, on, in_dt, in_dtypes=[in_dt])
                 + Work(kernels=1.0, kept_bytes=kept(math.prod(unreduced))))
-    if (args := get_callable_args(node, Term.dot)) is not None:
+    if (args := args_of(node, Term.dot)) is not None:
         left, right = (shape_of(graph, operand, held) for operand in args[:2])
         if left is None or right is None:
             return Work()
@@ -208,29 +211,31 @@ def work(graph: EGraph, node, region: Region, held: dict | None = None,
                    for extent, dtype in zip((left, right), product.operands, strict=True))
         done, elements = _product(left, right, params, product, on)
         return done + Work(shared_bytes=read, kernels=1.0, kept_bytes=kept(elements, product.made.itemsize))
-    if (args := get_callable_args(node, Term.binary)) is not None and text(args[1]) == RESCALE:
-        # A declaration's own rescale of two anchors (`derive.Reduction.rescale`): an exponential an element.
-        shapes = _shapes(graph, (args[0], args[2]), held)
-        return Work() if shapes is None else Work(exponentials=math.prod(np.broadcast_shapes(*shapes)))
-    if (args := get_callable_args(node, Term.binary)) is not None and text(args[1]) == CONTRACTED["mul"]:
-        # Its reader's fused multiply-add computes it (`rules._contracted`).
-        return Work()
-    # Each other elementwise operation by its primitive, its parameters' entry (`Region.params`); a
-    # selection's and a clamp's their own. A layout change computes nothing.
-    if (args := get_callable_args(node, Term.unary)) is not None:
+    binary = args_of(node, Term.binary)
+    if (paired := binary if binary is not None else args_of(node, Term.compare)) is not None:
+        operation = text(paired[1]) if binary is not None else None
+        if operation == RESCALE:
+            # A declaration's own rescale of two anchors (`derive.Reduction.rescale`): an exponential an
+            # element.
+            shapes = _shapes(graph, (paired[0], paired[2]), held)
+            return Work() if shapes is None else Work(exponentials=math.prod(np.broadcast_shapes(*shapes)))
+        if operation == CONTRACTED["mul"]:
+            # Its reader's fused multiply-add computes it (`rules._contracted`).
+            return Work()
+        # Each other elementwise operation by its primitive, its parameters' entry (`Region.params`).
+        param = paired[3]
+        primitive, params = region.params[integer(param)]
+        return _elementwise(graph, primitive, params, (paired[0], paired[2]), held, on, parameter=param,
+                            predicate=binary is None)
+    if (args := args_of(node, Term.unary)) is not None:
         param = args[2]
         return _elementwise(graph, *region.params[integer(param)], args[:1], held, on, parameter=param)
-    if (args := get_callable_args(node, Term.convert)) is not None:
+    if (args := args_of(node, Term.convert)) is not None:
         param = args[1]
         return _elementwise(graph, *region.params[integer(param)], args[:1], held, on, parameter=param)
-    for constructor in (Term.binary, Term.compare):
-        if (args := get_callable_args(node, constructor)) is not None:
-            param = args[3]
-            primitive, params = region.params[integer(param)]
-            return _elementwise(graph, primitive, params, (args[0], args[2]), held, on, parameter=param,
-                                predicate=constructor is Term.compare)
+    # A selection's and a clamp's their own. A layout change computes nothing.
     for constructor, primitive in ((Term.select, jax.lax.select_n_p), (Term.clamp, jax.lax.clamp_p)):
-        if (args := get_callable_args(node, constructor)) is not None:
+        if (args := args_of(node, constructor)) is not None:
             return _elementwise(graph, primitive, {}, args[:3], held, on)
     return Work()
 
@@ -434,7 +439,7 @@ def stable(region: Region, schedule: Schedule) -> DagCostModel[Seconds]:
     def marginal(graph: EGraph, node) -> Seconds:
         done = work(graph, node, region, held, schedule.facts)
         for constructor in (Term.unary, Term.binary):
-            if (args := get_callable_args(node, constructor)) is not None:
+            if (args := args_of(node, constructor)) is not None:
                 # Each operation's name follows its first operand; a fused multiply-add's is its primitive's.
                 risk = RISK.get(BOUND_AS.get(text(args[1]), text(args[1])), 0.0)
                 return Seconds(done, schedule, risk)

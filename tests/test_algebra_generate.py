@@ -220,6 +220,69 @@ def test_shared_component_preserves_layouts_constants_and_live_results():
         assert terms.jaxpr_digest(original, in_process=True) == terms.jaxpr_digest(composed, in_process=True)
 
 
+def test_shared_components_hold_only_what_their_copies_hold_alike():
+    """Two bodies whose runs agree in every statement but their first (a product, a difference by the same
+    constant): factored together (`_component_sharing.shared`), each computes what it did, its jaxpr's digest
+    and its values the written body's, so no helper takes one body's first statement for the other's."""
+    from dew.algebra import _component_sharing, terms
+
+    def written(first):
+        def run(x):
+            a = first(x)
+            b = jnp.sqrt(jnp.abs(a + x))
+            c = jnp.exp(-(b * x)) + a
+            return (jax.lax.logistic(c * b),)
+        return run
+
+    shape = jax.ShapeDtypeStruct((8,), jnp.float32)
+    programs = {"product": written(lambda x: x * 3.0), "difference": written(lambda x: x - 3.0)}
+    sources = {name: printed.formed(jax.make_jaxpr(run)(shape), borrow_shapes=True)[0]
+               for name, run in programs.items()}
+    factored = _component_sharing.shared(sources)
+    assert len(factored) == len(sources) + 1
+    value = np.linspace(-2.0, 2.0, shape.size, dtype=np.float32)
+    for name, run in programs.items():
+        loaded = printed.loaded("\n\n".join(body.render(key) for key, body in factored.items()), name)
+        rebuilt = jax.make_jaxpr(loaded)(shape)
+        assert terms.jaxpr_digest(rebuilt, in_process=True) == terms.jaxpr_digest(
+            jax.make_jaxpr(run)(shape), in_process=True)
+        np.testing.assert_array_equal(jax.jit(loaded)(value)[0], jax.jit(run)(value)[0])
+
+
+def test_a_span_kept_from_an_earlier_search_is_shared_at_a_shorter_width():
+    """Two bodies of eight bindings and two of twenty that begin with the eight's first six: the twenty's
+    helper is factored first (20 statements saved against 18), then the eight's two and that helper share
+    their first six (12 against 8), the eight's spans kept from the first search, which had read them eight
+    wide, taken six wide. Each body as factored computes what it did, its jaxpr's digest and its values."""
+    from dew.algebra import _component_sharing, terms
+
+    def prefix(x):
+        a = x * x
+        return jnp.exp(-jnp.sqrt(jnp.abs(a + x)))
+
+    def eight(x):
+        return (jnp.cos(jnp.sin(prefix(x))),)
+
+    def twenty(x):
+        f = jax.lax.integer_pow(prefix(x), 3)
+        g = jnp.tanh(f) * f + x
+        h = jnp.exp(-jnp.cos(jnp.sin(jnp.sqrt(jnp.abs(jnp.sin(g))))))
+        return (jnp.tanh(h) * h + g,)
+
+    shape = jax.ShapeDtypeStruct((8,), jnp.float32)
+    programs = {"eight_a": eight, "eight_b": eight, "twenty_a": twenty, "twenty_b": twenty}
+    sources = {name: printed.formed(jax.make_jaxpr(run)(shape), borrow_shapes=True)[0]
+               for name, run in programs.items()}
+    factored = _component_sharing.shared(sources)
+    rendered = "\n\n".join(body.render(key) for key, body in factored.items())
+    value = np.linspace(-2.0, 2.0, shape.size, dtype=np.float32)
+    for name, run in programs.items():
+        loaded = printed.loaded(rendered, name)
+        assert terms.jaxpr_digest(jax.make_jaxpr(loaded)(shape), in_process=True) == terms.jaxpr_digest(
+            jax.make_jaxpr(run)(shape), in_process=True)
+        np.testing.assert_array_equal(jax.jit(loaded)(value)[0], jax.jit(run)(value)[0])
+
+
 def test_shared_component_preserves_two_ordered_spans_in_one_body():
     from dew.algebra import _component_sharing, terms
 

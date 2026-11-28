@@ -22,7 +22,7 @@ from typing import NamedTuple
 import jax
 import jax.numpy as jnp
 import numpy as np
-from egglog import DagCostModel, EGraph, Schedule, String, Vec, get_callable_args, i64, seq, set_
+from egglog import DagCostModel, EGraph, Schedule, String, Vec, i64, seq, set_
 from jax._src import ad_util, api_util, config as jax_config
 from jax._src.interpreters import partial_eval
 from jax.core import ShapedArray, eval_jaxpr
@@ -971,7 +971,7 @@ def stated(graph: EGraph, region: terms.Region, *registered) -> None:
         seen_terms.add(named)
         bound = region.magnitudes.get(named)
         dtype = region.dtypes.get(named)
-        cast = get_callable_args(term, terms.Term.convert) if dtype == jnp.float32 else None
+        cast = terms.args_of(term, terms.Term.convert) if dtype == jnp.float32 else None
         if cast is not None and region.dtypes.get(terms.key(cast[0])) in (jnp.int8, jnp.uint8):
             facts.append(rules.int8_values(term))
             bound = 8 if bound is None else min(8, bound)
@@ -1014,7 +1014,7 @@ def reduced(region: terms.Region, term: terms.Term) -> tuple[int, bool] | None:
     """What a reduction states of its length (`stated`): its power (`rules.sum_length`) and whether a sum of
     it counts exactly (`rules.counting_sum`, `counts_exactly`); None for any other term. The one place each
     is computed, which a class of sizes reads too (`dew.algebra.derive._shape_of`)."""
-    if (args := get_callable_args(term, terms.Term.reduce)) is None:
+    if (args := terms.args_of(term, terms.Term.reduce)) is None:
         return None
     primitive, params = region.params[terms.integer(args[3])]
     length = math.prod(region.shape(args[0])[axis] for axis in params["axes"])
@@ -1028,7 +1028,7 @@ def contracted(region: terms.Region, term: terms.Term) -> tuple[int, bool] | Non
     its mode's slack beside it) and whether it is at most 256, an exact int8 product's (`|byte| < 256`: its
     integer partial sums below `2**24`); None for any other term. The one place each is computed, which a
     class of sizes reads too (`dew.algebra.derive._shape_of`)."""
-    if (args := get_callable_args(term, terms.Term.dot)) is None:
+    if (args := terms.args_of(term, terms.Term.dot)) is None:
         return None
     _, params = region.params[terms.integer(args[2])]
     (contracting, _), _ = params["dimension_numbers"]
@@ -1040,7 +1040,7 @@ def counts_exactly(region: terms.Region, operand: terms.Term, dtype, length: int
     """Two counts of predicate elements fit the unit-spaced integer range of the accumulator."""
     if dtype is None or not jnp.issubdtype(dtype, jnp.floating):
         return False
-    cast = get_callable_args(operand, terms.Term.convert)
+    cast = terms.args_of(operand, terms.Term.convert)
     if cast is None or region.dtypes.get(terms.key(cast[0])) != jnp.bool_:
         return False
     limits = jnp.finfo(dtype)
@@ -1058,7 +1058,7 @@ def _products(region: terms.Region) -> list:
     for term, extent in region.shapes:
         if len(extent) == 2:
             facts.append(rules.matrix(term))
-        if (args := get_callable_args(term, terms.Term.dot)) is None:
+        if (args := terms.args_of(term, terms.Term.dot)) is None:
             continue
         index = terms.integer(args[2])
         _, params = region.params[index]
@@ -1184,7 +1184,7 @@ def extracted[Price: Linear](graph: EGraph, bundle: terms.Term, model: DagCostMo
     """The roots' forms `model` prices cheapest together, each shared value once, and their price (the
     model's cost: `cost.Seconds` for the program's), extracted as `extract.cheapest` extracts them."""
     chosen, price = extract.cheapest(graph, bundle, model, exact=exact, checked=checked)
-    forms = get_callable_args(chosen, terms.Term.bundle)
+    forms = terms.args_of(chosen, terms.Term.bundle)
     if forms is None:
         raise ValueError(f"extraction chose no bundle of the program's roots: {chosen}")
     return list(forms[0].value), price

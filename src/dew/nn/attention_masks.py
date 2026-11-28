@@ -181,6 +181,19 @@ def visibility_mask(query_length: int, key_length: int, causal: bool, sliding_wi
     return seen if mask is None else jnp.logical_and(seen, mask)
 
 
+def rows_reach(query_length: int, key_length: int, sliding_window: int | None) -> np.ndarray:
+    """Whether each query row's keys reach one, by positions alone, as a NumPy array a trace reads without
+    placing anything on a device, compact: `[1, Q]` under a causal window (a window ends w - 1 keys before
+    its row, `windowed`), `[1, 1]` without one, every row's reach the keys' own (causality keeps key 0 in
+    it), broadcast over the rows. Positions of a call of at least one key (no window reaches a key of none).
+    A call with no mask, key bounds, key validity, counted places or another sequence's documents sees what
+    this says (`visible_rows`), and a recognized program's call is read by it (`dew.algebra.recognize`)."""
+    rows = np.arange(query_length)[None]
+    last = np.full((1, 1), key_length - 1)
+    reach = (last >= 0) if sliding_window is None else windowed(rows, last, sliding_window, causal=True)
+    return np.asarray(reach)
+
+
 def visible_rows(query_length: int, key_length: int, causal: bool, sliding_window: int | None,
                  mask=None, segment_ids=None, key_value_seq_lengths=None,
                  key_value_seq_starts=None, *, block_groups=None, image_groups=None, key_valid=None,
@@ -201,12 +214,8 @@ def visible_rows(query_length: int, key_length: int, causal: bool, sliding_windo
     if (mask is None and key_value_seq_lengths is None and key_value_seq_starts is None and key_valid is None
             and key_runs is None and places is None and query_slots is None
             and not isinstance(segment_ids, CrossDocuments)):
-        # The keys row i may see run from 0 to the last one; causality keeps 0 in reach, and a
-        # window ends w - 1 keys before the row (`windowed`). A call's own documents keep each row's
-        # own key, and block and image groups only add keys beside it.
-        rows = np.arange(query_length)[None]
-        last = np.full((1, 1), key_length - 1)
-        reach = (last >= 0) if sliding_window is None else windowed(rows, last, sliding_window, causal=True)
+        # A call's own documents keep each row's own key, and block and image groups only add keys beside it.
+        reach = rows_reach(query_length, key_length, sliding_window)
         if segment_ids is None:
             return None if reach.all() else jnp.asarray(reach)[:, :, None, None]
         return (jnp.asarray(reach) & (jnp.asarray(segment_ids) != 0))[:, :, None, None]

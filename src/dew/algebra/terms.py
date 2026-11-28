@@ -40,13 +40,14 @@ from egglog import (
     method,
 )
 from egglog.declarations import (
+    CallDecl,
     Declarations,
     FunctionSignature,
     HasDeclarations,
     TypeOrVarRef,
     TypeRefWithVars,
 )
-from egglog.runtime import RuntimeExpr
+from egglog.runtime import RuntimeExpr, RuntimeFunction
 from jax._src import ad_util, core as jax_core
 from jax._src.literals import TypedNdArray
 from jax.core import ShapedArray
@@ -353,7 +354,7 @@ def reduce_of(term: Term | Skeleton) -> tuple[str, Hashable] | None:
     term's or a skeleton's alike."""
     if isinstance(term, Skeleton):
         return (term.form[2], term.form[1]) if term.form[0] == "reduce" else None
-    if (args := get_callable_args(term, Term.reduce)) is None:
+    if (args := args_of(term, Term.reduce)) is None:
         return None
     return text(args[1]), key(args[0])
 
@@ -463,6 +464,50 @@ def key(term: BaseExpr | Skeleton) -> Hashable:
     if not isinstance(term, RuntimeExpr):
         raise TypeError(f"{term!r} is no egglog term")
     return term.__egg_typed_expr__
+
+
+def made_by(term: BaseExpr) -> Hashable | None:
+    """The constructor `term` is a call of, as `ref` names a constructor, None where it is no call (a value):
+    its declaration's callable, read without deconstructing the term. egglog's `get_callable_args(term, f)`
+    builds an expression of each of the term's arguments to answer whether it is a call of `f`, which a
+    node's cost callback asked of a dozen constructors (two thirds of a moments derivation's extractions,
+    row 14214)."""
+    if not isinstance(term, RuntimeExpr):
+        raise TypeError(f"{term!r} is no egglog term")
+    declared = term.__egg_typed_expr__.expr
+    return declared.callable if isinstance(declared, CallDecl) else None
+
+
+def ref(constructor: Callable) -> Hashable:
+    """`constructor`'s reference, the one `made_by` reads off a call of it: a function's or a method's; a
+    class's own constructor (`Vec[i64]`'s) is refused, `get_callable_args` matching those."""
+    if not isinstance(constructor, RuntimeFunction):
+        raise TypeError(f"{constructor!r} is no egglog function or method")
+    return constructor.__egg_ref__
+
+
+def arguments(term: BaseExpr) -> tuple[BaseExpr, ...]:
+    """`term`'s arguments (`get_callable_args`'s), none for a value: the term deconstructed once."""
+    return get_callable_args(term) or ()
+
+
+@overload
+def args_of[Made: BaseExpr, *Read](term: Made,
+                                   constructor: Callable[[*Read], Made]) -> tuple[*Read] | None: ...
+
+
+@overload
+def args_of(term: BaseExpr, constructor: frozenset[Hashable]) -> tuple[BaseExpr, ...] | None: ...
+
+
+def args_of(term: BaseExpr, constructor: Callable | frozenset[Hashable]) -> tuple | None:
+    """`get_callable_args(term, constructor)` (`ref`'s constructors), typed as it types them: `term`'s
+    arguments where it is a call of `constructor`, or of one of a set of them by reference (`ref`), None
+    otherwise, the term's constructor compared once (`made_by`) and the term deconstructed only where it
+    matched (`arguments`), where asking egglog of each constructor in turn deconstructs it at every ask."""
+    if isinstance(constructor, frozenset):
+        return arguments(term) if made_by(term) in constructor else None
+    return arguments(term) if made_by(term) == ref(constructor) else None
 
 
 class Product(NamedTuple):
@@ -2118,30 +2163,30 @@ def value_of(term: Term, value: Callable[[Term], jax.Array], region_: Region, le
     """One term's value, its operands' from `value`, each equation of several operands bound over them aligned
     as the lax function it came from aligns them (`jax_core.auto_insert_reshard`): a literal or a constant
     beside a value a checked `shard_map`'s manual axes vary varies as it does."""
-    if (args := get_callable_args(term, Term.leaf)) is not None:
+    if (args := args_of(term, Term.leaf)) is not None:
         return leaves[integer(args[0])]
-    if (args := get_callable_args(term, Term.literal)) is not None:
+    if (args := args_of(term, Term.literal)) is not None:
         return region_.literals[integer(args[0])]
 
     def bound(left: Term, right: Term, index: i64Like) -> jax.Array:
         primitive, given = region_.params[integer(index)]
         return primitive.bind(*jax_core.auto_insert_reshard(value(left), value(right)), **given)
 
-    if (args := get_callable_args(term, Term.dot)) is not None:
+    if (args := args_of(term, Term.dot)) is not None:
         return bound(args[0], args[1], args[2])
     for constructor in (Term.binary, Term.compare):
-        if (args := get_callable_args(term, constructor)) is not None:
+        if (args := args_of(term, constructor)) is not None:
             # An operation's name stands between its two operands.
             return bound(args[0], args[2], args[3])
-    if (args := get_callable_args(term, Term.select)) is not None:
+    if (args := args_of(term, Term.select)) is not None:
         return jax.lax.select_n_p.bind(*_aligned_explicit(*(value(operand) for operand in args)))
-    if (args := get_callable_args(term, Term.clamp)) is not None:
+    if (args := args_of(term, Term.clamp)) is not None:
         # A clamp binds as itself, its derivative JAX's own (zero at a bound, where a maximum and a
         # minimum would halve it), keeping JAX's placement from its middle operand.
         return jax.lax.clamp_p.bind(*jax_core.auto_insert_reshard(*(value(operand) for operand in args)))
     # Each other constructor's primitive parameters, by index, last after its operand and its other arguments.
     for constructor in (Term.unary, Term.convert, Term.shaped, Term.reduce):
-        if (args := get_callable_args(term, constructor)) is not None:
+        if (args := args_of(term, constructor)) is not None:
             primitive, given = region_.params[integer(args[-1])]
             if primitive is jax.lax.logistic_p:
                 # A logistic, a program's own or Dew's read as it (`normal_form._computed`), computed as Dew's
@@ -2203,6 +2248,9 @@ LANGUAGE = tuple(getattr(Term, written.constructor) for written in WRITTEN.value
 """The language's constructors that read terms (a leaf's and a literal's none: each kind's, `WRITTEN`): the
 one inventory every reader of the language walks (`subterms`, `carry`'s state readers by `pattern_of`)."""
 
+LANGUAGE_REFS = frozenset(map(ref, LANGUAGE))
+"""`LANGUAGE` by reference, as `args_of` matches a term's constructor among a set."""
+
 
 def pattern_of[Sort: BaseExpr](owner: type[Sort], constructor, name: str) -> tuple[Sort, tuple[Sort, ...]]:
     """`constructor`, one of `owner`'s, over fresh variables named from `name`, each of the sort its signature
@@ -2246,6 +2294,4 @@ def subterms(form: Term) -> Iterator[Term]:
             continue
         seen.add(named)
         yield term
-        for constructor in LANGUAGE:
-            if (args := get_callable_args(term, constructor)) is not None:
-                pending.extend(arg for arg in args if isinstance(arg, Term))
+        pending.extend(arg for arg in args_of(term, LANGUAGE_REFS) or () if isinstance(arg, Term))

@@ -72,7 +72,6 @@ from egglog import (
     f64,
     f64Like,
     function,
-    get_callable_args,
     i64,
     i64Like,
     method,
@@ -362,23 +361,23 @@ def parts(update: Program, readout: Program, saturation: program.Saturation) -> 
             graph, stopped):
         made, read = graph.extract(form_of(made)), graph.extract(form_of(read))
     erase = None
-    if (erased := get_callable_args(made, Affine.erased_before)) is not None:
+    if (erased := terms.args_of(made, Affine.erased_before)) is not None:
         base2, per_key, exponent, erase, correction, left, right = erased
         erased = (base2, per_key, exponent, left, right, correction)
-    before = erased if erased is not None else get_callable_args(made, Affine.corrected_before)
-    corrected = before if before is not None else get_callable_args(made, Affine.corrected)
-    args = corrected if corrected is not None else get_callable_args(made, Affine.decayed)
+    before = erased if erased is not None else terms.args_of(made, Affine.corrected_before)
+    corrected = before if before is not None else terms.args_of(made, Affine.corrected)
+    args = corrected if corrected is not None else terms.args_of(made, Affine.decayed)
     across = None
-    if args is None and (two_sided := get_callable_args(made, Affine.decayed_across)) is not None:
+    if args is None and (two_sided := terms.args_of(made, Affine.decayed_across)) is not None:
         base2, per_key, exponent, across, left, right = two_sided
         args = (base2, per_key, exponent, left, right)
     if args is None:
         raise Refused("the update is not a decayed state, exp(z) a scalar's or each key's, plus a rank-one "
                       "input and corrections of the decayed state or the state entering along the input's "
                       f"vector or an erase's own{stopped}")
-    readout_args = get_callable_args(read, Affine.readout)
+    readout_args = terms.args_of(read, Affine.readout)
     values_read = readout_args is None
-    found = get_callable_args(read, Affine.applied) if values_read else readout_args
+    found = terms.args_of(read, Affine.applied) if values_read else readout_args
     if found is None:
         raise Refused("the readout is not the state contracted with a vector over its keys or its values "
                       f"plus a part free of it{stopped}")
@@ -449,12 +448,12 @@ def coupled_parts(update: Program, readout: Program, saturation: program.Saturat
     with _saturated(made, read, update, readout, saturation, _coupled_rules(), "a coupled scan's token") as (
             graph, stopped):
         made, read = graph.extract(form_of(made)), graph.extract(form_of(read))
-    args = get_callable_args(made, Affine.coupled)
+    args = terms.args_of(made, Affine.coupled)
     if args is None:
         raise Refused("a pair's update is not its second state decayed by a scalar plus a rank-one input "
                       "reading the first state the token enters, and its first decayed by a scalar plus a "
                       f"scalar times that second value{stopped}")
-    found = get_callable_args(read, Affine.readout)
+    found = terms.args_of(read, Affine.readout)
     if found is None:
         raise Refused("a pair's readout is not its first state contracted with a vector over its keys plus a "
                       f"part free of the states{stopped}")
@@ -471,21 +470,21 @@ def _reader_scale(reader: Token, atoms: list, dtype: np.dtype) -> tuple[Token, f
     """A shrinking literal factored once with its dtype. A magnifying one stays on the reader, so its
     transpose never magnifies the memory before a small cotangent."""
     def factored(term):
-        scalar = get_callable_args(term, Token.scalar)
+        scalar = terms.args_of(term, Token.scalar)
         if scalar is not None:
-            literal = get_callable_args(scalar[0], Token.literal)
+            literal = terms.args_of(scalar[0], Token.literal)
             if literal is not None:
                 literal_value = np.dtype(dtype).type(terms.real(literal[0]))
                 if abs(literal_value) <= 1.0:
                     return None, literal_value
-            leaf = get_callable_args(scalar[0], Token.value)
+            leaf = terms.args_of(scalar[0], Token.value)
             if leaf is not None:
                 _, atom = atoms[terms.integer(leaf[0])]
                 if isinstance(atom, jcore.Literal):
                     literal_value = np.asarray(atom.val).dtype.type(atom.val)
                     if isinstance(literal_value, np.floating) and abs(literal_value) <= 1.0:
                         return None, literal_value
-        product = get_callable_args(term, Token.times)
+        product = terms.args_of(term, Token.times)
         if product is not None:
             left, ls = factored(product[0])
             right, rs = factored(product[1])
@@ -630,20 +629,20 @@ def _applied(matrix, vector, keys: int) -> jax.Array:
 def value_of(term: Token, read: Callable[[int], jax.Array], keys: int, dtype) -> jax.Array:
     """A free term's value over a state of `keys` keys, its leaves `read(index)` (`Token.value`'s), its
     constants in the computation's `dtype`."""
-    if (args := get_callable_args(term, Token.value)) is not None:
+    if (args := terms.args_of(term, Token.value)) is not None:
         return read(terms.integer(args[0]))
-    if (args := get_callable_args(term, Token.literal)) is not None:
+    if (args := terms.args_of(term, Token.literal)) is not None:
         return jnp.asarray(terms.real(args[0]), dtype)
-    if get_callable_args(term, Token.zero) is not None:
+    if terms.args_of(term, Token.zero) is not None:
         return jnp.zeros((), dtype)
-    if (args := get_callable_args(term, Token.read)) is not None:
+    if (args := terms.args_of(term, Token.read)) is not None:
         vector, matrix = args
         return _read(value_of(vector, read, keys, dtype), value_of(matrix, read, keys, dtype), keys)
-    if (args := get_callable_args(term, Token.applied)) is not None:
+    if (args := terms.args_of(term, Token.applied)) is not None:
         matrix, vector = args
         return _applied(value_of(matrix, read, keys, dtype), value_of(vector, read, keys, dtype), keys)
     for constructor, applied in _APPLIED:
-        if (args := get_callable_args(term, constructor)) is not None:
+        if (args := terms.args_of(term, constructor)) is not None:
             return applied(*(value_of(arg, read, keys, dtype) for arg in args))
     raise Refused("a part of the token's affine map that reads the state")
 
@@ -1011,12 +1010,12 @@ def derive(extents: Extents, *, corrects: bool, schedule: cost.Schedule, precisi
         graph.run(_stateful().saturate())
 
         def marginal(egraph: EGraph, node) -> cost.Seconds:
-            if get_callable_args(node, Chunk.solve) is not None:
+            if terms.args_of(node, Chunk.solve) is not None:
                 return cost.Seconds(Work(), schedule, math.inf)
             # A forward substitution whose given values read the entering state walks its rows over the
             # state, which no equation of the program's language computes, so no carry split takes it
             # (`carry.split`): the `linear` identity's two solves are its form, the state's a product.
-            substituted = get_callable_args(node, Chunk.substituted)
+            substituted = terms.args_of(node, Chunk.substituted)
             if substituted is not None and egraph.lookup_function_value(stateful(substituted[1])) is not None:
                 return cost.Seconds(Work(), schedule, math.inf)
             return cost.Seconds(_work(node, extents, lambda child: _shape_of(egraph, child), precision),
@@ -1026,7 +1025,7 @@ def derive(extents: Extents, *, corrects: bool, schedule: cost.Schedule, precisi
         extracted, _ = extract.cheapest(graph, root, model, checked=checked)
         # The pair of its two parts, or one algorithm that gives both (the token loop, where the target
         # prices its steps past every other form's work), read by its projections.
-        parts = get_callable_args(extracted, Chunk.pair)
+        parts = terms.args_of(extracted, Chunk.pair)
         outputs, state = parts if parts is not None else (extracted.outputs(), extracted.state())
         shape_of = functools.partial(_shape_of, graph)
         price = cost.Seconds(_priced((outputs, state), extents, shape_of, precision), schedule)
@@ -1076,10 +1075,7 @@ def _nodes(roots: tuple[Chunk, ...]) -> Iterator[Chunk]:
 
 
 def _children(node: Chunk) -> list[Chunk]:
-    for constructor in CONSTRUCTORS:
-        if (args := get_callable_args(node, constructor)) is not None:
-            return [arg for arg in args if isinstance(arg, Chunk)]
-    return []
+    return [arg for arg in terms.args_of(node, _CONSTRUCTED) or () if isinstance(arg, Chunk)]
 
 
 CONSTRUCTORS = (
@@ -1087,7 +1083,10 @@ CONSTRUCTORS = (
     Chunk.outputs, Chunk.state, Chunk.gram, Chunk.spread, Chunk.applied, Chunk.rows, Chunk.times,
     Chunk.matmul, Chunk.plus, Chunk.minus, Chunk.decayed, Chunk.written, Chunk.solve, Chunk.doubled,
     Chunk.substituted, Chunk.across_prefix, Chunk.across, Chunk.weighed, Chunk.columns)
-"""Every constructor of the chunk's language, as `get_callable_args` matches a node."""
+"""Every constructor of the chunk's language."""
+
+_CONSTRUCTED = frozenset(map(terms.ref, CONSTRUCTORS))
+"""`CONSTRUCTORS` by reference, as `terms.args_of` matches a node's constructor."""
 
 
 def _work(node: Chunk, extents: Extents, shape_of, precision: jax.lax.PrecisionLike) -> Work:
@@ -1101,8 +1100,8 @@ def _work(node: Chunk, extents: Extents, shape_of, precision: jax.lax.PrecisionL
     product = functools.partial(cost.product_work, precision=precision)
     kept = cost.kept
 
-    if get_callable_args(node, Chunk.loop) is not None or get_callable_args(node, Chunk.plain) is not None:
-        corrected = get_callable_args(node, Chunk.loop) is not None
+    if terms.args_of(node, Chunk.loop) is not None or terms.args_of(node, Chunk.plain) is not None:
+        corrected = terms.args_of(node, Chunk.loop) is not None
         # A token's step: the state decayed, read by its correction (a contraction over keys) and corrected,
         # written, and read out, each over the state's keys and values; its dependent steps a reduction and
         # the update that reads it (two launches a token on XLA's path).
@@ -1115,10 +1114,10 @@ def _work(node: Chunk, extents: Extents, shape_of, precision: jax.lax.PrecisionL
                     span=2.0 * c, kept_bytes=kept(c * states * k * v))
     # A decay's prefix and spans, along the keys (`decay_keys` wide) or the values (`across`, theirs).
     for prefix, decay, width in ((Chunk.prefix, Chunk.decay, d), (Chunk.across_prefix, Chunk.across, v)):
-        if get_callable_args(node, prefix) is not None:
+        if terms.args_of(node, prefix) is not None:
             # The compensated prefix (`scan._decays`): one pass over the tokens' exponents, one kernel.
             return Work(operations=12.0 * c * width, kernels=1.0, kept_bytes=kept(c * width))
-        if (args := get_callable_args(node, decay)) is not None:
+        if (args := terms.args_of(node, decay)) is not None:
             # Its pairs' exponentials of the prefix's differences, fused with the prefix's pass; a decay a
             # value takes alone three a span (`scan._Split`: its factors each normal).
             part = terms.text(args[0])
@@ -1134,41 +1133,41 @@ def _work(node: Chunk, extents: Extents, shape_of, precision: jax.lax.PrecisionL
                 # factor selected at a document's start and kept (`scan._back`).
                 return Work(operations=factors, kept_bytes=kept(factors))
             return Work(operations=factors, exponentials=factors)
-    if (args := get_callable_args(node, Chunk.gram)) is not None:
+    if (args := terms.args_of(node, Chunk.gram)) is not None:
         if d == 1:
             return product(c, k, c) + Work(operations=2.0 * c * c)
         return Work(operations=3.0 * c * c * k, kernels=1.0, kept_bytes=kept(c * c))
-    if get_callable_args(node, Chunk.spread) is not None:
+    if terms.args_of(node, Chunk.spread) is not None:
         # The reads `Q U^T`, then each pair's keys decayed and applied: a scalar decay's a product, a decay a
         # key's elementwise over the pairs' keys.
         reads = product(c, v, c)
         return reads + (product(c, c, k) if d == 1
                         else Work(operations=3.0 * c * c * k, kernels=1.0, kept_bytes=kept(c * k)))
-    if get_callable_args(node, Chunk.applied) is not None:
+    if terms.args_of(node, Chunk.applied) is not None:
         return product(c, v, k)
-    if get_callable_args(node, Chunk.weighed) is not None:
+    if terms.args_of(node, Chunk.weighed) is not None:
         # Each pair's score times its values decayed along them, summed over the earlier tokens.
         return Work(operations=3.0 * c * c * v, kernels=1.0, kept_bytes=kept(c * v))
-    if get_callable_args(node, Chunk.columns) is not None:
+    if terms.args_of(node, Chunk.columns) is not None:
         return Work(operations=k * v)
-    if get_callable_args(node, Chunk.doubled) is not None:
+    if terms.args_of(node, Chunk.doubled) is not None:
         # log2(C) levels, each squaring the power and applying it: two products of C by C.
         levels = max(math.ceil(math.log2(max(c, 2))), 1)
         return product(c, c, c, count=2 * levels) + Work(operations=levels * c * c)
-    if (args := get_callable_args(node, Chunk.substituted)) is not None:
+    if (args := terms.args_of(node, Chunk.substituted)) is not None:
         # A row a step: its contraction with the rows before it, then its row set (two launches a row), its
         # solved rows carried on chip, read and written each step as a token loop's state is.
         columns = shape_of(args[1])[-1]
         return Work(operations=2.0 * c * c * columns, span=2.0 * c, kept_bytes=c * kept(c * columns))
-    if (args := get_callable_args(node, Chunk.matmul)) is not None:
+    if (args := terms.args_of(node, Chunk.matmul)) is not None:
         left, right = shape_of(args[0]), shape_of(args[1])
         return product(left[0], left[-1], right[-1])
-    if get_callable_args(node, Chunk.written) is not None:
+    if terms.args_of(node, Chunk.written) is not None:
         return product(k, c, v) + Work(operations=c * k)
-    if get_callable_args(node, Chunk.decayed) is not None:
+    if terms.args_of(node, Chunk.decayed) is not None:
         return Work(operations=k * v)
     for constructor in (Chunk.rows, Chunk.times, Chunk.plus, Chunk.minus):
-        if (args := get_callable_args(node, constructor)) is not None:
+        if (args := terms.args_of(node, constructor)) is not None:
             return Work(operations=math.prod(shape_of(args[0])))
     return Work()
 
@@ -1176,13 +1175,13 @@ def _work(node: Chunk, extents: Extents, shape_of, precision: jax.lax.PrecisionL
 def looped(roots: tuple[Chunk, ...]) -> bool:
     """Whether a form under `roots` runs the token loop (`Chunk.loop`, `Chunk.plain`): the chunk's tokens a
     step each, in sequence."""
-    return any(get_callable_args(node, constructor) is not None for node in _nodes(roots)
+    return any(terms.args_of(node, constructor) is not None for node in _nodes(roots)
                for constructor in (Chunk.loop, Chunk.plain))
 
 
 def reads_state(node: Chunk) -> bool:
     """Whether `node` reads the entering state (`READING`)."""
-    return any(get_callable_args(each, constructor) is not None for each in _nodes((node,))
+    return any(terms.args_of(each, constructor) is not None for each in _nodes((node,))
                for constructor in READING)
 
 
@@ -1190,13 +1189,13 @@ def prepared(roots: tuple[Chunk, ...]) -> list[Chunk]:
     """The nodes under `roots` a chunk's walk prepares before its carry, as no equation of the program's
     language computes them: each solve's inverse (`doubled`) and each substitution that reads no state."""
     return [node for node in _nodes(roots)
-            if get_callable_args(node, Chunk.doubled) is not None
-            or (get_callable_args(node, Chunk.substituted) is not None and not reads_state(node))]
+            if terms.args_of(node, Chunk.doubled) is not None
+            or (terms.args_of(node, Chunk.substituted) is not None and not reads_state(node))]
 
 
 def inverse(node: Chunk) -> bool:
     """Whether `node` is a solve's inverse (`doubled`), which the solve's entries' bound bounds."""
-    return get_callable_args(node, Chunk.doubled) is not None
+    return terms.args_of(node, Chunk.doubled) is not None
 
 
 # egglog keeps a language's defining frame, and through it every importer's, until its declarations are

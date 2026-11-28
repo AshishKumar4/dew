@@ -303,6 +303,41 @@ def test_each_contraction_states_its_own_length():
     assert graph.check_bool(eq(algebra.rules.contracted_length(long)).to(i64(12)))
 
 
+def test_a_terms_constructor_read_once_answers_as_egglog_deconstructing_it():
+    """A term's arguments asked of a constructor and of a set of them (`terms.args_of`), the term's
+    constructor read once (`terms.made_by`), are egglog's
+    `get_callable_args`' answer for every term a program's region holds (leaves, literals, sums, products,
+    maxima, conversions), each read through a derivation's method (`stepped`) and function
+    (`moment_anchor`), and a value: its arguments where it is a call of that constructor, None otherwise,
+    under the language's every constructor, a leaf's, a literal's and the readings' (row 14214's extraction
+    callbacks ask it of every node)."""
+    from egglog import get_callable_args, i64
+
+    from dew.algebra.derive_moments import moment_anchor
+
+    closed = jax.make_jaxpr(lambda x, w: (jnp.sum(x * w, -1), jnp.max(x, -1) + 2.0,
+                                          (x @ w.T).astype(jnp.bfloat16)))(*rows(1, (4, 8), (4, 8)))
+    region = terms.region(closed)
+    found = [term for term, _ in region.shapes]
+    readings = [read for term in found for read in (term.stepped(), moment_anchor(term))]
+    constructors = (*terms.LANGUAGE, terms.Term.leaf, terms.Term.literal, terms.Term.stepped, moment_anchor)
+
+    def keys(args):
+        return None if args is None else tuple(map(terms.key, args))
+
+    for term in [*found, *readings, i64(3)]:
+        asked = {constructor: keys(get_callable_args(term, constructor)) for constructor in constructors}
+        assert {constructor: keys(terms.args_of(term, constructor)) for constructor in constructors} == asked
+        assert keys(terms.args_of(term, terms.LANGUAGE_REFS)) == next(
+            (asked[constructor] for constructor in terms.LANGUAGE if asked[constructor] is not None), None)
+    # Every term of the region and its readings is one of the constructors' calls, the value none's.
+    assert all(any(terms.args_of(term, constructor) is not None for constructor in constructors)
+               for term in [*found, *readings])
+    made = {terms.made_by(term) for term in found}
+    assert made >= {terms.ref(constructor) for constructor in (terms.Term.leaf, terms.Term.reduce,
+                                                               terms.Term.dot, terms.Term.binary)}
+
+
 def test_a_scale_lifted_past_a_product_is_priced_at_its_shape():
     """A row scale lifted past a matrix product (`linear`'s lift, `(s x) @ y` as `s (x @ y)`): its broadcast
     to the product's extent states that extent, so the region's price counts the lifted broadcast and its

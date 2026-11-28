@@ -29,7 +29,6 @@ from egglog import (
     Vec,
     eq,
     function,
-    get_callable_args,
     i64,
     rule,
     ruleset,
@@ -166,8 +165,7 @@ def _carry_priced(region: terms.Region, schedule) -> DagCostModel[Priced]:
 
     def marginal(graph: EGraph, node) -> Priced:
         work = cost.work(graph, node, region, on=schedule.facts)
-        operands = next((args for constructor in terms.LANGUAGE
-                         if (args := get_callable_args(node, constructor)) is not None), ())
+        operands = terms.args_of(node, terms.LANGUAGE_REFS) or ()
         if any(isinstance(operand, Term) and graph.lookup_function_value(reads(operand)) is not None
                for operand in operands):
             # The carry is a loop XLA lowers, a chunk an iteration: its work that reads the state is a step
@@ -244,7 +242,7 @@ def split(function: Callable, state, operands: Sequence, carried: Sequence[int],
     consts = list(closed.consts)
 
     def operand(term: Term) -> bool:
-        return get_callable_args(term, Term.leaf) is not None
+        return terms.args_of(term, Term.leaf) is not None
 
     def prepare(*values, issue=None):
         leaves = [*consts, None, *values]
@@ -296,7 +294,7 @@ def _products(graph: EGraph, region: terms.Region) -> None:
     plain = (((1,), (0,)), ((), ()))
     transposed = (((0,), (0,)), ((), ()))
     for term, _ in region.shapes:
-        if (args := get_callable_args(term, Term.dot)) is None:
+        if (args := terms.args_of(term, Term.dot)) is None:
             continue
         index = terms.integer(args[2])
         primitive, params = region.params[index]
@@ -317,7 +315,7 @@ def _products(graph: EGraph, region: terms.Region) -> None:
 
 def _reads(term: Term, reading: set[int]) -> bool:
     """Whether `term` reads one of the `reading` leaves."""
-    return any((args := get_callable_args(sub, Term.leaf)) is not None and terms.integer(args[0])
+    return any((args := terms.args_of(sub, Term.leaf)) is not None and terms.integer(args[0])
                in reading for sub in terms.subterms(term))
 
 
@@ -332,15 +330,14 @@ def _free(form: Term, reading: set[int]) -> list[Term]:
         term, ready = pending.pop()
         named = terms.key(term)
         if ready:
-            leaf = get_callable_args(term, Term.leaf)
+            leaf = terms.args_of(term, Term.leaf)
             reads[named] = (leaf is not None and terms.integer(leaf[0]) in reading) or any(
                 reads[terms.key(operand)] for operand in operands[named])
             continue
         if named in operands:
             continue
-        operands[named] = [arg for constructor in terms.LANGUAGE
-                           if (args := get_callable_args(term, constructor)) is not None
-                           for arg in args if isinstance(arg, Term)]
+        operands[named] = [arg for arg in terms.args_of(term, terms.LANGUAGE_REFS) or ()
+                           if isinstance(arg, Term)]
         pending.append((term, True))
         pending.extend((operand, False) for operand in operands[named])
     found: dict[Hashable, Term] = {}
@@ -352,6 +349,6 @@ def _free(form: Term, reading: set[int]) -> list[Term]:
         walked.add(named)
         if reads[named]:
             below.extend(reversed(operands[named]))
-        elif get_callable_args(term, Term.literal) is None:
+        elif terms.args_of(term, Term.literal) is None:
             found.setdefault(named, term)
     return list(found.values())
