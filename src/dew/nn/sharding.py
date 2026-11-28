@@ -959,6 +959,24 @@ def summed_to(cotangent, operand):
     return jax.lax.psum(cotangent, axes) if axes else cotangent
 
 
+def summed_like(cotangent, like):
+    """`cotangent` as the cotangent of `like`: summed over the axes `like` broadcast across (its missing
+    leading axes, and each of size one where `cotangent`'s is not) in the cotangent's dtype promoted with
+    `like`'s and fp32, never narrowed, so every sum is taken wide; over each manual mesh axis it varies over
+    that `like` does not (`summed_to`: a replicated operand's cotangent each shard's partial of a split one's,
+    which JAX's accumulator refuses unsummed); and placed as `like` is where an Explicit axis places it, as
+    `templates.gemm.factored` places its rows' (a replicated value's cotangent left split as a split
+    exponent's was; train 1398's review). One transpose's reduction for every declared rule that broadcasts
+    an operand (`dew.algebra.scan`'s, `dew.nn.kernels.titans`'; train 1430's review)."""
+    summing = jnp.promote_types(jnp.promote_types(cotangent.dtype, like.dtype), jnp.float32)
+    extra = cotangent.ndim - like.ndim
+    axes = (*range(extra), *(extra + axis for axis, size in enumerate(like.shape)
+                              if size == 1 and cotangent.shape[extra + axis] != 1))
+    total = summed_to(jnp.sum(cotangent.astype(summing), axis=axes).reshape(like.shape), like)
+    placed = explicit_placement(jax.typeof(like))
+    return total if placed is None else jax.sharding.reshard(total, placed)
+
+
 def checked() -> bool:
     """Whether a value traced here is typed by the manual axes it varies over: inside a `shard_map` that
     checks them (`check_vma`)."""
