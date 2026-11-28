@@ -85,19 +85,21 @@ def record_flags[R: Bound](record: type[R], member: type | Callable[..., registr
         flags.append((name, flat if held else flat | None, dataclasses.field(default=default)))
     suppressed = [("bound", tyro.conf.Suppress[functools.partial],
                    dataclasses.field(default_factory=lambda: functools.partial(member))),
-                  ("defaults", tyro.conf.Suppress[JsonRecords], dataclasses.field(default_factory=dict))]
+                  ("defaults", tyro.conf.Suppress[JsonRecords], dataclasses.field(default_factory=dict)),
+                  ("merged", tyro.conf.Suppress[frozenset[str]], dataclasses.field(default=frozenset()))]
 
     def __post_init__(self) -> None:
-        # The flags the sole source of what a flag can state: a value of a flag's kind in `bound` is one an
-        # earlier parse's flags put there (`Bound.flagged` moves every such value onto its flag), so it is
-        # dropped, and a flag at its default leaves the member's default, not a recipe's value a flag reset
-        # (row 14127: `--rollout.train-ratio 1024.0` over a recipe's 16.0 kept 16.0). A value no flag holds
-        # (an object) stays.
-        kept = {name: value for name, value in self.bound.keywords.items()
-                if name not in flats or not _fits(value, flats[name])}
+        # The flags the sole source of what they state: the arguments an earlier record's flags merged into
+        # `bound` (`merged`, which a parse over that record carries with its `bound`) are dropped before this
+        # one's flags set apart from their defaults are merged, so a flag reset to its default leaves the
+        # member's default, not a recipe's value it was set over (row 14127: `--rollout.train-ratio 1024.0`
+        # over a recipe's 16.0 kept 16.0). An argument no flag merged stays, a default-valued one stated
+        # outright among them (`Bound.flagged`).
+        kept = {name: value for name, value in self.bound.keywords.items() if name not in self.merged}
         given = {name: vars(self)[name] for name in stated_defaults
                  if vars(self)[name] != stated_defaults[name]}
         object.__setattr__(self, "bound", functools.partial(member, **{**kept, **given}))
+        object.__setattr__(self, "merged", frozenset(given))
         record.__post_init__(self)
 
     namespace = {"__post_init__": __post_init__, "__module__": __name__, "_alias": alias.replace("_", "-"),

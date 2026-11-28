@@ -106,15 +106,19 @@ def test_a_flag_set_to_its_members_default_over_a_recipes_value_takes_it():
         assert rollout.arguments.get("train_ratio", default) == ratio
 
 
-@pytest.mark.parametrize("ratio", [16.0, 64.0])
+@pytest.mark.parametrize("ratio", [16.0, 64.0, 1024.0])
 def test_a_flagged_records_fields_set_and_cleared_are_its_record_alike(ratio):
     """A flagged rollout's arguments set (`with_fields`) and cleared (`without_fields`) are the plain record's
-    so set and cleared: a value a flag can state set over a flag at its default is kept, and one cleared is
-    the member's default again, not the flag's (row 14127's review)."""
-    plain, flagged = RolloutConfig(), RolloutConfig().flagged()
-    expected = to_record(plain.with_fields(train_ratio=ratio), RolloutConfig)
-    for record in (plain, flagged):
-        stated = record.with_fields(train_ratio=ratio)
-        assert to_record(stated, RolloutConfig) == expected
-        cleared = stated.without_fields("train_ratio")
-        assert to_record(cleared, RolloutConfig) == to_record(plain, RolloutConfig)
+    so set and cleared, its flag set first or not: a value a flag can state is kept, the member's own default
+    stated outright among them, and one cleared is the member's default again, not the flag's (row 14127's
+    review)."""
+    plain = RolloutConfig()
+    for flagged in (plain.flagged(), plain.with_fields(train_ratio=64.0).flagged()):
+        _alike(plain, flagged, ratio)
+
+
+def _alike(plain, flagged, ratio):
+    """`flagged`'s `train_ratio` set to `ratio` and cleared, each as `plain`'s (`to_record`)."""
+    stated = flagged.with_fields(train_ratio=ratio)
+    assert to_record(stated, RolloutConfig) == to_record(plain.with_fields(train_ratio=ratio), RolloutConfig)
+    assert to_record(stated.without_fields("train_ratio"), RolloutConfig) == to_record(plain, RolloutConfig)
