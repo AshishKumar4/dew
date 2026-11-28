@@ -195,11 +195,9 @@ def _lifted(z: jax.Array) -> tuple[jax.Array, jax.Array]:
     is. `l`'s derivative `2^-k` is at most `2^64`, so a higher order's direction along `z` stays in range."""
     held = jax.lax.stop_gradient(z)
     finite = jnp.isfinite(held)
-    if jnp.dtype(z.dtype) == jnp.float32:
-        binade = binade_of(held)
-    else:
-        binade = jnp.frexp(held)[1] - 1
-    k = jnp.where(finite & (jnp.abs(held) >= 1), binade + 1, jnp.where(jnp.abs(held) < 2.0 ** -100, -64, 0))
+    binade = binade_of(held) if jnp.dtype(z.dtype) == jnp.float32 else jnp.frexp(held)[1] - 1
+    tiny = jnp.where(jnp.abs(held) < 2.0 ** -100, -64, 0)
+    k = jnp.where(finite & (jnp.abs(held) >= 1), binade + 1, tiny)
     exact = power2(held, -k)
     if jnp.dtype(z.dtype) == jnp.float32:
         exact = jnp.where(k < 0, raised_exactly(held, jnp.maximum(-k, 0)), exact)
