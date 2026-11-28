@@ -258,32 +258,35 @@ def rows_quantized(x: jax.Array) -> tuple[jax.Array, jax.Array]:
     return fake_quant.fp8_codes(blocks / scale).reshape(x.shape).astype(jnp.float8_e4m3fn), scale[..., 0]
 
 
-def blocks_quantized(w: jax.Array) -> tuple[jax.Array, jax.Array]:
+def blocks_quantized(w: jax.Array, *, k_major: bool = False) -> tuple[jax.Array, jax.Array]:
     """`w` (`[groups, depth, width]`) as E4M3 codes a 128 x 128 block at a time and each block's power-of-two
-    scale (`[groups, depth / 128, width / 128]` fp32): each block's rows and columns axes of their own, its
-    largest magnitude reduced over both where they lie, so no transposed copy of the matrix is made either
-    way (row 4518)."""
+    scale (`[groups, depth / 128, width / 128]` fp32); the codes K-major (`[groups, width, depth]`, as a
+    step-scaled product streams its matrix) where `k_major`. Each block's largest magnitude reduced at `w`'s
+    own width in two contiguous passes (`float_bits.largest_magnitude`: each row's 128 columns, then each
+    block's 128 rows), apart from the codes, each value over its block's scale spread back over the block,
+    so no pass reads the matrix transposed but a K-major one's codes, written transposed as they are formed
+    (row 4518: one reduction over a block's both axes shared the codes' fp32 matrix, which XLA then wrote
+    through a 6.7 ms transposing fusion of a 8.8 ms quantization on a GH200, M-NG-67f)."""
     from dew.nn import fake_quant
+    from dew.nn.float_bits import largest_magnitude
 
     groups, depth, width = w.shape
     edge = SCALE_DEPTH
-    tiles = w.astype(at_least_fp32(w.dtype)).reshape(groups, depth // edge, edge, width // edge, edge)
-    scale = fake_quant.fp8_block_scale(jnp.max(jnp.abs(tiles), axis=(2, 4), keepdims=True))
-    codes = fake_quant.fp8_codes(tiles / scale)
-    return codes.reshape(w.shape).astype(jnp.float8_e4m3fn), scale[:, :, 0, :, 0]
+    rows = largest_magnitude(w.reshape(groups, depth, width // edge, edge), -1)
+    amax = largest_magnitude(rows.reshape(groups, depth // edge, edge, width // edge), 2)
+    scale = fake_quant.fp8_block_scale(amax.astype(at_least_fp32(w.dtype)))
+    spread = jnp.repeat(jnp.repeat(scale, edge, axis=1), edge, axis=2)
+    wide = w.astype(at_least_fp32(w.dtype))
+    if k_major:
+        wide, spread = jnp.swapaxes(wide, 1, 2), jnp.swapaxes(spread, 1, 2)
+    return fake_quant.fp8_codes(wide / spread).astype(jnp.float8_e4m3fn), scale
 
-
-def _k_major(w: jax.Array) -> tuple[jax.Array, jax.Array]:
-    """`w`'s blockwise FP8 codes, K-major (`[groups, width, depth]`, as a step-scaled product streams its
-    matrix), and their 128 x 128 blocks' scales (`blocks_quantized`)."""
-    blocks, scales = blocks_quantized(w)
-    return jnp.swapaxes(blocks, 1, 2), scales
 
 
 def _quantized_rows_product(rows, rows_scales, w, sizes, out_dtype, interpret) -> jax.Array:
     """A blockwise FP8 projection of rows already quantized (E4M3 codes and their 1 x 128 scales, `[depth /
     128, rows]`) by `w`: the one statement a projection, a chain's gate and its down projection read."""
-    blocks, scales = _k_major(w)
+    blocks, scales = blocks_quantized(w, k_major=True)
     return blockwise_fp8_product(rows, blocks, sizes, rows_scales, scales, out_dtype=out_dtype,
                                  interpret_on_cpu=interpret)
 
@@ -330,7 +333,7 @@ def _chain_value(x, w_ins, w_down, group_blocks, tensor_scales, activation, out_
     sizes = (group_blocks * SCALE_DEPTH).astype(jnp.int32)
     rows, rows_scales = rows_quantized(x)
     *gate, w_up = w_ins
-    up, up_scales = _k_major(w_up)
+    up, up_scales = blocks_quantized(w_up, k_major=True)
     # A gate's product stored rounded, the up product's epilogue reading it as a tile beside its own sum:
     # one accumulator a launch (two exact sums, each a running total and a step's partial, take a Hopper
     # consumer's 336 registers at FP8's least 128 columns; row 12689).
