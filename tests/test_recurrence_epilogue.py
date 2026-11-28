@@ -124,34 +124,28 @@ def test_a_padded_token_keeps_the_memory_its_value_decay_would_halve():
 
 @pytest.mark.mesh(devices=2)
 def test_a_gate_split_across_a_checked_shard_map_sums_a_replicated_values_gradient():
-    """The template's bf16 chunked call in a checked `shard_map` over two devices, its queries, keys, values,
-    decays, write gates and norm weight replicated and its output gate alone split: the gradient of its
-    outputs' sum by the replicated values each device's gate's own, summed, as the call apart on each
-    device's gate gives them, the norm kept apart from the output launch (its gate varying where the
-    recurrence does not), where the fused norm's pullback left the values' cotangent varying (a head
-    review)."""
-    hooks = recurrence.Hooks(decay='scalar', scale=0.125, write_bound=1.0,
-                             output=recurrence.OutputNorm(1e-6, read_in='bfloat16'))
-    rng = np.random.default_rng(1967)
-
-    def normal(*shape, dtype=jnp.bfloat16):
-        return jnp.asarray(rng.standard_normal(shape), dtype)
-
-    unit = normal(1, 64, 1, 64)
-    unit = (unit / jnp.linalg.norm(unit.astype(jnp.float32), axis=-1, keepdims=True)).astype(jnp.bfloat16)
-    shared = {'query': unit, 'key': unit, 'log_decay': -jnp.abs(normal(1, 64, 1, dtype=jnp.float32)),
-              'beta': jax.nn.sigmoid(normal(1, 64, 1, dtype=jnp.float32)), 'weight': jnp.ones((64,))}
-    gates = normal(2, 64, 1, 64)
+    """The template's bf16 chunked call in a checked `shard_map` over two devices, 64 tokens of 64 values,
+    its query and key `e0` and its write gate one at the first token alone, its values, decays and memory
+    zero, its norm's weight one, `scale` and `eps` one, replicated, and its sigmoid output gate alone split,
+    0 on the first device and 96 on the second: the gradient of its outputs' sum by the replicated values
+    1.5 at the first token's every value (the two devices' gates, 1/2 and 1, summed) and zero elsewhere, the
+    norm kept apart from the output launch (its gate varying where the recurrence does not), where the fused
+    norm's pullback left the values' cotangent varying (a head review)."""
+    hooks = recurrence.Hooks(decay='scalar', scale=1.0, write_bound=1.0,
+                             output=recurrence.OutputNorm(1.0, 'sigmoid', read_in='bfloat16'))
+    first = jnp.zeros((1, 64, 1, 64), jnp.bfloat16).at[0, 0, 0, 0].set(1.0)
+    beta = jnp.zeros((1, 64, 1), jnp.float32).at[0, 0, 0].set(1.0)
+    gates = jnp.zeros((2, 64, 1, 64), jnp.bfloat16).at[1].set(96.0)
 
     def total(value, z):
-        operands = Chunk(shared['query'], shared['key'], value, log_decay=shared['log_decay'],
-                         beta=shared['beta'], z=z, weight=shared['weight'])
+        operands = Chunk(first, first, value, log_decay=jnp.zeros((1, 64, 1)), beta=beta, z=z,
+                         weight=jnp.ones((64,)))
         return jnp.sum(chunk_on('mosaic_gpu', hooks, operands, dtype=jnp.bfloat16)[0].astype(jnp.float32))
 
-    value = normal(1, 64, 1, 64)
     mesh = Mesh(np.asarray(jax.devices()[:2]), ('data',))
     split = jax.shard_map(lambda value, z: jax.lax.psum(total(value, z), 'data'), mesh=mesh,
                           in_specs=(P(), P('data')), out_specs=P(), check_vma=True)
-    found = jax.jit(jax.grad(split))(value, gates)
-    apart = sum(jax.jit(jax.grad(total))(value, gates[at:at + 1]).astype(jnp.float32) for at in range(2))
-    np.testing.assert_allclose(np.asarray(found, np.float32), np.asarray(apart), rtol=2 ** -6, atol=2 ** -10)
+    found = jax.jit(jax.grad(split))(jnp.zeros((1, 64, 1, 64), jnp.bfloat16), gates)
+    expected = np.zeros((1, 64, 1, 64), np.float32)
+    expected[0, 0] = 1.5
+    np.testing.assert_array_equal(np.asarray(found, np.float32), expected)
