@@ -8,6 +8,7 @@ reaches shared memory."""
 
 import dataclasses
 import functools
+import itertools
 from collections.abc import Callable
 from typing import Any
 
@@ -18,7 +19,7 @@ from jax.experimental.mosaic.gpu import utils as mgpu_utils
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
 from dew.algebra import bits
-from dew.nn.kernels.templates import product as product_formats, resources
+from dew.nn.kernels.templates import product as product_formats, resources, swizzling
 
 NVFP4_GROUP = 128
 """Dew: the depths an NVFP4 matrix's staged order groups (`nvfp4_staged_depth`): a group's sixteen word rows
@@ -474,8 +475,26 @@ def stage_decoded(words, scales, out, interpret: bool, *, layout=None) -> None:
     """Dew: a stage of an NVFP4 matrix (`words`, each 128 depths' `[columns, 16]` uint32 in the staged order,
     `formats.staged_rows`; `scales` `[columns, depth / 16]` E4M3) decoded into `out` (`[columns, depth]`
     bfloat16), each code's sixteen-depth slice where the staged order puts it (`lanes`)."""
-    for group, code, lane in lanes(words, scales, interpret, layout=layout):
-        out[:, pl.ds(nvfp4_staged_depth(group, 0, code), product_formats.NVFP4.depth)] = lane
+    _stored(out, ((nvfp4_staged_depth(group, 0, code), lane)
+                  for group, code, lane in lanes(words, scales, interpret, layout=layout)))
+
+
+def _stored(out, placed) -> None:
+    """Dew: the decoded lanes of `placed` (`(depth, lane)`: lanes `[columns, 16]` of consecutive depths,
+    their stage's in order, a group's 8 or 16 of them) stored into `out` (`[columns, depth]`) a swizzled row
+    at a time (`swizzling.SWIZZLE_BYTES` of the lanes' dtype: four bfloat16 lanes), each run stored as it
+    fills: a stage's buffer so stages at the widest swizzle, the one a gathered ring's rows stage at
+    (`gathered.ring`), which its product reads beside it under one transform. Stored a lane at a time, its
+    16-value columns held the buffer to a 32-byte swizzle the gathered rows' 128-byte one could not share,
+    and Mosaic's layout inference found no assignment (row 14111: the packed NVFP4 product of gathered rows
+    on a GH200)."""
+    placed = iter(placed)
+    first = next(placed)
+    _, lane = first
+    run = swizzling.swizzle_columns(lane.dtype, swizzling.SWIZZLE_BYTES) // lane.shape[1]
+    for held in itertools.batched(itertools.chain((first,), placed), run):
+        joined = jnp.concatenate([each for _, each in held], axis=1)
+        out[:, pl.ds(held[0][0], joined.shape[1])] = joined
 
 
 def rows_decoded(words, scales, interpret: bool, *, layout=None, fmt: str | None = None) -> jax.Array:
@@ -545,8 +564,8 @@ def packed_lanes(words, desc: PackedWeightFormat | str, interpret: bool, *, layo
 def stage_decoded_words(words, out, desc: PackedWeightFormat, interpret: bool, *, layout=None,
                         meta=None) -> None:
     """Decode a stage of word-packed weight groups (`desc`) into `out` (`[columns, depth]` bfloat16)."""
-    for group, code, lane in packed_lanes(words, desc, interpret, layout=layout, meta=meta):
-        out[:, pl.ds(desc.group_depth * group + 16 * code, 16)] = lane
+    _stored(out, ((desc.group_depth * group + 16 * code, lane)
+                  for group, code, lane in packed_lanes(words, desc, interpret, layout=layout, meta=meta)))
 
 
 def stage_decoded_ternary(words, out, interpret: bool, *, layout=None) -> None:

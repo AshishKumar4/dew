@@ -126,24 +126,30 @@ def test_the_mainloop_decodes_an_nvfp4_matrixs_rows_into_its_products_left_opera
         swapped("mma.sync")
 
 
-@pytest.mark.parametrize("family", ["mma.sync", "wgmma"])
-def test_the_mainloops_nvfp4_stage_decode_lowers_for_cuda(family):
+@pytest.mark.parametrize("family, gathered", [("mma.sync", False), ("wgmma", False), ("wgmma", True)],
+                         ids=["mma.sync", "wgmma", "wgmma gathered"])
+def test_the_mainloops_nvfp4_stage_decode_lowers_for_cuda(family, gathered):
     """The packed matrix's kernel (`mosaic_gpu.gmm` with `scales`) lowers for CUDA on the CPU on each
     family: its words' and scales' streams, the stage decode in the warpgroup MMA's fragment layout and its
-    buffers."""
+    buffers; and on Hopper with its rows gathered by a table (a mixture of experts' tokens, the producer's
+    128-byte-swizzled ring), whose decoded buffer the products read beside the rows under one transform
+    (row 14111: its 16-column stores held it to a narrower swizzle, which layout inference could not
+    assign beside the rows', on a GH200 and in this lowering alike)."""
     words = jax.ShapeDtypeStruct((1, 128, 512 // 8), jnp.uint32)
     scales = jax.ShapeDtypeStruct((1, 128, 512 // 16), jnp.float8_e4m3fn)
-    rows = jax.ShapeDtypeStruct((256, 512), jnp.bfloat16)
+    rows = jax.ShapeDtypeStruct((60 if gathered else 256, 512), jnp.bfloat16)
+    table = jax.ShapeDtypeStruct((256,), jnp.int32)
     name = "sm90" if family == "wgmma" else "sm80"
-    tiles = tiling.Tiles(64, 64, 256, 2, 1, family=family)
+    tiles = tiling.Tiles(64, 64, 256, 2 if not gathered else 3, 1, family=family)
 
-    def packed(rows, words, scales):
+    def packed(rows, words, scales, table):
         return mosaic_gpu.gmm(rows, words, jnp.asarray([256], jnp.int32), tiles=tiles, transpose_rhs=True,
-                              out_dtype=jnp.float32, multiprocessors=4, dense=True, scales=scales)
+                              out_dtype=jnp.float32, multiprocessors=4, dense=not gathered, scales=scales,
+                              gather=table if gathered else None)
 
     mesh = generation.gpu_mesh(Mesh(np.array(jax.devices()[:1]), ("data",)), name)
     with generation.assumed(name), jax.sharding.use_abstract_mesh(mesh):
-        jax.jit(packed).trace(rows, words, scales).lower(lowering_platforms=("cuda",))
+        jax.jit(packed).trace(rows, words, scales, table).lower(lowering_platforms=("cuda",))
 
 
 def test_the_mainloops_nvfp4_rows_decode_lowers_for_hopper():
@@ -242,6 +248,33 @@ def nvfp4_bank(seed: int, groups: int, depth: int, width: int) -> tuple[formats.
     bank = formats.NvFp4.of(codes, scales,
                             jnp.asarray([2.0 ** -group for group in range(groups)], jnp.float32))
     return bank, np.stack([values for _, values in matrices])
+
+
+def a_gathered_packed_nvfp4_bank_is_its_values_product():
+    """On a Hopper, a bank of four NVFP4 experts named packed (the mainloop decoding each stage in place) over
+    rows its producer gathers by a table (`gemm.gemm`'s `gather`: a mixture of experts' tokens read where
+    they lie), natively: bitwise its values' product over the gathered rows, XLA's decoded route's and the
+    float64 truth's, small integers making every sum exact (row 14111: the launch failed Mosaic's layout
+    inference on a GH200). Run by tests/test_gpu_gemm.py's cells."""
+    bank, values = nvfp4_bank(14, 4, 512, 128)
+    rng = np.random.default_rng(15)
+    tokens = jnp.asarray(rng.integers(-3, 4, size=(60, 512)), jnp.bfloat16)
+    table = jnp.asarray(rng.integers(0, 60, 136), jnp.int32)
+    sizes = np.asarray([40, 0, 72, 24])
+
+    def product(route):
+        with generation.chosen(nvfp4=route):
+            return np.asarray(jax.jit(lambda x: gemm.gemm(x, bank, jnp.asarray(sizes, jnp.int32),
+                                                          out_dtype=jnp.float32, gather=table))(tokens))
+
+    rows = np.asarray(tokens, np.float64)[np.asarray(table)]
+    starts = np.cumsum([0, *sizes])
+    truth = np.zeros((136, 128))
+    for group, (first, last) in enumerate(itertools.pairwise(starts)):
+        truth[first:last] = rows[first:last] @ values[group]
+    packed, decoded = product("packed"), product("xla")
+    np.testing.assert_array_equal(decoded, truth.astype(np.float32))
+    np.testing.assert_array_equal(packed, decoded)
 
 
 @pytest.mark.parametrize("sizes", [(40, 0, 72, 24), (0, 0, 0, 0)], ids=["ragged", "empty"])
