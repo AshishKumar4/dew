@@ -68,15 +68,51 @@ def published_release(directory: str | Path, write: Callable[[Path], None], *, f
     writes, then the publisher's replacement, in turn: a process that fails at any of them is heard by the
     others at the next round any takes, after which none takes another (`_coordination._unheard`). A pool's
     process that publishes none (`writes_weights`) writes in place, to a destination of its own; a location
-    with a scheme, which has no rename, is written file by file; and a `fresh` directory, one its caller
+    with a scheme (`gs://`, `s3://`), which has no rename, is built whole in a private local directory and
+    then put into the store a file at a time where it holds nothing (`_uploaded_release`), never written
+    under a local path its name would make; and a `fresh` directory, one its caller
     made empty and private for this write alone and publishes itself, is written in place."""
+    if is_uri(str(directory)):
+        _uploaded_release(str(directory), write)
+        return
     root = Path(directory)
-    in_place = fresh or is_uri(str(directory)) or not writes_weights()
+    in_place = fresh or not writes_weights()
     with contextlib.ExitStack() as staged:
         target = agreed_reading(lambda: root if in_place else staged.enter_context(
             swapped(root, refused_entries, replaces=replaced_entries)))
         agreed_reading(lambda: write(target))
         agreed_reading(staged.close)
+
+
+def _uploaded_release(location: str, write: Callable[[Path], None]) -> None:
+    """`published_release` at a store's `location` (a `<scheme>://` URI): refused where the store holds
+    anything there already, before anything is written, as a store has no rename to replace an earlier
+    release in one generation (row 14124: a `gs://` destination taken as a local path was written under
+    `gs:/` on the local disk, its export reported as published); else built whole by `write` in a private
+    local directory and each of its files put into the store where nothing is (`dew.data.storage.Store`'s
+    `put_if_absent`), its weights before the files that name them, in the pool's rounds as a local
+    release's (`agreed_reading`)."""
+    from dew.data.storage import Store
+
+    def staging(held: contextlib.ExitStack) -> Path:
+        fs, path = Store(location).resolve()
+        if fs.exists(path) and fs.ls(path):
+            raise FileExistsError(f"{location} holds a release already, which a store cannot replace in one "
+                                  f"generation; export to an empty location")
+        return Path(held.enter_context(tempfile.TemporaryDirectory(ignore_cleanup_errors=True)))
+
+    with contextlib.ExitStack() as staged:
+        target = agreed_reading(lambda: staging(staged))
+        agreed_reading(lambda: write(target))
+
+        def uploaded() -> None:
+            files = sorted((entry for entry in target.rglob("*") if entry.is_file()),
+                           key=lambda entry: (entry.suffix == ".json", entry.as_posix()))
+            for entry in files:
+                Store(f"{location.rstrip('/')}/{entry.relative_to(target).as_posix()}").put_if_absent(
+                    entry.read_bytes())
+
+        agreed_reading(uploaded)
 
 
 @contextlib.contextmanager

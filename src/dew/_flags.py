@@ -88,9 +88,16 @@ def record_flags[R: Bound](record: type[R], member: type | Callable[..., registr
                   ("defaults", tyro.conf.Suppress[JsonRecords], dataclasses.field(default_factory=dict))]
 
     def __post_init__(self) -> None:
+        # The flags the sole source of what a flag can state: a value of a flag's kind in `bound` is one an
+        # earlier parse's flags put there (`Bound.flagged` moves every such value onto its flag), so it is
+        # dropped, and a flag at its default leaves the member's default, not a recipe's value a flag reset
+        # (row 14127: `--rollout.train-ratio 1024.0` over a recipe's 16.0 kept 16.0). A value no flag holds
+        # (an object) stays.
+        kept = {name: value for name, value in self.bound.keywords.items()
+                if name not in flats or not _fits(value, flats[name])}
         given = {name: vars(self)[name] for name in stated_defaults
                  if vars(self)[name] != stated_defaults[name]}
-        object.__setattr__(self, "bound", functools.partial(member, **{**self.bound.keywords, **given}))
+        object.__setattr__(self, "bound", functools.partial(member, **{**kept, **given}))
         record.__post_init__(self)
 
     namespace = {"__post_init__": __post_init__, "__module__": __name__, "_alias": alias.replace("_", "-"),

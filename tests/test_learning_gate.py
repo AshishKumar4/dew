@@ -124,7 +124,32 @@ def test_a_judge_refuses_shards_that_claim_different_things(monkeypatch, later):
     rising = np.linspace(0.5, 1.5, half)
     first = {"holds": rising} if later == "adds a failing claim" else {"holds": rising, "also": rising}
     second = {"holds": rising, "fails": -rising} if later == "adds a failing claim" else {"holds": rising}
-    monkeypatch.setattr(learning_gate, "sharded", lambda *_, **__: [first, second])
+    shards = [(0, half, first), (half, 2 * half, second)]
+    monkeypatch.setattr(learning_gate, "sharded", lambda *_, **__: shards)
     with pytest.raises(ValueError):
         assert_learns(lambda numbers: {}, "shards", units=2 * half)
 
+
+
+def test_a_judge_refuses_shards_whose_contrasts_fill_another_shards_units(monkeypatch, tmp_path):
+    """A sharded site's map tasks each hold one contrast a unit of their own range: a task whose contrasts
+    are not refuses to publish them, and a judge pooling records that are (a long shard beside a short one,
+    their total the units') refuses them, rather than judging units one shard never drew (row 9047: an 8/0
+    split of `[0, 4)` and `[4, 8)` passed with t +inf and no evidence for units 4 to 7)."""
+    import map_judge
+
+    half = FEWEST_UNITS
+    whole = np.linspace(0.5, 1.5, 2 * half)
+    complementary = {(0, half): whole, (half, 2 * half): whole[:0]}
+    monkeypatch.setenv(map_judge.RECORDS, str(tmp_path))
+    monkeypatch.setenv(map_judge.DRAWS, f"0:{half}")
+    with pytest.raises(ValueError):
+        assert_learns(lambda numbers: {"holds": whole}, "complementary", units=2 * half)
+    assert not list(tmp_path.glob("*.pkl"))
+    for (start, stop), values in complementary.items():
+        monkeypatch.setenv(map_judge.DRAWS, f"{start}:{stop}")
+        assert map_judge.record_units("complementary", lambda *_, values=values: {"holds": values})
+    monkeypatch.delenv(map_judge.DRAWS)
+    monkeypatch.setenv(map_judge.POOL, str(tmp_path))
+    with pytest.raises(ValueError):
+        assert_learns(lambda numbers: {"holds": np.ones(numbers.size)}, "complementary", units=2 * half)

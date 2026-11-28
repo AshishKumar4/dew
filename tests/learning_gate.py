@@ -98,19 +98,22 @@ def assert_learns(contrasts_of, label: str, *, units: int) -> None:
     the judge pools them, every unit from zero once, and judges them as one task that took them all."""
     if units < FEWEST_UNITS:
         raise ValueError(f"{label}: {units} units, fewer than {FEWEST_UNITS}; declare more")
-    pooled = sharded(label, lambda start, stop: contrasts_of(np.arange(start, stop)), units, upto=units)
+    # Each shard's claims held to its units before a map task publishes them (`_unit_contrasts`).
+    pooled = sharded(label, lambda start, stop: _unit_contrasts(label, start, stop,
+                                                                contrasts_of(np.arange(start, stop))),
+                     units, upto=units)
     if pooled is None:
         return
-    # Every shard's claims the first's, each one contrast a unit: a shard adding a claim had its values
-    # dropped, so a failing claim could pass the judge (spec alignment, 9047).
-    named = [sorted(payload) for payload in pooled]
+    # And again as the judge pools them: every shard's claims the first's, each claim one contrast a unit of
+    # its own range, so no shard's surplus fills another's gap (row 9047: an 8/0 split of [0, 4) and [4, 8)
+    # passed with t +inf and no evidence for units 4 to 7), and no claim a later shard adds is dropped.
+    for start, stop, payload in pooled:
+        _unit_contrasts(label, start, stop, payload)
+    named = [sorted(payload) for _, _, payload in pooled]
     if any(claims != named[0] for claims in named):
         raise ValueError(f"{label}: its shards claim different things: {named}")
-    lengths = [{np.size(payload[claim]) for claim in payload} for payload in pooled]
-    if any(len(each) != 1 for each in lengths):
-        raise ValueError(f"{label}: a shard's claims hold different counts of contrasts: {lengths}")
-    contrasts = {claim: np.concatenate([np.asarray(payload[claim]) for payload in pooled])
-                 for claim in pooled[0]}
+    contrasts = {claim: np.concatenate([np.asarray(payload[claim]) for _, _, payload in pooled])
+                 for claim in named[0]}
     claims, table = _table(contrasts, label)
     if table.shape[0] != units:
         raise ValueError(f"{label}: {table.shape[0]} contrasts a claim for {units} units")
@@ -122,6 +125,16 @@ def assert_learns(contrasts_of, label: str, *, units: int) -> None:
         raise LearningFailure(f"{label}: over {units} units, {missed}; the gate needs t at least "
                               f"{needed:.3g}, which a trainer at the claim's margin reaches with chance "
                               f"{LEVEL}", tuple(claims[index] for index in short))
+
+
+def _unit_contrasts(label: str, start: int, stop: int,
+                    contrasts: Mapping[str, object]) -> Mapping[str, object]:
+    """`contrasts` by claim, refused unless each is a vector of one contrast a unit of `start` to `stop`."""
+    for claim, values in contrasts.items():
+        if np.ndim(values) != 1 or np.size(values) != stop - start:
+            raise ValueError(f"{label}: units {start} to {stop} hold contrasts of {claim} shaped "
+                             f"{np.shape(values)}, not one a unit ({stop - start},)")
+    return contrasts
 
 
 def false_red(effects: np.ndarray, units: int) -> float:

@@ -88,3 +88,18 @@ def test_an_env_run_parsed_from_its_command_line_holds_its_kinds_own_records():
     assert type(parsed.rollout) is RolloutConfig
     assert parsed.rollout == RolloutConfig(functools.partial(ControlRollout, unroll_length=64))
     assert EnvRunConfig.cli([]) == EnvRunConfig()
+
+
+def test_a_flag_set_to_its_members_default_over_a_recipes_value_takes_it():
+    """A rollout flag given its member's default over a recipe that binds another value runs the default
+    the command line asked for (row 14127: `--rollout.train-ratio 1024.0`, `DreamerRollout`'s own, over a
+    recipe's 16.0 kept 16.0, the flag dropped as unchanged from its default); a flag left unset keeps the
+    recipe's value, and one set elsewhere takes its own."""
+    from dew.objectives.rl.dreamer import DreamerRollout
+
+    recipe = EnvRunConfig(rollout=RolloutConfig(functools.partial(DreamerRollout, train_ratio=16.0)))
+    default = DreamerRollout.__dataclass_fields__["train_ratio"].default
+    for args, ratio in ((["--rollout.train-ratio", str(default)], default), ([], 16.0),
+                        (["--rollout.train-ratio", "64.0"], 64.0)):
+        parsed = EnvRunConfig.cli(args, default=recipe)
+        assert parsed.rollout.fields.get("train_ratio", default) == ratio

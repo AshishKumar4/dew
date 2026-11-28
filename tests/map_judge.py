@@ -141,19 +141,19 @@ def record_units(label: str, payload: Callable[[int, int], object], upto: int | 
 
 
 def sharded(label: str, payload: Callable[[int, int], object], units: int | None = None, *,
-            upto: int | None = None) -> list | None:
+            upto: int | None = None) -> list[tuple[int, int, object]] | None:
     """A site's units over armada's map tasks, each `payload(start, stop)`: a map task records its units'
     (`record_units`, cut at `upto` where a site takes at most that many) and gets None, the judge gets the
-    tasks' payloads in order (`pooled_units`, refused short of `units`), and a run whole gets
-    `[payload(0, units)]`."""
+    tasks' `(start, stop, payload)` in order (`pooled_units`, refused short of `units`), each payload with
+    the units it claims to hold, and a run whole gets `[(0, units, payload(0, units))]`."""
     if record_units(label, payload, upto=upto):
         return None
     pooled = pooled_units(label, units)
     if pooled is not None:
-        return [found for _, _, found in pooled]
+        return pooled
     if units is None:
         raise ValueError(f"{label}: a run whole of a sharded site takes its units' count")
-    return [payload(0, units)]
+    return [(0, units, payload(0, units))]
 
 
 def _published(path: Path, data: bytes) -> None:
