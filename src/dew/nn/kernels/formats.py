@@ -117,12 +117,13 @@ class NvFp4(_Packed):
     depth order (`words`, `[width, depth / 8]`: `staged_rows`, each word the `bits.NVFP4_BFLOAT16_FORM` word
     of its eight codes, `_staged_words`), each sixteen consecutive depths' E4M3
     scale (`scales`, `[width, depth / 16]`, in the depths' own order), and the tensor's fp32 scale
-    (`scale`, a scalar): each value its code times its block's scale times the tensor's. Its depth is whole
-    stages (`NVFP4_STAGE`): the mainloop's stage decode reads each column's words and scales as rows a TMA
-    copy takes, at least 16 bytes. A bank of experts' matrices (`[groups, depth, width]`, row 4516) leads
-    each field with its group axis: `words` `[groups, width, depth / 8]`, `scales` `[groups, width,
-    depth / 16]`, `scale` `[groups]`, each expert's matrix its own tensor scale. Its fields are NumPy
-    arrays where it was packed on the host (`of`)."""
+    (`scale`, a scalar, or one a column, `[width]`: matrices side by side each its own, a ModelOpt source's
+    gate and up members fused, row 13743): each value its code times its block's scale times its tensor's.
+    Its depth is whole stages (`NVFP4_STAGE`): the mainloop's stage decode reads each column's words and
+    scales as rows a TMA copy takes, at least 16 bytes. A bank of experts' matrices (`[groups, depth,
+    width]`, row 4516) leads each field with its group axis: `words` `[groups, width, depth / 8]`, `scales`
+    `[groups, width, depth / 16]`, `scale` `[groups]` or `[groups, width]`, each expert's matrix its own
+    tensor scale. Its fields are NumPy arrays where it was packed on the host (`of`)."""
 
     words: jax.Array | np.ndarray
     scales: jax.Array | np.ndarray
@@ -132,6 +133,25 @@ class NvFp4(_Packed):
     them, so a checkpoint's words carry the encoder that packed them (`checked`, `stored`)."""
     FORM_OF: ClassVar[bytes] = FORM
     FACTORY: ClassVar[str] = "NvFp4.of"
+    LEAST: ClassVar[float] = (float(jnp.finfo(jnp.float4_e2m1fn).smallest_subnormal)
+                              * float(jnp.finfo(jnp.float8_e4m3fn).smallest_subnormal) / bits.NVFP4_OWED)
+    """The least magnitude of a nonzero value its decode forms (`decoded`, owing `bits.NVFP4_OWED`): an E2M1
+    code's least times an E4M3 block scale's least, over the owed 2^8 (2**-18)."""
+
+    def checked(self) -> "NvFp4":
+        """Itself, its form this Dew's (`_Packed.checked`) and its tensor scale one a matrix or one a column
+        of each (`scale`)."""
+        super().checked()
+        *leading, width, _ = jnp.shape(self.words)
+        if tuple(jnp.shape(self.scale)) not in (tuple(leading), (*leading, width)):
+            raise ValueError(f"an NVFP4 matrix's tensor scale is one a matrix {tuple(leading)} or one a "
+                             f"column {(*leading, width)}, not {tuple(jnp.shape(self.scale))}")
+        return self
+
+    @property
+    def columned(self) -> bool:
+        """Whether its tensor scale is one a column (`scale`'s `[..., width]`), not one a matrix."""
+        return jnp.ndim(self.scale) == jnp.ndim(self.words) - 1
 
     @classmethod
     def quantized(cls, x: jax.Array) -> "NvFp4":
@@ -148,10 +168,10 @@ class NvFp4(_Packed):
     def of(cls, codes, scales, scale) -> "NvFp4":
         """The matrix of `codes` (`[depth, width]`, or a bank's `[groups, depth, width]`, in the depths' own
         order: each an E2M1 value, or its 4-bit code as a uint8 nibble, its sign bit 3), its block scales
-        `scales` (`[..., depth / 16, width]` float8_e4m3fn) and its tensor scale `scale` (one a matrix): a
-        checkpoint's NVFP4 weight, its codes packed in the staged order, K-major. NumPy codes, scales and
-        scale give a NumPy matrix (packed on the host, nothing copied to a device: a load places each
-        expert shard's itself)."""
+        `scales` (`[..., depth / 16, width]` float8_e4m3fn) and its tensor scale `scale` (one a matrix, or one
+        a column, `[..., width]`): a checkpoint's NVFP4 weight, its codes packed in the staged order, K-major.
+        NumPy codes, scales and scale give a NumPy matrix (packed on the host, nothing copied to a device: a
+        load places each expert shard's itself)."""
         if (why := unstaged(codes.shape[-2])) is not None:
             raise ValueError(f"an NVFP4 matrix: {why}")
         host = isinstance(codes, np.ndarray) and isinstance(scales, np.ndarray)
@@ -195,17 +215,16 @@ class NvFp4(_Packed):
         *groups, width, words = self.words.shape
         return (*groups, 8 * words, width)
 
-    @staticmethod
-    def leaf_axes(axes: Sequence[str | None]) -> dict[str, tuple[str | None, ...]]:
+    def leaf_axes(self, axes: Sequence[str | None]) -> dict[str, tuple[str | None, ...]]:
         """The logical axes of each of its leaves, in their order, where the matrix it stands for is laid out
-        along `axes` (`[..., depth, width]`, any axes before them a bank's or a stack's): its words' and
-        block scales' `[..., width, depth / 8 or depth / 16]`, its tensor scales' the leading ones alone,
-        its form none (a static field). The one statement of how its layout follows the matrix's,
-        which placing a packed bank reads (row 11734). By each leaf's field name, in its fields' order (the
-        leaves', as `jax.tree_util.register_dataclass` flattens it)."""
+        along `axes` (`[..., depth, width]`, any axes before them a bank's or a stack's): its words' and block
+        scales' `[..., width, depth / 8 or depth / 16]`, its tensor scales' the leading ones, and its width
+        where they are one a column (`columned`), its form none (a static field). The one statement of how its
+        layout follows the matrix's, which placing a packed bank reads (row 11734). By each leaf's field name,
+        in its fields' order (the leaves', as `jax.tree_util.register_dataclass` flattens it)."""
         *leading, depth, width = axes
         return {"words": (*leading, width, depth), "scales": (*leading, width, depth),
-                "scale": tuple(leading)}
+                "scale": (*leading, width) if self.columned else tuple(leading)}
 
     def layer(self, index: jax.Array) -> "NvFp4":
         """A stack of banks' bank at layer `index` (a traced index): its fields led by a layers axis before
@@ -213,12 +232,6 @@ class NvFp4(_Packed):
         return NvFp4(*(jax.lax.dynamic_index_in_dim(jnp.asarray(field), index, keepdims=False)
                        for field in (self.words, self.scales, self.scale)), form=self.form)
 
-    @property
-    def factor(self) -> jax.Array:
-        """The factor its decode defers to the product's accumulator (`bits.NVFP4_OWED` times the tensor's
-        scale, a bank's one a matrix): `bits.nvfp4_decoded` keeps each value within bfloat16's normal range
-        by owing 2^8."""
-        return jnp.float32(bits.NVFP4_OWED) * jax.lax.stop_gradient(jnp.asarray(self.scale, jnp.float32))
 
 def unstaged(depth: int) -> str | None:
     """Why a matrix of `depth` inputs is no NVFP4 matrix (`NvFp4`: its depth whole `NVFP4_STAGE`s), or None:
@@ -428,7 +441,11 @@ def scale_checked(scale_shape: tuple[int, ...], weights_shape: tuple[int, ...]) 
 def scale_factor(scale: jax.Array, sizes: jax.Array, count: int, weights_shape: tuple[int, ...],
                  dense: bool) -> jax.Array:
     """Broadcast a scaled packed matrix's `scale` to match `[count, width]` output rows under
-    `scale_checked`."""
+    `scale_checked`: a bank's scale one a group read at each of its group's rows by the one group-to-row
+    mapping (`templates.axes.at_rows`, placed where an Explicit axis splits the experts: train 1426's
+    review)."""
+    from dew.nn.kernels.templates import axes
+
     scale_checked(scale.shape, weights_shape)
     if scale.ndim == 0 or scale.shape == (1,) or dense:
         return scale
@@ -436,7 +453,7 @@ def scale_factor(scale: jax.Array, sizes: jax.Array, count: int, weights_shape: 
         return scale[None, :]
     if scale.shape[0] == 1:
         return scale[0]
-    return jnp.repeat(scale[:, 0, :], sizes, axis=0, total_repeat_length=count)
+    return axes.at_rows(scale[:, 0, :], (axes.GROUPS, 'columns'), sizes, count)
 
 
 def _block_values(codes: jax.Array, scales: jax.Array, block: int, dtype) -> jax.Array:
@@ -494,8 +511,11 @@ class NvFp4Block:
     def of(cls, matrix: NvFp4) -> "NvFp4Block":
         """A stored NVFP4 matrix (`NvFp4`, `[depth, width]`, its codes in the packed kernel's staged order)
         as the block-scaled products read it: `[1, width, depth]`, its depths in their own order, once its
-        form is this Dew's (`NvFp4.admitted`)."""
+        form is this Dew's (`NvFp4.admitted`) and its tensor scale one a matrix (a block product's scalar,
+        `bits.nvfp4_given_scale`; a columned one's columns are W4A16's, `gemm.nvfp4_product`)."""
         matrix.admitted()
+        if matrix.columned:
+            raise ValueError("a block-scaled NVFP4 product takes one tensor scale a matrix, not one a column")
         return cls(matrix.codes().T.astype(jnp.float4_e2m1fn)[None], jnp.asarray(matrix.scales)[None],
                    jnp.asarray(matrix.scale))
 
