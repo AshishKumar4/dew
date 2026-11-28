@@ -1388,8 +1388,8 @@ class GatedDeltaNet(nn.Module):
         # The chunked op forms the gates from their pre-activations and, where the layer has made its
         # parameters, gates and norms its output in its epilogue (`_chunk_hooks`), as the decode token does:
         # its gate, weight and output dtype, the sequence's either path's.
-        normed = not self.is_initializing()
         chunked = S > 1 or forked
+        normed = chunked and not self.is_initializing()
         hooks = self._chunk_hooks(operand, normed)
         sides = {'z': gate, 'weight': self.norm.variables['params']['weight']} if normed else {}
         normed_dtype = (self.norm.dtype or operand) if normed else None
@@ -1444,12 +1444,12 @@ class GatedDeltaNet(nn.Module):
                             state='recurrent_state', state_dtype=stored, conv_dtype=conv,
                             parts=heads, dtype=operand if ported else wide, token=token,
                             # The chunked op names the recurrence's output before its gated norm.
-                            named=not (chunked and normed))
+                            named=not normed)
         if token is not None:
             # The fused step gated and normalized its output (`_fused_hooks`), in its epilogue's dtype.
             return self.out_proj(out.astype(mixed.dtype))
 
-        if not (chunked and normed):
+        if not normed:
             # The scan read back in its projections' dtype, as Qwen3-Next's `.to(initial_dtype)` (the
             # query's); the norm scales, then the activation gates.
             out = self.norm(out.astype(mixed.dtype), gate)

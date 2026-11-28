@@ -234,8 +234,8 @@ class KimiDeltaAttention(nn.Module):
 
         # The chunked op, where the layer has made its parameters, gates and norms its output in its epilogue
         # (`_chunk_hooks`), as the decode token does.
-        normed = not self.is_initializing()
         chunked = S > 1 or forked
+        normed = chunked and not self.is_initializing()
         # The epilogue's gate, weight and output dtype, the sequence's either path's.
         hooks = self._chunk_hooks(projected.dtype, normed)
         sides = {'z': gate, 'weight': self.o_norm.variables['params']['weight']} if normed else {}
@@ -281,11 +281,11 @@ class KimiDeltaAttention(nn.Module):
                             state_dtype=wide, conv_dtype=wide, parts=heads,
                             dtype=projected.dtype if ported else wide, token=token,
                             # The chunked op names the recurrence's output before its gated norm.
-                            named=not (chunked and normed))
+                            named=not normed)
         if token is not None:
             # The fused step gated and normalized its output (`FUSED`), in its epilogue's dtype.
             return self.o_proj(out.astype(projected.dtype))
-        if not (chunked and normed):
+        if not normed:
             # The scan read back in its projections' dtype, as Kimi's delta attention reads it.
             out = self.o_norm(out.astype(projected.dtype), gate)
         return self.o_proj(out.reshape(B, S, self.qkv_features))
