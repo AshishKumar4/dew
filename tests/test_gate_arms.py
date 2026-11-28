@@ -22,7 +22,7 @@ from reference_error import (
 )
 from test_reference_error import exact_rows, noised_draw, stacked_arm, stacked_examples
 from test_reference_error_written import _cancelling, _combined
-from truths_ahead import UNPREPARED, compiled_truths
+from truths_ahead import UNPREPARED, compiled_truths, library_checked
 
 from dew.nn.kernels import gemm, generation, tuning
 from dew.nn.kernels.templates.hooks import Hook
@@ -207,6 +207,42 @@ def test_a_compile_only_gpu_prepare_holds_a_reference_of_its_own_compiler_option
         assert_as_exact(jax.jit(product), reference, normal_drawn(0x12062, (64, 32), (32, 16)),
                         "a reference of its own options", seeds=32, truth_fn=truth)
     assert not (tmp_path / "store" / UNPREPARED).exists(), (tmp_path / "store" / UNPREPARED).read_text()
+
+
+def test_a_prepared_library_arm_holds_its_call_for_the_run_that_loads_it(tmp_path, monkeypatch):
+    """A library reference (`generation_support.cublas_compiled`) prepared by a compile-only sm90 GPU-tier
+    part holds the library call its executable must make (`library_call`) beside its program, which the run
+    that loads the executable checks it by (`truths_ahead.library_checked`), so no compile of its own beside
+    the prepared one checks it (row 14096: its check compiled the arm again, natively, on the GPU)."""
+    import generation_support
+    import model_flows
+    import tier_wire
+    from truths_ahead import HELD, prepared
+
+    monkeypatch.setenv(model_flows.TOPOLOGY, str(generation_support.node_topology(tmp_path / "topology.bin",
+                                                                                   gpu="sm90")))
+    monkeypatch.setenv(tier_wire.PREPARE, "1")
+
+    def product(rows, matrix):
+        return jnp.dot(rows, matrix, preferred_element_type=jnp.float32)
+
+    draw = normal_drawn(0x14096, (64, 32), (32, 16))
+    truth = as_given(lambda rows, matrix: np.asarray(rows, np.float64) @ np.asarray(matrix, np.float64))
+    reference = generation_support.cublas_compiled(product, draw(0), "__cublas$lt$matmul")
+    with prepared(tmp_path / "store", stamp="library", target=generation_support.node_target()):
+        assert_as_exact(jax.jit(product), reference, draw, "a library reference", seeds=32, truth_fn=truth)
+    calls = {record.get("library_call") for held in (tmp_path / "store").glob(f"*/{HELD}")
+             for record in pickle.loads(held.read_bytes()).values()}
+    assert "__cublas$lt$matmul" in calls, calls
+
+
+def test_a_library_arms_executable_of_xlas_own_dot_is_refused():
+    """An executable a library arm's check reads (`truths_ahead.library_checked`) that makes no call of its
+    library, XLA's own dot, is refused."""
+    rows, matrix = np.ones((8, 4), np.float32), np.ones((4, 2), np.float32)
+    executable = jax.jit(jnp.dot).lower(rows, matrix).compile()
+    with pytest.raises(AssertionError):
+        library_checked(executable, "__cublas$lt$matmul", "a library arm")
 
 
 def test_a_written_twin_of_a_cublas_reference_keeps_its_compiler_options():

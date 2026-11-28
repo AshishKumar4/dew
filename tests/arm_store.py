@@ -22,6 +22,7 @@ from arm_forms import (
     _own_function,
     _refuse_numpy_arms,
     _RunToRun,
+    _signature,
     _Windowed,
     _written_references,
     _written_role,
@@ -33,7 +34,7 @@ from float64_terms import POWER, evaluated, evaluated_on, static, traced
 from reference_error import _of_float64, _site, _SiteTerms, _sizing_seeds, _truth_program
 from store_wire import COMPILED
 from tier_wire import stop_past_cap
-from truths_ahead import AT_RUN, CompiledTruths, arm_role, named
+from truths_ahead import AT_RUN, CompiledTruths, arm_role, library_call, library_checked, named
 
 from dew.parity_stages import staged_units
 
@@ -223,6 +224,8 @@ def _arm_program(programs: dict, held: dict, role: str, fn, inputs, *, reference
         return _arm_program(programs, held, role, fn.fn, jax.tree.map(lambda leaf: leaf[0], inputs),
                             reference=reference, written=written)
     own = own_options(fn) if written else None
+    # Its library's call, its twin's too (`truths_ahead.library_arm`), read before a twin's own function.
+    call = library_call(fn)
     fn = _own_function(fn) if written else fn
     name = named(role, inputs)
     traced_fn = unrewritten(fn) if reference and not _declared(fn) else fn
@@ -238,7 +241,7 @@ def _arm_program(programs: dict, held: dict, role: str, fn, inputs, *, reference
         with generation.routes() as reported, tuning.seen() as launched:
             out = traced_fn.trace(*inputs).out_info
         held[name] = {"constants": [], "tree": jax.tree.structure(out), "routes": list(reported),
-                      "launches": launched.held()}
+                      "launches": launched.held(), "library_call": call}
         programs[name] = (Whole(traced_fn, held[name]), [*map(jax.typeof, leaves)])
         return out
     with generation.routes() as reported, tuning.seen() as launched:
@@ -264,7 +267,7 @@ def _arm_program(programs: dict, held: dict, role: str, fn, inputs, *, reference
     # The routes its trace reported and the launches it took, which its run, calling the program and tracing
     # none, reports at each call (`truths_ahead.CompiledTruths.ran`), until a lowering of it takes its own
     # (`again`).
-    held_now = {"routes": list(reported), "launches": launched.held()}
+    held_now = {"routes": list(reported), "launches": launched.held(), "library_call": call}
     _hold(programs, held, name, closed, jax.tree.structure(shapes), inputs, again)
     with_own_options(programs[name][0], own)
     held[name].update(held_now)
@@ -336,30 +339,73 @@ def _stored_arm(store: CompiledTruths, label: str, given_fn, arm, role: str, *, 
     named_role = arm_role(role, given_fn, label)
     if named_role is None:
         store.unprepared(f"{label}: its {role} arm has no statement of what it computes")
-        return arm
+        return _library_checked(arm, given_fn, f"{label}: its {role} arm")
     at_run = store.at_run(_unlowered_arm(armed(label, written), named_role)) or store.at_run(
         armed(label, written))
     if at_run is not None:
         # Compiled on its GPU in the run, as its prepare stated (`_compile_arms`).
         store.unprepared(f"{label}: its {role} arm: {at_run}", AT_RUN)
-        return arm
+        return _library_checked(arm, given_fn, f"{label}: its {role} arm")
     if not store.holds(armed(label, written)):
         store.unprepared(f"{label}: its {role} arm ran unprepared: its prepare wrote the site's truths and "
                          "compiled none of its arms")
-        return arm
+        return _library_checked(arm, given_fn, f"{label}: its {role} arm")
     return _ahead_arm(given_fn, arm, functools.partial(store.ran, armed(label, written)), named_role)
+
+
+def _library_checked(arm, given_fn, label: str):
+    """`arm`, a site's arm its run compiles on its GPU (unprepared, unnamed, or at run), held to its library's
+    call where `given_fn`'s program (`_adapted`) is a library arm (`truths_ahead.library_arm`) and it runs on
+    a GPU (`truths_ahead.library_checked`), no prepare having compiled it (row 14096); `arm` as it is
+    otherwise."""
+    def checked(given, compiled):
+        call = library_call(given)
+        if call is None or jax.default_backend() != "gpu":
+            return compiled
+        return _LibraryChecked(compiled, call, label)
+
+    return _adapted(given_fn, arm, checked)
+
+
+class _LibraryChecked:
+    """A library arm (`arm`, as the gate runs it) whose program at each call's signature
+    (`arm_forms._signature`), the one it runs (its `lower`, under its switches: `Unrewritten`'s, a twin's as
+    written, a pair's selected), is compiled, checked to call `call` and run, once a signature
+    (`_library_checked`), its other attributes the arm's."""
+
+    def __init__(self, arm, call: str, label: str):
+        self.arm, self.call, self.label, self.executables = arm, call, label, {}
+
+    def __call__(self, *inputs):
+        key = _signature(inputs)
+        if key not in self.executables:
+            executable = self.arm.lower(*inputs).compile()
+            library_checked(executable, self.call, self.label)
+            self.executables[key] = executable
+        return self.executables[key](*inputs)
+
+    def __getattr__(self, name):
+        return getattr(self.arm, name)
+
+
+def _adapted(given, compiled, leaf: Callable):
+    """A site's arm (`given`, as the site passed it; `compiled`, as the gate runs it) with `leaf(given,
+    compiled)` in place of the program it holds, within a run-to-run declaration and a window loop, which
+    keep their meaning: the one walk of the arm's adapters, for its prepared calls (`_ahead_arm`) and its
+    run's checks (`_library_checked`) alike."""
+    if isinstance(given, _RunToRun):
+        return _RunToRun(_adapted(given.fn, compiled.fn, leaf), given.why)
+    if isinstance(given, _Windowed):
+        return _Windowed(_adapted(given.fn, compiled.fn, leaf))
+    return leaf(given, compiled)
 
 
 def _ahead_arm(given, compiled, call: Callable, role: str):
     """A site's arm (`given`, as the site passed it) whose programs a store compiled ahead (`_compile_arms`),
     as the gate runs it (`compiled`, `arm_forms._compiled`'s): each plain program's call its draw's executable
     (`call(role, inputs)`, `truths_ahead.CompiledTruths.ran`), within a run-to-run declaration and a window
-    loop (an arm that holds a program, `_holds_program`)."""
-    if isinstance(given, _RunToRun):
-        return _RunToRun(_ahead_arm(given.fn, compiled.fn, call, role), given.why)
-    if isinstance(given, _Windowed):
-        return _Windowed(_ahead_arm(given.fn, compiled.fn, call, role))
-    return _Ahead(compiled, functools.partial(call, role))
+    loop (an arm that holds a program, `_holds_program`, `_adapted`)."""
+    return _adapted(given, compiled, lambda _, leaf: _Ahead(leaf, functools.partial(call, role)))
 
 
 class _Ahead:

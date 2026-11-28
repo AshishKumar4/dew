@@ -924,7 +924,7 @@ def test_the_accurate_form_is_one_option_away():
 
 
 def test_narrowed_operands_hand_back_their_gradients_unrounded():
-    """A call whose key and value arrive wider than the mainloops compute them (`operand_dtype`, a sharding
+    """A call whose key and value arrive wider than the mainloops compute them (`operand_dtypes`, a sharding
     wrapper's, so its partial gradients sum wide and round once) is on par with the reference path (check
     1), its forward and its key's and value's gradients, which it hands back in their own fp32."""
     spans = template.spans(QUERIES, KEYS, ROWS, causal=True)
@@ -936,7 +936,8 @@ def test_narrowed_operands_hand_back_their_gradients_unrounded():
 
     def wide(query, key, value, dout):
         def attend(query, key, value):
-            return attention_route.attend(query, key, value, spans, operand_dtype=jnp.bfloat16)
+            return attention_route.attend(query, key, value, spans,
+                                          operand_dtypes=(jnp.bfloat16, jnp.bfloat16))
         return pulled_over(attend, query, key.astype(jnp.float32), value.astype(jnp.float32), dout)
 
     def routed(query, key, value, dout):
@@ -1552,7 +1553,7 @@ def test_a_value_given_as_its_keys_leading_columns_is_a_static_argument_of_a_jit
 
 def test_backward_route_declines_and_runs_with_its_rounded_flag():
     """Row 6729: `attention_mosaic.backward_declined` and `attention_route.backward` accept `rounded=False`
-    consistently, matching `operand_dtype`'s unrounded key/value gradient execution."""
+    consistently, matching `operand_dtypes`' unrounded key/value gradient execution."""
     from dew.nn.kernels.templates import attention_mosaic, attention_route
 
     q = jnp.zeros((1, 64, 1, 64), jnp.bfloat16)

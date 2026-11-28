@@ -134,7 +134,7 @@ def softmax_gradients(logits, q, k, values, dout, peak, total, anchor, delta, sl
     reads the logits, each masked where the tile's queries do not see its keys (`seen`: an empty query's
     product, or a padded query's hook derivative, need not be finite), and the queries', keys' and values'
     gradients their products at `scale` (dV from the dropped unnormalized weights against `dO / T`,
-    `value_operands`' order; with `normalized_values`, bf16's, the dropped normalized weights against `dO`
+    `value_weights`' order; with `normalized_values`, bf16's, the dropped normalized weights against `dO`
     as it is, FlashAttention's order, which holds no `dO / T` tile beside the step's: a Pallas-Triton dK/dV
     walk's shared memory 93,696 bytes against its hand form's 73,728 at width 64 on an sm86, dd-tsm), each
     product Dew's (`float32_einsum`), the `accurate` form's cotangents where it asks

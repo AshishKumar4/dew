@@ -41,6 +41,7 @@ from numpy.lib.array_utils import normalize_axis_tuple
 from dew._hashing import fmix32
 from dew.nn.aligned import aligned_sum
 from dew.nn.derivatives import Protected, contracted
+from dew.nn.fake_quant import straight_through
 from dew.nn.float_bits import binade_of, raised_exactly
 from dew.nn.kernels import generation, tuning
 from dew.nn.kernels.templates import band, scaled_contraction
@@ -290,11 +291,11 @@ def spans(queries: int, keys: int, batch: int, *, causal: bool = False, sliding_
         # The query's document's keys within the window's places run together in document order, since
         # their places never decrease along it, and their first and last key indices bound the span.
         before, after = window_sides(causal, sliding_window)
-        query_places, key_places = _widened(positions)
+        query_places, key_places = widened_places(positions)
         ordered = _least_after(jnp.take_along_axis(key_places, order, axis=1),
                                None if key_ids is None else jnp.take_along_axis(key_ids, order, axis=1))
-        start, end = _narrowed(start, end, order, run_lo, run_hi, ordered, _moved(query_places, -before),
-                               _moved(query_places, after))
+        start, end = _narrowed(start, end, order, run_lo, run_hi, ordered,
+                               moved_places(query_places, -before), moved_places(query_places, after))
     elif sliding_window is not None and positions is None:
         # No two places of the call lie further apart than its queries and keys, so a wider window
         # keeps what that one does, and its bounds stay within int32.
@@ -385,8 +386,9 @@ def _read_runs(runs: jax.Array, start: jax.Array, end: jax.Array, keys: int, nar
     by_places, windowed, positions = narrowings
     if windowed is not None:
         before, after = windowed
-        query_places, key_places = _widened(positions)
-        by_places = [*by_places, (key_places, _moved(query_places, -before), _moved(query_places, after))]
+        query_places, key_places = widened_places(positions)
+        by_places = [*by_places, (key_places, moved_places(query_places, -before),
+                                  moved_places(query_places, after))]
     start, end = _within_runs(runs, start, end, keys, by_places)
     place, own, block_groups = blocks
     if block_groups is None:
@@ -474,11 +476,11 @@ def _least_after(places: jax.Array, ids: jax.Array | None) -> jax.Array:
     return jax.lax.associative_scan(least, (places, ends), reverse=True, axis=1)[0]
 
 
-def _widened(positions: tuple[jax.Array, jax.Array]) -> tuple[jax.Array, jax.Array]:
+def widened_places(positions: tuple[jax.Array, jax.Array]) -> tuple[jax.Array, jax.Array]:
     """The queries' and keys' places in one integer dtype that holds both, in which a window's bounds move
-    (`_moved`): a bound past the narrower one's range is still a place the other may hold. A signed and an
-    unsigned dtype that no enabled integer dtype holds both of (int64 beside uint64; int32 beside uint32
-    without x64), whose promotion would leave integers or narrow one, are refused for one dtype."""
+    (`moved_places`): a bound past the narrower one's range is still a place the other may hold. A signed
+    and an unsigned dtype that no enabled integer dtype holds both of (int64 beside uint64; int32 beside
+    uint32 without x64), whose promotion would leave integers or narrow one, are refused for one dtype."""
     query_places, key_places = (jnp.asarray(places) for places in positions)
     ranges = [jnp.iinfo(places.dtype) for places in (query_places, key_places)]
     least, largest = min(int(bounds.min) for bounds in ranges), max(int(bounds.max) for bounds in ranges)
@@ -491,7 +493,7 @@ def _widened(positions: tuple[jax.Array, jax.Array]) -> tuple[jax.Array, jax.Arr
                      "integer dtype that holds both: pass them in one")
 
 
-def _moved(places: jax.Array, by: int) -> jax.Array:
+def moved_places(places: jax.Array, by: int) -> jax.Array:
     """`places` moved by `by`, exactly, in their own integer dtype, held at its least and largest rather
     than wrapping: a window's bound past either end of the dtype keeps every place on that side. The move
     runs on the places' distances from the dtype's least, unsigned, which hold any shift a window makes."""
@@ -1366,8 +1368,21 @@ def score_modded(products: jax.Array, hooks: Hooks) -> jax.Array:
     return jax.vmap(jax.vmap(one, in_axes=(None, 0)), in_axes=(0, None))(jnp.arange(batch), jnp.arange(heads))
 
 
+@overload
 def reference(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks | None = None,
-              *, scale: float | None = None, residuals: bool = False):
+              *, scale: float | None = None, residuals: Literal[False] = False, rounded_to=None) -> jax.Array:
+    ...
+
+
+@overload
+def reference(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks | None = None,
+              *, scale: float | None = None, residuals: Literal[True], rounded_to=None
+              ) -> tuple[jax.Array, jax.Array, jax.Array]:
+    ...
+
+
+def reference(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks | None = None,
+              *, scale: float | None = None, residuals: bool = False, rounded_to=None):
     """The template's arithmetic in XLA ops: `query` `[B, Q, H, D]` over `key` and `value` `[B, K, Hk, D]` and
     `[B, K, Hk, Dv]`, a query head reading the key head it shares with `H // Hk` others, the keys `spans`
     leaves it. As the kernels compute it: products of the inputs accumulated in fp32 (fp64 for fp64
@@ -1379,8 +1394,11 @@ def reference(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpan
     no state gives zeros. With `residuals`, also each query's running maximum `m` and denominator `total`
     `[B, H, Q]` (natural log, unnormalized), in the softmax's dtype, a query that sees no key and starts
     from no state holding 0 for both, so every residual is finite; a softmax resumed from them (`Initial`)
-    starts such a query from `m = -inf`. No hooks where `hooks` is None."""
+    starts such a query from `m = -inf`. No hooks where `hooks` is None. `rounded_to`, where given, is the
+    dtype the probabilities round to in the values' stead: values a caller widened (its copies' gradients
+    summed wide) weighed as their own dtype's (`attention_products._widely`)."""
     hooks = Hooks() if hooks is None else hooks
+    rounded_to = value.dtype if rounded_to is None else jnp.dtype(rounded_to)
     walked_initial(hooks.initial)
     batch, queries, heads, _ = query.shape
     kv_heads = key.shape[2]
@@ -1405,25 +1423,27 @@ def reference(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpan
     carried = jnp.where(jnp.isfinite(m0), jnp.exp(m0 - safe), 0)
     total = total0 * carried + jnp.sum(p, axis=-1)
 
-    def valued(weights: jax.Array, *, cotangent_wide: bool = False) -> jax.Array:
-        # The weights narrowed to the values' dtype times the values, a query group's over its key head. With
-        # `cotangent_wide` the weights' cotangent dO·Vᵀ fp32, the product's value and the values' cotangent
-        # the narrowed one's as they are: an fp16 dropping call's reached 8 x 2^15 before the small weight
-        # that takes it finite, inf in fp16 (row 9506's gradients).
+    def valued(weights: jax.Array, *, bound: float | None = None) -> jax.Array:
+        # The weights narrowed to the values' dtype times the values, a query group's over its key head.
+        # Values a caller widened (`rounded_to`), and an fp16 dropping call's, take their weights rounded
+        # straight through, held wide, so the weights' and the values' cotangents are the wide product's
+        # (an fp16 dropping call's reached 8 x 2^15 before the small weight that takes it finite, inf in
+        # fp16, row 9506's gradients); where a dropping call's multiplier `bound` can take a weight past
+        # fp16's largest, at each row's power of two, as the kernels' scaled parts hold them
+        # (`attention_algebra.weights_parts`): a kept weight of 1 times a multiplier of 2^16 (train 1452's
+        # review).
         def product(grouped, operand):
             return float32_einsum("bhgqk,bkhd->bhgqd", grouped, operand, precision=REFERENCE_PRECISION,
                                   preferred_element_type=wide).reshape(batch, heads, queries, value.shape[-1])
 
         grouped = weights.reshape(batch, kv_heads, heads // kv_heads, queries, spans.keys)
-        narrowed = product(grouped.astype(value.dtype), value)
-        if not cotangent_wide:
-            return narrowed
-        # Its value the narrowed product's; its derivatives at every order the same bilinear product's in
-        # fp32, the narrowing straight through, both operands live (`derivative_of`).
-        rounded = grouped.astype(value.dtype).astype(grouped.dtype)
-        wide_product = product(grouped + jax.lax.stop_gradient(rounded - grouped),
-                               value.astype(grouped.dtype))
-        return jax.lax.stop_gradient(narrowed) + derivative_of(wide_product)
+        sixteen = bound is not None and jnp.dtype(rounded_to) == jnp.float16
+        if rounded_to == value.dtype and not sixteen:
+            return product(grouped.astype(rounded_to), value)
+        past = bound is not None and sixteen and bound > float(jnp.finfo(jnp.float16).max)
+        rounded = (_narrowed_held(grouped, rounded_to) if past
+                   else grouped.astype(rounded_to).astype(grouped.dtype))
+        return product(straight_through(grouped, rounded), value.astype(grouped.dtype))
 
     drop = hooks.drop
     if hooks.rounds is not None:
@@ -1434,8 +1454,8 @@ def reference(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpan
         acc = acc0 * carried[..., None] + valued(p)
         normalized = jnp.where(total[..., None] > 0, acc / jnp.where(total > 0, total, 1)[..., None], 0)
         if hooks.initial is None or hooks.initial.valueless:
-            normalized = held_mean(acc, total, value.dtype, functools.partial(
-                _scaled_mean, logits, value, m0, total0, acc0))
+            normalized = held_mean(acc, total, rounded_to, functools.partial(
+                _scaled_mean, logits, value, m0, total0, acc0, rounded_to))
         if hooks.output.fn is None and jnp.dtype(query.dtype).itemsize == 2:
             # Rounded to odd for its narrowing, as the kernels' quotients outside a register epilogue are.
             normalized = narrowing_settled(normalized, acc, total, query.dtype)
@@ -1454,11 +1474,23 @@ def reference(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpan
         drawn = jax.vmap(jax.vmap(multiplier, in_axes=(None, 0)), in_axes=(0, None))(jnp.arange(batch),
                                                                                     jnp.arange(heads))
         normalized = acc0 * (carried * inverse)[..., None] + valued((p * inverse[..., None]) * drawn,
-                                                                   cotangent_wide=value.dtype == jnp.float16)
+                                                                   bound=drop.bound)
 
     out = output_hooked(normalized, hooks.output.fn, hooks.output.sides)
     out = jnp.swapaxes(out.astype(query.dtype), 1, 2)
     return (out, safe, total) if residuals else out
+
+
+def _narrowed_held(x: jax.Array, dtype) -> jax.Array:
+    """`x` rounded to `dtype`, held in `x`'s own dtype; an entry past `dtype`'s range rounded at its row's
+    power of two (its last axis', the row's largest at `2^13`) instead, as the kernels' scaled parts hold a
+    dropping call's weights (`attention_algebra.weights_parts`), every other entry as it narrows."""
+    largest = jnp.max(jnp.abs(x), axis=-1, keepdims=True, initial=0)
+    _, exponent = jnp.frexp(jnp.where(largest > 0, largest, 1))
+    shift = 14 - exponent
+    scaled = power2(power2(x, shift).astype(dtype).astype(x.dtype), -shift)
+    past = jnp.abs(x) > float(jnp.finfo(dtype).max)
+    return jnp.where(past, scaled, x.astype(dtype).astype(x.dtype))
 
 
 def saturated(x: jax.Array, finite_operands: jax.Array, dtype=None) -> jax.Array:
@@ -1487,7 +1519,7 @@ def held_mean(acc: jax.Array, total: jax.Array, dtype, law) -> jax.Array:
 
 
 def _scaled_mean(logits: jax.Array, value: jax.Array, m0: jax.Array, total0: jax.Array,
-                 acc0: jax.Array) -> jax.Array:
+                 acc0: jax.Array, rounded_to=None) -> jax.Array:
     """The mean of the values `[B, K, Hk, Dv]` at the logits `[B, H, Q, K]` beside a state (its maximum `m0`
     and mass `total0`, `[B, H, Q]`, and its sums `acc0`, `[B, H, Q, Dv]`, a valueless state's zero), `[B, H,
     Q, Dv]`, as the reference forms it (`valued`): each key's mass at the row's maximum, held out of the graph
@@ -1504,7 +1536,10 @@ def _scaled_mean(logits: jax.Array, value: jax.Array, m0: jax.Array, total0: jax
     reached = jnp.maximum(m0, jnp.max(logits, axis=-1, initial=-jnp.inf))
     shift = jax.lax.stop_gradient(jnp.where(jnp.isfinite(reached), reached, 0))
     masses = jnp.where(jnp.isfinite(logits), jnp.exp(logits - shift[..., None]), 0)
-    narrowing = jax.lax.stop_gradient(masses.astype(value.dtype).astype(masses.dtype) - masses)
+    # The masses rounded where the values' own dtype rounds them (`rounded_to`: values a caller widened
+    # weigh at their own, `reference`), their cotangents wide.
+    rounded_to = value.dtype if rounded_to is None else rounded_to
+    narrowing = jax.lax.stop_gradient(masses.astype(rounded_to).astype(masses.dtype) - masses)
     carried = jnp.where(jnp.isfinite(m0), jnp.exp(m0 - shift), 0)
     seen = jax.lax.stop_gradient(jnp.sum(masses, axis=-1) + total0 * carried) > 0
     form = scaled_contraction.Form(
@@ -1664,13 +1699,13 @@ def head_width(width: int) -> int:
 
 
 def _padded(param: Side, queries: int, keys: int, value_width: int, *, widened: bool = True) -> jax.Array:
-    """A hook parameter at the padded call's shape, in fp32 as the kernels compute a score or output hook
-    (its gradient returns in its own dtype), in its own where not `widened` (a prologue's, which takes it as
-    the reference gives it, `prologued`): zeros past its queries, keys and value width, and a head vector
-    at a power of two. A width parameter's `value_width` the width it pads to, its prologue's operand's."""
-    value = param.value
-    if widened and jnp.issubdtype(value.dtype, jnp.floating):
-        value = value.astype(jnp.float32)
+    """A hook parameter at the padded call's shape, in fp32 as the kernels compute a score hook (its gradient
+    returns in its own dtype, `kept_value`), in its own where not `widened` (a prologue's, which takes it as
+    the reference gives it, `prologued`; an output hook's, which `attention_algebra.finish` widens as it
+    applies the hook, so a 16-bit gate reaches a kernel at its own bytes, no convert before it: 54 us of a
+    d128 gated forward's 679, M-NA-47): zeros past its queries, keys and value width, and a head vector at
+    a power of two. A width parameter's `value_width` the width it pads to, its prologue's operand's."""
+    value = kept_value(param.value) if widened else param.value
     match kind_of(param):
         case Kind.HEAD:
             return jnp.pad(value, (0, power_of_two(value.shape[0]) - value.shape[0]))
@@ -1781,7 +1816,8 @@ def padded_call(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySp
     return PaddedCall(pad(query, padded_q, padded_d), padded_key, padded_value, start, end,
                    pad_ids(spans.query_ids, padded_q), pad_ids(spans.key_ids, padded_k),
                    tuple(_padded(param, padded_q, padded_k, padded_dv) for param in hooks.score.sides),
-                   tuple(_padded(param, padded_q, padded_k, padded_dv) for param in hooks.output.sides),
+                   tuple(_padded(param, padded_q, padded_k, padded_dv, widened=False)
+                         for param in hooks.output.sides),
                    queries, keys, table, page, spans.per_span,
                    tuple(_padded(param, padded_q, padded_k, padded_d, widened=False)
                          for param in hooks.query.sides))
@@ -1790,6 +1826,11 @@ def padded_call(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySp
 def kept_dtype(dtype) -> str:
     """A hook parameter's dtype in the kernels: fp32 for a floating one (`padded_call`), else its own."""
     return "float32" if jnp.issubdtype(dtype, jnp.floating) else jnp.dtype(dtype).name
+
+
+def kept_value(value: jax.Array) -> jax.Array:
+    """A hook parameter's values as the kernels compute its hook on them, in `kept_dtype`."""
+    return value.astype(kept_dtype(value.dtype))
 
 
 def floating_params(params) -> list[int]:
@@ -2353,7 +2394,7 @@ def gradients(launch: Callable, query: jax.Array, key: jax.Array, value: jax.Arr
         state, starts, peak, total, mass, delta, low, lost, cotangent,
         functools.partial(shifted, shift=shift[:, :, None]))
     # Unrounded (`rounded` False), dK and dV stay in at least fp32 for a caller that sums them across
-    # shards first and rounds once (`attention_route.attend`'s `operand_dtype`).
+    # shards first and rounds once (`attention_route.attend`'s `operand_dtypes`).
     key_dtype, value_dtype = ((key.dtype, value.dtype) if rounded
                               else (at_least_fp32(key.dtype), at_least_fp32(value.dtype)))
     found = Gradients(dq[:, :queries, :, :width].astype(query.dtype),

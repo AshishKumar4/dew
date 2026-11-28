@@ -10,6 +10,7 @@ def packed_banks(experts: int, depth: int, width: int, seed: int):
     (an MXFP4 checkpoint's, `codecs.mxfp4_as_nvfp4`), and their values `[experts, depth, width]` float32,
     exactly."""
     from dew.nn.kernels.formats import NvFp4
+    from dew.quantization import packed_values
 
     rng = np.random.default_rng(seed)
     codes = rng.integers(0, 16, (experts, depth, width), dtype=np.uint8)
@@ -17,5 +18,5 @@ def packed_banks(experts: int, depth: int, width: int, seed: int):
         jnp.float8_e4m3fn)
     scale = np.ldexp(np.float32(1), rng.integers(-4, 0, (experts,))).astype(np.float32)
     bank = NvFp4.of(codes, scales, scale)
-    values = np.asarray(bank.decoded(), np.float32) * np.asarray(bank.factor)[:, None, None]
+    values = np.asarray(packed_values(bank), np.float32)
     return bank, values

@@ -11,11 +11,10 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from generation_support import COMPILES_ON_CPU, INTERPRETS
-from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 from reference_error import equations
 
-from dew.nn.kernels.templates import bundles, mosaic_sm80
+from dew.nn.kernels.templates import bundles, mosaic_sm80, swizzling
 
 pytestmark = pytest.mark.kernel
 
@@ -40,7 +39,7 @@ def _staged_three(x, *, interpret: bool, batched: bool):
                 for out, buffer in zip(outs, buffers, strict=True):
                     out[...] = family.tile_of(buffer).astype(jnp.float32)
 
-        pl.run_scoped(scoped, *(plgpu.SMEM((16, 64), jnp.bfloat16) for _ in range(3)))
+        swizzling.run_scoped(scoped, *(plgpu.SMEM((16, 64), jnp.bfloat16) for _ in range(3)))
 
     out = jax.ShapeDtypeStruct((16, 64), jnp.float32)
     return family.kernel(body, out_type=(out,) * 3, grid=(1,), grid_names=("programs",), consumers=1,
@@ -131,7 +130,7 @@ def _staged_twice(x):
             first[...] = read.astype(jnp.float32)
             second[...] = reread.astype(jnp.float32)
 
-        pl.run_scoped(scoped, plgpu.SMEM((16, 64), jnp.bfloat16))
+        swizzling.run_scoped(scoped, plgpu.SMEM((16, 64), jnp.bfloat16))
 
     out = jax.ShapeDtypeStruct((16, 64), jnp.float32)
     return family.kernel(body, out_type=(out, out), grid=(1,), grid_names=("programs",), consumers=1,

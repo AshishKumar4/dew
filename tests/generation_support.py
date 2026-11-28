@@ -173,23 +173,21 @@ CUBLAS = {"xla_gpu_enable_triton_gemm": False}
 
 def cublas_compiled(fn, inputs, call: str):
     """`fn`, a program whose dots are a library's GEMMs, compiled as cuBLAS runs each (`CUBLAS`): a library
-    arm held to cuBLAS's on the same inputs (docs/design/testing.md). On a GPU its compiled program on
-    `inputs` is checked, by its instructions as XLA's own schema reads them
-    (`dew.telemetry.instrumentation.hlo_instructions`), to call cuBLAS's `call` and to run no dot of XLA's
-    own, fused or not, so no lane flag or fusion choice gives it another GEMM: `__cublas$lt$matmul`, as XLA
-    calls a GEMM through cuBLASLt on a Hopper (a deviceless sm90 compile's), cuBLASLt's FP8
-    `__cublas$lt$matmul$f8`. On a CPU its dots are XLA's own."""
+    arm held to cuBLAS's on the same inputs (docs/design/testing.md). On a GPU the executable that runs it is
+    checked (`truths_ahead.library_checked`) to call cuBLAS's `call` and to run no dot of XLA's own, fused
+    or not, so no lane flag or fusion choice gives it another GEMM: `__cublas$lt$matmul`, as XLA calls a
+    GEMM through cuBLASLt on a Hopper (a deviceless sm90 compile's), cuBLASLt's FP8
+    `__cublas$lt$matmul$f8`. Within a store of programs compiled ahead (`store_wire.COMPILED`) that is the
+    prepared executable as its run loads it (`truths_ahead.CompiledTruths._site`), or its run's own compile
+    where none was prepared (`arm_store._library_checked`), never a compile beside it (row 14096); outside
+    one, its program compiled here at `inputs`. On a CPU its dots are XLA's own."""
     from reference_error import without_ynn
+    from store_wire import COMPILED
+    from truths_ahead import library_arm, library_checked
 
-    from dew.telemetry.instrumentation import hlo_instructions
-
-    compiled = without_ynn(fn, compiler_options=CUBLAS)
-    if jax.default_backend() == "gpu":
-        instructions = hlo_instructions(compiled.lower(*inputs).compile()).values()
-        targets = {each.target for each in instructions} - {""}
-        assert call in targets, f"the library arm calls {sorted(targets)}, no {call}"
-        assert not any(each.op == "dot" or "dot" in each.fused for each in instructions), \
-            "the library arm runs a dot of XLA's own"
+    compiled = library_arm(without_ynn(fn, compiler_options=CUBLAS), call)
+    if jax.default_backend() == "gpu" and COMPILED.get() is None:
+        library_checked(compiled.lower(*inputs).compile(), call, "the library arm")
     return compiled
 
 

@@ -9,6 +9,8 @@ import jax
 import jax.numpy as jnp
 from jax.experimental import pallas as pl
 
+from dew.nn.sharding import explicit_spec, whole_along
+
 WHOLE = slice(None)
 """An axis taken whole (a view's slice along an axis it does not cut)."""
 
@@ -73,9 +75,20 @@ def at_rows(array: jax.Array, axes: Sequence[str], group_sizes: jax.Array, rows:
     group's value at each of its rows, a row past the groups' the last's (its output unrouted). Its
     derivative, the repetition's transpose, sums each group's rows' cotangents: the group-aware reduction
     its gradient is. The one group-to-row mapping: XLA's program's (`templates.gemm.sides.rows`) and a
-    launch's of no depth (`mosaic_gpu.gmm`)."""
-    return jnp.repeat(array, group_sizes.astype(jnp.int32), axis=list(axes).index(GROUPS),
-                      total_repeat_length=rows)
+    launch's of no depth (`mosaic_gpu.gmm`). Where an Explicit axis splits the groups (an expert-sharded
+    bank's column scales), the rows are placed as the operand is but whole along them, which JAX asks to be
+    told (train 1409's review); the group sizes are read whole wherever they lie, an Explicit split of them
+    gathered first (train 1437's review: a split `[1, 1, 1, 1]` repeated a replicated side's groups by each
+    device's half)."""
+    axis = list(axes).index(GROUPS)
+    sizes = whole_along(group_sizes.astype(jnp.int32), 0)
+    placed = explicit_spec(array)
+    whole = None
+    if placed is not None and placed.spec[axis] is not None:
+        spec = jax.sharding.PartitionSpec(*(None if at == axis else entry
+                                            for at, entry in enumerate(placed.spec)))
+        whole = jax.sharding.NamedSharding(placed.mesh, spec)
+    return jnp.repeat(array, sizes, axis=axis, total_repeat_length=rows, out_sharding=whole)
 
 
 def by_rows(tile: jax.Array, axes: Sequence[str], rows: int) -> jax.Array:

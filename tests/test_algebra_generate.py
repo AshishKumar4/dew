@@ -30,6 +30,7 @@ from dew.algebra import (
     recurrence_cases,
     terms,
 )
+from dew.nn.kernels import generation
 from dew.sampling import guidance_cases
 
 FORMS = [(name, policy) for name, form in generate.DECLARATIONS.items() for policy in form.cases.policies]
@@ -645,6 +646,25 @@ def test_the_chooser_measures_each_pair_of_distinct_programs_once():
     assert len(set(pairs)) == len(pairs)
     proposed = [program(candidate.function) for candidate in choice.candidates]
     assert len(set(proposed)) == len(proposed)
+
+
+def test_a_stable_forms_cases_are_generated_under_their_policys_numerics():
+    """A stable form's declaration is traced and chosen under each policy's numerics
+    (`generation.run_precision`), as a component's is: one computing by `generation.numerics()` generates each
+    policy's own program, its generated entrypoint (`_written`, loaded) three times its operand for "accurate"
+    and twice for "default", where both were generated under the process's own numerics (row 14104)."""
+    def scaled(x):
+        return x * (3.0 if generation.numerics().forms == "accurate" else 2.0)
+
+    cases = generate.Cases(((jax.ShapeDtypeStruct((8,), jnp.float32),),), generate.normal_operands, seeds=2)
+    found = generate._chosen("modal.scaled", generate.StableForm(scaled, cases))
+    emitted, factored = generate._emitted({"modal": found})
+    _, admitted = generate._written("modal", found, ["modal.scaled"], emitted["modal"], factored)
+    entry = printed.loaded_module(admitted, "modal")["scaled"]
+    assert callable(entry)
+    x = np.arange(8, dtype=np.float32)
+    np.testing.assert_array_equal(entry(x, policy="default"), x * 2)
+    np.testing.assert_array_equal(entry(x, policy="accurate"), x * 3)
 
 
 def test_one_name_declared_in_two_modules_generates_each_body_apart():

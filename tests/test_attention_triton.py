@@ -637,13 +637,14 @@ def test_an_output_hook_of_the_call_s_own_width_keys_and_runs():
                     seeds=SEEDS)
 
 
-def _check_zero_qkv_dv(draw, label: str, *, tokens: int, chunk: int | None = None) -> None:
-    """Check Triton backward's `dV` over equal zero Q/K/V against `template.reference`."""
+def _check_zero_qkv_dv(draw, label: str, *, tokens: int, chunk: int | None = None,
+                       interpret: bool = not ON_GPU) -> None:
+    """Check Triton backward's `dV` over equal zero Q/K/V against `template.reference`, interpreted or not."""
     def ours(zeros, dout):
         spans = template.spans(tokens, tokens, 1, chunk=chunk)
         with tuning.pinned({attention_triton.TritonBackward: joint(PINNED[0])}):
             return attention_triton.backward(zeros, zeros, zeros, spans, None, dout, scale=1.0,
-                                             interpret=not ON_GPU).value
+                                             interpret=interpret).value
 
     def theirs(zeros, dout):
         spans = template.spans(tokens, tokens, 1, chunk=chunk)
@@ -653,14 +654,17 @@ def _check_zero_qkv_dv(draw, label: str, *, tokens: int, chunk: int | None = Non
     assert_as_exact(jax.jit(ours), jax.jit(theirs), draw, label, seeds=8)
 
 
-def test_many_fp16_cotangents_too_small_once_normalized_still_sum_into_dv():
+@pytest.mark.parametrize("interpret", [
+    pytest.param(True, marks=pytest.mark.cpu(reason="interpreted on the CPU lane"), id="interpreted"),
+    pytest.param(False, marks=pytest.mark.gpu(reason="native on a GPU"), id="native")])
+def test_many_fp16_cotangents_too_small_once_normalized_still_sum_into_dv(interpret):
     """fp16, 32 queries over 32 equal keys, every output cotangent 2^-24: each query's share 2^-29 of
     every value is below fp16's least subnormal, yet their 32 sum to dV = 2^-24, as the reference's
-    derivative gives."""
+    derivative gives; interpreted on the CPU lane and natively on a GPU (its fp16 arithmetic the device's)."""
     def draw(_seed: int):
         return np.zeros((1, 32, 1, 1), np.float16), np.full((1, 32, 1, 1), 2.0 ** -24, np.float16)
 
-    _check_zero_qkv_dv(draw, "many small fp16 cotangents", tokens=32)
+    _check_zero_qkv_dv(draw, "many small fp16 cotangents", tokens=32, interpret=interpret)
 
 @pytest.mark.parametrize("dtype", attention_triton.DTYPES, ids=DTYPE_IDS)
 def test_cotangents_that_cancel_across_a_key_cancel_within_the_sums_bound(dtype):
@@ -1428,8 +1432,9 @@ def test_common_triton_forward_lowering_isolates_scaled_op():
 
 
 @pytest.mark.compiles_at_run(reason="runs the Triton forward on its GPU, judged bit for bit, no check-1 site")
-@pytest.mark.parametrize("interpret", [True, pytest.param(False, marks=pytest.mark.gpu)],
-                         ids=["interpreted", "native"])
+@pytest.mark.parametrize("interpret", [
+    pytest.param(True, marks=pytest.mark.cpu(reason="interpreted on the CPU lane"), id="interpreted"),
+    pytest.param(False, marks=pytest.mark.gpu(reason="native on a GPU"), id="native")])
 def test_triton_forward_settles_interior_and_overflow_midpoints(interpret):
     """`attention_triton.forward` retains full single-rounding (`narrowing_settled`) on 16-bit outputs,
     interpreted on the CPU lane and natively on a GPU (its BF16/FP16 conversions the device's own):

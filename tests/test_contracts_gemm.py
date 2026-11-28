@@ -20,6 +20,7 @@ from dew.nn.blocks import table_rows
 from dew.nn.dense import Dense
 from dew.nn.kernels import formats, gemm, generation, low_rank, projections
 from dew.nn.kernels.templates.hooks import Hook, Side
+from dew.quantization import packed_values
 
 
 @pytest.mark.parametrize("edge", EDGES)
@@ -407,7 +408,7 @@ def test_an_nvfp4_products_kernels_hold_every_order(edge, kernel="xla"):
     with ahead_on_the_host():
         matrix = formats.NvFp4.of(magnitudes.astype(np.float32),
                                   np.exp2(exponents).astype(jnp.float8_e4m3fn), 0.5)
-        values = np.asarray(matrix.decoded().astype(jnp.float32) * matrix.factor)
+        values = np.asarray(packed_values(matrix))
     primals = normal_draw(3623, (64, 256), scale=EDGES[edge])
     direction = normal_draw(3624, (64, 256), scale=EDGES[edge])
     (cotangent,) = normal_draw(3625, (64, 64))
@@ -429,8 +430,8 @@ def test_an_nvfp4_products_cotangent_past_bf16s_largest_keeps_its_input_gradient
     every value is 2^-9: its input gradient is the cotangent times the decoded values, finite as float32
     holds it (the cotangent taken as its saturating bf16 parts, `templates.product.formed`), where its own
     three-part split rounded the first part to infinity and its remainder to NaN."""
-    # A tensor scale of 2^-8, so the factor the decode defers (`NvFp4.factor`, its owed 2^8 times the scale)
-    # is one and the cotangent reaches the packed kernel's reverse as it is.
+    # A tensor scale of 2^-8, so the factor the decode defers (its owed 2^8, `bits.NVFP4_OWED`, times the
+    # scale) is one and the cotangent reaches the packed kernel's reverse as it is.
     matrix = formats.NvFp4.of(jnp.full((256, 64), 0.5, jnp.float32), jnp.ones((16, 64), jnp.float8_e4m3fn),
                            2.0 ** -8)
     rows = jnp.ones((8, 256), jnp.bfloat16)
@@ -443,7 +444,7 @@ def test_an_nvfp4_products_cotangent_past_bf16s_largest_keeps_its_input_gradient
         (d_rows,) = jax.vjp(product, rows)[1](cotangent)
     # Every value 2^-9, each part's product exact, their sum the cotangent's times it, rounded once to the
     # rows' bfloat16.
-    values = np.asarray(matrix.decoded(), np.float64) * float(matrix.factor)
+    values = np.asarray(packed_values(matrix), np.float64)
     expected = jnp.asarray(np.asarray(cotangent, np.float64) @ values.T, jnp.float32).astype(rows.dtype)
     assert bool(jnp.all(jnp.isfinite(expected))) and float(jnp.max(jnp.abs(expected))) > 1e35
     np.testing.assert_array_equal(np.asarray(d_rows, np.float32), np.asarray(expected, np.float32))

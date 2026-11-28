@@ -1,0 +1,595 @@
+"""A step's score products (`attention_products`, kernel-templates.md §A rows 16a and 25): summed, and
+selected by bands of distance, each on par with a reference written over its own products' logits (check 1),
+its output and every product's gradients, in the fast and the accurate form, on the template's route and on
+the Mosaic mainloop interpreted as an H100's and an A100's."""
+
+import jax
+import jax.numpy as jnp
+import numpy as np
+import pytest
+from attention_oracle import traced_attention_terms
+from generation_support import INTERPRETS
+from reference_error import assert_as_exact, with_gradients
+
+from dew.nn.kernels import generation
+from dew.nn.kernels.templates import (
+    attention as template,
+    attention_decode,
+    attention_mosaic,
+    attention_products,
+)
+from dew.nn.kernels.templates.hooks import Hook, Side
+from dew.nn.precision import float32_einsum
+
+pytestmark = pytest.mark.kernel
+
+SEEDS = 8
+TOKENS, HEADS, KV_HEADS, WIDTH = 160, 2, 1, 64
+WINDOW = 37
+"""A near band no tile's edge: 64- and 32-key tiles each hold keys of both products along it."""
+SCALE = WIDTH ** -0.5
+FORMS = {"fast": (False, False), "accurate": (True, True)}
+"""Each form's `(natural, accurate)`."""
+
+
+def _draw(products: int, dtype=jnp.bfloat16, *, queries: int = TOKENS, keys: int = TOKENS):
+    """A draw of `products` queries and keys, a value and the output's cotangent, unit Gaussians by seed."""
+    count = keys
+
+    def draw(seed: int):
+        streams = jax.random.split(jax.random.key(seed), 2 * products + 2)
+        laid = [jax.random.normal(stream, (1, queries, HEADS, WIDTH), jnp.float32).astype(dtype)
+                for stream in streams[:products]]
+        keys = [jax.random.normal(stream, (1, count, KV_HEADS, WIDTH), jnp.float32).astype(dtype)
+                for stream in streams[products:2 * products]]
+        value = jax.random.normal(streams[-2], (1, count, KV_HEADS, WIDTH), jnp.float32).astype(dtype)
+        dout = jax.random.normal(streams[-1], (1, queries, HEADS, WIDTH), jnp.float32).astype(dtype)
+        return (*laid, *keys, value, dout)
+
+    return draw
+
+
+def _softmax_reference(logits: jax.Array, value: jax.Array, dtype) -> jax.Array:
+    """The template reference's softmax over `logits` `[B, H, Q, K]` (`template.reference`): fp32 (fp64 for
+    fp64 inputs), the weights rounded to the value's dtype for their product, normalized, rounded to `dtype`;
+    a row that sees no key 0."""
+    batch, heads, queries, keys = logits.shape
+    kv_heads = value.shape[2]
+    m = jnp.max(logits, axis=-1, initial=-jnp.inf)
+    safe = jnp.where(jnp.isfinite(m), m, 0)
+    p = jnp.exp(logits - safe[..., None])
+    total = jnp.sum(p, axis=-1)
+    grouped = p.reshape(batch, kv_heads, heads // kv_heads, queries, keys).astype(value.dtype)
+    acc = float32_einsum("bhgqk,bkhd->bhgqd", grouped, value, precision=template.REFERENCE_PRECISION,
+                         preferred_element_type=logits.dtype).reshape(batch, heads, queries, value.shape[-1])
+    out = jnp.where(total[..., None] > 0, acc / jnp.where(total > 0, total, 1)[..., None], 0)
+    return jnp.swapaxes(out.astype(dtype), 1, 2)
+
+
+def _banded_reference(spans: template.KeySpans, bands: tuple[int, ...]):
+    """`(*queries, *keys, value)`'s attention whose logits are product `p`'s within band `p` of each query's
+    index (`attention_products.Banded`), written over each product's logits apart."""
+    def reference(*arguments):
+        products = len(bands) + 1
+        queries, keys, value = arguments[:products], arguments[products:2 * products], arguments[-1]
+        logits = [template.scores(query, key, spans, scale=SCALE)
+                  for query, key in zip(queries, keys, strict=True)]
+        distance = jnp.abs(jnp.arange(queries[0].shape[1])[:, None] - jnp.arange(spans.keys)[None, :])
+        chosen = jnp.searchsorted(jnp.asarray(bands), distance, side="left")
+        selected = logits[-1]
+        for p in reversed(range(products - 1)):
+            selected = jnp.where(chosen == p, logits[p], selected)
+        return _softmax_reference(selected, value, queries[0].dtype)
+
+    return reference
+
+
+def _routed(combine, spans: template.KeySpans, form: str, products: int):
+    """`attention_products.attend` on the template's route in `form` over `(*queries, *keys, value)`."""
+    natural, accurate = FORMS[form]
+
+    def attended(*arguments):
+        queries, keys, value = arguments[:products], arguments[products:2 * products], arguments[-1]
+        return attention_products.attend(queries, keys, value, spans, combine, scale=SCALE, natural=natural,
+                                         accurate=accurate)
+
+    return attended
+
+
+@pytest.mark.parametrize("form", FORMS)
+def test_summed_products_are_on_par_with_their_logits_summed(form):
+    """Two products summed (absorbed MLA's content and rope, kernel-templates.md §A row 25), causal, on the
+    template's route: on par with a softmax over each product's logits summed, its output and every
+    product's gradients (check 1)."""
+    spans = template.spans(TOKENS, TOKENS, 1, causal=True)
+
+    def reference(q1, q2, k1, k2, value):
+        logits = (template.scores(q1, k1, spans, scale=SCALE) + template.scores(q2, k2, spans, scale=SCALE))
+        return _softmax_reference(logits, value, q1.dtype)
+
+    ours = _routed(attention_products.SUM, spans, form, 2)
+    assert_as_exact(jax.jit(with_gradients(ours)), jax.jit(with_gradients(reference)), _draw(2),
+                    f"summed products {form}", seeds=SEEDS)
+
+
+@pytest.mark.parametrize("form", FORMS)
+@pytest.mark.parametrize(("case", "bands", "queries"),
+                         [("causal", (WINDOW,), TOKENS), ("full", (WINDOW,), TOKENS),
+                          ("causal", (11, 53), TOKENS), ("full", (5,), TOKENS + 48)],
+                         ids=["causal-two", "full-two", "causal-three", "full-more-queries"])
+def test_banded_products_are_on_par_with_their_logits_selected(case, bands, queries, form):
+    """Products selected by bands of distance (piecewise attention, §A row 16a), causal and full, two products
+    and three, and over more queries than keys (queries past the last key, whose far band holds every key
+    past its near one): on the template's route, on par with a softmax over each key's own product's logits,
+    its output and every product's gradients (check 1), the bands' edges inside key tiles."""
+    spans = template.spans(queries, TOKENS, 1, causal=case == "causal")
+    products = len(bands) + 1
+    ours = _routed(attention_products.Banded(bands), spans, form, products)
+    assert_as_exact(jax.jit(with_gradients(ours)), jax.jit(with_gradients(_banded_reference(spans, bands))),
+                    _draw(products, queries=queries), f"banded products {case} {bands} {queries} {form}",
+                    seeds=SEEDS)
+
+
+def _banded_terms(spans: template.KeySpans, combine: attention_products.Banded):
+    """The float64 terms of a two-product banded call's output and gradients (`attention_oracle`'s
+    `attention_terms` of the call laid out by hand from the bands' own predicate, at the products' scale):
+    a row that cancels, a query of one key's dQ among them, held to what it sums, as the template's own
+    backward checks hold it; each copy's key and value terms its product's, the value's copies' summed in
+    quadrature."""
+    def terms(q1, q2, k1, k2, value, dout):
+        # The call laid out by hand, each copy's keys those its band's predicate holds, and its queries taken
+        # so `attention_terms`' scale at the laid width is the products' (`SCALE`), the query's terms back.
+        count = spans.keys
+        apart = jnp.abs(jnp.arange(q1.shape[1])[:, None] - jnp.arange(count)[None, :])
+        near = jnp.searchsorted(jnp.asarray(combine.bands), apart, side="left") == 0
+        seen = template.dense(spans)
+        keep = jnp.concatenate([seen & near, seen & ~near], axis=-1)[:, None]
+        lift = (2 * WIDTH) ** 0.5 * SCALE
+        query = jnp.concatenate([q1, q2], axis=-1) * lift
+        key = jnp.concatenate([jnp.pad(k1, ((0, 0), (0, 0), (0, 0), (0, WIDTH))),
+                               jnp.pad(k2, ((0, 0), (0, 0), (0, 0), (WIDTH, 0)))], axis=1)
+        out, dq, dk, dv = traced_attention_terms(query, key, jnp.concatenate([value] * 2, axis=1), dout, keep)
+        dq = dq * lift
+        return (out, dq[..., :WIDTH], dq[..., WIDTH:], dk[:, :count, :, :WIDTH], dk[:, count:, :, WIDTH:],
+                jnp.sqrt(dv[:, :count] ** 2 + dv[:, count:] ** 2))
+
+    return terms
+
+
+@INTERPRETS
+@pytest.mark.parametrize("form", FORMS)
+@pytest.mark.parametrize("device", ["sm90", "sm80"])
+def test_banded_products_are_on_par_on_the_mosaic_mainloop_interpreted(device, form):
+    """Two products selected at a near band (`WINDOW`) of a causal call on the Mosaic mainloop, its training
+    forward and its backward from its residuals interpreted as `device` runs them, the copies' gradients
+    summed back through the selection's layout: on par with the softmax over each key's own product's
+    logits (check 1), its walks stepping each copy's tiles its band reaches, both at a tile the band's edge
+    cuts."""
+    spans = template.spans(TOKENS, TOKENS, 1, causal=True)
+    combine = attention_products.Banded((WINDOW,))
+    natural, accurate = FORMS[form]
+    placeholder = jnp.zeros((1, TOKENS, KV_HEADS, WIDTH), jnp.bfloat16)
+    _, _, _, chosen, hooks = attention_products.selected(
+        (placeholder,) * 2, (placeholder,) * 2, placeholder, spans, combine)
+
+    def layout(q1, q2, k1, k2, value):
+        # The keys' and the value's copies wide, their gradients summed unrounded (`attend`'s).
+        wide = [k.astype(jnp.float32) for k in (k1, k2)]
+        return attention_products.selected((q1, q2), wide, value.astype(jnp.float32), spans, combine)[:3]
+
+    def ours(q1, q2, k1, k2, value, dout):
+        (query, wide_key, wide_values), pull = jax.vjp(layout, q1, q2, k1, k2, value)
+        key, values = wide_key.astype(value.dtype), wide_values.astype(value.dtype)
+        with generation.assumed(device, interpreted=True):
+            # The residuals the route keeps for the form (`attention_route._forward`).
+            output = template.takes_output_residuals(hooks, query.dtype, accurate=accurate)
+            kept = template.Kept.OUTPUT if output else template.Kept.SPLIT
+            out, *residuals = attention_mosaic.forward(query, key, values, chosen, hooks, scale=SCALE,
+                                                       natural=natural, residuals=kept, interpret=True)
+            grads = attention_mosaic.backward(query, key, values, chosen, hooks, dout, residuals=residuals,
+                                              scale=SCALE, natural=natural, accurate=accurate, interpret=True,
+                                              rounded=False)
+        return out, *pull((grads.query.astype(query.dtype), grads.key, grads.value))
+
+    assert_as_exact(jax.jit(ours), jax.jit(with_gradients(_banded_reference(spans, combine.bands))), _draw(2),
+                    f"banded products on the Mosaic mainloop {device} {form}", seeds=SEEDS,
+                    terms=_banded_terms(spans, combine))
+
+
+@pytest.mark.parametrize("bands", [(), (8, 8), (16, 4), (-1,)])
+def test_a_banded_combine_refuses_bands_whose_products_would_share_keys(bands):
+    """A banded combine's bands are distances that increase, so its products' keys are each one product's:
+    bands that repeat, fall or are negative (or none) are refused where they are stated."""
+    with pytest.raises(ValueError):
+        attention_products.Banded(bands)
+
+
+@pytest.mark.parametrize("form", FORMS)
+def test_a_banded_calls_score_hook_reads_each_keys_own_index(form):
+    """A banded call (`Banded((WINDOW,))`, causal) under an ALiBi-like score hook reading its keys' indices,
+    `s - (q - k) / 16`, on the template's route: on par with each key's own product's logits under the
+    hook at its own index (check 1), output and every product's gradients; the copies' keys taken back to
+    their own (`k % K`), where read off one tile's program a hook reading them at another passed unseen at
+    its copy's index (train 1362's F1)."""
+    spans = template.spans(TOKENS, TOKENS, 1, causal=True)
+    natural, accurate = FORMS[form]
+    combine = attention_products.Banded((WINDOW,))
+
+    def alibi(s, q, k):
+        return s - (q - k).astype(s.dtype) / 16
+
+    hooks = template.Hooks(score=Hook(alibi))
+
+    def ours(q1, q2, k1, k2, value):
+        return attention_products.attend((q1, q2), (k1, k2), value, spans, combine, hooks, scale=SCALE,
+                                         natural=natural, accurate=accurate)
+
+    def reference(q1, q2, k1, k2, value):
+        logits = [template.scores(q, k, spans, scale=SCALE) for q, k in ((q1, k1), (q2, k2))]
+        apart = jnp.arange(TOKENS)[:, None] - jnp.arange(TOKENS)[None, :]
+        near = jnp.searchsorted(jnp.asarray(combine.bands), jnp.abs(apart), side="left") == 0
+        biased = jnp.where(near, logits[0], logits[1]) - apart.astype(logits[0].dtype) / 16
+        return _softmax_reference(jnp.where(template.dense(spans)[:, None], biased, -jnp.inf), value,
+                                  q1.dtype)
+
+    assert_as_exact(jax.jit(with_gradients(ours)), jax.jit(with_gradients(reference)), _draw(2),
+                    f"banded products under a hook reading keys {form}", seeds=SEEDS)
+
+
+def test_a_banded_call_selects_by_a_querys_explicit_place_however_far():
+    """A query placed at 100 over two keys, a near band of 100: both keys lie within it (distances 100 and
+    99), so both are the near product's, none the far's, whatever the call's extent."""
+    spans = template.spans(1, 2, 1)
+    operand = jnp.zeros((1, 1, KV_HEADS, WIDTH), jnp.bfloat16)
+    keys = jnp.zeros((1, 2, KV_HEADS, WIDTH), jnp.bfloat16)
+    laid = attention_products.selected((operand,) * 2, (keys,) * 2, keys, spans,
+                                       attention_products.Banded((100,)), places=jnp.asarray([[100]]))[3]
+    np.testing.assert_array_equal(np.asarray(template.dense(laid))[0, 0], [True, True, False, False])
+
+
+def test_a_banded_calls_16_bit_key_bias_sums_its_copies_gradients_before_it_rounds():
+    """A fp16 key bias (a KEY side) on a banded call whose near and far products' bias gradients each pass
+    fp16's largest and cancel: uniform logits, values 3 and -3, output cotangents 65504 and -65504; the
+    bias's gradient finite, its copies' summed wide before their one rounding."""
+    spans = template.spans(2, 2, 1)
+    combine = attention_products.Banded((0,))
+    query = jnp.zeros((1, 2, 1, 8), jnp.float16)
+    key = jnp.zeros((1, 2, 1, 8), jnp.float16)
+    value = jnp.broadcast_to(jnp.asarray([3.0, -3.0], jnp.float16)[None, :, None, None], (1, 2, 1, 8))
+    dout = jnp.broadcast_to(jnp.asarray([65504.0, -65504.0], jnp.float16)[None, :, None, None], (1, 2, 1, 8))
+
+    def attended(bias):
+        hooks = template.Hooks(score=Hook(lambda s, q, k, b: s + b, (Side(bias, template.Kind.KEY),)))
+        return attention_products.attend((query, query), (key, key), value, spans, combine, hooks, scale=1.0)
+
+    _, pull = jax.vjp(attended, jnp.zeros((1, 1, 2), jnp.float16))
+    assert np.isfinite(np.asarray(pull(dout)[0], np.float32)).all()
+
+
+def test_a_wide_banded_call_weighs_its_values_at_their_own_dtype():
+    """An fp64 query and key over fp16 values `[0, 1]`, logits `[0, -18]` (`_widely`, the call wide): the
+    far key's weight, 1.52e-8, rounds to fp16's 0 before its product, as every other path takes it, so the
+    output is 0, and the far value's gradient under a cotangent of `2^20` 0 (its weight's, rounded the
+    same, `_scaled_mean`), where weighed at the widened values' fp32 they read 1.52e-8 and 0.016 (train
+    1444's reviews)."""
+    with jax.enable_x64(new_val=True):
+        spans = template.spans(1, 2, 1)
+        query = jnp.zeros((1, 1, 1, 8), jnp.float64).at[..., 0].set(1.0)
+        key = jnp.zeros((1, 2, 1, 8), jnp.float64).at[0, 1, 0, 0].set(-18.0)
+        value = jnp.broadcast_to(jnp.asarray([0.0, 1.0], jnp.float16)[None, :, None, None], (1, 2, 1, 8))
+
+        def attended(value):
+            return attention_products.attend((query, query), (key, key), value, spans,
+                                             attention_products.Banded((0,)), scale=1.0)
+
+        out, pull = jax.vjp(attended, value)
+        (dvalue,) = pull(jnp.full(out.shape, 2.0 ** 20, out.dtype))
+        np.testing.assert_array_equal(np.asarray(out), np.zeros((1, 1, 1, 8)))
+        np.testing.assert_array_equal(np.asarray(dvalue, np.float32)[0, 1], np.zeros((1, 8), np.float32))
+
+
+def test_a_wide_banded_dropping_calls_kept_weight_stays_in_range():
+    """An fp64 query and key, one key, fp16 values of `2^-16`, dropout at a rate of `1 - 2^-16` over 2^20
+    queries: each kept weight 1 times its multiplier `2^16` held at its row's power before it narrows
+    (`template._narrowed_held`, as the kernels' scaled parts hold it), so a kept query reads 1 and a dropped
+    one 0, where narrowed to fp16 the multiplier read inf (train 1444's re-review)."""
+    queries = 2 ** 20
+    with jax.enable_x64(new_val=True):
+        spans = template.spans(queries, 1, 1)
+        query = jnp.zeros((1, queries, 1, 8), jnp.float64)
+        key = jnp.zeros((1, 1, 1, 8), jnp.float64)
+        value = jnp.full((1, 1, 1, 8), 2.0 ** -16, jnp.float16)
+        drop = template.Dropout(jnp.asarray([7, 11], jnp.uint32), jnp.arange(1, dtype=jnp.int32),
+                                jnp.arange(1, dtype=jnp.int32), 1.0 - 2.0 ** -16)
+        out = attention_products.attend((query, query), (key, key), value, spans,
+                                        attention_products.Banded((0,)), template.Hooks(drop=drop), scale=1.0)
+        kept = np.asarray(drop.draw(0, 0).keep(jnp.arange(queries)[:, None], jnp.arange(1)[None, :]))[:, 0]
+    assert kept.any()
+    np.testing.assert_array_equal(np.asarray(out)[0, :, 0, 0], np.where(kept, 1.0, 0.0))
+
+
+def test_a_wide_banded_calls_value_copies_sum_where_the_call_computes():
+    """fp64 queries at places 0 and 1 over one key, an fp16 value of 1, `Banded((0,))` (each query's own
+    product copy of the value), a resumed state of `m = 0, total = 1, acc = 0` (each weight 1/2), output
+    cotangents `2^130` and `-2^130`: the value's cotangent 0, its copies widened to the call's fp64 before
+    they are made (`attention_products.attend`), where widened to fp32 their cotangents `±2^129` each read
+    infinite and summed to NaN (train 1461's review)."""
+    with jax.enable_x64(new_val=True):
+        query = jnp.zeros((1, 2, 1, 8), jnp.float64)
+        key = jnp.zeros((1, 1, 1, 8), jnp.float64)
+        value = jnp.ones((1, 1, 1, 8), jnp.float16)
+        initial = template.Initial(jnp.zeros((1, 1, 2), jnp.float64), jnp.ones((1, 1, 2), jnp.float64),
+                                   jnp.zeros((1, 1, 2, 8), jnp.float64))
+
+        def attended(value):
+            return attention_products.attend((query, query), (key, key), value, template.spans(2, 1, 1),
+                                             attention_products.Banded((0,)), template.Hooks(initial=initial),
+                                             places=jnp.arange(2), scale=1.0)
+
+        out, pull = jax.vjp(attended, value)
+        cotangent = jnp.broadcast_to(jnp.asarray([2.0 ** 130, -(2.0 ** 130)])[None, :, None, None], out.shape)
+        (dvalue,) = pull(cotangent.astype(out.dtype))
+    np.testing.assert_array_equal(np.asarray(dvalue, np.float32), np.zeros((1, 1, 1, 8), np.float32))
+
+
+def test_a_wide_banded_dropping_call_of_no_keys_reads_zero():
+    """The same call over no keys (`template.spans(4, 0, 1)`), dropout at a rate of `1 - 2^-16`: zeros, a
+    row's weights of none held at its power with no maximum to take (`template._narrowed_held`)."""
+    with jax.enable_x64(new_val=True):
+        query = jnp.zeros((1, 4, 1, 8), jnp.float64)
+        key = jnp.zeros((1, 0, 1, 8), jnp.float64)
+        value = jnp.zeros((1, 0, 1, 8), jnp.float16)
+        drop = template.Dropout(jnp.asarray([7, 11], jnp.uint32), jnp.arange(1, dtype=jnp.int32),
+                                jnp.arange(1, dtype=jnp.int32), 1.0 - 2.0 ** -16)
+        out = attention_products.attend((query, query), (key, key), value, template.spans(4, 0, 1),
+                                        attention_products.Banded((0,)), template.Hooks(drop=drop), scale=1.0)
+    np.testing.assert_array_equal(np.asarray(out), np.zeros((1, 4, 1, 8)))
+
+
+def test_a_wide_banded_calls_key_bias_copies_sum_where_the_call_computes():
+    """fp64 queries at places 0 and 1 over one key of value 1, a zero fp32 key bias on the logits (a KEY
+    side), `Banded((0,))`, a resumed state of `m = 0, total = 1, acc = 0`, output cotangents `2^132` and
+    `-2^132`: the bias's cotangent 0, its copies widened to the call's fp64 (`attention_products`'s
+    `_copied_hooks`), where widened to fp32 their cotangents `±2^130` each read infinite and summed to NaN
+    (train 1472's review)."""
+    with jax.enable_x64(new_val=True):
+        query = jnp.zeros((1, 2, 1, 8), jnp.float64)
+        key = jnp.zeros((1, 1, 1, 8), jnp.float64)
+        value = jnp.ones((1, 1, 1, 8), jnp.float64)
+        initial = template.Initial(jnp.zeros((1, 1, 2), jnp.float64), jnp.ones((1, 1, 2), jnp.float64),
+                                   jnp.zeros((1, 1, 2, 8), jnp.float64))
+
+        def attended(bias):
+            hooks = template.Hooks(score=Hook(lambda s, q, k, b: s + b, (Side(bias, template.Kind.KEY),)),
+                                   initial=initial)
+            return attention_products.attend((query, query), (key, key), value, template.spans(2, 1, 1),
+                                             attention_products.Banded((0,)), hooks, places=jnp.arange(2),
+                                             scale=1.0)
+
+        out, pull = jax.vjp(attended, jnp.zeros((1, 1, 1), jnp.float32))
+        cotangent = jnp.broadcast_to(jnp.asarray([2.0 ** 132, -(2.0 ** 132)])[None, :, None, None], out.shape)
+        (dbias,) = pull(cotangent.astype(out.dtype))
+    np.testing.assert_array_equal(np.asarray(dbias), np.zeros((1, 1, 1), np.float32))
+
+
+def test_a_banded_call_takes_an_unsigned_place_without_x64():
+    """A uint32 place of 0 over two keys, x64 off: the near product's key 0, the far's key 1 (band 0), its
+    keys' end held unsigned beside it."""
+    spans = template.spans(1, 2, 1)
+    operand = jnp.zeros((1, 1, KV_HEADS, WIDTH), jnp.bfloat16)
+    keys = jnp.zeros((1, 2, KV_HEADS, WIDTH), jnp.bfloat16)
+    with jax.enable_x64(new_val=False):
+        laid = attention_products.selected((operand,) * 2, (keys,) * 2, keys, spans,
+                                           attention_products.Banded((0,)),
+                                           places=jnp.asarray([[0]], jnp.uint32))[3]
+        seen = np.asarray(template.dense(laid))[0, 0]
+    np.testing.assert_array_equal(seen, [True, False, False, True])
+
+
+def test_a_banded_call_moves_a_narrow_place_past_its_dtypes_range():
+    """A query placed at 127 (int8) over 129 keys, a near band of 1: keys 126, 127 and 128 are the near
+    product's, where the edge 129 saturated at int8's 127 and left 127 and 128 out."""
+    spans = template.spans(1, 129, 1)
+    operand = jnp.zeros((1, 1, KV_HEADS, WIDTH), jnp.bfloat16)
+    keys = jnp.zeros((1, 129, KV_HEADS, WIDTH), jnp.bfloat16)
+    laid = attention_products.selected((operand,) * 2, (keys,) * 2, keys, spans,
+                                       attention_products.Banded((1,)),
+                                       places=jnp.asarray([[127]], jnp.int8))[3]
+    near = np.asarray(template.dense(laid))[0, 0, :129]
+    np.testing.assert_array_equal(np.flatnonzero(near), [126, 127, 128])
+
+
+def test_a_banded_call_keeps_a_querys_place_in_its_own_dtype():
+    """A query placed at 2^32 (int64) over two keys, a near band of 0: both keys are the far product's, the
+    place's distance from each past int32's range, where an int32 place wrapped to 0 and took key 0 near."""
+    spans = template.spans(1, 2, 1)
+    operand = jnp.zeros((1, 1, KV_HEADS, WIDTH), jnp.bfloat16)
+    keys = jnp.zeros((1, 2, KV_HEADS, WIDTH), jnp.bfloat16)
+    with jax.enable_x64(new_val=True):
+        laid = attention_products.selected((operand,) * 2, (keys,) * 2, keys, spans,
+                                           attention_products.Banded((0,)),
+                                           places=jnp.asarray([[2**32]], jnp.int64))[3]
+        seen = np.asarray(template.dense(laid))[0, 0]
+    np.testing.assert_array_equal(seen, [False, False, True, True])
+
+
+def test_a_banded_call_keeps_its_queries_and_keys_dtype_beside_narrower_values():
+    """A banded call (`Banded((0,))`) of fp32 queries and keys over bf16 values at the highest precision: one
+    query at place 0 of `[4096, 4097]` against its near key `[1, -1]` has the near logit -1 and its far
+    key's product 0, so the second key weighs `1 / (1 + e^-1)` and its value 1 is the output; the query
+    and keys stay fp32 (`attention_route.attend`'s `operand_dtypes`, the key's and the value's), where
+    narrowing them to the values' bf16 rounded 4097 to 4096 and read 0.5 (train 1379's P-F2)."""
+    spans = template.spans(1, 2, 1)
+    near = jnp.asarray([4096.0, 4097.0], jnp.float32)[None, None, None]
+    near_keys = jnp.asarray([[1.0, -1.0], [0.0, 0.0]], jnp.float32)[None, :, None]
+    far = jnp.zeros((1, 1, 1, 2), jnp.float32)
+    far_keys = jnp.zeros((1, 2, 1, 2), jnp.float32)
+    value = jnp.asarray([0.0, 1.0], jnp.bfloat16)[None, :, None, None]
+    with jax.default_matmul_precision("highest"):
+        out = attention_products.attend((near, far), (near_keys, far_keys), value, spans,
+                                        attention_products.Banded((0,)), places=jnp.asarray([[0]]), scale=1.0)
+    # 0.731 (1 / (1 + e^-1)) told apart from the narrowed call's 0.5 at two decimals.
+    assert round(float(out[0, 0, 0, 0]), 2) == 0.73, out[0, 0, 0, 0]
+
+
+def test_the_mosaic_mainloop_declines_narrow_queries_and_keys_over_wide_values():
+    """A banded call's mix the other way, bf16 queries and keys over fp32 values: the Mosaic forward and
+    backward each decline it (`attention_mosaic_program.mixed_operands`: their rings stage the values in
+    the query's dtype), so the route takes a mainloop that reads each operand in its own (train 1379's
+    P-F2 review)."""
+    spans = template.spans(TOKENS, TOKENS, 1, causal=True)
+    query = jnp.zeros((1, TOKENS, HEADS, WIDTH), jnp.bfloat16)
+    key = jnp.zeros((1, TOKENS, KV_HEADS, WIDTH), jnp.bfloat16)
+    value = jnp.zeros((1, TOKENS, KV_HEADS, WIDTH), jnp.float32)
+    with generation.assumed("sm90"):
+        assert attention_mosaic.forward_declined(query, key, value, spans, template.Hooks(),
+                                                 residuals=template.Kept.NONE) is not None
+        residuals = attention_mosaic.forward(query, key, value.astype(jnp.bfloat16), spans, template.Hooks(),
+                                             residuals=template.Kept.SPLIT, interpret=True)[1:]
+        assert attention_mosaic.backward_declined(query, key, value, spans, template.Hooks(), query,
+                                                  residuals=tuple(residuals)) is not None
+
+
+@pytest.mark.parametrize("gap", ["cancelled", "one unit"])
+def test_a_banded_call_keeps_its_fp64_operands(gap):
+    """A banded call (`Banded((0,))`) of fp64 operands at x64, scale 1, its values 0 and 1, forward and
+    backward in fp64: one query at place 0 of `[2^24 + 1, 1]` against its near key `[1, -(2^24 + 1)]` has
+    the logit 0 exactly beside its far key's 0, so the output reads 0.5 exactly (`cancelled`), where staged
+    in fp32 `-(2^24 + 1)` rounded to `-2^24` and read `1 / (1 + e)` (train 1389's P0); and a query `[1, 0]`
+    against keys `2^24` and `2^24 + 1` (`one unit`) has logits a unit apart, `e / (1 + e)`, where the
+    route's fp32 mainloop tied them and read 0.5 (train 1427's P0)."""
+    with jax.enable_x64(new_val=True):
+        spans = template.spans(1, 2, 1)
+        unit = jnp.asarray([1.0, 0.0], jnp.float64)[None, None, None]
+        if gap == "cancelled":
+            near = jnp.asarray([2.0 ** 24 + 1, 1.0], jnp.float64)[None, None, None]
+            near_keys = jnp.asarray([[1.0, -(2.0 ** 24 + 1)], [0.0, 0.0]], jnp.float64)[None, :, None]
+            far, far_keys = jnp.zeros_like(near), jnp.zeros((1, 2, 1, 2), jnp.float64)
+        else:
+            # The first key on the near product, the second on the far one: logits `2^24` and `2^24 + 1`.
+            near, far = unit, unit
+            near_keys = jnp.asarray([[2.0 ** 24, 0.0], [0.0, 0.0]], jnp.float64)[None, :, None]
+            far_keys = jnp.asarray([[0.0, 0.0], [2.0 ** 24 + 1, 0.0]], jnp.float64)[None, :, None]
+        value = jnp.asarray([0.0, 1.0], jnp.float64)[None, :, None, None]
+
+        def attend(near_keys, far_keys):
+            return attention_products.attend((near, far), (near_keys, far_keys), value, spans,
+                                             attention_products.Banded((0,)), places=jnp.asarray([[0]]),
+                                             scale=1.0, natural=True, accurate=True)
+
+        out, pull = jax.vjp(attend, near_keys, far_keys)
+        grads = pull(jnp.ones_like(out))
+        assert out.dtype == jnp.float64 and all(grad.dtype == jnp.float64 for grad in grads)
+        # Its softmax at fp64 as jax.nn's of the two logits forms it (the fp32 mainloop's tie read 0.5).
+        logits = jnp.asarray([0.0, 0.0] if gap == "cancelled" else [2.0 ** 24, 2.0 ** 24 + 1], jnp.float64)
+        np.testing.assert_array_equal(np.asarray(out)[0, 0, 0, 0], np.asarray(jax.nn.softmax(logits))[1])
+
+
+def test_a_mixed_banded_call_takes_the_plain_jax_mainloop_on_a_gpu():
+    """A banded call of bf16 queries and keys over fp32 values, forward and backward, on an H100: the same
+    to the bit as on the host's plain-JAX mainloop, the Mosaic and Triton mainloops each declining its
+    mixed operands (`mixed_operands`, `attention_triton._holding`'s `_eligible`), where Triton's backward
+    took them and narrowed the wider one (train 1389's P1)."""
+    spans = template.spans(16, 16, 1, causal=True)
+    rng = np.random.default_rng(0)
+    query = jnp.asarray(rng.standard_normal((1, 16, 2, 16)), jnp.bfloat16)
+    key = jnp.asarray(rng.standard_normal((1, 16, 1, 16)), jnp.bfloat16)
+    value = jnp.asarray(rng.standard_normal((1, 16, 1, 16)), jnp.float32)
+    dout = jnp.asarray(rng.standard_normal((1, 16, 2, 16)), jnp.float32)
+
+    def run():
+        def attended(query, key, value):
+            return attention_products.attend((query, query), (key, key), value, spans,
+                                             attention_products.Banded((2,)))
+
+        out, pull = jax.vjp(attended, query, key, value)
+        return out, pull(dout.astype(out.dtype))
+
+    host = run()
+    # A compiling H100's route (not interpreted: an interpreted one stays on the host's mainloop), which
+    # takes neither GPU mainloop here, so the call runs on the host.
+    with generation.assumed("sm90"):
+        gpu = run()
+    for found, expected in zip(jax.tree.leaves(gpu), jax.tree.leaves(host), strict=True):
+        np.testing.assert_array_equal(np.asarray(found, np.float32), np.asarray(expected, np.float32))
+
+
+@INTERPRETS
+def test_a_banded_decode_step_on_a_64_row_tile_reads_each_rows_own_query_place():
+    """A banded decode step (`Banded((0,))`) of one position and two query heads over one key head, its
+    keys' products zero, values 0 and 1, a score hook adding `q_pos · k_pos` on a 64-row tile alone, its
+    tiles pinned to 64 rows: each head's packed row reads its own query's place, 0, both heads 0.5
+    (`attention_decode.unpacked_places`, train 1389's K-F4 note)."""
+    from dew.nn.kernels import tuning
+
+    def placed(s, q_pos, k_pos):
+        return s + (q_pos * k_pos).astype(s.dtype) if s.shape[0] == 64 else s
+
+    spans = template.spans(1, 2, 1)
+    query = jnp.zeros((1, 1, 2, 64), jnp.bfloat16)
+    keys = jnp.zeros((1, 2, 1, 64), jnp.bfloat16)
+    value = jnp.broadcast_to(jnp.asarray([0.0, 1.0], jnp.bfloat16)[None, :, None, None], (1, 2, 1, 64))
+    # The banded layout's one call (`selected`), its decode step on the Mosaic mainloop interpreted.
+    laid = attention_products.selected((query, query), (keys, keys), value, spans, attention_products.Banded(
+        (0,)), template.Hooks(score=Hook(placed, ())), places=jnp.asarray([[0]]))
+    pinned = {attention_mosaic.MosaicForward: attention_mosaic.Tiles(64, 64, 2, 1, family="wgmma")}
+    with generation.assumed("sm90"), tuning.pinned(pinned):
+        out = attention_decode.attend(*laid, interpret=True)
+    np.testing.assert_array_equal(np.asarray(out, np.float32)[0, 0, :, 0], [0.5, 0.5])
+
+
+@pytest.mark.parametrize("case", ["an fp32 query over fp64 keys", "an fp64 bias along the keys"])
+def test_a_wide_banded_call_keeps_fp64_where_any_of_it_is(case):
+    """A banded call at x64 with values 0 and 1, scale 1: an fp32 query `[1, 0]` against fp64 keys `2^24`
+    (near) and `2^24 + 1` (far) reads `e / (1 + e)` at fp64's softmax, its output fp32 (the call's softmax at
+    its widest operand's dtype, `attention_products._widely`, where the query's fp32 tied the logits and read
+    0.5); and an fp64 near logit `2^24 + 1` under an fp64 KEY bias of `-(2^24 + 1)` beside a far logit 0
+    reads 0.5 exactly (the bias kept fp64 in its copies, `_copied_hooks`, where narrowed to fp32 it read
+    `1 / (1 + e)`) (train 1427's review of ed7ded3cc)."""
+    with jax.enable_x64(new_val=True):
+        spans = template.spans(1, 2, 1)
+        value = jnp.asarray([0.0, 1.0], jnp.float64)[None, :, None, None]
+        if case == "an fp32 query over fp64 keys":
+            unit = jnp.asarray([1.0, 0.0], jnp.float32)[None, None, None]
+            queries = (unit, unit)
+            keys = (jnp.asarray([[2.0 ** 24, 0.0], [0.0, 0.0]], jnp.float64)[None, :, None],
+                    jnp.asarray([[0.0, 0.0], [2.0 ** 24 + 1, 0.0]], jnp.float64)[None, :, None])
+            hooks, logits = None, [2.0 ** 24, 2.0 ** 24 + 1]
+        else:
+            unit = jnp.asarray([1.0, 0.0], jnp.float64)[None, None, None]
+            queries = (unit, jnp.zeros_like(unit))
+            keys = (jnp.asarray([[2.0 ** 24 + 1, 0.0], [0.0, 0.0]], jnp.float64)[None, :, None],
+                    jnp.zeros((1, 2, 1, 2), jnp.float64))
+            bias = jnp.asarray([[[-(2.0 ** 24 + 1), 0.0]]], jnp.float64)
+            hooks = template.Hooks(score=Hook(lambda s, q_pos, k_pos, b: s + b,
+                                              (Side(bias, template.Kind.KEY),)))
+            logits = [0.0, 0.0]
+        out = attention_products.attend(queries, keys, value, spans, attention_products.Banded((0,)), hooks,
+                                        places=jnp.asarray([[0]]), scale=1.0, natural=True, accurate=True)
+        assert out.dtype == queries[0].dtype
+        expected = np.asarray(jax.nn.softmax(jnp.asarray(logits, jnp.float64)))[1]
+        np.testing.assert_array_equal(np.asarray(out)[0, 0, 0, 0], np.asarray(expected, out.dtype))
+
+
+def _by_dtype(x, positions):
+    """A query prologue whose program depends on its operand's dtype: `x` on fp32, `-x` on any other."""
+    return x if x.dtype == jnp.float32 else -x
+
+
+def test_a_wide_summed_calls_prologue_sees_its_queries_own_dtype():
+    """A summed call at x64 of two products, an fp32 query 1 over fp64 keys `[0, 1]` and zeros, values
+    `[0, 1]`, scale 1, under a query prologue whose program depends on its operand's dtype (`_by_dtype`):
+    its prologue run on the fp32 query, the logits `[0, 1]`, the output `sigmoid(1)`, the query widened
+    after its prologue (`attention_products._widely`), where widened first the prologue read fp64, negated
+    it and the output read `sigmoid(-1)` (train 1427's review of 2b4f553fa)."""
+    with jax.enable_x64(new_val=True):
+        spans = template.spans(1, 2, 1)
+        query = jnp.ones((1, 1, 1, 1), jnp.float32)
+        keys = (jnp.asarray([0.0, 1.0], jnp.float64)[None, :, None, None],
+                jnp.zeros((1, 2, 1, 1), jnp.float64))
+        value = jnp.asarray([0.0, 1.0], jnp.float64)[None, :, None, None]
+        hooks = template.Hooks(query=Hook(_by_dtype, ()))
+        out = attention_products.attend((query, jnp.zeros_like(query)), keys, value, spans,
+                                        attention_products.SUM, hooks, scale=1.0, natural=True, accurate=True)
+        expected = np.asarray(jax.nn.softmax(jnp.asarray([0.0, 1.0], jnp.float64)))[1]
+        np.testing.assert_array_equal(np.asarray(out)[0, 0, 0, 0], np.asarray(expected, out.dtype))

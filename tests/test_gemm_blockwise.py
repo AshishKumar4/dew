@@ -9,11 +9,12 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from blockwise_matrix import CUBLASLT_PRECISION
+from blockwise_matrix import CUBLASLT_PRECISION, cublaslt_shares
 from reference_error import assert_as_exact, equations, with_gradients
 
-from dew.nn.kernels import gemm, generation, grouped_quantized, projections, tuning
+from dew.nn.kernels import gemm, generation, grouped_cells, grouped_quantized, projections, tuning
 from dew.nn.kernels.templates.gemm import tiling
+from dew.nn.kernels.templates.hooks import Hook
 
 
 @pytest.mark.parametrize("groups", ["1", "4"])
@@ -88,6 +89,106 @@ def a_blockwise_fp8_product_at_large_finite_scales_is_finite(interpret_on_cpu: b
                         jnp.float8_e4m3fn, interpret_on_cpu)
     np.testing.assert_array_equal(out, np.full(out.shape, blockwise_matrix.DEPTH // 128 * 2.0 ** 122,
                                                np.float32))
+
+
+RECEIPT_CELLS = {"routed gate forward": grouped_cells.ROUTED_GATE,
+                 "routed gate input gradient": grouped_cells.ROUTED_DOWN}
+"""Two of the products M-NG-38c timed, the selector's own declared Hopper records (`grouped_cells.
+BLOCKWISE_CELLS`, train 1450's review): DeepSeek-V3's routed gate's forward at 8192 rows over 256 experts
+and the launch of its input gradient (the down projection's extents), each expert's rows an equal share."""
+
+
+def a_receipt_cells_blockwise_product_holds_check_1_unnamed(name: str) -> None:
+    """A blockwise FP8 product at one of the extents a receipt timed on Hopper (`RECEIPT_CELLS[name]`),
+    unnamed, as a model's call reaches it: its route the template's walk (`grouped_cells.BLOCKWISE_CELLS`),
+    on par with cuBLASLt's FP8 GEMM a 128-deep block at a time from the float64 sum of the dequantized
+    blocks, over the gate's seeds, at production width (`_shares_hold_check_1`; train 1439's review: the
+    cells' native check at their own extents, beside the matrix's small named cases)."""
+    taken = _shares_hold_check_1(RECEIPT_CELLS[name], f"blockwise receipt {name}")
+    assert "mosaic" in taken, taken
+
+
+def test_equal_shares_blockwise_reference_and_truth_hold_check_1_on_this_cpu():
+    """`_shares_hold_check_1` at a small extent (256 rows, 512 deep, 256 wide, four experts) on this CPU
+    whatever the lane's device, unnamed (XLA's arm, no cell): the product, the cuBLASLt arm's arithmetic for
+    equal row shares (`blockwise_matrix.cublaslt_shares`, XLA's own dots here) and the float64 truth taken
+    an expert at a time agree to check 1, the GPU cells' reference and truth proven where they run first."""
+    from generation_support import on_the_host
+
+    with on_the_host():
+        taken = _shares_hold_check_1(grouped_cells.Blockwise(256, 512, 256, 4, 128),
+                                     "blockwise equal shares 256x512x256", arm=lambda fn, inputs: jax.jit(fn))
+    assert taken == {"xla"}, taken
+
+
+def _shares_hold_check_1(cell: grouped_cells.Blockwise, label: str, *,
+                         arm=blockwise_matrix.cublaslt_arm) -> set[str]:
+    """Check 1 of the unnamed blockwise FP8 product of `cell` (a `grouped_cells.Blockwise` record): its rows
+    by its experts' width x depth matrices, each expert an equal share of the rows (as the receipts drew
+    them), each column scale over 128 depths and `cell.per` columns:
+    against cuBLASLt's FP8 GEMM a 128-deep block at a time (`blockwise_matrix.cublaslt_shares` compiled by
+    `arm`, cuBLASLt's: the reference docs/design/testing.md holds block-scaled FP8 to) from the float64 sum
+    of the dequantized blocks an expert at a time, over the gate's seeds (each its rows and scales, the bank
+    every seed's); the kernels its route took. Its codes travel as their bits (`uint8`), which the gate keeps
+    as they are, so no arm holds a float64 stack of them: each arm reads them back as E4M3, and the truth
+    widens an expert's alone (a receipt extent's stack is 28 GiB in float64)."""
+    rows, depth, width, groups, per = cell
+    sizes = np.full((groups,), rows // groups, np.int32)
+    share, blocks = rows // groups, depth // 128
+
+    def codes(rng, shape):
+        # E4M3 codes as their bits, drawn as bytes (normals for a receipt's 3.7 billion codes take a minute a
+        # draw), each a random sign and mantissa at a binade from 2^-2 to 2^1 (exponent fields 5 to 8:
+        # magnitudes 0.25 to 3.75, as a unit normal's codes mostly are), no NaN: one buffer, rewritten in
+        # place, its sign, the field's low two bits and the mantissa kept (0x9F), the field raised by 5
+        # (0x28).
+        drawn = rng.integers(0, 256, size=shape, dtype=np.uint8)
+        np.bitwise_and(drawn, np.uint8(0x9F), out=drawn)
+        return np.add(drawn, np.uint8(0x28), out=drawn)
+
+    # The experts' matrices one bank for every seed, as a model's weights are across its calls, each seed its
+    # own rows and scales: a GPU tier's prepare holds several seeds' draws at once (`arm_store`'s truth draw,
+    # its first draws and the next seed's), each the one 3.5 GiB bank, under its 10 GiB (train 1454: a bank
+    # a seed exceeded it).
+    bank = codes(np.random.default_rng(4518), (groups, width, depth))
+
+    def draw(seed):
+        # NumPy's, as a site's draws are (a GPU tier's prepare computes on no device).
+        rng = np.random.default_rng(4519 + seed)
+        return (codes(rng, (rows, depth)), bank,
+                rng.uniform(0.5, 2.0, size=(blocks, rows)).astype(np.float32),
+                rng.uniform(0.5, 2.0, size=(groups, blocks, width // per)).astype(np.float32))
+
+    def read(bits):
+        return jax.lax.bitcast_convert_type(bits, jnp.float8_e4m3fn)
+
+    def unnamed(x, w, row_scales, column_scales):
+        return gemm.blockwise_fp8_product(read(x), read(w), sizes, row_scales, column_scales,
+                                          out_dtype=jnp.float32)
+
+    def reference(x, w, row_scales, column_scales):
+        # The arm's function by name, not through its module, whose state (`reference_error.COMPILED`, a
+        # ContextVar) no fingerprint of the arm reads: its prepare took it (train 1450's review).
+        return cublaslt_shares(groups, jnp.float32)(read(x), read(w), row_scales, column_scales)
+
+    def truth(x, w, row_scales, column_scales):
+        wide = jnp.float64
+
+        def expert(operands):
+            # An expert's share of rows by its matrix, each code times its block's scales (exact).
+            codes, matrix, by_rows, by_columns = operands
+            scaled = read(codes).astype(wide) * jnp.repeat(by_rows.T.astype(wide), 128, axis=1)
+            columns = jnp.repeat(jnp.repeat(by_columns.astype(wide), 128, axis=0), per, axis=1)
+            return scaled @ (read(matrix).astype(wide) * columns.T).T
+
+        row_blocks = jnp.transpose(row_scales.reshape(blocks, groups, share), (1, 0, 2))
+        return jax.lax.map(expert, (x.reshape(groups, share, depth), w, row_blocks, column_scales)).reshape(
+            rows, width)
+
+    with generation.routes() as routes:
+        assert_as_exact(jax.jit(unnamed), arm(reference, draw(0)), draw, label, seeds=blockwise_matrix.SEEDS,
+                        truth_fn=jax.jit(truth))
+    return {route.kernel for route in routes if route.choice == "blockwise_fp8"}
 
 
 E5M2_EDGES = {
@@ -657,3 +758,59 @@ def test_a_recipe_chains_products_carry_the_names_a_remat_policy_saves(recipe, g
     plain = products(total(("gate", "up")))
     assert products(jax.checkpoint(total(("gate", "up")), policy=policy)) == plain
     assert products(jax.checkpoint(total(None), policy=policy)) > plain
+
+
+def _blockwise_routes(gpu, rows, depth, width, groups, *, codes=jnp.float8_e4m3fn, scales=jnp.float32,
+                      finished=False, placed=None):
+    """The kernels a blockwise FP8 product of these extents (abstract operands, a 128 x 128 weight block's
+    column scales) takes, traced unnamed on `gpu`; `placed`, an Explicit mesh's sharding of its matrix."""
+    operands = (jax.ShapeDtypeStruct((rows, depth), codes),
+                jax.ShapeDtypeStruct((groups, width, depth), codes, sharding=placed),
+                jax.ShapeDtypeStruct((groups,), jnp.int32),
+                jax.ShapeDtypeStruct((depth // 128, rows), scales),
+                jax.ShapeDtypeStruct((groups, depth // 128, width // 128), scales))
+
+    def product(*operands):
+        if finished:
+            doubled = Hook(lambda summed: (summed, summed))
+            return gemm.blockwise_fp8_finished(*operands, epilogue=doubled,
+                                               out_dtypes=(jnp.bfloat16, jnp.float32))
+        return gemm.blockwise_fp8_product(*operands, out_dtype=jnp.bfloat16)
+
+    with generation.assumed(gpu), generation.routes() as routes:
+        jax.eval_shape(product, *operands)
+    return {route.kernel for route in routes if route.choice == "blockwise_fp8"}
+
+
+def test_a_blockwise_products_receipt_cells_run_the_template_unnamed_for_their_products_alone():
+    """The blockwise FP8 products M-NG-38c timed on a GH200 (DeepSeek-V3's routed gate and up at 8192 tokens,
+    its down at 32768), traced unnamed on an H100, run the template's walk; the same matrices over rows no
+    receipt timed (16384), on an A100, of E5M2 codes or bf16 scales (operands no receipt timed), through an
+    epilogue's several outputs, or as the kernel gradient, run XLA's arm (row 4518: a cell over its timed
+    rows, the receipt timing these launches alone)."""
+    assert _blockwise_routes("sm90", 8192, 7168, 2048, 256) == {"mosaic"}
+    assert _blockwise_routes("sm90", 32768, 2048, 7168, 256) == {"mosaic"}
+    assert _blockwise_routes("sm90", 16384, 7168, 2048, 256) == {"xla"}
+    assert _blockwise_routes("sm80", 8192, 7168, 2048, 256) == {"xla"}
+    assert _blockwise_routes("sm90", 8192, 7168, 2048, 256, codes=jnp.float8_e5m2) == {"xla"}
+    assert _blockwise_routes("sm90", 8192, 7168, 2048, 256, scales=jnp.bfloat16) == {"xla"}
+    assert _blockwise_routes("sm90", 8192, 7168, 2048, 256, finished=True) == {"xla"}
+    with generation.assumed("sm90"), generation.routes() as routes:
+        jax.eval_shape(functools.partial(gemm.blockwise_fp8_kernel_gradient, out_dtype=jnp.float32),
+                       jax.ShapeDtypeStruct((7168, 8192), jnp.float8_e4m3fn),
+                       jax.ShapeDtypeStruct((2048, 8192), jnp.float8_e4m3fn),
+                       jax.ShapeDtypeStruct((256,), jnp.int32), jax.ShapeDtypeStruct((64, 7168), jnp.float32),
+                       jax.ShapeDtypeStruct((64, 2048), jnp.float32))
+    assert {route.kernel for route in routes if route.choice == "blockwise_fp8"} == {"xla"}
+
+
+@pytest.mark.mesh(devices=2)
+def test_a_timed_blockwise_product_whose_matrices_a_mesh_splits_runs_xlas_arm():
+    """A blockwise FP8 product of a receipt's extents (DeepSeek-V3's routed gate at 8192 tokens) whose
+    experts' matrices an Explicit axis splits, traced unnamed on an H100: its launch would read them whole on
+    every device, so it runs XLA's arm, whose ragged product partitions them (row 4518's review)."""
+    from jax.sharding import AxisType, NamedSharding, PartitionSpec
+
+    mesh = jax.make_mesh((2,), ("expert",), axis_types=(AxisType.Explicit,), devices=jax.devices()[:2])
+    split = NamedSharding(mesh, PartitionSpec("expert"))
+    assert _blockwise_routes("sm90", 8192, 7168, 2048, 256, placed=split) == {"xla"}

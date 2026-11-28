@@ -714,47 +714,18 @@ def expert_leaf_axes(matrix: jax.Array | NvFp4, axes: Sequence[str | None]) -> l
 def packed_values(matrix: NvFp4) -> jax.Array:
     """A packed matrix's values, float32 (`[..., depth, width]`): each code times its block's scale times the
     matrix's (`NvFp4.decoded`, whose values owe `bits.NVFP4_OWED`, times its stored tensor scale), the exact
-    product rounded once, a subnormal among them and an overflow an infinity (`_product_rounded`). The one
-    decode of a packed matrix's values, a Linear's applied kernel's (`LinearProducts.applied_kernel`, row
+    product rounded once, a subnormal among them and an overflow an infinity (`float_bits.owed_product`). The
+    one decode of a packed matrix's values, a Linear's applied kernel's (`LinearProducts.applied_kernel`, row
     11740's review) and an export's (`decoded_packed`)."""
     from dew.algebra.bits import NVFP4_OWED
+    from dew.nn.float_bits import owed_product
 
     # Its words read once the format admits them (`NvFp4.admitted`), an export's and a Linear's alike.
-    scale = jnp.asarray(matrix.scale, jnp.float32)[..., None, None]
-    return _product_rounded(matrix.admitted().decoded(), scale, round(math.log2(NVFP4_OWED)))
-
-
-def _product_rounded(values: jax.Array, scale: jax.Array, owed: int) -> jax.Array:
-    """`values` (bfloat16) times `scale` (float32, broadcast against them) times `2^owed`, rounded once to
-    nearest even into float32: the exact product's significand (8 bits times 24, under 2^32) formed in
-    integer arithmetic on their fields and rounded once (`float_bits.rounded_float32`), however far below
-    the least normal, and past the largest finite an infinity of the product's sign; a non-finite operand's
-    product IEEE's, read off the operands' bits. A float32 multiply rounds a result below the least normal
-    twice where its operands' significands are wider than the result's (to 24 bits, then to the
-    subnormal's), or flushes it (XLA's CPU, row 4023): 1.5 times
-    0.25 times 2^-126 (1 + 7 2^-23) is 3145730.625 2^-149, `0x00300003` once rounded, `0x00300002` twice;
-    and the owed power applied to `scale` alone first overflows a finite product's factor (row 11740's
-    review)."""
-    from dew.nn.float_bits import raw_fields, rounded_float32
-
-    _, sign_v, biased_v, fraction_v = (field.astype(jnp.uint32) for field in raw_fields(values))
-    _, sign_f, biased_f, fraction_f = raw_fields(scale)
-    # Each a whole significand times a power of two, a subnormal's at the least normal's exponent: a
-    # bfloat16's of 8 bits, a float32's of 24.
-    lead = np.uint32(1 << 23)
-    whole_v = jnp.where(biased_v > 0, fraction_v | np.uint32(1 << 7), fraction_v)
-    whole_f = jnp.where(biased_f > 0, fraction_f | lead, fraction_f)
-    product = whole_v * whole_f
-    exponent = ((jnp.maximum(biased_v.astype(jnp.int32), 1) - 134)
-                + (jnp.maximum(biased_f.astype(jnp.int32), 1) - 150) + owed)
-    # A non-finite operand's product as IEEE's, classified on the operands' bits (row 11795): a NaN where
-    # either is one or an infinity meets a zero, else an infinity of the product's sign.
-    infinite_v, infinite_f = (biased_v == 0xFF) & (fraction_v == 0), (biased_f == 0xFF) & (fraction_f == 0)
-    zero_v, zero_f = (biased_v == 0) & (fraction_v == 0), (biased_f == 0) & (fraction_f == 0)
-    nan = (((biased_v == 0xFF) & ~infinite_v) | ((biased_f == 0xFF) & ~infinite_f)
-           | (infinite_v & zero_f) | (infinite_f & zero_v))
-    return rounded_float32((sign_v << np.uint32(16)) ^ sign_f, product, exponent,
-                           infinite=infinite_v | infinite_f, nan=nan)
+    # A tensor scale one a matrix, or one a column (`NvFp4.columned`), against its values' [..., depth,
+    # width].
+    scale = jnp.asarray(matrix.scale, jnp.float32)
+    scale = scale[..., None, :] if matrix.columned else scale[..., None, None]
+    return owed_product(matrix.admitted().decoded(), scale, round(math.log2(NVFP4_OWED)))
 
 
 def decoded_packed(variables: Variables) -> Variables:

@@ -197,8 +197,13 @@ def unfitted(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans
 def _holding(op: Template, ba: tokamax.BoundArguments, launch: str, *, certified: bool) -> Refusal | None:
     """Why `op` runs no call of `ba` on the GPU in effect: no config its model fits, or where `certified`
     every config it derives spilling as the GPU's assembler builds it alone (`tuning`'s `_certified`: each
-    refused, the next derived, to `LEAST` over four warps and eight), or None."""
+    refused, the next derived, to `LEAST` over four warps and eight), or None; a call it does not run at all
+    (`_eligible`: its operands of one dtype among them, a banded call's mixed ones the plain-JAX mainloop's,
+    whose backward would narrow the wider one) refused first."""
     target = generation.gpu_target()
+    if not _eligible(ba, target):
+        return Refusal('dtype', f"the Triton mainloop's {launch} takes queries, keys and values of one dtype "
+                       "of its own on a GPU that compiles it")
     if not op.fits(ba, target):
         return Refusal('resources', f"no config of the Triton mainloop's {launch} fits the GPU's block and "
                        "registers")

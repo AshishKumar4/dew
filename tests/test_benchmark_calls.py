@@ -609,8 +609,8 @@ def test_a_tpu_run_of_a_generic_async_collective_is_read_as_the_op_it_wraps(tmp_
     (`benchmark._opcodes`: the start as the op its computation's root is, the done by the start it reads):
     an all-to-all's moves data alone and times no kernel of the call's (`NoKernels`), an all-reduce's
     reduces as it moves and is timed (Train 1431's review: its start read as no op, an all-to-all's run was
-    timed as kernels); a done reading a loop-carried handle from a tuple is its own computation's op, and a
-    fusion calling a computation is a fusion."""
+    timed as kernels); a done naming its own computation is that computation's op, and a fusion calling a
+    computation is a fusion."""
     from dew.telemetry import benchmark, hlo
     from dew.telemetry.benchmark import NoKernels, tpu_ops
 
@@ -628,10 +628,8 @@ def test_a_tpu_run_of_a_generic_async_collective_is_read_as_the_op_it_wraps(tmp_
         instruction("main", "async-done", "async-done", ["async-start"]),
         instruction("main", "async-start.1", "async-start", ["x"], ["wrapped_all_reduce"]),
         instruction("main", "async-done.1", "async-done", ["async-start.1"]),
-        # A loop-carried handle: the done reads it from a tuple and names the computation itself.
-        instruction("main", "carried", "tuple", ["async-start", "x"]),
-        instruction("main", "handle", "get-tuple-element", ["carried"]),
-        instruction("main", "async-done.2", "async-done", ["handle"], ["wrapped_all_to_all"]),
+        # A done naming its own computation takes it first.
+        instruction("main", "async-done.2", "async-done", ["x"], ["wrapped_all_to_all"]),
         instruction("main", "fusion", "fusion", ["x"], ["wrapped_all_reduce"], root=True)])
     assert (opcodes["async-done.2"], opcodes["fusion"]) == ("all-to-all-done", "fusion")
     runs = [(0, "jit_run(7)", 0.0, 1.0, None)]
@@ -643,6 +641,79 @@ def test_a_tpu_run_of_a_generic_async_collective_is_read_as_the_op_it_wraps(tmp_
         tpu_ops(transfer, {0}, "jit_run", annotation=READ, instructions=opcodes)
     assert [op.name for op in tpu_ops(reduction, {0}, "jit_run", annotation=READ, instructions=opcodes)] == [
         "async-start.1", "async-done.1"]
+
+
+_CARRIED = """
+HloModule carried
+
+add {
+  a = f32[] parameter(0)
+  b = f32[] parameter(1)
+  ROOT sum = f32[] add(a, b)
+}
+
+wrapped {
+  p = f32[8]{0} parameter(0)
+  ROOT op = f32[8]{0} OPERATION
+}
+
+body {
+  state = (((f32[8]{0}), f32[8]{0}, u32[]), s32[]) parameter(0)
+  handle = ((f32[8]{0}), f32[8]{0}, u32[]) get-tuple-element(state), index=0
+  i = s32[] get-tuple-element(state), index=1
+  one = s32[] constant(1)
+  next = s32[] add(i, one)
+  ROOT out = (((f32[8]{0}), f32[8]{0}, u32[]), s32[]) tuple(handle, next)
+}
+
+cond {
+  state = (((f32[8]{0}), f32[8]{0}, u32[]), s32[]) parameter(0)
+  i = s32[] get-tuple-element(state), index=1
+  two = s32[] constant(2)
+  ROOT less = pred[] compare(i, two), direction=LT
+}
+
+ENTRY main {
+  x = f32[8]{0} parameter(0)
+  start = ((f32[8]{0}), f32[8]{0}, u32[]) async-start(x), calls=wrapped
+  zero = s32[] constant(0)
+  carried = (((f32[8]{0}), f32[8]{0}, u32[]), s32[]) tuple(start, zero)
+  looped = (((f32[8]{0}), f32[8]{0}, u32[]), s32[]) while(carried), condition=cond, body=body
+  held = (((f32[8]{0}), f32[8]{0}, u32[]), s32[]) opt-barrier(looped)
+  handle = ((f32[8]{0}), f32[8]{0}, u32[]) get-tuple-element(held), index=0
+  ROOT done = f32[8]{0} async-done(handle)
+}
+"""
+"""A module whose generic async collective's handle a while loop carries from its start to its done, through
+an optimization barrier, the done naming no computation of its own (`OPERATION` the op its start wraps)."""
+
+
+@pytest.mark.parametrize(("operation", "moves"), [
+    ("all-to-all(p), replica_groups={{0}}, dimensions={0}", True),
+    ("all-reduce(p), replica_groups={{0}}, to_apply=add", False)], ids=["all-to-all", "all-reduce"])
+def test_a_done_reads_the_op_whose_handle_a_loop_carried_to_it(tmp_path, operation, moves):
+    """A serialized module (`hlo.module_from_text`) whose generic async collective's handle a tuple, a while
+    loop's state and an optimization barrier carry from its `async-start` to its `async-done`, which names no
+    computation of its own: the done is read as the op its start wraps (`benchmark._opcodes`, following the
+    handle through each, as XLA's async-chain reader does), so an all-to-all's run times no kernel
+    (`NoKernels`) and an all-reduce's is timed (Train 1450's review: the done stopped at the
+    `get-tuple-element` and an all-to-all's run was timed as kernels)."""
+    from dew.telemetry import benchmark, hlo
+    from dew.telemetry.benchmark import NoKernels, tpu_ops
+
+    module = hlo.module_from_text(_CARRIED.replace("OPERATION", operation))
+    opcodes = benchmark._opcodes(list(hlo.instructions(module)))
+    op = operation.split("(")[0]
+    assert (opcodes["start"], opcodes["done"]) == (f"{op}-start", f"{op}-done")
+    _tpu_capture(tmp_path, [(0, "start", 0.25, 0.5, None), (0, "done", 0.5, 0.75, None)],
+                 [(0, "jit_run(7)", 0.0, 1.0, None)])
+    if moves:
+        with pytest.raises(NoKernels):
+            tpu_ops(tmp_path, {0}, "jit_run", annotation=READ, instructions=opcodes)
+    else:
+        assert [each.name for each in tpu_ops(tmp_path, {0}, "jit_run", annotation=READ,
+                                              instructions=opcodes)] == ["start", "done"]
+
 
 def test_a_tpu_call_is_timed_by_the_ops_inside_its_run_as_a_v5e_records_them(tmp_path):
     """A v5e's XProf (M-FS-90's capture of a bf16 8192x4096 by 4096x4096 GEMM, its three ops' spans as

@@ -7,8 +7,9 @@ Each cell runs the product's forward alone: the primitive has no gradient of its
 FP8 products of their own requantized operands, row 2513). It is held to the product with the selector's other
 kernel named, `xla` (`generation.chosen`, check 1), from the float64 sum of the dequantized blocks.
 
-The kernel under test is the template, named where the cells run it (no receipt yet qualifies it, so its
-selector, `gemm.BLOCKWISE_FP8`, takes it by name alone): the cells' `CHOICES` are `blockwise_fp8`.
+The kernel under test is the template, named where the cells run it (its selector, `gemm.BLOCKWISE_FP8`,
+takes it unnamed only for the products a receipt timed, `grouped_cells.BLOCKWISE_CELLS`): the cells'
+`CHOICES` are `blockwise_fp8`.
 
 What the route serves is read from the product's own selector: the product traced for its shapes as the
 case's generation with the template named, the route its choice reports the template.
@@ -129,6 +130,36 @@ def cublaslt(sizes, out_dtype: str) -> callable:
                 columns = jnp.repeat(column_scales[group, block], per)
                 out = out + jnp.where(mine, partial * row_scales[block, :, None] * columns[None, :], 0)
         return out.astype(out_dtype)
+    return run
+
+
+def cublaslt_shares(groups: int, out_dtype) -> callable:
+    """`cublaslt`'s arm where every group's rows are an equal share of them, at a production extent: a
+    128-deep block at a time (a loop over the blocks), every group's share of rows by its matrix in one FP8
+    GEMM batched over the groups (cuBLASLt's under `cublaslt_arm`, at DEFAULT precision as `cublaslt`'s),
+    each block's partial scaled by its rows' and columns' scales and added in fp32 in order, as the
+    product's definition orders them (a dot a group and block would be tens of thousands at 256 experts, and
+    every block's partials at once gigabytes): `run(rows, matrices, row_scales, column_scales)`."""
+    def run(rows, matrices, row_scales, column_scales):
+        count, depth = rows.shape
+        width, blocks, share = matrices.shape[1], depth // 128, count // groups
+        per = width // column_scales.shape[-1]
+        shares = rows.reshape(groups, share, blocks, 128)
+        stacks = matrices.reshape(groups, width, blocks, 128)
+        by_rows = row_scales.reshape(blocks, groups, share)
+
+        def scaled(block):
+            partial = jax.lax.dot_general(
+                jax.lax.dynamic_index_in_dim(shares, block, 2, keepdims=False),
+                jax.lax.dynamic_index_in_dim(stacks, block, 2, keepdims=False), (((2,), (2,)), ((0,), (0,))),
+                precision=CUBLASLT_PRECISION, preferred_element_type=jnp.float32)
+            columns = jnp.repeat(jax.lax.dynamic_index_in_dim(column_scales, block, 1, keepdims=False), per,
+                                 axis=-1)
+            return partial * jax.lax.dynamic_index_in_dim(by_rows, block, 0, keepdims=False)[..., None] * (
+                columns[:, None, :])
+
+        out = jax.lax.fori_loop(1, blocks, lambda block, out: out + scaled(block), scaled(0))
+        return out.reshape(count, width).astype(out_dtype)
     return run
 
 
