@@ -1356,6 +1356,7 @@ class GatedDeltaNet(nn.Module):
         wide = at_least_fp32(operand)
         g, beta = recurrence.gated(self._gates, a.astype(wide), self.A_log.astype(wide),
                                    self.dt_bias.astype(wide), b.astype(wide))
+        assert beta is not None, "the gated delta rule's write gate is its sigmoid's"
         if valid is not None:
             # exp(0)=1 and beta=0 preserve recurrent memory for invalid input.
             beta = jnp.where(valid[:, :, None], beta, 0.0)

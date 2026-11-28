@@ -168,7 +168,7 @@ def test_a_float64_recurrences_norm_read_back_in_fp32_keeps_its_gates_precision(
     norm worked in the read-back's fp32 and its gate's `exp(100)` overflowed to a zero output (train 1461's
     review)."""
     hooks = recurrence.Hooks(decay='scalar', output=recurrence.OutputNorm(1e-6, 'sigmoid', read_in='float32'))
-    with jax.enable_x64(True):
+    with jax.enable_x64(new_val=True):
         unit = jnp.zeros((1, 1, 1, 8), jnp.float64).at[..., 0].set(1.0)
         operands = Chunk(unit, unit, jnp.ones((1, 1, 1, 8), jnp.float64), log_decay=jnp.zeros((1, 1, 1)),
                          beta=jnp.ones((1, 1, 1), jnp.float64), z=jnp.full((1, 1, 1, 8), -100.0, jnp.float64),
@@ -184,7 +184,7 @@ def test_a_float64_recurrences_rate_is_exponentiated_in_its_work_dtype():
     entering: the memory leaves `exp(-1)` of itself (its binade), the rate exponentiated in the recurrence's
     float64, where in its own fp32 `exp(100)` overflowed and cleared the memory (train 1461's review)."""
     hooks = recurrence.Hooks(decay='scalar', gates=recurrence.Gates())
-    with jax.enable_x64(True):
+    with jax.enable_x64(new_val=True):
         zeros = jnp.zeros((1, 1, 1, 8), jnp.float64)
         operands = Chunk(zeros, zeros, zeros, gate=jnp.full((1, 1, 1), -100.0, jnp.float64),
                          log_a=jnp.full((1,), 100.0, jnp.float32), bias=jnp.zeros((1,), jnp.float64),
@@ -246,7 +246,7 @@ def test_the_output_launchs_norm_is_on_par_with_the_norm_after_it(block, trainin
     hooks = recurrence.Hooks(decay='scalar', scale=0.125, output=recurrence.OutputNorm(1e-6, 'sigmoid'))
 
     def truth(*operands):
-        with jax.enable_x64(True):
+        with jax.enable_x64(new_val=True):
             wide = [jnp.asarray(x, jnp.float64) for x in operands]
 
             def composed(q, k, v, g, beta, z, weight):

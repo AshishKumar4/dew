@@ -256,6 +256,32 @@ def _normed_read(normed: Normed, family, carry, *, steps: int, bv: int, columns,
         family.stored([normalized.astype(out_ref.dtype)], [out_ref.at[columns(block)]], smem=landing["out"])
 
 
+def _output_walk(normed: Normed | None, family, views: dict, produced, *, prologue, chunk: int, steps: int,
+                 bv: int, refs: tuple, rows, columns, landing) -> mosaic.Walk:
+    """`output_launch`'s walk of its `steps` value blocks, each step's output `produced(index, slots,
+    loaded)` stored at its block's columns (`columns`, `refs`' first, `_output_refs`); under an epilogue
+    (`normed`) its rows' sums of squares carried across the steps, zero as the chunk starts, with a row of
+    one block itself (`_normed_step`), and the rows normalized past the walk (`_normed_read`,
+    `mosaic.Walk.read`)."""
+    if normed is None:
+        def step(index, slots, carry, accumulators, loaded=None):
+            out = produced(index, slots, loaded)
+            family.stored([out.astype(refs[0].dtype)], [refs[0].at[columns(index)]], smem=landing["out"])
+            return carry, accumulators
+
+        return mosaic.Walk(views, step, steps=steps, prologue=prologue)
+    norm = normed
+    epilogue = {"steps": steps, "bv": bv, "refs": refs, "rows": rows, "columns": columns, "landing": landing}
+
+    def normed_step(index, slots, carry, accumulators, loaded=None):
+        out = produced(index, slots, loaded)
+        return _normed_step(norm, family, out, index, carry, **epilogue), accumulators
+
+    carry = (family.as_row(family.zeros((chunk,))), *((family.zeros((chunk, bv)),) if steps == 1 else ()))
+    return mosaic.Walk(views, normed_step, steps=steps, prologue=prologue, carry=carry,
+                       read=lambda carry, sums: _normed_read(norm, family, carry, **epilogue))
+
+
 def _columns(span, first: int, bv: int, block):
     """Value block `block`'s columns of a head's `[R, HV * Dv]` rows from its first column `first`, over the
     chunk's rows `span`."""
@@ -337,7 +363,7 @@ def output_launch(q, k, h, corrected, prefix: tuple, taken, beta, call: Call, ti
             return (tuple(family.rows_of(ref.at[h, span]) for ref in rows),
                     tuple(family.columns_of(ref.at[h, span]) for ref in columns))
 
-        def step(index, slots, carry, accumulators, loaded=None):
+        def produced(index, slots, loaded=None):
             def block(name, operand, c, *, along_rows=False):
                 place = pl.ds(c * call.block, call.block)
                 return stream_tile(slots, name, operand,
@@ -377,22 +403,11 @@ def output_launch(q, k, h, corrected, prefix: tuple, taken, beta, call: Call, ti
                                            Parts(staged, held.dtype), value, scale, Issuer(call))
             if skip_ref:
                 out = out + skip_ref[0][h] * value.value().astype(jnp.float32)
-            columns = functools.partial(_columns, span, h * value_width, bv)
-            if normed is None:
-                family.stored([out.astype(outputs[0].dtype)], [outputs[0].at[columns(index)]],
-                              smem=landing["out"])
-                return carry, accumulators
-            return _normed_step(normed, family, out, index, carry, **epilogue), accumulators
+            return out
 
-        if normed is None:
-            return mosaic.Walk(views, step, steps=steps, prologue=None if call.per_key else prologue)
-        # The epilogue's rows' sums of squares carried across the value blocks, zero as the chunk starts (and
-        # a row of one block itself), the rows normalized past the walk.
-        epilogue = {"steps": steps, "bv": bv, "refs": outputs, "rows": rows[0] if rows else None,
-                    "columns": functools.partial(_columns, span, h * value_width, bv), "landing": landing}
-        carry = (family.as_row(family.zeros((chunk,))), *((family.zeros((chunk, bv)),) if steps == 1 else ()))
-        return mosaic.Walk(views, step, steps=steps, prologue=None if call.per_key else prologue, carry=carry,
-                           read=lambda carry, sums: _normed_read(normed, family, carry, **epilogue))
+        return _output_walk(normed, family, views, produced, prologue=None if call.per_key else prologue,
+                            chunk=chunk, steps=steps, bv=bv, refs=outputs, rows=rows[0] if rows else None,
+                            columns=functools.partial(_columns, span, h * value_width, bv), landing=landing)
 
     blocks, staging = _output_streams(call, bv)
     out_type = jax.ShapeDtypeStruct((call.rows, call.heads * value_width), out_dtype)
