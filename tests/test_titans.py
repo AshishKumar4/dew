@@ -29,9 +29,9 @@ def _layer_normed(x, eps: float):
 
 
 def _half_gradient(k, v, readout, weight, bias, eps: float):
-    """Half the inner loss `|LN(readout) w + b - (v - k)|^2`'s gradient at `readout`, by autodiff."""
+    """Half the inner loss `|k + (LN(readout) w + b) - v|^2`'s gradient at `readout`, by autodiff."""
     def loss(at):
-        return 0.5 * jnp.sum((_layer_normed(at, eps) * weight + bias - (v - k)) ** 2)
+        return 0.5 * jnp.sum(((k + (_layer_normed(at, eps) * weight + bias)) - v) ** 2)
 
     return jax.grad(loss)(readout)
 
@@ -459,6 +459,18 @@ def test_a_ttt_tokens_absent_slot_leaves_its_live_gradients_the_one_slot_calls()
     expected = gradient(memory, offset, jnp.float32(1.0), *one)
     for leaf, alone in zip(found, expected, strict=True):
         np.testing.assert_array_equal(np.asarray(leaf), np.asarray(alone))
+
+
+def test_ttts_inner_error_keeps_a_residual_its_target_would_round_away():
+    """TTT-Linear over one fp32 token, its entering state zero, the inner loss's affine weight one and bias
+    `(-2^100, 0)`, `eps` 1, its key `(2^100, 1)`, value `(1, 1)` and rate 2^-100: its memory's first row
+    `(1/2, -1/2)` exactly, the error `(k + (LN(k W) w + c)) - v` the memory's own (`(-1, 0)`), where against
+    `v - k` the target rounded to `(-2^100, 0)` and erased the update (a head review)."""
+    key, value = _pair((2.0 ** 100, 1.0)), _pair((1.0, 1.0))
+    affine = (jnp.ones((1, 2), jnp.float32), jnp.asarray([[-(2.0 ** 100), 0.0]], jnp.float32))
+    _, (memory, _) = ttt_linear(jnp.zeros_like(key), key, value, *affine, jnp.full((1, 1, 1), 2.0 ** -100),
+                                chunk=1, scale=1.0, eps=1.0)
+    np.testing.assert_array_equal(np.asarray(memory)[0, 0, 0], np.asarray([0.5, -0.5], np.float32))
 
 
 def test_titans_partial_mini_batch_leaves_the_state_its_last_token_does():

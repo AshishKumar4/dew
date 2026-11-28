@@ -2,11 +2,11 @@
 kernel): a memory `M` learned at test time by gradient descent with momentum `S`, each head's `[D, D]`,
 
     S_t = eta_t S_{t-1} - 2 theta_t k_t^T u_t,    M_t = (1 - alpha_t) M_{t-1} + S_t,
-    o_t = q_t + LN(q_t M_t) w + b,
+    o_t = q_t + (LN(q_t M_t) w + b),
 
 the memory's residual around its query, as Dew's in-context memory reads it (`dew.nn.memory`'s
 `ResidualMemory`; fla's reference reads `q M + LN(q M)`), `2 k_t^T u_t` the gradient at `M` of the inner
-loss `|LN(k_t M) w + b - (v_t - k_t)|^2`, `u_t` taken
+loss `|k_t + (LN(k_t M) w + b) - v_t|^2`, `u_t` taken
 through the LayerNorm's backward (`inner_gradient`) at the memory entering the token's mini-batch: `chunk`
 tokens from the sequence's start share one memory their gradients are taken at, as fla's reference anchors
 them (its `M_prev_nabla`). The LayerNorm's backward is TTT's (fla/ops/ttt/naive.py), `(D g - sum g -
@@ -45,11 +45,13 @@ def layer_normed(x, eps: float):
 
 
 def inner_gradient(k, v, km, weight, bias, eps: float):
-    """Half the inner loss's gradient at the memory's readout `km` (`k M`), `[..., D]`: the LayerNorm's
-    output `LN(km) w + b` against the target `v - k`, its error times `w`, through the LayerNorm's pullback
-    (autodiff's, `layer_normed`)."""
+    """Half the inner loss's gradient at the memory's readout `km` (`k M`), `[..., D]`: the memory's output
+    `k + (LN(km) w + b)` (the residual around its key, as `dew.nn.memory`'s `ResidualMemory`) against the
+    value `v`, its error times `w`, through the LayerNorm's pullback (autodiff's, `layer_normed`). The
+    residual first, as the memory computes its output: against `v - k`, a key of 2^100 beside a value of 1
+    rounded the target and erased the error (a head review)."""
     normed, pullback = jax.vjp(functools.partial(layer_normed, eps=eps), km)
-    (gradient,) = pullback((normed * weight + bias - (v - k)) * weight)
+    (gradient,) = pullback(((k + (normed * weight + bias)) - v) * weight)
     return gradient
 
 
