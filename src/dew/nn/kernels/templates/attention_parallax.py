@@ -189,18 +189,19 @@ def _halved(z: jax.Array, exponent: jax.Array, power: jax.Array) -> jax.Array:
 
 
 def _tiny(z: jax.Array) -> jax.Array:
-    """Whether `z` is nonzero and below `2^-100` in magnitude: an fp32 `z`'s zero read from its bits, as a
-    flushing backend (XLA's CPU) reads a subnormal equal to 0."""
+    """Whether `z` is nonzero and its half below fp32's least normal (`|z| < 2^-125`), which `z / 2`
+    flushes: an fp32 `z`'s zero read from its bits, as a flushing backend (XLA's CPU) reads a subnormal
+    equal to 0. A larger `z`'s half is normal, its directions the halved form's, met jointly."""
     nonzero = (z != 0) if jnp.dtype(z.dtype) != jnp.float32 else (
         jax.lax.bitcast_convert_type(z, jnp.uint32) & 0x7FFFFFFF) != 0
-    return nonzero & (jnp.abs(z) < 2.0 ** -100)
+    return nonzero & (jnp.abs(z) < 2.0 ** -125)
 
 
 def _raised(z: jax.Array, exponent: jax.Array, power: jax.Array) -> jax.Array:
-    """`exp_scaled` of a tiny nonzero `z` (`|z| < 2^-100`) raised by `2^64` from its bits (`raised_exactly`,
-    which no flushing multiply reads), its power among the powers, every power applied at once; zero for any
-    other `z`: its derivative along the exponent, which JAX takes of it, where `z / 2` flushed the
-    direction, its derivative along `z` `2^64`."""
+    """`exp_scaled` of a tiny nonzero `z` (`_tiny`) raised by `2^64` from its bits (`raised_exactly`, which no
+    flushing multiply reads), its power among the powers, every power applied at once; zero for any other
+    `z`: its derivative along the exponent, which JAX takes of it, where `z / 2` flushed the direction, its
+    derivative along `z` `2^64`."""
     finite, whole, fraction = _decay_parts(exponent)
     held = jax.lax.stop_gradient(z)
     tiny = _tiny(held)
@@ -215,10 +216,10 @@ def _exp_scaled_tangent(primals, tangents):
     """`exp_scaled`'s tangent beside the rule's own value, so a higher order meets the rule again: the halved
     form's, JAX's own derivative of it (`_halved`), but along the exponent of a tiny nonzero `z` the raised
     form's (`_raised`): `2^-149 · 2^149` along its exponent is 1, where `z / 2` flushed it 0 (train 1489's
-    F2). Its order is fixed, as JAX transposes it: a direction meets `z / 2` before the powers and a
-    cotangent the powers first, so `2^120 · 2^-120` along `2^100` overflows where the reverse of `3 · 2^124`
-    at `2^126 · 2^-124` does not; a declared transpose (`generation.linear_map`) read NaN past the second
-    order of `attend`."""
+    F2), a tiny `z`'s two directions meeting the powers apart. Its order is fixed, as JAX transposes it: a
+    direction meets `z / 2` before the powers and a cotangent the powers first, so `2^120 · 2^-120` along
+    `2^100` overflows where the reverse of `3 · 2^124` at `2^126 · 2^-124` does not; a declared transpose
+    (`generation.linear_map`) read NaN past the second order of `attend`."""
     z, exponent, power = primals
     along_z, along_exponent, along_power = tangents
     tiny = _tiny(jax.lax.stop_gradient(z))
