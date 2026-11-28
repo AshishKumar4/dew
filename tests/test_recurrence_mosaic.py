@@ -1540,10 +1540,10 @@ def test_a_spilled_launch_moving_no_registers_steps_to_a_program_fewer_at_its_fa
         derived = template.MOSAIC.derived(bound, facts)
         report.refuse_launch(template.MOSAIC, bound, derived, {kernel})
         stepped = template.MOSAIC.derived(bound, facts)
+        assert stepped == dataclasses.replace(derived, residents=resources.Residents(((kernel, 1),)))
         family = template.bundle(facts)
         launches = tuple(template.MOSAIC.launches(bound, stepped, facts, backward=True))
     (launch,) = (launch for launch in launches if launch.name == kernel)
-    assert stepped == dataclasses.replace(derived, residents=resources.Residents(((kernel, 1),)))
     assert (launch.resident, launch.registers) == (1, family.registers(launch.consumers, 1))
     assert template.holds(launches, family, generation.shared_budget(facts))
 
