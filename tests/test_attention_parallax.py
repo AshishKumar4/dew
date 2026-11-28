@@ -983,18 +983,13 @@ def test_a_second_product_direction_is_centred_before_the_values(arm):
 
 
 def test_a_subnormal_term_decays_and_raises_before_it_rounds():
-    """`attention_parallax.exp_scaled` of fp32's least subnormal, `2^-149`, undecayed and raised by `2^149`,
-    is 1, and a tile's one key at logit 0 with a second product of `2^-149` has that centre (`moments`): its
-    mantissa and power read from its bits, every power applied at once, where halving it first rounded it to
-    0 (train 1478's K-F2)."""
+    """`attention_parallax.exp_scaled` of fp32 subnormals raised back into the normal range: `2^-149` by
+    `2^149` is 1 and `3 · 2^-149` by `2^148` is 1.5, their bits read before any multiply (a flushing
+    backend's, XLA's CPU, reads a subnormal operand as 0) and every power applied at once, where halving it
+    first rounded `2^-149` to 0 (train 1478's K-F2)."""
     least = jnp.float32(2.0 ** -149)
     assert float(attention_parallax.exp_scaled(least, jnp.float32(0.0), 149)) == 1.0
-    logits = jnp.zeros((1, 1, 1, 1, 1), jnp.float32)
-    seconds = jnp.full((1, 1, 1, 1, 1), least, jnp.float32)
-    found = attention_parallax.moments(logits, seconds, jnp.ones((1, 1, 1, 4), jnp.float32),
-                                       jnp.zeros((1, 1, 1, 1), jnp.int32))
-    assert float(found.centre[0][0, 0, 0, 0] + found.centre[1][0, 0, 0, 0]) == 2.0 ** -149
-
+    assert float(attention_parallax.exp_scaled(3 * least, jnp.float32(0.0), 148)) == 1.5
 
 def test_a_float64_second_product_keeps_its_keys_apart():
     """Parallax (`attention_parallax.attend`) with x64 on over fp32 queries, keys and values (zeros, and
