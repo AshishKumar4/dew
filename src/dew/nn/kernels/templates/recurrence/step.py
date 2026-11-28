@@ -24,6 +24,7 @@ from jax.experimental.pallas import mosaic_gpu as plgpu
 from dew.nn import norms
 from dew.nn.kernels import generation, recurrence, recurrence_algebra, short_conv, tuning
 from dew.nn.kernels.templates import cost, mosaic, resources, scan
+from dew.nn.kernels.templates.recurrence.conv import read_taps
 from dew.nn.precision import (
     L2NORM_EPS,
     accurate_exp,
@@ -145,9 +146,6 @@ def _launched(hooks: recurrence.Hooks, operands: recurrence.Step, *, dtype, fami
     rows, value_heads, key_width, value_width = state.shape
     key_heads = (recurrence._pieces(hooks, value_heads, key_width, value_width, given['token'].shape[-1])
                  if hooks.conv is not None else given['query'].shape[1])
-    if hooks.conv is not None:
-        # Each tap's weights a row `[K, C]`, a program's channels of it read contiguously.
-        given['taps'] = given['taps'].T
     if 'weight' in given:
         # The norm's weight a row, as a program's block reads its columns.
         given['weight'] = given['weight'][None]
@@ -280,8 +278,8 @@ def _program(hooks, inputs, active_ref, state_out, moved, out_ref, scratch, *, b
                    pl.ds(lax.axis_index("columns") * block.columns, block.columns), block)
     state_ref = inputs['state']
     key_width = state_ref.shape[2]
-    conv = (_Conv(inputs, moved, token, hooks.conv, key_heads, key_width, state_ref.shape[3], group)
-            if hooks.conv is not None else None)
+    conv = (_Conv(inputs, moved, token, hooks.conv, key_heads, key_width, state_ref.shape[3], group,
+                  interpret) if hooks.conv is not None else None)
 
     @pl.when(active_ref[token.row] != 0)
     def _():
@@ -331,7 +329,8 @@ def _key_entry(vectors, token: _Token, which: int, k: int):
 @dataclasses.dataclass(frozen=True)
 class _Conv:
     """A program's view of the prologue's conv (`recurrence.Conv`): the row's token `[C]`, history
-    `[rows, K - 1, C]`, taps `[K, C]` and bias `[C]`, in the conv's order of queries, keys and values
+    `[rows, K - 1, C]`, taps `[C, K]` (the checkpoint's order, `conv.read_taps`) and bias `[C]`, in the conv's
+    order of queries, keys and values
     (`recurrence.conv_pieces`); its streams the block's heads' values, contiguous, then each block head's key
     head's queries and keys; the moved history it writes, the queries' and keys' by their key head's first
     value head."""
@@ -344,6 +343,7 @@ class _Conv:
     key_width: int
     value_width: int
     group: int
+    interpret: bool
 
     @property
     def pieces(self):
@@ -380,7 +380,7 @@ class _Conv:
         taps = self.inputs['taps']
         streams = []
         for window, (first, width) in zip(windows, self.pieces, strict=True):
-            weights = [self._load(taps.at[j], first, width).astype(jnp.float32) for j in range(len(window))]
+            weights = list(read_taps(taps, pl.ds(first, width), len(window), width, interpret=self.interpret))
             bias = (self._load(self.inputs['conv_bias'], first, width).astype(jnp.float32) if self.conv.bias
                     else None)
             pre = short_conv.preactivation(window, weights, bias)

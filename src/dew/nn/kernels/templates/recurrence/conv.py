@@ -146,12 +146,13 @@ def _activated(pre, activation: bool):
     return pre / (1.0 + jnp.exp(-pre)), logistic_value(pre)
 
 
-def _taps(ref, columns, count: int, lanes_: int, *, interpret: bool) -> tuple:
+def read_taps(ref, columns, count: int, lanes_: int, *, interpret: bool) -> tuple:
     """The taps `[lanes, count]` of `columns` (`ref` `[C, K]`, the checkpoint's order, `DepthwiseConv1d`'s), a
-    vector `[lanes]` a tap in the scan's layout (`scan.blocked`): each lane's taps read whole once, a thread
-    `width` lanes' `count` taps side by side, and split in its registers (`_split_taps`, a shuffle a tap).
-    Read a tap at a time down `[K, C]`, the call transposed its weight first, a launch a layer a decode step
-    (row 14174: 12 of an LM_HYBRID B8 step's, weight-only work)."""
+    vector `[lanes]` a tap in the scan's layout (`scan.blocked`), the short conv's and the fused decode step's
+    (`step._Conv`) alike: each lane's taps read whole once, a thread `width` lanes' `count` taps side by side,
+    and split in its registers (`_split_taps`, a shuffle a tap). Read a tap at a time down `[K, C]`, the call
+    transposed its weight first, a launch a layer a decode step (row 14174: 12 of an LM_HYBRID B8 step's,
+    weight-only work)."""
     width = lanes_ // scan.THREADS
     side_by_side = plgpu.Layout.WG_STRIDED((lanes_, count), vec_size=width * count)
     weights = plgpu.load(ref.at[columns, :], layout=side_by_side, optimized=False).astype(jnp.float32)
@@ -163,8 +164,8 @@ def _taps(ref, columns, count: int, lanes_: int, *, interpret: bool) -> tuple:
 
 
 def _split_taps(_, held, *, lanes_: int, count: int) -> tuple:
-    """`_taps`' body (`plgpu.inline_mgpu`'s): a thread's register of its lanes' taps side by side, a vector of
-    its lanes a tap (`vector.shuffle` of every `count`-th element from the tap's)."""
+    """`read_taps`' body (`plgpu.inline_mgpu`'s): a thread's register of its lanes' taps side by side, a
+    vector of its lanes a tap (`vector.shuffle` of every `count`-th element from the tap's)."""
     width = lanes_ // scan.THREADS
     (register,) = held.registers.flat
     lane = fa.WGStridedFragLayout((lanes_,), vec_size=width)
@@ -185,7 +186,7 @@ class _Piece:
         self.local, self.columns = pl.ds(local, lanes_), pl.ds(first + local, lanes_)
         self.lanes = lanes_
         layout = scan.blocked(lanes_)
-        self.taps = _taps(self.w_ref, self.columns, count, lanes_, interpret=interpret)
+        self.taps = read_taps(self.w_ref, self.columns, count, lanes_, interpret=interpret)
         self.bias = (None if self.b_ref is None else plgpu.load(
             self.b_ref.at[self.columns], layout=layout, optimized=False).astype(jnp.float32))
 
