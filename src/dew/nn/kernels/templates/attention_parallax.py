@@ -773,9 +773,10 @@ def _dense_tangent(dtype: str, primals, tangents, value) -> jax.Array:
         return _dense_value(dtype, logits, seconds, values, powers)
 
     _, moved = jax.jvp(held, (logits, seconds), (dlogits, dseconds))
-    # The values' coefficients `w (1 - τ)` as mantissas at their row's power `2^E` (each pair's product
-    # decayed with its weight, `exp_scaled`), their contraction with the direction taken back by it after:
-    # a coefficient past fp32 (`w τ` of `2^138`) meets a small direction, or its pullback a small cotangent,
+    # The values' coefficients `w (1 - τ)`, each pair's product decayed with its weight (`exp_scaled`), held
+    # below `2^126` by their row's power `2^E` where they pass it (none where they do not, so a small
+    # direction meets them at their size), their contraction with the direction taken back by it after: a
+    # coefficient past fp32 (`w τ` of `2^138`) meets a small direction, or its pullback a small cotangent,
     # before it would overflow.
     seen = logits > -jnp.inf
     level = jax.lax.stop_gradient(jnp.max(logits, axis=-1, keepdims=True))
@@ -787,7 +788,7 @@ def _dense_tangent(dtype: str, primals, tangents, value) -> jax.Array:
     apart = jnp.where(seen, (seconds - hi) - lo, 0.0)
     rows = powers[..., None]
     reach = jnp.where(seen & (apart != 0), _reach(below) + _exponent(apart) - rows, _NONE)
-    power = jnp.maximum(jnp.max(reach, axis=-1, keepdims=True), 1)
+    power = jnp.maximum(jnp.max(reach, axis=-1, keepdims=True) - 126, 0)
     coefficients = (exp_scaled(jnp.broadcast_to(1.0 / over, below.shape), below, -power)
                     - exp_scaled(apart / over, below, -rows - power))
     valued = power2(float32_einsum("bhgqk,bkhd->bhgqd", coefficients, dvalues, precision=REFERENCE_PRECISION,
