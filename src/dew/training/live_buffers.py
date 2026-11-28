@@ -32,7 +32,7 @@ import contextlib
 import dataclasses
 import json
 from collections.abc import Callable, Mapping
-from typing import Any
+from typing import Any, NamedTuple
 
 import jax
 
@@ -383,16 +383,25 @@ class Assignment:
         # call's names its result alone, an unknown call's none of its elements.
         named = (instruction.frontend_attributes.map.get("checkpoint_name")
                  if _names_output(instruction, index) else None)
-        written = None if named else _aliased_named(self.aliases.get(buffer.id, ()), self.instructions,
-                                                     self.computations)
+        # A loop's state element: what its body writes into it, the buffer defined at the loop itself (its
+        # state's value past the loop, which XLA assigns apart from its initial element's) or at an
+        # instruction a loop's element aliases (row 12463: a scanned decoder's stacks, defined at its loop,
+        # read unnamed).
+        looped = (_loop_named(instruction, index[0], self.instructions, self.computations, ran=True)
+                  if not named and instruction.opcode == "while" and len(index) == 1 else None)
+        written = looped if named or looped is not None else _aliased_named(
+            self.aliases.get(buffer.id, ()), self.instructions, self.computations)
+        row_op = ""
         if written is not None:
-            named = written.frontend_attributes.map.get("checkpoint_name")
+            named, row_op = _value_named(written, self.instructions, self.computations)
         made, within, getter = _maker(instruction, index, self.instructions, self.computations)
         if not named and getter is not None:
             named = getter.frontend_attributes.map.get("checkpoint_name")
         if not named and _names_output(made, within):
             named = made.frontend_attributes.map.get("checkpoint_name")
-        op_name = (metadata.op_name or (written.metadata.op_name if written is not None else "")
+        # A stack's op is the row its loop writes, which its rung's scope names (row 12463: read as the
+        # loop's, a scanned decoder's stacks lay in no rung's scope, so no remat was priced to drop them).
+        op_name = ((row_op if looped is not None else "") or metadata.op_name or row_op
                    or made.metadata.op_name)
         return {"bytes": buffer.size, "shape": tuple(shape.dimensions),
                 "dtype": self.types.values_by_number[shape.element_type].name.lower(), "kind": kind,
@@ -449,10 +458,24 @@ def _maker(instruction, index: tuple[int, ...], instructions,
     maker's names its tuple (`_names_output`), or None."""
     if instruction.opcode != "fusion":
         return instruction, index, None
-    made = instructions[computations[instruction.called_computation_ids[0]].root_id]
+    return _projected(instructions[computations[instruction.called_computation_ids[0]].root_id], index,
+                      instructions, computations, entered=frozenset({"fusion"}))
+
+
+def _projected(made, index: tuple[int, ...], instructions, computations, *, entered: frozenset[str]):
+    """The instruction making element `index` of `made`'s output, through tuples, get-tuple-elements and the
+    called computations of the ops `entered` names, with where in its own output the element is, and the
+    nearest instruction passed that names the value it selects whole, a get-tuple-element or an entered
+    call or fusion (`_maker`'s, a stack's row's: `_value_named`)."""
     getter = None
     while True:
-        if made.opcode == "tuple" and index:
+        if made.opcode in entered and made.called_computation_ids:
+            # A call or fusion that names the value it returns names the element selected whole.
+            if getter is None and _names_output(made, index) and made.frontend_attributes.map.get(
+                    "checkpoint_name"):
+                getter = made
+            made = instructions[computations[made.called_computation_ids[0]].root_id]
+        elif made.opcode == "tuple" and index:
             made, index = instructions[made.operand_ids[index[0]]], index[1:]
         elif made.opcode == "get-tuple-element":
             if getter is None and not index and made.frontend_attributes.map.get("checkpoint_name"):
@@ -497,10 +520,43 @@ def _aliased_named(locations, instructions, computations):
     return None
 
 
-def _loop_named(loop, element: int, instructions, computations):
+class _Trips(NamedTuple):
+    """XLA's trip count annotation of a while (WhileLoopBackendConfig): its steps, and where XLA states them
+    (its annotator's affine loops alone), its counter's start and stride and the state element holding the
+    counter."""
+
+    steps: int
+    init: int | None
+    step: int | None
+    counter: int | None
+
+
+def _annotation(loop) -> _Trips | None:
+    """`loop`'s trip count annotation (`_Trips`), None where it states no trip count: a config XLA's parser
+    held as an opaque string, or one of no count. Its counter's fields None where XLA states none (its
+    annotator's count of a loop whose counter is no affine one: a counter from -1); a field missing within
+    a stated one is 0 (Proto3's JSON leaves a zero out)."""
+    known = None
+    with contextlib.suppress(ValueError):  # JSON's, or bytes no text decodes
+        known = json.loads(loop.backend_config or "{}")
+    if not isinstance(known, dict) or "known_trip_count" not in known:
+        return None
+    start, counter = known.get("known_init_step"), known.get("known_induction_variable")
+    return _Trips(int(known["known_trip_count"].get("n", 0)),
+                  None if start is None else int(start.get("init", 0)),
+                  None if start is None else int(start.get("step", 0)),
+                  None if counter is None else int(counter.get("tuple_index", 0)))
+
+
+def _loop_named(loop, element: int, instructions, computations, *, ran: bool = False):
     """What while `loop`'s body writes into the whole of its state's `element`: the body's element where it
     is named (the state element is that value); else the row a scan writes into its stacked output each step
-    (`_stacked`); None for any other element, a write into part of a buffer naming none of it."""
+    (`_stacked`); None for any other element, a write into part of a buffer naming none of it. With `ran`,
+    for the loop's own result, the body's value where its annotation states it runs a step (`_Trips`): a
+    loop of no step holds its initial value (review of row 12463)."""
+    trips = _annotation(loop)
+    if ran and (trips is None or trips.steps <= 0):
+        return None
     # XLA's while names its body first, its condition second.
     root = instructions[computations[loop.called_computation_ids[0]].root_id]
     if root.opcode != "tuple" or element >= len(root.operand_ids):
@@ -508,11 +564,10 @@ def _loop_named(loop, element: int, instructions, computations):
     written = instructions[root.operand_ids[element]]
     if written.frontend_attributes.map.get("checkpoint_name"):
         return written
-    return _stacked(loop, element, written, instructions, computations)
+    return None if trips is None else _stacked(loop, element, written, trips, instructions, computations)
 
 
-def _stacked(loop, element: int, written, instructions,
-             computations):
+def _stacked(loop, element: int, written, trips: _Trips, instructions, computations):
     """The row a scan writes into its stacked output each step, state `element` of while `loop`, `written`
     the body's value for it: XLA keeps a loop's state in its initial elements' buffers, so a scan's stack is
     the buffer its broadcast fills, which carries no name, while each step's dynamic-update-slice writes the
@@ -525,7 +580,10 @@ def _stacked(loop, element: int, written, instructions,
     # Each caller the write is made in, outermost first, with what its called computation holds: an
     # async-start's, then a fusion's.
     callers: list[tuple[Any, frozenset[int]]] = []
-    put = written
+    # A bitcast moves no byte (XLA's, past layout assignment): the element is the write it views, a scanned
+    # decoder's stack its fusion's update viewed as the state's shape (row 12463: a cold 4B start's 167 GiB of
+    # stacked residuals read unnamed, no rung's recomputation priced to free them).
+    put = _bitcast_of(written, instructions)
     if put.opcode == "async-done":
         put = instructions[put.operand_ids[0]]
         if put.opcode != "async-start":
@@ -536,18 +594,8 @@ def _stacked(loop, element: int, written, instructions,
         put = instructions[computation.root_id]
     if put.opcode != "dynamic-update-slice" or not put.shape.dimensions:
         return None
-    # A loop's config is XLA's JSON where XLA wrote it, an opaque string where a module's text gave one,
-    # whose loop states no trip count to read: its stack is named by none.
-    known = None
-    with contextlib.suppress(ValueError):  # JSON's, or bytes no text decodes
-        known = json.loads(loop.backend_config or "{}")
-    if not isinstance(known, dict) or not {"known_trip_count", "known_init_step",
-                                           "known_induction_variable"} <= known.keys():
-        return None  # Proto3's JSON leaves a zero out, so a missing field is 0.
-    steps = int(known["known_trip_count"].get("n", 0))
-    start = known["known_init_step"]
-    counter = int(known["known_induction_variable"].get("tuple_index", 0))
-    if int(start.get("init", 0)) != 0 or int(start.get("step", 0)) != 1:
+    steps, counter = trips.steps, trips.counter
+    if trips.init != 0 or trips.step != 1 or counter is None:
         return None
     # XLA's while names its body first; its one parameter is the loop's state.
     body = computations[loop.called_computation_ids[0]]
@@ -560,6 +608,13 @@ def _stacked(loop, element: int, written, instructions,
                 instruction = instructions[caller.operand_ids[instruction.parameter_number]]
         return instruction
 
+    def viewed(instruction):
+        # The body's value `instruction` views, through bitcasts in a caller or out of it.
+        instruction = outside(instruction)
+        while instruction.opcode == "bitcast":
+            instruction = outside(instructions[instruction.operand_ids[0]])
+        return instruction
+
     def state(instruction) -> int | None:
         # The body state's element `instruction` reads, if it reads one.
         if instruction.opcode != "get-tuple-element" or instruction.operand_ids[0] != state_:
@@ -569,9 +624,9 @@ def _stacked(loop, element: int, written, instructions,
     rows, *row = put.shape.dimensions
     update = instructions[put.operand_ids[1]]
     if (steps != rows or list(update.shape.dimensions) != [1, *row]
-            # The element itself, never one laid out again: a bitcast to another layout and a copy back moves
-            # its elements (a square's transpose).
-            or state(outside(instructions[put.operand_ids[0]])) != element):
+            # The element itself, viewed through bitcasts alone, never one laid out again: a copy moves its
+            # elements (a square's transpose's copy back).
+            or state(viewed(instructions[put.operand_ids[0]])) != element):
         return None
     # The row each step writes, its other starts clamped to 0 as it is whole: the counter itself, never one
     # passed through another op (a bitcast to a signed type of its width takes a large count negative).
@@ -589,6 +644,31 @@ def _stacked(loop, element: int, written, instructions,
         return None
     # What the row is, through the bitcasts, reshapes and copies on its way.
     return _laid_out(outside(_laid_out(update, instructions)), instructions)
+
+
+def _value_named(instruction, instructions, computations) -> tuple[str | None, str]:
+    """The checkpoint name of the value `instruction` makes, and the op that names or makes it: its own,
+    else, through tuples, get-tuple-elements, the calls XLA kept and fusions, the nearest instruction
+    naming the value whole, or its maker's own (`_projected`), as a buffer it defines is named (a scan's
+    row a fusion or a jitted call makes, written into its stack: row 12463). The op is the first of them
+    stating one, the instruction's, the naming one's, the maker's: the scope a remat rung reads it by."""
+    made, within, namer = _projected(instruction, (), instructions, computations,
+                                     entered=frozenset({"fusion", "call"}))
+    named = instruction.frontend_attributes.map.get("checkpoint_name")
+    if not named and namer is not None:
+        named = namer.frontend_attributes.map.get("checkpoint_name")
+    if not named and _names_output(made, within):
+        named = made.frontend_attributes.map.get("checkpoint_name")
+    ops = (instruction, *((namer,) if namer is not None else ()), made)
+    return named or None, next((op.metadata.op_name for op in ops if op.metadata.op_name), "")
+
+
+def _bitcast_of(instruction, instructions):
+    """The value `instruction` views through its bitcasts, each moving no byte; `instruction` where it is
+    none."""
+    while instruction.opcode == "bitcast":
+        instruction = instructions[instruction.operand_ids[0]]
+    return instruction
 
 
 def _laid_out(instruction, instructions):

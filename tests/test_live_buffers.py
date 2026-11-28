@@ -343,9 +343,10 @@ def _loop_names(steps: int, config: str = _STATED) -> dict[str, tuple[str, ...]]
     module = module_bytes(_LOOP.replace(_STATED, config).replace("STEPS", str(steps)))
     defined = instruction_ids(module, "e")
     assignment: Any = empty_assignment()
-    assignment.buffer_allocations.add(index=0, size=128)
+    assignment.buffer_allocations.add(index=0, size=512)
     peak = assignment.peak_buffers.add(index=0)
-    for element, name in enumerate(("zeros", "ones", "populated", "filled", "spread", "blank", "tardy")):
+    for element, name in (*enumerate(("zeros", "ones", "populated", "filled", "spread", "blank", "tardy")),
+                          (8, "viewed"), (9, "fused"), (10, "called")):
         buffer = assignment.logical_buffers.add(id=element, size=32)
         buffer.defined_at.instruction_id = defined[name].id
         alias = assignment.buffer_aliases.add(source_buffer_id=element)
@@ -355,17 +356,96 @@ def _loop_names(steps: int, config: str = _STATED) -> dict[str, tuple[str, ...]]
     return {buffer.instruction: buffer.names for buffer in read(assignment, module).live()}
 
 
+_VIEWED_OUTSIDE = (("  flat = f32[4,2]{1,0} parameter(0)\n  stack = f32[4,1,2]{2,1,0} bitcast(flat)",
+                    "  stack = f32[4,1,2]{2,1,0} parameter(0)"),
+                   ("fusion(flat, seen, i)", "fusion(wide, seen, i)"),
+                   ("  stacked = ", "  wide = f32[4,1,2]{2,1,0} bitcast(flat)\n  stacked = "))
+"""The fixture's viewed stack with its bitcast moved out of the write's fusion, into the loop's body."""
+
+
+def _defined_at_loop(text: str, elements: tuple[int, ...]) -> dict[tuple[str, ...], str]:
+    """The names and ops `Assignment.live` gives the buffers the loop of `text` itself defines at
+    `elements`, all live at one peak."""
+    module = module_bytes(text)
+    loop = instruction_ids(module, "e")["loop"]
+    assignment: Any = empty_assignment()
+    assignment.buffer_allocations.add(index=0, size=32 * len(elements))
+    peak = assignment.peak_buffers.add(index=0)
+    for buffer_id, element in enumerate(elements):
+        buffer = assignment.logical_buffers.add(id=buffer_id, size=32)
+        buffer.defined_at.instruction_id = loop.id
+        buffer.defined_at.shape_index.append(element)
+        peak.logical_buffer_ids.append(buffer_id)
+    return {buffer.names: buffer.op_name for buffer in read(assignment, module).live()}
+
+
+@pytest.mark.parametrize("outside", [False, True], ids=["bitcast-in-fusion", "bitcast-in-body"])
+def test_a_stack_defined_at_its_loop_is_named_by_the_row_its_body_writes(outside):
+    """A scan's stack whose buffer the loop itself defines (its state past the loop, assigned apart from its
+    initial element's) is named by the row its body writes, as an aliased one is, fused or viewed through
+    bitcasts, in its write's fusion or in the loop's body, and made by the row's op (row 12463: a scanned
+    decoder's stacks read unnamed at a cold 4B start's peak, and as the loop's op, outside every rung's
+    scope)."""
+    text = _LOOP.replace("STEPS", "4")
+    for old, moved in _VIEWED_OUTSIDE if outside else ():
+        assert old in text
+        text = text.replace(old, moved)
+    live = _defined_at_loop(text, (0, 8))
+    assert sorted(live) == [("hidden",), ("viewed",)]
+    # Its op the row's, in its rung's scope, not the loop's.
+    assert live[("hidden",)] == "jit(f)/jvp(g)/dew_rung/hidden"
+
+
+def test_a_stack_written_from_a_kept_call_is_named_by_its_nearest_name_and_made_by_its_scoped_producer():
+    """A scan's stack the loop defines, its row a call XLA kept returning a call that names it ("outer")
+    around a producer naming it otherwise ("inner"), is named by the nearest name, and made by the first op
+    stating one, the producer's in its rung's scope, where the calls state none (review of row 12463)."""
+    nested = "\n".join((
+        "inner_calling {",
+        '  ROOT value = f32[2]{0} constant({13, 14}), frontend_attributes={checkpoint_name="inner"}, '
+        'metadata={op_name="jit(f)/jvp(g)/dew_rung/inner"}',
+        "}",
+        "",
+        "calling {",
+        '  value = f32[2]{0} call(), to_apply=inner_calling, frontend_attributes={checkpoint_name="outer"}',
+        "  ROOT both = (f32[2]{0}) tuple(value)",
+        "}"))
+    text = _LOOP.replace("STEPS", "4")
+    start = text.index("calling {")
+    text = text[:start] + nested + text[text.index("\n}\n", start) + 2:]
+    assert _defined_at_loop(text, (10,)) == {("outer",): "jit(f)/jvp(g)/dew_rung/inner"}
+
+
+@pytest.mark.parametrize(("steps", "affine", "expected"),
+                         [(4, True, ("next",)), (0, True, ()), (4, False, ("next",))],
+                         ids=["runs", "runs-no-step", "runs-no-affine-counter"])
+def test_a_loops_result_is_named_by_its_body_only_where_the_loop_runs(steps, affine, expected):
+    """A loop's result element whose body names the value it returns is that name's where its loop is
+    stated to run, whether or not XLA states its counter's start and stride (its annotator's count of a
+    counter from -1), and none where it runs no step, its initial value held (review of row 12463)."""
+    named = '  next = s32[] add(i, one), frontend_attributes={checkpoint_name="next"}'
+    text = _LOOP.replace("STEPS", str(steps)).replace("  next = s32[] add(i, one)", named)
+    if not affine:
+        stated = '"known_init_step":{"init":"0","step":"1"},'
+        assert stated in text
+        text = text.replace(stated, "")
+    assert list(_defined_at_loop(text, (7,))) == [expected]
+
+
 def test_a_loops_state_is_named_only_by_a_scans_whole_stack():
     """A scan's stack, which the loop's steps fill a row each, forwards or backwards, fused or through an
     async fusion, is named by the row it writes (row 13304); a populated matrix whose one row each step
     overwrites is not, nor a filled one written at one row, nor a square turned by a bitcast to another
     layout and a copy back before each write, nor one written at the counter passed through any op (a
     bitcast to a signed type of its width may take it negative), nor a stack whose loop runs fewer steps
-    than its rows, nor one of a loop whose config states no trip count."""
+    than its rows, nor one of a loop whose config states no trip count; one whose row a fusion writes into
+    the stack viewed through bitcasts, as XLA lays a scanned decoder's stacks, is, as is one whose row a
+    fusion or a call XLA kept makes, by its maker's name (row 12463)."""
     assert _loop_names(4) == {"zeros": ("hidden",), "ones": ("late",), "populated": (), "filled": (),
-                              "spread": (), "blank": (), "tardy": ("deep",)}
+                              "spread": (), "blank": (), "tardy": ("deep",), "viewed": ("viewed",),
+                              "fused": ("fused",), "called": ("called",)}
     assert _loop_names(2) == {"zeros": (), "ones": (), "populated": (), "filled": (), "spread": (),
-                              "blank": (), "tardy": ()}
+                              "blank": (), "tardy": (), "viewed": (), "fused": (), "called": ()}
     # A config XLA's parser holds as an opaque string states no trip count: no stack is named by it.
     assert _loop_names(4, 'backend_config="opaque"') == _loop_names(2)
     assert _loop_names(4, 'backend_config="\\377"') == _loop_names(2)
