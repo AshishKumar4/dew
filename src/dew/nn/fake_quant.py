@@ -15,7 +15,7 @@ import numpy as np
 from flax import linen as nn
 
 from dew.nn.derivatives import contracted, surrogate
-from dew.nn.float_bits import exact_power2, raw_fields
+from dew.nn.float_bits import exact_power2, largest_magnitude, raw_fields
 from dew.nn.precision import at_least_fp32, correctly_rounded_divide, divided
 
 E2M1 = np.arange(16, dtype=np.uint8).view(ml_dtypes.float4_e2m1fn).astype(np.float32)
@@ -129,7 +129,7 @@ def fp8_block_scale(amax):
 def fp8_scaled_blocks(x, block: int):
     """`x` in fp32 blocks of `block` channels and each block's power-of-two scale (`fp8_block_scale`)."""
     blocks = x.astype(at_least_fp32(x.dtype)).reshape(*x.shape[:-1], -1, block)
-    return blocks, fp8_block_scale(jnp.max(jnp.abs(blocks), -1, keepdims=True))
+    return blocks, fp8_block_scale(largest_magnitude(blocks, -1, keepdims=True))
 
 
 def fp8_codes(values):

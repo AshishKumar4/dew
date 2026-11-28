@@ -16,7 +16,7 @@ import jax.numpy as jnp
 from flax.typing import PrecisionLike
 
 from dew.algebra import bits
-from dew.nn.float_bits import raw_fields
+from dew.nn.float_bits import largest_magnitude
 from dew.nn.kernels import launches
 from dew.nn.kernels.templates import inline_forms, product as product_formats
 
@@ -70,12 +70,9 @@ def _block_max(acc: jax.Array, block: int) -> jax.Array:
     a block (`_blocks_reduced`), elsewhere one reduction of the blocks' view."""
     rows, columns = acc.shape
     if _EPILOGUE_LAYOUT.get() is None and columns % block == 0:
-        # Its magnitudes' words reduced at its own width, as the quantizer reduces them (`bits.nvfp4_coded`):
-        # a float maximum a flushing platform takes (XLA's CPU) read a subnormal accumulator as zero (row
-        # 14083's review), and a float64 one narrowed first overflowed (train 1455's: 2^128 to infinity).
-        words, sign, _, _ = raw_fields(acc)
-        peaks = jnp.max((words ^ sign).reshape(rows, columns // block, block), axis=-1)
-        return jnp.repeat(jax.lax.bitcast_convert_type(peaks, acc.dtype), block, axis=1)
+        # Each block's largest magnitude at the accumulator's own width, as every quantizer reads it
+        # (`float_bits.largest_magnitude`): a subnormal, an infinity and a NaN alike on every platform.
+        return jnp.repeat(largest_magnitude(acc.reshape(rows, columns // block, block), -1), block, axis=1)
     magnitude = jnp.abs(acc)
     block_id = _block_ids(acc.shape, block)
     peaks = jnp.zeros_like(acc)
