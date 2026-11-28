@@ -54,9 +54,11 @@ beside 1 under a cotangent of `2^127`) are held to the template's own attention 
 attention, which lose them alike (no exponent tiers; row 14033). The shared dots, `r · k2` and `g · v`, are
 taken at one power a row over the pairs it sees (`_row_bounds`): its largest visible dot held below `2^125`
 (`HELD`, the headroom threshold), a visible dot more than fp32's range below that largest held to plain
-fp32's parity (row 14033). Every higher order differentiates the dense reference (`reference`), whose tails
-read as the plain formula's (row 14007): a lifted term meets a tangent or cotangent at its own size, its
-power taken first (`_shifted`).
+fp32's parity (row 14033); the row's power taken by its second query before its products, so an entry of
+`r` more than fp32's range below the row's largest visible dot past `2^125` flushes, as plain fp32's
+product overflows there (Main's ruling on train 1444's review, row 14033). Every higher order
+differentiates the dense reference (`reference`), whose tails read as the plain formula's (row 14007): a
+lifted term meets a tangent or cotangent at its own size, its power taken first (`_shifted`).
 
 It is XLA's alone: no launch of a Pallas mainloop (a GH200's Triton walk spilled at every backward tile and
 walked its forward 10 times the template's sdpa, M-NA-58b)."""
@@ -96,7 +98,8 @@ class Moments(NamedTuple):
     """A query row's moments over the keys it has met `[B, Hk, G, Q]` (each value `[..., Dv]`), fp32: the
     largest logit `m` (-inf before any key) and the denominator `total` at it, the values' mean `mean`, the
     second products' mean `centre` as a pair `(hi, lo)` summing to it, in the row's units (`t̂`,
-    `second_powers`), and their covariance with the values `spread · 2^spread_power`, a mantissa of at most
+    `second_powers`), and their covariance with the values `spread · 2^spread_power`, a channel at a time
+    (`[..., Dv]` each: a channel of `2^-100` beside one of `2^127` its own), a mantissa of at most
     1 and its row's power of two, at least 0: a part's covariance past fp32's range carried through a
     merge whose shares bring it back (`merged`), one below 1 held as it is (its power 0, a zero's too, so
     a covariance that cancels bounds nothing after it), its tangent then the covariance's own (train 1444's
@@ -239,9 +242,11 @@ def moments(logits: jax.Array, seconds: jax.Array, value: jax.Array, powers: jax
     tail_pairs = jnp.where(seen & tail, _reach(below) + valued, _NONE)
     raised = jnp.clip(126 - width - jnp.max(tail_pairs, axis=-1), 0, 241)[..., None]
     lifted = jnp.where(tail, exp_scaled(jnp.broadcast_to(1.0 / over, below.shape), below, raised), 0.0)
-    mean = weighed(jnp.where(tail, 0.0, weights), value) + _shifted(weighed, lifted, value, -raised)
-    hi = jax.lax.stop_gradient(jnp.sum(weights * seconds, axis=-1))
-    lo = jnp.sum(weights * (seconds - hi[..., None]), axis=-1)
+    mean = weighed(jnp.where(tail, 0.0, weights), value) + _shifted(weighed, lifted, value, -raised, 0)
+    # The centre's terms each a second product decayed with its weight before either rounds (`exp_scaled`):
+    # a tail's `2^200 e^-128` kept where its weight alone underflowed (train 1444's review).
+    hi = jax.lax.stop_gradient(jnp.sum(exp_scaled(seconds / over, below, 0), axis=-1))
+    lo = jnp.sum(exp_scaled((seconds - hi[..., None]) / over, below, 0), axis=-1)
     apart = jnp.where(seen, (seconds - hi[..., None]) - lo[..., None], 0.0)
     # The row's power: its largest pair `|w (t̂ - c)| |v|` and `|w (t̂ - c)| |a|` below `2^(G - log2 K)`, so
     # `Σ |ũ| |v| / 2` and `Σ |ũ| |a| / 2` within `2^126`, each pair's own value read (a key of no weight
@@ -265,42 +270,46 @@ def moments(logits: jax.Array, seconds: jax.Array, value: jax.Array, powers: jax
 
     halves = (value * 0.5, mean * 0.5)
     # Its power from the covariance at the lifted units, the covariance then taken to it whole (`_shifted`).
-    spread_power = _spread_power(jax.lax.stop_gradient(covariance(taken, halves)), units - before)
-    spread = _shifted(covariance, taken, halves, (units - before - spread_power)[..., None])
+    lift = (units - before)[..., None]
+    spread_power = _spread_power(jax.lax.stop_gradient(covariance(taken, halves)), lift)
+    spread = _shifted(covariance, taken, halves, lift, -spread_power)
     return Moments(jnp.max(logits, axis=-1), total, mean, (hi, lo), spread, spread_power)
 
 
 def _spread_power(covariance: jax.Array, power) -> jax.Array:
-    """`Moments.spread_power` of a covariance `covariance · 2^power` (`[..., Dv]`, `power` int32 `[...]`): its
-    row's power of two where that passes 1, else 0 (a zero's too)."""
-    _, scaled = _normalized(covariance)
-    held = jnp.any(covariance != 0, axis=-1)
-    return jnp.where(held, jnp.maximum(scaled + power, 0), 0)
+    """`Moments.spread_power` of a covariance `covariance · 2^power` (`[..., Dv]`, `power` int32 broadcast to
+    it): each channel's power of two where that passes 1, else 0 (a zero's too)."""
+    return jnp.where(covariance != 0, jnp.maximum(_exponent(covariance) + power, 0), 0)
 
 
-def _shifted_value(product: Callable, rows: jax.Array, by, shift) -> jax.Array:
-    """`product(rows, by) 2^shift`, its product formed before the power (`_shifted`)."""
-    return power2(product(rows, by), shift)
+def _shifted_value(product: Callable, rows: jax.Array, by, lift, scale) -> jax.Array:
+    """`product(rows, by) 2^(lift + scale)`, its product formed before the power (`_shifted`)."""
+    return power2(product(rows, by), lift + scale)
 
 
 def _shifted_tangent(product: Callable, primals, tangents, value) -> jax.Array:
     """`_shifted`'s tangent: the rows' direction met by `by` before the power, as the value forms it (so its
     pullback takes the power on a cotangent first, as autodiff of the value did); `by`'s direction met by
-    the rows at their own size, the power's negative part taken by the rows first and its positive part by
-    the product (a row's power, which `by`, a key's values among it, cannot take)."""
+    the rows taken toward their own size first, by as much of the row's `lift` as keeps their largest within
+    `2^125` (all of it where it is negative), the rest of the power after: a lift of `2^60` taken off before
+    a direction of `2^125` meets them, and a positive one put back before a direction of `2^-124` does (its
+    products `2^-165` otherwise, train 1444's review)."""
     del value
-    rows, by, shift = primals
-    drows, dby, _ = tangents
-    low, high = jnp.minimum(shift, 0), jnp.maximum(shift, 0)
-    return power2(product(drows, by), shift) + power2(product(power2(rows, low), dby), high)
+    rows, by, lift, scale = primals
+    drows, dby, _, _ = tangents
+    largest = jnp.max(_exponent(jax.lax.stop_gradient(rows)), axis=-1, keepdims=True)
+    take = jnp.minimum(lift, 125 - largest)
+    return (power2(product(drows, by), lift + scale)
+            + power2(product(power2(rows, take), dby), lift - take + scale))
 
 
 _shifted = contracted("test_parallax_holds_every_order")(
     surrogate(_shifted_value, _shifted_tangent, nondiff_argnums=(0,)))
-"""`product(rows, by) 2^shift` (`_shifted_value`), `product` bilinear in a row's terms `rows` `[..., K]`
-lifted for their products and what they meet, `by` (an array or a tuple of them), and `shift` the rows'
-integral power back: its value the product's before the power, so a lifted term keeps its product with a
-small value and terms that cancel do so before the power; a direction along `by` meets the terms at their
+"""`product(rows, by) 2^(lift + scale)` (`_shifted_value`), `product` bilinear in a row's terms `rows`
+`[..., K]` lifted for their products and what they meet, `by` (an array or a tuple of them), `lift` the
+rows' integral power back `[..., 1]` and `scale` each channel's own `[..., Dv]` (or 0): its value the
+product's before the power, so a lifted term keeps its product with a small value and terms that cancel
+do so before the power; a direction along `by` meets the terms at their
 own size (`_shifted_tangent`): equal logits, second products `[1, -1]`, values 0 along `[2^126, -2^126]`
 read the covariance's tangent `2^126`, where `2^60`-lifted terms met `2^125` before their `2^-60` and
 overflowed (train 1444's review). Its tails' tangents so read as plain fp32's (Main's ruling of
@@ -339,24 +348,26 @@ def merged(held: Moments, tile: Moments, powers: jax.Array) -> Moments:
     # The three terms' powers, each its decay's reach and its mantissa's bound: the largest their common
     # power, each term taken to it with its decay at once.
     cross_power = own + theirs + exponent + 1 - powers
-    estimates = (jnp.where(_spread_held(held), _reach(first) + own + held.spread_power, _NONE),
-                 jnp.where(_spread_held(tile), _reach(second) + theirs + tile.spread_power, _NONE),
-                 jnp.where((held.total > 0) & (tile.total > 0) & (fraction != 0),
-                           _reach(first + second) + cross_power + jnp.max(_exponent(apart), axis=-1), _NONE))
+    # Each channel's own (`Moments.spread`).
+    estimates = (jnp.where(_spread_held(held), column(_reach(first) + own) + held.spread_power, _NONE),
+                 jnp.where(_spread_held(tile), column(_reach(second) + theirs) + tile.spread_power, _NONE),
+                 jnp.where(column((held.total > 0) & (tile.total > 0) & (fraction != 0)),
+                           column(_reach(first + second) + cross_power) + _exponent(apart), _NONE))
     common = functools.reduce(jnp.maximum, estimates)
     common = jnp.where(common > _NONE, common, 0)
-    summed = (exp_scaled(column(share) * held.spread, column(first), column(own + held.spread_power - common))
+    summed = (exp_scaled(column(share) * held.spread, column(first), column(own) + held.spread_power - common)
               + exp_scaled(column(other) * tile.spread, column(second),
-                           column(theirs + tile.spread_power - common))
+                           column(theirs) + tile.spread_power - common)
               + exp_scaled(column(share * other * fraction) * apart, column(first + second),
-                           column(cross_power - common)))
+                           column(cross_power) - common))
     spread_power = _spread_power(summed, common)
-    return Moments(m, total, mean, (hi, lo), power2(summed, column(common - spread_power)), spread_power)
+    return Moments(m, total, mean, (hi, lo), power2(summed, common - spread_power), spread_power)
 
 
 def _spread_held(part: Moments) -> jax.Array:
-    """Whether a part's rows hold a covariance (a zero's power bounds no merge, `Moments.spread`)."""
-    return (part.total > 0) & jnp.any(part.spread != 0, axis=-1)
+    """Whether each channel of a part's rows holds a covariance (a zero's power bounds no merge,
+    `Moments.spread`)."""
+    return (part.total > 0)[..., None] & (part.spread != 0)
 
 
 def _merged_centre(held: Moments, tile: Moments, held_share: tuple, tile_share: tuple):
@@ -481,9 +492,9 @@ def _output(found: Moments, dtype) -> jax.Array:
     """`a - C` `[B, Q, H, Dv]` in `dtype`, the two subtracted at their common power and the difference
     taken back by it, so a covariance past fp32 whose difference with the mean fp32 holds reads that
     difference (`a = 2^126`, `C = 2^128`: `-3 · 2^126`, train 1423's review of 72b1ef355)."""
-    largest = jnp.maximum(found.spread_power + 1, jnp.max(_exponent(found.mean), axis=-1))
-    common = jnp.maximum(0, largest - 126)[..., None]
-    difference = power2(found.mean, -common) - power2(found.spread, found.spread_power[..., None] - common)
+    largest = jnp.maximum(found.spread_power + 1, _exponent(found.mean))
+    common = jnp.maximum(0, largest - 126)
+    difference = power2(found.mean, -common) - power2(found.spread, found.spread_power - common)
     return _ungrouped(power2(difference, common)).astype(dtype)
 
 
@@ -652,7 +663,9 @@ def derivative(query, second, key, second_key, value, spans: KeySpans, held: Mom
         seen, fraction, tau_power, delta, delta_power = paired(logits, seconds, moved)
         logit, common = _logit_coefficient(delta, delta_power, fraction, tau_power, row(against),
                                            row(against_power))
-        logit = logit / row(over)
+        # A scale of 0 moves no logit: no query's or key's cotangent, never an overflowing coefficient
+        # times 0 (train 1444's review).
+        logit = jnp.zeros_like(logit) if scale == 0 else logit / row(over)
         values_coefficient, values_power = _values_coefficient(fraction, tau_power)
         values_coefficient = values_coefficient / row(over)
         second_coefficient = -delta / row(over)

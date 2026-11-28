@@ -307,6 +307,10 @@ WITNESSES = {
     # Its review of 0fafa2dcb: a tail's values' weight past fp32 under a small cotangent.
     "a tail's values' weight past fp32 under a small cotangent": lambda: _witness(
         (0.0, -81.0), (0.0, 2.0 ** 125), (0.0, 0.0), second=2.0 ** 125),
+    # Train 1444's review of ef337c837: a tail's second product of `2^200` in the centre, `2^200 e^-128`,
+    # the dominant value's cotangent `(1 + c) / (1 + e^-128)`, about 41335.
+    "a tail's second product in the centre": lambda: _witness((0.0, -128.0), (0.0, 2.0 ** 100), (0.0, 0.0),
+                                                              second=2.0 ** 100),
 }
 COTANGENTS = {"values' weights past fp32 under a small cotangent": 2.0 ** -100,
               "a tail's values' weight under a large cotangent": 2.0 ** 127,
@@ -806,3 +810,56 @@ def test_a_scale_of_zero_gives_logits_of_zero(arm):
     attend = attention_parallax.attend if arm == "walk" else attention_parallax.reference
     out = attend(query, second, key, second_key, value, template.spans(1, 2, 1), scale=0.0)
     np.testing.assert_array_equal(np.asarray(out), np.ones((1, 1, 1, 4), np.float32))
+
+
+def test_a_scale_of_zero_moves_no_query_or_key():
+    """A scale of 0 over a query and keys `±2^127`, values `±2^127` under a cotangent of `2^127`: the query's
+    and keys' cotangents 0, the logits' coefficients never formed (`attention_parallax.derivative`), where
+    unscaled ones of `2^253` landed, overflowed and met the scale's 0 as NaN (train 1444's review)."""
+    query = jnp.zeros((1, 1, 1, 4), jnp.float32).at[0, 0, 0, 0].set(2.0 ** 127)
+    key = jnp.zeros((1, 2, 1, 4), jnp.float32).at[0, :, 0, 0].set(jnp.asarray([2.0 ** 127, -(2.0 ** 127)]))
+    value = jnp.broadcast_to(jnp.asarray([2.0 ** 127, -(2.0 ** 127)], jnp.float32)[None, :, None, None],
+                             (1, 2, 1, 4))
+    second, second_key = jnp.zeros((1, 1, 1, 1), jnp.float32), jnp.zeros((1, 2, 1, 1), jnp.float32)
+    spans = template.spans(1, 2, 1)
+    out, pull = jax.vjp(lambda query, key: attention_parallax.attend(query, second, key, second_key, value,
+                                                                     spans, scale=0.0), query, key)
+    dquery, dkey = pull(jnp.full_like(out, 2.0 ** 127))
+    np.testing.assert_array_equal(np.asarray(dquery), np.zeros(query.shape, np.float32))
+    np.testing.assert_array_equal(np.asarray(dkey), np.zeros(key.shape, np.float32))
+
+
+@pytest.mark.parametrize("arm", ["walk", "reference"])
+def test_each_value_channel_keeps_its_own_covariance(arm):
+    """Equal logits, second products `[1, -1]`, values `(2^127, 2^-100)` and `(-2^127, -2^-100)`: the means
+    0 and the output `[-2^127, -2^-100]`, each channel's covariance at its own power
+    (`attention_parallax.Moments.spread_power`), where the row's one power took the small channel to
+    `2^-228` (train 1444's review)."""
+    query = jnp.zeros((1, 1, 1, 4), jnp.float32)
+    key = jnp.zeros((1, 2, 1, 4), jnp.float32)
+    second = jnp.ones((1, 1, 1, 1), jnp.float32)
+    second_key = jnp.asarray([1.0, -1.0], jnp.float32)[None, :, None, None]
+    value = jnp.asarray([[2.0 ** 127, 2.0 ** -100], [-(2.0 ** 127), -(2.0 ** -100)]],
+                        jnp.float32)[None, :, None]
+    attend = attention_parallax.attend if arm == "walk" else attention_parallax.reference
+    out = attend(query, second, key, second_key, value, template.spans(1, 2, 1))
+    np.testing.assert_array_equal(np.asarray(out)[0, 0, 0], np.asarray([-(2.0 ** 127), -(2.0 ** -100)],
+                                                                        np.float32))
+
+
+@pytest.mark.parametrize("arm", ["walk", "reference"])
+def test_a_small_value_direction_meets_lifted_terms_at_their_size(arm):
+    """Eight equal logits, second products `[2^100, -2^100, 2^70, -2^70, 0, 0, 0, 0]`, values of `2^127` on
+    the last four keys, along the direction `[0, 0, 2^-124, -2^-124, 0, 0, 0, 0]`: the output's tangent
+    plain fp32's `-2^-56`, the terms taken back toward their size before the direction meets them
+    (`attention_parallax._shifted`), where a positive power put back after their products took `2^-165`
+    below fp32's least (train 1444's review)."""
+    seconds = (2.0 ** 100, -(2.0 ** 100), 2.0 ** 70, -(2.0 ** 70), 0.0, 0.0, 0.0, 0.0)
+    query, second, key, second_key, value, spans = _witness((0.0,) * 8, seconds,
+                                                             (0.0,) * 4 + (2.0 ** 127,) * 4)
+    attend = attention_parallax.attend if arm == "walk" else attention_parallax.reference
+    direction = jnp.broadcast_to(jnp.asarray([0.0, 0.0, 2.0 ** -124, -(2.0 ** -124), 0.0, 0.0, 0.0, 0.0],
+                                             jnp.float32)[None, :, None, None], value.shape)
+    _, tangent = jax.jvp(lambda value: attend(query, second, key, second_key, value, spans), (value,),
+                         (direction,))
+    np.testing.assert_array_equal(np.asarray(tangent), np.full((1, 1, 1, 4), -(2.0 ** -56), np.float32))
