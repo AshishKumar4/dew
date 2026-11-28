@@ -895,7 +895,6 @@ def _evaluated(node, tokens: Mapping, decays: _Decays, h, known: dict, issue: Ca
     `base2`; `linear_scan.Chunk.across_prefix`), and its token loop's each token's own. Its token loop's
     corrections read the state a token enters where `before` (`linear_scan.Parts.before`)."""
     issue = issue or _issued
-    from egglog import get_callable_args
 
     Chunk = linear_scan.Chunk
     named = terms.key(node)
@@ -906,55 +905,55 @@ def _evaluated(node, tokens: Mapping, decays: _Decays, h, known: dict, issue: Ca
         return _evaluated(child, tokens, decays, h, known, issue, values_read=values_read, apart=apart,
                           base2=base2, across=across, before=before, erased=erased)
 
-    if (args := get_callable_args(node, Chunk.token)) is not None:
+    if (args := terms.args_of(node, Chunk.token)) is not None:
         value = tokens[terms.text(args[0])]
-    elif get_callable_args(node, Chunk.entering) is not None:
+    elif terms.args_of(node, Chunk.entering) is not None:
         value = h
-    elif (args := get_callable_args(node, Chunk.decay)) is not None:
+    elif (args := terms.args_of(node, Chunk.decay)) is not None:
         value = getattr(decays, terms.text(args[0]))
-    elif get_callable_args(node, Chunk.across_prefix) is not None:
+    elif terms.args_of(node, Chunk.across_prefix) is not None:
         value = _decays(tokens["E"], base2)
-    elif (args := get_callable_args(node, Chunk.across)) is not None:
+    elif (args := terms.args_of(node, Chunk.across)) is not None:
         value = getattr(of(args[1]), terms.text(args[0]))
-    elif (args := get_callable_args(node, Chunk.loop)) is not None:
+    elif (args := terms.args_of(node, Chunk.loop)) is not None:
         value = _looped(tokens, decays, h, of(args[0]), corrected=True, values_read=values_read, apart=apart,
                         before=before, erased=erased)
-    elif (args := get_callable_args(node, Chunk.plain)) is not None:
+    elif (args := terms.args_of(node, Chunk.plain)) is not None:
         value = _looped(tokens, decays, h, of(args[0]), corrected=False, values_read=values_read,
                         apart=apart, across=_exp(base2, tokens["E"]) if across else None)
-    elif (args := get_callable_args(node, Chunk.pair)) is not None:
+    elif (args := terms.args_of(node, Chunk.pair)) is not None:
         value = (of(args[0]), of(args[1]))
-    elif (args := get_callable_args(node, Chunk.outputs)) is not None:
+    elif (args := terms.args_of(node, Chunk.outputs)) is not None:
         value = of(args[0])[0]
-    elif (args := get_callable_args(node, Chunk.state)) is not None:
+    elif (args := terms.args_of(node, Chunk.state)) is not None:
         value = of(args[0])[1]
-    elif (args := get_callable_args(node, Chunk.gram)) is not None:
+    elif (args := terms.args_of(node, Chunk.gram)) is not None:
         # Through decays a token back (`between_before`), a pair factors at the reference's next row.
-        through = get_callable_args(args[3], Chunk.decay)
+        through = terms.args_of(args[3], Chunk.decay)
         value = _paired(of(args[0]), of(args[1]), of(args[3]), issue, _pairing_role(args[0]),
                         apart=terms.integer(args[2]),
                         back=through is not None and terms.text(through[0]) == "between_before")
-    elif (args := get_callable_args(node, Chunk.spread)) is not None:
+    elif (args := terms.args_of(node, Chunk.spread)) is not None:
         value = spread(of(args[0]), of(args[1]), of(args[2]), of(args[3]), issue=issue)
-    elif (args := get_callable_args(node, Chunk.weighed)) is not None:
+    elif (args := terms.args_of(node, Chunk.weighed)) is not None:
         # Each pair's score times the earlier token's values decayed to the reader along them, summed.
         value = _each_decayed(of(args[0]), of(args[1]), of(args[2]))
-    elif (args := get_callable_args(node, Chunk.applied)) is not None:
+    elif (args := terms.args_of(node, Chunk.applied)) is not None:
         value = issue("apply", of(args[1]), of(args[0]).T)
     elif (value := _elementwise(node, of)) is not None:
         pass
-    elif (args := get_callable_args(node, Chunk.matmul)) is not None:
+    elif (args := terms.args_of(node, Chunk.matmul)) is not None:
         # The chunk's scores (a pairing of its tokens through their decays, not the solve's) applied to its
         # tokens' values is its local readout, `readout_local` (`carry.EMIT_ROLES`), as the hand form's.
-        pairing = get_callable_args(args[0], Chunk.gram)
+        pairing = terms.args_of(args[0], Chunk.gram)
         local = pairing is not None and _pairing_role(pairing[0]) == "scores"
         value = issue("readout_local" if local else "apply", of(args[0]), of(args[1]))
-    elif (args := get_callable_args(node, Chunk.written)) is not None:
+    elif (args := terms.args_of(node, Chunk.written)) is not None:
         value = issue("carry", _scaled(of(args[0]), of(args[2])).T, of(args[1]))
-    elif (args := get_callable_args(node, Chunk.doubled)) is not None:
+    elif (args := terms.args_of(node, Chunk.doubled)) is not None:
         # Differentiated by its own rule where Dew's products make it (`_lowered`); a mainloop's are forward.
         value = _lowered(of(args[0])) if issue is _issued else _doubled(of(args[0]), issue)
-    elif (args := get_callable_args(node, Chunk.substituted)) is not None:
+    elif (args := terms.args_of(node, Chunk.substituted)) is not None:
         value = _substituted(of(args[0]), of(args[1]))
     else:
         raise Refused(f"a chunk form's node of no evaluation: {node}")
@@ -965,33 +964,32 @@ def _evaluated(node, tokens: Mapping, decays: _Decays, h, known: dict, issue: Ca
 def _elementwise(node, of: Callable):
     """`node`'s value where it is elementwise in its operands (`of`'s values) or a decay's scaling of them;
     None for any other."""
-    from egglog import get_callable_args
 
     Chunk = linear_scan.Chunk
-    if (args := get_callable_args(node, Chunk.rows)) is not None:
+    if (args := terms.args_of(node, Chunk.rows)) is not None:
         return of(args[1])[:, None] * of(args[0])
-    if (args := get_callable_args(node, Chunk.times)) is not None:
+    if (args := terms.args_of(node, Chunk.times)) is not None:
         # The decay (or the values' decay, `across`) on the right, the value it scales on the left.
-        first_decays = get_callable_args(args[0], Chunk.decay) is not None
+        first_decays = terms.args_of(args[0], Chunk.decay) is not None
         value, decay = (of(args[1]), of(args[0])) if first_decays else (of(args[0]), of(args[1]))
         # A decay across a document's start (`_crossed`) takes its factor out by select before the product,
         # so a memory past the largest read before its reset is no 0 times inf, nor its gradient (row 8560);
         # a live span's that underflows multiplies as the recurrence does, a split decay's factors in turn.
-        if first_decays or get_callable_args(args[1], Chunk.decay) is not None:
+        if first_decays or terms.args_of(args[1], Chunk.decay) is not None:
             value = jnp.where(_crossed(decay.first if isinstance(decay, _Split) else decay), 0.0, value)
         return _scaled(value, decay)
-    if (args := get_callable_args(node, Chunk.plus)) is not None:
+    if (args := terms.args_of(node, Chunk.plus)) is not None:
         return of(args[0]) + of(args[1])
-    if (args := get_callable_args(node, Chunk.minus)) is not None:
+    if (args := terms.args_of(node, Chunk.minus)) is not None:
         return of(args[0]) - of(args[1])
-    if (args := get_callable_args(node, Chunk.decayed)) is not None:
+    if (args := terms.args_of(node, Chunk.decayed)) is not None:
         # A state carried across a document's start taken out by select before its decay, as `times` takes
         # a read's: a memory past the largest before the reset is no 0 times inf.
         whole = of(args[1])
         crossed = _crossed(whole.first if isinstance(whole, _Split) else whole)
         state = jnp.where(crossed[:, None], 0.0, of(args[0]))
         return _scaled(state, jax.tree.map(lambda x: x[:, None], whole))
-    if (args := get_callable_args(node, Chunk.columns)) is not None:
+    if (args := terms.args_of(node, Chunk.columns)) is not None:
         return _scaled(of(args[0]), jax.tree.map(lambda x: x[None, :], of(args[1])))
     return None
 
@@ -1193,9 +1191,8 @@ def _scaled_contract(subscripts: str, scale: float | np.floating, scale_dtype: n
 def _pairing_role(left) -> str:
     """A pairing's products' role (`linear_scan.Chunk.gram`), by its rows: a correction's (the token `C`) a
     system's `gram`, a reader's the chunk's `scores`."""
-    from egglog import get_callable_args
 
-    token = get_callable_args(left, linear_scan.Chunk.token)
+    token = terms.args_of(left, linear_scan.Chunk.token)
     return "gram" if token is not None and terms.text(token[0]) == "C" else "scores"
 
 

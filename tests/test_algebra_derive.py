@@ -2113,15 +2113,12 @@ def test_direct_weighted_variance_pullback_is_zero_at_equal_large_values(mode, w
     np.testing.assert_array_equal(dw, np.zeros((1, 2), np.float32))
 
 
-def test_chunked_moments_balances_unequal_scales_value_gradients_and_explicit_sharding():
-    """Positive-mass combines and tile products balance unequal covariance scales and minimum-normal weights
-    without underflow; value gradients hold Check 1 (`assert_as_exact`) and explicit sharding lowers."""
-    from jax.sharding import AxisType, NamedSharding, PartitionSpec as P
-
+def test_chunked_covariance_balances_unequal_scales():
+    """Positive-mass combines and tile products balance unequal covariance scales (`x ~ 2^100, y ~ 2^-100,
+    w ~ 2^-100`): the covariance stays normal and matches float64 truth at each tile and in each mode, where
+    naive float32 `(w * dx) * dy` underflows to zero."""
     from dew.algebra import moments
 
-    # Unequal covariance scales (`x ~ 2^100, y ~ 2^-100, w ~ 2^-100`): balanced associativity stays normal
-    # and matches float64 truth even where naive float32 `(w * dx) * dy` underflows to zero.
     big_d, sml_d = np.float32(2.0 ** 100), np.float32(2.0 ** -100)
     for x_pair, y_pair, w_pair in (([0.0, big_d], [0.0, sml_d], [1.0, sml_d]),
                                    ([0.0, sml_d], [0.0, big_d], [1.0, sml_d]),
@@ -2137,8 +2134,14 @@ def test_chunked_moments_balances_unequal_scales_value_gradients_and_explicit_sh
                 _, _, got_cov = moments.chunked_covariance(xu, yu, wu, tile=tile, mode=mode)
                 assert np.all(np.isfinite(np.asarray(got_cov))) and float(got_cov[0]) != 0.0
                 np.testing.assert_array_equal(np.asarray(got_cov), exact_cov)
-    # Minimum-normal float32 weights (`2^-126`): normalized monoid keeps primal and value VJPs finite/exact
-    # both through `chunked_covariance` and through direct `derive.derive` without `custom_jvp`.
+
+
+def test_chunked_moments_keep_minimum_normal_weights_exact():
+    """Minimum-normal float32 weights (`2^-126`): the normalized monoid keeps the primal and the value VJPs
+    finite and exact through `chunked_moments`, `chunked_covariance` and direct `derive.derive` forms (no
+    `custom_jvp`)."""
+    from dew.algebra import moments
+
     tiny = float(np.finfo(np.float32).tiny)
     for x_pair, w_scale, expect_var in (([-0.5, 0.5], 2.0 ** -124, 0.25), ([-1.0, 1.0], tiny, 1.0)):
         x_tiny = jnp.asarray([x_pair], jnp.float32)
@@ -2172,68 +2175,96 @@ def test_chunked_moments_balances_unequal_scales_value_gradients_and_explicit_sh
             np.testing.assert_array_equal(np.asarray(gy), np.asarray([[-4.0, 4.0]], np.float32))
             np.testing.assert_array_equal(np.asarray(gw), np.asarray([[0.0, 0.0]], np.float32))
 
-    # Ordinary value gradients (`dx`, `dy`): Check 1 (`assert_as_exact`) against the declared reductions.
+
+@pytest.mark.parametrize("mode", ["walk", "merge"])
+def test_chunked_covariance_value_gradients_hold_check_1(mode):
+    """Ordinary value gradients (`dx`, `dy`) of the chunked covariance on par with the declared reduction's
+    (check 1, `assert_as_exact`)."""
+    from dew.algebra import moments
+
     def draw_xyw(seed):
         rng = np.random.default_rng([9044, seed])
         return ((10.0 + rng.standard_normal((4, 16))).astype(np.float32),
                 (-5.0 + rng.standard_normal((4, 16))).astype(np.float32),
                 rng.uniform(0.25, 2.0, (4, 16)).astype(np.float32))
 
-    for mode in ("walk", "merge"):
-        assert_as_exact(
-            jax.jit(jax.grad(lambda x_, y_, w_, m=mode: moments.chunked_covariance(
-                x_, y_, w_, tile=4, mode=m)[2].sum(), argnums=(0, 1))),
-            jax.jit(jax.grad(lambda x_, y_, w_: moments.weighted_covariance(
-                x_, y_, w_)[2].sum(), argnums=(0, 1))),
-            draw_xyw, f"chunked covariance value gradients ({mode})", seeds=8)
+    assert_as_exact(
+        jax.jit(jax.grad(lambda x_, y_, w_: moments.chunked_covariance(
+            x_, y_, w_, tile=4, mode=mode)[2].sum(), argnums=(0, 1))),
+        jax.jit(jax.grad(lambda x_, y_, w_: moments.weighted_covariance(
+            x_, y_, w_)[2].sum(), argnums=(0, 1))),
+        draw_xyw, f"chunked covariance value gradients ({mode})", seeds=8)
 
-    # Explicit sharding (`AxisType.Explicit`): derived walk and merge lower cleanly under explicit meshes.
+
+@pytest.mark.parametrize("mode", ["walk", "merge"])
+def test_chunked_moments_lower_under_an_explicit_mesh(mode):
+    """The derived walk and merge lower under an explicit mesh (`AxisType.Explicit`) and give the weighted
+    moments bit for bit."""
+    from jax.sharding import AxisType, NamedSharding, PartitionSpec as P
+
+    from dew.algebra import moments
+
     xv = jnp.asarray([[1.0, 3.0, 5.0, 7.0]], jnp.float32)
     wv = jnp.asarray([[0.5, 1.5, 1.0, 1.0]], jnp.float32)
+    ref_ms, ref_vs = moments.weighted_moments(xv, wv)
     mesh = jax.make_mesh((1,), ("data",), axis_types=(AxisType.Explicit,), devices=jax.devices()[:1])
     sharding = NamedSharding(mesh, P("data", None))
     with jax.set_mesh(mesh):
         xs, ws = jax.device_put(xv, sharding), jax.device_put(wv, sharding)
-        for mode in ("walk", "merge"):
-            ms, vs = jax.jit(lambda a, b, m=mode: moments.chunked_moments(a, b, tile=2, mode=m))(xs, ws)
-            ref_ms, ref_vs = moments.weighted_moments(xv, wv)
-            np.testing.assert_array_equal(np.asarray(ms), np.asarray(ref_ms))
-            np.testing.assert_array_equal(np.asarray(vs), np.asarray(ref_vs))
+        ms, vs = jax.jit(lambda a, b: moments.chunked_moments(a, b, tile=2, mode=mode))(xs, ws)
+    np.testing.assert_array_equal(np.asarray(ms), np.asarray(ref_ms))
+    np.testing.assert_array_equal(np.asarray(vs), np.asarray(ref_vs))
 
 
-def test_zero_mass_scaled_covariance_ad():
-    """Two-band zero-mass covariance (`moment_hi`, `moment_scale`) preserves exact direct `derive` JVP/VJP
-    across orthogonal, mixed-scale, multi-scale high-band, and one-sided shifted tiles."""
+def _zero_mass_covariance(x_, y_, w_, *, tile: int, mode: str):
+    """The covariance's direct `derive` forms (`moments.derived("covariance")`, derived once a process) over
+    `tile`-wide tiles of one row, walked (`walk`) or each tile stepped alone and merged (`merge`), its
+    covariance summed."""
     from dew.algebra import moments
-    forms_cov = derive.derive(moments.declaration("covariance"), accurate=False, saturation=SATURATION)
 
-    def direct_eval(x_, y_, w_, *, tile: int, mode: str):
-        shapes = dict.fromkeys(("x", "y", "w"), ((1, tile), jnp.float32))
-        ntiles = x_.shape[1] // tile
-        tiles = [{"x": x_[:, i * tile:(i + 1) * tile], "y": y_[:, i * tile:(i + 1) * tile],
-                  "w": w_[:, i * tile:(i + 1) * tile]} for i in range(ntiles)]
-        if mode == "walk":
-            state = forms_cov.init(shapes)
-            for part in tiles:
-                state = forms_cov.step(state, part)
-        else:
-            empty = forms_cov.init(shapes)
-            partials = [forms_cov.step(empty, part) for part in tiles]
-            state = partials[0]
-            for part in partials[1:]:
-                state = forms_cov.merge(state, part, shapes=shapes)
-        return forms_cov.finish(state, tiles[0], shapes=shapes)[2].sum()
+    forms_cov = moments.derived("covariance")
+    shapes = dict.fromkeys(("x", "y", "w"), ((1, tile), jnp.float32))
+    ntiles = x_.shape[1] // tile
+    tiles = [{"x": x_[:, i * tile:(i + 1) * tile], "y": y_[:, i * tile:(i + 1) * tile],
+              "w": w_[:, i * tile:(i + 1) * tile]} for i in range(ntiles)]
+    if mode == "walk":
+        state = forms_cov.init(shapes)
+        for part in tiles:
+            state = forms_cov.step(state, part)
+    else:
+        empty = forms_cov.init(shapes)
+        partials = [forms_cov.step(empty, part) for part in tiles]
+        state = partials[0]
+        for part in partials[1:]:
+            state = forms_cov.merge(state, part, shapes=shapes)
+    return forms_cov.finish(state, tiles[0], shapes=shapes)[2].sum()
 
-    # Orthogonal zero-mass witness: `x = [2^70, 0], y = [0, 2^70], w = [0, 0]` has zero exact derivative in
-    # both weight directions and both direct JVP and direct VJP at `tile=1` (step & merge) and `tile=2`.
-    big = np.float32(2.0 ** 70)
+
+_ZERO_MASS_BIG = np.float32(2.0 ** 70)
+_ZERO_MASS_HUGE = np.float32(2.0 ** 127)
+_ZERO_MASS_FMAX = np.finfo(np.float32).max
+_ZERO_MASS_MID = np.float32(2.0 ** 63)
+_ZERO_MASS_NEAR = np.float32(1.25 * 2.0 ** 63)
+_ZERO_MASS_OVER = np.float32(2.0 ** 64)
+_ZERO_MASS_SMALL = np.float32(2.0 ** -45)
+_ZERO_MASS_TINY = float(np.finfo(np.float32).tiny)
+"""The zero-mass covariance witnesses' values: `2^70` beside zero, `2^127` and float32's largest whose
+signs cancel, `2^63`, `1.25 * 2^63` (its square's boundary) and `2^64` (whose square overflows) beside them,
+`2^-45` (a small entry beside large ones) and the minimum normal `2^-126` (a weight direction)."""
+
+
+def test_zero_mass_scaled_covariance_ad_is_zero_in_orthogonal_directions():
+    """Two-band zero-mass covariance (`moment_hi`, `moment_scale`): `x = [2^70, 0], y = [0, 2^70], w = [0, 0]`
+    has zero exact derivative in both weight directions and both value directions, direct JVP and VJP, at
+    `tile=1` (walked and merged) and `tile=2`."""
+    big = _ZERO_MASS_BIG
     xo = jnp.asarray([[big, 0.0]], jnp.float32)
     yo = jnp.asarray([[0.0, big]], jnp.float32)
     wo = jnp.asarray([[0.0, 0.0]], jnp.float32)
     for tile in (1, 2):
         for mode in ("walk", "merge"):
             def fn(w_, t=tile, m=mode):
-                return direct_eval(xo, yo, w_, tile=t, mode=m)
+                return _zero_mass_covariance(xo, yo, w_, tile=t, mode=m)
 
             for dw_vals in ([1.0, 0.0], [0.0, 1.0]):
                 val, dval = jax.jvp(fn, (wo,), (jnp.asarray([dw_vals], jnp.float32),))
@@ -2241,21 +2272,20 @@ def test_zero_mass_scaled_covariance_ad():
             gw = jax.grad(fn)(wo)
             np.testing.assert_array_equal(np.asarray(gw), np.zeros((1, 2), np.float32))
             gx, gy = jax.grad(
-                lambda x_, y_, t=tile, m=mode: direct_eval(x_, y_, wo, tile=t, mode=m),
+                lambda x_, y_, t=tile, m=mode: _zero_mass_covariance(x_, y_, wo, tile=t, mode=m),
                 argnums=(0, 1))(xo, yo)
             np.testing.assert_array_equal(np.asarray(gx), np.zeros((1, 2), np.float32))
             np.testing.assert_array_equal(np.asarray(gy), np.zeros((1, 2), np.float32))
 
-    # Multi-tile and same-tile witnesses: finite scaled derivatives, `2^127` sign cancel, small entries beside
-    # large entries, boundary finite (`1.25*2^63`) and overflowing (`2^64`) entries beside `2^127` and `fmax`
-    # with minimum-normal `dw = 2^-126`, multi-scale high-band merges, and one-sided shifts beside `±2^127`.
-    huge = np.float32(2.0 ** 127)
-    fmax = np.finfo(np.float32).max
-    mid_big = np.float32(2.0 ** 63)
-    near_ov = np.float32(1.25 * 2.0 ** 63)
-    hi_ov = np.float32(2.0 ** 64)
-    small = np.float32(2.0 ** -45)
-    tiny = float(np.finfo(np.float32).tiny)
+
+def test_zero_mass_scaled_covariance_ad_keeps_each_tiles_scaled_tangent():
+    """Two-band zero-mass covariance's direct JVP at `tile=1`, walked and merged: finite scaled derivatives,
+    `2^127` sign cancellation, small entries beside large ones, boundary finite (`1.25*2^63`) and
+    overflowing (`2^64`) entries beside `2^127` and float32's largest under a minimum-normal `dw = 2^-126`,
+    and one-sided shifts beside `+-2^127`, each exact."""
+    big, huge, fmax = _ZERO_MASS_BIG, _ZERO_MASS_HUGE, _ZERO_MASS_FMAX
+    mid_big, near_ov, hi_ov = _ZERO_MASS_MID, _ZERO_MASS_NEAR, _ZERO_MASS_OVER
+    small, tiny = _ZERO_MASS_SMALL, _ZERO_MASS_TINY
     for x_vals, y_vals, w_vals, dw_vals, expect in (
         ([big, 0.0, big], [big, 0.0, big], [0.0, 0.0, 1.0], [1.0, 0.0, 0.0], 0.0),
         ([big, 0.0, 0.0], [big, 0.0, 0.0], [0.0, 0.0, 1.0], [0.0, 1.0, 0.0], 0.0),
@@ -2281,8 +2311,17 @@ def test_zero_mass_scaled_covariance_ad():
         dwc = jnp.asarray([dw_vals], jnp.float32)
         for mode in ("walk", "merge"):
             val, dval = jax.jvp(
-                lambda w_, x_=xc, y_=yc, m=mode: direct_eval(x_, y_, w_, tile=1, mode=m), (wc,), (dwc,))
+                lambda w_, x_=xc, y_=yc, m=mode: _zero_mass_covariance(x_, y_, w_, tile=1, mode=m),
+                (wc,), (dwc,))
             assert float(val) == 0.0 and float(dval) == expect
+
+
+def test_zero_mass_scaled_covariance_ad_holds_across_multi_scale_tiles():
+    """Two-band zero-mass covariance's direct JVP over tiles of three (and two) that hold high-band entries
+    of several scales beside a small one, walked and merged, and its VJP in the weights, each exact."""
+    huge, fmax = _ZERO_MASS_HUGE, _ZERO_MASS_FMAX
+    mid_big, near_ov, hi_ov = _ZERO_MASS_MID, _ZERO_MASS_NEAR, _ZERO_MASS_OVER
+    small, tiny = _ZERO_MASS_SMALL, _ZERO_MASS_TINY
     for x_row, dw_row, expect, tile in (
         ([-mid_big, mid_big, small], [0.0, 0.0, 1.0], float(small * small), 3),
         ([-huge, huge, small], [0.0, 0.0, 1.0], float(small * small), 3),
@@ -2297,10 +2336,11 @@ def test_zero_mass_scaled_covariance_ad():
         ws_mix = jnp.zeros((1, len(x_row)), jnp.float32)
         dws_mix = jnp.asarray([dw_row], jnp.float32)
         for mode in ("walk", "merge"):
-            val, dval = jax.jvp(lambda w_, x_=xs_mix, t=tile, m=mode: direct_eval(x_, x_, w_, tile=t, mode=m),
-                                (ws_mix,), (dws_mix,))
+            val, dval = jax.jvp(
+                lambda w_, x_=xs_mix, t=tile, m=mode: _zero_mass_covariance(x_, x_, w_, tile=t, mode=m),
+                (ws_mix,), (dws_mix,))
             assert float(val) == 0.0 and float(dval) == expect
-    gw_mix = jax.grad(lambda w_: direct_eval(
+    gw_mix = jax.grad(lambda w_: _zero_mass_covariance(
         jnp.asarray([[-mid_big, mid_big, small]], jnp.float32),
         jnp.asarray([[-mid_big, mid_big, small]], jnp.float32), w_, tile=3, mode="walk"))(
         jnp.asarray([[0.0, 0.0, 0.0]], jnp.float32))

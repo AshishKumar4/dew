@@ -13,7 +13,6 @@ from typing import NamedTuple, Protocol
 import jax
 import jax.numpy as jnp
 import numpy as np
-from egglog import get_callable_args
 from jax.core import ShapedArray
 from jax.extend import core as jcore
 
@@ -341,9 +340,9 @@ def _scaled(operand: terms.Term, value: Callable[[terms.Term], jax.Array]) -> tu
     """An exponential's operand as a declaration's exponential takes it (`derive.Reduction.exponential`): a
     product of a value and a literal as the value and the literal's scale, so the exponential carries the
     scale's product itself (raw logits' `exp((s - m) c)`, its rounding compensated); else the value alone."""
-    if (args := get_callable_args(operand, terms.Term.binary)) is not None and terms.text(args[1]) == "mul":
+    if (args := terms.args_of(operand, terms.Term.binary)) is not None and terms.text(args[1]) == "mul":
         for scaled, literal in ((args[0], args[2]), (args[2], args[0])):
-            if get_callable_args(literal, terms.Term.literal) is not None:
+            if terms.args_of(literal, terms.Term.literal) is not None:
                 return value(scaled), float(np.asarray(value(literal)))
     return (value(operand),)
 
@@ -385,9 +384,9 @@ def evaluator(region: terms.Region[terms.Term], leaves: Sequence, known: Mapping
         key = terms.key(term)
         if key in values:
             return values[key]
-        if (args := get_callable_args(term, terms.Term.leaf)) is not None:
+        if (args := terms.args_of(term, terms.Term.leaf)) is not None:
             made = leaf(terms.integer(args[0]))
-        elif (args := get_callable_args(term, terms.Term.dot)) is not None:
+        elif (args := terms.args_of(term, terms.Term.dot)) is not None:
             left, right, index = args
             _, params = region.params[terms.integer(index)]
             numbers = jax.tree.map(int, params["dimension_numbers"])
@@ -402,10 +401,10 @@ def evaluator(region: terms.Region[terms.Term], leaves: Sequence, known: Mapping
                 made = float32_dot_general(a, b, params["dimension_numbers"],
                                            precision=params.get("precision"),
                                            preferred_element_type=params.get("preferred_element_type"))
-        elif (exponential is not None and (args := get_callable_args(term, terms.Term.unary)) is not None
+        elif (exponential is not None and (args := terms.args_of(term, terms.Term.unary)) is not None
               and terms.text(args[1]) == exponential[0]):
             made = exponential[1](*_scaled(args[0], value))
-        elif (rescale is not None and (args := get_callable_args(term, terms.Term.binary)) is not None
+        elif (rescale is not None and (args := terms.args_of(term, terms.Term.binary)) is not None
               and terms.text(args[1]) == terms.RESCALE):
             made = rescale(value(args[0]), value(args[2]))
         else:

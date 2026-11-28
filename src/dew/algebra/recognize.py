@@ -1102,9 +1102,15 @@ def _attention_candidates(q: jcore.Var, k: jcore.Var, v: jcore.Var, output: jcor
                           extra: jcore.Var | None, softcaps, fills, windows) -> Iterator[Candidate]:
     """`_attentions`' candidates over one query, keys, values and result (the module's account)."""
     from dew.nn.attention import AttentionImpl, scaled_dot_product_attention
+    from dew.nn.attention_masks import rows_reach
 
     dtype = aval(output).dtype
     boolean = extra is not None and aval(extra).dtype == jnp.bool_
+    # Whether a causal window passes every key of a row (`attention_masks.rows_reach`, positions alone: a
+    # recognition runs within a trace, where a compile-only device holds no array), once a window.
+    queries, keys = aval(q).shape[-3], aval(k).shape[-3]
+    hidden = {window: window is not None and not rows_reach(queries, keys, window).all()
+              for window in windows}
     choices = itertools.product((False, True), softcaps, (True, False), (True, False), fills, windows)
     for causal, softcap, wide, after, fill, window in choices:
         if window is not None and not causal:
@@ -1125,14 +1131,15 @@ def _attention_candidates(q: jcore.Var, k: jcore.Var, v: jcore.Var, output: jcor
         # A row's hidden keys count where it can have no mass: a mask hides it wholly, a window passes every
         # key a later row's than the keys hold, or a bias puts -inf on every key a causal or windowed row
         # sees (a finite floor weighing the hidden keys there, where the reference excludes the row). An
-        # unbiased causal or windowed walk of no more queries than keys hides no row wholly (its first key
-        # each row's own), each key it sees a finite logit, as an unmasked call's are
+        # unbiased causal walk hides no row wholly (each row's reach holds the first key), nor a window that
+        # keeps every row within reach of the keys' last, however many queries it has (the reach
+        # `attention_masks.rows_reach` states of every call: 129 queries over 128 keys at width 16, the
+        # last row sees keys 113-127), each key it sees a finite logit, as an unmasked call's are
         # (`keeps_reference_rows`' contract: a product overflowing to -inf is no row of no mass any kernel
         # answers for). A fill reaches a row only where one can have no mass. Plain programs' attention
         # holds no sinks.
         biased = extra is not None and not boolean
-        masked = boolean or (window is not None and aval(q).shape[-3] > aval(k).shape[-3]) or (
-            biased and (causal or window is not None))
+        masked = boolean or hidden[window] or (biased and (causal or window is not None))
         rows = {"masked": masked, "filled": fill is not None and (masked or biased), "sunk": False,
                 "biased": biased}
         yield Candidate(operands, (output,), attend, functools.partial(attend, implementation='reference'),

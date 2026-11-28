@@ -2,8 +2,10 @@
 counted from its body, as each warpgroup runs it."""
 
 import contextlib
+import dataclasses
 import functools
 import math
+import pickle
 
 import jax
 import jax.numpy as jnp
@@ -569,6 +571,41 @@ def test_a_walks_serial_loops_compose_their_paths_before_their_mean():
     segment = cost.Work(chains=(cost.Chain(barriers=1),))
     role = emission.Role(cost.Work(), (segment, segment))
     assert role.step(lambda work: cost.chained(work, target)) == target.barrier_seconds
+
+
+def test_works_side_by_side_sum_every_unit_keep_the_longer_span_and_the_paths_none_outlasts():
+    """Two works side by side (`Work.__add__`, built past its `__init__`), every field of each drawn
+    nonzero: each unit the two's sum, field by field as `dataclasses.fields(Work)` lists them, its span the
+    longer, and its paths those neither side's outlasts (a path outlasted dropped, two apart both kept, one
+    side's alone where the other has none); equal to, and hashed as, the work `Work(...)` builds of those
+    values, rebuilt through `__init__` (`dataclasses.replace`) and pickled as it is; a unit a subclass holds
+    on its class read as any other. The sum is built past `__init__` (`cost._work_of`), so `Work` states no
+    `__post_init__` and no slots for it to pass by."""
+    assert not hasattr(Work, "__post_init__") and not hasattr(Work, "__slots__")
+    rng = np.random.default_rng(14214)
+    names = [field.name for field in dataclasses.fields(Work) if field.name not in ("span", "chains")]
+    barriers, products = cost.Chain(barriers=2), cost.Chain(products=3)
+    both = cost.Chain(products=3, barriers=2)
+    paths = [((barriers, products), (cost.Chain(barriers=1), both), (both,)),
+             ((barriers,), (products,), (barriers, products)),
+             ((), (barriers,), (barriers,))]
+    for mine, theirs, kept_paths in paths:
+        a, b = (Work(**dict(zip(names, rng.uniform(1.0, 9.0, len(names)), strict=True)),
+                     span=float(rng.uniform(1.0, 9.0)), chains=chains) for chains in (mine, theirs))
+        summed = a + b
+        expected = Work(**{name: getattr(a, name) + getattr(b, name) for name in names},
+                        span=max(a.span, b.span), chains=kept_paths)
+        assert summed == expected and hash(summed) == hash(expected)
+        assert all(getattr(summed, name) != getattr(a, name) for name in names)
+        assert dataclasses.replace(summed) == summed and pickle.loads(pickle.dumps(summed)) == summed
+
+    @dataclasses.dataclass(frozen=True)
+    class Fixed(Work):
+        """A work of fixed operations, held on the class (no instance's own field)."""
+
+        operations: float = dataclasses.field(init=False, default=7.0)
+
+    assert (Work() + Fixed()).operations == (Fixed() + Work()).operations == 7.0
 
 
 def test_a_launch_carries_each_warpgroups_paths_its_steps_times():

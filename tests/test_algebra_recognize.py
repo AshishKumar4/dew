@@ -294,46 +294,42 @@ program, Dew's call and the oracle's keep set read."""
 FORMS = {
     "a mask of its inputs": (
         lambda q, k, v: jax.nn.dot_product_attention(q, k, v, mask=input_mask(q, k), implementation="xla"),
-        lambda q, k, v: {"mask": input_mask(q, k), "mask_fill": JAX_FILL}, jax_nn_written(mask=input_mask)),
+        lambda q, k, v: {"mask": input_mask(q, k), "mask_fill": JAX_FILL}, jax_nn_written(mask=input_mask),
+        frozenset()),
     "a mask of its inputs filled with -inf": (
         masked_attention(keyed_mask), lambda q, k, v: {"mask": keyed_mask(q, k), "mask_fill": -jnp.inf},
-        masked_attention(keyed_mask)),
+        masked_attention(keyed_mask), frozenset()),
     "a bias of its inputs": (
         lambda q, k, v: jax.nn.dot_product_attention(q, k, v, bias=input_bias(q, k), implementation="xla"),
-        lambda q, k, v: {"bias": input_bias(q, k)}, jax_nn_written(bias=input_bias)),
+        lambda q, k, v: {"bias": input_bias(q, k)}, jax_nn_written(bias=input_bias),
+        frozenset({"template", "inference"})),
     "twice the default scale": (
         lambda q, k, v: jax.nn.dot_product_attention(q, k, v, scale=2 * q.shape[-1] ** -0.5,
                                                      implementation="xla"),
-        None, jax_nn_written(scale=2)),
+        None, jax_nn_written(scale=2), frozenset()),
     "a causal window": (
         lambda q, k, v: jax.nn.dot_product_attention(q, k, v, is_causal=True,
                                                      local_window_size=(WINDOW - 1, 0), implementation="xla"),
         lambda q, k, v: {"causal": True, "sliding_window": WINDOW, "mask_fill": JAX_FILL},
-        jax_nn_written(causal=True, window=WINDOW - 1)),
+        jax_nn_written(causal=True, window=WINDOW - 1), None),
     "a softcap": (softcapped_attention,
                   lambda q, k, v: {"causal": True, "softcap": SOFTCAP, "mask_fill": -jnp.inf},
-                  softcapped_attention),
+                  softcapped_attention, None),
 }
 """Each plain program's attention under a form beside the default scale and a causal mask, the arguments
 Dew's own attention takes for it, its fill the program's (None where no call of Dew's computes it: a scale
-other than the default is another constant, which the compile point keeps as written), and the program
-whose run on float64 operands is its truth: itself where it is written at its operands' width, jax.nn's
-written out (`jax_nn_written`) where it is jax.nn's. The masks leave rows partly masked (a window,
-causality, -inf's mask) and wholly masked (jax.nn's mask, uniform rows under its finite fill); a row -inf
-masks wholly is NaN, as written, which check 1 does not compare."""
-
-
-FORM_ROWS = {
-    "a mask of its inputs": {"masked": True, "filled": True, "sunk": False, "biased": False},
-    "a mask of its inputs filled with -inf": {"masked": True, "filled": True, "sunk": False, "biased": False},
-    "a bias of its inputs": {"masked": False, "filled": False, "sunk": False, "biased": True},
-    "twice the default scale": {"masked": False, "filled": False, "sunk": False, "biased": False},
-    "a causal window": {"masked": False, "filled": False, "sunk": False, "biased": False},
-    "a softcap": {"masked": False, "filled": False, "sunk": False, "biased": False},
-}
-"""How each form's call can reach a row of no mass (`attention_kernels.keeps_reference_rows`): a mask can
-hide a row wholly, its fill reaching it; a causal walk or window of as many queries as keys hides none; a
-bias can put -inf on a row's every key."""
+other than the default is another constant, which the compile point keeps as written), the program whose
+run on float64 operands is its truth (itself where it is written at its operands' width, jax.nn's written
+out, `jax_nn_written`, where it is jax.nn's), and the kernels of Dew's own (none of `recognize.KEPT`) that
+read each row of the form's call as its program does, None where every one does. The masks leave rows
+partly masked (a window, causality, -inf's mask) and wholly masked (jax.nn's mask, uniform rows under its
+finite fill); a row -inf masks wholly is NaN, as written, which check 1 does not compare. A mask of the
+inputs can hide a row wholly: the program reads it as its fill makes it (jax.nn's finite fill, its values'
+mean; -inf, NaN), the template's masked walk, FlashAttention and cuDNN zero. A bias of the inputs can put
+-inf on a row's every key, NaN as written: the template reads it NaN (row 14116), and so the inference
+route, its forward the template's and its derivatives xla's softmax op for op; FlashAttention and cuDNN
+zero. A causal window or causality over as many queries as keys hides no row, every key a row sees a finite
+logit."""
 
 
 @pytest.mark.parametrize("form", list(FORMS))
@@ -341,18 +337,17 @@ def test_a_plain_programs_attention_under_each_form_runs_the_kernel_dews_own_cal
     """A plain program's attention under a mask (filled as jax.nn fills it, or with -inf) or a bias it draws
     from its inputs, a causal window or a softcap, compiled through `dew.jit` on an H100, runs the kernel
     Dew's own attention call under those arguments routes to where that reads each row as the program does
-    (`FORM_ROWS`; none where it is XLA's or reads a row of no mass otherwise), and under a scale no call of
-    Dew's takes runs as written, XLA's; on this host, under the template, its output and gradients on par
-    with the program as written (check 1)."""
+    (`FORMS`' keepers; none where it is XLA's or reads a row of no mass otherwise), and under a scale no
+    call of Dew's takes runs as written, XLA's; on this host, under the template, its output and gradients on
+    par with the program as written (check 1)."""
     from attention_oracle import attention_on_par, kept
     from contract_support import normal_drawn
 
     import dew
     from dew.algebra.recognize import KEPT
     from dew.nn.attention import scaled_dot_product_attention
-    from dew.nn.attention_kernels import keeps_reference_rows
 
-    attend, arguments, exact = FORMS[form]
+    attend, arguments, exact, keepers = FORMS[form]
     shapes = (jax.ShapeDtypeStruct((2, 128, 4, 64), jnp.bfloat16),) * 3
 
     def own(q, k, v):
@@ -362,7 +357,7 @@ def test_a_plain_programs_attention_under_each_form_runs_the_kernel_dews_own_cal
         assert not _routes("attention", lambda: jax.jit(attend).trace(*shapes))
         expected = [] if arguments is None else [kernel for kernel in _routes(
             "attention", lambda: jax.jit(own).trace(*shapes))
-            if kernel not in KEPT and keeps_reference_rows(kernel, **FORM_ROWS[form])]
+            if kernel not in KEPT and (keepers is None or kernel in keepers)]
         assert set(_routes("attention", lambda: dew.jit(attend).trace(*shapes))) == set(expected)
     drawn = (2, 64, 4, 32)
     draw = normal_drawn(41, *(drawn,) * 4, dtype=jnp.bfloat16)
@@ -407,6 +402,52 @@ def test_a_plain_programs_row_of_no_mass_reads_as_written_under_the_pass():
     with generation.chosen(attention="template"):
         rewritten = np.isnan(np.asarray(dew.jit(biased_without_mass)(q, k, v), np.float32))
     assert written[:, 0].all() and not written[:, 1:].any()
+    np.testing.assert_array_equal(rewritten, written)
+
+
+def windowed_without_fill(q, k, v):
+    """A causal window of WINDOW keys written out over the queries and keys as they come (each query `i` the
+    keys `i - WINDOW < j <= i`), its hidden logits -inf: a row its window passes every key of NaN, as
+    written."""
+    logits = jnp.einsum("bqhd,bkhd->bhqk", q, k, preferred_element_type=_wide(q)) * q.shape[-1] ** -0.5
+    rows, keys = jnp.arange(q.shape[1])[:, None], jnp.arange(k.shape[1])[None, :]
+    weights = jax.nn.softmax(jnp.where((keys <= rows) & (rows < keys + WINDOW), logits, -jnp.inf),
+                             axis=-1).astype(v.dtype)
+    return jnp.einsum("bhqk,bkhd->bqhd", weights, v)
+
+
+@pytest.mark.parametrize(("queries", "taken"), [(65, True), (79, True), (80, False), (96, False)])
+def test_a_window_over_more_queries_than_keys_runs_the_template_where_every_row_sees_a_key(queries, taken):
+    """`windowed_without_fill` over 64 keys, traced with a compile-only H100 the default device (a prepare's
+    trace, where no array can be placed) and the template named: up to 79 queries (the last, 78, seeing keys
+    63 and none past) take the template, and on this host its output and gradients are on par with the
+    program as written (check 1, the keys each query keeps); from 80, whose rows past 78 see no key and read
+    NaN as written where the template's read zero, they run as written, NaN exactly where the program is."""
+    from attention_oracle import attention_on_par, kept
+    from contract_support import normal_drawn
+
+    import dew
+
+    keys, width = 64, 64
+    shapes = (jax.ShapeDtypeStruct((2, queries, 4, width), jnp.bfloat16),
+              *(jax.ShapeDtypeStruct((2, keys, 4, width), jnp.bfloat16),) * 2)
+    (gpu,) = generation.compile_only_gpus("sm90", 1)
+    with jax.default_device(gpu), generation.chosen(attention="template"):
+        routes = _routes("attention", lambda: dew.jit(windowed_without_fill).trace(*shapes))
+    assert ("template" in routes) == taken
+    if taken:
+        draw = normal_drawn(47, (2, queries, 4, width), *((2, keys, 4, width),) * 2, (2, queries, 4, width),
+                            dtype=jnp.bfloat16)
+        with generation.chosen(attention="template"):
+            attention_on_par(dew.jit(windowed_without_fill), windowed_without_fill, draw,
+                             f"dew.jit {queries} queries' window", keep=kept(queries, keys, causal=True,
+                                                                              sliding_window=WINDOW))
+        return
+    q, k, v = normal_drawn(47, (2, queries, 4, width), *((2, keys, 4, width),) * 2, dtype=jnp.bfloat16)(0)
+    written = np.isnan(np.asarray(windowed_without_fill(q, k, v), np.float32))
+    with generation.chosen(attention="template"):
+        rewritten = np.isnan(np.asarray(dew.jit(windowed_without_fill)(q, k, v), np.float32))
+    assert written[:, keys + WINDOW - 1:].all() and not written[:, :keys + WINDOW - 1].any()
     np.testing.assert_array_equal(rewritten, written)
 
 

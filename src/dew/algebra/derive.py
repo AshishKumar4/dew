@@ -48,7 +48,6 @@ from egglog import (
     Vec,
     eq,
     function,
-    get_callable_args,
     i64,
     rewrite,
     rule,
@@ -606,7 +605,7 @@ def _decoupled(rescaling: bool = False):
         # A step states its parts as it writes them, whatever form extraction then picks of the step: the
         # factor (`rescaled_by`) and a product's weights and values a mainloop's own accumulator takes, or a
         # reduction's tile sum its own addition takes (`summand`).
-        product = get_callable_args(tile, Term.dot)
+        product = terms.args_of(tile, Term.dot)
         parts = (set_(rescaled_by(stepped)).to(correction(0, k.stepped())),
                  *((set_(summand(stepped)).to(tile), set_(summed_terms(stepped)).to(x.stepped()))
                    if product is None else
@@ -655,8 +654,9 @@ DECOUPLED_RESCALED = rules.Rules("decoupled rescaled", "reorders", _decoupled(re
 PLAIN = _plain()
 
 
-_READINGS = (Term.stepped, Term.merged, Term.finished, Term.held, moment_anchor, moment_hi, moment_scale,
-             *MOMENT_SSA)
+_READINGS = frozenset(map(terms.ref, (Term.stepped, Term.merged, Term.finished, Term.held, moment_anchor,
+                                       moment_hi, moment_scale, *MOMENT_SSA)))
+"""The derivation's readings by constructor (`terms.made_by`): a form that keeps one is no form."""
 
 
 def _priced(region: terms.Region, schedule) -> DagCostModel[cost.Seconds]:
@@ -667,7 +667,7 @@ def _priced(region: terms.Region, schedule) -> DagCostModel[cost.Seconds]:
     timed = cost.model(region, schedule)
 
     def marginal(graph: EGraph, node) -> cost.Seconds:
-        if any(get_callable_args(node, reading) is not None for reading in _READINGS):
+        if terms.made_by(node) in _READINGS:
             return cost.Seconds(Work(), schedule, math.inf)
         return timed.marginal_cost(graph, node)
 
@@ -856,7 +856,7 @@ def _role(reduction: Term) -> str:
     """A walked reduction's role in the carried state, as the declaration's reduction is made: a maximum's
     `max`, a sum's `sum`, a product's contracting the walked axis `contraction` (each the constructor that
     made it, `terms.reduce_of`)."""
-    if get_callable_args(reduction, Term.dot) is not None:
+    if terms.args_of(reduction, Term.dot) is not None:
         return "contraction"
     found = terms.reduce_of(reduction)
     if found is None or found[0] not in ("max", "sum"):
@@ -1530,7 +1530,7 @@ def _inserted_reshape_axes(region: terms.Region, index: int) -> list[int]:
     keeping every other axis in order."""
     pairs = []
     for term, after in region.shapes:
-        if (args := get_callable_args(term, Term.shaped)) is not None and terms.integer(args[2]) == index:
+        if (args := terms.args_of(term, Term.shaped)) is not None and terms.integer(args[2]) == index:
             pairs.append((region.shape(args[0]), tuple(after)))
     if not pairs:
         return []
@@ -1557,7 +1557,7 @@ def _moved(primitive, params, region: terms.Region, index: int) -> list[tuple[in
 def _operand_and_result_shapes(region: terms.Region, index: int):
     """The shapes of the operand and the result of a single-operand term of parameters `index`."""
     for term, extent in region.shapes:
-        args = get_callable_args(term, Term.shaped) or get_callable_args(term, Term.reduce)
+        args = terms.args_of(term, Term.shaped) or terms.args_of(term, Term.reduce)
         if args is not None and terms.integer(args[-1]) == index:
             return region.extents.get(terms.key(args[0])), extent
     return None, None
@@ -1570,7 +1570,7 @@ def _rank_before(region: terms.Region, index: int, reduced: set[int]) -> int:
 
 def _dot_ranks(region: terms.Region, index: int) -> tuple[int, int]:
     for term, _ in region.shapes:
-        args = get_callable_args(term, Term.dot)
+        args = terms.args_of(term, Term.dot)
         if args is not None and terms.integer(args[-1]) == index:
             return len(region.shape(args[0])), len(region.shape(args[1]))
     return 0, 0
@@ -1652,26 +1652,24 @@ def _floors(graph: EGraph, region: terms.Region, reductions: Sequence[Term]) -> 
               if term is not None and terms.key(term) in places}
 
     def literal_of(term: Term) -> float | None:
-        if (args := get_callable_args(term, Term.literal)) is None:
+        if (args := terms.args_of(term, Term.literal)) is None:
             return None
         value = np.asarray(region.literals[terms.integer(args[0])])
         return value.item() if value.shape == () and np.isfinite(value) else None
 
     for term, _ in region.shapes:
-        for constructor in terms.LANGUAGE:
-            if (args := get_callable_args(term, constructor)) is None:
+        if (args := terms.args_of(term, terms.LANGUAGE_REFS)) is None:
+            continue
+        for child in (arg for arg in args if isinstance(arg, Term)):
+            if (index := places.get(terms.key(child))) is None:
                 continue
-            children = [arg for arg in args if isinstance(arg, Term)]
-            for child in children:
-                if (index := places.get(terms.key(child))) is None:
-                    continue
-                binary = get_callable_args(term, Term.binary)
-                floor = None
-                if binary is not None and terms.text(binary[1]) == "max":
-                    other = binary[2] if terms.key(binary[0]) == terms.key(child) else binary[0]
-                    floor = literal_of(other)
-                if floor is None or floors.setdefault(index, floor) != floor:
-                    barred.add(index)
+            binary = terms.args_of(term, Term.binary)
+            floor = None
+            if binary is not None and terms.text(binary[1]) == "max":
+                other = binary[2] if terms.key(binary[0]) == terms.key(child) else binary[0]
+                floor = literal_of(other)
+            if floor is None or floors.setdefault(index, floor) != floor:
+                barred.add(index)
     held = {index: floor for index, floor in floors.items() if index not in barred}
     classes = {floor: number for number, floor in enumerate(dict.fromkeys(held.values()))}
     for literal, value in enumerate(region.literals):
@@ -1695,10 +1693,9 @@ def _identity(reduction: Term, dtype) -> float:
 def _reads_leaves(form: Term) -> set[int]:
     """The region's leaves `form` reads."""
     return {terms.integer(args[0]) for term in terms.subterms(form)
-            if (args := get_callable_args(term, Term.leaf)) is not None}
+            if (args := terms.args_of(term, Term.leaf)) is not None}
 
 
 def _written(form: Term) -> bool:
     """Whether `form` keeps none of the derivation's readings: a form in the language."""
-    return not any(get_callable_args(term, reading) is not None for term in terms.subterms(form)
-                   for reading in _READINGS)
+    return not any(terms.made_by(term) in _READINGS for term in terms.subterms(form))

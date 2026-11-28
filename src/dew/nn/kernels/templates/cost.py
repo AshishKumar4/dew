@@ -205,12 +205,28 @@ class Work:
     def __add__(self, other: "Work") -> "Work":
         # Works summed side by side: their span the longer one's; a chain of works' span is its path's sum,
         # which the term that chains them states (`dew.algebra.linear_scan`).
-        summed = {field.name: getattr(self, field.name) + getattr(other, field.name)
-                  for field in dataclasses.fields(Work) if field.name not in ("span", "chains")}
+        summed = {name: getattr(self, name) + getattr(other, name) for name in SUMMED_UNITS}
+        summed["span"] = max(self.span, other.span)
         # Each path no other outlasts, the side with none's kept as the other's.
-        chains = (_kept(self.chains + other.chains) if self.chains and other.chains
-                  else self.chains or other.chains)
-        return Work(**summed, span=max(self.span, other.span), chains=chains)
+        summed["chains"] = (_kept(self.chains + other.chains) if self.chains and other.chains
+                            else self.chains or other.chains)
+        return _work_of(summed)
+
+
+SUMMED_UNITS = tuple(field.name for field in dataclasses.fields(Work) if field.name not in ("span", "chains"))
+"""The fields of `Work` two works side by side sum (`Work.__add__`): every field but the span and the
+paths."""
+
+
+def _work_of(values: dict) -> Work:
+    """The `Work` of `values`, every field's, the dictionary its own, made past the frozen `__init__`'s
+    setattr a field: an extraction's prices add works hundreds of thousands of times (361k in two moments
+    derivations' four, row 14214), 5.8 us an add through `__init__` (armada t6, main 3e92ca8fe) against
+    under 2 made so (t11, 2.0 us with its units read by attribute). `Work` states no `__post_init__` and no
+    slots, which this would pass by (its sum's test holds it so)."""
+    made = object.__new__(Work)
+    object.__setattr__(made, "__dict__", values)
+    return made
 
 
 ISSUED_UNITS = tuple(field.name for field in dataclasses.fields(Work) if field.metadata.get("issued", True))

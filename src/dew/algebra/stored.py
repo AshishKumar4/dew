@@ -78,6 +78,9 @@ CONSTRUCTORS: Mapping[str, Callable] = {
 """The constructors a derived form is written in, by name: each operation of the language (`terms.WRITTEN`)
 and the terms an evaluation reads beside them, a tile's leaf, a literal and a carried state."""
 
+_NAMED = {terms.ref(constructor): name for name, constructor in CONSTRUCTORS.items()}
+"""Each of `CONSTRUCTORS`' names by its reference (`terms.made_by`)."""
+
 class Unstated(Exception):
     """A value the store's key or codec does not state: its derivation is not stored."""
 
@@ -324,11 +327,10 @@ def _appended(region: terms.Region, literals_from: int, shapes_from: int) -> Non
 
 
 def _called(term) -> tuple[str, tuple]:
-    """`term`'s constructor's name and its arguments (`CONSTRUCTORS`)."""
-    for name, constructor in CONSTRUCTORS.items():
-        if (args := get_callable_args(term, constructor)) is not None:
-            return name, tuple(args)
-    raise Unstated(f"a term of no stored constructor: {str(term)[:80]}")
+    """`term`'s constructor's name and its arguments (`CONSTRUCTORS`, by reference: `terms.made_by`)."""
+    if (name := _NAMED.get(terms.made_by(term))) is None:
+        raise Unstated(f"a term of no stored constructor: {str(term)[:80]}")
+    return name, terms.arguments(term)
 
 
 class _Writer:

@@ -29,11 +29,8 @@ from collections.abc import Hashable, Iterable, Mapping, Sequence
 from typing import Protocol
 
 import numpy as np
-from egglog import BaseExpr, DagCostModel, EGraph, get_callable_args, get_callable_fn
+from egglog import BaseExpr, DagCostModel, EGraph, get_callable_fn
 from egglog.egraph import ComparableAdd
-from scipy.optimize import milp
-from scipy.sparse import coo_array, csr_array
-from scipy.sparse.csgraph import connected_components
 
 from dew.algebra import terms
 
@@ -149,7 +146,7 @@ def recorded[Price: Linear, Root: BaseExpr](graph: EGraph, root: Root, model: Da
         found = egraph.lookup_function_value(node) if function in tables else None
         key = terms.key(node)
         nodes[key] = Node(key, key if found is None else terms.key(found),
-                          tuple(terms.key(argument) for argument in get_callable_args(node) or ()), price)
+                          tuple(terms.key(argument) for argument in terms.arguments(node)), price)
         return price
 
     form, greedy = graph.extract(root, include_cost=True, extractor="greedy-dag",
@@ -215,6 +212,11 @@ def _cyclic(classes: Mapping[Hashable, Sequence[Node]]) -> dict[Hashable, int]:
     """Each class in a cycle of the graph of classes and their nodes' reads, by its strongly connected
     component (`scipy.sparse.csgraph.connected_components`); a class in no cycle is absent, as no order need
     hold it."""
+    # SciPy's graph and solver modules, read where an exact extraction runs alone (half a second a process's
+    # import, which a greedy extraction, the default, never reads: armada t17).
+    from scipy.sparse import csr_array
+    from scipy.sparse.csgraph import connected_components
+
     owners = list(classes)
     place = {owner: number for number, owner in enumerate(owners)}
     edges = {(place[owner], place[child]) for owner, nodes in classes.items() for node in nodes
@@ -306,6 +308,9 @@ class _Program:
 
     def _least(self, objective: Mapping[int, float]) -> float:
         """The least value of `objective` under the program's rows, its choice kept (`chosen`)."""
+        from scipy.optimize import milp
+        from scipy.sparse import coo_array
+
         cost = np.zeros(self.width)
         for column, value in objective.items():
             cost[column] = value
