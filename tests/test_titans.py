@@ -395,7 +395,7 @@ def test_a_memorys_mini_batches_are_recomputed_where_the_rung_recomputes_the_chu
     """Each mini-batched memory's residuals for its gradient (`jax.ad_checkpoint.saved_residuals`) fewer where
     the run's rung recomputes the memory's chunks (`residuals.memory_chunks`, as `dew.nn.memory`'s), each
     mini-batch recomputed from the state it entered with, its gradients the stored run's bit for bit."""
-    from jax.ad_checkpoint import saved_residuals
+    from jax._src.ad_checkpoint import saved_residuals
 
     from dew.nn.residuals import MEMORY_RESIDUALS, recomputing
 
@@ -406,7 +406,7 @@ def test_a_memorys_mini_batches_are_recomputed_where_the_rung_recomputes_the_chu
         return sum(jnp.sum(x) for x in jax.tree.leaves(memory(*arguments)))
 
     def saved():
-        return sum(np.prod(aval.shape) for aval, _ in saved_residuals(total, *given, states))
+        return sum(aval.size * aval.dtype.itemsize for aval, _ in saved_residuals(total, *given, states))
 
     stored, stored_bytes = jax.jit(with_gradients(memory))(*given, states, cotangent), saved()
     with recomputing((MEMORY_RESIDUALS[1],)):
@@ -565,7 +565,8 @@ def test_the_mini_batches_run_on_an_explicit_mesh_with_the_affine_alone_split_by
 
 
 @pytest.mark.mesh(devices=2)
-@pytest.mark.parametrize('split', ['rows', 'rows, a replicated state', 'affine', 'a state leaf', 'the query'])
+@pytest.mark.parametrize('split', ['rows', 'rows, a replicated state', 'affine', 'a state leaf', 'the query',
+                                   'the mask'])
 @pytest.mark.parametrize('form', sorted(FORMS))
 def test_the_mini_batches_run_in_a_checked_shard_map_whatever_varies(form, split):
     """Each form in a checked `shard_map` over two devices, each device's operands its own where they vary
@@ -614,6 +615,10 @@ def test_the_mini_batches_run_in_a_checked_shard_map_whatever_varies(form, split
     shapes = jax.eval_shape(call, *each[0])
     assert ([(x.shape, x.dtype) for x in jax.tree.leaves(found)]
             == [((2, *x.shape), x.dtype) for x in jax.tree.leaves(shapes)])
+    if split == 'the mask':
+        # The idle device's states leave as they entered (zeros).
+        for state in jax.tree.leaves(found[1]):
+            np.testing.assert_array_equal(np.asarray(state)[1], np.zeros(state.shape[1:], state.dtype))
 
     def total(*leaves):
         return sum(jnp.sum(x) for x in jax.tree.leaves(mapped(*leaves)))
