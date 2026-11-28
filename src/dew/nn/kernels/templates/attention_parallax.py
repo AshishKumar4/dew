@@ -219,13 +219,9 @@ def moments(logits: jax.Array, seconds: jax.Array, value: jax.Array, powers: jax
     that holds `Σ |ũ|` at most 1 against its seen values' largest, so no partial sum passes fp32's range
     where the covariance does not; the covariance then a mantissa and its power (`Moments.spread`).
     Differentiable at every order (the reference's, `reference`)."""
-    seen = logits > -jnp.inf
-    m = jax.lax.stop_gradient(jnp.max(logits, axis=-1))
-    below = logits - jnp.where(jnp.isfinite(m), m, 0.0)[..., None]
-    p = jnp.exp(below)
-    total = jnp.sum(p, axis=-1)
-    over = jnp.where(total > 0, total, 1.0)[..., None]
-    weights = p / over
+    tile = _centred_tile(logits, seconds)
+    seen, below, total, over = tile.seen, tile.below, tile.total, tile.over
+    weights = jnp.exp(below) / over
 
     def weighed(w, x):
         return float32_einsum("bhgqk,bkhd->bhgqd", w, x, precision=REFERENCE_PRECISION,
@@ -244,16 +240,12 @@ def moments(logits: jax.Array, seconds: jax.Array, value: jax.Array, powers: jax
     lifted = jnp.where(tail, exp_scaled(jnp.broadcast_to(1.0 / over, below.shape), below, raised), 0.0)
     mean = (weighed(jnp.where(tail, 0.0, weights), value)
             + _shifted(weighed, lifted, value, -raised, 0, (0, 0)))
-    # The centre's terms each a second product decayed with its weight before either rounds (`exp_scaled`):
-    # a tail's `2^200 e^-128` kept where its weight alone underflowed (train 1444's review).
-    hi = jax.lax.stop_gradient(jnp.sum(exp_scaled(seconds / over, below, 0), axis=-1))
-    lo = jnp.sum(exp_scaled((seconds - hi[..., None]) / over, below, 0), axis=-1)
-    apart = jnp.where(seen, (seconds - hi[..., None]) - lo[..., None], 0.0)
+    hi, lo, apart = tile.hi, tile.lo, tile.apart
     # Each value channel taken to its own largest power first (`_channel_powers`), so its values and mean
     # are at most 1 and one channel's `2^127` takes no other's `2^-124` below fp32's least (train 1444's
     # review); the row's power then its largest pair `|w (t̂ - c)|` below `2^(G - log2 K)`, so `Σ |ũ| |v| / 2`
     # and `Σ |ũ| |a| / 2` within `2^126` in every channel.
-    channels, rows = _channel_powers(value)
+    channels, rows = _channel_powers(value, seen)
     reach = jnp.where(seen & (apart != 0), _reach(below) + _exponent(apart), _NONE)
     largest = jnp.max(jnp.where(reach > _NONE, reach + 1, _NONE), axis=-1)
     power = jnp.where(largest > _NONE, largest, 0) + width - 125
@@ -278,11 +270,43 @@ def moments(logits: jax.Array, seconds: jax.Array, value: jax.Array, powers: jax
     return Moments(jnp.max(logits, axis=-1), total, mean, (hi, lo), spread, spread_power)
 
 
-def _channel_powers(value: jax.Array) -> tuple[jax.Array, jax.Array]:
-    """Each value channel's power of two over a tile's keys (`[B, K, Hk, Dv]`), the power its values lie
-    below (0 for a channel of zeros), as the values take it `[B, 1, Hk, Dv]` and as a row's mean does
-    `[B, Hk, 1, 1, Dv]`: a channel's mean, a mean of its values, lies below it too."""
-    found = jnp.max(_exponent(value), axis=1, keepdims=True)
+class _Tile(NamedTuple):
+    """A key tile's softmax and centre as its moments and the dense tangent both read them
+    (`_centred_tile`): where each query sees each key, the logits below the row's maximum, the denominator
+    (and it held at 1 where none), the second products' centre as a pair `(hi, lo)` and each second
+    product's distance from it."""
+
+    seen: jax.Array
+    below: jax.Array
+    total: jax.Array
+    over: jax.Array
+    hi: jax.Array
+    lo: jax.Array
+    apart: jax.Array
+
+
+def _centred_tile(logits: jax.Array, seconds: jax.Array) -> _Tile:
+    """A tile's `_Tile` from its logits and second products `[B, Hk, G, Q, K]`: the centre's terms each a
+    second product decayed with its weight before either rounds (`exp_scaled`), so a tail's `2^200 e^-128`
+    is kept where its weight alone underflowed (train 1444's review)."""
+    seen = logits > -jnp.inf
+    m = jax.lax.stop_gradient(jnp.max(logits, axis=-1))
+    below = logits - jnp.where(jnp.isfinite(m), m, 0.0)[..., None]
+    total = jnp.sum(jnp.exp(below), axis=-1)
+    over = jnp.where(total > 0, total, 1.0)[..., None]
+    hi = jax.lax.stop_gradient(jnp.sum(exp_scaled(seconds / over, below, 0), axis=-1))
+    lo = jnp.sum(exp_scaled((seconds - hi[..., None]) / over, below, 0), axis=-1)
+    apart = jnp.where(seen, (seconds - hi[..., None]) - lo[..., None], 0.0)
+    return _Tile(seen, below, total, over, hi, lo, apart)
+
+
+def _channel_powers(value: jax.Array, seen: jax.Array) -> tuple[jax.Array, jax.Array]:
+    """Each value channel's power of two over the tile's keys some query sees (`seen` `[B, Hk, G, Q, K]`;
+    `value` `[B, K, Hk, Dv]`), the power its values lie below (0 for a channel of zeros), as the values take
+    it `[B, 1, Hk, Dv]` and as a row's mean does `[B, Hk, 1, 1, Dv]`: a channel's mean, a mean of its seen
+    values, lies below it too; a hidden key's value bounds nothing (train 1444's review)."""
+    visible = jnp.moveaxis(jnp.any(seen, axis=(2, 3)), 1, 2)[..., None]
+    found = jnp.max(jnp.where(visible, _exponent(value), _ABSENT), axis=1, keepdims=True)
     found = jnp.where(found > _ABSENT, found, 0)
     return found, jnp.moveaxis(found, 2, 1)[:, :, None]
 
@@ -300,9 +324,8 @@ def _shifted_value(product: Callable, rows: jax.Array, by, lift, scale, restored
 
 
 def _shifted_tangent(product: Callable, primals, tangents, value) -> jax.Array:
-    """`_shifted`'s tangent: the rows' direction met by `by` before the power, as the value forms it (so its
-    pullback takes the power on a cotangent first, as autodiff of the value did); `by`'s direction met by
-    the rows taken toward their own size first, by as much of the row's `lift` as keeps their largest within
+    """`_shifted`'s tangent: each direction, the rows' and `by`'s, met with the rows taken toward their own
+    size first, by as much of the row's `lift` as keeps their largest within
     `2^125` (all of it where it is negative), the rest of the power after: a lift of `2^60` taken off before
     a direction of `2^125` meets them, and a positive one put back before a direction of `2^-124` does (its
     products `2^-165` otherwise, train 1444's review). Each direction meets `by` with the channels' powers
@@ -315,7 +338,7 @@ def _shifted_tangent(product: Callable, primals, tangents, value) -> jax.Array:
     take = jnp.minimum(lift, 125 - largest)
     whole = jax.tree.map(power2, by, by_powers)
     moved = jax.tree.map(power2, dby, by_powers)
-    return (power2(product(drows, whole), lift + scale - out_power)
+    return (power2(product(power2(drows, take), whole), lift - take + scale - out_power)
             + power2(product(power2(rows, take), moved), lift - take + scale - out_power))
 
 
@@ -785,14 +808,8 @@ def _dense_tangent(dtype: str, primals, tangents, value) -> jax.Array:
     # direction meets them at their size), their contraction with the direction taken back by it after: a
     # coefficient past fp32 (`w τ` of `2^138`) meets a small direction, or its pullback a small cotangent,
     # before it would overflow.
-    seen = logits > -jnp.inf
-    level = jax.lax.stop_gradient(jnp.max(logits, axis=-1, keepdims=True))
-    below = logits - jnp.where(jnp.isfinite(level), level, 0.0)
-    total = jnp.sum(jnp.where(seen, jnp.exp(below), 0.0), axis=-1, keepdims=True)
-    over = jnp.where(total > 0, total, 1.0)
-    hi = jax.lax.stop_gradient(jnp.sum(exp_scaled(seconds / over, below, 0), axis=-1, keepdims=True))
-    lo = jnp.sum(exp_scaled((seconds - hi) / over, below, 0), axis=-1, keepdims=True)
-    apart = jnp.where(seen, (seconds - hi) - lo, 0.0)
+    tile = _centred_tile(logits, seconds)
+    seen, below, over, apart = tile.seen, tile.below, tile.over, tile.apart
     rows = powers[..., None]
     reach = jnp.where(seen & (apart != 0), _reach(below) + _exponent(apart) - rows, _NONE)
     power = jnp.maximum(jnp.max(reach, axis=-1, keepdims=True) - 126, 0)

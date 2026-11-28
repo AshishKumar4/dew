@@ -895,3 +895,31 @@ def test_a_values_tangent_meets_its_mean_before_it_lands(arm):
     _, tangent = jax.jvp(lambda value: attend(query, second, key, second_key, value, spans), (value,),
                          (direction,))
     np.testing.assert_array_equal(np.asarray(tangent), np.full((1, 1, 1, 4), -3.0 * 2.0 ** 126, np.float32))
+
+
+@pytest.mark.parametrize("arm", ["walk", "reference"])
+def test_a_hidden_keys_value_bounds_no_channel(arm):
+    """One query seeing keys 0 and 1 of three, equal logits, second products `[1, -1, 0]`, values
+    `[2^-120, -2^-120, 2^127]`: the output `-2^-120`, the channel's power over the keys some query sees
+    (`attention_parallax._channel_powers`), where the hidden key's `2^127` took the seen values to
+    `2^-248` (train 1444's review)."""
+    query, second, key, second_key, value, _ = _witness((0.0, 0.0, 0.0), (1.0, -1.0, 0.0),
+                                                        (2.0 ** -120, -(2.0 ** -120), 2.0 ** 127))
+    spans = template.spans(1, 3, 1, valid=jnp.asarray([[True, True, False]]))
+    attend = attention_parallax.attend if arm == "walk" else attention_parallax.reference
+    out = attend(query, second, key, second_key, value, spans)
+    np.testing.assert_array_equal(np.asarray(out), np.full((1, 1, 1, 4), -(2.0 ** -120), np.float32))
+
+
+@pytest.mark.parametrize("arm", ["walk", "reference"])
+def test_a_second_query_direction_meets_lifted_terms_at_their_size(arm):
+    """Equal logits, a second query of 1 over second keys `[1, -1]`, values `[2^127, -2^127]`, along the
+    second query's direction 1: the output's tangent plain fp32's `-2^127`, the terms' direction taken toward
+    their size before it meets the values (`attention_parallax._shifted`), where a `2^60` direction met
+    `2^126` and overflowed (train 1444's review)."""
+    query, second, key, second_key, value, spans = _witness((0.0, 0.0), (1.0, -1.0),
+                                                            (2.0 ** 127, -(2.0 ** 127)))
+    attend = attention_parallax.attend if arm == "walk" else attention_parallax.reference
+    _, tangent = jax.jvp(lambda second: attend(query, second, key, second_key, value, spans), (second,),
+                         (jnp.ones_like(second),))
+    np.testing.assert_array_equal(np.asarray(tangent), np.full((1, 1, 1, 4), -(2.0 ** 127), np.float32))
