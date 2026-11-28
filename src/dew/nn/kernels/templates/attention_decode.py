@@ -501,7 +501,7 @@ def _massless_read(spec: algebra.Forward, out: jax.Array, stacked: jax.Array, in
     the call reads it so (`algebra.Forward.massless_nan`, a call from no `initial` state): no slice's
     denominator (`stacked[1]` `[B, KV, S, R]`), which the merge's own finish reads zero. Past an `output`
     hook the merge fused, the row is as the hook read its zero (`serves` keeps such a call off the work
-    list)."""
+    list; row 14204)."""
     if not spec.massless_nan or initial is not None or output:
         return out
     empty = jnp.all(stacked[1][..., :queries] == 0, axis=2)
