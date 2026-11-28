@@ -1037,8 +1037,9 @@ def test_a_regions_variants_are_each_weighed_alone():
 
 def test_a_search_reads_the_passs_decision_and_the_region_it_fuses():
     """A projection times a scalar array, on an H100 whose call names the template: the pass's decision of its
-    region (`fusion.decided`) fuses it not, the template refusing the epilogue, its launch the template's,
-    and the region the pass fuses (`fusion.taken`) is the product alone, as `fused_program` writes it
+    region (`fusion.decided`) fuses it not, the template refusing the epilogue (its analysis held with it,
+    `RegionDecision.analysis`), its launch the template's, and the region the pass fuses (`fusion.taken`) is
+    the product alone, as `fused_program` writes it
     (test_a_product_whose_epilogue_the_template_refuses_is_fused_without_it): the seams a whole-layer search
     reads the pass's choice by."""
     from dew.algebra import fusion
@@ -1053,7 +1054,87 @@ def test_a_search_reads_the_passs_decision_and_the_region_it_fuses():
         whole = fusion.decided(index, region)
         fused = fusion.taken(index, region)
     assert not whole.taken and whole.launched, whole
+    assert whole.analysis is not None and whole.analysis.epilogue.refusal is not None, whole.analysis
     assert fused is not None and fused.places == (product,), fused
+
+
+def attended_then_projected(q, k, v, w):
+    """jax.nn's attention as a plain program writes it, its output's rows projected."""
+    attended = jax.nn.dot_product_attention(q, k, v, implementation="xla")
+    return attended.reshape(-1, attended.shape[2] * attended.shape[3]) @ w
+
+
+def test_a_search_weighs_the_product_regions_the_pass_weighs():
+    """The product regions the pass weighs (`fusion.eligible`), on an H100: none holds an equation of the
+    attention region the pass writes as Dew's attention call (`recognize.ATTENTION`), the projection of its
+    output's rows is one, and each one's decision holds the analysis it was priced by
+    (`RegionDecision.analysis`, its product's launch routed)."""
+    from dew.algebra import fusion, recognize
+
+    shapes = (jax.ShapeDtypeStruct((2, 128, 4, 64), jnp.bfloat16),
+              *(jax.ShapeDtypeStruct((2, 128, 2, 64), jnp.bfloat16),) * 2,
+              jax.ShapeDtypeStruct((256, 256), jnp.bfloat16))
+    program = jax.make_jaxpr(attended_then_projected)(*shapes).jaxpr
+    index = fusion.Index(program)
+    with generation.assumed("sm90"):
+        (attention,) = recognize.recognized(program, index, recognize.ATTENTION)
+        weighed = fusion.eligible(index)
+        decisions = [fusion.decided(index, region) for region in weighed]
+    (projected,) = weighed
+    assert set(program.outvars) <= set(projected.outputs)
+    assert not set(attention.places) & set(projected.places)
+    assert all(made.analysis is not None and made.analysis.launch is not None for made in decisions)
+
+
+def chosen_by_platform(x, w):
+    """A product's consumer chosen by the platform a program lowers for (`lax.platform_dependent`): doubled
+    on CUDA, one added elsewhere."""
+    return jax.lax.platform_dependent(x, w, cuda=lambda x, w: (x @ w) * 2, default=lambda x, w: (x @ w) + 1)
+
+
+def test_a_search_for_a_platform_weighs_the_branch_its_lowering_runs():
+    """A platform choice's branches (`program.fused_bodies`): the pass weighs both, and a search for a
+    platform (`platform="cuda"`) weighs the branch a program lowered for it runs alone
+    (`programs.platform_branch`), the product doubled, each by its number among the choice's branches."""
+    from dew.algebra import program
+
+    shapes = (jax.ShapeDtypeStruct((256, 512), jnp.bfloat16), jax.ShapeDtypeStruct((512, 256), jnp.bfloat16))
+    traced = jax.make_jaxpr(chosen_by_platform)(*shapes).jaxpr
+
+    def branches(platform):
+        return {path[-1][2]: {equation.primitive for equation in body.eqns}
+                for path, body in program.fused_bodies(traced, lambda path, body: (path, body),
+                                                       platform=platform)
+                if path and path[-1][0] == "cond"}
+
+    every, cuda = branches(None), branches("cuda")
+    assert len(every) == 2 and len(cuda) == 1
+    [(number, primitives)] = cuda.items()
+    assert every[number] == primitives and jax.lax.mul_p in primitives and jax.lax.add_p not in primitives
+
+
+def doubled_product(x, w):
+    """A product doubled: one function a platform choice's two branches both take."""
+    return (x @ w) * 2
+
+
+def test_a_platform_choice_sharing_one_body_is_weighed_by_its_branches():
+    """A platform choice whose two branches are one function (`lax.platform_dependent`, CUDA's and the
+    default's, `doubled_product`): the pass weighs each branch by its own number however one body they share
+    (`program.fused_bodies`), and a search for CUDA the branch its lowering runs, once."""
+    from dew.algebra import program
+
+    shapes = (jax.ShapeDtypeStruct((256, 512), jnp.bfloat16), jax.ShapeDtypeStruct((512, 256), jnp.bfloat16))
+    traced = jax.make_jaxpr(lambda x, w: jax.lax.platform_dependent(
+        x, w, cuda=doubled_product, default=doubled_product))(*shapes).jaxpr
+
+    def branches(platform):
+        return [path[-1][2] for path, _ in program.fused_bodies(traced, lambda path, body: (path, body),
+                                                                platform=platform)
+                if path and path[-1][0] == "cond"]
+
+    assert branches(None) == [0, 1]
+    assert len(branches("cuda")) == 1
 
 
 def products_in_bodies(x, w):
