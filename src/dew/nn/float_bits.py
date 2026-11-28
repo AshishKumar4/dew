@@ -512,8 +512,17 @@ def _widens(source: np.dtype, target: np.dtype) -> bool:
 
 def _widened_bits(x: jax.Array, dtype: jnp.dtype) -> jax.Array:
     """`widened_exactly`'s map: a subnormal `x` placed in `dtype` from `float_bits`' reading, a normal one
-    converted."""
+    converted. Where every subnormal of `x`'s format is a normal number of `dtype` (float32's and fp16's in
+    float64, fp16's in float32), it is its fraction, an integer converted exactly, times the format's least
+    subnormal, a power of two `dtype` holds normally: no step of it a subnormal, which a flushing process
+    would drop, and a fifth of the operations of setting its bits (row 13308: 121 operations a sum's two
+    operands, 33k of a GLM-5 cell's 104k)."""
     source, target = jnp.finfo(x.dtype), jnp.finfo(dtype)
+    least = int(source.minexp) - int(source.nmant)
+    if least >= int(target.minexp):
+        _, sign, biased, fraction = raw_fields(x)
+        magnitude = fraction.astype(dtype) * np.asarray(2.0 ** least, dtype)
+        return jnp.where(biased == 0, jnp.where(sign != 0, -magnitude, magnitude), x.astype(dtype))
     word = jnp.dtype(f"uint{target.bits}")
     sign, biased, fraction, normalized, exponent = float_bits(x)
     normal = (((exponent + (1 << (target.nexp - 1)) - 1).astype(word) << word.type(target.nmant))
