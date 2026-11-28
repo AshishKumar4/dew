@@ -1288,7 +1288,8 @@ def test_a_factored_product_split_three_ways_by_its_depth_runs_on_an_explicit_me
 
     def product(x, matrix):
         return factored(functools.partial(gemm.decoded_product, interpret_on_cpu=False), (matrix, None, None),
-                        jnp.float32(1), x, wide=gemm.interpreted_wide(False), wide_operands=(matrix, None))
+                        jnp.float32(1), x, wide=gemm.interpreted_wide(interpret_on_cpu=False),
+                        wide_operands=(matrix, None))
 
     @jax.jit
     def pulled(x, matrix, cotangent):
