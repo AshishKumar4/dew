@@ -420,7 +420,8 @@ def test_a_bf16_levels_overflowed_read_leaves_a_later_tokens_decay_gradient_zero
 
     def read(g):
         queries = _tokens(69, [67, 68], [2.0 ** 127, 1.0])
-        return log_linear_attention(queries, unit, unit, g, weights, scale=1.0)[0, 68, 0, 0].astype(jnp.float32)
+        out = log_linear_attention(queries, unit, unit, g, weights, scale=1.0)
+        return out[0, 68, 0, 0].astype(jnp.float32)
 
     found, gradient = jax.value_and_grad(read)(jnp.zeros((1, 69, 1), jnp.float32).at[0, 67].set(-1.0)
                                                .at[0, 68].set(-1000.0))
