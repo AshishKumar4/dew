@@ -334,12 +334,12 @@ def assert_faults_refused(*, interpret: bool, lane: Lane | None = None,
     if not interpret and tier_wire.preparing():
         return
     for fault in faults:
-        FAULTS[fault][1](q, k, v, runs, lane)
+        forms, check = FAULTS[fault]
+        check(q, k, v, *(runs[form] for form in forms), lane=lane)
 
 
-def _rescale_refused(q, k, v, runs: dict, lane) -> None:
-    """A dropped rescale, refused at the sums."""
-    truth = runs["full"]
+def _rescale_refused(q, k, v, truth: dict, *, lane) -> None:
+    """A full launch's records (`truth`) with a dropped rescale, refused at the sums."""
     m, acc = truth["m"], truth["acc"]
     alpha = np.exp2(np.where(np.isfinite(m[:, :, :-1]), m[:, :, :-1] - m[:, :, 1:], 0.0))
     dropped = dict(truth, acc=np.concatenate(
@@ -347,40 +347,41 @@ def _rescale_refused(q, k, v, runs: dict, lane) -> None:
     assert refused(witnessed(q, k, v, mask_of("full"), dropped, lane=lane), "acc")
 
 
-def _maximum_refused(q, k, v, runs: dict, lane) -> None:
-    """A maximum from the wrong tile, refused at the maxima."""
-    truth = runs["full"]
+def _maximum_refused(q, k, v, truth: dict, *, lane) -> None:
+    """A full launch's records (`truth`) with a maximum from the wrong tile, refused at the maxima."""
     wrong = dict(truth, m=np.concatenate([truth["m"][:, :, :1], truth["m"][:, :, :-1]], 2))
     assert refused(witnessed(q, k, v, mask_of("full"), wrong, lane=lane), "m")
 
 
-def _narrowed_refused(q, k, v, runs: dict, lane) -> None:
-    """Sums rounded to bf16 where the walk holds fp32, refused at the sums."""
-    narrowed = dict(runs["full"], acc=np.asarray(nearest(runs["full"]["acc"], BFLOAT16)))
+def _narrowed_refused(q, k, v, truth: dict, *, lane) -> None:
+    """A full launch's records (`truth`) with sums rounded to bf16 where the walk holds fp32, refused at the
+    sums."""
+    narrowed = dict(truth, acc=np.asarray(nearest(truth["acc"], BFLOAT16)))
     assert refused(witnessed(q, k, v, mask_of("full"), narrowed, lane=lane), "acc")
 
 
-def _shifted_refused(q, k, v, runs: dict, lane) -> None:
+def _shifted_refused(q, k, v, causal: dict, *, lane) -> None:
     """A causal launch's records held under a mask one key short of its own."""
     shifted = mask_of("causal") & ~np.eye(SHAPE[1], dtype=bool)[None, None]
-    held = witnessed(q, k, v, shifted, runs["causal"], lane=lane)
+    held = witnessed(q, k, v, shifted, causal, lane=lane)
     assert sum(refused(held, name) for name in ("m", "l", "acc"))
 
 
-def _bounded_refused(q, k, v, runs: dict, lane) -> None:
-    """A window's or the documents' launch held as one undivided causal call: its bounds read."""
-    for form in ("window", "documents"):
-        held = witnessed(q, k, v, mask_of("causal"), runs[form], lane=lane)
-        assert sum(refused(held, name) for name in ("m", "l", "acc")), form
+def _bounded_refused(q, k, v, *bounded: dict, lane) -> None:
+    """Each bounded launch's records (a window's, the documents') held as one undivided causal call: its
+    bounds read."""
+    for records in bounded:
+        held = witnessed(q, k, v, mask_of("causal"), records, lane=lane)
+        assert sum(refused(held, name) for name in ("m", "l", "acc"))
 
 
-def _capped_refused(q, k, v, runs: dict, lane) -> None:
-    """A capped launch held as an uncapped call's, and an uncapped one as a capped call's: its cap read."""
-    causal = mask_of("causal")
-    assert sum(refused(witnessed(q, k, v, causal, runs["capped"], lane=lane), name)
-               for name in ("m", "l", "acc"))
+def _capped_refused(q, k, v, causal: dict, capped: dict, *, lane) -> None:
+    """A capped launch held as an uncapped call's, and an uncapped (causal) one as a capped call's: its cap
+    read."""
+    mask = mask_of("causal")
+    assert sum(refused(witnessed(q, k, v, mask, capped, lane=lane), name) for name in ("m", "l", "acc"))
     constants = capped_constants("capped", SHAPE[3])
-    assert sum(refused(witnessed(q, k, v, causal, runs["causal"], lane=lane, capped=constants), name)
+    assert sum(refused(witnessed(q, k, v, mask, causal, lane=lane, capped=constants), name)
                for name in ("m", "l", "acc"))
 
 
@@ -989,59 +990,55 @@ def assert_backward_faults_refused(*, interpret: bool, lane: Lane | None = None,
         return
     mask = mask_of("causal")
     for fault in faults:
-        BACKWARD_FAULTS[fault][1](q, k, v, do, mask, runs, lane)
+        names, check = BACKWARD_FAULTS[fault]
+        check(q, k, v, do, mask, *(runs[name] for name in names), lane=lane)
 
 
-def _bent_refused(q, k, v, do, mask, runs: dict, lane, *, run: str) -> None:
-    """Run `run`'s dK at twice its scale, dQ and dV a sixty-fourth off, each refused at its gradient."""
-    records = runs[run]
+def _bent_refused(q, k, v, do, mask, records: dict, *, lane) -> None:
+    """A run's dK at twice its scale, dQ and dV a sixty-fourth off, each refused at its gradient."""
     for name, bent in (("dk", 2.0), ("dq", 1.0 + 2.0 ** -6), ("dv", 1.0 - 2.0 ** -6)):
         held = backward_witnessed(q, k, v, do, mask, dict(records, **{name: records[name] * bent}), lane=lane)
         assert refused(held, name), name
 
 
-def _masked_refused(q, k, v, do, mask, runs: dict, lane) -> None:
+def _masked_refused(q, k, v, do, mask, causal: dict, *, lane) -> None:
     """A causal call's gradients held as a full call's."""
-    held = backward_witnessed(q, k, v, do, mask_of("full"), runs["causal"], lane=lane)
+    held = backward_witnessed(q, k, v, do, mask_of("full"), causal, lane=lane)
     assert sum(refused(held, name) for name in ("dq", "dk", "dv"))
 
 
-def _delta_refused(q, k, v, do, mask, runs: dict, lane) -> None:
+def _delta_refused(q, k, v, do, mask, causal: dict, *, lane) -> None:
     """The fast form's D taken and stated a sixty-fourth off (its prior and the D its launch read alike),
     refused at the row whatever the gradients."""
-    causal = runs["causal"]
     off = dict(causal, prior=causal["prior"] * (1 + 2.0 ** -6) + 2.0 ** -6,
                delta=causal["delta"] * (1 + 2.0 ** -6) + 2.0 ** -6)
     assert refused(backward_witnessed(q, k, v, do, mask, off, lane=lane), "prior")
 
 
-def _cap_refused(q, k, v, do, mask, runs: dict, lane) -> None:
+def _cap_refused(q, k, v, do, mask, capped: dict, *, lane) -> None:
     """The cap's slope read: a capped call's gradients held with it, and without it, its logits and weights
     capped (`sloped`), its dQ and dK refused and its dV (no slope in it) held."""
     for sloped in (True, False):
-        held = backward_witnessed(q, k, v, do, mask, runs["capped"], lane=lane, softcap=CAPS["capped"],
+        held = backward_witnessed(q, k, v, do, mask, capped, lane=lane, softcap=CAPS["capped"],
                                   sloped=sloped)
         assert [bool(refused(held, name)) for name in ("dq", "dk", "dv")] == [not sloped, not sloped, False]
 
 
-def _parts_refused(q, k, v, do, mask, runs: dict, lane) -> None:
+def _parts_refused(q, k, v, do, mask, causal: dict, accurate: dict, *, lane) -> None:
     """The accurate dK of the exact cotangents whole held, cast to one bf16 part first refused; the fast
     form's dQ and dK held as the accurate form's refused."""
-    accurate = runs["accurate"]
     scores = _exact_scores(q, k, v, do, mask)
     one_part = nearest(nearest(scores, FLOAT32), BFLOAT16)
     for cotangents, wrong in ((scores, False), (one_part, True)):
         exact = dict(accurate, dk=_exact_dk(q, k, cotangents))
         assert bool(refused(backward_witnessed(q, k, v, do, mask, exact, lane=lane), "dk")) == wrong
-    causal = runs["causal"]
     held = backward_witnessed(q, k, v, do, mask, dict(accurate, dq=causal["dq"], dk=causal["dk"]), lane=lane)
     assert refused(held, "dq") and refused(held, "dk")
 
 
-def _doubled_refused(q, k, v, do, mask, runs: dict, lane) -> None:
+def _doubled_refused(q, k, v, do, mask, accurate: dict, *, lane) -> None:
     """The accurate form's dQ pass denominators bent: doubled with the dV it weighs halved, and a row's
     nudged or NaN."""
-    accurate = runs["accurate"]
     # A dQ pass's denominator twice its own with the dV it weighs half its own, each consistent with the other
     # (`dq_finish` doubling its total): refused by the denominators' bound on the weights' sum.
     doubled = dict(accurate, denominator=accurate["denominator"] * 2, dv=accurate["dv"] / 2)
@@ -1055,9 +1052,9 @@ def _doubled_refused(q, k, v, do, mask, runs: dict, lane) -> None:
                        "dq")
 
 
-def _row_sums_bounded(q, k, v, do, mask, runs: dict, lane) -> None:
+def _row_sums_bounded(q, k, v, do, mask, *, lane) -> None:
     """A fixed maximum's row sums against their bound: its denominators' rows held and refused."""
-    del q, k, v, do, mask, runs
+    del q, k, v, do, mask
     # A fixed maximum's row of 512 exact unit weights: its fp32 sum 512 held, and 512 + 3 2^-7, past an fp32
     # row sum's gamma_n (512 + 2^-6) though within a tensor-core sum's twice that, refused; one such weight
     # beside 511 masked keys, its sum 1 held and 1 + 2^-16 refused (an add of a masked zero no rounding);
@@ -1074,14 +1071,14 @@ def _row_sums_bounded(q, k, v, do, mask, runs: dict, lane) -> None:
 
 
 BACKWARD_FAULTS = {
-    "scaled": (("causal",), functools.partial(_bent_refused, run="causal")),
+    "scaled": (("causal",), _bent_refused),
     "masked": (("causal",), _masked_refused),
     "delta": (("causal",), _delta_refused),
     "capped": (("capped",), _cap_refused),
-    "accurate": (("accurate",), functools.partial(_bent_refused, run="accurate")),
+    "accurate": (("accurate",), _bent_refused),
     "parts": (("causal", "accurate"), _parts_refused),
     "doubled": (("accurate",), _doubled_refused),
     "row sums": ((), _row_sums_bounded),
 }
 """The backward's faults (`assert_backward_faults_refused`), each the runs it reads and its check of them
-from the operands, the causal mask and the runs, a part a test may hold alone."""
+from the operands, the causal mask and those runs in their order, a part a test may hold alone."""
