@@ -121,4 +121,5 @@ def _alike(plain, flagged, ratio):
     """`flagged`'s `train_ratio` set to `ratio` and cleared, each as `plain`'s (`to_record`)."""
     stated = flagged.with_fields(train_ratio=ratio)
     assert to_record(stated, RolloutConfig) == to_record(plain.with_fields(train_ratio=ratio), RolloutConfig)
+    assert stated.record()["fields"] == plain.with_fields(train_ratio=ratio).record()["fields"]
     assert to_record(stated.without_fields("train_ratio"), RolloutConfig) == to_record(plain, RolloutConfig)
