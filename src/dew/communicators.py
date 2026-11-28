@@ -49,7 +49,7 @@ from typing import Protocol, runtime_checkable
 import jax
 from jax.sharding import Mesh, NamedSharding, PartitionSpec
 
-from dew import _pool
+from dew import _pool, _xla_flags
 from dew._builds import dew_cache_dir
 from dew._cache import keep, kept_beside, read_kept
 from dew._code import code_digest
@@ -217,7 +217,7 @@ def configuration() -> dict:
     follow), the driver's CUDA version, NCCL's version and every NCCL setting in the environment, each XLA
     flag that sets NCCL's communicators, and the JAX build that makes them."""
     gpus = local_gpus() or ()
-    flags = os.environ.get("XLA_FLAGS", "").split()
+    flags = [span for name, span in _xla_flags.spans(os.environ.get("XLA_FLAGS", "")) if name]
     return {"gpus": [gpu_name(index) for index in gpus],
             "placement": [gpu_place(index) for index in gpus], "driver": cuda_driver_version(),
             "nccl": nccl_version(), "nccl_env": {name: value for name, value in sorted(os.environ.items())

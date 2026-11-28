@@ -465,6 +465,40 @@ def test_a_dry_prepares_row_is_red_for_each_cell_it_left_unprepared_that_mains_r
     assert graded(set(cells), code=1, kind=ci.grading.STALE)["kind"] == ci.grading.STALE
 
 
+def test_a_cell_moved_by_an_edit_above_it_is_main_s_cell_and_a_new_one_beside_it_is_new(ci):
+    """An unprepared cell is its test, its file, its label and its site, the source text of its line, at
+    whatever line an edit above it moves it to (prepares.py's `knowing`): three lines added above a test's
+    cell move it from :83 to :86 and the row stays green (train 1489 read it as new); a run that fixed main's
+    site of a test and broke another of it is red for the other (train 1493's P-F7); a second cell of one
+    site beside it is new, main's one cell answering one of the run's alone; a cell left twice at one where is
+    one; and against a baseline that kept no sites, a cell of the place counts as main's (its count alone)."""
+    name = "3.12:tests/test_gpu_attention.py#5/25@prepare-sm90"
+    test = "tests/test_gpu_attention.py::test_merged"
+    file = "tests/test_gpu_attention.py"
+
+    def graded(cells, before):
+        records = [{"test": test, "where": where, "error": "lowered", "kind": "site", "site": site}
+                   for where, site in cells]
+        found = {"name": name, "exitCode": 0, "output": ""}
+        [row] = ci.prepares.graded([found], {file: records}, before, "sm90",
+                                   lambda named: ci.grading.owning(ci.parsed_row(named)[1]),
+                                   ci.grading.STALE, ci.tier_wire().CAPPED)
+        return row
+    main = {(test, f"{file}:83", None, "site", "out = merged(a)")}
+    assert graded([(f"{file}:86", "out = merged(a)")], main)["exitCode"] == 0
+    assert graded([(f"{file}:86", "out = merged(a)")] * 2, main)["exitCode"] == 0
+    swapped = graded([(f"{file}:90", "out = merged(b)")], main)
+    assert swapped["new_unprepared"] == [f"{test} @ {file}:90"]
+    beside = graded([(f"{file}:86", "out = merged(a)"), (f"{file}:120", "out = merged(a)")], main)
+    assert beside["new_unprepared"] == [f"{test} @ {file}:120"]
+    unsited = {(test, f"{file}:83", None, "site")}
+    assert graded([(f"{file}:90", "out = merged(b)")], unsited)["exitCode"] == 0
+    two = graded([(f"{file}:90", "x"), (f"{file}:91", "y")], unsited)
+    assert two["new_unprepared"] == [f"{test} @ {file}:91"]
+    elsewhere = graded([("src/dew/nn/attention.py:86", "out = merged(a)")], main)
+    assert elsewhere["new_unprepared"] == [f"{test} @ src/dew/nn/attention.py:86"]
+
+
 def test_a_cell_its_prepares_cap_left_is_named_and_counted_but_reds_no_row(ci):
     """A cell a dry prepare's cap left unprepared (tests/tier_wire.py's `CAPPED`, its where exactly) is named
     among its row's unprepared and counted apart (`capped`, its output; kept as the row is reused), but no
@@ -571,9 +605,9 @@ def test_a_baseline_keeps_its_cells_by_their_fields_and_main_s_capped_cells_are_
     row = graded([same], before=kept(capped))
     assert row["exitCode"] == 0
     assert json.loads(json.dumps(row))["unprepared_cells"] == [
-        ["tests/test_gpu_vae.py::test_flow", "tests/test_gpu_vae.py", "two", None]]
+        ["tests/test_gpu_vae.py::test_flow", "tests/test_gpu_vae.py", "two", None, None]]
     assert ci.prepares.cells_of(json.loads(json.dumps(row))) == {
-        ("tests/test_gpu_vae.py::test_flow", "tests/test_gpu_vae.py", "two", None)}
+        ("tests/test_gpu_vae.py::test_flow", "tests/test_gpu_vae.py", "two", None, None)}
     assert graded([], before=kept(capped), found=json.loads(json.dumps(row)))["exitCode"] == 0
     sibling = {**same, "cell": "three"}
     assert graded([same, sibling], before=kept(capped))["new_unprepared"] == [ci.prepares.identity(sibling)]
@@ -1108,7 +1142,7 @@ def test_a_whole_cut_of_fields_and_older_identities_is_read_and_graded_apart(ci,
     monkeypatch.setattr(ci.run_keys, "head_commit", lambda: "head")
     monkeypatch.setattr(ci, "baseline_key", lambda commit, python, place, held: f"baseline/{place}")
     found = ci.prepares.before(ci, "3.12", "tests/test_gpu_a.py", "@prepare-sm90", time.monotonic() + 600)
-    assert found == {(*lookalike, None), older}
+    assert found == {(*lookalike, None, None), older}
     reached = {"test": "tests/test_gpu_a.py::test_flow[p]", "where": "a site", "error": "e",
                "cell": "q @ a site [c"}
     other = {"test": "tests/test_gpu_a.py::test_other", "where": "x", "error": "e"}
@@ -1138,12 +1172,17 @@ def test_a_commits_baseline_is_its_green_prepares_and_a_red_run_writes_none(ci, 
     fields = [["tests/test_gpu_a.py::t[p] @ " + ci.tier_wire().CAPPED + " [q", "a site", "c"]]
     assert ci.run_keys.baselined("3.12", place, "cls", "token",
                                  {"exitCode": 0, "unprepared": ["a @ x"], "unprepared_cells": fields})
-    assert ci.prepares.cells_of(json.loads(stored[baseline])) == {(*fields[0], None)}
+    assert ci.prepares.cells_of(json.loads(stored[baseline])) == {(*fields[0], None, None)}
     # Its kind kept too: a row's four fields published and read back whole.
     kinded = [[*fields[0], "flow"]]
     assert ci.run_keys.baselined("3.12", place, "cls", "token",
                                  {"exitCode": 0, "unprepared": ["a @ x"], "unprepared_cells": kinded})
-    assert ci.prepares.cells_of(json.loads(stored[baseline])) == {tuple(kinded[0])}
+    assert ci.prepares.cells_of(json.loads(stored[baseline])) == {(*kinded[0], None)}
+    # And its site: a row's five fields published and read back whole.
+    sited = [[*kinded[0], "out = merged(a)"]]
+    assert ci.run_keys.baselined("3.12", place, "cls", "token",
+                                 {"exitCode": 0, "unprepared": ["a @ x"], "unprepared_cells": sited})
+    assert ci.prepares.cells_of(json.loads(stored[baseline])) == {tuple(sited[0])}
 
 
 @pytest.mark.parametrize("taken", [True, False])

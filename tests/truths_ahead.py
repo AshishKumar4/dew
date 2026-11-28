@@ -35,6 +35,7 @@ import hashlib
 import inspect
 import io
 import json
+import linecache
 import logging
 import os
 import pickle
@@ -640,22 +641,27 @@ def unprepared(directory: Path, test: str, frames: Sequence[tuple[str, int]], wh
     """The writer of a test's record that it ran unprepared (`UNPREPARED`, in its store `directory`),
     compiling a site or an arm on its devices with every site judged: its node id and each reason it gives,
     where (`frames`, innermost first, `(file, line)`: the first of the test's own file, else the test's file)
-    and why (`reasoned`). Under `tier_wire.DEFERRED`, a GPU flow's cell its prepare deferred to its run
-    (`gpu_flow.run_cells`), which its run's store still serves, and which the run names unprepared
-    (tests/conftest.py's `compiled_ahead`); `cell` its label, so the flow's cells deferred at one line are
-    each their own."""
+    and why (`reasoned`), and the site that line is, its source text (`site`), which an edit above it does
+    not move as it moves its line (prepares.py's `knowing`). Under `tier_wire.DEFERRED`, a GPU flow's cell
+    its prepare deferred to its run (`gpu_flow.run_cells`), which its run's store still serves, and which the
+    run names unprepared (tests/conftest.py's `compiled_ahead`); `cell` its label, so the flow's cells
+    deferred at one line are each their own."""
     # The test's file as CI's grading reads a node id (`tools/armada/grading.py`'s `owning`).
     path = Path(load("grading", "tools/armada").owning(test))
-    lines = [line for file, line in frames if Path(file).name == path.name]
-    reasoned(directory / record, test, f"{path}:{lines[0]}" if lines else str(path), why, cell)
+    lines = [(file, line) for file, line in frames if Path(file).name == path.name]
+    site = linecache.getline(lines[0][0], lines[0][1]).strip() if lines else ""
+    reasoned(directory / record, test, f"{path}:{lines[0][1]}" if lines else str(path), why, cell,
+             site=site or None)
 
 
-def reasoned(record: Path, test: str, where: str, why: str, cell: str | None = None) -> None:
+def reasoned(record: Path, test: str, where: str, why: str, cell: str | None = None,
+             site: str | None = None) -> None:
     """Into a test's `record` (`UNPREPARED`, `tier_wire.DEFERRED`), a reason it ran unprepared, `where` and
     `why`, each reason once in the order given, its first's its record's own `where` and `error` (a
     prepare's, before its run's): a test with three unprepared arms names three (Main); `cell` a flow's cell's
-    label, where the reason is one."""
-    reason = {"where": where, "error": why, **({"cell": cell} if cell else {})}
+    label, where the reason is one; `site` the source text of the line `where` names (`unprepared`)."""
+    reason = {"where": where, "error": why, **({"cell": cell} if cell else {}),
+              **({"site": site} if site else {})}
     if record.exists():
         held = json.loads(record.read_text())
         if reason not in held["reasons"]:

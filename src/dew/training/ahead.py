@@ -66,7 +66,7 @@ from jax._src import cache_key
 from jax.experimental import serialize_executable
 from jaxlib import xla_client
 
-from dew import communicators
+from dew import _xla_flags, communicators
 from dew._cache import carried, cuda_libraries, plugin_builds, topology_digest, uncached
 from dew._devices import DEW_SHARE, STATED_GPUS, StatedGpu, device_memory
 from dew._records import JSON, boolean, record
@@ -564,7 +564,9 @@ def computation_flags(flags: str | None = None) -> tuple[str, ...]:
     division, dew/__init__.py, among them): every one but a phase's own (`PHASE_FLAGS`) and its host's
     (`HOST_FLAGS`), in their order, as XLA reads a flag given twice by its last value."""
     given = os.environ.get("XLA_FLAGS", "") if flags is None else flags
-    return tuple(setting for setting in given.split() if not setting.startswith((*PHASE_FLAGS, *HOST_FLAGS)))
+    # Each flag read whole as XLA reads it (`dew._xla_flags`): a quoted dump path naming a flag is no flag.
+    return tuple(span for name, span in _xla_flags.spans(given)
+                 if not name.startswith((*PHASE_FLAGS, *HOST_FLAGS)))
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1129,8 +1131,8 @@ def dumps(directory: Path, environment: Mapping[str, str]) -> dict[str, str]:
         # it.
         with tempfile.NamedTemporaryFile(dir=root / part, prefix=".written-"):
             pass
-    given = environment.get("XLA_FLAGS", "").split()
-    flags = [setting for setting in given if not setting.startswith(DUMP_FLAGS)]
+    flags = [span for name, span in _xla_flags.spans(environment.get("XLA_FLAGS", ""))
+             if not name.startswith(DUMP_FLAGS)]
     kept = {name: value for name, value in environment.items() if not name.startswith("MOSAIC_GPU_DUMP")}
     dumping = [*flags, f"--xla_dump_to={root / 'xla'}"]
     return {**kept, "XLA_FLAGS": " ".join(dumping), "MOSAIC_GPU_DUMP_TO": str(root / "mosaic")}

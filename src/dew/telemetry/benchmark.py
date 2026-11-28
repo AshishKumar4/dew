@@ -20,10 +20,12 @@ from __future__ import annotations
 import contextlib
 import ctypes
 import dataclasses
+import functools
 import html
 import math
 import os
 import re
+import runpy
 import select
 import statistics
 import threading
@@ -278,6 +280,14 @@ loads into a timing worker beside any tree's Dew (tools/timing.py's `instrument`
 program's options read too (`options_of`)."""
 
 
+@functools.cache
+def _lexer() -> dict:
+    """Dew's XLA flag lexer (src/dew/_xla_flags.py) beside this file, its names as running it leaves them
+    (`runpy.run_path`): the instrument loads by its path into an arm's process, whose Dew may be a checkout
+    that states none (row 12063)."""
+    return runpy.run_path(str(Path(__file__).resolve().parents[1] / "_xla_flags.py"))
+
+
 def options_of(flags: str) -> dict[str, str]:
     """The XLA options `flags`, in XLA_FLAGS' form, name: a program compiled with them runs as a process
     given them does (`UNGRAPHED_FLAG`'s, `dew.nn.kernels.options.UNGRAPHED_OPTIONS`)."""
@@ -292,10 +302,10 @@ def graphs() -> bool:
     a checkout that states none of its own reader (row 12063: an older baseline raised ImportError)."""
     name = UNGRAPHED_FLAG.removesuffix("=")
     kinds: set[str] | None = None
-    for token in os.environ.get("XLA_FLAGS", "").split():
-        named, _, value = token.partition("=")
+    for named, span in _lexer()["spans"](os.environ.get("XLA_FLAGS", "")):
         if named != name:
             continue
+        value = _lexer()["value"](named, span)
         listed = [kind.strip().upper() for kind in value.split(",") if kind.strip()]
         if not (listed and all(kind[0] in "+-" for kind in listed)):
             kinds = set(listed)
