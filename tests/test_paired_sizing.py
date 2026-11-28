@@ -116,3 +116,23 @@ def test_a_sizing_holds_a_library_reference_to_its_call_on_the_executable_it_run
     with pytest.raises(NotTheLibrary):
         seeds_for(reference, normal_drawn(0x14096, (16, 8), (8, 4)), "a library reference sized",
                   truth_fn=truth, dew_fn=jax.jit(product))
+
+
+@pytest.mark.skipif(jax.default_backend() != "cpu", reason="the arm's mark is a CPU's")
+def test_a_sizing_with_no_truth_widens_its_library_reference_unchecked():
+    """A sizing (`seeds_for`) of a site that names no truth runs its library reference
+    (`truths_ahead.library_arm`, LAPACK's float32 Cholesky marked for a CPU) as its float64 truth on widened
+    inputs without the arm's check: that executable calls float64's routine, no library's of the mark, and
+    the sizing takes its count; the arms themselves are still checked (train 1472's fix's review: the
+    checked arm refused its own widened truth)."""
+    import jax.numpy as jnp
+    from jaxlib.lapack import build_lapack_fn_target
+    from test_gate_arms import _spd
+    from truths_ahead import library_arm
+
+    def cholesky(matrices):
+        return jnp.linalg.cholesky(matrices)
+
+    call = build_lapack_fn_target("potrf_ffi", np.float32)
+    reference = library_arm(jax.jit(cholesky), call, platform="cpu")
+    assert seeds_for(reference, _spd, "a library reference sized by itself", dew_fn=jax.jit(cholesky)) > 0

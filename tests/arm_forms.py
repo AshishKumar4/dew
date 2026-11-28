@@ -540,6 +540,19 @@ class _LibraryChecked(_Adapting):
         return self.executables[key](*inputs)
 
 
+def _unchecked(arm):
+    """`arm` without its library check (`_LibraryChecked`), within a declaration and a window loop: the arm a
+    truth that names none runs as its reference, on widened inputs, whose executable is no library's
+    (`reference_error._drawn`)."""
+    if isinstance(arm, _LibraryChecked):
+        return arm.fn
+    if isinstance(arm, _RunToRun):
+        return _RunToRun(_unchecked(arm.fn), arm.why)
+    if isinstance(arm, _Windowed):
+        return _Windowed(_unchecked(arm.fn))
+    return arm
+
+
 def _paired_arms(arms) -> list[_Paired]:
     """The paired arms among `arms`, through every arm each adapts (`_layers`)."""
     return [layer for arm in arms for layer in _layers(arm) if isinstance(layer, _Paired)]

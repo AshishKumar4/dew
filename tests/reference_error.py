@@ -97,6 +97,7 @@ from arm_forms import (
     _one_draws_program,
     _refuse_numpy_arms,
     _RunToRun,
+    _unchecked,
     _varies,
     _window_count,
     _Windowed,
@@ -1060,7 +1061,10 @@ def _drawn(dew_fn, reference_fn, draw, seeds, truth_fn=None, reference_seeds=Non
     prepared_followed = None if followed is None else _truth_program(followed.truth)
     stacked, stacked_rows = ([None for _ in arms] for _ in range(2))
     evidence, per_example, per_example_rows = ([[] for _ in arms] for _ in range(3))
-    truth_and_terms = functools.partial(_truth_and_terms, truth_fn or reference_fn, terms_fn)
+    # A truth the site names none of, its reference's arm without its library check: run on widened inputs,
+    # its executable is no library's (row 14096).
+    truth_or_reference = truth_fn or _unchecked(reference_fn)
+    truth_and_terms = functools.partial(_truth_and_terms, truth_or_reference, terms_fn)
     def rows_at(at, seed):
         """Every arm's evidence on the draw at `seed`, the `at`th, its orders' worst rows the larger."""
         nonlocal names, widths
@@ -1074,8 +1078,8 @@ def _drawn(dew_fn, reference_fn, draw, seeds, truth_fn=None, reference_seeds=Non
             _ynn_decided(label, [dew_fn, *arms], inputs)
         truth, terms, ran = _draw_truth(truth_and_terms, prepared_followed, followed, dew_fn, inputs)
         # Else held (`arm_store.compile_site`).
-        if site_first and (running() is None or _given(truth_fn or reference_fn)):
-            _of_float64(label, _truth_read(truth_fn or reference_fn, followed, ran), inputs, truth)
+        if site_first and (running() is None or _given(truth_or_reference)):
+            _of_float64(label, _truth_read(truth_or_reference, followed, ran), inputs, truth)
         if reference_seeds is None:
             their_inputs, their_truth, their_terms = inputs, truth, terms
         else:
@@ -1800,9 +1804,6 @@ def seeds_for(reference_fn, draw, label: str, *, start: int = FEWEST_SEEDS, most
     # elements classed over its first stages' draws.
     weighing = (_conditioning(reference_fn, truth_fn, draw, range(staged_units(max(start, FEWEST_SEEDS))),
                               scale=conditioning_scale) if conditioning else None)
-    # A truth it names none of, the reference it compiles as its arm is, unchecked: a library arm's check
-    # reads the executable its arm runs, never its truth's widened one (`_site_judged`'s alike).
-    unchecked = None
     if arms is None:
         from arm_store import _routed_arm
 
@@ -1810,14 +1811,13 @@ def seeds_for(reference_fn, draw, label: str, *, start: int = FEWEST_SEEDS, most
         # verdict's are (`arm_store._routed_arm`, row 14096).
         given = dew_fn if paired else reference_fn
         compiled = _arms(given, reference_fn)
-        unchecked = twin or compiled[1]
         arms = (_routed_arm(None, label, given, compiled[0], "dew"),
                 _routed_arm(None, label, reference_fn, compiled[1], "reference"))
         twin = twin and _routed_arm(None, label, reference_fn, twin, _written_role(None), written=True)
     dew_fn, reference_fn = arms
     reference_fn = twin or reference_fn
     dew_fn = dew_fn if paired else None
-    truth_fn = _truth_program(truth_fn) if truth_fn is not None else unchecked
+    truth_fn = _truth_program(truth_fn)
     # Both modes from SIZING_FROM, the draws no verdict takes: the reference compared with itself from seed 0
     # chose its count by the verdict's own inputs, its confirming blocks overlapping at least the whole first
     # stage (spec alignment, 9005).
