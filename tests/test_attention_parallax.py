@@ -1104,8 +1104,8 @@ def test_a_second_keys_pullback_restores_its_rows_power_after_the_values():
     (1.0, 2.0 ** 124, 1.0, 1.0, -(2.0 ** 124)),
     (2.0 ** 8, 2.0 ** 119, 2.0 ** -10, 2.0 ** 10, -(2.0 ** 119)),
 ], ids=["power taken back", "small values first"])
-def test_a_second_queries_tangent_restores_its_rows_power_after_the_values(second, second_key, value, direction,
-                                                                           expected):
+def test_a_second_queries_tangent_restores_its_rows_power_after_the_values(second, second_key, value,
+                                                                           direction, expected):
     """Parallax's forward-mode tangent along its second query (`reference`'s, the derivative's higher
     orders), one query over second keys `±second_key` and values `±value`, whose rows' power holds the
     products: the plain formula's `expected`, the centred direction met by the values before the power
