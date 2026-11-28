@@ -13,6 +13,7 @@ from jax.typing import ArrayLike
 from dew.diffusion.discrete import DiscreteDenoiser
 from dew.diffusion.process import Denoiser
 from dew.nn.autoencoders import AutoEncoder
+from dew.nn.precision import rounding_alone, rounding_as_compiled
 from dew.nn.programs import on_host
 from dew.sampling.guidance import Guidance, Walk, pair_of
 from dew.sampling.solvers import RowKeys, RowSolver, Solver
@@ -186,15 +187,53 @@ def _sampling_key(key: int | jax.Array | RowKeys, solver: Solver, rows: int) -> 
 
 def _stepped(solver: Solver, key: jax.Array | RowKeys, index: jax.Array) -> Callable[..., tuple]:
     """`solver`'s step at the step `index`, from `key` folded with it: `step_rows` over each row's
-    key folded alike for `RowKeys`, `step` over the one key otherwise."""
+    key folded alike for `RowKeys`, `step` over the one key otherwise, rounded alone (`_rounded_alone`)."""
     if isinstance(key, RowKeys):
         assert isinstance(solver, RowSolver)
         keys = jax.vmap(jax.random.fold_in, in_axes=(0, None))(key.keys, index)
-        return lambda x, t, t_next, denoised, eps, state, *, process, denoise: solver.step_rows(
-            x, t, t_next, denoised, eps, state, keys, process, denoise)
+        return lambda x, t, t_next, denoised, eps, state, *, process, denoise: _rounded_alone(
+            solver.step_rows, x, t, t_next, denoised, eps, state, keys, process, _AsCompiled(denoise))
     folded = jax.random.fold_in(key, index)
-    return lambda x, t, t_next, denoised, eps, state, *, process, denoise: solver.step(
-        x, t, t_next, denoised, eps, state, folded, process, denoise)
+    return lambda x, t, t_next, denoised, eps, state, *, process, denoise: _rounded_alone(
+        solver.step, x, t, t_next, denoised, eps, state, folded, process, _AsCompiled(denoise))
+
+
+def _rounded_alone[ResultT](step: Callable[..., ResultT], *arguments) -> ResultT:
+    """`step` of `arguments`, each add and multiply it traces rounded alone where the trace marks so (a
+    CPU's, `rounding_alone`): as the sources' eager steps round them, not as XLA's fusion grouping happens
+    to contract them, which another op's lowering anywhere in the program moves (train 1492:
+    kdpm2_ancestral's gradient 1.65x the reference's error, a native pipeline's images 1 ulp apart on 83% of
+    them). The model the step calls is no step arithmetic (`_AsCompiled`)."""
+    with rounding_alone():
+        return step(*arguments)
+
+
+class _AsCompiled:
+    """A denoiser a solver's step calls, traced unmarked inside the step's marks (`rounding_as_compiled`),
+    as the walk's own call of it traces: a step calling the model (KDPM2's midpoint, Heun's corrector)
+    rounds it as its first call does (review of train 1492's fold). It is the denoiser to every reader:
+    each attribute its own, a call of it or of a method of it made unmarked (a discrete solver's
+    `masked`)."""
+
+    __slots__ = ("wrapped",)
+
+    def __init__(self, denoise):
+        self.wrapped = denoise
+
+    def __call__(self, *arguments, **named):
+        with rounding_as_compiled():
+            return self.wrapped(*arguments, **named)
+
+    def __getattr__(self, name: str):
+        found = getattr(self.wrapped, name)
+        if not callable(found):
+            return found
+
+        def called(*arguments, **named):
+            with rounding_as_compiled():
+                return found(*arguments, **named)
+
+        return called
 
 
 def sampling_modules(model: nn.Module, guidance: Guidance | None,

@@ -30,8 +30,6 @@ from dew.nn.kernels import generation
 from dew.nn.kernels.options import program
 from dew.objectives.base import Step
 from dew.objectives.diffusion import DiffusionObjective
-from dew.sampling.guidance import CFG
-from dew.sampling.walks import sample
 
 
 def bundle(directory, streamed: bool = False):
@@ -145,21 +143,6 @@ def walked(prepared, given, null):
     spatial = {name: prepared.conditions[name][:prepared.rows] for name in ("mask", "masked_image")
                if name in prepared.conditions}
     return {**given, **spatial}, {**null, **spatial}
-
-
-def trajectory(source, prepared, given, null, process, times, key):
-    """The single solver walk from the public `prepare`'s start, the one
-    path every caller starts from: its images, its images before any safety
-    checker, its last latents, and the conditions it walks under (`walked`)."""
-    given, null = walked(prepared, given, null)
-    denoise = process.denoiser(source.model, source.variables, given, null)
-    latents = sample(denoise, prepared.noise[:prepared.rows], solver=source.solver, guidance=CFG(3.0),
-                     key=key, times=times, final_denoise=False)
-    decoded = source.autoencoder.decode(source.variables["autoencoder"], latents)
-    images = unchecked = jnp.clip(decoded, -1, 1)
-    if source.finish is not None:
-        images = source.finish(source.variables, images)
-    return images, unchecked, latents, given
 
 
 def public_start(task, source, start, meta, key, given, null, process, times, bypassed=False):
@@ -337,9 +320,9 @@ def check_pipeline(directory, parts: tuple[str, ...] = PARTS, streamed: bool = F
 def walk_leaves(name, source, meta, key, start, wanted=None, bypassed=False):
     """Dew's leaves `wanted` (all of the task's `leaves`, by default) from `start`'s prompts, noise and
     pixels: the prompt's states, the autoencoder's encode of the pixels and decode of the noise, the walk's
-    start, last latents and images before any safety checker (`public_start`, `trajectory`), and the
-    checker's transform and tower on the draw's own inputs, each as the recording keeps it. Only what the
-    wanted leaves read is computed: the walk where a walk leaf is wanted."""
+    start (`public_start`), last latents and images before any safety checker through the public task call,
+    its finish aside, and the checker's transform and tower on the draw's own inputs, each as the recording
+    keeps it. Only what the wanted leaves read is computed: the walk where a walk leaf is wanted."""
     wanted = leaves(name) if wanted is None else wanted
     autoencoder = source.variables["autoencoder"]
     computed = {}
@@ -354,11 +337,11 @@ def walk_leaves(name, source, meta, key, start, wanted=None, bypassed=False):
         computed["decoded"] = source.autoencoder.decode(autoencoder, jnp.asarray(start["noise"]))
     if set(GROUPS["walk"]) & set(wanted):
         given, null, process, times = selection(source, meta, prompts(start))
-        prepared = public_start(source.text_to_image(), source, start, meta, key, given, null, process, times,
-                                bypassed)
-        _, unchecked, latents, _ = trajectory(source, prepared, given, null, process, times, key)
-        computed.update(start=prepared.noise[:prepared.rows], final_latents=latents,
-                        images=(np.asarray(unchecked, np.float64) + 1) / 2)
+        task = source.text_to_image()
+        prepared = public_start(task, source, start, meta, key, given, null, process, times, bypassed)
+        walk = replace(task, finish=None)(prepared, steps=meta.get("steps", 2), guidance=3.0, key=key).host()
+        computed.update(start=prepared.noise[:prepared.rows], final_latents=walk.latents,
+                        images=(np.asarray(walk.images, np.float64) + 1) / 2)
     if set(GROUPS["checker"]) & set(wanted):
         computed["checker_pixels"] = source.finish.transform(start["checker_raw"])
         computed["checker_embeddings"] = source.finish.model.apply(
@@ -368,11 +351,14 @@ def walk_leaves(name, source, meta, key, start, wanted=None, bypassed=False):
 
 
 def qualified(name, source, reference, meta, key, label=""):
-    """`source`'s walk on par with its saved pipeline's own Diffusers pipeline over drawn prompts, noise
-    and pixels (check 1, `walk_leaves` against the task's recording), each group of its leaves on its own
-    seeds (`groups`, WALK_SEEDS), SDXL's image call from Dew's own encoding as clean image latents on par at
-    its start too, and the public task call walking to the same images on the saved reference's inputs.
-    `label` prefixes each check's name, so two loads report apart."""
+    """`source`'s walk through its public task call on par with its saved pipeline's own Diffusers
+    pipeline over drawn prompts, noise and pixels (check 1, `walk_leaves` against the task's recording),
+    each group of its leaves on its own seeds (`groups`, WALK_SEEDS), SDXL's image call from Dew's own
+    encoding as clean image latents on par at its start too, and its finish's decision through the public
+    call (`finished`). `label` prefixes each check's name, so two loads report apart. The task call is held
+    to the source, not to the bits of another program walking the same steps, which XLA need not round
+    alike (docs/design/testing.md; train 1492: a lowering's change regrouped a walk's contractions, 1 ulp
+    apart on 83% of its images)."""
     from reference_error import as_given, assert_as_exact, indexed_recording, recording
 
     draw = draw_for(name)
@@ -397,13 +383,34 @@ def qualified(name, source, reference, meta, key, label=""):
         assert_as_exact(dew(("start",), bypassed=True), dew(("start",)), drawn,
                         f"{label}{name} bypassed start against the pixels' start", seeds=seeds,
                         truth_fn=truth)
-    # The same walk through the task facade: the same images.
+    if source.finish is not None:
+        finished(source, reference, meta, key)
+
+
+def finished(source, reference, meta, key):
+    """`source`'s public task call with its finish on, on the saved reference's inputs: each row blocked,
+    every pixel -1, as its safety checker decides on the call's images unchecked, and every row blocked
+    under a checker that flags every concept (the update's `blocking`). Its images unchecked are check 1's
+    (`walk_leaves`); this is the decision the finish adds to them."""
     given, null, process, times = selection(source, meta)
     task = source.text_to_image()
     prepared = public_start(task, source, reference, meta, key, given, null, process, times)
-    images, *_ = trajectory(source, prepared, given, null, process, times, key)
-    output = task(prepared, steps=meta.get("steps", 2), guidance=3.0, key=key)
-    np.testing.assert_array_equal(output.host().images, images)
+
+    def called(task) -> np.ndarray:
+        return np.asarray(task(prepared, steps=meta.get("steps", 2), guidance=3.0, key=key).host().images)
+
+    def blocked(images: np.ndarray) -> np.ndarray:
+        return np.all(images == -1, axis=tuple(range(1, images.ndim)))
+
+    unchecked = called(replace(task, finish=None))
+    decided = blocked(np.asarray(source.finish(task.variables, jnp.asarray(unchecked))))
+    np.testing.assert_array_equal(blocked(called(task)), decided)
+    safety = task.variables["encoders"]["safety"]
+    weights = safety["concept_embeds_weights"]
+    flagging = {**safety, "concept_embeds_weights": jax.device_put(jnp.full_like(weights, -2.0),
+                                                                   weights.sharding)}
+    variables = {**task.variables, "encoders": {**task.variables["encoders"], "safety": flagging}}
+    assert blocked(called(replace(task, variables=variables))).all()
 
 
 def streamed_parity(directory, whole, reference, meta, key):
