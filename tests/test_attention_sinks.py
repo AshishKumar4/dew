@@ -139,16 +139,19 @@ def test_a_querys_own_sinks_stream_where_the_kernels_taking_a_heads_alone_refuse
     def attend(sinks, **options):
         return lambda q, k, v: scaled_dot_product_attention(q, k, v, sinks=sinks, **options)
 
-    query = jnp.zeros((1, 2048, 4, 128), jnp.bfloat16)
-    sinks = jnp.zeros((1, 2048, 4), jnp.float32)
+    # A call long enough to take its kernels' tiles, short enough to trace in seconds: at 2048 queries the
+    # TPU template's trace took 87 s and the decode step's over 4096 keys 33 s, past the file's group target
+    # (row 14006).
+    query = jnp.zeros((1, 256, 4, 128), jnp.bfloat16)
+    sinks = jnp.zeros((1, 256, 4), jnp.float32)
     with generation.assumed("v5e"):
         with pytest.raises(KernelRefused) as refused:
             attend(sinks, causal=True, implementation="tpu")(query, query, query)
         assert "query_sinks" in {refusal.code for refusal in refused.value.refusals}
         assert not _scores_whole(attend(sinks, causal=True), query, query, query)
         assert _scores_whole(attend(sinks, causal=True, implementation="reference"), query, query, query)
-    step, cache = jnp.zeros((2, 1, 4, 128), jnp.bfloat16), jnp.zeros((2, 4096, 4, 128), jnp.bfloat16)
-    lengths, own = jnp.asarray([3000, 2000], jnp.int32), jnp.zeros((2, 1, 4), jnp.float32)
+    step, cache = jnp.zeros((2, 1, 4, 128), jnp.bfloat16), jnp.zeros((2, 512, 4, 128), jnp.bfloat16)
+    lengths, own = jnp.asarray([400, 300], jnp.int32), jnp.zeros((2, 1, 4), jnp.float32)
     with generation.assumed("sm90"):
         assert not _scores_whole(attend(own, key_value_seq_lengths=lengths), step, cache, cache)
         assert _scores_whole(attend(own, key_value_seq_lengths=lengths, implementation="reference"),
