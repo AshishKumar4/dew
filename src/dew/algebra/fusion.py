@@ -60,7 +60,7 @@ from dew.nn.nested import nested
 from dew.nn.programs import RaggedLayout, entrywise, ragged_layout, with_equations
 
 if TYPE_CHECKING:
-    from dew.nn.kernels import tuning
+    from dew.nn.kernels import fused_gemm, tuning
 
 CAPTURED = (jax.lax.broadcast_in_dim_p, jax.lax.reshape_p)
 """The layout equations a region takes of a captured operand only it reads (a bias broadcast over rows), so
@@ -100,12 +100,10 @@ def fused_program(jaxpr: jcore.Jaxpr, *, _base: tuple[Hashable, Hashable] | None
 
     index = Index(jaxpr)
     base = base_context() if _base is None else _base
-    front = recognize.recognized(jaxpr, index, (*recognize.ATTENTION, *recognize.RECURRENCES), _base=base)
+    front = _front(index, base)
     held = {place for region in front for place in region.places}
     identities = {}
-    for found in _regions(index):
-        if held & set(found.places):
-            continue
+    for found in _outside(index, held):
         selected = taken(index, found, _base=base)
         if selected is not None:
             identities[selected] = _identity(jaxpr, selected)
@@ -119,6 +117,29 @@ def fused_program(jaxpr: jcore.Jaxpr, *, _base: tuple[Hashable, Hashable] | None
                         _fusing(_replayed(jaxpr, region, fused_gemm), fused_gemm),
                         ("product", identities[region])) for region in products]
     return _spliced(jaxpr, written, _base=base)
+
+
+def eligible(index: Index, *, _base: tuple[Hashable, Hashable] | None = None) -> tuple[Region, ...]:
+    """Each product region `fused_program` weighs (`regions`): all but those an attention or recurrence
+    region `recognize` writes as Dew's call holds an equation of (`_front`). A search weighing the pass's
+    regions itself (row 9038's layer plan) reads them here, and each one's decisions (`decided`, whose
+    `RegionDecision.analysis` holds its prices and routes) and selection (`taken`) over them."""
+    front = _front(index, base_context() if _base is None else _base)
+    return tuple(_outside(index, {place for region in front for place in region.places}))
+
+
+def _front(index: Index, base: tuple[Hashable, Hashable]) -> list[Written]:
+    """The attention and recurrence regions `recognize` writes as Dew's calls in `index`'s body, weighed
+    before its product regions (`fused_program`)."""
+    from dew.algebra import recognize
+
+    families = (*recognize.ATTENTION, *recognize.RECURRENCES)
+    return recognize.recognized(index.jaxpr, index, families, _base=base)
+
+
+def _outside(index: Index, held: set[int]) -> Iterator[Region]:
+    """`index`'s product regions (`_regions`) holding none of `held`'s equations."""
+    return (found for found in _regions(index) if held.isdisjoint(found.places))
 
 
 def _taken(index: Index, found: Region, decided: Callable[[Region], RegionDecision]) -> Region | None:
@@ -643,6 +664,10 @@ class RegionDecision(NamedTuple):
     taken: bool
     launchable: bool
     launched: bool
+    analysis: fused_gemm.Analysis | None = None
+    """What the region was weighed by (`analyzed`: each stage's route, both prices, residency, a refusal),
+    held with the decision, so a search reading it prices no region again; None for no region's (`fewer`'s
+    walk of every variant)."""
 
 
 _held: collections.OrderedDict[Hashable, Held[RegionDecision]] = collections.OrderedDict()
@@ -719,7 +744,7 @@ def _takes(index: Index, region: Region) -> RegionDecision:
     routes = [found.launch, *([found.prologue] if region.prologue else [])]
     if found.epilogue is None and not region.prologue:
         # No stage to weigh (a bare product, a kernel gradient's): its launch's selector decides alone.
-        return RegionDecision(all(map(kernel, routes)), launchable, launched)
+        return RegionDecision(all(map(kernel, routes)), launchable, launched, found)
     # A prologue the template refuses (a row normalized from float32 to bfloat16, `dtype_changes`) is no
     # region's: the region without it is weighed instead (`fused_program`). Each stage it holds is weighed by
     # price, a prologue's as an epilogue's (`fused_gemm.priced`: the operand formed in the launch, not
@@ -728,7 +753,8 @@ def _takes(index: Index, region: Region) -> RegionDecision:
     # A neighbour joins the kernel only where the kernel with it keeps its residency (KERNEL-TEMPLATES-13, row
     # 9032: `fused_gemm.Analysis.resident`); refused for it, the region is still weighed without its stages.
     # Fused where it is the cheaper (`fused_gemm.Analysis.cheaper`: no more work no rule prices than XLA's).
-    return RegionDecision(all(map(kernel, stages)) and found.cheaper and found.resident, launchable, launched)
+    return RegionDecision(all(map(kernel, stages)) and found.cheaper and found.resident, launchable, launched,
+                          found)
 
 
 def _xla_whatever_its_prologue(launch) -> bool:

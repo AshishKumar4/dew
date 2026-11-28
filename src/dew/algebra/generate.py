@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import collections
+import contextlib
 import dataclasses
 import difflib
 import functools
@@ -24,7 +25,7 @@ import importlib.util
 import itertools
 import logging
 import sys
-from collections.abc import Callable, Collection, Hashable, Iterable, Mapping, Sequence
+from collections.abc import Callable, Collection, Hashable, Iterable, Iterator, Mapping, Sequence
 from pathlib import Path
 from types import ModuleType
 
@@ -393,12 +394,12 @@ def _chosen(qualified: str, form: StableForm | ComponentForm) -> list[_Chosen]:
                     single, text, written = _component(form, operands, policy, target, label)
                 else:
                     gate = admits(form.function, operands, form.cases, label)
-                    with algebra.passes(target=target):
+                    with _generating(policy, target):
                         choice = error.choose(form.function, operands, accurate=policy == "accurate",
                                               saturation=algebra.SATURATION, admits=gate)
-                    candidate = choice.chosen
-                    single = _single(form.function, operands)
-                    closed = jax.make_jaxpr(candidate.form or candidate.function)(*operands)
+                        candidate = choice.chosen
+                        single = _single(form.function, operands)
+                        closed = jax.make_jaxpr(candidate.form or candidate.function)(*operands)
                     text, _ = printed.source(closed, "form", compensated=candidate.compensated)
                 if found and found[0].single != single:
                     raise ValueError(f"{label}: a declaration must keep its array or tuple result convention")
@@ -414,12 +415,22 @@ def _check_cases(cases: Cases) -> None:
             raise ValueError("a component has duplicate dispatch keys")
 
 
-def _component(form: ComponentForm, operands, policy: str, target: str, label: str
-               ) -> tuple[bool, printed.Body, jcore.Jaxpr]:
+@contextlib.contextmanager
+def _generating(policy: str, target: str) -> Iterator[None]:
+    """The context a declaration's case is traced and chosen in (`_chosen`), a stable form's and a
+    component's alike: priced for `target` (`algebra.passes`), and the run's numerics `policy` names
+    (`generation.run_precision`: the accurate forms for "accurate", the fast ones for "default"), which a
+    declaration reading `generation.numerics()` traces by."""
     from dew import algebra
 
     with (algebra.passes(target=target),
           generation.run_precision(Numerics(forms="accurate" if policy == "accurate" else "fast"))):
+        yield
+
+
+def _component(form: ComponentForm, operands, policy: str, target: str, label: str
+               ) -> tuple[bool, printed.Body, jcore.Jaxpr]:
+    with _generating(policy, target):
         closed, shaped = jax.make_jaxpr(form.function, return_shape=True)(*operands)
     if closed.effects:
         raise printed.Unprintable(f"{label}: a component has effects")

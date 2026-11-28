@@ -20,6 +20,8 @@ one process (`gpu_flow`), each cell its own file's property:
   accumulator width and on a two-CTA pair, the pair also on extents no tile divides (test_gemm_tcgen05).
 - The NVFP4 product's packed kernel (its mainloop decoding each stage in place) holds every order on an
   H100 and an A100 (test_contracts_gemm).
+- The quantize epilogue's E4M3 and E5M2 encodes, `bits.encode_form`'s PTX inline in the compiled epilogue,
+  are `bits.encoded` bit for bit on an H100 and an A100 (test_gemm_nvfp4; row 14105).
 - A delayed NVFP4 MLP's chain on a Blackwell, its up projection's block-scaled epilogue storing the down
   projection's rows as codes two a byte and transposed block scales, is bitwise its projections apart,
   value and every gradient, gated and ungated (test_gemm_nvfp4_chain; rows 12721, 12743).
@@ -75,6 +77,7 @@ from jax.experimental.pallas import fuser
 from reference_error import ahead_arm, assert_as_exact
 from test_gemm_template import rms_norm as template_rms_norm
 
+from dew.algebra import bits
 from dew.nn.kernels import fused_gemm, generation
 from dew.nn.kernels.templates.gemm import tiling
 from dew.nn.norms import rms_normalized
@@ -269,6 +272,17 @@ def _scale_edge_cells() -> tuple[Cell, ...]:
     )
 
 
+def _encode_cells() -> tuple[Cell, ...]:
+    """The quantize epilogue's FP8 encodes compiled, each `bits.encode_form`'s PTX inline in the epilogue
+    (`inline_forms.registers`), which the interpreter runs as the form's evaluation instead (algebra.md §7.3,
+    row 14105): on an H100's warpgroup MMA and an A100's mma.sync, each `bits.encoded` bit for bit."""
+    return tuple(
+        Cell(f"the quantize epilogue's {name} encode is bits.encoded's on {gpu}",
+             functools.partial(gemm_nvfp4.the_quantize_epilogue_encodes_as_bits_encoded, minifloat), gpu,
+             mosaic=gpu == "sm80", fault=INLINE_ENCODE, at_run=EXACT_CODES)
+        for gpu in ("sm90", "sm80") for name, minifloat in (("E4M3", bits.E4M3), ("E5M2", bits.E5M2)))
+
+
 def _syrk_and_tail_cells():
     return [
         # The family's cells as its own grid states them, each pinned to its GPU (`gpu_flow.cells_of`).
@@ -316,6 +330,13 @@ prepare: 'Executable' object has no attribute 'local_devices')."""
 EXACT_OVERFLOW = "an exact finite value its run compiles and reads, no check-1 site for a prepare to compile"
 """Why the blockwise FP8 overflow witness runs at its run (`Cell.at_run`): it asserts one exact value of a
 native launch, which a compile-only prepare's device cannot run (row 13257)."""
+
+INLINE_ENCODE = "an encode's PTX inline in a compiled epilogue, which the interpreter runs as its evaluation"
+"""Why the quantize epilogue's encode cells stay on the GPU (`_encode_cells`, row 14105)."""
+
+EXACT_CODES = "exact codes its run compiles and reads, no check-1 site for a prepare to compile ahead"
+"""Why the encode cells run their programs at run (`Cell.at_run`): each asserts every code bit for bit, a
+native launch's, which a compile-only prepare's device cannot run."""
 
 CUBLAS_BF16 = "cuBLASLt's dense bf16 product stored in bf16, which no CPU dot computes"
 """Why the XLA fallback's direct bf16 product stays on the GPU (the GEMM lane, 11-25)."""
@@ -415,7 +436,7 @@ def test_the_gemm_kernels_run_on_this_gpu(part):
                gemm_paired.a_chained_input_gradient_is_as_finite_as_its_products_sum, name,
                native={"launch": "chained", "generation": name, "case": "overflow"})
           for name in ("sm90", "sm100")),
-        *_scale_edge_cells(),
+        *_scale_edge_cells(), *_encode_cells(),
         *_converted_cells(),
         Cell("the blockwise FP8 kernel gradient is on par",
              gemm_blockwise.a_blockwise_kernel_gradient_is_on_par, "sm90", fault="red at 475913063"),

@@ -137,14 +137,17 @@ def _converted(block_k: int, *widths: int) -> list[list[tuple]]:
 
 def _epilogue_registers(family: mosaic.Family, carried: list, block_q: int, value_width: int, dtype, *,
                         residuals: bool, plan: BlockPlan | None = None, masked: bool = False) -> int:
-    """Wide (>128) inference epilogue's live registers (chunked, or whole-width finish + masked preserve)."""
+    """Wide (>128) inference epilogue's live registers (chunked, or whole-width finish + masked preserve),
+    a pointwise output hook's tiles past its input at its chunk (the plan's `tile_dtypes`) beside the
+    chunk's finish."""
     if residuals or not family.budgets_registers or family.places_on_role or value_width <= 128:
         return 0
     block = plan or BlockPlan(split=False, out_dtype=None, output_hook=False)
     ed = dtype if block.out_dtype is None else block.out_dtype
     w = block.epilogue_chunk(family, value_width, dtype, training=residuals, masked=masked) or value_width
     r, live = family.row_registers(block_q, jnp.float32), resources.live_registers
-    fin = live(family, carried, [(block_q, w, jnp.float32)] * 3 + [(block_q, w, ed)]) + 2 * r
+    hooked = [(block_q, w, jnp.dtype(kept)) for kept in block.tile_dtypes] if block.pointwise else []
+    fin = live(family, carried, [(block_q, w, jnp.float32)] * 3 + [(block_q, w, ed)] + hooked) + 2 * r
     return max(fin, live(family, [], [(block_q, value_width, ed)] * 2) + r) if masked else fin
 
 
@@ -395,7 +398,8 @@ class ForwardRegisters:
     """A forward call's facts its launches' consumer registers read (`forward_registers`, `peaks_registers`):
     operand dtype, query/value widths, training split sums (`residuals`), natural logits, score hook
     parameters, fp32 parts, in-kernel scaling, quantized codes, packed positions, initial-state merge/start,
-    dropout/weight parts, query prologue, prescale flags, output dtype, and output-hook presence."""
+    dropout/weight parts, query prologue, prescale flags, output dtype, output-hook presence and its pointwise
+    tiles."""
     dtype: Any
     width: int
     value_width: int
@@ -422,6 +426,11 @@ class ForwardRegisters:
     rewalk_prescaled: bool = False
     out_dtype: Any = None
     has_output_mod: bool = False
+    output: tuple | None = None
+    """The output hook its consumers apply as they finish, `(hook, kinds, dtypes)` (`MosaicForward`'s), whose
+    program at each candidate's own output tile decides and prices its epilogue
+    (`forward_block_plan`'s `tile_dtypes`, as the walk replays it there, `BlockPlan.sliced`); None where it
+    has none."""
 
     def at(self, family: mosaic.Family, tiles: Tiles, *, peaks: bool = False,
            columns: int | None = None, masked: bool = False) -> int | None:
@@ -444,8 +453,11 @@ class ForwardRegisters:
             return max(before, peaks_registers(family, tiles, self.dtype, params=self.params, width=width))
         padded_v = _width(self.value_width, family, self.dtype)
         value_width = value_columns(padded_v, columns or tiles.columns)
+        # The forward's one plan (`forward_block_plan`): a hook its launch keeps traced at this candidate's
+        # own output tile alone, as its walk takes it (`BlockPlan.sliced`).
         plan = forward_block_plan(padded_v, columns or tiles.columns, self.out_dtype,
-                                  has_output_mod=self.has_output_mod, training=self.residuals)
+                                  has_output_mod=self.has_output_mod, training=self.residuals,
+                                  output=self.output, rows=tiles.block_q)
         return max(before, forward_registers(
             family, tiles, value_width, self.dtype, self.residuals,
             natural=tiles.natural_form or self.natural, params=self.params, width=width, parts=self.parts,

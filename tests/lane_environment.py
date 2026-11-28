@@ -111,7 +111,7 @@ def configure_lane(environ: MutableMapping[str, str]) -> None:
             environ["JAX_PLATFORMS"] = ",".join([*platforms, "cpu"])
         cpu_devices = max(1, local[flagged](environ))
     flags.append(f"--xla_force_host_platform_device_count={cpu_devices}")
-    environ["XLA_FLAGS"] = " ".join(flags).strip()
+    environ["XLA_FLAGS"] = _each_once(" ".join(flags))
     # XLA:CPU runs every device of a launch on one pool of max(cores,
     # devices) threads (PJRT_NPROC overrides the cores), each held until the
     # launch's collectives meet, and dispatches the next launch on the same
@@ -165,6 +165,17 @@ def outside_suite(environ: Mapping[str, str]) -> dict[str, str]:
     2510, 2736)."""
     suite = configured({})
     return {**{name: value for name, value in environ.items() if name not in suite}, "JAX_PLATFORMS": "cpu"}
+
+
+def _each_once(flags: str) -> str:
+    """XLA's flags `flags` with each flag named once, its last value: a process configured again (a second
+    `configured`, or a child of a process that was) states each flag it sets once, not again beside the
+    inherited one."""
+    named: dict[str, str] = {}
+    for flag in flags.split():
+        named.pop(flag.partition("=")[0], None)
+        named[flag.partition("=")[0]] = flag
+    return " ".join(named.values())
 
 
 def _local_gpus(environ: MutableMapping[str, str]) -> int:

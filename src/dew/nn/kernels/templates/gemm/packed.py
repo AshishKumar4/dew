@@ -23,9 +23,9 @@ from dew.nn.kernels.templates import product as product_formats, resources
 if TYPE_CHECKING:
     from dew.nn.kernels.templates.cost import Work
 
-NVFP4_GROUP = 128
-"""Dew: the depths an NVFP4 matrix's staged order groups (`nvfp4_staged_depth`): a group's sixteen word rows
-decode, code by code, into its eight sixteen-depth slices."""
+NVFP4_GROUP = product_formats.NVFP4.depth * 32 // bits.E2M1.width
+"""Dew: the depths an NVFP4 matrix's staged order groups (`nvfp4_staged_depth`): a block's depth of word rows
+(sixteen), decoding code by code (eight a word) into as many block-deep slices, 128."""
 
 
 def nvfp4_staged_depth(group, word, code):

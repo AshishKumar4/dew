@@ -396,6 +396,126 @@ def test_a_decayed_value_times_factors_holds_every_order(edge):
                     plain_fn=lambda exponent, value, a, b: value * jnp.exp(exponent) * a * b)
 
 
+def test_scaled_exps_tangent_of_a_complex_value_is_its_decayed_value():
+    """The tangent of `scan.scaled_exp` of a complex64 `1 + 2j` along a unit float32 exponent at 0: `1 + 2j`,
+    the stored zero of a complex direction read from its parts, where its words were bitcast whole and JAX
+    refused the complex bitcast (train 1466's review)."""
+    _, found = jax.jvp(lambda exponent: scan.scaled_exp(jnp.complex64(1 + 2j), exponent), (jnp.float32(0.0),),
+                       (jnp.float32(1.0),))
+    assert found == jnp.complex64(1 + 2j), found
+
+
+@pytest.mark.parametrize("edge", sorted(EDGES))
+def test_a_guarded_product_holds_every_order(edge):
+    """`log_linear._product`, a product of two operands summed in fp32, its derivatives' terms each a zero
+    factor annihilates (`_product_value`'s guarded form), declared (each order a product again): every order
+    finite wherever float64 is a normal float32 and the plain product's is, at operands scaled to the edge,
+    the truth an unrestricted einsum's in float64."""
+    from dew.nn.kernels import log_linear
+
+    a, b, seeded, along_a, along_b = normal_draw(1466, (2, 3, 4), (2, 5, 4), (2, 3, 5), (2, 3, 4), (2, 5, 4),
+                                                 scale=EDGES[edge])
+
+    def product(a, b):
+        return log_linear._product('btk,bpk->btp', log_linear.PLAIN, None, a, b)
+
+    def einsum(a, b):
+        return jnp.einsum('btk,bpk->btp', a, b)
+
+    assert_contract(product, (a, b), (along_a, along_b), seeded, f"a guarded product {edge}", plain_fn=einsum,
+                    truth_fn=einsum)
+
+
+@pytest.mark.parametrize(("a", "b", "expected"), [
+    ([np.nan, 1.0], [0.0, 1.0], 1.0), ([np.inf, 0.0], [2.0 ** -127, 0.0], np.inf),
+    ([np.inf, 1.0], [-1.0, 0.0], -np.inf), ([np.inf, -np.inf], [1.0, 1.0], np.nan),
+    ([np.inf, 1.0], [0.0, 3.0], 3.0)],
+    ids=["a NaN beside a zero", "an infinity beside a subnormal", "an infinity beside a negative one",
+         "infinities of both signs", "an infinity beside a zero"])
+def test_a_guarded_products_terms_survive_as_their_stored_factors_say(a, b, expected):
+    """`log_linear._product`'s guarded form of one row's two terms: a term a stored zero factor annihilates
+    none (a NaN's or an infinity's beside a zero), one beside a stored nonzero factor survives with its sign
+    (a subnormal a flushing comparison reads as zero among them), infinities of both signs NaN (train 1466's
+    head review)."""
+    from dew.nn.kernels import log_linear
+
+    def product(a, b):
+        return log_linear._product('tk,pk->tp', log_linear.GUARDED, None, a, b)
+
+    # Each one computation, as XLA compiles and fuses it, under jit and op by op.
+    for run in (product, jax.jit(product)):
+        found = run(jnp.asarray([a], jnp.float32), jnp.asarray([b], jnp.float32))
+        np.testing.assert_array_equal(np.asarray(found), np.asarray([[expected]], np.float32))
+
+
+def test_a_plain_products_tangent_along_a_zero_direction_keeps_its_finite_channel():
+    """The tangent of `log_linear._product`'s plain form at `(inf, 2) . (1, 1)` along `(0, 1)` in its second
+    operand: 2, the direction's zero annihilating the infinite channel, where the plain tangent's `inf * 0`
+    was NaN (train 1466's head review)."""
+    from dew.nn.kernels import log_linear
+
+    a = jnp.asarray([[np.inf, 2.0]], jnp.float32)
+    _, found = jax.jvp(lambda b: log_linear._product('tk,pk->tp', log_linear.PLAIN, None, a, b),
+                       (jnp.ones((1, 2), jnp.float32),), (jnp.asarray([[0.0, 1.0]], jnp.float32),))
+    assert found[0, 0] == 2, found
+
+
+@pytest.mark.mesh(devices=2)
+def test_a_guarded_products_transpose_contracts_an_explicitly_split_axis():
+    """The gradient by a replicated unit `a` `[1, 1, 1]` of `log_linear._product`'s `btk,bpk->btp` with a unit
+    `b` `[1, 2, 1]` its `p` split over two Explicit devices, summed: `[[[2]]]`, replicated, the transpose's
+    contraction over the split axis placed as `a` is (`out_sharding`, as JAX's own dot transposes it), where
+    the contraction was refused (train 1466's head review)."""
+    from jax.sharding import AxisType, NamedSharding, PartitionSpec as P
+
+    from dew.nn.kernels import log_linear
+
+    mesh = jax.make_mesh((2,), ("value",), axis_types=(AxisType.Explicit,), devices=jax.devices()[:2])
+    with jax.set_mesh(mesh):
+        a = jax.device_put(np.ones((1, 1, 1), np.float32), NamedSharding(mesh, P()))
+        b = jax.device_put(np.ones((1, 2, 1), np.float32), NamedSharding(mesh, P(None, "value", None)))
+        def total(a):
+            return jnp.sum(log_linear._product('btk,bpk->btp', log_linear.PLAIN, None, a, b))
+
+        found = jax.jit(jax.grad(total))(a)
+    assert found.sharding.is_fully_replicated, found.sharding
+    np.testing.assert_array_equal(np.asarray(found), np.full((1, 1, 1), 2.0, np.float32))
+
+
+def test_a_decayed_value_times_a_zero_factor_is_zero_and_its_derivative_by_it_finite():
+    """`scan._times_decayed` of an overflowed value (`inf`) under `exp(-1)` times a zero factor and a unit
+    one: zero, its derivative by the exponent zero (the zero factor annihilating the value at every order),
+    and, of a finite value of 3, its derivative by the zero factor the decayed value's, as at a factor of
+    one: the term that differentiates the zero away kept (a head review)."""
+    exponent = jnp.float32(-1.0)
+    assert scan._times_decayed(exponent, jnp.float32(jnp.inf), jnp.float32(0.0), jnp.float32(1.0)) == 0
+    by_exponent = jax.grad(lambda e: scan._times_decayed(e, jnp.float32(jnp.inf), jnp.float32(0.0),
+                                                         jnp.float32(1.0)))(exponent)
+    assert by_exponent == 0, by_exponent
+    by_factor = jax.grad(lambda a: scan._times_decayed(exponent, jnp.float32(3.0), a, jnp.float32(1.0)))
+    # Linear in the factor: its derivative at zero its derivative anywhere, the decayed value.
+    assert by_factor(jnp.float32(0.0)) == by_factor(jnp.float32(1.0)) != 0, by_factor(jnp.float32(0.0))
+
+
+@pytest.mark.parametrize(("factor", "zero"), [(0.0, True), (1.0, False)], ids=["a zero factor", "a unit one"])
+def test_a_spent_decays_derivative_of_an_overflowed_value_is_zero_beside_a_zero_factor_alone(factor, zero):
+    """The derivative by the exponent of `scan._times_decayed` of an overflowed value (`inf`) under a spent
+    decay (`exp(-1000)`) times a factor and one: zero beside a zero factor, the term annihilated before its
+    decay is classified, and NaN beside a unit one, its infinity unmasked (a head review)."""
+    found = jax.grad(lambda e: scan._times_decayed(e, jnp.float32(jnp.inf), jnp.float32(factor),
+                                                   jnp.float32(1.0)))(jnp.float32(-1000.0))
+    assert (found == 0) if zero else np.isnan(found), found
+
+
+def test_a_decayed_products_subnormal_factor_is_no_zero_on_a_flushing_lane():
+    """`scan._decayed_terms` of the product of `2^-127` and `2^127` undecayed: exactly one, the subnormal read
+    from its bits as its scaled significand, no zero, where a flushing lane's comparison read it as zero and
+    annihilated the term (a head review)."""
+    tiny, large = jnp.float32(2.0 ** -127), jnp.float32(2.0 ** 127)
+    found = scan._decayed_terms(((0, 1),), jnp.float32(0.0), tiny, large)
+    assert found == 1, found
+
+
 def test_scaled_exps_mixed_second_derivative_decays_before_its_directions_meet():
     """The derivative by `scan.scaled_exp`'s value of a direction of 2^100 times its exponent's pullback of
     a cotangent of 2^100, at a value of 1 under `e^-60`: `2^200 e^-60` (2^113.4) in float64's binade, the

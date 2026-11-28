@@ -81,6 +81,34 @@ def test_a_bodys_recognition_is_its_families_own():
         assert recognize.recognized(closed, index, (recognize.Family(norms.anchor, untaken), *others)) == []
 
 
+def test_a_candidate_its_training_probe_refuses_hides_no_later_equal_one():
+    """A region's candidates are each weighed (`recognize.recognized`): the first, equal to a norm's region as
+    written but refused by its training probe, leaves the region to a later one equal to it only after
+    saturation (its row negated twice), which is written, where the joint check took the first equal one
+    alone and wrote none (row 14103)."""
+    from dew.algebra import fusion, recognize
+
+    closed = jax.make_jaxpr(_norm_of)(jax.ShapeDtypeStruct((256, 256), jnp.bfloat16),
+                                      jax.ShapeDtypeStruct((256,), jnp.bfloat16))
+    index = fusion.Index(closed)
+    (norms, *_) = recognize.NORMS
+
+    def negated_twice(rows, weight, implementation="xla"):
+        del implementation
+        widened = jnp.negative(jnp.negative(rows.astype(jnp.float32)))
+        return (widened * jax.lax.rsqrt(jnp.mean(widened * widened, axis=-1, keepdims=True) + 1e-6)
+                * weight).astype(rows.dtype)
+
+    def refused_then_equal(index, place):
+        first = next(iter(norms.candidates(index, place)))
+        yield first._replace(training_ok=lambda: False)
+        yield first._replace(declared=functools.partial(negated_twice, implementation="xla"))
+
+    family = recognize.Family(norms.anchor, refused_then_equal)
+    with generation.assumed("sm90"):
+        assert len(recognize.recognized(closed, index, (family,))) == 1
+
+
 def test_an_unwritten_regions_route_to_xla_is_reported_as_it_ran():
     """A region its compile point does not write (its call making other types than its own) reports every
     route its call took: one to a kernel of Dew's as refused (`fusion.UNWRITTEN`), and one its call took to

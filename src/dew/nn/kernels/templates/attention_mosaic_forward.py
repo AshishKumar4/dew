@@ -58,6 +58,8 @@ from dew.nn.kernels.templates.attention import (
     by_power,
     head_width,
     kept,
+    kept_dtype,
+    kept_value,
     kind_of,
     kinds_of,
     output_hooked,
@@ -101,6 +103,7 @@ from dew.nn.kernels.templates.attention_mosaic_program import (
     issued_pairs,
     launch_scope,
     modelled,
+    output_program,
     output_stage_swizzle,
     param_types,
     params_read,
@@ -318,10 +321,12 @@ def _forward_allocations(family: mosaic.Family, tiles: Tiles, width: int, value_
     elif not interpret or family.gathers_interpreted:
         streams = family.streams(blocks, stages, consumers, swizzles=swizzles, gathered=keyed)
     else:
-        # A copy a row of each swizzled tile's columns (`rings.Ring.parts`), where no lane-level copy runs.
-        unit = {name: swizzling.swizzle_columns(stored, swizzles.get(name, swizzling.SWIZZLE_BYTES))
-                for name in keyed}
-        copies = {name: blocks[name][0][0] * max(1, blocks[name][0][1] // unit[name]) for name in keyed}
+        # Each row's copies as `rings.Ring.parts` makes them where no lane-level copy runs, at the swizzle the
+        # slot is staged at (`rings.piece_copies`: none stated, layout inference's, one copy a row), so its
+        # load barrier takes the arrivals they make: counted at a 128-byte swizzle the slot was not staged
+        # at, a 128-wide step's barrier awaited 128 arrivals of its 64 rows' 64 copies forever (row 13656).
+        copies = {name: blocks[name][0][0] * rings.piece_copies(*blocks[name], swizzles.get(name), 1)
+                  for name in keyed}
         streams = family.streams(blocks, stages, consumers, swizzles=swizzles, copies=copies)
     return scoped, streams, after
 
@@ -647,9 +652,10 @@ def _form_tiles(spec: algebra.Forward, call, form: algebra.Forward, tiles: Tiles
 
 def _output_hooked(out: jax.Array, hooks: Hooks, hooked: _Hooked) -> jax.Array:
     """The normalized output `out` `[B, H, Qp, Dv]` fp32 under the output hook in XLA, its parameters as the
-    launches read them (`hooked`, padded to the call's blocks; `template.output_hooked`)."""
-    params = tuple(Side(array, param.axes) for array, param in zip(hooked.output, hooks.output.sides,
-                                                                     strict=True))
+    launches compute it on them (`hooked`, padded to the call's blocks, `kept_value`;
+    `template.output_hooked`)."""
+    params = tuple(Side(kept_value(array), param.axes)
+                   for array, param in zip(hooked.output, hooks.output.sides, strict=True))
     return output_hooked(out, hooks.output.fn, params)
 
 
@@ -1576,8 +1582,12 @@ def _stored_walk(program: _Program, spec: algebra.Forward, state: algebra.Partia
         # its rows' are: formed before the walk, its query block's base was held across it (a B200's scaled
         # fp32 walk at 64 x 64, two consumers, spilled 12 bytes).
         out_view = stored().out
-        out_params = tuple(_param(family, ref, kind_of(param), row, head, first, state.acc)
-                           for ref, param in zip(hooked.output, hooks.output.sides, strict=True))
+
+        def out_params(like, column=None):
+            # The output hook's parameters at the output tile `like`, its block of columns from `column`.
+            return tuple(_param(family, ref, kind_of(param), row, head, first, like, column=column)
+                         for ref, param in zip(hooked.output, hooks.output.sides, strict=True))
+
         if isinstance(state.acc, mosaic.Kept):
             # Sums its issuer keeps past the walk (`Issuer.accumulated`'s `mosaic.Kept`: a plain walk's, its
             # hooks refused and its rows all its own, `MosaicForward._placed_refusal`): the walk's ratio, as
@@ -1595,10 +1605,15 @@ def _stored_walk(program: _Program, spec: algebra.Forward, state: algebra.Partia
 
             kept = state.acc.scaled(ratio)
             out_stage(lambda stage: family.stored((kept,), (out_view,), smem=stage))
-        elif (chunk := BlockPlan(split=False, out_dtype=out_view.dtype,
-                                 output_hook=hooks.output.fn is not None).epilogue_chunk(
+        elif program.block_plan is not None and (chunk := program.block_plan.epilogue_chunk(
                 family, state.acc.shape[-1], out_view.dtype, masked=keep is not None, kept=False)):
-            # so `state.acc` and `output` fit without spilling (rows 5272, 10864).
+            # The launch's one plan (`_launched`), its hook's program traced there alone.
+            sliced = program.block_plan.sliced()
+            # so `state.acc` and `output` fit without spilling (rows 5272, 10864); the output hook, its
+            # program at the whole tile replayed on each chunk with its parameters' block of the chunk's
+            # columns (`BlockPlan.sliced`: a d256 gated forward held whole in one launch, where its
+            # whole-width finish split it into two launches of 128 columns, each walking every key: 1.51x
+            # unhooked and XLA's gate, M-NA-47).
             width = state.acc.shape[-1]
             maximum, denominator = algebra.finished_rows(spec, state, initial=hooked.initial is not None)
             def write_chunks(smem):
@@ -1606,6 +1621,8 @@ def _stored_walk(program: _Program, spec: algebra.Forward, state: algebra.Partia
                     sl = pl.ds(col, chunk)
                     piece = state._replace(acc=state.acc[:, col:col + chunk])
                     out_chunk = algebra.finish(spec, piece, initial=hooked.initial is not None,
+                                               output_mod=None if hooks.output.fn is None else sliced,
+                                               output_params=out_params(piece.acc, col),
                                                held=program.parts > 1)[0]
                     if smem is None:
                         out_view[:, sl] = out_chunk.astype(out_view.dtype)
@@ -1618,9 +1635,13 @@ def _stored_walk(program: _Program, spec: algebra.Forward, state: algebra.Partia
                       else write_chunks(stage) if stage.shape[-1] == chunk
                       else family.stored((mosaic.StagedWriter(write_chunks),), (out_view,), smem=stage))
         else:
+            # The hook as the launch traced it once (`BlockPlan.whole`), not traced a second time here.
+            hook = hooks.output.fn
+            if hook is not None and program.block_plan is not None:
+                hook = program.block_plan.whole(hook)
             output, maximum, denominator = algebra.finish(spec, state, initial=hooked.initial is not None,
-                                                          output_mod=hooks.output.fn,
-                                                          output_params=out_params,
+                                                          output_mod=hook,
+                                                          output_params=out_params(state.acc),
                                                           held=program.parts > 1)
             out_stage(lambda stage: family.stored((_kept_rows(family, keep, output, out_view),), (out_view,),
                                                   smem=stage))
@@ -1903,6 +1924,7 @@ def _paged_views(refs: dict, table, row, head, page: int, block_k: int) -> dict:
     return {name: (ref.at[head], tile) for name, ref in refs.items()}
 
 
+@tuning.one_call
 def _launch(query, key, value, spans: _Spans | None, hooked: _Hooked, *,
             spec: algebra.Forward, hooks: Hooks, tiles: Tiles, family: mosaic.Family, training: bool,
             interpret: bool, columns: int | None = None, peaks: bool = False,
@@ -2053,7 +2075,8 @@ def _entry(program: _Program, layout: "_Layout", body: Callable, allocations: tu
 
 def _program_of(family: mosaic.Family, tiles: Tiles, spec: algebra.Forward, read: _Read, key, steps: int,
                 value_width: int, dtype, *, splits: int, peaks: bool, parts: int, training: bool,
-                value_columns: int | None = None, tmem_columns: int | None = None) -> _Program:
+                value_columns: int | None = None, tmem_columns: int | None = None,
+                block_plan: BlockPlan | None = None) -> _Program:
     """A launch's program (`_Program`) of `steps` key tiles: no more ring stages than them (a slot past them
     would load past the keys), and its keys read a step ahead where it issues its logits so
     (`logits_ahead`). Such a program's consumers take no turns on the tensor cores (FlashAttention 3's
@@ -2066,7 +2089,7 @@ def _program_of(family: mosaic.Family, tiles: Tiles, spec: algebra.Forward, read
                          training=training, tmem_columns=tmem_columns)
     return _Program(family, tiles, steps, stages, spec.keys, spec.form == "causal", spec.queries, splits,
                     _per_span(spec, read.spans), parts=parts, products=declared(ahead, peaks=peaks),
-                    value_columns=value_columns, training=training)
+                    value_columns=value_columns, training=training, block_plan=block_plan)
 
 
 NATURAL_NAME = "_natural"
@@ -2189,13 +2212,22 @@ def _launched(query, key, value, read: _Read, *, hooks: Hooks, spec: algebra.For
         query, key, value, read, page=page, column_width=column_width, parts=parts)
     group, consumers = heads // kv_heads, tiles.consumers
     block_q, block_k = tiles.block_q, tiles.block_k
+    # The launch's output hook traced once at its walk's tile (`output_program`), which its approximate math
+    # and its one plan (`forward_block_plan`, read by its epilogue, `_Program.block_plan`) both read.
+    output = (hooks.output.fn, kinds_of(hooks.output.sides),
+              tuple(kept_dtype(side.value.dtype) for side in hooks.output.sides))
+    traced = output_program(*output, (block_q, value_width))
     spec = dataclasses.replace(spec, approximate=approximate(
-        hooks, (block_q, block_k), value_width, differentiated=False, query=(block_q, width, query.dtype)))
+        hooks, (block_q, block_k), value_width, differentiated=False, query=(block_q, width, query.dtype),
+        output=traced))
     pair = consumers * block_q
     steps = keys_count // block_k
+    plan = forward_block_plan(value_width, None, query.dtype if out_dtype is None else jnp.dtype(out_dtype),
+                              has_output_mod=hooks.output.fn is not None, training=training, output=output,
+                              rows=block_q, program=traced)
     program = _program_of(family, tiles, spec, read, key, steps, value_width, query.dtype, splits=splits,
                           peaks=peaks, parts=parts, training=training, value_columns=value_columns,
-                          tmem_columns=tmem_columns)
+                          tmem_columns=tmem_columns, block_plan=plan)
     # The output stores through the query's stage where the two are as wide (its rows are read before the
     # store); else it takes a stage of its own beside the query's and the rings (`_forward_allocations`).
     out_dtype = query.dtype if out_dtype is None else jnp.dtype(out_dtype)
