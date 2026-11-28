@@ -29,8 +29,8 @@
 "tests/test_algebra_derive.py::test_chunked_moments_balances_unequal_scales_value_gradients_and_explicit_sharding",
 "tests/test_algebra_derive.py::test_chunked_moments_contract_broadcasts_promotes_scans_and_rejects_empty",
 "tests/test_algebra_derive.py::test_chunked_moments_handles_narrow_float16_and_bfloat16_inputs[merge-float16]",
-"tests/test_algebra_derive.py::test_chunked_moments_move_value_cotangents_along_weights[1-merge]",
-"tests/test_algebra_derive.py::test_chunked_moments_move_weight_cotangents_along_values[2-walk]",
+"tests/test_algebra_derive.py::test_chunked_moments_move_value_cotangents_along_weights[2-walk]",
+"tests/test_algebra_derive.py::test_chunked_moments_preserve_the_large_mean_cotangent[1-walk]",
 "tests/test_algebra_derive.py::test_chunked_moments_preserves_extreme_anchors[zero-prefix-walk]",
 "tests/test_algebra_derive.py::test_chunked_moments_preserves_zero_weight_derivatives[mean-vjp-2-walk]",
 "tests/test_algebra_derive.py::test_chunked_moments_preserves_zero_weight_derivatives[weight-jvp-2-walk]",
@@ -165,7 +165,7 @@
 "tests/test_attention_algebra.py::test_the_plain_jax_backward_is_on_par_under_every_score_hook[alibi-bfloat16-default]",
 "tests/test_attention_algebra.py::test_the_plain_jax_backward_is_on_par_under_every_score_hook[alibi-float32-default]",
 "tests/test_attention_algebra.py::test_the_plain_jax_backward_is_on_par_under_every_score_hook[band-bias-float32-accurate]",
-"tests/test_attention_algebra.py::test_the_plain_jax_backward_is_on_par_under_every_score_hook[custom-vjp-float32-accurate]",
+"tests/test_attention_algebra.py::test_the_plain_jax_backward_is_on_par_under_every_score_hook[custom-vjp-float32-default]",
 "tests/test_attention_algebra.py::test_the_plain_jax_backward_is_on_par_under_every_score_hook[key-bias-float32-accurate]",
 "tests/test_attention_algebra.py::test_the_plain_jax_backward_is_on_par_under_every_score_hook[none-float32-accurate]",
 "tests/test_attention_algebra.py::test_the_plain_jax_backward_is_on_par_under_every_score_hook[row-indexed-bfloat16-accurate]",
@@ -185,7 +185,7 @@
 "tests/test_attention_algebra.py::test_the_plain_jax_forward_is_on_par_under_every_hook[alibi-bfloat16-fold]",
 "tests/test_attention_algebra.py::test_the_plain_jax_forward_is_on_par_under_every_hook[gate-float32-fold]",
 "tests/test_attention_algebra.py::test_the_plain_jax_forward_is_on_par_under_every_hook[softcap-bfloat16-fold]",
-"tests/test_attention_algebra.py::test_the_plain_jax_forward_is_on_par_where_no_residuals_are_kept[cross-causal-lengths-starts]",
+"tests/test_attention_algebra.py::test_the_plain_jax_forward_is_on_par_where_no_residuals_are_kept[documents]",
 "tests/test_attention_algebra.py::test_the_plain_jax_mainloops_forward_and_backward_certify[causal-fp32]",
 "tests/test_attention_algebra.py::test_the_plain_jax_mainloops_forward_and_backward_certify[full-fp32]"
 ],
@@ -1097,11 +1097,11 @@
 "tests/test_contracts_attention.py::test_the_sparse_latent_kernel_holds_every_order[normal]"
 ],
 "tests/test_contracts_gemm.py": [
-"tests/test_contracts_gemm.py::test_a_gemm_prologue_holds_every_order[normal]",
-"tests/test_contracts_gemm.py::test_a_recipe_chain_holds_every_reverse_order[near the least normal-blockwise fp8]",
-"tests/test_contracts_gemm.py::test_a_ternary_weight_product_holds_every_order[normal]",
-"tests/test_contracts_gemm.py::test_an_nvfp4_projection_holds_every_reverse_order[near the least normal]",
-"tests/test_contracts_gemm.py::test_matrices_side_by_side_hold_every_order[near the largest]"
+"tests/test_contracts_gemm.py::test_a_once_rounded_biased_layer_holds_every_order[near the largest]",
+"tests/test_contracts_gemm.py::test_a_recipe_chain_holds_every_reverse_order[near the least normal-gated delayed nvfp4]",
+"tests/test_contracts_gemm.py::test_a_softmaxs_pullback_of_a_cotangent_near_the_largest_holds_every_order[categorical-a pivot at the largest]",
+"tests/test_contracts_gemm.py::test_a_ternary_weight_product_holds_every_order[near the least normal]",
+"tests/test_contracts_gemm.py::test_an_fp8_codes_product_holds_every_order"
 ],
 "tests/test_contracts_moments.py": [
 "tests/test_contracts_moments.py::test_the_covariance_merge_holds_every_order[grad of grad-mesh]",
@@ -4253,9 +4253,6 @@
 "tests/test_trainer.py::test_a_generator_declared_to_replay_resumes_on_the_batches_the_whole_run_reads",
 "tests/test_trainer.py::test_a_share_of_a_run_with_no_planned_length_is_refused",
 "tests/test_trainer.py::test_an_explicit_state_starts_a_token_count_with_its_own_reader"
-],
-"tests/test_training_dtypes.py": [
-"tests/test_training_dtypes.py::test_x64_router_bias_storage_survives_updates_and_restart[float32]"
 ],
 "tests/test_training_transactions.py": [
 "tests/test_training_transactions.py::test_a_masked_diffusion_run_clips_its_attention_at_its_pooled_maxima[whole]",
