@@ -681,7 +681,6 @@ def test_a_prepares_failure_inside_a_site_is_recorded_by_its_label(tmp_path):
     import json
 
     import pytest
-    import tier_wire
     from conftest import recorded_unprepared
 
     def failing(seed):
@@ -698,7 +697,7 @@ def test_a_prepares_failure_inside_a_site_is_recorded_by_its_label(tmp_path):
         recorded_unprepared(tmp_path / "outside", test, outside)
     (inside_reason,) = json.loads((tmp_path / "inside" / UNPREPARED).read_text())["reasons"]
     (outside_reason,) = json.loads((tmp_path / "outside" / UNPREPARED).read_text())["reasons"]
-    assert inside_reason["site"].partition("\n")[0] == f"{tier_wire.LABELED}a site whose draw fails"
+    assert inside_reason["check"] == "a site whose draw fails" and "check" not in outside_reason
     assert outside_reason["site"] == 'raise ValueError("a draw that cannot be made")'
     # A site's failure caught leaves no label on a later failure outside any site (train 1499's F2).
     with compiled_truths(tmp_path / "later", prepare=True, stamp="here"):
@@ -709,3 +708,16 @@ def test_a_prepares_failure_inside_a_site_is_recorded_by_its_label(tmp_path):
         recorded_unprepared(tmp_path / "later", test, later)
     (later_reason,) = json.loads((tmp_path / "later" / UNPREPARED).read_text())["reasons"]
     assert later_reason["site"] == 'raise ValueError("a draw that cannot be made")'
+    assert "check" not in later_reason
+    # A site's error caught and raised again later, outside any site, names no site: the label it took was its
+    # escape's then, not its traceback's now (train 1503).
+    with compiled_truths(tmp_path / "again", prepare=True, stamp="here"):
+        try:
+            assert_as_exact(_combined, _combined, failing, "a site whose error is kept", seeds=8)
+        except ValueError as kept:
+            caught = kept
+        with pytest.raises(ValueError) as again:
+            raise caught.with_traceback(None)
+        recorded_unprepared(tmp_path / "again", test, again)
+    (again_reason,) = json.loads((tmp_path / "again" / UNPREPARED).read_text())["reasons"]
+    assert "check" not in again_reason
