@@ -619,11 +619,16 @@ class Mosaic(base.Template[mainloop.Tiles]):
                    *, training: bool) -> bool:
         """Whether a compile refused `tiles` past what its derivation's rungs answer: a kernel spilled
         (`report.refused_at`), of the product `training` names (`_refused`), whose launch's producer can rise
-        no further, or would leave its tiles unheld (`_raised`), and whose launch walks no key block of its
-        own it can narrow (`_narrowed`)."""
+        no further, or would leave its tiles unheld (`_raised`), which no program fewer a multiprocessor
+        answers (`_fewer`), and whose launch walks no key block of its own it can narrow (`_narrowed`). A
+        launch that moves no registers has no producer to raise: read exhausted at its first refusal, its
+        tiles were refused before the residency that holds it was asked, and its derivation took the next
+        ring depth, planning the launch alike, to its last value block (Kimi's key-scores backward on an sm90
+        under JAX 0.12.1, row 14169)."""
         spilled = frozenset(kernel for kernel in report.refused_at(self, ba, tiles, target)
                             if _of(kernel, training))
         return (bool(spilled) and self._raised(ba, tiles, spilled, target) is None
+                and self._fewer(ba, tiles, spilled, target) is None
                 and self._narrowed(ba, tiles, spilled, target) is None)
 
     def _plans(self, ba: tokamax.BoundArguments, tiles: mainloop.Tiles, target: generation.GpuTarget
