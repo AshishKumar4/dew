@@ -114,6 +114,9 @@ def _seeded(form: _Seeded, primitive, args, signed: bool, equation):
             op = {jax.lax.shift_right_logical_p: BitOp.SHR, jax.lax.shift_left_p: BitOp.SHL,
                   jax.lax.shift_right_arithmetic_p: BitOp.SAR}[primitive]
             return _Place(form.step(op, (value,), places)) if places else value
+        if primitive is jax.lax.shift_right_arithmetic_p:
+            # SAR shifts by its immediate alone: the vocabulary's shifts by a value are logical.
+            raise ValueError(f"{primitive.name}: by a value, no step of the vocabulary")
         variable = BitOp.SHRV if primitive is jax.lax.shift_right_logical_p else BitOp.SHLV
         return _Place(form.step(variable, (value, places)))
     if primitive in (jax.lax.and_p, jax.lax.or_p, jax.lax.xor_p):
@@ -123,6 +126,9 @@ def _seeded(form: _Seeded, primitive, args, signed: bool, equation):
         constants = [arg for arg in args if not isinstance(arg, _Place)]
         return _Place(form.step(BitOp.LOGIC, places, constants[0] if constants else 0, table))
     if primitive is jax.lax.not_p:
+        # A boolean, held as 0 or 1, is complemented as its other value (xor 1); a word, every bit.
+        if equation.invars[0].aval.dtype == jnp.bool_:
+            return _Place(form.step(BitOp.LOGIC, (args[0],), 1, 0xF0 ^ 0xCC))
         return _Place(form.step(BitOp.LOGIC, (args[0],), 0, 0x0F))
     if primitive is jax.lax.add_p:
         places = [arg for arg in args if isinstance(arg, _Place)]

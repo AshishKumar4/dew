@@ -13,6 +13,7 @@ import atexit
 import contextlib
 import dataclasses
 import functools
+import hashlib
 import importlib.util
 import json
 import os
@@ -23,7 +24,7 @@ import sys
 import tempfile
 import threading
 from collections import Counter
-from collections.abc import Callable, Collection, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any, NamedTuple
@@ -401,8 +402,9 @@ def _certified_since(count: int) -> list[dict]:
             for found in report.certifications()[count:]]
 
 
-def _compiled(case, generation: str, record: dict,
-              directory: str | None = None) -> tuple[list[tuple[str, int]], dict[str, int]] | None:
+def _compiled(case, generation: str, record: dict, directory: str | None = None, *,
+              earlier: Mapping[str, dict] | None = None
+              ) -> tuple[list[tuple[str, int]], dict[str, int]] | None:
     """`case` lowered as on the CUDA `generation` (`lowered_for`) and compiled by XLA for a
     compile-only device of it: the custom kernels its executable launches (`assembled.launched_kernels`) and
     the lowered program's Triton calls by name
@@ -412,7 +414,9 @@ def _compiled(case, generation: str, record: dict,
     (`report.certifications`). Given a `directory`, its Mosaic GPU kernels' evidence too (`_dumped`):
     `record['estimates']` each one's resource estimate Pallas prints as it lowers, `record['binaries']` each
     one's binary (`assembled.binaries`), and in `directory` the PTX Mosaic dumps as it compiles (`_dumped`), a
-    `<kernel>.ptx` each."""
+    `<kernel>.ptx` each. `record['lowered']` is its lowering's digest; where an `earlier` run lowered the same
+    program (by that digest), nothing is compiled: that run's compile is this one's (`record['same']`, its
+    name)."""
     fn, args = case.call()
     expected = getattr(case, "expected", None)
     # Each launch's derived config is certified as it traces, as a start on the GPU certifies it
@@ -427,11 +431,8 @@ def _compiled(case, generation: str, record: dict,
     estimating = _dumped(str(lowering)) if lowering is not None else contextlib.nullcontext()
     uncertified = report.uncertified()
     certifying = len(report.certifications())
-    # Each certification this case's lowering asks for, one an earlier case held among them (row 10766),
-    # collected before its compile-only device is set up, so a case failing there has none.
-    offers: list = []
     try:
-        with report.offered() as offers, estimating, report.certifying(compile_only_gpus(generation)[0]):
+        with estimating, report.certifying(compile_only_gpus(generation)[0]):
             lowered = lowered_for(fn, args, generation, expected)
     except Exception as error:  # A case that does not lower is its own failure.
         # One a block's shared memory does not hold asks its bytes, as XLA's refusal of a Triton kernel does.
@@ -445,14 +446,8 @@ def _compiled(case, generation: str, record: dict,
         record["exhausted"] = isinstance(error, report.Exhausted)
         record["uncertified"] = _uncertified_since(uncertified)
         record["certifications"] = _certified_since(certifying)
-        if lowering is not None:
-            # Every offer refused under the certifying build, each judged under the others too: one another
-            # build holds is a launch production there runs that no gate compiled (row 10766). Its estimates
-            # read first, the tensor memory each judgment holds it to.
-            _estimates((), dumps(str(lowering), ".resources.txt"))
-            record["refused_builds"] = _judged_across_builds(
-                offers, printed_modules(dumps(str(lowering), ".ptx")), generation)
         return None
+    record["lowered"] = hashlib.sha256(lowered.as_text().encode()).hexdigest()
     # A launch the lowering could not certify (`report.certified`) is a failure of its own: its run would
     # find its spills only as its whole program compiles.
     record["uncertified"] = _uncertified_since(uncertified)
@@ -465,14 +460,19 @@ def _compiled(case, generation: str, record: dict,
     modules = report.kernel_modules(calls)
     record["modules"] = modules
     # Each kernel certification compiled alone in this process, by name and launch: its module.
-    record["certified"] = {name: module for found in report.certifications()
-                           for name, (module, _) in found.kernels.items()}
+    record["certified"] = _certified_modules()
     # Each launch certification compiled for this case, its op and config and each kernel's registers, spilled
     # bytes and verdict (`Binary.refused`): what a cell a family declines proves the decline by, read where
     # a process of its own compiled it (`compiled_apart`) as here.
     record["certifications"] = _certified_since(certifying)
     if directory is not None:
         record["estimates"] = _estimates(calls, dumps(str(lowering), ".resources.txt"))
+    if (same := (earlier or {}).get(record["lowered"])) is not None:
+        # Another build's run selected this program: its compile's evidence is this run's, judged as this
+        # run's build assembles it (`_run`).
+        record.update({field: same[field] for field in ("binaries", "route", "thunks") if field in same},
+                      same=same["name"])
+        return None
     # A process whose persistent compilation cache is on keeps it on here (JAX settles that once a
     # process): a compile-only device's entry reads back as unloadable, with a warning, and compiles.
     printing = _dumped(str(compiling)) if compiling is not None else contextlib.nullcontext()
@@ -489,11 +489,6 @@ def _compiled(case, generation: str, record: dict,
     if directory is not None:
         record["binaries"] = [dataclasses.asdict(found)
                               for found in assembled.binaries(executable, decoded=True)]
-        # The lowering's print read once: the settled kernels' modules and the refused configs' alike.
-        lowered_modules = printed_modules(dumps(str(lowering), ".ptx"))
-        written({**lowered_modules, **printed_modules(dumps(str(compiling), ".ptx"))}, directory, modules)
-        # Each config certification refused, judged under every build its generation's GPUs run (row 10766).
-        record["refused_builds"] = _judged_across_builds(offers, lowered_modules, generation)
     if expected is not None:
         record["route"] = _route(lowered, executable, _device(generation, expected.axes))
     record["thunks"] = assembled.launched_thunks(executable)
@@ -522,142 +517,6 @@ ESTIMATES: dict[str, str] = {}
 """Each Mosaic GPU kernel's resource estimate this process read, by its module (its kernel hash)."""
 
 
-def write_modules(lowering: str, compiling: str, directory: str, kernels: Collection[str]) -> None:
-    """Each PTX module of the program's `kernels` (by name and launch, `assembled.launch_name`) Mosaic printed
-    (`PTX_MODULE`) into `directory` as `<kernel>.ptx`, its kernel's name and launch its entry's
-    (`assembled.kernel_of`): one certification assembled as the program lowered (`report.certified`), which
-    its compile reuses, or one its compile assembled. A module the compile assembled supersedes
-    certification's of its name and launch, which the program does not run (a gradient's forward is another
-    kernel than the one certified, the recurrence template's); one of no kernel of the program is a config
-    certification refused. Two modules of one name and launch in one print raise."""
-    written({**printed_modules(lowering), **printed_modules(compiling)}, directory, kernels)
-
-
-def written(modules: Mapping[str, str], directory: str, kernels: Collection[str]) -> None:
-    """Each module of `modules` (`printed_modules`) of the program's `kernels` into `directory` as
-    `<kernel>.ptx` (`write_modules`)."""
-    for name, part in modules.items():
-        if name in kernels:
-            Path(directory, f"{name}.ptx").write_text(part)
-
-
-def printed_modules(printed: str) -> dict[str, str]:
-    """Each PTX module Mosaic GPU printed in `printed` (`PTX_MODULE`), whole, by its kernel's name and launch
-    (`assembled.launch_name`, its entry's: `assembled.kernel_of`). Two modules of one name and launch in one
-    print raise."""
-    modules: dict[str, str] = {}
-    for part in printed.split(PTX_MODULE)[1:]:
-        entry = PTX_ENTRY.search(part)
-        if entry is None:
-            raise ValueError(f"a printed PTX module names no entry: {part[:200]}")
-        name = assembled.launch_name(*assembled.kernel_of(entry.group(1)))
-        if name in modules:
-            raise ValueError(f"two PTX modules of {name}")
-        modules[name] = "//\n" + PTX_MODULE + part
-    return modules
-
-
-def refused_across_builds(certifications, printed: dict[str, str], builds: Sequence[str],
-                          judge: Callable[[str, str, str, assembled.Binary, str], str]) -> list[dict]:
-    """Each Mosaic GPU launch config certification refused (`report.Certification.refused`) judged under every
-    build of `builds` a GPU of its generation runs (row 10766), by `judge(build, kernel, ptx, its certified
-    binary, its module)` of each kernel (`_judged_under`): `refused` where the build's assembler refuses a
-    kernel of it too, production there stepping past it as the gate did; else production on that build
-    certifies it, a launch the gate's settled kernels are not, so it is held to the gate's own kernel checks
-    under that build (`Report.failure`): `qualified` where every kernel holds them, else `failed` and why.
-    Each kernel's PTX is the module Mosaic GPU printed as it certified (`printed`, `printed_modules`, by name
-    and launch; else by its module where an earlier case printed it, `PTX`): a config whose kernel printed
-    none here (its module compiled before the gate) is `unverified`. A Triton launch's config is not judged
-    here: no print of its PTX is read (its certifying build's verdict alone). Each `{op, config, builds}`."""
-    judged = []
-    for found in certifications:
-        triton = any(binary.kind != "mosaic_gpu" for _, binary in found.kernels.values())
-        if not found.refused or triton:
-            continue
-        sources = {}
-        for name, (module, _) in found.kernels.items():
-            if name in printed:
-                PTX[module] = printed[name]
-            sources[name] = PTX.get(module)
-        verdicts = {}
-        for build in builds:
-            if None in sources.values():
-                verdicts[build] = "unverified"
-                continue
-            each = [judge(build, name, sources[name], binary, module)
-                    for name, (module, binary) in found.kernels.items()]
-            failed = [verdict for verdict in each if verdict.startswith("failed")]
-            verdicts[build] = ("refused" if "refused" in each else "; ".join(failed) if failed
-                               else "qualified")
-        judged.append({"op": found.op, "config": repr(found.config), "builds": verdicts})
-    return judged
-
-
-def alternate_verdict(name: str, read: Assembled, alternate: assembled.Binary | None,
-                      certified: assembled.Binary, estimate: str, ptx: str, generation: str) -> str:
-    """A refused config's kernel `name` as a build other than its certifying one assembles it (`read`, its
-    ptxas's report; `alternate`, its cubin, None where it made none): `refused` where that assembler refuses
-    it (`assembled.refuses`), else held to the gate's own checks (`Report.failure`) of its launch's shared
-    bytes (`certified`'s, its certifying compile's launch), its tensor memory (`estimate`, Pallas's printed
-    `Resources`), and that build's registers, spills, losses, machine code, threads and register cap (as
-    `mosaic_kernels` caps a settled kernel's, from its PTX's programs): `qualified`, or `failed: ` and why."""
-    if assembled.refuses(read.spilled, read.losses):
-        return "refused"
-    tmem = TENSOR_MEMORY.search(estimate)
-    unread = tuple(field for field, known in (
-        ("shared bytes", certified.shared is not None), ("tensor memory columns", tmem),
-        ("binary", alternate), ("machine code", alternate is not None and alternate.sass is not None))
-        if not known)
-    programs = int(held.group(1)) if (held := PROGRAMS.search(ptx)) else 1
-    threads = alternate.threads if alternate is not None else None
-    raised = alternate.raised if alternate is not None else None
-    with assumed(gpu_target(generation)):
-        shared_cap = None if threads is None else resources.thread_share(threads, programs)
-    cap = raised if raised is not None else shared_cap
-    kernel, launch, _ = assembled.kernel_of(name)
-    report = Report(kernel, certified.shared, sum(map(int, tmem.groups())) if tmem else None, read.registers,
-                    read.spilled, unread, None, launch, losses=read.losses,
-                    sass=tuple(alternate.sass or ()) if alternate is not None else (), threads=threads,
-                    decreased=alternate.decreased if alternate is not None else None, raised=raised, cap=cap)
-    target = gpu_target(generation)
-    failure = report.failure(target.shared_limit or 0, target.tmem_columns or 0)
-    return "qualified" if failure is None else f"failed: {failure}"
-
-
-def _judged_under(generation: str, build: str, name: str, ptx: str, certified: assembled.Binary,
-                  module: str) -> str:
-    """`alternate_verdict` of the kernel `name`'s `ptx` assembled by JAX's CUDA `build`'s ptxas for
-    `generation` as the GPU compiles it (`RELOCATABLE`), its cubin decoded (`assembled.binary_of`), its
-    estimate its module's (`ESTIMATES`)."""
-    text, cubin = _ptxas_cubin(ptx, generation, RELOCATABLE, ptxas_of(build))
-    read = ptxas_read(text)
-    entry = PTX_ENTRY.search(ptx)
-    alternate = (assembled.binary_of(entry.group(1), cubin, decoded=True, spilled=read.spilled)
-                 if cubin is not None and entry is not None else None)
-    estimate = ESTIMATES.get(module[:16], "")
-    return alternate_verdict(name, read, alternate, certified, estimate, ptx, generation)
-
-
-def _judged_across_builds(offers: list, printed: dict[str, str], generation: str) -> list[dict]:
-    """`refused_across_builds` of each certification the case asked for (`offers`, `report.offered`'s, each
-    once), their PTX as the case's lowering printed it (`printed`, `printed_modules`) or an earlier case's
-    (`PTX`)."""
-    # Each once, by identity: a certification holds its kernels in a dict, no key.
-    asked = list({id(found): found for found in offers}.values())
-    return refused_across_builds(asked, printed, judged_builds(generation),
-                                 functools.partial(_judged_under, generation))
-
-
-def refused_across_build_failures(record: dict) -> list[str]:
-    """Each config `record`'s certification refused that a build of its generation's holds but fails the
-    gate's kernel checks under, or that no build's assembler judged here (`refused_across_builds`): a launch
-    production on that build may run that the gate does not qualify."""
-    return [f"{record['name']}: {judged['op']} at {judged['config']} refused as it certified, "
-            f"{verdict} under {build}"
-            for judged in record.get("refused_builds", ()) for build, verdict in judged["builds"].items()
-            if verdict not in ("refused", "qualified")]
-
-
 def _route(lowered, executable, mesh: Mesh) -> dict:
     """What a compiled route shows (`Expected`): its launches by name, the operands each of their calls
     reads, and its collectives over `mesh`, JSON's types (a record a process of its own writes back). Its
@@ -680,23 +539,29 @@ def route_failures(cases, found: list[dict]) -> list[str]:
     program to read: the route's own evidence, beside its kernels' resources."""
     failed = []
     for case, record in zip(cases, found, strict=True):
-        if (expected := getattr(case, "expected", None)) is None:
-            continue
-        if (route := record.get("route")) is None:
-            why = record.get("error", "none")
-            failed.append(f"{case.name}: no compiled program states its route ({why})")
-            continue
-        if missing := sorted(expected.launches - set(route["launches"])):
-            failed.append(f"{case.name}: no launch of {', '.join(missing)} (it ran {route['launches']})")
-        for name, shape in expected.shards.items():
-            calls = route["shards"].get(name, [])
-            if not any(list(shape) in operands for operands in calls):
-                failed.append(f"{case.name}: no call of {name} reads a {list(shape)} shard "
-                              f"(its calls read {calls})")
-        collectives = {(op, frozenset(axes)) for op, axes in route["collectives"]}
-        if collectives != expected.collectives:
-            failed.append(f"{case.name}: collectives {sorted(map(_named, collectives))}, where its plan "
-                          f"states {sorted(map(_named, expected.collectives))}")
+        if (expected := getattr(case, "expected", None)) is not None:
+            # Each build's run of the case (`runs`), its own program's route as much as the first's.
+            failed += [failure for run in runs([record]) for failure in _route_failures(run, expected)]
+    return failed
+
+
+def _route_failures(run: dict, expected) -> list[str]:
+    """`route_failures` of one run of a routed case against its `expected` route, its selection its build's
+    only where its build judged every kernel it certified (`_unjudged`)."""
+    failed = _unjudged(run)
+    if (route := run.get("route")) is None:
+        return [*failed, f"{run['name']}: no compiled program states its route ({run.get('error', 'none')})"]
+    if missing := sorted(expected.launches - set(route["launches"])):
+        failed.append(f"{run['name']}: no launch of {', '.join(missing)} (it ran {route['launches']})")
+    for name, shape in expected.shards.items():
+        calls = route["shards"].get(name, [])
+        if not any(list(shape) in operands for operands in calls):
+            failed.append(f"{run['name']}: no call of {name} reads a {list(shape)} shard "
+                          f"(its calls read {calls})")
+    collectives = {(op, frozenset(axes)) for op, axes in route["collectives"]}
+    if collectives != expected.collectives:
+        failed.append(f"{run['name']}: collectives {sorted(map(_named, collectives))}, where its plan states "
+                      f"{sorted(map(_named, expected.collectives))}")
     return failed
 
 
@@ -706,13 +571,19 @@ def _named(collective: tuple[str, frozenset[str]]) -> str:
     return f"{op} over {'/'.join(sorted(axes)) or 'no axis'}"
 
 
-def mosaic_kernels(record: dict) -> list[dict]:
+def mosaic_kernels(record: dict, judge: report.Judge | None = None) -> list[dict]:
     """Each Mosaic GPU kernel's report from `record`'s evidence (`reports`, `_compiled`), as a record a test's
-    process of its own writes back as JSON (`compile_mosaic_kernels`)."""
+    process of its own writes back as JSON (`compile_mosaic_kernels`): its binary as compiled, or as `judge`
+    remakes it by its module (`_Rebuilt`: another build's)."""
     # A binary's notes come back from its record as their fields (`dataclasses.asdict`).
     binaries = [assembled.Binary(**{**found, "notes": tuple(assembled.AssemblerNote(**note)
                                                           for note in found.get("notes", ()))})
                 for found in record.get("binaries", ())]
+    if judge is not None:
+        modules = record.get("modules") or {}
+        judged = judge({str(at): (modules.get(assembled.launch_name(binary.kernel, binary.launch)), binary)
+                        for at, binary in enumerate(binaries)})
+        binaries = [binary for _, binary in judged.values()]
     return [dataclasses.asdict(found) for found in
             reports(record.get("estimates", {}), binaries, record.get("modules"))]
 
@@ -835,8 +706,11 @@ def compile_mosaic_kernels(cases, generation: str) -> list[dict]:
 
 
 def _undumped(found: list[dict]) -> bool:
-    """Whether a kernel of `found`'s records has no PTX this process dumped (`_compiled_here`'s `dumped`)."""
-    return any(not kernel["dumped"] for record in found for kernel in record.get("kernels", ()))
+    """Whether a run of `found`'s records (`runs`) has a kernel no PTX of which this process dumped
+    (`_run`'s `dumped`), or one a build's run could not judge for want of it (`_Rebuilt.unjudged`)."""
+    every = runs(found)
+    return any(run.get("unjudged") for run in every) or any(
+        not kernel["dumped"] for run in every for kernel in run.get("kernels", ()))
 
 
 _CALLS: Counter[str] = Counter()
@@ -891,28 +765,18 @@ def _ran_apart(tests: list[str]) -> Path:
     return directory
 
 
-COMPILED: dict[str, dict] = {}
-"""Each Mosaic GPU kernel's registers and spills as the GPU compiles its PTX (`_compiled_reports`), by its
-module: Mosaic compiles a module once a process, so a later case of the same module prints no PTX
-(`inherited`)."""
-
-
 def inherited(kernel: dict, compiled: dict[str, dict], generation: str) -> dict:
     """`kernel`'s record (`mosaic_kernels`) with its registers and spills, their only source: as the GPU
-    compiles its PTX, this compile's (`compiled`, by its name and launch, `assembled.launch_name`), which this
-    process keeps by its module (`COMPILED`), or, where Mosaic compiled the same module before in this process
-    and so printed no PTX, that compile's. A kernel neither covers takes its executable's binary's where this
-    process's builds are every build `generation`'s GPUs run (`_assembles_for`), its verdict then theirs;
-    elsewhere it keeps them unread, another compiler's verdict no evidence of the GPU's."""
+    compiles its PTX (`compiled`, by its name and launch, `assembled.launch_name`: its module's, printed
+    once a process, `_compiled_reports`). A kernel it does not cover (its module compiled before the gate's)
+    takes its executable's binary's where this process's builds are every build `generation`'s GPUs run
+    (`_assembles_for`), its verdict then theirs; elsewhere it keeps them unread, another compiler's verdict
+    no evidence of the GPU's."""
     if not kernel["planned"] and kernel["registers"] is not None and kernel["spilled"] is not None:
         return {**kernel, "ptxas": "its executable's binary"}
     name = assembled.launch_name(kernel["kernel"], kernel["launch"])
     if name in compiled:
-        if kernel["module"] is not None:
-            COMPILED[kernel["module"]] = compiled[name]
         return {**kernel, **compiled[name]}
-    if kernel["module"] in COMPILED:
-        return {**kernel, **COMPILED[kernel["module"]], "ptxas": "an earlier compile of its module"}
     if kernel["binary_registers"] is not None and _assembles_for(generation):
         # No PTX of it in this process (its module compiled before the gate's): its executable's binary
         # (`assembled.binaries`), as certification reads it, where this process's builds are every build the
@@ -933,8 +797,9 @@ def _assembles_for(generation: str) -> bool:
 
 
 PTX: dict[str, str] = {}
-"""Each Mosaic GPU module's PTX this process printed, by its module, as `COMPILED` keeps its compile: a later
-compile of the same module prints none, and its raise and its producer's decrease are read from this."""
+"""Each Mosaic GPU module's PTX this process printed, by its module (`_read_printed`): a later compile of the
+same module prints none, and its registers, spills, raise and its producer's decrease are read from this
+under each build (`_assembly`)."""
 
 
 BUILD_NVCC = {"cuda12": ("nvidia.cuda_nvcc", "12.9"), "cuda13": ("nvidia.cu13", "13.0")}
@@ -1043,85 +908,272 @@ def _ptxas_cubin(ptx: str, generation: str, relocatable: bool, ptxas: Path) -> t
         return text, target.read_bytes() if took and target.exists() else None
 
 
-def _assembled_under(generation: str, ptx: str, build: str) -> Assembled:
-    """ptxas's report of the kernel `ptx` for the CUDA `generation` under JAX's CUDA `build` (`ptxas_of`),
-    compiled as the GPU compiles it (`RELOCATABLE`); a kernel it does not compile raises."""
-    ptxas = ptxas_of(build)
-    text, took = _ptxas_text(ptx, generation, RELOCATABLE, ptxas)
-    if not took:
-        raise RuntimeError(f"{ptxas} does not compile a kernel for {generation}: {text[-400:]}")
-    return ptxas_read(text)
-
-
-def _compiled_reports(directory: str, generation: str) -> dict[str, dict]:
-    """Each kernel's registers a thread and spilled bytes as the GPU compiles the PTX Mosaic printed into
-    `directory` (`_ptxas_text`, at its own entry), by its name and launch (`assembled.launch_name`), the most
-    of each under every CUDA build the gate judges the generation under (`judged_builds`,
-    `_assembled_under`) and every build's notes: its binary is its compile in this process, which may not be
-    the GPU's (`RELOCATABLE`)."""
+def _compiled_reports(modules: Mapping[str, str], generation: str, build: str) -> dict[str, dict]:
+    """Each kernel of `modules` (its module by its name and launch, `assembled.launch_name`) whose PTX Mosaic
+    printed (`PTX`): its registers a thread, spilled bytes and notes of a loss as JAX's CUDA `build`'s ptxas
+    compiles it as the GPU does (`_assembly`), or, where ptxas takes none, why (`unassembled`, its report's
+    tail: no figures of it); its binary here is this process's compile, which may not be the GPU's."""
     found = {}
-    for path in Path(directory).glob("*.ptx"):
-        ptx = path.read_text()
-        reads = [_assembled_under(generation, ptx, build) for build in judged_builds(generation)]
-        worst = max(reads, key=lambda read: (read.spilled, read.registers))
-        found[path.stem] = {"registers": worst.registers, "spilled": worst.spilled,
-                            "losses": tuple(dict.fromkeys(code for read in reads for code in read.losses)),
-                            "ptxas": "the GPU's compile of its PTX"}
+    for name, module in modules.items():
+        if module not in PTX:
+            continue
+        made = _assembly(module, generation, build)
+        found[name] = ({"unassembled": made.text[-400:]} if made.binary is None else
+                       {"registers": made.read.registers, "spilled": made.read.spilled,
+                        "losses": made.read.losses, "ptxas": f"{build}'s compile of its PTX"})
     return found
 
 
 def _compiled_here(cases, generation: str) -> list[dict]:
-    """`compile_mosaic_kernels`' records, compiled in this process."""
+    """`compile_mosaic_kernels`' records, compiled in this process: each case run once a build its
+    generation's GPUs run (`judged_builds`; this process's own compiler's first, `_ordered_builds`), its
+    launches certified as that build's assembler certifies them (this process's compiler's own, or that
+    build's ptxas's, `_Rebuilt`) and the program its derivations select judged under that build alone, as a
+    GPU running it runs it: the first run the record, every other beside it (`record['builds']`, row
+    10766)."""
     found: list[dict] = []
     for case in cases:
-        # The program's own record (its error, or XLA's refusal of its block), its Mosaic kernels' reports the
-        # evidence of their resources: a Triton launch line is none of theirs.
-        models = dict(case.models or {})
-        record: dict = {"name": case.name, "generation": generation,
-                        "limit": gpu_target(generation).shared_limit,
-                        "models": {name: model.record() for name, model in models.items()}}
-        # Every compile of the case a real one (`dew._cache.uncached`): Mosaic prints a module's PTX, the
-        # gate's evidence, only as it compiles it, and a program JAX's persistent cache loads compiles
-        # nothing, its kernels' records then empty (train 953: three programs loaded from the shared cache
-        # gave a B200's gathered cells no registers, no spills and no producer).
-        # Its certifications' verdicts kept apart from the store a run reads (`tuning.verdicts_kept_in`), so
-        # each config certifies here and prints its PTX, refused ones among them (row 10766).
-        with (tempfile.TemporaryDirectory(prefix="dew-mosaic-") as directory, _cache.uncached(),
-              tempfile.TemporaryDirectory(prefix="dew-verdicts-") as verdicts,
-              tuning.verdicts_kept_in(verdicts)):
-            _compiled(case, generation, record, directory)
-            kernels = mosaic_kernels(record)
-            # Each kernel's model its launch stated as it traced (`report.Launch.kernels`), whose producer
-            # its schedule lowers to (`producer_failures`).
-            record["stated_models"] = {
-                assembled.launch_name(kernel["kernel"], kernel["launch"]): stated.record()
-                for kernel in kernels if kernel["planned"] and kernel["launched"] is not None
-                and (launch := report.traced(kernel["launched"])) is not None
-                and (stated := launch.kernels.get(kernel["kernel"])) is not None}
-            compiled = _compiled_reports(directory, generation)
-            record["kernels"] = [inherited(kernel, compiled, generation) for kernel in kernels]
-            printed = {path.stem: path.read_text() for path in Path(directory).glob("*.ptx")}
-            for kernel in record["kernels"]:
-                if not kernel["planned"]:
-                    # Its cubin its evidence, read as it was made: no PTX of it to dump.
-                    kernel["dumped"] = True
-                    programs = 1
-                else:
-                    name = assembled.launch_name(kernel["kernel"], kernel["launch"])
-                    if kernel["module"] is not None and name in printed:
-                        PTX[kernel["module"]] = printed[name]
-                    ptx = printed.get(name, PTX.get(kernel["module"], ""))
-                    # Whether this process dumped its PTX: none where its Mosaic module compiled before the
-                    # gate's.
-                    kernel["dumped"] = bool(ptx)
-                    programs = int(held.group(1)) if (held := PROGRAMS.search(ptx)) else 1
-                with assumed(gpu_target(generation)):
-                    kernel["cap"] = (kernel["raised"] if kernel["raised"] is not None
-                                     else None if kernel["threads"] is None
-                                     else resources.thread_share(kernel["threads"], programs))
-        record["tmem_limit"] = gpu_target(generation).tmem_columns or 0
+        runs: dict[str, dict] = {}
+        for build in _ordered_builds(generation):
+            run = _header(case, generation)
+            if runs:
+                run["name"] = f"{case.name} under {build}"
+            # This process's compiler's run binds its certifications' dumps alone (`_Bound`); another
+            # build's remakes them as that build assembles them (`_Rebuilt`).
+            rebuilt = _Rebuilt(build, generation) if build not in cuda_builds() else None
+            _run(case, generation, run, build, judge=rebuilt or _Bound(),
+                 earlier={each["lowered"]: each for each in runs.values() if "lowered" in each})
+            if rebuilt is not None:
+                run["unjudged"] = rebuilt.unjudged
+            runs[build] = run
+        record, *others = runs.values()
+        record["builds"] = dict(zip(list(runs)[1:], others, strict=True))
         found.append(record)
     return found
+
+
+def _header(case, generation: str) -> dict:
+    """A case's record before it compiles: its name, generation, block limit and the models it states."""
+    models = dict(case.models or {})
+    return {"name": case.name, "generation": generation, "limit": gpu_target(generation).shared_limit,
+            "models": {name: model.record() for name, model in models.items()}}
+
+
+def _run(case, generation: str, record: dict, build: str, *,
+         judge: report.Judge | None = None, earlier: Mapping[str, dict] | None = None) -> None:
+    """`case` compiled into `record` (`_compiled`) and its Mosaic GPU kernels read (`mosaic_kernels`) as JAX's
+    CUDA `build` assembles them: its launches certified as this process's compiler certifies them, or, given
+    a `judge`, as it remakes their kernels (`report.judging`, a build's `_Rebuilt`), its derivations stepping
+    by those verdicts from no refusal of another run's (`report.refusals`); its program's kernels that
+    build's binaries (remade by `judge`) and registers and spills (`_compiled_reports`). A program an
+    `earlier` run lowered is not compiled again (`_compiled`): its evidence is read as this build's."""
+    # Every compile of the case a real one (`dew._cache.uncached`): Mosaic prints a module's PTX, the gate's
+    # evidence, only as it compiles it, and a program JAX's persistent cache loads compiles nothing, its
+    # kernels' records then empty (train 953: three programs loaded from the shared cache gave a B200's
+    # gathered cells no registers, no spills and no producer). Its certifications' verdicts kept apart from
+    # the store a run reads (`tuning.verdicts_kept_in`), and from another run's, so each config certifies here
+    # and prints its PTX.
+    with (tempfile.TemporaryDirectory(prefix="dew-mosaic-") as directory, _cache.uncached(),
+          tempfile.TemporaryDirectory(prefix="dew-verdicts-") as verdicts,
+          tuning.verdicts_kept_in(verdicts), _judged(build, judge)):
+        _compiled(case, generation, record, directory, earlier=earlier)
+        # Its certifications' PTX as they lowered, its program's as it compiled, each its own modules'.
+        _read_printed(Path(directory, "compiling").glob("*.ptx"), record.get("modules") or {})
+        kernels = mosaic_kernels(record, judge)
+        # Each kernel's model its launch stated as it traced (`report.Launch.kernels`), whose producer its
+        # schedule lowers to (`producer_failures`).
+        record["stated_models"] = {
+            assembled.launch_name(kernel["kernel"], kernel["launch"]): stated.record()
+            for kernel in kernels if kernel["planned"] and kernel["launched"] is not None
+            and (launch := report.traced(kernel["launched"])) is not None
+            and (stated := launch.kernels.get(kernel["kernel"])) is not None}
+        compiled = _compiled_reports(record.get("modules") or {}, generation, build)
+        record["kernels"] = [inherited(kernel, compiled, generation) for kernel in kernels]
+        for kernel in record["kernels"]:
+            if not kernel["planned"]:
+                # Its cubin its evidence, read as it was made: no PTX of it to dump.
+                kernel["dumped"] = True
+                programs = 1
+            else:
+                # Its own module's PTX (`_read_printed`), none where its module compiled before the gate's.
+                ptx = PTX.get(kernel["module"], "")
+                kernel["dumped"] = bool(ptx)
+                programs = int(held.group(1)) if (held := PROGRAMS.search(ptx)) else 1
+            with assumed(gpu_target(generation)):
+                kernel["cap"] = (kernel["raised"] if kernel["raised"] is not None
+                                 else None if kernel["threads"] is None
+                                 else resources.thread_share(kernel["threads"], programs))
+    record["build"] = build
+    record["tmem_limit"] = gpu_target(generation).tmem_columns or 0
+
+
+@contextlib.contextmanager
+def _judged(build: str, judge: report.Judge | None) -> Iterator[None]:
+    """Within the block, launches certified as `judge` remakes their kernels as `build` assembles them
+    (`report.judging`), with refusals of their own (`report.refusals`); as this process's compiler certifies
+    them where None."""
+    if judge is None:
+        yield
+        return
+    with report.refusals(), report.judging(build, judge):
+        yield
+
+
+def _ordered_builds(generation: str) -> tuple[str, ...]:
+    """The builds `generation`'s GPUs run (`judged_builds`), this process's compiler's own first
+    (`dew._devices.cuda_builds`): its run certifies by the compiles it makes, every other by its build's
+    assembler (`_Rebuilt`)."""
+    return tuple(sorted(judged_builds(generation), key=lambda build: build not in cuda_builds()))
+
+
+def _read_printed(dumps: Iterable[Path], modules: Mapping[str, str]) -> None:
+    """Each PTX module Mosaic GPU dumped (`_dumped`) of `dumps` whose kernel's name and launch (its entry's,
+    `assembled.kernel_of`) `modules` names, kept by the module `modules` gives it (`PTX`): a program's
+    calls' (`report.kernel_modules`, its compile's dumps) or a certification's own kernels' (the dumps its
+    own compile wrote, `_Bound.compiling`), each dump read again only once it changes (`_READ`: Mosaic
+    numbers each compile's dumps afresh, so a later module may be written over an earlier one's file); two
+    fresh dumps of one name bound to neither, no name telling two modules apart. A module's dumps share no
+    name of its own, so its resource estimate, dumped as it lowers, and its PTX, as it compiles, are not
+    paired by their files; nor is a module's PTX ever another's of its name: Mosaic compiles a module once a
+    process, so a later run's certification of it prints none and reads the PTX its first compile printed,
+    by its module (`_Rebuilt`)."""
+    fresh: dict[str, list[tuple[Path, tuple[int, int], str]]] = {}
+    for path in sorted(dumps):
+        stamp = (status := path.stat()).st_mtime_ns, status.st_size
+        if _READ.get(path) == stamp or (entry := PTX_ENTRY.search(text := path.read_text())) is None:
+            continue
+        if (name := assembled.launch_name(*assembled.kernel_of(entry.group(1)))) in modules:
+            fresh.setdefault(name, []).append((path, stamp, text))
+    for name, ((path, stamp, text),) in ((name, dumps) for name, dumps in fresh.items() if len(dumps) == 1):
+        _READ[path] = stamp
+        PTX[modules[name]] = text
+
+
+def _certified_modules() -> dict[str, str]:
+    """Each kernel this process's certifications compiled (`report.certifications`), its module by its name
+    and launch: whatever its case did after, a refused or exhausted one among them."""
+    return {name: module for found in report.certifications() for name, (module, _) in found.kernels.items()}
+
+
+_READ: dict[Path, tuple[int, int]] = {}
+"""Each PTX dump `_read_printed` read, by its path, as it was when read (its modification time and size)."""
+
+
+@dataclasses.dataclass(eq=False)
+class _Bound:
+    """This process's compiler's run's judge (`report.judging`, a `report.Judge`): each certification's
+    kernels as compiled, the PTX its own compile printed (`compiling`: the dumps it wrote, a failed one's
+    none of the next's) bound to its own kernels' modules as it certifies (`_read_printed`), which another
+    build's run of the case reads (`_Rebuilt`: Mosaic compiles a module once a process, so that run's
+    prints none)."""
+
+    fresh: list[Path] = dataclasses.field(default_factory=list, init=False)
+    """The PTX dumps the last certification's compile wrote (`compiling`)."""
+
+    @contextlib.contextmanager
+    def compiling(self) -> Iterator[None]:
+        dumping = os.environ.get("MOSAIC_GPU_DUMP_TO")
+        before = _stamps(dumping)
+        try:
+            yield
+        finally:
+            self.fresh = [path for path, stamp in _stamps(dumping).items() if before.get(path) != stamp]
+
+    def __call__(self, kernels: dict[str, tuple[str | None, assembled.Binary]]
+                 ) -> dict[str, tuple[str | None, assembled.Binary]]:
+        self._bind(kernels)
+        return kernels
+
+    def _bind(self, kernels: Mapping[str, tuple[str | None, assembled.Binary]]) -> None:
+        _read_printed(self.fresh, {name: module for name, (module, _) in kernels.items()
+                                   if module is not None})
+        self.fresh = []
+
+
+def _stamps(dumping: str | None) -> dict[Path, tuple[int, int]]:
+    """Each PTX dump in the directory `dumping` names, as it stands (its modification time and size)."""
+    if dumping is None:
+        return {}
+    return {path: ((status := path.stat()).st_mtime_ns, status.st_size)
+            for path in Path(dumping).glob("*.ptx")}
+
+
+@dataclasses.dataclass(eq=False)
+class _Rebuilt(_Bound):
+    """Kernels as JAX's CUDA `build` assembles them for `generation`: a run's judge (`report.judging`, its
+    certifications apart from every other run's by its identity, and `mosaic_kernels`, its program's), each
+    Mosaic GPU kernel of the PTX printed of its module that build's binary (`_assembly`), its launch's own
+    facts (its name, launch, caller and shared bytes) its compile's: its verdict (`assembled.Binary.refused`),
+    its SASS, register raises and decreases that build's. A kernel of no PTX printed here (its module
+    compiled before the gate's) or one that build does not assemble is left as compiled and named
+    (`unjudged`): its case runs again in a process of its own (`_undumped`)."""
+
+    build: str
+    generation: str
+    unjudged: list[str] = dataclasses.field(default_factory=list)
+
+    def __call__(self, kernels: dict[str, tuple[str | None, assembled.Binary]]
+                 ) -> dict[str, tuple[str | None, assembled.Binary]]:
+        self._bind(kernels)
+        return {name: (module, self._assembled(module, binary)) for name, (module, binary) in kernels.items()}
+
+    def _assembled(self, module: str | None, binary: assembled.Binary) -> assembled.Binary:
+        if binary.kind != "mosaic_gpu":
+            # A Triton kernel: no print of its PTX is read, its compiling build's verdict alone.
+            return binary
+        rebuilt = None if module not in PTX else _assembly(module, self.generation, self.build).binary
+        if rebuilt is None:
+            self.unjudged.append(assembled.launch_name(binary.kernel, binary.launch))
+            return binary
+        return dataclasses.replace(rebuilt, kernel=binary.kernel, launch=binary.launch, caller=binary.caller,
+                                   shared=binary.shared, index=binary.index)
+
+
+class Assembly(NamedTuple):
+    """A module's PTX as one build's ptxas compiles it (`_assembly`): its report (`text`), read
+    (`ptxas_read`), and its cubin's binary, None where ptxas took none."""
+
+    read: Assembled
+    binary: assembled.Binary | None
+    text: str
+
+
+@functools.cache
+def _assembly(module: str, generation: str, build: str) -> Assembly:
+    """The PTX printed of `module` (`PTX`) as JAX's CUDA `build`'s ptxas (`ptxas_of`) compiles it for
+    `generation` as the GPU does (`RELOCATABLE`), once a process: its report, read (`ptxas_read`), and its
+    cubin's binary (`assembled.binary_of`, decoded, its notes of a loss ptxas's), None where ptxas took
+    none."""
+    ptx = PTX[module]
+    text, cubin = _ptxas_cubin(ptx, generation, RELOCATABLE, ptxas_of(build))
+    entry = PTX_ENTRY.search(ptx)
+    read = ptxas_read(text)
+    if cubin is None or entry is None:
+        return Assembly(read, None, text)
+    binary = assembled.binary_of(entry.group(1), cubin, decoded=True, spilled=read.spilled)
+    return Assembly(read, dataclasses.replace(binary, notes=_notes(text)), text)
+
+
+def _notes(text: str) -> tuple[assembled.AssemblerNote, ...]:
+    """ptxas's notes of a loss in its report `text` the gate fails a kernel for (`LOSSES`), each its code and
+    message."""
+    return tuple(assembled.AssemblerNote(found.group(1), line[found.end():].strip())
+                 for line in text.splitlines() if (found := LOSS.search(line)) and found.group(1) in LOSSES)
+
+
+def runs(found: list[dict]) -> list[dict]:
+    """Each record of `found` and each other build's run of its case beside it (`record['builds']`,
+    `_compiled_here`), each a run alone (none of its own beside it): every program a GPU of the generation
+    runs, as its build assembles it, which the gate's checks hold."""
+    return [{**each, "builds": {}} for record in found
+            for each in (record, *record.get("builds", {}).values())]
+
+
+def failing_runs(record: dict) -> list[dict]:
+    """Each run of `record`'s case (its own and each build's, `runs`) the gate's checks fail
+    (`mosaic_failures`): a cell a family declines is declined by every one, none of a build's GPUs running a
+    program the gate failed."""
+    return [run for run in runs([record]) if _run_failures(run)]
 
 
 def mosaic_failures(found: list[dict], *, traced_models: bool = False) -> list[str]:
@@ -1130,13 +1182,18 @@ def mosaic_failures(found: list[dict], *, traced_models: bool = False) -> list[s
     states (`setmaxnreg.dec` against `RegisterModel.producer`: a launch's plan and its emission one fact).
     Whether a launch's registers hold is its certification's alone: the gate judges no register model. A
     kernel's planned shared bytes are its case's model's, or with `traced_models`, where its case states
-    none, its launch's as it traced (a case settled as a call takes its tile, `KernelOp.lowering` at None)."""
-    failed = failures(found)
-    for record in found:
-        # A config the certifying build refused that another holds, a case's every offer refused among them.
-        failed += refused_across_build_failures(record)
-        if refused(record):
-            continue
+    none, its launch's as it traced (a case settled as a call takes its tile, `KernelOp.lowering` at None).
+    Each run of a case is held to them (`runs`): its own, and each build's whose derivations selected another
+    program (row 10766)."""
+    return [failure for run in runs(found) for failure in _run_failures(run, traced_models=traced_models)]
+
+
+def _run_failures(record: dict, *, traced_models: bool = False) -> list[str]:
+    """`mosaic_failures` of one run's `record`."""
+    failed = failures([record]) + _unjudged(record) + [
+        f"{record['name']} {kernel['kernel']}: {record.get('build')}'s ptxas does not compile it: "
+        f"{kernel['unassembled']}" for kernel in record.get("kernels", ()) if "unassembled" in kernel]
+    if not refused(record):
         failed += [f"{record['name']}: a launch not certified, {why}"
                    for why in record.get("uncertified", ())]
         if not record["kernels"]:
@@ -1158,7 +1215,14 @@ def mosaic_failures(found: list[dict], *, traced_models: bool = False) -> list[s
             if stated is not None and stated["shared"] not in (None, found_kernel.shared):
                 failed.append(f"{record['name']} {found_kernel.kernel}: its planner sized {stated['shared']} "
                               f"bytes of shared memory, the kernel asks for {found_kernel.shared}")
-    return failed + producer_failures(found)
+    return failed + producer_failures([record])
+
+
+def _unjudged(run: dict) -> list[str]:
+    """Each kernel `run`'s build judged none of (`_Rebuilt.unjudged`: no PTX of its module dumped here), its
+    run's verdicts, and so its selection, not its build's."""
+    return [f"{run['name']}: {kernel} not judged under {run.get('build')}, no PTX of its module dumped"
+            for kernel in run.get("unjudged", ())]
 
 
 def producer_failures(found: list[dict]) -> list[str]:

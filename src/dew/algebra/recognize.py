@@ -96,9 +96,10 @@ def recognized(jaxpr: jcore.Jaxpr, index: fusion.Index, families: Sequence[Famil
     a kernel of Dew's, written as that call (the module's account): `families` in order (`ATTENTION`,
     `RECURRENCES`, `NORMS`), an anchor's candidates in the order its family names them, the first equal one
     taken, no two regions sharing an equation nor one `held` (a product's epilogue's). Each region's choice
-    is held by structure and constant values (`_HELD_REGIONS`), the body's recognition by its key
-    (`_HELD_BODIES`). A body with no local unclaimed anchor is answered before its key is built;
-    nested control bodies are searched separately, not anchored at their enclosing equation."""
+    is held by its family, structure and constant values (`_HELD_REGIONS`), the body's recognition by its
+    key and its families, never their anchors alone (`_HELD_BODIES`). A body with no local unclaimed anchor
+    is answered before its key is built; nested control bodies are searched separately, not anchored at their
+    enclosing equation."""
     if _bound(jaxpr).isdisjoint(family.anchor for family in families):
         return []
     anchors = tuple(tuple(place for place, equation in enumerate(jaxpr.eqns)
@@ -107,8 +108,7 @@ def recognized(jaxpr: jcore.Jaxpr, index: fusion.Index, families: Sequence[Famil
     if not any(anchors):
         return []
     base = fusion.base_context() if _base is None else _base
-    key = (_keyed(jaxpr, index), held, tuple(family.anchor for family in families),
-           fusion.choice_context_of(base))
+    key = (_keyed(jaxpr, index), held, tuple(map(_family_key, families)), fusion.choice_context_of(base))
 
     def recognizing() -> list:
         return [_positioned(jaxpr, written)
@@ -174,15 +174,16 @@ def _recognizing(jaxpr: jcore.Jaxpr, index: fusion.Index, held: frozenset[int], 
             spans = [(candidate, places) for candidate in family.candidates(index, place)
                      if (places := _between(index, candidate.operands, candidate.outputs)) is not None
                      and not claimed & set(places)]
-            written = _first_equal(jaxpr, index, spans, accurate, _base=_base)
+            written = _first_equal(jaxpr, index, family, spans, accurate, _base=_base)
             if written is not None:
                 found.append(written)
                 claimed.update(written.places)
     return found
 
 
-def _first_equal(jaxpr: jcore.Jaxpr, index: fusion.Index, spans: Sequence[tuple[Candidate, tuple[int, ...]]],
-                 accurate: bool, *, _base: tuple[Hashable, Hashable] | None = None) -> fusion.Written | None:
+def _first_equal(jaxpr: jcore.Jaxpr, index: fusion.Index, family: Family,
+                 spans: Sequence[tuple[Candidate, tuple[int, ...]]], accurate: bool, *,
+                 _base: tuple[Hashable, Hashable] | None = None) -> fusion.Written | None:
     """The first of an anchor's candidates whose call takes a kernel of Dew's and whose region the e-graph
     proves computes it, written as its call; None where none is. Its regions are weighed in the order their
     first candidates come, each once: which of its candidates is equal and taken (`_chosen`), held by the
@@ -192,7 +193,8 @@ def _first_equal(jaxpr: jcore.Jaxpr, index: fusion.Index, spans: Sequence[tuple[
     for candidate, places in spans:
         regions.setdefault(places, []).append(candidate)
     for places, members in regions.items():
-        key = _region_key(jaxpr, index, places, members[0].outputs, accurate, members, _base=_base)
+        key = _region_key(jaxpr, index, family, places, members[0].outputs, accurate, members,
+                          _base=_base)
 
         def chose(places=places, members=members):
             # Its probes' routes are no program's: the routes a block collects are the kernels it runs.
@@ -213,18 +215,26 @@ _HELD_REGIONS: collections.OrderedDict[Hashable, Held[int | None]] = collections
 once."""
 
 
-def _region_key(jaxpr: jcore.Jaxpr, index: fusion.Index, places: tuple[int, ...],
+def _region_key(jaxpr: jcore.Jaxpr, index: fusion.Index, family: Family, places: tuple[int, ...],
                 outputs: Sequence[jcore.Var], accurate: bool, members: Sequence[Candidate], *,
                 _base: tuple[Hashable, Hashable] | None = None) -> Hashable:
-    """What a region's choice reads: its structure (`program.structure`, every value it reads an input), the
-    values of the constants among them (`_digest`: a statistic's divisor, an epsilon held as an array), the
-    ordered candidate identities (`Candidate.key`, distinguishing regions whose outer proofs drop candidates),
-    the numerics' forms, and the context its kernels are chosen in (`fusion.choice_context`)."""
+    """What a region's choice reads: the family its candidates are of (its choice an index into them), its
+    structure (`program.structure`, every value it reads an input), the values of the constants among them
+    (`_digest`: a statistic's divisor, an epsilon held as an array), the ordered candidate identities
+    (`Candidate.key`, distinguishing regions whose outer proofs drop candidates), the numerics' forms, and the
+    context its kernels are chosen in (`fusion.choice_context`)."""
     inputs = fusion.region_inputs(jaxpr, places)
     held = tuple(_digest(index.consts[var]) if var in index.consts else None for var in inputs)
     candidate_keys = tuple(candidate.key for candidate in members)
-    return (program.structure_of(inputs, [jaxpr.eqns[place] for place in places], outputs),
-            held, candidate_keys, accurate, fusion.choice_context_of(_base))
+    structure = program.structure_of(inputs, [jaxpr.eqns[place] for place in places], outputs)
+    return _family_key(family), structure, held, candidate_keys, accurate, fusion.choice_context_of(_base)
+
+
+def _family_key(family: Family) -> Hashable:
+    """A family as a held recognition's key reads it (`recognized`, `_region_key`): its anchor and its
+    candidates' provider by identity (`_cache.Same`: a registered family's module-level function, the same
+    every trace; any callable, hashable or not)."""
+    return family.anchor, _cache.Same(family.candidates)
 
 
 def _digest(value) -> Hashable:

@@ -1709,11 +1709,22 @@ class _Program[T: (Tiles, BackwardTiles)]:
 
     def whole_run(self, k_first, q_steps: int, spans: _Spans | None) -> tuple[jax.Array, jax.Array] | None:
         """The query tiles `[a, b)` that see the key block from `k_first` whole (`readers`' `whole`), one run
-        of them: a causal call's, from its diagonal to its first tile holding padding rows; None for a spans
-        call, whose whole tiles need not run unbroken, and for a full call, whose every tile but a padded
-        edge's is whole (ET-SEGS-h100: the run its own segment, 2% slower a full launch at width 64, 7%
-        faster a causal one at Qwen3-8B's)."""
-        return None if spans is not None or not self.causal else self._whole_run(k_first, q_steps)
+        of them: a causal call's, from its diagonal to its first tile holding padding rows, and a padded full
+        call's, before its first tile holding padding rows, none where the block holds padding keys; None
+        for a spans call, whose whole tiles need not run unbroken, and for a full call of whole tiles, every
+        tile whole (ET-SEGS-h100: the run its own segment, 2% slower a full launch at width 64, 7% faster a
+        causal one at Qwen3-8B's). A padded full call's edge tiles take their mask by its run's segments,
+        never chosen at run time: Mosaic GPU's layout inference found no layout for that choice in an RTX
+        5090's (sm120) one-warpgroup fused backward over 333 keys (row 14034); paired holders keep theirs
+        (`attention_mosaic_fused._walked_run`)."""
+        if spans is not None or not (self.causal or self.padded_edges):
+            return None
+        return self._whole_run(k_first, q_steps)
+
+    @property
+    def padded_edges(self) -> bool:
+        """Whether the call's last key or query tile holds padding (its keys or queries no whole tiles')."""
+        return self.keys % self.tiles.block_k != 0 or self.queries is not None
 
     def forward_whole_run(self, first, spans: _Spans | None) -> tuple[jax.Array | None, jax.Array] | None:
         """The key tiles `[0, whole_end)` a causal inference forward/dQ query block from `first` sees whole

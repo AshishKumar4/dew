@@ -18,7 +18,7 @@ from test_attention_template import CASES, arguments, geometry as core_geometry
 
 from dew.nn import programs
 from dew.nn.kernels import generation, tuning
-from dew.nn.kernels.templates import assembled, attention as template, attention_mosaic
+from dew.nn.kernels.templates import assembled, attention as template, attention_mosaic, swizzling
 from dew.nn.kernels.templates.hooks import Hook
 
 pytestmark = pytest.mark.kernel
@@ -891,7 +891,7 @@ def test_a_dq_ring_producer_and_reducer_hold_across_multiple_ordinals_on_one_rol
                     def _():
                         ring.reduced(0, 3, role=0)
 
-                pl.run_scoped(
+                swizzling.run_scoped(
                     scope,
                     plgpu.SMEM((placed.TURNS, dkv.REDUCED, block_q, slot_cols), jnp.float32),
                     tuple(plgpu.Barrier(num_barriers=dkv.REDUCED) for _ in range(placed.TURNS)),

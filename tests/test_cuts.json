@@ -211,43 +211,41 @@
 "tests/test_attention_compositions.py::test_forgetting_attention_by_default_runs_the_template_holding_no_written_out_bias[sm90]"
 ],
 "tests/test_attention_decode_template.py": [
-"tests/test_attention_decode_template.py::test_a_decode_plan_prices_its_merges_as_its_launch_merges[finished]",
-"tests/test_attention_decode_template.py::test_a_decode_plan_prices_its_merges_as_its_launch_merges[state]",
-"tests/test_attention_decode_template.py::test_a_decode_step_fuses_output_hooks_single_slice_and_split_interpreted[single-stateless]",
+"tests/test_attention_decode_template.py::test_a_decode_rows_logits_past_the_folds_reach_walk_again_natural_interpreted[one-query-None]",
+"tests/test_attention_decode_template.py::test_a_decode_step_fuses_output_hooks_single_slice_and_split_interpreted[split-head]",
 "tests/test_attention_decode_template.py::test_a_decode_step_fuses_output_hooks_single_slice_and_split_interpreted[split-output]",
 "tests/test_attention_decode_template.py::test_a_decode_step_fuses_output_hooks_single_slice_and_split_interpreted[split-query]",
-"tests/test_attention_decode_template.py::test_a_decode_step_given_its_caches_value_bounds_walks_as_one_given_none_interpreted[near-bf16s-largest-dense]",
-"tests/test_attention_decode_template.py::test_a_decode_step_launches_only_kernels_its_certification_held",
-"tests/test_attention_decode_template.py::test_a_decode_step_over_a_quantized_cache_is_on_par_interpreted[sm90-dense-float8_e4m3fn]",
-"tests/test_attention_decode_template.py::test_a_decode_step_through_the_template_is_on_par_interpreted[sm80-float16-mha-plain]",
-"tests/test_attention_decode_template.py::test_a_decode_step_through_the_template_is_on_par_interpreted[sm90-bfloat16-one-query-softcap]",
-"tests/test_attention_decode_template.py::test_a_decode_step_whose_programs_fill_the_gpu_finishes_each_row_in_its_walk_interpreted[sinks]",
-"tests/test_attention_decode_template.py::test_a_decode_step_with_output_hooks_compiles_spill_free[sm120-single]",
-"tests/test_attention_decode_template.py::test_a_decode_step_with_output_hooks_compiles_spill_free[sm80-split]",
+"tests/test_attention_decode_template.py::test_a_decode_step_fuses_output_hooks_single_slice_and_split_interpreted[split-stateless]",
+"tests/test_attention_decode_template.py::test_a_decode_step_given_its_caches_value_bounds_walks_as_one_given_none_interpreted[ordinary-dense]",
+"tests/test_attention_decode_template.py::test_a_decode_step_of_no_split_is_priced_at_its_keys_reads",
+"tests/test_attention_decode_template.py::test_a_decode_step_over_a_quantized_cache_is_on_par_interpreted[sm90-16-int8]",
+"tests/test_attention_decode_template.py::test_a_decode_step_through_the_template_is_on_par_interpreted[sm80-bfloat16-mha-softcap]",
+"tests/test_attention_decode_template.py::test_a_decode_step_through_the_template_is_on_par_interpreted[sm90-bfloat16-mha-plain]",
+"tests/test_attention_decode_template.py::test_a_decode_step_through_the_template_is_on_par_interpreted[sm90-float16-one-query-plain]",
+"tests/test_attention_decode_template.py::test_a_decode_step_with_output_hooks_compiles_spill_free[sm100-split]",
+"tests/test_attention_decode_template.py::test_a_decode_step_with_output_hooks_compiles_spill_free[sm80-single]",
 "tests/test_attention_decode_template.py::test_a_decode_step_with_output_hooks_compiles_spill_free[sm90-single-head]",
 "tests/test_attention_decode_template.py::test_a_decode_step_with_output_hooks_compiles_spill_free[sm90-split]",
 "tests/test_attention_decode_template.py::test_a_decode_steps_price_reads_its_keys_and_a_paged_pool_walks_no_fewer_steps",
-"tests/test_attention_decode_template.py::test_a_decode_steps_state_resumed_over_the_rest_of_its_keys_is_its_whole_softmax_interpreted[256-plain]",
-"tests/test_attention_decode_template.py::test_a_decode_steps_state_resumed_over_the_rest_of_its_keys_is_its_whole_softmax_interpreted[4096-plain]",
+"tests/test_attention_decode_template.py::test_a_decode_steps_state_resumed_over_the_rest_of_its_keys_is_its_whole_softmax_interpreted[256-sinks]",
 "tests/test_attention_decode_template.py::test_a_decode_steps_state_resumed_over_the_rest_of_its_keys_is_its_whole_softmax_interpreted[4096-sinks]",
 "tests/test_attention_decode_template.py::test_a_paged_decode_step_of_pages_smaller_than_its_tile_compiles_for_an_h100[16]",
-"tests/test_attention_decode_template.py::test_a_paged_decode_step_of_pages_smaller_than_its_tile_compiles_for_an_h100[1]",
 "tests/test_attention_decode_template.py::test_a_paged_decode_step_of_pages_smaller_than_its_tile_compiles_for_an_h100[4]",
-"tests/test_attention_decode_template.py::test_a_paged_decode_step_through_the_template_is_on_par_interpreted[one-query-sm80-4]",
-"tests/test_attention_decode_template.py::test_a_paged_decode_step_through_the_template_is_on_par_interpreted[verify-four-sm80-4]",
-"tests/test_attention_decode_template.py::test_a_split_decode_step_at_aligned_keys_beside_an_empty_row_is_on_par_interpreted",
-"tests/test_attention_decode_template.py::test_a_split_decode_steps_price_includes_the_native_merges_bytes_and_span",
+"tests/test_attention_decode_template.py::test_a_paged_decode_step_through_the_template_is_on_par_interpreted[one-query-sm90-128]",
+"tests/test_attention_decode_template.py::test_a_paged_decode_step_through_the_template_is_on_par_interpreted[verify-four-sm90-128]",
+"tests/test_attention_decode_template.py::test_a_split_absorbed_mla_decode_step_whose_values_are_its_keys_leading_columns_is_on_par_interpreted",
+"tests/test_attention_decode_template.py::test_a_split_decode_step_resumed_past_fp32s_largest_in_raw_units_keeps_its_share_interpreted",
 "tests/test_attention_decode_template.py::test_a_verify_blocks_drafts_read_their_prefix_causally_interpreted[16]",
 "tests/test_attention_decode_template.py::test_an_a100s_decode_walk_prices_its_larger_key_tile_at_or_below_its_smaller[1-32768-128]",
 "tests/test_attention_decode_template.py::test_an_fp32_decode_steps_programs_are_its_walks_grid_and_its_step_is_on_par_interpreted",
 "tests/test_attention_decode_template.py::test_an_inference_forward_compiles_spill_free_whether_or_not_it_decides[sm100-128]",
-"tests/test_attention_decode_template.py::test_an_inference_forward_compiles_spill_free_whether_or_not_it_decides[sm80-128]",
-"tests/test_attention_decode_template.py::test_an_inference_forward_compiles_spill_free_whether_or_not_it_decides[sm90-256]",
+"tests/test_attention_decode_template.py::test_an_inference_forward_compiles_spill_free_whether_or_not_it_decides[sm120-256]",
+"tests/test_attention_decode_template.py::test_an_inference_forward_compiles_spill_free_whether_or_not_it_decides[sm90-128]",
 "tests/test_attention_decode_template.py::test_one_row_decode_split_k_keeps_sm_utilization_and_per_slice_stage_depth",
 "tests/test_attention_decode_template.py::test_softcap_and_windowed_decode_compile_spill_free[sm100-softcap-d64-decode]",
 "tests/test_attention_decode_template.py::test_softcap_and_windowed_decode_compile_spill_free[sm120-softcap-d64-decode]",
 "tests/test_attention_decode_template.py::test_softcap_and_windowed_decode_compile_spill_free[sm80-softcap-d64-decode]",
-"tests/test_attention_decode_template.py::test_softcap_and_windowed_decode_compile_spill_free[sm90-softcap-d256-prefill]"
+"tests/test_attention_decode_template.py::test_softcap_and_windowed_decode_compile_spill_free[sm90-softcap-d64-decode]"
 ],
 "tests/test_attention_derived.py": [
 "tests/test_attention_derived.py::test_sm90_roofline_forward_and_fused_backward_compile_spill_free[128]",
@@ -423,8 +421,8 @@
 "tests/test_attention_mosaic_compile.py::test_a_deterministic_backward_holds_check_1_interpreted[causal]",
 "tests/test_attention_mosaic_compile.py::test_a_hook_that_forms_a_unit_axis_compiles_for_an_h100[1]",
 "tests/test_attention_mosaic_compile.py::test_a_paged_decode_step_compiles_spill_free_at_its_plans_tiles[p1-sm80]",
-"tests/test_attention_mosaic_compile.py::test_a_paged_decode_step_compiles_spill_free_at_its_plans_tiles[p16-sm100]",
-"tests/test_attention_mosaic_compile.py::test_a_paged_decode_step_compiles_spill_free_at_its_plans_tiles[p16-sm90]",
+"tests/test_attention_mosaic_compile.py::test_a_paged_decode_step_compiles_spill_free_at_its_plans_tiles[p1-sm90]",
+"tests/test_attention_mosaic_compile.py::test_a_paged_decode_step_compiles_spill_free_at_its_plans_tiles[p16-sm80]",
 "tests/test_attention_mosaic_compile.py::test_a_public_fp32_decode_fallback_reports_every_plain_forward_kernels_resources[sm100-256]",
 "tests/test_attention_mosaic_compile.py::test_a_public_fp32_decode_fallback_reports_every_plain_forward_kernels_resources[sm80-64]",
 "tests/test_attention_mosaic_compile.py::test_a_short_training_calls_backward_compiles_spill_free_for_an_a100[16-deterministic]",
@@ -466,8 +464,8 @@
 "tests/test_attention_mosaic_compile.py::test_the_backward_compiles_spill_free_as_its_model_decides[sm80-256-fast-none]",
 "tests/test_attention_mosaic_compile.py::test_the_backward_compiles_spill_free_as_its_model_decides[sm86-128-acc-alibi]",
 "tests/test_attention_mosaic_compile.py::test_the_backward_compiles_spill_free_as_its_model_decides[sm86-128-acc-key-bias]",
-"tests/test_attention_mosaic_compile.py::test_the_backward_compiles_spill_free_as_its_model_decides[sm86-128-acc-softcap]",
-"tests/test_attention_mosaic_compile.py::test_the_backward_compiles_spill_free_as_its_model_decides[sm86-128-fast-sinks]",
+"tests/test_attention_mosaic_compile.py::test_the_backward_compiles_spill_free_as_its_model_decides[sm86-128-acc-tile-bias]",
+"tests/test_attention_mosaic_compile.py::test_the_backward_compiles_spill_free_as_its_model_decides[sm86-128-fast-softcap]",
 "tests/test_attention_mosaic_compile.py::test_the_backward_compiles_spill_free_as_its_model_decides[sm89-128-acc-none]",
 "tests/test_attention_mosaic_compile.py::test_the_backward_compiles_spill_free_as_its_model_decides[sm89-64-fast-none]",
 "tests/test_attention_mosaic_compile.py::test_the_backward_compiles_spill_free_as_its_model_decides[sm90-128-acc-band-bias]",
@@ -478,7 +476,7 @@
 "tests/test_attention_mosaic_compile.py::test_the_backward_compiles_spill_free_as_its_model_decides[sm90-128-acc-softcap]",
 "tests/test_attention_mosaic_compile.py::test_the_backward_compiles_spill_free_as_its_model_decides[sm90-128-acc-temperature]",
 "tests/test_attention_mosaic_compile.py::test_the_backward_compiles_spill_free_as_its_model_decides[sm90-128-fast-alibi]",
-"tests/test_attention_mosaic_compile.py::test_the_backward_compiles_spill_free_as_its_model_decides[sm90-128-fast-row-indexed]",
+"tests/test_attention_mosaic_compile.py::test_the_backward_compiles_spill_free_as_its_model_decides[sm90-128-fast-none]",
 "tests/test_attention_mosaic_compile.py::test_the_backward_compiles_spill_free_as_its_model_decides[sm90-128-fast-softcap]",
 "tests/test_attention_mosaic_compile.py::test_the_backward_compiles_spill_free_as_its_model_decides[sm90-256-acc-none]",
 "tests/test_attention_mosaic_compile.py::test_the_backward_compiles_spill_free_as_its_model_decides[sm90-64-acc-none]",
@@ -820,10 +818,10 @@
 "tests/test_attention_triton_hooks.py::test_the_backward_is_on_par_under_every_score_hook[tile-bias-float32-accurate]"
 ],
 "tests/test_attention_witness.py": [
+"tests/test_attention_witness.py::test_each_backward_fault_is_refused_at_its_elements",
 "tests/test_attention_witness.py::test_each_fault_is_refused_at_its_elements",
 "tests/test_attention_witness.py::test_each_gradient_of_the_backward_lies_in_its_enclosure[capped-accurate]",
-"tests/test_attention_witness.py::test_each_gradient_of_the_backward_lies_in_its_enclosure[causal-accurate]",
-"tests/test_attention_witness.py::test_each_gradient_of_the_backward_lies_in_its_enclosure[documents-accurate]",
+"tests/test_attention_witness.py::test_each_gradient_of_the_backward_lies_in_its_enclosure[causal-fast]",
 "tests/test_attention_witness.py::test_each_gradient_of_the_backward_lies_in_its_enclosure[documents-fast]",
 "tests/test_attention_witness.py::test_each_gradient_of_the_backward_lies_in_its_enclosure[full-fast]",
 "tests/test_attention_witness.py::test_each_gradient_of_the_backward_lies_in_its_enclosure[window-fast]",
@@ -1572,10 +1570,12 @@
 ],
 "tests/test_delayed_nvfp4_parts.py": [
 "tests/test_delayed_nvfp4_parts.py::test_a_reference_an_earlier_dew_saved_is_refused_and_one_this_dew_saved_resumes",
+"tests/test_delayed_nvfp4_parts.py::test_a_reference_keeps_the_histories_it_started_with",
 "tests/test_delayed_nvfp4_parts.py::test_a_run_resumed_partway_through_a_held_update_rolls_what_its_taken_calls_recorded",
 "tests/test_delayed_nvfp4_parts.py::test_an_averaged_forward_reads_the_committed_histories",
 "tests/test_delayed_nvfp4_parts.py::test_an_earlier_dews_checkpoint_resumes_where_an_update_applied_and_is_refused_partway",
-"tests/test_delayed_nvfp4_parts.py::test_an_optimizer_holding_updates_back_rolls_the_largest_of_every_call_it_held"
+"tests/test_delayed_nvfp4_parts.py::test_an_optimizer_holding_updates_back_rolls_the_largest_of_every_call_it_held",
+"tests/test_delayed_nvfp4_parts.py::test_what_waits_rolls_once_an_update_applies_and_a_skipped_input_waits_for_none"
 ],
 "tests/test_delayed_nvfp4_training.py": [
 "tests/test_delayed_nvfp4_training.py::test_a_split_step_rolls_the_largest_its_microbatches_recorded_into_each_history_once_an_update"
@@ -1806,6 +1806,9 @@
 ],
 "tests/test_flight.py": [
 "tests/test_flight.py::test_a_step_pays_passes_ends_and_finishes_as_the_race_rules"
+],
+"tests/test_flow_cells.py": [
+"tests/test_flow_cells.py::test_the_model_widths_recurrence_cells_programs_fit_a_part_of_an_a100"
 ],
 "tests/test_flow_grpo.py": [
 "tests/test_flow_grpo.py::test_a_transitions_density_keeps_a_residual_whose_square_overflows",
@@ -3945,10 +3948,12 @@
 "tests/test_selective_template.py::test_a_forked_calls_training_step_compiles[sm90]",
 "tests/test_selective_template.py::test_a_routed_forked_training_step_compiles_spill_free[sm80]",
 "tests/test_selective_template.py::test_a_spilled_backward_takes_its_models_next_plan[sm80]",
-"tests/test_selective_template.py::test_large_input_gates_with_normal_or_zero_steps_keep_dx_finite_interpreted[skip cancelling]"
+"tests/test_selective_template.py::test_large_input_gates_with_normal_or_zero_steps_keep_dx_finite_interpreted[normal step]"
 ],
 "tests/test_sequence_parallel.py": [
-"tests/test_sequence_parallel.py::test_per_token_visibility_passes_through_either_exchange[gather runs-template]"
+"tests/test_sequence_parallel.py::test_per_token_visibility_passes_through_either_exchange[all-to-all images-xla]",
+"tests/test_sequence_parallel.py::test_per_token_visibility_passes_through_either_exchange[gather reversed slots-template]",
+"tests/test_sequence_parallel.py::test_per_token_visibility_passes_through_either_exchange[gather starts-xla]"
 ],
 "tests/test_served_episodes.py": [
 "tests/test_served_episodes.py::test_a_served_cohort_draws_what_its_policy_draws_whole[greedy-attention]",
@@ -4285,6 +4290,9 @@
 "tests/test_tree_speculation.py": [
 "tests/test_tree_speculation.py::test_a_trees_first_two_tokens_are_drawn_as_the_target_draws_them[picked]",
 "tests/test_tree_speculation.py::test_a_trees_forks_read_each_nodes_prefix_and_ancestors"
+],
+"tests/test_tuning.py": [
+"tests/test_tuning.py::test_a_tpu_step_of_another_librarys_kernels_alone_is_named_untunable_by_its_compiler"
 ],
 "tests/test_users_process.py": [
 "tests/test_users_process.py::test_a_flow_holds_in_a_process_that_computes_as_a_users_does[test_a_kinds_run_set_on_the_command_line_pools_logs_scores_and_keeps_as_set[diffusion]]",

@@ -27,7 +27,7 @@ import pytest
 from fla_sites import RECORDED, the_template_is_as_exact_as_fla
 from generation_support import COMPILES_ON_CPU, lowers, production_refusals
 from identity_cover import COVER_PRECISION, IDENTITY_COVER
-from kernel_compile import gate_generations
+from kernel_compile import gate_generations, runs
 from reference_error import assert_as_exact, declared_seeds
 from test_recurrence_chunk import (
     FORMED,
@@ -1454,19 +1454,20 @@ def compiled_cases(target: str, plans: dict, refused: list, apart: dict, only: t
 
 
 def planned_failures(found: list, plans: dict) -> list[str]:
-    """Each compiled kernel past its plan's shared memory (`template.planned`'s launch of its name,
-    from which the tiles are derived): the recurrence's shared-memory model, beside the gate's verdicts on
-    each kernel (`kernel_compile.mosaic_failures`)."""
-    def planned(record: dict, kernel: dict) -> int:
+    """Each compiled kernel of each build's run (`kernel_compile.runs`) past its case's plan's shared memory
+    (`template.planned`'s launch of its name, from which the tiles are derived): the recurrence's
+    shared-memory model, beside the gate's verdicts on each kernel (`kernel_compile.mosaic_failures`)."""
+    def planned(case: str, kernel: dict) -> int:
         # A kernel's launches the longest names that begin its own: `recurrence_intra_own` is no
         # `recurrence_intra`.
-        named = [launch for launch in plans[record['name']] if kernel['kernel'].startswith(launch.name)]
+        named = [launch for launch in plans[case] if kernel['kernel'].startswith(launch.name)]
         longest = max((len(launch.name) for launch in named), default=0)
         return max((launch.shared for launch in named if len(launch.name) == longest), default=0)
 
-    return [f"{record['name']} {kernel['kernel']}: {kernel['shared']} shared bytes past its plan's "
-            f"{planned(record, kernel)}" for record in found for kernel in record.get('kernels', ())
-            if kernel['shared'] is not None and not kernel['shared'] <= planned(record, kernel)]
+    return [f"{run['name']} {kernel['kernel']}: {kernel['shared']} shared bytes past its plan's "
+            f"{planned(record['name'], kernel)}"
+            for record in found for run in runs([record]) for kernel in run.get('kernels', ())
+            if kernel['shared'] is not None and not kernel['shared'] <= planned(record['name'], kernel)]
 
 
 def refused_kernels(record: dict, launches: set[str]) -> set[str]:
@@ -1476,17 +1477,17 @@ def refused_kernels(record: dict, launches: set[str]) -> set[str]:
 
 
 def apart_failures(found: list, apart: dict) -> list[str]:
-    """Each compiled case's launches held apart (`apart`, the names its model refuses by its label): every
-    launch its model admits as a required case's (`kernel_compile.mosaic_failures`: spill-free, every report
-    read), and every one it refuses free to spill, as certification would refuse it."""
+    """Each compiled case's launches held apart (`apart`, the names its model refuses by its label) in each
+    build's run (`kernel_compile.runs`): every one its model admits as a required case's (`mosaic_failures`:
+    spill-free, every report read), and every one it refuses free to spill, as certification refuses it."""
     from kernel_compile import mosaic_failures
 
     failed = []
-    for record in found:
-        refused = refused_kernels(record, apart[record["name"]])
-        admitted = [kernel for kernel in record.get("kernels", ()) if kernel["kernel"] not in refused]
+    for record, run in [(each, run) for each in found for run in runs([each])]:
+        refused = refused_kernels(run, apart[record["name"]])
+        admitted = [kernel for kernel in run.get("kernels", ()) if kernel["kernel"] not in refused]
         if admitted:
-            failed += mosaic_failures([{**record, "kernels": admitted}])
+            failed += mosaic_failures([{**run, "kernels": admitted}])
     return failed
 
 
@@ -1495,7 +1496,7 @@ def resource_failures(cases: list, found: list, plans: dict, apart: dict) -> lis
     launch holds, and forced variants' model-refused launches may spill."""
     from kernel_compile import failures, mosaic_failures
 
-    failed = failures(found) + planned_failures(found, plans)
+    failed = failures(runs(found)) + planned_failures(found, plans)
     required = [record for case, record in zip(cases, found, strict=True)
                 if case.required and case.name not in apart]
     failed += mosaic_failures(required)
@@ -1632,10 +1633,10 @@ def stepped_down(target: str, group: tuple, plans: dict, refused: list, apart: d
     cases = compiled_cases(target, plans, refused, apart, only=group, launched=launched)
     found = compile_mosaic_kernels(cases, target)
     while True:
-        spilling = {case.name: {kernel["kernel"] for kernel in record.get("kernels", ())
+        spilling = {case.name: {kernel["kernel"] for run in runs([record])
+                                for kernel in run.get("kernels", ())
                                 if assembled.refuses(kernel.get("spilled") or 0, kernel.get("losses", ()))
-                                and kernel["kernel"] not in
-                                refused_kernels(record, apart.get(case.name, set()))}
+                                and kernel["kernel"] not in refused_kernels(run, apart.get(case.name, set()))}
                     for case, record in zip(cases, found, strict=True) if case.required}
         # A case refused once at a config, and again at the config its derivation then gives (a launch's
         # producer raised a step, `Mosaic._settled`), never twice at one.

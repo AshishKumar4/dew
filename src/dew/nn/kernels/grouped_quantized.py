@@ -109,10 +109,14 @@ class MosaicPackedGmm(MosaicGmm):
         # whatever the bank's size, an empty one's too).
         stored = 0.5 + jnp.dtype(kernel.scales.dtype).itemsize / NVFP4.depth
         rows, stage = jnp.dtype(tokens.dtype).itemsize, jnp.dtype(kernel.dtype).itemsize
+        from .templates.gemm import pricing
+
+        # Each value's decode priced on the pipes its bit forms issue on (row 14106).
+        work = packed.nvfp4_decode_work()
         if tile.swapped:
-            return (stored, rows), ((0, 1), None)
+            return (stored, rows), (pricing.Decoded(0, 1, work), None)
         copies = 1 if packed.shared_decode(tile, interpret=False) else tile.warpgroups
-        return (rows, stored), (None, (stage, copies))
+        return (rows, stored), (None, pricing.Decoded(stage, copies, work))
 
     def _swaps_on(self, family: mosaic.Family, dtype) -> bool:
         # Swapped, its matrix's stages decode in registers into the products' left operand

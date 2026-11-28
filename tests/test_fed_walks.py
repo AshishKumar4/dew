@@ -96,8 +96,8 @@ def _fed_products(p, x, *, interpret, consumers: int = 2, lo: int = 0, unrolled:
                 across.summed_across(value, scratch, wg, consumers,
                                      lambda value, out=out: out.__setitem__(slice(None), value))
 
-        pl.run_scoped(total, **across.summing((FED_ROWS, FED_WIDTH), consumers),
-                      **({"collective_axes": "wg"} if threaded else {}))
+        swizzling.run_scoped(total, **across.summing((FED_ROWS, FED_WIDTH), consumers),
+                             **({"collective_axes": "wg"} if threaded else {}))
 
     out = jax.ShapeDtypeStruct((FED_ROWS, FED_WIDTH), jnp.float32)
     return family.kernel(body, out_type=(out, out), grid=(1,), grid_names=("programs",), consumers=consumers,

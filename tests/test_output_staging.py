@@ -6,10 +6,9 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from generation_support import INTERPRETS, on_the_host
-from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
-from dew.nn.kernels.templates import bundles, stores
+from dew.nn.kernels.templates import bundles, stores, swizzling
 
 NVFP4 = (stores.Output((64, 256), jnp.uint8, 2), stores.Output((64, 256), jnp.float8_e4m3fn, 16))
 """A 64-row share of a 256-column NVFP4 tile's codes (two to a byte) and scales (one a 16-column block)."""
@@ -126,7 +125,7 @@ def _packed_store(rows: int, columns: int, divisor: int, chunk: int, *, transpos
                                  transposed=transposed)
             plgpu.wait_smem_to_gmem(0)
 
-        pl.run_scoped(scoped, plgpu.SMEM((2, *block), jnp.float32))
+        swizzling.run_scoped(scoped, plgpu.SMEM((2, *block), jnp.float32))
 
     total = rows if out_rows is None else out_rows
     width = columns // divisor if out_columns is None else out_columns

@@ -461,16 +461,27 @@ class _Paired:
         return not self.pairing.with_ynn
 
     def __call__(self, *inputs, **options):
-        if self.pairing.with_ynn:
-            return self.plain(*inputs, **options)
-        compiled = self.ahead.get(_signature(inputs)) if self.ahead and not options else None
-        return (compiled or self.without)(*inputs, **options)
+        ahead = self.ahead and not options and not self.pairing.with_ynn
+        compiled = self.ahead.get(_signature(inputs)) if ahead else None
+        return (compiled or self.selected)(*inputs, **options)
+
+    @property
+    def selected(self) -> Callable:
+        """The program the arm runs (`plain` or `without`, as its pairing decided), whose trace and lowering
+        are its own."""
+        return self.plain if self.pairing.with_ynn else self.without
 
     @property
     def trace(self):
         """The trace of the arm the site runs (JAX's `jit(...).trace`), where it is a compiled program's:
         an arm of Dew's own programs has none."""
-        return (self.plain if self.pairing.with_ynn else self.without).trace
+        return self.selected.trace
+
+    @property
+    def lower(self):
+        """The lowering of the program the arm runs (`selected`), where it is a compiled program's: an arm of
+        Dew's own programs has none."""
+        return self.selected.lower
 
 
 def _signature(inputs) -> tuple:

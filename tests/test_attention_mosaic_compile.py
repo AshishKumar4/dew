@@ -18,10 +18,10 @@ from generation_support import COMPILES_FOR_TPU, COMPILES_ON_CPU, INTERPRETS, lo
 from jax.sharding import AbstractDevice, AbstractMesh, AxisType, Mesh
 from kernel_compile import (
     compile_mosaic_kernels,
+    failing_runs,
     gate_generations,
     lowered_for,
     mosaic_failures,
-    refused_across_build_failures,
 )
 from test_attention_mosaic import (
     BACKWARD_HOOKS,
@@ -452,11 +452,14 @@ def test_a_decode_step_compiles_spill_free_at_its_plans_tiles(generation_name, w
     failed = mosaic_failures(found)
     if failed and stored == "int8":
         record = found[0]
-        offered = [cert for cert in record.get("certifications", ()) if cert["op"] == "MosaicForward"]
-        assert "derives no config" in record.get("error", ""), "\n".join(failed)
-        assert not record.get("uncertified"), record
-        assert offered and all(any(refused for _, _, refused in cert["kernels"].values())
-                               for cert in offered), "\n".join(failed)
+        # Refused as every build's GPUs refuse it, each build's run on its own judged evidence: no build's run
+        # lowers a program the gate failed.
+        for run in failing_runs(record):
+            offered = [cert for cert in run.get("certifications", ()) if cert["op"] == "MosaicForward"]
+            assert "derives no config" in run.get("error", ""), "\n".join(failed)
+            assert not run.get("uncertified") and not run.get("unjudged"), run
+            assert offered and all(any(refused for _, _, refused in cert["kernels"].values())
+                                   for cert in offered), "\n".join(failed)
     else:
         assert not failed, "\n".join(failed)
 
@@ -686,12 +689,15 @@ def _check_backward_case(generation_name: str, width: int, accurate: bool, hooks
         return
     if mandatory:
         assert not failed, "\n".join(failed)
-    assert record.get("exhausted"), "\n".join(failed)
-    assert not record.get("uncertified"), record
-    assert offered and all(any(refused for _, _, refused in cert["kernels"].values())
-                           for cert in offered), "\n".join(failed)
-    # Every offer refused under every build its GPUs run, none taken ungated where another build holds it.
-    assert not refused_across_build_failures(record), "\n".join(refused_across_build_failures(record))
+    # Declined as every build's GPUs decline it, each build's run on its own judged evidence: each run that
+    # fails exhausted its derivation, every config it offered refused, none taken ungated where another
+    # build holds a config (row 10766).
+    for run in failing_runs(record):
+        refusals = [cert for cert in run.get("certifications", ()) if cert["op"] == type(op).__name__]
+        assert run.get("exhausted"), "\n".join(failed)
+        assert not run.get("uncertified") and not run.get("unjudged"), run
+        assert refusals and all(any(refused for _, _, refused in cert["kernels"].values())
+                                for cert in refusals), "\n".join(failed)
 
 
 @COMPILES_ON_CPU
@@ -2164,4 +2170,31 @@ def test_a_g4s_full_training_step_lowers_with_no_value_of_another_trace(without_
     mesh = generation.gpu_mesh(Mesh(np.array(jax.devices()[:1]), ("data",)), "sm120")
     with generation.assumed("sm120"), jax.sharding.use_abstract_mesh(mesh):
         jax.jit(step).trace(query, key, key).lower(lowering_platforms=("cuda",))
+
+
+@lowers("sm120")
+@pytest.mark.parametrize("call", ["full", "causal"])
+def test_a_g4s_fused_backward_over_padded_tiles_lowers(call, without_deterministic_ops):
+    """A G4's (sm120) training step over 333 queries and keys (12 heads 64 wide, bf16), its backward the fused
+    one-warpgroup launch (`BackwardTiles` pinned, 64 x 64 on mma.sync's fed rings): a full call's padded
+    edge tiles take their mask by its walk's segments (`_Program.whole_run`), as a causal call's do, where
+    their mask chosen at run time left Mosaic GPU's layout inference no layout ("Failed to infer a possible
+    set of layouts", row 14034: simple-mmdit-b's step on one device)."""
+    shape = jax.ShapeDtypeStruct((1, 333, 12, 64), jnp.bfloat16)
+    tiles = attention_mosaic.BackwardTiles(block_q=64, block_k=64, stages=3, consumers=1, fused=True,
+                                           family="mma.sync.fed", columns=1)
+
+    def step(q, k, v):
+        def loss(q, k, v):
+            out = scaled_dot_product_attention(q, k, v, causal=call == "causal", implementation="template")
+            return jnp.sum(out.astype(jnp.float32))
+        return jax.grad(loss, argnums=(0, 1, 2))(q, k, v)
+
+    mesh = generation.gpu_mesh(Mesh(np.array(jax.devices()[:1]), ("data",)), "sm120")
+    with (generation.assumed("sm120"), jax.sharding.use_abstract_mesh(mesh),
+          tuning.pinned({attention_mosaic.MosaicBackward: tiles}), tuning.seen() as found):
+        jax.jit(step).trace(shape, shape, shape).lower(lowering_platforms=("cuda",))
+    # The fused launch the pin names traced, the one-warpgroup walk row 14034's step took.
+    taken = [entry.config for entry in found if isinstance(entry.op, attention_mosaic.MosaicBackward)]
+    assert taken == [tiles], taken
 

@@ -106,10 +106,9 @@ def fused_program(jaxpr: jcore.Jaxpr, *, _base: tuple[Hashable, Hashable] | None
     for found in _regions(index):
         if held & set(found.places):
             continue
-        taken = _taken(index, found, lambda region: _decided(
-            _identity(jaxpr, region), lambda: _takes(index, region), _base=base))
-        if taken is not None:
-            identities[taken] = _identity(jaxpr, taken)
+        selected = taken(index, found, _base=base)
+        if selected is not None:
+            identities[selected] = _identity(jaxpr, selected)
     products = list(identities)
     # A norm a product's prologue replays is the product's (`_prologue`), as an epilogue's norm is.
     held |= {place for region in products for place in region.replayed}
@@ -471,6 +470,27 @@ def analyzed(index: Index, region: Region):
         return fused_gemm.analysis(_replayed(index.jaxpr, region, fused_gemm), *inputs)
 
 
+def decided(index: Index, region: Region, *, _base: tuple[Hashable, Hashable] | None = None
+            ) -> RegionDecision:
+    """`region` of `index`'s body as `fused_program` decides it (`_takes`, held for its structure in the
+    context a kernel is chosen in, `_decided`, its trace-stable part `_base` where the caller has it):
+    whether it is fused, and whether the region without its prologue or without its epilogue could be
+    (`RegionDecision`). A caller weighing a region's variants itself (`regions`, `fewer`, `analyzed`)
+    reads the pass's rule by it, never a copy of it."""
+    return _decided(_identity(index.jaxpr, region), lambda: _takes(index, region), _base=_base)
+
+
+def taken(index: Index, region: Region, *, _base: tuple[Hashable, Hashable] | None = None) -> Region | None:
+    """The region of `region`'s product `fused_program` selects to fuse, as it selects it (`_taken`):
+    `region`, or the region of most stages of fewer that the pass's decisions reach (`decided`, each in one
+    context, `_base`, computed once where the caller gives none), None where none is taken. A selection, not
+    a written region: `fused_program` sets aside first a region an attention or recurrence region
+    `recognize` writes holds an equation of (`regions`), and writes no selected region whose call's traced
+    types differ from the program's (`_traced`, `_unwritten`)."""
+    base = base_context() if _base is None else _base
+    return _taken(index, region, lambda found: decided(index, found, _base=base))
+
+
 def _regions(index: Index) -> list[Region]:
     """Each product of `jaxpr` (`product_form`), its prologue (`_prologue`) and the elementwise equations
     after it that read its values, each of the product's shape over operands that follow its tiles
@@ -803,9 +823,9 @@ def _unwritten(region: Written, trace: _Trace) -> None:
     made = [str(var.aval) for var in trace.equation.outvars]
     own = [str(var.aval) for var in region.outputs]
     refusal = Refusal(UNWRITTEN, f"its written call makes {made}, not the region's own {own}")
-    for taken in trace.record.routes:
-        generation.published(taken if taken.kernel == "xla" else dataclasses.replace(
-            taken, kernel="xla", preferred=taken.kernel, refusal=refusal))
+    for route in trace.record.routes:
+        generation.published(route if route.kernel == "xla" else dataclasses.replace(
+            route, kernel="xla", preferred=route.kernel, refusal=refusal))
 
 
 def _spliced(jaxpr: jcore.Jaxpr, regions: Sequence[Written], *,

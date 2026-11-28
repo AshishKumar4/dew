@@ -603,3 +603,37 @@ def test_a_one_operand_lop3_reads_its_immediate_as_both_other_operands():
         minterms = (held << 2) | (other << 1) | other
         expected = np.sum(((np.uint32(table) >> minterms) & 1) << lanes, axis=-1, dtype=np.uint64)
         np.testing.assert_array_equal(form.decoded(words)[0], expected, err_msg=f"table {table:#04x}")
+
+
+def seeded_as_computed() -> None:
+    """`tools/superoptimize_bits.seed` against its references, in the tool's own environment (run by
+    test_the_bit_tracer_seeds_a_booleans_not_and_refuses_an_arithmetic_shift_by_a_value): a boolean's NOT,
+    held as 0 or 1, is its other value on every word; an arithmetic shift by a value is refused."""
+    from tools import superoptimize_bits
+
+    words = np.array([0, 1, 5, 0x80000000, 0xFFFFFFFF], np.uint32)
+
+    def nonzero(words):
+        return jnp.logical_not(words == 0).astype(jnp.uint32)
+
+    def shifted_by_its_low_bits(words):
+        return (words.astype(jnp.int32) >> (words & 7).astype(jnp.int32)).astype(jnp.uint32)
+
+    [seeded] = superoptimize_bits.seed(nonzero).decoded(words)
+    np.testing.assert_array_equal(seeded, np.asarray(nonzero(jnp.asarray(words))))
+    with pytest.raises(ValueError):
+        superoptimize_bits.seed(shifted_by_its_low_bits)
+
+
+def test_the_bit_tracer_seeds_a_booleans_not_and_refuses_an_arithmetic_shift_by_a_value():
+    """The nonlinear search's tracer (`tools/superoptimize_bits.seed`, §7.3), run in a fresh interpreter under
+    its own PEP 723 environment (its Z3, no dependency of Dew's, layered by `uv run --with`): a boolean's NOT
+    seeds its other value (it seeded the word's complement, 0 and 1 to 0xffffffff and 0xfffffffe), and an
+    arithmetic shift by a value, which no step of the vocabulary states, is refused (it seeded a left
+    shift)."""
+    from release_support import ROOT, under_release
+
+    from tools import check_tool_types
+
+    [(_, [requirement])] = check_tool_types.environments_of(ROOT / "tools" / "superoptimize_bits.py", {})
+    under_release(requirement, seeded_as_computed)

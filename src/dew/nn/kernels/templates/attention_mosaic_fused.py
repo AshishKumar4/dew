@@ -528,6 +528,10 @@ def _walked_run(program, consumers: int, firsts: tuple, q_steps: int, spans_of):
     pair_first, k_first = firsts
     if not dq_summed(family, consumers):
         return program.whole_run(k_first, q_steps, spans_of)
+    if not program.causal:
+        # A padded full call's paired holders choose each tile's mask at run time, each its own (their runs'
+        # intersection masked a holder's valid tiles where its partner's block held padding).
+        return None
     runs = [program.whole_run(pair_first + index * block_k, q_steps, spans_of) for index in range(consumers)]
     if any(run is None for run in runs):
         return None

@@ -1311,22 +1311,27 @@ def test_the_default_form_is_finite_where_the_truth_is_at_fp32s_edges(family):
     default_is_finite(family, "portable")
 
 
-@pytest.mark.skipif(not (INTERPRETED or ON_HOPPER),
-                    reason="runs interpreted as Hopper on CPU or compiled on Hopper (row 6881)")
+@pytest.mark.parametrize("interpreted", [
+    pytest.param(True, marks=pytest.mark.cpu(reason="interpreted on the CPU lane"), id="interpreted"),
+    pytest.param(False, marks=pytest.mark.gpu(reason="native on a GPU"), id="native")])
 @pytest.mark.parametrize("family", ["values at fp32's largest over 2 equal keys",
                                     "values at fp32's largest over 256 equal keys"])
-def test_the_mosaic_forward_of_values_at_fp32s_largest_is_as_exact_as_the_reference_interpreted(family):
-    """The Mosaic forward in fp32, routed through `attention_route.attend` (interpreted on a CPU as an H100
-    runs it, or compiled natively on Hopper; rows 6842, 6869, 6881), over values at fp32's limit: check 1
-    over the family's draws, where it summed its operands' bf16 parts and its products' pairs largest first
-    and passed fp32's largest before the smaller terms took it back (inf over 2 keys already)."""
+def test_the_mosaic_forward_of_values_at_fp32s_largest_is_as_exact_as_the_reference_interpreted(family,
+                                                                                               interpreted):
+    """The Mosaic forward in fp32, routed through `attention_route.attend` (interpreted on the CPU lane as an
+    H100 runs it, or compiled natively on Hopper, gpu-marked; rows 6842, 6869, 6881), over values at fp32's
+    limit: check 1 over the family's draws, where it summed its operands' bf16 parts and its products' pairs
+    largest first and passed fp32's largest before the smaller terms took it back (inf over 2 keys
+    already)."""
+    if not interpreted and not ON_HOPPER:
+        pytest.skip("compiled natively on Hopper (row 6881)")
     seeds, family = SEEDS[family], FAMILIES[family]
 
     def forward(query, key, value, extra):
         spans = _spans(family, query, key)
         # An fp32 call's Mosaic parts are the default precision's alone (`MosaicForward.refusal`); the suite
         # runs at HIGHEST.
-        if INTERPRETED:
+        if interpreted:
             with generation.assumed("sm90"), jax.default_matmul_precision("default"):
                 return attention_mosaic.forward(query, key, value, spans, None, interpret=True)
         with generation.chosen(attention_mainloop="mosaic"), jax.default_matmul_precision("default"):
@@ -1336,7 +1341,7 @@ def test_the_mosaic_forward_of_values_at_fp32s_largest_is_as_exact_as_the_refere
         assert_as_exact(jax.jit(forward), as_given(jax.jit(_reference(family, anchored=False))),
                         lambda seed: _cast(family, family.draw)(seed)[:4], "mosaic forward at fp32's limit",
                         seeds=seeds, truth_fn=_reference(family, anchored=True))
-    if not INTERPRETED:
+    if not interpreted:
         assert any(found.choice == "attention_mainloop" and found.kernel == "mosaic"
                    for found in routes), routes
 
@@ -1993,12 +1998,23 @@ def test_a_bf16_call_of_wide_logits_scaled_after_keeps_its_bf16_product():
     """The reference path's bf16 call with wide logits scaled after (`wide_logits`, `scale_logits`) under an
     ambient F16_F16_F32 preset: its logits' product takes jax.nn's bf16 preset for its own bf16 operands
     (`attention.unscaled_scores`' `dtype`), so a query and key of 2^20 give finite logits and a finite
-    output, where read off the widened operands it took the ambient fp16 product, whose operands overflow."""
+    output, where read off the widened operands it took the ambient fp16 product, whose operands overflow.
+    An arm of no site (`ahead_arm`), its operands host arrays: compiled in a GPU part's prepare and run as
+    that executable in its run (bible section 8: no dense math on the node's CPU, whose default device there
+    is a compile-only GPU)."""
+    from reference_error import ahead_arm
+
     from dew.nn.attention import reference_attention
 
-    query = jnp.zeros((1, 2, 1, 8), jnp.bfloat16).at[..., 0].set(2.0 ** 20)
-    value = jnp.ones((1, 2, 1, 8), jnp.bfloat16)
-    with jax.default_matmul_precision("F16_F16_F32"):
-        out = reference_attention(query, query * 2.0 ** -40, value, dtype=jnp.bfloat16, wide_logits=True,
-                                  scale_logits=True)
+    query = np.zeros((1, 2, 1, 8), jnp.bfloat16)
+    query[..., 0] = 2.0 ** 20
+    key = (query.astype(np.float32) * 2.0 ** -40).astype(jnp.bfloat16)
+    value = np.ones((1, 2, 1, 8), jnp.bfloat16)
+
+    def attended(query, key, value):
+        with jax.default_matmul_precision("F16_F16_F32"):
+            return reference_attention(query, key, value, dtype=jnp.bfloat16, wide_logits=True,
+                                       scale_logits=True)
+
+    out = ahead_arm(jax.jit(attended), "bf16 wide logits scaled after")(query, key, value)
     assert np.isfinite(np.asarray(out, np.float32)).all()
