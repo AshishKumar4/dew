@@ -671,3 +671,32 @@ def test_a_draw_on_the_host_chooses_the_hosts_kernels():
     host = generation.device_generation()
     with generation.assumed("sm90"):
         assert drawn_on_the_host(lambda _: generation.device_generation(), 0) == host
+
+
+def test_a_prepares_failure_inside_a_site_is_recorded_by_its_label(tmp_path):
+    """A prepare that fails inside a Check 1 site before it is kept (its draws, its truth's tracing), its
+    failure recorded by the suite's hook (tests/conftest.py's `recorded_unprepared`), names that site by its
+    label, never by its call's opening line, which two of a test's sites may share (train 1498's F2); one that
+    fails outside any site names its line's text."""
+    import json
+
+    import pytest
+    import tier_wire
+    from conftest import recorded_unprepared
+
+    def failing(seed):
+        raise ValueError("a draw that cannot be made")
+
+    test = "tests/test_gate_arms.py::test_a_prepares_failure_inside_a_site_is_recorded_by_its_label"
+    with compiled_truths(tmp_path / "inside", prepare=True, stamp="here"):
+        with pytest.raises(ValueError) as inside:
+            assert_as_exact(_combined, _combined, failing, "a site whose draw fails", seeds=8)
+        recorded_unprepared(tmp_path / "inside", test, inside)
+    with compiled_truths(tmp_path / "outside", prepare=True, stamp="here"):
+        with pytest.raises(ValueError) as outside:
+            failing(0)
+        recorded_unprepared(tmp_path / "outside", test, outside)
+    (inside_reason,) = json.loads((tmp_path / "inside" / UNPREPARED).read_text())["reasons"]
+    (outside_reason,) = json.loads((tmp_path / "outside" / UNPREPARED).read_text())["reasons"]
+    assert inside_reason["site"] == f"{tier_wire.LABELED}a site whose draw fails"
+    assert outside_reason["site"] == "failing(0)"

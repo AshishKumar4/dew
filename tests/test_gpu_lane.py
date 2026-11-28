@@ -511,8 +511,9 @@ def test_two_sites_opening_on_one_line_are_two_cells_by_their_labels(ci, tmp_pat
                                 site=label)
     (first,), (second,) = (json.loads((tmp_path / name / tier_wire.UNPREPARED).read_text())["reasons"]
                            for name in ("merged-forward", "merged-backward"))
-    assert (first["where"], first["site"]) == ("tests/test_gpu_attention.py:83", "merged forward")
-    assert (second["where"], second["site"]) == ("tests/test_gpu_attention.py:83", "merged backward")
+    at = "tests/test_gpu_attention.py:83"
+    assert (first["where"], first["site"]) == (at, f"{tier_wire.LABELED}merged forward")
+    assert (second["where"], second["site"]) == (at, f"{tier_wire.LABELED}merged backward")
     main = {(test, first["where"], None, "site", first["site"])}
     found = {"name": "3.12:tests/test_gpu_attention.py#5/25@prepare-sm90", "exitCode": 0, "output": ""}
     left = {"test": test, "where": second["where"], "error": second["error"], "kind": "site",
@@ -521,6 +522,35 @@ def test_two_sites_opening_on_one_line_are_two_cells_by_their_labels(ci, tmp_pat
                                lambda named: ci.grading.owning(ci.parsed_row(named)[1]), ci.grading.STALE,
                                ci.tier_wire().CAPPED)
     assert row["new_unprepared"] == [f"{test} @ tests/test_gpu_attention.py:83"]
+
+
+def test_a_label_and_a_line_s_text_are_two_kinds_of_site_never_compared(ci):
+    """A site's identity is its Check 1 label (tests/tier_wire.py's `LABELED`) or, in a baseline written
+    before labels were kept, its line's text: two kinds a grade never compares (prepares.py's `knowing`), so a
+    site unchanged since an older baseline stays green; two labels are compared, an A→B swap red; and a flow's
+    cell is its label (`cell`) whatever its site says (train 1498's F1)."""
+    name = "3.12:tests/test_gpu_attention.py#5/25@prepare-sm90"
+    test = "tests/test_gpu_attention.py::test_merged"
+    where = "tests/test_gpu_attention.py:83"
+    labeled = ci.tier_wire().LABELED
+
+    def graded(records, before):
+        found = {"name": name, "exitCode": 0, "output": ""}
+        [row] = ci.prepares.graded([found], {"tests/test_gpu_attention.py": records}, before, "sm90",
+                                   lambda named: ci.grading.owning(ci.parsed_row(named)[1]),
+                                   ci.grading.STALE, ci.tier_wire().CAPPED, label_prefix=labeled)
+        return row
+    site = {"test": test, "where": where, "error": "e", "kind": "site", "site": f"{labeled}merged forward"}
+    old_site = {(test, where, None, "site", "assert_as_exact(")}
+    assert graded([site], old_site)["exitCode"] == 0
+    swapped = {(test, where, None, "site", f"{labeled}merged backward")}
+    assert graded([site], swapped)["new_unprepared"] == [f"{test} @ {where}"]
+    flow = {"test": test, "where": where, "error": "e", "kind": "flow", "cell": "merged forward",
+            "site": f"{labeled}merged forward"}
+    old_flow = {(test, where, "merged forward", "flow", "assert_as_exact(")}
+    assert graded([flow], old_flow)["exitCode"] == 0
+    other_flow = {(test, where, "merged backward", "flow", f"{labeled}merged backward")}
+    assert graded([flow], other_flow)["new_unprepared"] == [f"{test} @ {where} [merged forward]"]
 
 
 def test_a_cell_its_prepares_cap_left_is_named_and_counted_but_reds_no_row(ci):

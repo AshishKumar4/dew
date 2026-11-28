@@ -49,7 +49,7 @@ from typing import Any
 import jax
 import numpy as np
 from store_wire import COMPILED, SITE_IN_PROGRESS
-from tier_wire import UNPREPARED, PastCap
+from tier_wire import LABELED, UNPREPARED, PastCap
 from tool_support import load
 
 
@@ -648,7 +648,10 @@ def unprepared(directory: Path, test: str, frames: Sequence[tuple[str, int]], wh
     # The test's file as CI's grading reads a node id (`tools/armada/grading.py`'s `owning`).
     path = Path(load("grading", "tools/armada").owning(test))
     lines = [(file, line) for file, line in frames if Path(file).name == path.name]
-    site = site or (linecache.getline(lines[0][0], lines[0][1]).strip() if lines else "")
+    # A label's identity says so (`tier_wire.LABELED`), a line's text, the fallback outside any site, as
+    # records before labels were kept: two kinds a grade never compares (prepares.py's `knowing`).
+    site = f"{LABELED}{site}" if site else (
+        linecache.getline(lines[0][0], lines[0][1]).strip() if lines else "")
     reasoned(directory / record, test, f"{path}:{lines[0][1]}" if lines else str(path), why, cell,
              site=site or None)
 

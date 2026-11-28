@@ -195,11 +195,7 @@ def pytest_runtest_makereport(item, call):
     if (call.when == "call" and call.excinfo is not None
             and not call.excinfo.errisinstance(pytest.skip.Exception) and tier_wire.preparing()
             and (store := _sites_store(item)) is not None and not any(store.glob("*/site.json"))):
-        from truths_ahead import UNPREPARED, unprepared
-
-        frames = [(str(entry.path), entry.lineno + 1) for entry in reversed(call.excinfo.traceback)]
-        unprepared(store, item.nodeid, frames, call.excinfo.exconly().splitlines()[0][:400])
-        where = json.loads((store / UNPREPARED).read_text())["where"]
+        where = recorded_unprepared(store, item.nodeid, call.excinfo)
         report = outcome.get_result()
         report.outcome, report.longrepr = "skipped", (str(item.path), item.location[1] or 0,
                                                       f"computes before its first check-1 site, at {where}: "
@@ -352,6 +348,23 @@ def judged_on_zeros(excinfo) -> bool:
 
     store = store_wire.COMPILED.get()
     return store is not None and store.judged_its_zeros(excinfo.value)
+
+
+def recorded_unprepared(store: Path, test: str, excinfo) -> str:
+    """A test's failure in its prepare (`excinfo`) recorded unprepared in its `store`
+    (`truths_ahead.unprepared`), and where it stood: the Check 1 site it stopped in its identity
+    (`CompiledTruths.preparing`'s tried and not done, a site's label and not its arms' beside it, the labels
+    joined where it stopped in several), its line's text alone where it stopped in none."""
+    import store_wire
+    from truths_ahead import UNPREPARED, unprepared
+
+    compiled = store_wire.COMPILED.get()
+    open_ = sorted(compiled.tried - compiled.done) if compiled is not None else []
+    # A site's own label, never its arms' beside it (`arm_store.armed`: the label, then ", its arms").
+    open_ = [label for label in open_ if not any(label.startswith(f"{other}, ") for other in open_)]
+    frames = [(str(entry.path), entry.lineno + 1) for entry in reversed(excinfo.traceback)]
+    unprepared(store, test, frames, excinfo.exconly().splitlines()[0][:400], site=" | ".join(open_) or None)
+    return json.loads((store / UNPREPARED).read_text())["where"]
 
 
 def _sites_store(item) -> Path | None:
