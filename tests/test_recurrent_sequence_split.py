@@ -97,12 +97,10 @@ def test_a_split_idle_rows_rate_gradient_is_zero_whatever_its_rate(name):
     params = dict(variables['params'], A_log=jnp.full_like(variables['params']['A_log'], 100.0))
     mesh = MeshSpec(sequence=4).build(jax.devices()[:4])
 
-    def loss(params, valid):
-        call = MixerCall(AttentionMetadata(coordinates=coordinates(valid=valid)))
-        return jnp.sum(module.apply({**variables, 'params': params}, x, call))
-
+    call = MixerCall(AttentionMetadata(coordinates=coordinates(valid=jnp.zeros((SPLIT_BATCH, 32), bool))))
+    summed = jax.grad(lambda params: jnp.sum(module.apply({**variables, 'params': params}, x, call)))
     with jax.set_mesh(mesh):
-        found = jax.jit(jax.grad(loss))(params, jnp.zeros((SPLIT_BATCH, 32), bool))
+        found = jax.jit(summed)(params)
     np.testing.assert_array_equal(np.asarray(found['A_log']), np.zeros_like(np.asarray(found['A_log'])))
 
 

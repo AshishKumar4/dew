@@ -27,7 +27,7 @@ from jax.ad_checkpoint import checkpoint_name
 
 from dew import _cache
 from dew.nn import derivatives, norms
-from dew.nn.kernels import chunked_launch, generation, recurrence
+from dew.nn.kernels import chunked_launch, generation
 from dew.nn.kernels.templates import base, bundles, cost, mosaic, report, resources, sass
 from dew.nn.kernels.templates.recurrence import chunk_forward, mainloop, mainloop_backward
 from dew.nn.precision import at_least_fp32
