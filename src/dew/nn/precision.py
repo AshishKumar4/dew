@@ -40,6 +40,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from flax.typing import Dtype, PrecisionLike
+from jax.core import ShapedArray, Tracer
 from jax.extend import core
 from jax.typing import DTypeLike
 from numpy.lib.array_utils import normalize_axis_tuple
@@ -130,6 +131,7 @@ __all__ = [
     "precision_names",
     "products_dtype",
     "projection_role",
+    "ragged",
     "recipe_role",
     "refuse_recipe",
     "rms_statistics",
@@ -877,17 +879,82 @@ def accumulated(product: Callable[..., jax.Array], *operands,
     on a CPU, states its fp32 sums with JAX's dot algorithm for them, `with
     jax.default_matmul_precision(FP32_SUMS)`, which jit's cache keys as it keys every precision."""
     if _ragged(product):
-        # A ragged dot's group sizes count its rows and multiply nothing (`counts`): its product is of the two
-        # others, the sizes passed through as they are.
-        *multiplied, _ = operands
-        if _sums_in_float64(*multiplied):
-            return _summed_wide(product, preferred_element_type, *operands, counts=1)
-        return product(*operands, preferred_element_type=preferred_element_type)
+        return ragged(product, *operands, preferred_element_type=preferred_element_type, summed_wide=True)
     if not _sums_in_float64(*operands):
         return product(*operands, preferred_element_type=preferred_element_type)
     if (key := _contraction(product, preferred_element_type)) is not None:
         return _traced_once(key, _summed_wide)(*operands)
     return _summed_wide(product, preferred_element_type, *operands)
+
+
+def ragged(product: Callable[..., jax.Array], *operands, preferred_element_type: DTypeLike | None = None,
+           summed_wide: bool = False) -> jax.Array:
+    """`product(*operands, preferred_element_type=...)`, a ragged dot (`jax.lax.ragged_dot_general` bound,
+    `_ragged`; its last operand its group sizes, which count its rows and multiply nothing): where its groups
+    are statically none (the sizes' last axis empty) and count its rows (`_grouped`) its zeros
+    (`_no_groups`), as it multiplies no row; else, `summed_wide` (`accumulated`'s), its products summed as a
+    wide CPU process sums them (`_summed_wide`), or as written. XLA's CUDA backend refuses a ragged dot of no
+    groups (row 14112: a forward's legalization left its result unmaterialized, a kernel gradient's
+    contraction aborted the process; a bank of no experts on a GH200). Every ragged product Dew forms passes
+    here (`accumulated`'s, `xla_products.placed_ragged_dot`'s, the fuser's dot as written)."""
+    *multiplied, sizes = operands
+    traced = None if jnp.shape(sizes)[-1] else _grouped(product, operands, preferred_element_type)
+    if traced is not None:
+        return _no_groups(traced, operands)
+    if summed_wide and _sums_in_float64(*multiplied):
+        return _summed_wide(product, preferred_element_type, *operands, counts=1)
+    return product(*operands, preferred_element_type=preferred_element_type)
+
+
+def _grouped(product: Callable[..., jax.Array], operands: tuple,
+             preferred_element_type) -> core.Jaxpr | None:
+    """The ragged dot `product` of `operands` traced (`jax.make_jaxpr`), where its group sizes count its
+    rows: its rows' ragged axis one it keeps or contracts (JAX's ragged non-contracting and contracting
+    modes). None where that axis is a batch axis (its ragged-batch mode), a batched dot whatever its sizes,
+    which it reads not at all (`jax.lax.ragged_dot_general`; train 1478's review of row 14112: two [2, 1, 1]
+    operands of 2s and 3s batched on their ragged axis are two 6s at sizes of no groups, not zeros). Its
+    dimension numbers read at any depth of the program (`programs.equations`: a product jitted or wrapped);
+    a product that binds no ragged dot is refused."""
+    bound = functools.partial(product, preferred_element_type=preferred_element_type)
+    traced = jax.make_jaxpr(bound)(*operands)
+    numbers = next((equation.params["ragged_dot_dimension_numbers"] for equation in equations(traced)
+                    if "ragged_dot_dimension_numbers" in equation.params), None)
+    if numbers is None:
+        raise ValueError(f"precision.ragged multiplies a ragged dot, and {product!r} binds none")
+    (ragged_axis,) = numbers.lhs_ragged_dimensions
+    _, (batch_axes, _) = numbers.dot_dimension_numbers
+    return None if ragged_axis in batch_axes else traced
+
+
+def _no_groups(traced: core.Jaxpr, operands: tuple) -> jax.Array:
+    """A ragged dot of no groups' zeros (`traced`, its program, `_grouped`'s), typed as the product is: its
+    traced aval's zeros as JAX forms a value's (`ad_util.zeros_like_aval`: its dtype, a float64 one's outside
+    x64 too, its weakness and its placement each the aval's, an Explicit one a shape's evaluation drops
+    beside an Auto axis), varying as its operands vary; an eager call's made on the mesh of devices its
+    operands lie on at the product's placement (train 1484's review: allocated at the abstract mesh outside
+    any mesh context, a two-device product's zeros were refused), else committed to the one device its
+    committed operands lie on, as their product would be. A constant, its derivative zero at every order
+    (row 14112's reviews)."""
+    from jax._src import ad_util
+
+    from dew.nn.sharding import concrete_mesh, varying_like
+
+    # The one array a ragged dot returns.
+    typed = next(aval for aval in traced.out_avals if isinstance(aval, ShapedArray))
+    narrowed = jax.dtypes.canonicalize_dtype(typed.dtype) != typed.dtype
+    meshes = [mesh for leaf in jax.tree.leaves(operands) if (mesh := concrete_mesh(leaf)) is not None]
+    mesh = meshes[0] if meshes else None
+    with jax.enable_x64(new_val=True) if narrowed else contextlib.nullcontext():
+        if mesh is not None and isinstance(typed.sharding, jax.sharding.NamedSharding):
+            return varying_like(jnp.zeros(typed.shape, typed.dtype, device=jax.sharding.NamedSharding(
+                mesh, typed.sharding.spec)), *operands)
+        zeros = ad_util.zeros_like_aval(typed)
+    devices = {device for leaf in jax.tree.leaves(operands)
+               if isinstance(leaf, jax.Array) and not isinstance(leaf, Tracer) and leaf.committed
+               for device in leaf.devices()}
+    if len(devices) == 1:
+        zeros = jax.device_put(zeros, devices.pop())
+    return varying_like(zeros, *operands)
 
 
 def _ragged(product: Callable) -> bool:

@@ -395,7 +395,8 @@ def hardware_status(row: Row, device_kind: str) -> str | None:
 
 
 def measure(tree: Path, python: Path, args: argparse.Namespace, newer: Path, is_head: bool = True,
-            cache: Path | None = None, settings: dict[str, str] | None = None) -> dict:
+            cache: Path | None = None, settings: dict[str, str] | None = None,
+            name: str | None = None) -> dict:
     """One sample of every row in `tree`, run by `python` with `settings` in its environment: a number, or
     why the row could not run there, and beside each the seconds its probe's process took (`seconds <row>`). The head's external references (`Row.head_only`), each a judged
     pairing of its own, run in its first round alone (`is_head`)."""
@@ -427,8 +428,9 @@ def measure(tree: Path, python: Path, args: argparse.Namespace, newer: Path, is_
                                    if reason is not None})
                     continue
                 # A step this tree's prepare compiled ahead (`ahead_battery`) runs as its first step, so the
-                # GPU compiles none of it.
-                handed = Path(getattr(args, "ahead", None) or "/nonexistent") / tree.name
+                # GPU compiles none of it: its arm's own (`name`, the tree's name in the run, base or head),
+                # never its checkout's directory name, which a base and a head may share (row 14123).
+                handed = Path(getattr(args, "ahead", None) or "/nonexistent") / (name or tree.name)
                 stepped = probe.tool == "benchmark_step.py" and handed.is_dir()
                 handoff = ["--ahead", str(handed)] if stepped else []
                 began = time.perf_counter()
@@ -493,7 +495,7 @@ def run(args: argparse.Namespace) -> int:
             if tree in unbuilt:
                 return dict.fromkeys((row.name for row in rows if not row.head_only), unbuilt[tree])
             return measure(path, pythons[tree], args, head_path / "tools", arm == "head" and round_ == 0,
-                           Path(caches) / arm, settings=settings if arm == "head" else None)
+                           Path(caches) / arm, settings=settings if arm == "head" else None, name=tree)
 
         # A timed step's window warms first (`rounds`); a compile's or a server's, measured cold, needs none.
         rounds(args, results, sample, warm=any(row.name.startswith("step ") for row in rows))
@@ -678,7 +680,7 @@ def ahead_battery(args: argparse.Namespace) -> int:
     target = ["--capacity-gib", str(gib)]
     for name, path in built.items():
         done = _run(Path(path), pythons[name], "benchmark_step.py",
-                    ["--cases", json.dumps(cases), "--compile-ahead", str(Path(args.out) / Path(path).name),
+                    ["--cases", json.dumps(cases), "--compile-ahead", str(Path(args.out) / name),
                      "--generation", generation, *target], head_path / "tools", 3600)
         said = f"into {args.out}" if done.returncode == 0 else f"not: {done.stderr[-400:]}"
         print(f"{name}: steps compiled ahead {said}", flush=True)

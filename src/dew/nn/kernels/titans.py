@@ -2,9 +2,11 @@
 kernel): a memory `M` learned at test time by gradient descent with momentum `S`, each head's `[D, D]`,
 
     S_t = eta_t S_{t-1} - 2 theta_t k_t^T u_t,    M_t = (1 - alpha_t) M_{t-1} + S_t,
-    o_t = q_t M_t + LN(q_t M_t) w + b,
+    o_t = q_t + (LN(q_t M_t) w + b),
 
-`2 k_t^T u_t` the gradient at `M` of the inner loss `|LN(k_t M) w + b - (v_t - k_t)|^2`, `u_t` taken
+the memory's residual around its query, as Dew's in-context memory reads it (`dew.nn.memory`'s
+`ResidualMemory`; fla's reference reads `q M + LN(q M)`), `2 k_t^T u_t` the gradient at `M` of the inner
+loss `|k_t + (LN(k_t M) w + b) - v_t|^2`, `u_t` taken
 through the LayerNorm's backward (`inner_gradient`) at the memory entering the token's mini-batch: `chunk`
 tokens from the sequence's start share one memory their gradients are taken at, as fla's reference anchors
 them (its `M_prev_nabla`). The LayerNorm's backward is TTT's (fla/ops/ttt/naive.py), `(D g - sum g -
@@ -29,6 +31,7 @@ from dew.nn import sharding
 from dew.nn.aligned import aligned_sum
 from dew.nn.inputs import sequence_blocks
 from dew.nn.precision import at_least_fp32
+from dew.nn.residuals import memory_chunks
 
 
 def layer_normed(x, eps: float):
@@ -42,23 +45,29 @@ def layer_normed(x, eps: float):
 
 
 def inner_gradient(k, v, km, weight, bias, eps: float):
-    """Half the inner loss's gradient at the memory's readout `km` (`k M`), `[..., D]`: the LayerNorm's
-    output `LN(km) w + b` against the target `v - k`, its error times `w`, through the LayerNorm's pullback
-    (autodiff's, `layer_normed`)."""
+    """Half the inner loss's gradient at the memory's readout `km` (`k M`), `[..., D]`: the memory's output
+    `k + (LN(km) w + b)` (the residual around its key, as `dew.nn.memory`'s `ResidualMemory`) against the
+    value `v`, its error times `w`, through the LayerNorm's pullback (autodiff's, `layer_normed`). The
+    residual first, as the memory computes its output: against `v - k`, a key of 2^100 beside a value of 1
+    rounded the target and erased the error (a head review)."""
     normed, pullback = jax.vjp(functools.partial(layer_normed, eps=eps), km)
-    (gradient,) = pullback((normed * weight + bias - (v - k)) * weight)
+    (gradient,) = pullback(((k + (normed * weight + bias)) - v) * weight)
     return gradient
 
 
-def mini_batches(chunk: int, keys, *operands):
+def mini_batches(chunk: int, keys, *operands, valid=None):
     """`keys` and each of `operands` `[B, H, T, ...]` as `[N, B, H, chunk, ...]`, their tokens past the last
     whole chunk zero (`inputs.sequence_blocks`), and which tokens are real, `[N, B, H, chunk]`, placed and
     varying as the keys, which write the states (an Explicit mesh's rows; a checked `shard_map`'s axes: a
-    mask of the queries' varied the states where only the queries did, train 1455's review)."""
+    mask of the queries' varied the states where only the queries did, train 1455's review), a token
+    `valid` (`[B, T]`) marks absent none."""
     def batched(x):
         return jnp.moveaxis(sequence_blocks(jnp.moveaxis(x, 2, 1), chunk, leading=True), 3, 2)
 
-    return (*map(batched, (keys, *operands)), batched(jnp.ones_like(keys[..., 0], dtype=bool)))
+    real = jnp.ones_like(keys[..., 0], dtype=bool)
+    if valid is not None:
+        real = real & jnp.asarray(valid, bool)[:, None]
+    return (*map(batched, (keys, *operands)), batched(real))
 
 
 def real_gradients(k, v, readout, real, weight, bias, eps: float):
@@ -68,11 +77,15 @@ def real_gradients(k, v, readout, real, weight, bias, eps: float):
     return jnp.where(live, inner_gradient(k, v, jnp.where(live, readout, zeros), weight, bias, eps), zeros)
 
 
-def read_out(walked, length: int, weight, bias, eps: float, dtype):
+def read_out(walked, queries, weight, bias, eps: float, dtype):
     """A walk's readouts `[N, C, B, H, D]` as the call's output `[B, T, H, D]` in `dtype`, the padding
-    dropped: each readout plus its LayerNorm under the inner loss's affine."""
-    out = jnp.moveaxis(walked.reshape(-1, *walked.shape[2:]), 0, 2)[:, :, :length]
-    return jnp.moveaxis(out + layer_normed(out, eps) * weight + bias, 1, 2).astype(dtype)
+    dropped: each query (`[B, H, T, D]`, as the walk read it) plus its readout's LayerNorm under the inner
+    loss's affine, the memory's residual around its input (Dew's `ResidualMemory`, the TTT paper's Sec
+    2.7)."""
+    out = jnp.moveaxis(walked.reshape(-1, *walked.shape[2:]), 0, 2)[:, :, :queries.shape[2]]
+    # The affine whole before the residual, as the memory's norm applies it (`ResidualMemory`): `q + (LN w +
+    # c)`, where `(q + LN w) + c` lost the query to an affine its bias cancels.
+    return jnp.moveaxis(queries + (layer_normed(out, eps) * weight + bias), 1, 2).astype(dtype)
 
 
 def placed_alike(affine, *operands):
@@ -98,7 +111,7 @@ def placed_alike(affine, *operands):
     return tuple(placed_as(x, heads) for x in affine), tuple(placed_as(x, rows, heads) for x in operands)
 
 
-def prepared_operands(query, key, value, weight, bias, gates, state, shapes, scale=None):
+def prepared_operands(query, key, value, weight, bias, gates, state, shapes, scale=None, valid=None):
     """A mini-batched memory's operands (`titans`, `ttt.ttt_linear`) in `at_least_fp32` of their dtype, heads
     before tokens (`[B, H, T, D]`; `gates` each `[B, H, T]`), the inner loss's affine `[H, 1, D]` and the
     entering states (zeros `[B, H, *shape]` of each of `shapes` where `state` is None), placed alike, the
@@ -106,11 +119,18 @@ def prepared_operands(query, key, value, weight, bias, gates, state, shapes, sca
     every operand writing them varies (a checked `shard_map`'s manual axes), as every step's states are, the
     queries, which read them alone, apart (a state left as it entered, replicated beside queries split, was
     typed split: train 1455's review); `(q, k, v, affine, gates, states)`, the queries times `scale` where
-    given. One preparation for both memories (train 1439's review)."""
+    given. A token `valid` (`[B, T]`) marks absent zero in every operand before any product (its scale's
+    among them: an absent query of inf times its zero cotangent was NaN in the scale's gradient), and the
+    states typed as the mask varies too (one device's tokens absent, the other's live). One preparation for
+    both memories (train 1439's review)."""
     work = at_least_fp32(jnp.result_type(query, key, value))
+    present = None if valid is None else jnp.asarray(valid, bool)
 
     def heads(x):
-        return jnp.moveaxis(jnp.asarray(x, work), 2, 1)
+        x = jnp.asarray(x, work)
+        if present is not None:
+            x = jnp.where(present.reshape(*present.shape, *(1,) * (x.ndim - 2)), x, jnp.zeros((), work))
+        return jnp.moveaxis(x, 2, 1)
 
     q, k, v = heads(query), heads(key), heads(value)
     q = q if scale is None else q * scale
@@ -120,12 +140,13 @@ def prepared_operands(query, key, value, weight, bias, gates, state, shapes, sca
               else tuple(jnp.asarray(x, work) for x in state))
     affine, (k, q, v, *rest) = placed_alike(affine, k, q, v, *gates, *states)
     gates, states = tuple(rest[:len(gates)]), tuple(rest[len(gates):])
-    states = tuple(sharding.varying_like(x, k, v, *gates, *affine, *states) for x in states)
+    masks = () if present is None else (present,)
+    states = tuple(sharding.varying_like(x, k, v, *gates, *affine, *states, *masks) for x in states)
     return q, k, v, affine, gates, states
 
 
 def titans(query, key, value, weight, bias, theta, alpha, eta, state=None, *, chunk: int = 16,
-           eps: float = 1e-6):
+           eps: float = 1e-6, valid=None, coefficient: float = 2.0):
     """Titans' linear memory a mini-batch of `chunk` tokens at a time: `query`, `key` and `value`
     `[B, T, H, D]`, the inner loss's LayerNorm affine `weight` and `bias` `[H, D]`, the learning rate
     `theta`, forgetting `alpha` and momentum `eta` `[B, T, H]`, and `state` the entering `(M, S)`
@@ -137,12 +158,16 @@ def titans(query, key, value, weight, bias, theta, alpha, eta, state=None, *, ch
     elsewhere moves the memory later inner gradients are taken at, padding none). An intentional divergence
     from fla's reference, which pads it and gives its last padded slot the last real token's gates
     (fla/ops/titans/naive.py:332-342 at 413ad2c), decaying the state again (one real token at `alpha` 1/2 in
-    a mini-batch of two keeps a quarter of the memory where the recurrence keeps half)."""
+    a mini-batch of two keeps a quarter of the memory where the recurrence keeps half). A token `valid`
+    (`[B, T]`) marks absent is none: its operands zero (`prepared_operands`), its readout what the walk
+    reads, the state as it was. `coefficient` is the write's factor before its rate, `coefficient theta k u`
+    (2, the squared loss's gradient; 1 where the caller's loss is half of it, as the in-context memory's), one
+    factor of the exact product, so no rate is halved or doubled first."""
     dtype = jnp.result_type(query, key, value)
     # Titans' memory and momentum each `[D, Dv]`.
     shapes = ((key.shape[-1], value.shape[-1]),) * 2
     q, k, v, (weight, bias), (theta, alpha, eta), states = prepared_operands(
-        query, key, value, weight, bias, (theta, alpha, eta), state, shapes)
+        query, key, value, weight, bias, (theta, alpha, eta), state, shapes, valid=valid)
 
     def mini_batch(pair, at):
         q, k, v, theta, alpha, eta, real = at
@@ -156,8 +181,8 @@ def titans(query, key, value, weight, bias, theta, alpha, eta, state=None, *, ch
             # 1430's review; doubled onto a key of 2^127 first, a zero gradient wrote NaN, train 1455's;
             # doubled onto a cotangent of 2^127 first, the transpose overflowed, a head review; the rate of
             # 2^127 doubled first overflowed, train 1461's).
-            write = aligned_sum([[jnp.asarray(2.0, theta.dtype), theta[..., None, None], k[..., :, None],
-                                  gradient[..., None, :]]])
+            write = aligned_sum([[jnp.asarray(coefficient, theta.dtype), theta[..., None, None],
+                                  k[..., :, None], gradient[..., None, :]]])
             momentum = eta[..., None, None] * pair[1] - write
             memory = (1.0 - alpha)[..., None, None] * pair[0] + momentum
             # A padded token leaves the pair as it was.
@@ -168,6 +193,6 @@ def titans(query, key, value, weight, bias, theta, alpha, eta, state=None, *, ch
         tokens = tuple(jnp.moveaxis(x, 2, 0) for x in (q, k, gradient, theta, alpha, eta, real))
         return jax.lax.scan(token, pair, tokens)
 
-    keys, *rest = mini_batches(chunk, k, q, v, theta, alpha, eta)
-    final, out = jax.lax.scan(mini_batch, states, (rest[0], keys, *rest[1:]))
-    return read_out(out, k.shape[2], weight, bias, eps, dtype), final
+    keys, *rest = mini_batches(chunk, k, q, v, theta, alpha, eta, valid=valid)
+    final, out = memory_chunks(mini_batch, states, (rest[0], keys, *rest[1:]))
+    return read_out(out, q, weight, bias, eps, dtype), final
