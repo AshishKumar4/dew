@@ -411,6 +411,25 @@ def test_a_decayed_value_times_a_zero_factor_is_zero_and_its_derivative_by_it_fi
     assert by_factor(jnp.float32(0.0)) == by_factor(jnp.float32(1.0)) != 0, by_factor(jnp.float32(0.0))
 
 
+@pytest.mark.parametrize(("factor", "zero"), [(0.0, True), (1.0, False)], ids=["a zero factor", "a unit one"])
+def test_a_spent_decays_derivative_of_an_overflowed_value_is_zero_beside_a_zero_factor_alone(factor, zero):
+    """The derivative by the exponent of `scan._times_decayed` of an overflowed value (`inf`) under a spent
+    decay (`exp(-1000)`) times a factor and one: zero beside a zero factor, the term annihilated before its
+    decay is classified, and NaN beside a unit one, its infinity unmasked (a head review)."""
+    found = jax.grad(lambda e: scan._times_decayed(e, jnp.float32(jnp.inf), jnp.float32(factor),
+                                                   jnp.float32(1.0)))(jnp.float32(-1000.0))
+    assert (found == 0) if zero else np.isnan(found), found
+
+
+def test_a_decayed_products_subnormal_factor_is_no_zero_on_a_flushing_lane():
+    """`scan._decayed_terms` of the product of `2^-127` and `2^127` undecayed: exactly one, the subnormal read
+    from its bits as its scaled significand, no zero, where a flushing lane's comparison read it as zero and
+    annihilated the term (a head review)."""
+    tiny, large = jnp.float32(2.0 ** -127), jnp.float32(2.0 ** 127)
+    found = scan._decayed_terms(((0, 1),), jnp.float32(0.0), tiny, large)
+    assert found == 1, found
+
+
 def test_scaled_exps_mixed_second_derivative_decays_before_its_directions_meet():
     """The derivative by `scan.scaled_exp`'s value of a direction of 2^100 times its exponent's pullback of
     a cotangent of 2^100, at a value of 1 under `e^-60`: `2^200 e^-60` (2^113.4) in float64's binade, the
