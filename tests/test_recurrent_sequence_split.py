@@ -59,6 +59,11 @@ def test_a_delta_rule_split_over_the_sequence_runs_its_rows_as_whole_ones(name, 
                           width=WIDTH)
 
 
+TANGENT_SEEDS = {"gated delta net": 8, "kimi delta attention": 32}
+"""Each mixer's declared draws of its parameters' tangent over packed rows (`seeds_for`'s, sized at
+fb0bafcde0)."""
+
+
 @pytest.mark.mesh
 @pytest.mark.parametrize("name", sorted(MIXERS))
 def test_a_delta_rule_split_over_the_sequence_moves_along_its_parameters_as_a_whole_row(name):
@@ -70,7 +75,7 @@ def test_a_delta_rule_split_over_the_sequence_moves_along_its_parameters_as_a_wh
     module = MIXERS[name]
     hidden = jnp.zeros((1, 32, WIDTH), jnp.float32)
     variables = jax.tree.map(lambda leaf: np.asarray(leaf), module.init(jax.random.key(7), hidden))
-    assert_split_as_whole(module, variables, "packed", SEEDS["packed"],
+    assert_split_as_whole(module, variables, "packed", TANGENT_SEEDS[name],
                           f"{name} split over the sequence, its parameters' tangent", width=WIDTH,
                           forward=True)
 
