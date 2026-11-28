@@ -473,16 +473,17 @@ def tpu_ops(directory: str | Path, devices: Iterable[int], module: str, *, annot
         if not inside:
             raise NoKernels(f"{module}'s run under {directory} holds no op on TPU {device} of the call's "
                             f"{sorted(runs)}")
-        if not stated:
-            named = [_opcode_of(op.name, instructions) for op in inside]
-            opcodes = [opcode for opcode in named if opcode is not None]
-            if len(opcodes) < len(named):
-                unnamed = [op.name for op, opcode in zip(inside, named, strict=True) if opcode is None]
-                raise AmbiguousCapture(f"{module}'s run under {directory} holds ops on TPU {device} no "
-                                       f"instruction of its module names: {unnamed}")
-            if all(trace.moves_only(opcode) for opcode in opcodes):
-                raise NoKernels(f"{module}'s run under {directory} holds transfers alone on TPU {device}: "
-                                f"{[op.name for op in inside]}")
+        # Each op the instruction it names, whichever way its run states its program (row 14120: a run of
+        # ops stating it by stat was timed whole, transfers alone among them).
+        named = [_opcode_of(op.name, instructions) for op in inside]
+        opcodes = [opcode for opcode in named if opcode is not None]
+        if len(opcodes) < len(named):
+            unnamed = [op.name for op, opcode in zip(inside, named, strict=True) if opcode is None]
+            raise AmbiguousCapture(f"{module}'s run under {directory} holds ops on TPU {device} no "
+                                   f"instruction of its module names: {unnamed}")
+        if all(trace.moves_only(opcode) for opcode in opcodes):
+            raise NoKernels(f"{module}'s run under {directory} holds transfers alone on TPU {device}: "
+                            f"{[op.name for op in inside]}")
         timed += [KernelTime(op.name, op.duration_ns / 1e6) for op in inside]
     return tuple(timed)
 

@@ -602,7 +602,8 @@ def test_a_tpu_call_is_timed_by_its_own_programs_run_on_its_own_devices(tmp_path
         tpu_ops(carried, {0}, "jit_run", annotation=READ, instructions=OPCODES)
 
 
-def test_a_tpu_run_of_a_generic_async_collective_is_read_as_the_op_it_wraps(tmp_path):
+@pytest.mark.parametrize("program", [None, 7], ids=["named", "stated"])
+def test_a_tpu_run_of_a_generic_async_collective_is_read_as_the_op_it_wraps(tmp_path, program):
     """A TPU call's run whose ops are a generic async collective's start and done alone (`async-start` over
     a computation holding the op itself, as XLA wraps some collectives, `trace.COLLECTIVES`), each the
     instruction its name is, its opcode as it runs read from its module's typed instructions
@@ -610,7 +611,8 @@ def test_a_tpu_run_of_a_generic_async_collective_is_read_as_the_op_it_wraps(tmp_
     an all-to-all's moves data alone and times no kernel of the call's (`NoKernels`), an all-reduce's
     reduces as it moves and is timed (Train 1431's review: its start read as no op, an all-to-all's run was
     timed as kernels); a done naming its own computation is that computation's op, and a fusion calling a
-    computation is a fusion."""
+    computation is a fusion. Alike whether a run names its program in its name alone (a v5e's) or states it
+    by stat on it and its ops (`program`; row 14120: a stated run's transfers were timed)."""
     from dew.telemetry import benchmark, hlo
     from dew.telemetry.benchmark import NoKernels, tpu_ops
 
@@ -632,11 +634,12 @@ def test_a_tpu_run_of_a_generic_async_collective_is_read_as_the_op_it_wraps(tmp_
         instruction("main", "async-done.2", "async-done", ["x"], ["wrapped_all_to_all"]),
         instruction("main", "fusion", "fusion", ["x"], ["wrapped_all_reduce"], root=True)])
     assert (opcodes["async-done.2"], opcodes["fusion"]) == ("all-to-all-done", "fusion")
-    runs = [(0, "jit_run(7)", 0.0, 1.0, None)]
+    runs = [(0, "jit_run(7)", 0.0, 1.0, program)]
     transfer, reduction = tmp_path / "transfer", tmp_path / "reduction"
-    _tpu_capture(transfer, [(0, "async-start", 0.25, 0.5, None), (0, "async-done", 0.5, 0.75, None)], runs)
-    _tpu_capture(reduction, [(0, "async-start.1", 0.25, 0.5, None), (0, "async-done.1", 0.5, 0.75, None)],
+    _tpu_capture(transfer, [(0, "async-start", 0.25, 0.5, program), (0, "async-done", 0.5, 0.75, program)],
                  runs)
+    _tpu_capture(reduction, [(0, "async-start.1", 0.25, 0.5, program),
+                             (0, "async-done.1", 0.5, 0.75, program)], runs)
     with pytest.raises(NoKernels):
         tpu_ops(transfer, {0}, "jit_run", annotation=READ, instructions=opcodes)
     assert [op.name for op in tpu_ops(reduction, {0}, "jit_run", annotation=READ, instructions=opcodes)] == [
