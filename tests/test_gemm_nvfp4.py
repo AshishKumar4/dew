@@ -2141,25 +2141,46 @@ def test_a_grouped_nvfp4_product_of_no_depth_is_zero(generation_name):
 
 def test_a_packed_steps_price_counts_its_decodes_integer_pipes():
     """A step whose NVFP4 operand its consumers decode (`pricing.step_seconds`, the form's work in its
-    `Decoded`, row 14106): on an H100's narrowest legal packed tile (two consumers decoding a 256-deep stage
-    of 128 rows for 8 tokens, each weight's half byte and its block's scale stored) the decode ties the
-    shared bytes, so its price stands, and a decode of four times its work outlasts them, the step priced
-    at it; and two operands' decodes on one pipe add, not overlap, each pipe's work summed before the
-    busiest is read (its review: a 64x64x256 step's two decodes 384 clocks, not 192)."""
+    `Decoded`, row 14106): on the tile an H100's planner takes for an 8-token call (its forms the launch's
+    own, `_operand_bytes`; theme 21's review K-F7) the shared bytes outlast the decode, so its price
+    stands, and a decode of sixty-four times its work outlasts them, the step priced past them; and two
+    operands' decodes on one pipe add, not overlap, each pipe's work summed before the busiest is read (its
+    review: a 64x64x256 step's two decodes 384 clocks, not 192)."""
     from dew.nn.kernels.templates import cost
-    from dew.nn.kernels.templates.gemm import packed, pricing
+    from dew.nn.kernels.templates.gemm import pricing
 
-    h100, work = generation.gpu_target("sm90"), packed.nvfp4_decode_work()
-    stored = 0.5 + 1 / 16
-    narrow = tiling.Tiles(128, 8, 256, 2, 1, warpgroups=2, family="wgmma")
+    # The forms the packed launch itself prices a decode call's step by (`_operand_bytes`, its review's
+    # K-F7: not built by hand beside it), of an 8-token call through it.
+    spec, matrix, _ = _columned_case(8, grouped=False)
+    launch = grouped_quantized.MosaicPackedGmm()
+    with generation.assumed("sm90"), generation.chosen(nvfp4="packed"), tuning.seen() as launched:
+        jax.jit(lambda x: gemm.nvfp4_product(x, matrix, None, out_dtype=jnp.float32,
+                                             interpret_on_cpu=True)).trace(spec)
+    taken = [(observed.config, observed.arguments) for observed in launched.held()
+             if isinstance(observed.arguments.op, grouped_quantized.MosaicPackedGmm)]
+    assert taken, "the call took no packed launch"
+    # The tile the planner took for it and the operand whose stage its consumers decode there.
+    (tile, bound), h100 = taken[0], generation.gpu_target("sm90")
+    itemsizes, forms = launch._operand_bytes(bound, tile)
+    [(slot, form)] = [(slot, each) for slot, each in enumerate(forms) if each is not None]
+    assert form.work is not None
 
-    def priced(form):
-        return pricing.step_seconds(narrow, h100, (stored, 2), (form, None), issued=jnp.bfloat16)
+    def held(work):
+        each = list(forms)
+        each[slot] = form._replace(work=work)
+        return tuple(each)
 
-    assert priced(pricing.Decoded(0, 1, work)) == priced(pricing.Decoded(0, 1))
-    assert priced(pricing.Decoded(0, 1, cost.repeated(work, 4))) > priced(pricing.Decoded(0, 1))
-    rates, square = cost.rates(h100, device=False), tiling.Tiles(64, 64, 256, 2, 1, family="wgmma")
-    one = pricing.Decoded(2, 1, work)
+    def priced(work):
+        return pricing.step_seconds(tile, h100, itemsizes, held(work), issued=jnp.bfloat16)
+
+    rates = cost.rates(h100, device=False)
+    assert priced(form.work) == priced(None)
+    # A decode of sixty-four times its work outlasts the shared bytes, and the step is priced at it.
+    heavy = cost.repeated(form.work, 64)
+    decoding = pricing.decode_seconds(tile, held(heavy), rates)
+    assert decoding > priced(None) and priced(heavy) == decoding
+    square = tiling.Tiles(64, 64, 256, 2, 1, family="wgmma")
+    one = pricing.Decoded(2, 1, form.work)
     # The square tile's two operands alike, each decode's seconds the other's; doubled exactly.
     left, right = (pricing.decode_seconds(square, forms, rates) for forms in ((one, None), (None, one)))
     assert left == right and pricing.decode_seconds(square, (one, one), rates) == 2 * left
