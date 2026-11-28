@@ -294,7 +294,8 @@ def test_an_eager_product_of_no_groups_lands_on_its_operands_mesh():
                                                                                                 "tensor")))
     sizes = jax.device_put(jnp.zeros((0,), jnp.int32), NamedSharding(mesh, PartitionSpec()))
     out = xla_products.placed_ragged_dot(rows, bank, sizes, preferred_element_type=jnp.float32)
-    assert out.sharding.mesh == mesh and out.sharding.spec[-1] == "tensor"
+    placed = out.sharding
+    assert isinstance(placed, NamedSharding) and placed.mesh == mesh and placed.spec[-1] == "tensor"
     np.testing.assert_array_equal(np.asarray(out), np.zeros((8, 128), np.float32))
 
 
