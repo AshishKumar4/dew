@@ -486,6 +486,17 @@ def rounds_products() -> bool:
 
 _LN2_HI, _LN2_LO = 0.693145751953125, 1.428606765330187e-06
 """ln 2 in two parts (Cody-Waite), the first's 16 bits times an exponent's at most 8 exact."""
+
+
+def ln2_remainder(x: jax.Array, n: jax.Array) -> jax.Array:
+    """`x - n ln 2` for an integral `n` within `2^16` (Cody-Waite, `_LN2_HI` and `_LN2_LO`): `n` split as
+    `256 a + b` toward zero, so each product with the high part is exact (`256 _LN2_HI` a power of two's
+    multiple, `a` and `b` of at most 8 bits), the low part's product rounding once; for `|n| < 256` the
+    two-part reduction itself. The one owner of reducing by ln 2 (`_exp_value`'s, a decay's split into
+    its powers of two, `attention_parallax.exp_scaled`'s)."""
+    high = jnp.trunc(n * (1.0 / 256.0))
+    low = n - high * 256.0
+    return ((x - high * (256.0 * _LN2_HI)) - low * _LN2_HI) - n * _LN2_LO
 _EXP_TERMS = (1.0 / 5040.0, 1.0 / 720.0, 1.0 / 120.0, 1.0 / 24.0, 1.0 / 6.0, 0.5, 1.0, 1.0)
 """`e^r`'s Taylor sum to `r^7` by Horner, its highest term first: at `|r| <= ln 2 / 2` the next is 5e-9."""
 
@@ -502,7 +513,7 @@ def _exp_value(base2: bool, x) -> jax.Array:
     else:
         x = jnp.clip(x, -104.0, 90.0)
         n = jnp.round(x * (1.0 / math.log(2.0)))
-        r = (x - n * _LN2_HI) - n * _LN2_LO
+        r = ln2_remainder(x, n)
     summed = functools.reduce(lambda p, term: p * r + term, _EXP_TERMS[1:], jnp.full_like(r, _EXP_TERMS[0]))
     return power2(summed, n, reach=150)
 

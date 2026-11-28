@@ -17,6 +17,7 @@ from dew.nn.kernels import generation
 from dew.nn.kernels.templates import (
     attention as template,
     attention_algebra as algebra,
+    attention_parallax,
     attention_quantized,
     merged,
 )
@@ -310,3 +311,32 @@ def test_a_giant_heads_clip_holds_every_order(taken):
         assert_contract(lambda x: clipped(x, 8.0, 1e-6), (x * scale,), (direction * scale,), cotangent,
                         f"a head's clip {edge}", plain_fn=plain, taking=ORDER_SETS[taken])
 
+
+def plain_parallax(query, second, key, second_key, value):
+    """Parallax written plainly (`attention_parallax`'s docstring): the softmax's weights each taken by
+    `1 + c - t`, `t` the second products, `c` their mean under the weights."""
+    logits = jnp.einsum("bqhd,bkhd->bhqk", query, key) * query.shape[-1] ** -0.5
+    weights = jax.nn.softmax(logits, axis=-1)
+    seconds = jnp.einsum("bqhd,bkhd->bhqk", second, second_key)
+    mean = jnp.sum(weights * seconds, axis=-1, keepdims=True)
+    return jnp.einsum("bhqk,bkhd->bqhd", weights * (1 + mean - seconds), value)
+
+
+@pytest.mark.parametrize("edge", EDGES)
+def test_parallax_holds_every_order(edge):
+    """Parallax (`attention_parallax.attend`: its forward and first derivative its key tiles' walks, every
+    higher order its reference's in XLA): every order runs, finite wherever float64 is a normal float32 and
+    the plain formula is, at queries, keys and values whose products near float32's ends."""
+    shape = (1, 16, 2, 16)
+    spans = template.spans(16, 16, 1)
+
+    def inputs(seed: int, scale: float) -> tuple:
+        return (normal_draw([13690, seed], *(shape,) * 5, scale=scale),
+                normal_draw([13691, seed], *(shape,) * 5, scale=scale),
+                normal_draw([13692, seed], shape)[0])
+
+    def parallax(query, second, key, second_key, value):
+        return attention_parallax.attend(query, second, key, second_key, value, spans)
+
+    assert_drawn_contract(parallax, inputs, EDGES[edge], f"parallax {edge}", truth_fn=plain_parallax,
+                          plain_fn=plain_parallax)

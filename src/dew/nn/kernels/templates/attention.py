@@ -120,17 +120,25 @@ def within(keys: jax.Array, start: jax.Array, end: jax.Array,
     return seen if ids is None else seen & (ids[0] == ids[1])
 
 
-def dense(spans: KeySpans) -> jax.Array:
-    """Whether each key is visible to each query (`within`), every one: `[B, Q, K]` boolean, by broadcasting
-    alone, so a batch-sharded call's spans take no gather."""
+def dense(spans: KeySpans, columns: jax.Array | None = None) -> jax.Array:
+    """Whether each key is visible to each query (`within`), every one, or each of `columns` (key indices, a
+    tile's, none past the call's keys visible): `[B, Q, K]` boolean, by broadcasting alone, so a
+    batch-sharded call's spans take no gather."""
     spans = spans.per_query()
-    keys = jnp.arange(spans.keys)[None, None, :]
-    ids = (None if spans.query_ids is None or spans.key_ids is None
-           else (spans.query_ids[:, :, None], spans.key_ids[:, None, :]))
+    every = columns is None
+    if not every and not spans.keys:
+        return jnp.zeros((*spans.start.shape[:2], columns.shape[0]), bool)
+    columns = jnp.arange(spans.keys) if every else columns
+    keys = columns[None, None, :]
+    key_ids = (spans.key_ids if every or spans.key_ids is None
+               else spans.key_ids[:, jnp.minimum(columns, spans.keys - 1)])
+    ids = (None if spans.query_ids is None or key_ids is None
+           else (spans.query_ids[:, :, None], key_ids[:, None, :]))
     # A run axis stays last (`within`), the keys' axis beside the queries'.
     start, end = ((spans.start[:, :, None, :], spans.end[:, :, None, :]) if spans.start.ndim == 3
                   else (spans.start[:, :, None], spans.end[:, :, None]))
-    return within(keys, start, end, ids)
+    visible = within(keys, start, end, ids)
+    return visible if every else visible & (keys < spans.keys)
 
 
 def reads(spans: KeySpans) -> jax.Array:
