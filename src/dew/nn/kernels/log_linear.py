@@ -205,8 +205,7 @@ def _levels_above(query, key, value, g, weights, *, within):
         unread = (blocked[..., None]
                   | ((prefix_spent[..., None] | local_spent)[..., None] & jnp.isinf(readers)))
         readers = jnp.where(unread, 0.0, readers)
-        # `[B, G, n, r, E, t, P]`, the product's own layout.
-        read = jnp.einsum('bgnretk,bgnrepk->bgnretp', readers, held, preferred_element_type=jnp.float32)
+        read = _read(readers, held)
         keyed = (nan_keyed | (inf_keyed & ~prefix_spent)) & ~emptied[..., 0, 0]
         # A NaN decay within the chunk before the reader, the reader's or the held memory's NaN-ness.
         read_nan = reader_nan[..., None] | held_nan[..., None, :] | jnp.isnan(local)[..., None]
@@ -220,6 +219,24 @@ def _levels_above(query, key, value, g, weights, *, within):
     # Back to the tokens' layout `[B, T, H, P]`, once.
     out = jnp.moveaxis(out, (1, 3), (3, 4)).reshape(rows, padded, heads, columns)
     return out[:, :length]
+
+
+def _read(readers, held):
+    """Each reader's read of its chunk's held memory, `[B, G, n, r, E, t, P]` (the product's own layout): the
+    readers' product with the memory, an overflowed reader's (an infinite one its finite query and weight
+    formed) left out of the memory's gradient, so the product's transpose meets no infinite reader with
+    another output's zero cotangent (`inf * 0`; train 1455's review), its read the plain product's where one
+    overflowed (formed apart, where any did: no call without one pays for it)."""
+    def product(readers, held):
+        return jnp.einsum('bgnretk,bgnrepk->bgnretp', readers, held, preferred_element_type=jnp.float32)
+
+    overflowed = jnp.isinf(readers)
+    read = product(jnp.where(overflowed, 0.0, readers), held)
+    rows = jnp.any(overflowed, axis=-1)[..., None]
+    def exceptional():
+        return jnp.where(rows, product(readers, jax.lax.stop_gradient(held)), read)
+
+    return jax.lax.cond(jnp.any(rows), exceptional, lambda: read)
 
 
 def _held_memory(memory, poisoned, before, emptied, prefix_spent, dtype):
