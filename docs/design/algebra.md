@@ -1151,7 +1151,10 @@ chunk algorithm side by side:
 - a solve is linear in its given values, so the part of the system that reads the state is off it.
 
 The cheapest under the work-span model is the chunk's form, which `scan.py` evaluates and `carry.py`
-splits. At a kernel's chunk on an A100 or an H100 (64 tokens, 128 keys and values) the extraction is the
+splits; a forward substitution of values that read the entering state is priced past every form, its row
+walk over the state no equation of the program's language and so no split's, so the linearity's two solves
+are taken (a 128-wide gated delta net's chunk on an A10, an L4, a T4 or a B300, whose pricing had made the
+state's substitution the cheapest and its split refused). At a kernel's chunk on an A100 or an H100 (64 tokens, 128 keys and values) the extraction is the
 compact WY form with its inverse by doubling, the hand-written chunk's form. Both rule sets are proven
 sound over the reals from their declarations (tests/test_linear_scan.py), at every chunk size by
 induction: each identity holds exactly at a symbolic chunk of three tokens (so at one, two and three, each
