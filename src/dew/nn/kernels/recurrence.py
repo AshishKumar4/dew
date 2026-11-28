@@ -32,14 +32,7 @@ from dew.nn.activations import logistic, silu
 from dew.nn.aligned import aligned_sum
 from dew.nn.derivatives import KernelGlue, Protected, contracted, with_gradients_formed
 from dew.nn.kernels import launches
-from dew.nn.precision import (
-    accurate_exp,
-    at_least_fp32,
-    compensated_add,
-    l2norm,
-    softplus,
-    stochastic_bf16,
-)
+from dew.nn.precision import accurate_exp, at_least_fp32, compensated_add, l2norm, softplus, stochastic_bf16
 
 from ..sharding import explicit_spec, grouped_heads, manual_map
 from . import chunked_launch, short_conv
@@ -239,7 +232,7 @@ class Hooks:
                 raise TypeError(f"{name} declares its operand normalized or not, a bool: not "
                                 f"{getattr(self, name)!r}")
         if self.gates is not None and (self.decay == 'none'
-                                       or self.decay == 'vector' and self.gates.write != 'sigmoid'):
+                                       or (self.decay == 'vector' and self.gates.write != 'sigmoid')):
             raise ValueError(f"the gates form a log decay a head or a key dimension, a key dimension's "
                              f"beside a sigmoid's write gate (Kimi's): not {self}")
         if self.rated and (self.decay != 'scalar' or self.gates is not None):

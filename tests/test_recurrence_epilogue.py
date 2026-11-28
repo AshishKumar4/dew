@@ -79,7 +79,9 @@ def test_a_gated_delta_nets_norm_in_the_output_launch_is_on_par_with_the_portabl
             return layer.apply(params, x)
 
         def loss(params, x):
-            return jnp.sum(layer.apply(params, x).astype(weights.dtype) * weights)
+            out = layer.apply(params, x)
+            # The loss at least fp32, float64 in the truth's own.
+            return jnp.sum(out.astype(jnp.promote_types(out.dtype, jnp.float32)) * weights)
         return jax.value_and_grad(loss, argnums=(0, 1))(params, x)
 
     def applied(kernel):
