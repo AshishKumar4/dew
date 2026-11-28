@@ -446,7 +446,8 @@ def _triton_slot_steps(total_slices: int) -> float:
     span three passes a chunk (`_launch_for_block`), but the launches' time rose a slot at a time: an A100's
     merge of 32 rows' 128 channels took 20.3 us over 16 slots and 33.9 over 32 (M-FS-101-a100: 13, 16 and 27
     slices), 0.85 us a slot against 3 x 225.3 ns steps; a GH200's of one row's 64 channels 3.84 over 8 and
-    7.10 over 16 (M-NA-20-gh200), 0.41 a slot against 3 x 142.7 ns. Priced a step a pass a chunk, the A100's
+    7.10 over 16 (M-NA-20-gh200), 0.41 a slot against its own 3 x 153.7 ns (M-FS-114; the H100's 142.7 it
+    borrowed before). Priced a step a pass a chunk, the A100's
     were 3.9 and 5.4 us, and row 5274's decode plan took 27 slices where 13 ran its walk and merge 136 us
     against 162 (M-NA-50b-a100)."""
     width = windows.chunk_width(total_slices)
