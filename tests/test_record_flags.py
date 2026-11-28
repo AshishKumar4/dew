@@ -88,3 +88,38 @@ def test_an_env_run_parsed_from_its_command_line_holds_its_kinds_own_records():
     assert type(parsed.rollout) is RolloutConfig
     assert parsed.rollout == RolloutConfig(functools.partial(ControlRollout, unroll_length=64))
     assert EnvRunConfig.cli([]) == EnvRunConfig()
+
+
+def test_a_flag_set_to_its_members_default_over_a_recipes_value_takes_it():
+    """A rollout flag given its member's default over a recipe that binds another value runs the default
+    the command line asked for (row 14127: `--rollout.train-ratio 1024.0`, `DreamerRollout`'s own, over a
+    recipe's 16.0 kept 16.0, the flag dropped as unchanged from its default); a flag left unset keeps the
+    recipe's value, and one set elsewhere takes its own. The rollout built takes what the record states."""
+    from dew.objectives.rl.dreamer import DreamerRollout
+
+    recipe = EnvRunConfig(rollout=RolloutConfig(functools.partial(DreamerRollout, train_ratio=16.0)))
+    default = DreamerRollout.__dataclass_fields__["train_ratio"].default
+    for args, ratio in ((["--rollout.train-ratio", str(default)], default), ([], 16.0),
+                        (["--rollout.train-ratio", "64.0"], 64.0)):
+        rollout = EnvRunConfig.cli(args, default=recipe).rollout
+        assert rollout.fields.get("train_ratio", default) == ratio
+        assert rollout.arguments.get("train_ratio", default) == ratio
+
+
+@pytest.mark.parametrize("ratio", [16.0, 64.0, 1024.0])
+def test_a_flagged_records_fields_set_and_cleared_are_its_record_alike(ratio):
+    """A flagged rollout's arguments set (`with_fields`) and cleared (`without_fields`) are the plain record's
+    so set and cleared, its flag set first or not: a value a flag can state is kept, the member's own default
+    stated outright among them, and one cleared is the member's default again, not the flag's (row 14127's
+    review)."""
+    plain = RolloutConfig()
+    for flagged in (plain.flagged(), plain.with_fields(train_ratio=64.0).flagged()):
+        _alike(plain, flagged, ratio)
+
+
+def _alike(plain, flagged, ratio):
+    """`flagged`'s `train_ratio` set to `ratio` and cleared, each as `plain`'s (`to_record`)."""
+    stated = flagged.with_fields(train_ratio=ratio)
+    assert to_record(stated, RolloutConfig) == to_record(plain.with_fields(train_ratio=ratio), RolloutConfig)
+    assert stated.record()["fields"] == plain.with_fields(train_ratio=ratio).record()["fields"]
+    assert to_record(stated.without_fields("train_ratio"), RolloutConfig) == to_record(plain, RolloutConfig)
