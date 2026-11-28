@@ -83,9 +83,9 @@ def local_packed(args, *, lost: bool = False) -> dict:
 
 def _local_steps(args, run: str, lost: bool, second) -> dict:
     """`local_packed`'s run `run` (its own persistent and local directories): steps 1 (the packed matrices)
-    and 2 (`second` of them) saved on the local tier and restored in turn, each restore's report: the
-    matrices it read as written (`_read`), or its refusal (`process_support.refusal`, its message beside a
-    step 1's)."""
+    and 2 (`second` of them) saved on the local tier and restored in turn into the packed matrices'
+    template, each restore's report: the matrices it read as written (`_read`), or its refusal
+    (`process_support.refusal`, its message beside a step 1's)."""
     import shutil
 
     import jax
@@ -116,9 +116,13 @@ def _local_steps(args, run: str, lost: bool, second) -> dict:
             if jax.process_index() == 1:
                 shutil.rmtree(local_dir / "process1")
             multihost_utils.sync_global_devices(f"{run} local copy {step} lost")
+        # Restored into the valid matrices' template (their own forms), so a foreign step is refused by its
+        # stored digest alone, not its template's static form (train 1437's review).
+        valid = dataclasses.replace(written, variables={**placed.variables, QUANTIZATION: packed})
+        template = _template(valid)
         try:
             with checkpoints:
-                restored, _ = checkpoints.restore(_template(written), step)
+                restored, _ = checkpoints.restore(template, step)
         except (ValueError, PeerFailure) as error:
             reports[step] = refusal(error) if step == 2 else {**refusal(error), "message": str(error)}
             continue
