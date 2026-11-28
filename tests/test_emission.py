@@ -1747,6 +1747,31 @@ def test_a_launchs_l2_traffic_is_the_reads_every_path_makes_at_its_buffers_packe
     assert _l2_bytes(thrice, jnp.float4_e2m1fn, 1024) == 512
 
 
+def test_a_copy_its_predicate_or_a_loops_unproven_trip_guards_counts_no_read():
+    """A copy guarded by its own predicate reads where the predicate holds, surely only where it is known
+    true; a loop no walk marks, its trips its data's, may take none: so neither counts a read (Train 1512's
+    review). Three reads of a 512-byte row past its row and output each count none so guarded, the launch's
+    one read before them none past its row and output, and a predicate known true counts its three."""
+    def predicated(predicate):
+        def body(row, out, staged, barrier):
+            _read(row, staged, barrier)
+            for _ in range(3):
+                plgpu.copy_gmem_to_smem(row, staged, barrier, predicate=predicate(staged))
+                plgpu.barrier_wait(barrier)
+            _stored(staged, out)
+
+        return body
+
+    def looped(row, out, staged, barrier):
+        _read(row, staged, barrier)
+        trips = staged[0].astype(jnp.int32)
+        lax.fori_loop(0, trips, lambda step, carry: (_read(row, staged, barrier, times=3), carry)[1], 0)
+        _stored(staged, out)
+
+    assert _l2_bytes(predicated(lambda staged: staged[0] > 0)) == _l2_bytes(looped) == 0
+    assert _l2_bytes(predicated(lambda staged: True)) == 1024
+
+
 def test_a_walk_whose_trips_read_their_place_counts_no_reads():
     """A walk whose trips copy its row as their place decides counts none of their reads, as a bound every
     trip makes holds none of them: one trip may be its first and its last at once (Train 1508's F1). Its first

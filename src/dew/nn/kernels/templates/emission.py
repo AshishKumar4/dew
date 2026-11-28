@@ -348,6 +348,16 @@ _PRODUCTS = frozenset({gpu.wgmma_ref_p, gpu.tcgen05_mma_p})
 _COPIES = frozenset({gpu.copy_gmem_to_smem_p, gpu.copy_smem_to_gmem_p})
 """Copies between device and shared memory (`_copied`)."""
 
+def _surely(value) -> bool:
+    """Whether a predicate the count holds as `value` is known true here (`programs.integral_scalar`)."""
+    return programs.integral_scalar(value) and bool(value)
+
+
+def _runs(start, stop) -> bool:
+    """Whether a range from `start` to `stop`, as the count holds them, takes a trip: both known, apart."""
+    return programs.integral_scalar(start) and programs.integral_scalar(stop) and int(stop) > int(start)
+
+
 def _unread(work: Work) -> Work:
     """`work` with no copies' reads counted (`Work.device_reads`): a trip's that no bound every trip makes
     holds (`_Counting.loop`)."""
@@ -836,7 +846,9 @@ class _Counting:
             self.add(_tensor(lhs.dtype, 2 * acc.shape[0] * acc.shape[1] * lhs.shape[1]))
         elif primitive in _COPIES:
             copied = _copied(equation)
-            read = copied if primitive is gpu.copy_gmem_to_smem_p and self.guaranteed else 0
+            # A copy its own predicate guards reads where the predicate holds: surely, where it is known true.
+            surely = not params.get("has_user_predicate") or _surely(values[-1])
+            read = copied if primitive is gpu.copy_gmem_to_smem_p and self.guaranteed and surely else 0
             self.add(Work(device_bytes=copied, shared_bytes=copied, device_reads=read))
         elif primitive is gpu.async_copy_smem_to_tmem_p:
             self.add(Work(shared_bytes=_smem_to_tmem_bytes(equation)))
@@ -939,9 +951,11 @@ class _Counting:
         # other trips' places.
         steady = trip("steady", 0)
         odd = trip("steady", 1) if "parity" in consulted else steady
-        # Its reads a bound every trip makes (`Work.device_reads`): a trip that read its place or parity reads
-        # as they decide, one trip may be every place at once, so such a loop's trips count none.
-        unread = bool(consulted)
+        # Its reads a bound every run makes (`Work.device_reads`): a trip that read its place or parity reads
+        # as they decide, one trip may be every place at once, and a loop no walk marks counts its one trip
+        # where it stands, which may never run where its data decides its trips: such a loop's count none.
+        marked = steady.loops[-1].marks > 0
+        unread = bool(consulted) or not (marked or (ranged is not None and _runs(*ranged[1:3])))
         self.fixed = self.fixed + steady.fixed
         self.walks.extend(_unread(walk) if unread else walk for walk in steady.walks)
         work = _mean([steady.loops[-1].work, odd.loops[-1].work])
