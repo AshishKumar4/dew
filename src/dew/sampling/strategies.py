@@ -27,6 +27,7 @@ from dew._distributions import counted, row_draw, wellformed
 from dew.batch import Variables, prefix_sum
 from dew.nn import categorical
 from dew.nn.inputs import PredictionPhase, continuation_keys, prompt_major
+from dew.nn.kernels.templates.recurrence.step import donated_state
 from dew.nn.scatter import DROPPED, gather_positions
 from dew.sampling import decoding
 from dew.sampling.decoding import Finish, StepState
@@ -336,7 +337,10 @@ def _sample_rows(state: DecoderState, start: StepState, ops: DecodeOps,
         drew = row_step(step_state, state.logits, transform, stopping,
                         None if grammar is None else (grammar, automaton))
         stopped = active & drew.finished.done
-        following = ops.advance(state, drew.token, active)
+        # The loop's next state replaces the one it hands the step: each recurrent state steps in place
+        # (`donated_state`), where written apart the carry copied it back each step (row 14174).
+        with donated_state():
+            following = ops.advance(state, drew.token, active)
         carry = (following, dataclasses.replace(drew.committed, active=active & ~stopped),
                  terminated | (active & drew.finished.ended), drew.automaton)
         return carry, (drew.token, active, drew.behavior, drew.raw)
@@ -574,7 +578,9 @@ def _beam_search(state: DecoderState, start: StepState, ops: DecodeOps,
         worst = jnp.where(done.flag, jnp.min(done.score, axis=1, keepdims=True), DEAD)
         extending = carry.extending & jnp.any(live[:, :1] / jnp.power(reach, penalty) > worst,
                                 axis=-1, keepdims=True)
-        state = ops.advance(state, selected, real)
+        # The reparented rows' state is the step's own (row 14174, `_sample_rows`).
+        with donated_state():
+            state = ops.advance(state, selected, real)
         drawn = gather_positions(grown, forward).reshape(prompts * width, budget)
         scored = gather_positions(traced, forward).reshape(prompts * width, budget)
         # The three are None together, where the search asks for no boundaries.
