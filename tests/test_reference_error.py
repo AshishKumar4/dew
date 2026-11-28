@@ -124,12 +124,13 @@ def test_a_library_arm_compiled_only_with_ynnpacks_fusions_switches_its_site_bef
     YNNPACK's fusions (jax.nn's XLA attention's backward over a single key) switches its site's arms onto
     them before any draw (`_ynn_decided`, reported in `SWITCHED`), as the bare arm does, and its check reads
     the executable it then runs, the fused one, which makes no call of the mark's and is refused for that
-    (train 1472's review: the check hid the arm's pairing and lowered the variant XLA refuses)."""
+    (`NotTheLibrary`; train 1472's review: the check hid the arm's pairing and lowered the variant XLA
+    refuses)."""
     from check1_judge import SWITCHED
-    from truths_ahead import library_arm
+    from truths_ahead import NotTheLibrary, library_arm
 
     marked = library_arm(pulled_by_itself(xla_attention), "__a_library_call", platform="cpu")
-    with pytest.raises(AssertionError, match="no __a_library_call"):
+    with pytest.raises(NotTheLibrary):
         assert_as_exact(marked, pulled_by_itself(written_attention), one_key_draw,
                         "a library arm over one key", seeds=16)
     assert [entry["label"] for entry in SWITCHED] == ["a library arm over one key"]

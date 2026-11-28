@@ -435,6 +435,11 @@ def library_call(fn) -> tuple[str, str] | None:
     return next((marked for arm, marked in _LIBRARY_CALLS.items() if arm is fn), None)
 
 
+class NotTheLibrary(AssertionError):
+    """A library arm's executable that makes no call of its library's, or runs a dot of XLA's own
+    (`library_checked`)."""
+
+
 def library_checked(executable: jax.stages.Compiled, mark: tuple[str, str], label: str) -> None:
     """`executable`, a library arm's (`library_arm`'s `mark`, its call and the platform that makes it) as it
     runs, read by its instructions as XLA's own schema reads them
@@ -452,9 +457,9 @@ def library_checked(executable: jax.stages.Compiled, mark: tuple[str, str], labe
     instructions = hlo_instructions(executable).values()
     targets = {each.target for each in instructions} - {""}
     if call not in targets:
-        raise AssertionError(f"{label}: the library arm calls {sorted(targets)}, no {call}")
+        raise NotTheLibrary(f"{label}: the library arm calls {sorted(targets)}, no {call}")
     if any(each.op == "dot" or "dot" in each.fused for each in instructions):
-        raise AssertionError(f"{label}: the library arm runs a dot of XLA's own")
+        raise NotTheLibrary(f"{label}: the library arm runs a dot of XLA's own")
 
 
 def _platform(executable: jax.stages.Compiled) -> str:

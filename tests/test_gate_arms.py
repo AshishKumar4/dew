@@ -4,7 +4,6 @@ as the reference is."""
 import contextlib
 import itertools
 import pickle
-import re
 
 import jax
 import jax.numpy as jnp
@@ -23,7 +22,7 @@ from reference_error import (
 )
 from test_reference_error import exact_rows, noised_draw, stacked_arm, stacked_examples
 from test_reference_error_written import _cancelling, _combined
-from truths_ahead import UNPREPARED, compiled_truths
+from truths_ahead import UNPREPARED, NotTheLibrary, compiled_truths
 
 from dew.nn.kernels import gemm, generation, tuning
 from dew.nn.kernels.templates.hooks import Hook
@@ -297,7 +296,7 @@ def test_a_library_arm_is_held_to_its_call_on_the_executable_its_run_runs(tmp_pa
             if case == "its call made":
                 assert_as_exact(jax.jit(fn), reference, draw, label, seeds=8, truth_fn=truth)
             else:
-                with pytest.raises(AssertionError, match=f"no {re.escape(call)}"):
+                with pytest.raises(NotTheLibrary):
                     assert_as_exact(jax.jit(fn), reference, draw, label, seeds=8, truth_fn=truth)
 
 
