@@ -762,12 +762,13 @@ def placed_zeros(shape: tuple, dtype, sharding: jax.sharding.NamedSharding | Non
                  weak_type: bool = False) -> jax.Array:
     """Zeros of `shape` and `dtype` (a float64 one's outside x64 too; weak where `weak_type`), placed at
     `sharding`'s Explicit axes (a type's, or None) and made where they are read: Dew's one allocation of a
-    type's zeros (`precision._no_groups`, `factored`'s rescue; train 1490's review K-F2). Traced (JAX
-    tracing, or a tracer among `anchors`), under the placement's own abstract mesh, so it holds outside any
-    mesh context. Run eagerly, on the devices of `anchors`' named mesh, that concrete mesh entered for the
-    allocation alone (an abstract mesh allocates on none; JAX refuses one entered while tracing, where a
-    jit's closure holds concrete anchors beside its tracers: K-F1); else on the one device committed
-    `anchors` lie on, committed there, as a product of them would be; else JAX's default."""
+    type's zeros (`precision._no_groups`, `factored`'s rescue; train 1490's review K-F2). Traced (JAX tracing,
+    or a tracer among `anchors`), under the placement's own abstract mesh, so it holds outside any mesh
+    context. Run eagerly, on the devices of `anchors`' named mesh (the anchors of one product share it), that
+    concrete mesh entered for the allocation alone (an abstract mesh allocates on none; JAX refuses one
+    entered while tracing, where a jit's closure holds concrete anchors beside its tracers: K-F1); else on the
+    one device committed `anchors` lie on, committed there, as a product of them would be; else JAX's
+    default."""
     leaves = jax.tree.leaves(anchors)
     eager = jax_core.trace_state_clean() and not any(isinstance(leaf, jax_core.Tracer) for leaf in leaves)
     explicit = sharding is not None and bool(sharding.mesh.explicit_axes)
