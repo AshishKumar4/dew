@@ -422,12 +422,12 @@ def prepared(q, k, v, g, beta, h0, *, starts, max_segments, scale, delta, tiles,
     # port is its reference). Without it, a `rounded` call's (the SSD's under the run's fast forms, which its
     # route resolves, `recurrence_chunk.fast_rounding`) in the operands' dtype too, as mamba_ssm rounds its
     # scores and entered memories for its products (`_chunk_scan_fwd`'s `cb` and `prev_states`), its memory
-    # summed and passed in fp32: on an H100 Nemotron-H 4B's SSD forward took 0.581 ms against fp32's three
-    # parts' 2.031 and the port's 0.606, 30B's 0.249 against 0.593 and 0.229 (ssd-held-h100-fdab2424c); and
-    # fla's simple GLA's, its write gated on the values (`values_gated`, `Call.values_gated`). Else,
-    # and under the accurate forms, fp32's three parts, as the portable math holds them (a 16-bit call's
-    # rounded put the output 1.7 times and the final memory up to 540 times the portable math's distance from
-    # float64).
+    # summed and passed in fp32, a training call's boundaries in two limbs (`Call.limbed`): on an H100
+    # Nemotron-H 4B's SSD forward took 0.581 ms against fp32's three parts' 2.031 and the port's 0.606, 30B's
+    # 0.249 against 0.593 and 0.229 (ssd-held-h100-fdab2424c); and fla's simple GLA's, its write gated on the
+    # values (`values_gated`, `Call.values_gated`). Else, and under the accurate forms, fp32's three parts, as
+    # the portable math holds them (a 16-bit call's rounded put the output 1.7 times and the final memory up
+    # to 540 times the portable math's distance from float64).
     held = given if delta or rounded else Operand(rows, product.bf16_part_count(), jnp.dtype(jnp.float32))
     if apart and (delta or per_key or tiles.chunk % apart):
         raise NotImplementedError("the mainloop reads a token's state apart from its group's writes under a "

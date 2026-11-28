@@ -64,6 +64,14 @@ def cast(iv: Iv, fmt: Format) -> Iv:
     return Iv(nearest(iv.lo, fmt), nearest(iv.hi, fmt))
 
 
+def saturated(iv: Iv, fmt: Format) -> Iv:
+    """A saturating cast to nearest of a value within `iv`: clipped to `fmt`'s largest finite magnitude, then
+    rounded (both monotone), as a bf16 part a store forms (`product.bf16_parts`' saturating parts): a finite
+    fp32 value past `fmt`'s overflow midpoint its largest, where `cast` gives infinity."""
+    largest = fmt.largest
+    return cast(Iv(np.clip(iv.lo, -largest, largest), np.clip(iv.hi, -largest, largest)), fmt)
+
+
 def cell(x, fmt: Format) -> Iv:
     """The values that round to nearest to each `x` of `fmt`: between its midpoints with its neighbours."""
     x = np.asarray(x, np.float64)
@@ -246,6 +254,19 @@ def dot(a: Iv, b: Iv, lane: Lane, fmt: Format = BFLOAT16, into: Iv | None = None
     `parts` (`Lane.held`, `Lane.given`): a one-part fp32 operand read as TF32 (`operand`); bf16 parts
     multiplied over the pairs `product.terms` issues, each exact, their sum the exact product less the pairs
     dropped (`PART_BOUNDS`' products of them), the terms `product.terms` times as many."""
+    return _contracted(Iv(a.lo[:, None, :], a.hi[:, None, :]), Iv(b.lo.T[None, :, :], b.hi.T[None, :, :]),
+                       lane, fmt, into, parts)
+
+
+def row_dot(a: Iv, b: Iv, lane: Lane, fmt: Format = BFLOAT16, parts: tuple[int, int] = (1, 1)) -> Iv:
+    """Each row's `sum(a * b)` over its last axis (`[M, K]` each, `[M]`) as `dot` bounds one of its entries,
+    the diagonal of `a @ b^T` alone: the terms a row's own."""
+    return _contracted(a, b, lane, fmt, None, parts)
+
+
+def _contracted(a: Iv, b: Iv, lane: Lane, fmt: Format, into: Iv | None, parts: tuple[int, int]) -> Iv:
+    """`dot`'s sums over the last axis of `a` and `b` broadcast together (`dot`'s `[M, 1, K]` and `[1, N, K]`,
+    `row_dot`'s rows), each `[..., K]` term exact and their sum within the native-dot contract's bound."""
     from dew.nn.kernels.templates import product
 
     pa, pb = parts
@@ -259,12 +280,12 @@ def dot(a: Iv, b: Iv, lane: Lane, fmt: Format = BFLOAT16, into: Iv | None = None
     lost = sum(PART_BOUNDS[i] * PART_BOUNDS[j] for i, j in dropped)
     if pa * pb > 1:
         fmt = BFLOAT16
-    terms = mul(Iv(a.lo[:, None, :], a.hi[:, None, :]), Iv(b.lo.T[None, :, :], b.hi.T[None, :, :]))
+    terms = mul(a, b)
     if into is not None:
         terms = Iv(np.concatenate([terms.lo, into.lo[..., None]], -1),
                    np.concatenate([terms.hi, into.hi[..., None]], -1))
     live = ((terms.lo != 0) | (terms.hi != 0)).sum(-1) * len(issued)
-    pairs = aligned(a, fmt)[:, None, :] * aligned(b, fmt).T[None, :, :]
+    pairs = aligned(a, fmt) * aligned(b, fmt)
     magnitude = pairs.sum(-1) * share * (1 + 2.0 ** -50)
     if into is not None:
         magnitude = magnitude + np.maximum(np.abs(into.lo), np.abs(into.hi)) * (1 + 2.0 ** -50)
