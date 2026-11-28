@@ -109,6 +109,29 @@ def adapters(model=None, generation=None):
             spec.apply(model, variables, key=1, fp8_base=record(variables, generation)))
 
 
+@pytest.mark.mesh(devices=1)
+def test_a_one_stage_scan_reads_a_frozen_fp8_base_where_it_lies():
+    """A LoRA run over an FP8 base, its layers scanned on one stage, reads the packed frozen kernels where
+    they lie, a row an iteration (`QUANTIZATION` among its `LAYER_ROWS`), and holds no more temporaries for
+    its step than the same run over the layers unscanned, under no rung and under `full`: it stacked every
+    layer's packed kernels each step (row 4751: 40.8 MB against 21.8 MB, eight layers)."""
+    rows = {"text": jnp.asarray(np.random.default_rng(1).integers(0, VOCAB, (BATCH, SEQ + 1)), jnp.int32)}
+    for remat in (None, "full"):
+        held = {}
+        for scan in (True, False):
+            with stacked(scan):
+                _, adapter = adapters(decoder(num_layers=4, remat=remat))
+                run = Trainer(LMObjective(adapter.model, SEQ, variables=adapter.variables), optax.sgd(1e-3),
+                              key=jax.random.key(0), mesh=MeshSpec(), checkpoints=None, tracker=None,
+                              advanced=TrainerAdvanced(layout=Layout(min_shard=1, tolerance=1.0,
+                                                                     stage_local=True)))
+                run.device_mesh = MeshSpec().build(jax.devices()[:1])
+                state, _, _ = run.place()
+                run.compile(state, rows)
+                held[scan] = run.executable.memory_analysis().temp_size_in_bytes
+        assert held[True] <= held[False], (remat, held)
+
+
 ELSEWHERE = "sm90" if device_generation() == "sm80" else "sm80"
 """A generation other than this process's: an A100's record runs on an H100, anything else's on an A100."""
 

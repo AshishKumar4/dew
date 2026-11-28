@@ -80,3 +80,17 @@ def test_a_recorded_reference_is_refused_a_paired_sizing(heavy):
 
     with pytest.raises(ValueError):
         seeds_for(recorded, heavy, "recorded sums", truth_fn=_truth, dew_fn=_summed(1))
+
+
+def test_a_recorded_dew_arm_is_refused_a_paired_sizing(heavy):
+    """A judged recording, Dew's arm read from a recording without pilots, holds its recorded seeds alone as
+    a recorded reference does, so a paired sizing of it is refused too: the pair's pilot budget is both
+    arms' (train 1430's review: it was read off the reference alone)."""
+    dew = _summed(1)
+
+    @as_recorded
+    def recorded(x):
+        return dew(x)
+
+    with pytest.raises(ValueError):
+        seeds_for(_summed(0), heavy, "recorded Dew sums", truth_fn=_truth, dew_fn=recorded)

@@ -217,6 +217,11 @@ def held_by_stage(sites: Sequence[DecoderBank]) -> Iterator[None]:
         _STAGE_SITES.reset(token)
 
 
+def stage_sites() -> tuple[DecoderBank, ...]:
+    """The stage-local sites in context (`held_by_stage`), empty outside a stage-local run."""
+    return _STAGE_SITES.get()
+
+
 def stacked_layers(path: tuple) -> tuple[tuple[tuple, ...], int] | None:
     """The paths of the stored layers a leaf at `path` stacks, in its rows' order, and how many of
     its leading dimensions stack them, where `path` is a stage-local run's under the sites in

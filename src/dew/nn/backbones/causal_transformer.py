@@ -1544,7 +1544,10 @@ class CausalTransformer(LinearProducts):
             view = self._view_of(store, lambda module: decoder_stages.stage_view(module, stages))
         if stages == 1 and not (scans and any(count > 1 for _, count in view.groups)):
             return ()
-        return (DecoderBank((), view),)
+        frozen = (stages == 1 and not view.holds(dict(store).get('params', {}))
+                  and any(isinstance(tree, Mapping) and view.holds(tree)
+                          for name, tree in store.items() if name != 'params'))
+        return (DecoderBank((), view, frozen=frozen),)
 
     def _loop_spans(self) -> tuple[tuple[int, int], ...]:
         """The layer ranges this decoder runs separately (`run_loop`), in order: the whole stack without a

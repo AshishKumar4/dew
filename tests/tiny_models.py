@@ -141,7 +141,9 @@ def forward(architecture, dtype, rng):
     model = build_model(architecture, dtype)
     inputs = tiny_inputs(architecture, rng)
     args, kwargs = inputs if isinstance(inputs[0], tuple) else (inputs, {})
-    variables = nn.unbox(model.init(rng, *args, **kwargs))
+    # One program: initialized eagerly, op by op, a decoder's init compiled each operation alone (row 12809:
+    # GLM-5's tiny, 128 s a cold cell).
+    variables = nn.unbox(jax.jit(model.init)(rng, *args, **kwargs))
     if dtype == "float64":
         variables, args, kwargs = jax.tree.map(
             lambda leaf: leaf.astype(jnp.float64) if jnp.issubdtype(leaf.dtype, jnp.floating) else leaf,
