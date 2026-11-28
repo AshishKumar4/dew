@@ -537,6 +537,22 @@ def test_element_pointers_of_mixed_widths_cancel_by_their_bytes_and_a_narrow_ind
     assert _counted(body).shared_bytes == 4
 
 
+def test_an_inline_body_taking_a_semaphore_counts_as_its_code():
+    """An inline body taking a global semaphore beside its tile (a GEMM tail's flag, `pl.get_global`) counts
+    what its code issues, the semaphore no integer scalar the count folds (an extended dtype of no data):
+    the tile doubled in place, as the body without it (row 14181's launches)."""
+    def kernel(out_gmem, smem):
+        del out_gmem
+        flag = pl.get_global(plgpu.SemaphoreType.REGULAR(()))
+        plgpu.inline_mgpu(arg_types=(plgpu.RefType(), plgpu.RefType()))(
+            lambda ctx, ref, semaphore: _scaled(ref))(smem, flag)
+
+    launched = plgpu.kernel(kernel, out_type=_ROW, num_threads=1, thread_name="wg",
+                            scratch_types=[plgpu.SMEM((128,), jnp.float32)])
+    work = emission.emitted(jax.make_jaxpr(launched)().jaxpr, 1, "wg").roles[0].fixed
+    assert work == _counted(lambda ctx, ref: _scaled(ref))
+
+
 def test_an_elements_stride_is_stated_only_where_its_layout_is_its_payload():
     """An element pointer's stride is its element's bytes only where LLVM lays it out so (a scalar of 8 to 64
     bits, a vector of a power of two of them); an i24 (padded to four bytes), i1s (packed to bits) and a

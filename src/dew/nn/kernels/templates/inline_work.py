@@ -10,6 +10,7 @@ import re
 import weakref
 from collections.abc import Callable, Sequence
 
+import jax
 import numpy as np
 from jax._src import core as jax_core
 from jax._src.interpreters import mlir as jax_mlir
@@ -103,8 +104,9 @@ def body_work(fn: Callable, avals: Sequence, arg_types: Sequence, values: Sequen
 
 
 def _scalar(aval, value) -> int | None:
-    """`value` where it is an integer scalar operand's concrete value, else None."""
-    if getattr(aval, "shape", None) != () or not np.issubdtype(aval.dtype, np.integer):
+    """`value` where it is an integer scalar operand's concrete value, else None (a semaphore's, an extended
+    dtype's, none)."""
+    if getattr(aval, "shape", None) != () or not jax.dtypes.issubdtype(aval.dtype, np.integer):
         return None
     if isinstance(value, np.ndarray) and value.ndim == 0 and np.issubdtype(value.dtype, np.integer):
         return int(value)
@@ -173,8 +175,10 @@ def _stand_in_type(aval, kind) -> ir.Type:
         inner = viewed.inner_aval
         assert isinstance(inner, jax_core.ShapedArray), inner
         shared = "smem" in str(aval.memory_space).lower()
-        return ir.MemRefType.get(inner.shape, mgpu_utils.dtype_to_ir_type(inner.dtype),
-                                 memory_space=mgpu_utils.smem() if shared else None)
+        # A semaphore's words its i32 counters (an extended dtype, Mosaic GPU's `SemaphoreRef`).
+        element = (ir.IntegerType.get_signless(32) if jax.dtypes.issubdtype(inner.dtype, jax.dtypes.extended)
+                   else mgpu_utils.dtype_to_ir_type(inner.dtype))
+        return ir.MemRefType.get(inner.shape, element, memory_space=mgpu_utils.smem() if shared else None)
     return mgpu_utils.dtype_to_ir_type(aval.dtype)
 
 
