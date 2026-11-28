@@ -39,7 +39,7 @@ from dew.algebra import _component_sharing, _generated, error, printed, rules
 from dew.algebra._generated import case_of
 from dew.nn import programs
 from dew.nn.kernels import generation
-from dew.nn.precision import Numerics
+from dew.nn.precision import EXACT_FLOAT32, Numerics, configured_precision
 
 _log = logging.getLogger(__name__)
 
@@ -688,9 +688,9 @@ def _path(module: str) -> Path:
     return origin.with_name(f"{origin.stem}_derived.py")
 
 
-GENERATION_MATMUL = "highest"
+GENERATION_MATMUL = EXACT_FLOAT32
 """The precision of a product that states none while generation selects, prints and admits forms
-(`jax.default_matmul_precision`): the precision the written modules state, whatever the generating
+(`configured_precision`): the precision the written modules state, whatever the generating
 process's default. A product that states its own precision keeps it."""
 
 
@@ -709,7 +709,7 @@ def generate(*, check: bool = False) -> tuple[Generated, ...]:
         if (module := qualified.rsplit(".", 1)[0]) in DECLARING:
             by_module.setdefault(module, []).append(qualified)
     sets = tuple(found.name for found in rules.admitted(accurate=False, dev=True))
-    with jax.default_matmul_precision(GENERATION_MATMUL):
+    with configured_precision(GENERATION_MATMUL):
         found = {module: [one for qualified in declared
                           for one in _chosen(qualified, DECLARATIONS[qualified])]
                  for module, declared in by_module.items()}
