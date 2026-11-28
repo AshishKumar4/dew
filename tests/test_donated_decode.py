@@ -7,6 +7,7 @@ import jax.numpy as jnp
 import pytest
 from flax import linen as nn
 from generation_support import COMPILES_ON_CPU
+from jax._src import config as jax_config
 from jax.experimental.mosaic.gpu import core as mgpu_core
 from jax.sharding import NamedSharding, PartitionSpec
 from kernel_compile import _device, assumed, gpu_target
@@ -129,3 +130,28 @@ def test_a_donated_state_steps_in_place_unless_a_checked_map_types_it(shards, ch
     with donated_state():
         donated = aliased()
     assert not kept and bool(donated) == (not checked), (kept, donated)
+
+
+@COMPILES_ON_CPU
+def test_a_donated_states_step_in_a_checked_map_types_its_state_as_its_operands():
+    """A decode token (`decode_gated_delta_rule`) traced in a program that donates its state (`donated_state`)
+    inside a checked map over two H100s (`jax.shard_map`, `check_vma`): its initial state replicated, one
+    zero row, beside a split `active`, the next state varies over the map's axis as its rows do, so a
+    `psum` of it traces with no implicit cast (`jax_auto_pcast` off). Frozen from an in-place ref, the next
+    state kept the initial state's replicated type, and the `psum` refused it (train 1511's K-F1)."""
+    mesh = _device('sm90', (('data', 2),))
+    rows, heads, width = 1, 16, 128
+    split, whole = PartitionSpec('data'), PartitionSpec()
+
+    def step(query, key, value, g, beta, state, active):
+        _, next_state = decode_gated_delta_rule(query, key, value, g, beta, state, active)
+        return jax.lax.psum(next_state.astype(jnp.float32), 'data')
+
+    operands = (*(jax.ShapeDtypeStruct((rows, 1, heads, width), jnp.bfloat16) for _ in range(3)),
+                *(jax.ShapeDtypeStruct((rows, 1, heads), jnp.float32) for _ in range(2)),
+                jax.ShapeDtypeStruct((rows, heads, width, width), jnp.bfloat16),
+                jax.ShapeDtypeStruct((2,), jnp.bool_))
+    mapped = jax.shard_map(step, in_specs=(whole,) * 6 + (split,), out_specs=whole, check_vma=True)
+    with (assumed('sm90'), jax.set_mesh(mesh), donated_state(), jax_config.auto_pcast(new_val=False),
+          mgpu_core.artificial_shared_memory_limit(gpu_target('sm90').shared_limit)):
+        jax.jit(mapped).trace(*operands).lower()
