@@ -36,7 +36,6 @@ from __future__ import annotations
 import contextlib
 import contextvars
 import dataclasses
-import enum
 import functools
 from collections.abc import Callable, Sequence
 from typing import TYPE_CHECKING, Literal
@@ -66,7 +65,13 @@ from dew.nn.kernels.formats import (
     e8m0_exponents,
 )
 from dew.nn.kernels.gemm_xla import XlaConfig, as_tuple, direct_dtype, xla_mainloop
-from dew.nn.kernels.grouped_cells import BLOCKWISE_CELLS, Blockwise
+from dew.nn.kernels.grouped_cells import (
+    BLOCKWISE_CELLS,
+    NVFP4_CELLS,
+    NVFP4_DECODE_ROWS,
+    Blockwise,
+    PackedRows,
+)
 from dew.nn.kernels.templates import product as product_of
 from dew.nn.kernels.templates.axes import GROUPS
 from dew.nn.kernels.templates.gemm import (
@@ -78,7 +83,7 @@ from dew.nn.kernels.templates.gemm import (
     sides as hook_sides,
     tiling,
 )
-from dew.nn.kernels.templates.gemm.factored import factored
+from dew.nn.kernels.templates.gemm.factored import factored, owed_exactly, owed_native, per_row
 from dew.nn.kernels.templates.gemm.hooks import (
     NO_HOOKS,
     ColumnLocal,
@@ -1054,14 +1059,6 @@ NVFP4_ROW = 'ledger 3621'
 """The NVFP4 product's in-stage decode (K51)."""
 
 
-class PackedRows(enum.Enum):
-    """An NVFP4 call's size as its receipts measure it (`PackedCase.cell`): decode-sized (at most
-    `NVFP4_DECODE_ROWS` rows, the packed matrix's bytes its time) or a prefill."""
-
-    DECODE = 'decode'
-    PREFILL = 'prefill'
-
-
 @dataclasses.dataclass(frozen=True)
 class PackedCase:
     """An NVFP4 product as its selector reads it (`NVFP4`): the tile the template's packed launch plans for
@@ -1081,22 +1078,6 @@ class PackedCase:
                 PackedRows.DECODE if self.rows <= NVFP4_DECODE_ROWS else PackedRows.PREFILL)
 
 
-NVFP4_DECODE_ROWS = 64
-"""The most rows a decode-sized NVFP4 call has (`PackedCase.cell`): the receipts' largest decode row count."""
-
-PACKED_FASTER = ("W13-a100-4-M-NS-8b-a100 (base/kernels 8d23bb9872, CUPTI, arms rotated): Llama-3-8B's "
-                 "q/o, up and down projections at 1, 16 and 64 rows on an A100-SXM4-40GB, the packed kernel "
-                 "0.119-0.398 ms against the matrix decoded once a call's 0.309-1.418 (2.6-3.6x), its "
-                 "temporary memory 0.66-3.7 MB against 71-250 MB; at 4096 rows 4.4-4.7x slower, each row "
-                 "tile decoding the matrix again")
-"""The receipt behind the packed NVFP4 kernel's declared A100 cell (`NVFP4_CELLS`)."""
-PACKED_FASTER_SM90 = (
-    "W7-gh200-8-M-NS-8-h100 (base/kernels d4bb24d4f8, CUPTI, arms rotated): Llama-3-8B's q/o, up and down "
-    "projections at 1, 16 and 64 rows on a GH200, the packed kernel 0.059-0.193 ms against the matrix "
-    "decoded once a call's 0.142-0.505 (2.4x q/o, 4.5x up, 2.6x down), its temporary memory 0.2-3.7 MB "
-    "against 71-250 MB; at 4096 rows 5.2-5.3x slower, its stage decode unhidden under the products")
-"""The receipt behind the packed NVFP4 kernel's declared H100 cell (`NVFP4_CELLS`)."""
-
 PACKED = selection.Kernel[PackedCase]('packed', (
     selection.Requirement(
         'placement', lambda case: case.whole, "a mesh axis splits the product's operands, and the packed "
@@ -1108,17 +1089,10 @@ PACKED = selection.Kernel[PackedCase]('packed', (
 ))
 """The packed kernel: the template's mainloop decoding each stage of the packed matrix in place."""
 
-NVFP4_CELLS: dict[tuple[str | None, PackedRows], tuple[selection.Kernel[PackedCase], str]] = {
-    ('sm80', PackedRows.DECODE): (PACKED, PACKED_FASTER),
-    ('sm90', PackedRows.DECODE): (PACKED, PACKED_FASTER_SM90),
-}
-"""The NVFP4 product's declared cells (`selection.Op.declared`), (device generation, call size) to the
-packed kernel and its receipt: a literal of them, which the selector reads and thresh's declared-set seam
-registers (.thresh/thresh.cue)."""
-
 
 NVFP4: selection.Op[PackedCase] = selection.Op(generation.Choice.NVFP4, (
-    PACKED, selection.Kernel('xla', (), generic=True)), lambda case: 'xla', declared=NVFP4_CELLS)
+    PACKED, selection.Kernel('xla', (), generic=True)), lambda case: 'xla',
+    declared={cell: (PACKED, receipt) for cell, receipt in NVFP4_CELLS.items()})
 """An NVFP4 product's selector (`nvfp4_product`): the matrix decoded once a call and its product (`gemm`),
 but the template's mainloop decoding each stage of the packed matrix in place (`mosaic_gpu.gmm`'s `scales`)
 where a receipt measured it faster (a decode-sized call on an A100 or an H100: `NVFP4_CELLS`) or it is
@@ -1149,7 +1123,8 @@ def nvfp4_product(lhs: jax.Array, matrix: NvFp4, group_sizes: jax.Array | None =
     bank = matrix if layer is None else matrix.layer(layer)
     rows = lhs.astype(jnp.bfloat16)
     launch = grouped_quantized.MosaicPackedGmm()
-    words, scales = (jnp.asarray(field if group_sizes is not None else field[None])
+    # The block scales frozen, as the tensor scale is: no derivative reaches a launch reading them.
+    words, scales = (jax.lax.stop_gradient(jnp.asarray(field if group_sizes is not None else field[None]))
                      for field in (matrix.words, matrix.scales))
     count = rows.shape[0] if gather is None else gather.shape[0]
     sizes = jnp.asarray([count], jnp.int32) if group_sizes is None else group_sizes.astype(jnp.int32)
@@ -1177,21 +1152,64 @@ def nvfp4_product(lhs: jax.Array, matrix: NvFp4, group_sizes: jax.Array | None =
 
         product: Callable[..., jax.Array] = packed
         operands = (words, scales, sizes, gather, first)
+        finished = _packed_finish(launch, bound, bank, count, dense=group_sizes is None,
+                             interpret_on_cpu=interpret_on_cpu)
     else:
+        finished = None
         # Each product of two bfloat16 values is exact in fp32, so the default precision is the exact
         # product's, whatever precision the program defaults to (`decoded_product`).
         product = functools.partial(decoded_product, interpret_on_cpu=interpret_on_cpu)
         operands = (bank.decoded(), group_sizes, gather)
-    # The tensor scale, frozen: the matrix's, its columns' (`columned`), or a bank's each group's, which each
-    # row takes from its group in `factored`, no row's kept; the decode's owed 2^8 apart from it, both in the
-    # one rounding (`factored`'s `owed`), so no scale past 2^120 overflows the factor they make (train 1403's
-    # review). A cancelling cotangent under a factor past fp32's largest pulls back its finite sum, the bank
-    # decoded only where it does.
+    # The frozen tensor scale (a matrix's, its columns', a group's: each row its group's, in `factored`) and
+    # the owed 2^8 apart, in one rounding (no scale past 2^120 overflowing them, train 1403's review).
     scale = jax.lax.stop_gradient(jnp.asarray(bank.scale, jnp.float32))
     return factored(product, operands, scale, lhs, gather=gather,
                     groups=None if group_sizes is None else sizes, owed=bits.NVFP4_OWED, least=NvFp4.LEAST,
-                    wide=interpreted_wide(interpret_on_cpu),
+                    wide=interpreted_wide(interpret_on_cpu), finished=finished,
                     wide_operands=(bank, group_sizes), prepared=decoded_operands).astype(out_dtype)
+
+
+def _packed_finish(launch, bound, bank: NvFp4, count: int, *, dense: bool, interpret_on_cpu: bool):
+    """The packed product finished in its launch's epilogue (`factored`'s `finished`, row 13743): the tensor
+    scale (its tile's columns') and the owed 2^8 (`factored.owed_native`), CUDA's alone. None for a decode's
+    rows (`NVFP4_DECODE_ROWS`, a swapped launch's), interpreted or on a TPU (whose float32 flushes the
+    subnormals `factored`'s rounding keeps), or a placed scale; a call its operands place on the CPU when it
+    runs finishes there by `owed_exactly` (its review: 2^-127 times 256 flushed to zero there)."""
+    if (xla_products.interpreted(interpret_on_cpu) or generation.tpu(generation.gpu_target())
+            or count <= NVFP4_DECODE_ROWS or not launched_whole(bank.scale)):
+        return None
+    raised, lead = round(np.log2(bits.NVFP4_OWED)), () if dense else (bank.shape[0],)
+    hooks = Hooks(epilogue=functools.partial(owed_native, raised=raised),
+                  epilogue_axes=((*(() if dense else (GROUPS,)), 'columns'),))
+
+    def side_of(factor):
+        factor = factor if bank.columned else jnp.asarray(factor)[..., None]
+        return jnp.broadcast_to(factor, (*lead, bank.shape[-1]))
+
+    finishing = {name: value for name, value in bound.arguments.items() if name not in ('hooks', 'interpret')}
+    finishing['epilogue_operands'] = (jax.eval_shape(side_of, bank.scale),)
+    # An optional form, bound as its native launch is (uninterpreted): a pin the hooked call cannot take, or
+    # no tile of it, keeps the plain launch.
+    hooked = launch.bind(**finishing, hooks=hooks, interpret=False)
+    if launch.pin_refuses(hooked) or _planned(launch, hooked) is None:
+        return None
+
+    def finish(rows, words, scales, sizes, gather, first, factor, groups):
+        def owed(product):
+            return owed_exactly(product, per_row(factor, groups, product.shape[0]), raised)
+
+        def kernel(*operands, interpret: bool):  # interpreted on the CPU: the plain launch, the exact finish
+            if not interpret:
+                return _packed_launch(launch, *operands, interpret=False, dense=dense, hooks=hooks)
+            return owed(_packed_launch(launch, *operands[:-1], interpret=True, dense=dense))
+
+        def portable(*operands):
+            return owed(_packed_portable(*operands[:-1]))
+
+        return xla_products.dispatched(kernel, portable, interpret_on_cpu, rows, words, scales, sizes, gather,
+                                       first, side_of(factor))
+
+    return finish
 
 
 def wide_transpose(cotangent: jax.Array, matrices: jax.Array, sizes: jax.Array | None, *,
@@ -1214,6 +1232,30 @@ def _undeferred(words, scales) -> NvFp4:
     return NvFp4(words, scales, jnp.ones((words.shape[0],), jnp.float32))
 
 
+def _packed_launch(launch, rows, words, scales, sizes, gather, first, *sides, interpret: bool, dense: bool,
+                   hooks: Hooks = NO_HOOKS) -> jax.Array:
+    """The packed launch of the rows (`gather`'s) by the matrices' words and block scales (a stack's layer's
+    from `first`) in fp32, each step's sums exact, through `hooks`' epilogue over `sides` where given."""
+    return launch(rows, _undeferred(words, scales), sizes, (), sides, None, first, gather, hooks=hooks,
+                  out_dtype='float32', trans_rhs=False, interpret=interpret, dense=dense, exact_sums=True)
+
+
+def _layer_decoded(words, scales, sizes, first) -> jax.Array:
+    """The bank's matrices decoded, a stack's layer's alone (its groups' from `first`)."""
+    if first is not None:
+        words, scales = (jax.lax.dynamic_slice_in_dim(each, first, len(sizes)) for each in (words, scales))
+    return _undeferred(words, scales).decoded()
+
+
+def _packed_portable(rows, words, scales, sizes, gather, first) -> jax.Array:
+    """The packed product's portable arm: the rows (`gather`'s) times the matrices decoded, each product
+    exact (the default precision the exact one's), summed in fp32."""
+    matrices = _layer_decoded(words, scales, sizes, first)
+    return xla_products.xla_ragged_dot(rows if gather is None else rows[gather], matrices, sizes,
+                                       precision=jax.lax.Precision.DEFAULT,
+                                       preferred_element_type=jnp.float32)
+
+
 def _packed(rows: jax.Array, words: jax.Array, scales: jax.Array, sizes: jax.Array, gather, first,
             launch: grouped_quantized.MosaicPackedGmm, interpret: bool, *, dense: bool) -> jax.Array:
     """The packed matrices' product in fp32 (`nvfp4_product`'s packed kernel, `words` and `scales` led by
@@ -1225,18 +1267,7 @@ def _packed(rows: jax.Array, words: jax.Array, scales: jax.Array, sizes: jax.Arr
     rows a gather read (the frozen words, scales, sizes and table taking none). It runs through `launch`
     (`grouped_quantized.MosaicPackedGmm`), whose config a pin or a stored pick may name."""
 
-    def decoded(words, scales, first):
-        # The bank's matrices, a dense call's one alone (`gemm`'s dense matrix is `[depth, width]`), a stack's
-        # layer's alone (its groups' from `first`).
-        if first is not None:
-            words, scales = (jax.lax.dynamic_slice_in_dim(field, first, sizes.shape[0])
-                             for field in (words, scales))
-        matrices = _undeferred(words, scales).decoded()
-        return matrices[0] if dense else matrices
-
-    def kernel(rows, words, scales, sizes, gather, first, *, interpret):
-        return launch(rows, _undeferred(words, scales), sizes, (), (), None, first, gather,
-                      out_dtype='float32', trans_rhs=False, interpret=interpret, dense=dense, exact_sums=True)
+    kernel = functools.partial(_packed_launch, launch, dense=dense)
 
     def forward(rows, words, scales, sizes, gather, first):
         # The launch where the call lowers for CUDA, interpreted on a CPU where asked, the decoded values'
@@ -1255,8 +1286,9 @@ def _packed(rows: jax.Array, words: jax.Array, scales: jax.Array, sizes: jax.Arr
         # 1 - 511/512 summed to 0, audit A2).
         del saved
         rows, words, scales, sizes, gather, first = operands
-        matrices = decoded(words, scales, first)
-        d_rows = wide_transpose(cotangent, matrices, None if dense else sizes, interpret_on_cpu=interpret)
+        matrices = _layer_decoded(words, scales, sizes, first)
+        d_rows = wide_transpose(cotangent, matrices[0] if dense else matrices, None if dense else sizes,
+                                interpret_on_cpu=interpret)
         if gather is not None:
             d_rows = jnp.zeros(rows.shape, d_rows.dtype).at[gather].add(d_rows)
         leaves = (d_rows.astype(rows.dtype), zero_from_primal(words), zero_from_primal(scales),
@@ -1264,12 +1296,7 @@ def _packed(rows: jax.Array, words: jax.Array, scales: jax.Array, sizes: jax.Arr
                   *(() if first is None else (zero_from_primal(first),)))
         return tuple(leaves[index] for index in live)
 
-    def portable(rows, words, scales, sizes, gather, first):
-        matrices = decoded(words, scales, first)
-        return xla_products.xla_ragged_dot(rows if gather is None else rows[gather],
-                                             matrices if not dense else matrices[None], sizes,
-                                             precision=jax.lax.Precision.DEFAULT,
-                                             preferred_element_type=jnp.float32)
+    portable = _packed_portable
 
     differentiable = contracted("test_an_nvfp4_products_kernels_hold_every_order")(
         generation.linear_tangent(forward, backward, portable, live_cotangents=True, kind=KernelGlue()))
