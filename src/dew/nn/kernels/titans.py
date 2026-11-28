@@ -15,10 +15,10 @@ x sum(g x)) / (D sigma)`, `sigma = sqrt(var + eps)`; fla's Titans reference writ
 
 `titans` takes a mini-batch at a time (docs/design/kernel-templates.md's C class: its orchestration outside
 the recurrence tile): its tokens' gradients at once at the memory entering it, then its tokens a step at a
-time, each writing its own and reading the pair it leaves, its changes held apart from the pair entering the
-mini-batch as the memory's general path holds its steps (`dew.nn.memory`), so no query meets a key (a live
-score of 2^70 by 2^70 overflowed beside a zero write) and no state is weighed after a read (a memory of 2^70
-forgotten whole read `0 * inf`). Documents are not packed: a mini-batch is the sequence's `chunk` tokens,
+time, each writing its own and reading the pair it leaves, the memory a compensated pair within it that holds
+steps below its last place as the memory's general path does (`dew.nn.memory`), so no query meets a key (a
+live score of 2^70 by 2^70 overflowed beside a zero write) and no state is weighed after a read (a memory of
+2^70 forgotten whole read `0 * inf`). Documents are not packed: a mini-batch is the sequence's `chunk` tokens,
 which a document starting within one would split (fla's reference takes none either)."""
 
 from __future__ import annotations
@@ -28,7 +28,7 @@ import functools
 import jax
 import jax.numpy as jnp
 
-from dew.nn import sharding
+from dew.nn import precision, sharding
 from dew.nn.aligned import aligned_sum
 from dew.nn.inputs import sequence_blocks
 from dew.nn.norms import row_shift
@@ -180,9 +180,8 @@ def titans(query, key, value, weight, bias, theta, alpha, eta, state=None, *, ch
     def mini_batch(pair, at):
         q, k, v, theta, alpha, eta, real = at
         gradient = real_gradients(k, v, k @ pair[0], real, weight, bias, eps)
-        memory0, momentum0 = pair
 
-        def token(changes, along):
+        def token(carried, along):
             q, k, gradient, theta, alpha, eta, real = along
             # The write `2 theta k u` one exact product of the 2, the rate, the key and the gradient, rounded
             # once (`aligned_sum`), its transpose's alike: no partial product leaves the range its value does
@@ -192,25 +191,25 @@ def titans(query, key, value, weight, bias, theta, alpha, eta, state=None, *, ch
             # 2^127 doubled first overflowed, train 1461's).
             write = aligned_sum([[jnp.asarray(coefficient, theta.dtype), theta[..., None, None],
                                   k[..., :, None], gradient[..., None, :]]])
-            # The pair's changes since the mini-batch entered, `D = M - M_0` and `E = S - S_0`, stepped apart
-            # from the entering pair, as the memory's general path holds its steps apart from the state its
-            # chunk entered (`dew.nn.memory`): a change below the entering memory's last place is kept rather
-            # than rounded away token by token (79g's review: four writes of 0.98 into a memory of 2^25 left
-            # it as it was). `S' = eta S - w` and `M' = (1 - alpha) M + S'` as changes:
-            # `E' = (eta E - w) - (1 - eta) S_0` and `D' = ((1 - alpha) D - alpha M_0) + (S_0 + E')`.
-            memory_change, momentum_change = changes
-            forget, carry = (1.0 - alpha)[..., None, None], eta[..., None, None]
-            momentum_change = (carry * momentum_change - write) - (1.0 - carry) * momentum0
-            memory_change = ((forget * memory_change - alpha[..., None, None] * memory0)
-                             + (momentum0 + momentum_change))
-            # A padded token leaves the changes as they were.
-            changes = tuple(jnp.where(real[..., None, None], new, old) for new, old in
-                            zip((memory_change, momentum_change), changes, strict=True))
-            return changes, jnp.einsum('bhk,bhkv->bhv', q, memory0 + changes[0])
+            memory, low, momentum = carried
+            momentum = eta[..., None, None] * momentum - write
+            # The memory a compensated pair within the mini-batch: what each step's addition rounds away is
+            # kept in its low part (`precision.two_sum`) and the pair renormalized, so the memory read, its
+            # rounded value, holds steps below its last place as the memory's general path holds a chunk's
+            # (`dew.nn.memory`; 79g's review: four writes of 0.98 into a memory of 2^25 left it as it was),
+            # and a decayed memory is the recurrence's own product, as exact as fla's reference.
+            forget = (1.0 - alpha)[..., None, None]
+            total, dropped = precision.two_sum(forget * memory, momentum)
+            memory, low = precision.two_sum(total, forget * low + dropped)
+            # A padded token leaves the memory and momentum as they were.
+            carried = tuple(jnp.where(real[..., None, None], new, old)
+                            for new, old in zip((memory, low, momentum), carried, strict=True))
+            return carried, jnp.einsum('bhk,bhkv->bhv', q, carried[0])
 
         tokens = tuple(jnp.moveaxis(x, 2, 0) for x in (q, k, gradient, theta, alpha, eta, real))
-        changes, reads = jax.lax.scan(token, tuple(jnp.zeros_like(held) for held in pair), tokens)
-        return tuple(held + change for held, change in zip(pair, changes, strict=True)), reads
+        entering = (pair[0], jnp.zeros_like(pair[0]), pair[1])
+        (memory, _, momentum), reads = jax.lax.scan(token, entering, tokens)
+        return (memory, momentum), reads
 
     keys, *rest = mini_batches(chunk, k, q, v, theta, alpha, eta, valid=valid)
     final, out = memory_chunks(mini_batch, states, (rest[0], keys, *rest[1:]))
