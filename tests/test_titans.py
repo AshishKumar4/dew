@@ -5,6 +5,7 @@ float64 (check 1), the recurrence this file's own (its inner gradient the inner 
 of either module's)."""
 
 import functools
+import typing
 
 import jax
 import jax.numpy as jnp
@@ -407,7 +408,9 @@ def test_a_memorys_mini_batches_are_recomputed_where_the_rung_recomputes_the_chu
         return sum(jnp.sum(x) for x in jax.tree.leaves(memory(*arguments)))
 
     def saved():
-        return sum(aval.size * aval.dtype.itemsize for aval, _ in saved_residuals(total, *given, states))
+        found = saved_residuals(total, *given, states)
+        avals = (typing.cast(jax.core.ShapedArray, aval) for aval, _ in found)
+        return sum(aval.size * aval.dtype.itemsize for aval in avals)
 
     stored_bytes = saved()
     with recomputing((MEMORY_RESIDUALS[1],)):
@@ -604,7 +607,7 @@ def test_the_mini_batches_run_in_a_checked_shard_map_whatever_varies(form, split
         if split == 'the query':
             return (tokens[0] * (1 + device), *tokens[1:]), affine, gates, None, None
         if split == 'the mask':
-            return tokens, affine, gates, None, np.full(tokens[0].shape[:2], device == 0)
+            return tokens, affine, gates, None, np.full(jnp.shape(tokens[0])[:2], device == 0)
         return tokens, affine, gates, (states[0], states[1] * (1 + device)), None
 
     each = [on(device) for device in range(2)]
