@@ -929,12 +929,12 @@ def _grouped(product: Callable[..., jax.Array], operands: tuple,
 def _no_groups(traced: core.Jaxpr, operands: tuple) -> jax.Array:
     """A ragged dot of no groups' zeros (`traced`, its program, `_grouped`'s), typed as the product is: its
     traced aval's zeros as JAX forms a value's (`ad_util.zeros_like_aval`: its dtype, a float64 one's outside
-    x64 too, its weakness and its placement each the aval's, an Explicit one a shape's evaluation drops
-    beside an Auto axis), varying as its operands vary; an eager call's made on the mesh of devices its
-    operands lie on (every operand of one product shares it) at the product's placement (train 1484's
-    review: allocated at the abstract mesh outside any mesh context, a two-device product's zeros were
-    refused), else committed to the one device its committed operands lie on, as their product would be. A constant, its derivative zero at every order
-    (row 14112's reviews)."""
+    x64 too, its weakness and its placement each the aval's, an Explicit one a shape's evaluation drops beside
+    an Auto axis), varying as its operands vary; an eager call's made on the mesh of devices its operands lie
+    on (every operand of one product shares it) at the product's placement (train 1484's review: allocated at
+    the abstract mesh outside any mesh context, a two-device product's zeros were refused), else committed to
+    the one device its committed operands lie on, as their product would be. A constant, its derivative zero
+    at every order (row 14112's reviews)."""
     from jax._src import ad_util
 
     from dew.nn.sharding import concrete_mesh, varying_like
@@ -944,11 +944,13 @@ def _no_groups(traced: core.Jaxpr, operands: tuple) -> jax.Array:
     narrowed = jax.dtypes.canonicalize_dtype(typed.dtype) != typed.dtype
     meshes = [mesh for leaf in jax.tree.leaves(operands) if (mesh := concrete_mesh(leaf)) is not None]
     mesh = meshes[0] if meshes else None
-    with jax.enable_x64(new_val=True) if narrowed else contextlib.nullcontext():
-        if mesh is not None and isinstance(typed.sharding, jax.sharding.NamedSharding):
-            return varying_like(jnp.zeros(typed.shape, typed.dtype, device=jax.sharding.NamedSharding(
-                mesh, typed.sharding.spec)), *operands)
+    # On the operands' mesh of devices, where one runs eagerly outside any mesh context: the traced aval's
+    # zeros (its weakness kept, its review) made on those devices.
+    placed = jax.set_mesh(mesh) if mesh is not None else contextlib.nullcontext()
+    with jax.enable_x64(new_val=True) if narrowed else contextlib.nullcontext(), placed:
         zeros = ad_util.zeros_like_aval(typed)
+    if mesh is not None:
+        return varying_like(zeros, *operands)
     devices = {device for leaf in jax.tree.leaves(operands)
                if isinstance(leaf, jax.Array) and not isinstance(leaf, Tracer) and leaf.committed
                for device in leaf.devices()}
