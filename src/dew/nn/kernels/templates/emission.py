@@ -780,7 +780,7 @@ class _Counting:
         old = equation.outvars[0]
         read = _bytes(old.aval) if old in live else 0
         written = _bytes(equation.invars[1].aval) if primitive is state.swap_p else 0
-        self.add(Work(device_bytes=read + written, device_reads=read))
+        self.add(Work(device_bytes=read + written))
         return [None] * len(equation.outvars)
 
     def equation(self, equation, values: list, given: list[bool]) -> list:
@@ -1533,8 +1533,8 @@ def launch_programs(kernel) -> int:
 
 def launch_work(kernel, stated: Stated) -> Work:
     """A kernel equation's work from its body's emission, a launch's: each unit's, a step's `stated.steps`
-    times and the rest each program's (`Emitted.issued`), the bytes it states its device's and the bytes it
-    reads past its operands' whole its L2's (`Work.l2_bytes`), its span the
+    times and the rest each program's (`Emitted.issued`), the bytes it states its device's and the bytes its
+    copies read past its buffers' whole its L2's (`Work.l2_bytes`), its span the
     steps its longest program walks (`Stated.longest`, else their mean), and one kernel. Its cost
     estimate's (`_estimate`) and a step's price (`work_of`, `attention_decode.priced_step`) alike."""
     return _launched(kernel, stated)[0]
@@ -1556,11 +1556,12 @@ def _launched(kernel, stated: Stated) -> "Launched":
     # The steps on its critical path: its longest program's walk where it states one, else their mean.
     walked = stated.steps / programs if stated.longest is None else stated.longest
 
-    # Its compulsory bytes the ones it states; its reads past its operands, each whole once, read again from
-    # the L2 (row 14180: a tile's repeated reads of an operand other programs read). Past them, so at most
-    # its rereads: a first read a statement omits is no reread, nor a store or a reduction, and an operand
-    # read in part only hides another's.
-    footprint = sum(_bytes(var.aval) for var in kernel.invars)
+    # Its compulsory bytes the ones it states; its copies' reads past every buffer it holds, each whole once,
+    # read again from the L2 (row 14180: a tile's repeated reads of an operand other programs read). Past
+    # them all, so at most its rereads: a first read a statement omits is no reread (an operand's, an
+    # output's read back), nor a store or a reduction; a buffer read in part or written alone only hides
+    # another's.
+    footprint = sum(_bytes(var.aval) for var in (*kernel.invars, *kernel.outvars))
     reads = counted.issued(lambda work: work.device_reads, stated.steps, programs)
     work = Work(**{unit: issued(unit) for unit in ISSUED_UNITS if unit != "issue_excess"},
                 device_bytes=stated.bytes_accessed, l2_bytes=max(0.0, reads - footprint),

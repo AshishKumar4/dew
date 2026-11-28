@@ -149,13 +149,13 @@ class Work:
     conversions: float = 0.0
     device_bytes: float = dataclasses.field(default=0.0, metadata=_NOT_ISSUED)
     l2_bytes: float = dataclasses.field(default=0.0, metadata=_NOT_ISSUED)
-    """The bytes a launch's body reads from device memory past its operands' whole, each once
-    (`emission.launch_work`), so at most its rereads: a tile's repeated reads of an operand other programs
-    read, met in the L2 (`GpuTarget.l2_rate`), the device memory's own unit's rate a level up (`units`:
-    row 14180, the two-level memory a launch's body counts)."""
+    """The bytes a launch's copies read from device memory past its operands' and outputs' whole, each
+    once (`emission.launch_work`), so at most its rereads: a tile's repeated reads of an operand other
+    programs read, met in the L2 (`GpuTarget.l2_rate`), the device memory's own unit's rate a level up
+    (`units`: row 14180, the two-level memory a launch's body counts)."""
     device_reads: float = dataclasses.field(default=0.0, metadata=_NOT_ISSUED)
-    """The bytes of a body's `device_bytes` it reads (its copies into shared memory, its loads of device
-    refs; no store or reduction), which a launch's `l2_bytes` reads past its operands (`emission`)."""
+    """The bytes of a body's `device_bytes` its copies into shared memory read (no store or reduction),
+    which a launch's `l2_bytes` reads past its buffers (`emission.launch_work`)."""
     shared_bytes: float = 0.0
     tf32_flops: float = 0.0
     span: float = dataclasses.field(default=0.0, metadata=_NOT_ISSUED)
