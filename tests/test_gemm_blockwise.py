@@ -117,7 +117,7 @@ def test_equal_shares_blockwise_reference_and_truth_hold_check_1_on_this_cpu():
 
     with on_the_host():
         taken = _shares_hold_check_1(grouped_cells.Blockwise(256, 512, 256, 4, 128),
-                                     "blockwise equal shares 256x512x256", arm=lambda fn, inputs: jax.jit(fn))
+                                     "blockwise equal shares 256x512x256", arm=jax.jit)
     assert taken == {"xla"}, taken
 
 
@@ -186,7 +186,7 @@ def _shares_hold_check_1(cell: grouped_cells.Blockwise, label: str, *,
             rows, width)
 
     with generation.routes() as routes:
-        assert_as_exact(jax.jit(unnamed), arm(reference, draw(0)), draw, label, seeds=blockwise_matrix.SEEDS,
+        assert_as_exact(jax.jit(unnamed), arm(reference), draw, label, seeds=blockwise_matrix.SEEDS,
                         truth_fn=jax.jit(truth))
     return {route.kernel for route in routes if route.choice == "blockwise_fp8"}
 
@@ -346,7 +346,7 @@ def a_blockwise_kernel_gradient_is_on_par(interpret: bool = False):
     GEMM on the same codes a block at a time (check 1, `_gradient_cublaslt`: block-scaled FP8 on Hopper is
     held at parity with cuBLASLt), from float64; an empty group's gradient is zero. On this GPU, or
     `interpret`ed (test_gpu_gemm's cell)."""
-    reference = blockwise_matrix.cublaslt_arm(_gradient_cublaslt, _gradient_operands(0))
+    reference = blockwise_matrix.cublaslt_arm(_gradient_cublaslt)
     with generation.routes() as routes:
         assert_as_exact(jax.jit(_gradient("mosaic", interpret)), reference, _gradient_operands,
                         "blockwise kernel gradient", seeds=blockwise_matrix.SEEDS,

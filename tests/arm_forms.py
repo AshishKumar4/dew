@@ -72,8 +72,21 @@ class _Windowed:
                             for index in range(_window_count(arguments))])
 
 
+class _Adapting:
+    """An arm adapting another (`fn`), whose marks and mode are its arm's (`_RunToRun`, `_LibraryChecked`)."""
+
+    fn: Callable
+
+    def __getattr__(self, name):
+        # Its arm's marks and mode; its own field, before it is set, and no dunder (a jit's `__wrapped__`,
+        # which would state the record as the wrapper it is not, `dew._stated.stated`).
+        if name == "fn" or name.startswith("__"):
+            raise AttributeError(name)
+        return getattr(self.fn, name)
+
+
 @dataclasses.dataclass(frozen=True)
-class _RunToRun:
+class _RunToRun(_Adapting):
     """An arm whose outputs vary in their last bits from run to run on the same inputs (`run_to_run`):
     the gate compiles `fn` as it compiles any arm (`_arms`) and judges each draw by the one run it makes. A
     frozen record, stated by its arm and its reason (`truths_ahead.arm_role`)."""
@@ -84,20 +97,14 @@ class _RunToRun:
     def __call__(self, *inputs, **options):
         return self.fn(*inputs, **options)
 
-    def __getattr__(self, name):
-        # Its arm's marks and mode; its own field, before it is set, and no dunder (a jit's `__wrapped__`,
-        # which would state the record as the wrapper it is not, `dew._stated.stated`).
-        if name == "fn" or name.startswith("__"):
-            raise AttributeError(name)
-        return getattr(self.fn, name)
-
 
 def _layers(fn):
-    """`fn` and every arm it adapts, outermost first: through a declaration (`_RunToRun`), a window loop
-    (`_Windowed`) and a reference's unrewritten scope (`Unrewritten`)."""
+    """`fn` and every arm it adapts, outermost first: through an arm adapting it (`_Adapting`: a declaration,
+    a library arm's check), a window loop (`_Windowed`) and a reference's unrewritten scope
+    (`Unrewritten`)."""
     while True:
         yield fn
-        if isinstance(fn, _RunToRun | _Windowed):
+        if isinstance(fn, _Adapting | _Windowed):
             fn = fn.fn
         elif isinstance(fn, Unrewritten):
             fn = fn.wrapped
@@ -461,15 +468,25 @@ class _Paired:
         return not self.pairing.with_ynn
 
     def __call__(self, *inputs, **options):
-        ahead = self.ahead and not options and not self.pairing.with_ynn
-        compiled = self.ahead.get(_signature(inputs)) if ahead else None
-        return (compiled or self.selected)(*inputs, **options)
+        # Keyword options a call passes its program take no compile ahead, whose signature held none.
+        return ((None if options else self._ahead(inputs)) or self.selected)(*inputs, **options)
+
+    def _ahead(self, inputs) -> jax.stages.Compiled | None:
+        """The arm's compile ahead at `inputs`' signature (`ahead`, `_ynn_decided`) where its pairing runs
+        without the fusions and holds one; None otherwise: the one choice of its call and its executable."""
+        return None if self.pairing.with_ynn else self.ahead.get(_signature(inputs))
 
     @property
     def selected(self) -> Callable:
         """The program the arm runs (`plain` or `without`, as its pairing decided), whose trace and lowering
         are its own."""
         return self.plain if self.pairing.with_ynn else self.without
+
+    def executable(self, inputs) -> jax.stages.Compiled:
+        """The executable the arm runs at `inputs`: its compile ahead (`_ahead`), else its selected program's
+        (`selected`)."""
+        held = self._ahead(inputs)
+        return held if held is not None else self.selected.lower(*inputs).compile()
 
     @property
     def trace(self):
@@ -497,6 +514,43 @@ def _signature(inputs) -> tuple:
         return type(leaf), getattr(leaf, "shape", ()), getattr(leaf, "dtype", None)
 
     return jax.dtypes.canonicalize_dtype(np.float64), tree, tuple(taken(leaf) for leaf in leaves)
+
+
+class _LibraryChecked(_Adapting):
+    """A library arm (`fn`, as the gate runs it; its `mark`, `truths_ahead.library_arm`'s) whose executable
+    at each call's signature (`_signature`) is checked to make its library's call where it runs on the
+    platform that makes it (`truths_ahead.library_checked`), then run: the executable the arm runs, a pair's
+    compile ahead where it holds one (`_Paired.executable`), else its program's (its `lower`, under its
+    switches: `Unrewritten`'s, a twin's as written), once a signature; the gate's layers see through it
+    (`_layers`), so its pairing is decided as the bare arm's (`_ynn_decided`). Its other attributes are the
+    arm's (row 14096, train 1472's review)."""
+
+    def __init__(self, fn, mark: tuple[str, str], label: str):
+        self.fn, self.mark, self.label, self.executables = fn, mark, label, {}
+
+    def __call__(self, *inputs):
+        from truths_ahead import library_checked
+
+        key = _signature(inputs)
+        if key not in self.executables:
+            executable = (self.fn.executable(inputs) if isinstance(self.fn, _Paired)
+                          else self.fn.lower(*inputs).compile())
+            library_checked(executable, self.mark, self.label)
+            self.executables[key] = executable
+        return self.executables[key](*inputs)
+
+
+def _unchecked(arm):
+    """`arm` without its library check (`_LibraryChecked`), within a declaration and a window loop: the arm a
+    truth that names none runs as its reference, on widened inputs, whose executable is no library's
+    (`reference_error._drawn`)."""
+    if isinstance(arm, _LibraryChecked):
+        return arm.fn
+    if isinstance(arm, _RunToRun):
+        return _RunToRun(_unchecked(arm.fn), arm.why)
+    if isinstance(arm, _Windowed):
+        return _Windowed(_unchecked(arm.fn))
+    return arm
 
 
 def _paired_arms(arms) -> list[_Paired]:
@@ -543,8 +597,9 @@ def _ynn_decided(label: str, arms, inputs) -> None:
     _ynn_option_held()
     refused = None
     for arm in arms:
-        # Through a declaration alone: a window loop's arm takes each window's slices, which the draw is not.
-        arm = arm.fn if isinstance(arm, _RunToRun) else arm
+        # Through the arms that adapt it alone (a declaration, a library arm's check): a window loop's arm
+        # takes each window's slices, which the draw is not.
+        arm = next(layer for layer in _layers(arm) if not isinstance(layer, _Adapting))
         if not isinstance(arm, _Paired) or not hasattr(arm.without, "lower"):
             continue
         try:

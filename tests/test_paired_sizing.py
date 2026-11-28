@@ -2,6 +2,7 @@
 upstream rounding, each one's error heavy-tailed across draws, resolve paired where the reference
 compared with itself does not, and a fault still fails at the count they declare."""
 
+import jax
 import numpy as np
 import pytest
 from reference_error import GateFailure, Inconclusive, as_given, as_recorded, assert_as_exact, seeds_for
@@ -94,3 +95,50 @@ def test_a_recorded_dew_arm_is_refused_a_paired_sizing(heavy):
 
     with pytest.raises(ValueError):
         seeds_for(_summed(0), heavy, "recorded Dew sums", truth_fn=_truth, dew_fn=recorded)
+
+
+@pytest.mark.skipif(jax.default_backend() != "cpu", reason="the arm's mark is a CPU's")
+def test_a_sizing_holds_a_library_reference_to_its_call_on_the_executable_it_runs():
+    """A qualification run's sizing (`seeds_for`) of a site no prepare reached holds a library reference
+    (`truths_ahead.library_arm`, marked for a CPU) to its call on the executable it runs, as the verdict
+    does, before any count is drawn: XLA's own dot marked as a library's call is refused (`NotTheLibrary`;
+    train 1472's review: the sizing ran it unchecked, and could decide its count before the verdict's
+    check)."""
+    import jax.numpy as jnp
+    from contract_support import normal_drawn
+    from truths_ahead import NotTheLibrary, library_arm
+
+    def product(rows, matrix):
+        return jnp.dot(rows, matrix)
+
+    truth = as_given(lambda rows, matrix: np.asarray(rows, np.float64) @ np.asarray(matrix, np.float64))
+    reference = library_arm(jax.jit(product), "__a_library_call", platform="cpu")
+    with pytest.raises(NotTheLibrary):
+        seeds_for(reference, normal_drawn(0x14096, (16, 8), (8, 4)), "a library reference sized",
+                  truth_fn=truth, dew_fn=jax.jit(product))
+
+
+@pytest.mark.skipif(jax.default_backend() != "cpu", reason="the arm's mark is a CPU's")
+@pytest.mark.parametrize("routed", [False, True])
+def test_a_sizing_with_no_truth_widens_its_library_reference_unchecked(routed):
+    """A sizing (`seeds_for`) of a site that names no truth runs its library reference
+    (`truths_ahead.library_arm`, LAPACK's float32 Cholesky marked for a CPU) as its float64 truth on widened
+    inputs without the arm's check, whether it compiles the pair itself or is handed it routed
+    (`arm_store._routed_arms`, as a qualification run's bound hands it, `_written_pair`): that executable
+    calls float64's routine, no library's of the mark, and the sizing takes its count; the arms themselves
+    are still checked (train 1472's fix's review: the checked arm refused its own widened truth)."""
+    import jax.numpy as jnp
+    from arm_forms import _arms_with
+    from arm_store import _routed_arms
+    from jaxlib.lapack import build_lapack_fn_target
+    from test_gate_arms import _spd
+    from truths_ahead import library_arm
+
+    def cholesky(matrices):
+        return jnp.linalg.cholesky(matrices)
+
+    label = "a library reference sized by itself"
+    call = build_lapack_fn_target("potrf_ffi", np.float32)
+    dew, reference = jax.jit(cholesky), library_arm(jax.jit(cholesky), call, platform="cpu")
+    arms = _routed_arms(None, label, dew, reference, {}, _arms_with(dew, reference, [], label))[:2]
+    assert seeds_for(reference, _spd, label, dew_fn=dew, arms=arms if routed else None) > 0

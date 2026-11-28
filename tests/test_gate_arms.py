@@ -22,7 +22,7 @@ from reference_error import (
 )
 from test_reference_error import exact_rows, noised_draw, stacked_arm, stacked_examples
 from test_reference_error_written import _cancelling, _combined
-from truths_ahead import UNPREPARED, compiled_truths, library_checked
+from truths_ahead import UNPREPARED, NotTheLibrary, compiled_truths
 
 from dew.nn.kernels import gemm, generation, tuning
 from dew.nn.kernels.templates.hooks import Hook
@@ -228,21 +228,77 @@ def test_a_prepared_library_arm_holds_its_call_for_the_run_that_loads_it(tmp_pat
 
     draw = normal_drawn(0x14096, (64, 32), (32, 16))
     truth = as_given(lambda rows, matrix: np.asarray(rows, np.float64) @ np.asarray(matrix, np.float64))
-    reference = generation_support.cublas_compiled(product, draw(0), "__cublas$lt$matmul")
+    reference = generation_support.cublas_compiled(product, "__cublas$lt$matmul")
     with prepared(tmp_path / "store", stamp="library", target=generation_support.node_target()):
         assert_as_exact(jax.jit(product), reference, draw, "a library reference", seeds=32, truth_fn=truth)
     calls = {record.get("library_call") for held in (tmp_path / "store").glob(f"*/{HELD}")
              for record in pickle.loads(held.read_bytes()).values()}
-    assert "__cublas$lt$matmul" in calls, calls
+    assert ("__cublas$lt$matmul", "gpu") in calls, calls
 
 
-def test_a_library_arms_executable_of_xlas_own_dot_is_refused():
-    """An executable a library arm's check reads (`truths_ahead.library_checked`) that makes no call of its
-    library, XLA's own dot, is refused."""
-    rows, matrix = np.ones((8, 4), np.float32), np.ones((4, 2), np.float32)
-    executable = jax.jit(jnp.dot).lower(rows, matrix).compile()
-    with pytest.raises(AssertionError):
-        library_checked(executable, "__cublas$lt$matmul", "a library arm")
+def _lapack_cholesky(matrices):
+    """A Cholesky factor's lower triangle, as LAPACK's `potrf` gives it on a CPU (one custom call)."""
+    return jnp.linalg.cholesky(matrices)
+
+
+def _spd(seed):
+    """A seed's symmetric positive definite matrix, `a a^T + 8 I` of a standard normal `a`."""
+    a = np.random.default_rng(seed).standard_normal((8, 8)).astype(np.float32)
+    return (a @ a.T + 8 * np.eye(8, dtype=np.float32),)
+
+
+def _dot(rows, matrix):
+    """`rows @ matrix`, XLA's own dot on a CPU."""
+    return jnp.dot(rows, matrix)
+
+
+def _widened_dot(rows, matrix):
+    """`rows @ matrix` in float64."""
+    return np.asarray(rows, np.float64) @ np.asarray(matrix, np.float64)
+
+
+LIBRARY_ARMS = {
+    "its call made": (_lapack_cholesky, _spd, "potrf",
+                      as_given(lambda m: np.linalg.cholesky(np.asarray(m, np.float64)))),
+    "its call not made": (_dot, normal_drawn(0x14096, (16, 8), (8, 4)), "__cublas$lt$matmul",
+                          as_given(_widened_dot))}
+"""A library arm on this process's CPU, its program, draw, the call it is marked to make (`potrf` LAPACK's,
+named by jaxlib for float32) and its truth: one whose executable makes the call, one whose does not."""
+
+
+@pytest.mark.skipif(jax.default_backend() != "cpu",
+                    reason="a store prepares on the process's default devices; these arms' marks are a CPU's")
+@pytest.mark.parametrize("reached", [True, False])
+@pytest.mark.parametrize("case", LIBRARY_ARMS)
+def test_a_library_arm_is_held_to_its_call_on_the_executable_its_run_runs(tmp_path, monkeypatch, case,
+                                                                          reached):
+    """A library arm marked for a CPU (`truths_ahead.library_arm`), in a process whose devices are a CPU's,
+    is held to its call on the executable its run runs: the prepared one as its run loads it (`reached`,
+    `CompiledTruths._site`), or, where its prepare stopped past its cap before the site, its run's own
+    compile (`arm_store._library_checked`). An arm whose executable makes its call (LAPACK's Cholesky) runs;
+    one whose does not (XLA's own dot marked as cuBLAS's) is refused (train 1472's review: an arm at a site
+    its prepare did not reach ran unchecked; its check read an executable no run loaded)."""
+    import time
+
+    import tier_wire
+    from jaxlib.lapack import build_lapack_fn_target
+    from truths_ahead import library_arm
+
+    fn, draw, call, truth = LIBRARY_ARMS[case]
+    call = build_lapack_fn_target(f"{call}_ffi", np.float32) if call == "potrf" else call
+    reference = library_arm(jax.jit(fn), call, platform="cpu")
+    label = f"a library arm, {case}"
+    with monkeypatch.context() as capped:
+        if not reached:
+            capped.setenv(tier_wire.PREPARE_BY, repr(time.monotonic() - 1.0))
+        with compiled_truths(tmp_path, prepare=True, stamp="here"):
+            assert_as_exact(jax.jit(fn), reference, draw, label, seeds=8, truth_fn=truth)
+    with compiled_truths(tmp_path, prepare=False, stamp="here"):
+        if case == "its call made":
+            assert_as_exact(jax.jit(fn), reference, draw, label, seeds=8, truth_fn=truth)
+        else:
+            with pytest.raises(NotTheLibrary):
+                assert_as_exact(jax.jit(fn), reference, draw, label, seeds=8, truth_fn=truth)
 
 
 def test_a_written_twin_of_a_cublas_reference_keeps_its_compiler_options():
