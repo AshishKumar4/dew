@@ -122,7 +122,19 @@ def largest_magnitude(x: jax.Array, axis: int | tuple[int, ...] | None = None, *
     x64 whatever x64 scope it is called in (outside one, a 64-bit word is two 32-bit ones)."""
     with jax.enable_x64(new_val=True) if x.dtype == np.dtype(np.float64) else contextlib.nullcontext():
         words, sign, _, _ = raw_fields(x)
-        return jax.lax.bitcast_convert_type(jnp.max(words ^ sign, axis=axis, keepdims=keepdims), x.dtype)
+        magnitude = words ^ sign
+        if _sign_bit_nan(x.dtype):
+            # Its NaN, the sign bit alone (FNUZ's), kept whole: its word is above every magnitude's.
+            nan = words.dtype.type(1 << (jnp.finfo(x.dtype).bits - 1))
+            magnitude = jnp.where(words == nan, words, magnitude)
+        return jax.lax.bitcast_convert_type(jnp.max(magnitude, axis=axis, keepdims=keepdims), x.dtype)
+
+
+def _sign_bit_nan(dtype) -> bool:
+    """Whether a float format's word of its sign bit alone is a NaN (the FNUZ formats', which hold no -0),
+    read off its own encoding."""
+    bits = jnp.finfo(dtype).bits
+    return bool(np.isnan(np.asarray(1 << (bits - 1), f"uint{bits}").view(dtype).astype(np.float32)))
 
 
 def split_bits(dtype) -> tuple[type, int, int]:

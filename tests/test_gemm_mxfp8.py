@@ -347,18 +347,19 @@ def test_a_nan_among_normal_draws_takes_the_nan_scale_quantized_or_in_the_epilog
 
 
 @pytest.mark.parametrize("dtype", [jnp.bfloat16, jnp.float16, jnp.float32, jnp.float64, jnp.float8_e4m3fn,
-                                   jnp.float8_e5m2])
+                                   jnp.float8_e5m2, jnp.float8_e4m3fnuz, jnp.float8_e5m2fnuz])
 def test_a_largest_magnitude_is_ieees_maximum_of_magnitudes_at_every_width(dtype):
     """`float_bits.largest_magnitude` of each row, eager and jitted, bit for bit, at each width a quantizer
     reads: a NaN among normal draws NaN; an infinity (E4M3FN's largest finite, as it holds none) among them
     that; a negative largest its magnitude; a least subnormal among zeros of both signs that subnormal, which
     a flushing maximum reads as zero; zeros of both signs +0 (row 14083's train 1477). A float64 array made in
-    x64 and reduced eagerly outside it reads its own width (its review)."""
+    x64 and reduced eagerly outside it reads its own width; an FNUZ format's NaN, its sign bit alone, NaN
+    (its review)."""
     from dew.nn.float_bits import largest_magnitude
 
     with jax.enable_x64(new_val=True) if dtype == jnp.float64 else contextlib.nullcontext():
         limits = jnp.finfo(dtype)
-        top = float(limits.max) if dtype == jnp.float8_e4m3fn else np.inf
+        top = np.inf if np.isinf(np.float32(np.inf).astype(dtype)) else float(limits.max)
         least = float(limits.smallest_subnormal)
         rows = np.random.default_rng(14083).normal(size=(5, 32))
         rows[0, 2], rows[1, 7], rows[2, 9] = np.nan, top, -8.0
