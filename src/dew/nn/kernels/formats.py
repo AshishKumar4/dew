@@ -19,7 +19,7 @@ from jax.typing import DTypeLike
 
 from dew.algebra import bits
 from dew.nn.derivatives import Protected, contracted, declared_tangent
-from dew.nn.float_bits import exact_power2, quiet_nan, raw_fields, rounded_binary
+from dew.nn.float_bits import exact_power2, largest_magnitude, quiet_nan, raw_fields, rounded_binary
 from dew.nn.kernels import generation
 from dew.nn.kernels.templates import product as formats_of
 from dew.nn.kernels.templates.gemm import packed
@@ -363,7 +363,7 @@ class MxFp8:
         x = x.astype(at_least_fp32(x.dtype))
         per = formats_of.MXFP8.depth
         blocks = x.reshape(*x.shape[:-1], x.shape[-1] // per, per)
-        largest = jnp.max(jnp.abs(blocks), axis=-1, keepdims=True)
+        largest = largest_magnitude(blocks, -1, keepdims=True)
         # Its scale's exponent and E8M0 byte from the largest magnitude's own bits (`mxfp8_scale_bytes`, the
         # GEMM epilogue's quantizer's too; row 13249).
         exponent, stored = mxfp8_scale_bytes(largest)

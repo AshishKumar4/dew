@@ -44,8 +44,8 @@ from dew.algebra.shared_derived import (
     shared_component_19,
     shared_component_26,
     shared_component_33,
-    shared_component_38,
     shared_component_39,
+    shared_component_40,
 )
 
 
@@ -240,7 +240,7 @@ def _scores_0(x1, x2, x3):
 
 def _selective_adjoint_0(x1, x2, x3, x4, x5, x6, x7, x8, x9):
     v11, v13, v16 = shared_component_26(x1, x2, x3, x7, x5, x6, x9)
-    v18, v21, v22 = shared_component_38(x1, x5, x6, x3, x2, x4, x8, v11)
+    v18, v21, v22 = shared_component_39(x1, x5, x6, x3, x2, x4, x8, v11)
     return (v13, v16, v18, v21, v22)
 
 
@@ -289,7 +289,7 @@ def _selective_dx_scale_0(x1, x2, x3):
 
 def _selective_lifted_adjoint_0(x1, x2, x3, x4, x5, x6, x7, x8, x9, x10):
     v12, v14, v17 = shared_component_26(x1, x2, x3, x7, x10, x6, x9)
-    v19, v22, v23 = shared_component_38(x1, x5, x6, x3, x2, x4, x8, v12)
+    v19, v22, v23 = shared_component_39(x1, x5, x6, x3, x2, x4, x8, v12)
     return (v14, v17, v19, v22, v23)
 
 
@@ -328,8 +328,8 @@ def _selective_state_tangent_0(x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x12
 
 
 def _selective_token_0(x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x12, x13, x14):
-    v17, v20 = shared_component_39(x13, x5, x6)
-    v23, v26 = shared_component_39(x13, x7, x8)
+    v17, v20 = shared_component_40(x13, x5, x6)
+    v23, v26 = shared_component_40(x13, x7, x8)
     v27 = lax.mul_p.bind(x13, x14, out_dtype=None)
     v30, v33 = shared_component_10(v17, x1, v27, x9, v20, x2, x10)
     v36, v39 = shared_component_10(v23, x3, v27, x11, v26, x4, x12)

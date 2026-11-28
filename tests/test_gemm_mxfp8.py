@@ -324,6 +324,78 @@ def test_a_nan_block_takes_the_nan_scale_and_poisons_only_the_sums_it_reaches():
     assert (out[:128][~nan[:128]] == 64.0).all()
 
 
+def test_a_nan_among_normal_draws_takes_the_nan_scale_quantized_or_in_the_epilogue():
+    """A NaN among normal draws, one a row at its own column: each 32-column block holding it takes the NaN
+    scale (`0xFF`, `formats.MxFp8.quantized`), every other block its own, and the GEMM's quantizing epilogue
+    (`quantized.quantize_mxfp8_epilogue`) scales them and codes every other value as the quantizer does (row
+    14083's train 1477: the quantizer's float block maximum, which XLA:CPU's YNNPACK reduction takes, dropped
+    a NaN beside normal draws)."""
+    rng = np.random.default_rng(14083)
+    values = rng.normal(size=(64, 128)).astype(np.float32)
+    columns = (np.arange(64) * 37) % 128
+    values[np.arange(64), columns] = np.nan
+    operand = formats.MxFp8.quantized(jnp.asarray(values))
+    held = np.asarray(jax.lax.bitcast_convert_type(operand.scales, jnp.uint8))
+    holding = np.zeros((64, 4), bool)
+    holding[np.arange(64), columns // 32] = True
+    np.testing.assert_array_equal(held == 0xFF, holding)
+    codes, scales = quantized.quantize_mxfp8_epilogue()(jnp.asarray(values))
+    np.testing.assert_array_equal(np.asarray(scales).view(np.uint8)[:, ::32], held)
+    finite = ~np.isnan(values)
+    np.testing.assert_array_equal(np.asarray(codes).view(np.uint8)[finite],
+                                  np.asarray(operand.codes).view(np.uint8)[finite])
+
+
+@pytest.mark.parametrize("dtype", [jnp.bfloat16, jnp.float16, jnp.float32, jnp.float64, jnp.float8_e4m3fn,
+                                   jnp.float8_e5m2, jnp.float8_e4m3fnuz, jnp.float8_e5m2fnuz])
+def test_a_largest_magnitude_is_ieees_maximum_of_magnitudes_at_every_width(dtype):
+    """`float_bits.largest_magnitude` of each row, eager and jitted, bit for bit, at each width a quantizer
+    reads: a NaN among normal draws NaN; an infinity (E4M3FN's largest finite, as it holds none) among them
+    that; a negative largest its magnitude; a least subnormal among zeros of both signs that subnormal, which
+    a flushing maximum reads as zero; zeros of both signs +0 (row 14083's train 1477). A float64 array made in
+    x64 and reduced eagerly outside it reads its own width; an FNUZ format's NaN, its sign bit alone, NaN
+    (its review)."""
+    from dew.nn.float_bits import largest_magnitude
+
+    with jax.enable_x64(new_val=True) if dtype == jnp.float64 else contextlib.nullcontext():
+        limits = jnp.finfo(dtype)
+        top = np.inf if np.isinf(np.float32(np.inf).astype(dtype)) else float(limits.max)
+        least = float(limits.smallest_subnormal)
+        rows = np.random.default_rng(14083).normal(size=(5, 32))
+        rows[0, 2], rows[1, 7], rows[2, 9] = np.nan, top, -8.0
+        rows[3:] = 0.0
+        rows[3:, ::2] = -0.0
+        rows[3, 5] = least
+        x = jnp.asarray(rows, dtype)
+        jitted = jax.jit(lambda x: largest_magnitude(x, -1))(x)
+    word = np.dtype(f"uint{limits.bits}")
+    want = np.asarray([top, 8.0, least, 0.0]).astype(dtype).view(word)
+    for got in (largest_magnitude(x, -1), jitted):
+        got = np.asarray(got)
+        assert got.dtype == np.dtype(dtype) and np.isnan(got[0].astype(np.float32))
+        np.testing.assert_array_equal(got[1:].view(word), want)
+
+
+@pytest.mark.mesh(devices=2)
+@pytest.mark.parametrize("split", [0, 1])
+def test_a_largest_magnitude_is_placed_as_jaxs_maximum_is(split):
+    """`float_bits.largest_magnitude` along the columns of rows an Explicit axis splits by their rows or by
+    the columns it reduces, jitted: the values and the placement of `jnp.max(jnp.abs(x), 1)` (row 14083)."""
+    from jax.sharding import NamedSharding, PartitionSpec
+
+    from dew.nn.float_bits import largest_magnitude
+
+    mesh = jax.make_mesh((2,), ("i",), (jax.sharding.AxisType.Explicit,), devices=jax.devices()[:2])
+    spec = PartitionSpec(*(("i", None) if split == 0 else (None, "i")))
+    x = jax.device_put(np.random.default_rng(14083).normal(size=(4, 256)).astype(np.float32),
+                       NamedSharding(mesh, spec))
+    with jax.set_mesh(mesh):
+        got = jax.jit(lambda x: largest_magnitude(x, 1))(x)
+        want = jax.jit(lambda x: jnp.max(jnp.abs(x), 1))(x)
+    assert jax.typeof(got).sharding.spec == jax.typeof(want).sharding.spec
+    np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
+
+
 def _blocks_product(signs: tuple[int, ...], row_exponents: tuple[int, ...],
                     column_exponents: tuple[int, ...], policy: str) -> np.ndarray:
     """An MXFP8 product of one 128-row group over `len(signs)` 32-deep blocks, every code one (its row's sign
@@ -373,6 +445,66 @@ def test_a_nan_in_a_quantizing_epilogues_product_takes_the_nan_scale():
     assert (held[2] == 0xFF).all() and (np.delete(held, 2, axis=0) != 0xFF).all()
     expected = formats.MxFp8.quantized(jnp.dot(x, w, preferred_element_type=jnp.float32)).scales
     np.testing.assert_array_equal(held, np.asarray(jax.lax.bitcast_convert_type(expected, jnp.uint8)))
+
+
+NAN_AT = ((3, 37), (50, 70), (99, 37), (99, 70))
+"""The accumulator entries `test_a_launchs_quantizing_epilogue_scales_a_mixed_nan_block_as_the_quantizer`'s
+epilogue side makes NaN, each in a block of finite values."""
+
+
+def test_a_launchs_quantizing_epilogue_scales_a_mixed_nan_block_as_the_quantizer():
+    """The template's launch (an H100's, interpreted, its epilogue in the accumulator's register layout)
+    quantizing a product of finite operands to MXFP8, its epilogue adding a side tile of zeros with a NaN at
+    `NAN_AT`: each 32-column block mixing that NaN with finite values takes the NaN scale and every other
+    block its own, each finite code the quantizer's (`formats.MxFp8.quantized` of the same sum), as the
+    quantizer scales the product (train 1484's review: the launch's arm reduced float magnitudes; its
+    confirm: the NaN made after the dot, where an overflow inside it need not make one)."""
+    from dew.nn.kernels.templates.hooks import Hook, Side
+
+    rng = np.random.default_rng(14084)
+    x = jnp.asarray(rng.normal(size=(128, 128)), jnp.bfloat16)
+    w = jnp.eye(128, dtype=jnp.bfloat16)
+    side = np.zeros((128, 128), np.float32)
+    side[tuple(np.transpose(NAN_AT))] = np.nan
+
+    def epilogue(acc, nan):
+        return quantized.quantize_mxfp8_epilogue()(acc + nan)
+
+    with (generation.assumed("sm90"), generation.chosen(grouped_matmul="mosaic"),
+          generation.routes() as routes):
+        out = gemm.gemm(x, w, None, epilogue=Hook(epilogue, (Side(jnp.asarray(side), ("rows", "columns")),)),
+                        out_dtype=jnp.float8_e4m3fn, out_dtypes=(jnp.float8_e4m3fn, jnp.float8_e8m0fnu),
+                        interpret_on_cpu=True)
+    assert isinstance(out, tuple)
+    codes, scales = out
+    assert ("grouped_matmul", "mosaic") in {(route.choice, route.kernel) for route in routes}, routes
+    summed = jnp.dot(x, w, preferred_element_type=jnp.float32) + side
+    want = formats.MxFp8.quantized(summed)
+    held = np.asarray(scales).view(np.uint8)[:, ::32]
+    np.testing.assert_array_equal(held, np.asarray(want.scales).view(np.uint8))
+    holding = np.zeros((128, 4), bool)
+    for row, column in NAN_AT:
+        holding[row, column // 32] = True
+    np.testing.assert_array_equal(held == 0xFF, holding)
+    finite = ~np.isnan(np.asarray(summed))
+    assert finite.sum() == 128 * 128 - len(NAN_AT)
+    np.testing.assert_array_equal(np.asarray(codes).view(np.uint8)[finite],
+                                  np.asarray(want.codes).view(np.uint8)[finite])
+
+
+def test_a_launchs_word_block_maximum_lowers_for_an_h100():
+    """The same quantizing launch lowers for an H100 (Mosaic GPU on the CPU): its block maxima an unsigned
+    row reduction of magnitude words in the accumulator's layout (train 1484's review)."""
+    from kernel_compile import lowered_for
+
+    def fused(x, w):
+        with generation.chosen(grouped_matmul="mosaic"):
+            out = quantized.gemm_quantized(x, w, minifloat=formats.MxFp8)
+        assert isinstance(out, formats.MxFp8)
+        return out.codes, out.scales
+
+    specs = (jax.ShapeDtypeStruct((128, 128), jnp.bfloat16), jax.ShapeDtypeStruct((128, 128), jnp.bfloat16))
+    lowered_for(fused, specs, "sm90")
 
 
 def test_a_float64_truths_block_past_float32s_range_keeps_its_scale():
