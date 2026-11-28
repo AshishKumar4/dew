@@ -70,6 +70,29 @@ def test_ternary_weights_pack_decode_and_stage_match_bitwise():
     assert d_empty.shape == (16, 0)
 
 
+@pytest.mark.parametrize("devices", [2, 4], ids=["whole groups a device", "groups cut by the devices"])
+@pytest.mark.mesh(devices=4)
+def test_a_depth_split_ternary_matrix_decodes_on_an_explicit_mesh(devices):
+    """A 512-deep ternary matrix whose depth an Explicit 'tensor' axis splits (its words' last axis: two
+    devices each a whole 256-deep group, or four each half a group), jitted: its codes are the unsplit
+    matrix's, placed by the same depth. Each group's staged order is undone where it lies, as an NVFP4
+    matrix's (`formats._unstaged`; row 14097's class, train 1466's review: a gather across the split depth
+    had no placement)."""
+    from jax.sharding import AxisType, PartitionSpec
+
+    rng = np.random.default_rng(14098)
+    weights = formats.TernaryWeights.of(jnp.asarray(rng.standard_normal((512, 64)), jnp.float32))
+    expected = np.asarray(weights.unscaled(jnp.float32))
+    mesh = jax.make_mesh((devices,), ("tensor",), axis_types=(AxisType.Explicit,),
+                         devices=jax.devices()[:devices])
+    with jax.set_mesh(mesh):
+        deep = PartitionSpec(None, "tensor")
+        placed = dataclasses.replace(weights, words=jax.device_put(weights.words, deep))
+        codes = jax.jit(lambda each: each.unscaled(jnp.float32))(placed)
+    assert jax.typeof(codes).sharding.spec[0] == "tensor"
+    np.testing.assert_array_equal(np.asarray(codes), expected)
+
+
 @pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16, jnp.float16, jnp.float64])
 def test_decoded_ternary_keeps_the_sign_and_bits_of_a_subnormal_scale(dtype):
     values = np.tile(np.asarray([[-1, -1], [0, 0], [1, 1], [0, 0]], np.float32), (64, 1))
@@ -402,7 +425,7 @@ def test_an_eager_ternary_pullback_of_explicitly_split_rows_runs_outside_its_mes
                                                                        "trailing", "scalar"])
 @pytest.mark.mesh(devices=2)
 def test_a_broadcasts_transpose_sums_a_split_cotangent_keeping_its_placement(shape, in_context):
-    """`generation.unbroadcast` of a `[8, 16, 64]` cotangent an Explicit axis splits by its leading rows, back
+    """`sharding.unbroadcast` of a `[8, 16, 64]` cotangent an Explicit axis splits by its leading rows, back
     to an operand's `shape` broadcast to it (a rank-changing `[1, 64]` under a batch axis, a widened `[8, 1,
     64]`, a trailing `[64]`, a scalar), jitted under its mesh or outside its context: the sum JAX's own
     broadcast pullback gives of the plain cotangent, exactly over small integers, its placement the split
@@ -410,7 +433,7 @@ def test_a_broadcasts_transpose_sums_a_split_cotangent_keeping_its_placement(sha
     the split cotangent)."""
     from jax.sharding import AxisType, NamedSharding, PartitionSpec
 
-    from dew.nn.kernels import generation
+    from dew.nn import sharding
 
     rng = np.random.default_rng(14373)
     cotangent = rng.integers(-3, 4, (8, 16, 64)).astype(np.float32)
@@ -419,7 +442,7 @@ def test_a_broadcasts_transpose_sums_a_split_cotangent_keeping_its_placement(sha
     mesh = jax.make_mesh((2,), ("data",), axis_types=(AxisType.Explicit,), devices=jax.devices()[:2])
     split = jax.device_put(cotangent, NamedSharding(mesh, PartitionSpec("data")))
     with jax.set_mesh(mesh) if in_context else contextlib.nullcontext():
-        summed = jax.jit(lambda each: generation.unbroadcast(each, shape))(split)
+        summed = jax.jit(lambda each: sharding.unbroadcast(each, shape))(split)
     assert summed.shape == shape
     np.testing.assert_array_equal(np.asarray(summed), np.asarray(plain))
     if len(shape) == 3:

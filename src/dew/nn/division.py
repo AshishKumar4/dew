@@ -212,13 +212,10 @@ def _divide_transpose(cotangent, numerator, denominator):
         return [ad.Zero(numerator.aval), None]
     quotient = correctly_rounded_divide_p.bind(cotangent, denominator)
     # A numerator the division broadcast (a scalar's, or along a unit axis) takes the sum of the quotients
-    # it was broadcast to, over the axes a broadcast's transpose sums (`sharding.broadcast_axes`, the one
-    # statement of them), in the quotient's dtype.
-    from dew.nn.sharding import broadcast_axes
+    # it was broadcast to, as a broadcast's transpose sums them (`sharding.unbroadcast`), in their dtype.
+    from dew.nn.sharding import unbroadcast
 
-    shape = numerator.aval.shape
-    widened = broadcast_axes(shape, quotient.shape)
-    return [jnp.reshape(jnp.sum(quotient, axis=widened), shape) if widened else quotient, None]
+    return [unbroadcast(quotient, numerator.aval.shape), None]
 
 
 ad.defjvp2(correctly_rounded_divide_p,

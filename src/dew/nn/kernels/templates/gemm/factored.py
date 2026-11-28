@@ -19,34 +19,37 @@ from dew.nn import float_bits, precision
 from dew.nn.derivatives import KernelGlue, contracted, declared_tangent
 from dew.nn.kernels import generation
 from dew.nn.kernels.templates import axes as side_axes
-from dew.nn.sharding import explicit_placement, explicit_spec, summed_to, varying_like
+from dew.nn.sharding import explicit_placement, explicit_spec, summed_to, unbroadcast, varying_like
 
 
 def factored(run: Callable, operands: tuple, factor: jax.Array, rows: jax.Array, *, wide: Callable,
              wide_operands: tuple, prepared: Callable | None = None, gather: jax.Array | None = None,
-             groups: jax.Array | None = None, owed: float = 1.0, least: float = 1.0) -> jax.Array:
+             groups: jax.Array | None = None, owed: float = 1.0, least: float = 1.0,
+             finished: Callable | None = None) -> jax.Array:
     """`run(rows as bf16, *operands) * factor * owed`, linear in `rows`: `run` a product of bf16 rows (those
     `gather` reads where given, `gemm`'s `gather`, among `operands`), `factor` a packed matrix's fp32 scales
-    broadcast against its output (`formats.scale_factor`, an NVFP4 matrix's tensor scale): one a row's, one
-    a column's, one an entry's or one for all; with `groups` (the group sizes of the output's rows), one a
+    broadcast against its output (`formats.scale_factor`, an NVFP4 matrix's tensor scale): one a row's, one a
+    column's, one an entry's or one for all; with `groups` (the group sizes of the output's rows), one a
     group's (`[groups]`) or one a group's column (`[groups, width]`), which each row takes from its group
     where the product and its pullback read it (`_per_row`), no row's saved. `owed` is a power of two the
-    product owes besides (an NVFP4 decode's, `bits.NVFP4_OWED`), applied with the factor in its one
-    rounding (`owed_exactly`), never folded into a factor it would carry past fp32's largest (a tensor scale
-    of 2**122 under the decode's 2**8) or below its normals. `least`, the least magnitude of a nonzero
-    coefficient of the decoded matrix (`prepared`'s). Its transpose is the plain one, the cotangent times its
-    factor through `run`'s pullback, wherever that holds it: finite, and every nonzero product of a row's
-    route at least the plain transpose's least (`plain_least`); where it does not (a product past fp32's
-    largest, or one its bf16 parts or fp32's normals lose), the exact one (`_Transpose.moved`): each
-    product `cotangent * factor` and each
-    coefficient of the decoded matrix (`prepared(*wide_operands)`, its depth its axis -2) cut into integer
-    slices on grids of their own, each pair of slices multiplied by a bf16 GEMM whose fp32 sums are exact
-    integers (`wide`, the transpose over the rows `run` reads, a route each where gathered), the sums kept
-    in int32 limbs, added across routes into their tokens and across the devices that sum them, then
-    rounded once (`_rounded`). A product of a cotangent, factor or coefficient not finite is IEEE's: no
-    product overflows or flushes, so a scale of 2**126 under cotangents that cancel pulls back their
-    remainder, a subnormal one among them. A checked `shard_map`'s devices sum a cotangent only they vary
-    over before its pullback, and their partials after."""
+    product owes besides (an NVFP4 decode's, `bits.NVFP4_OWED`), applied with the factor in its one rounding
+    (`owed_exactly`), never folded into a factor it would carry past fp32's largest (a tensor scale of 2**122
+    under the decode's 2**8) or below its normals. `least`, the least magnitude of a nonzero coefficient of
+    the decoded matrix (`prepared`'s). `finished`, where given, `run` with the factor and the owed power of
+    two applied in its own finish (`finished(rows, *operands, factor, groups)`: a launch's epilogue,
+    `gemm.nvfp4_product`'s), which the product runs in their place. Its transpose is the plain one, the
+    cotangent times its factor through `run`'s pullback, wherever that holds it: finite, and every nonzero
+    product of a row's route at least the plain transpose's least (`plain_least`); where it does not (a
+    product past fp32's largest, or one its bf16 parts or fp32's normals lose), the exact one
+    (`_Transpose.moved`): each product `cotangent * factor` and each coefficient of the decoded matrix
+    (`prepared(*wide_operands)`, its depth its axis -2) cut into integer slices on grids of their own, each
+    pair of slices multiplied by a bf16 GEMM whose fp32 sums are exact integers (`wide`, the transpose over
+    the rows `run` reads, a route each where gathered), the sums kept in int32 limbs, added across routes into
+    their tokens and across the devices that sum them, then rounded once (`_rounded`). A product of a
+    cotangent, factor or coefficient not finite is IEEE's: no product overflows or flushes, so a scale of
+    2**126 under cotangents that cancel pulls back their remainder, a subnormal one among them. A checked
+    `shard_map`'s devices sum a cotangent only they vary over before its pullback, and their partials
+    after."""
     raised = round(math.log2(owed))
     if owed != 2.0 ** raised or raised < 0:
         raise ValueError(f"a product's owed factor is a power of two of at least 1, not {owed}")
@@ -56,12 +59,14 @@ def factored(run: Callable, operands: tuple, factor: jax.Array, rows: jax.Array,
 
     def apply(residuals, moving):
         scale, sizes, ran, _ = residuals
+        if finished is not None:
+            return finished(moving.astype(jnp.bfloat16), *ran, scale, sizes)
         product = run(moving.astype(jnp.bfloat16), *ran)
-        return owed_exactly(product, _per_row(scale, sizes, product.shape[0]), raised)
+        return owed_exactly(product, per_row(scale, sizes, product.shape[0]), raised)
 
     def pullback(residuals, cotangent):
         scale, sizes, ran, routed = residuals
-        scale = _per_row(scale, sizes, cotangent.shape[0]).astype(jnp.float32)
+        scale = per_row(scale, sizes, cotangent.shape[0]).astype(jnp.float32)
         return transpose.paired(ran, routed, (cotangent.astype(jnp.float32),), (scale,)).astype(rows.dtype)
 
     # An Explicit placement of the rows kept as a residual of no rows (`rows[:0]`, no memory): an eager
@@ -82,7 +87,7 @@ def plain_least(least: float) -> int:
             - math.floor(math.log2(least)))
 
 
-def _per_row(factor: jax.Array, groups: jax.Array | None, rows: int) -> jax.Array:
+def per_row(factor: jax.Array, groups: jax.Array | None, rows: int) -> jax.Array:
     """`factor` as `rows` output rows take it: as it is without `groups`; with them, each row its group's
     (`side_axes.at_rows`, the one group-to-row mapping): `[groups]` a row's, `[rows, 1]`; `[groups, width]`
     a row's columns', `[rows, width]`."""
@@ -177,13 +182,15 @@ def _scaled_value(raised: int, product: jax.Array, factor: jax.Array) -> jax.Arr
 
 
 def owed_native(product: jax.Array, factor: jax.Array, *, raised: int) -> jax.Array:
-    """`owed_exactly`'s value where the platform keeps subnormals (CUDA's float32), rounded once: the plain
-    multiply, the factor and the owed power of two one multiplier where that is finite (a subnormal factor
-    raised exactly), else the product times the power of two, exact (a subnormal product raised; one it
-    overflows is one whose owed product past a factor of 2**(128 - raised) overflows too), then times the
-    factor, rounded once (train 1450's review: the product times the factor first rounded a subnormal one on
-    the subnormal grid before the power raised it). A power past fp32's (`raised` 128 or more, which no
-    float32 multiplier holds) is `lowered_product`'s one rounding in integer arithmetic."""
+    """`owed_exactly`'s value where the platform keeps subnormals (CUDA's float32, a launch's epilogue
+    `gemm.nvfp4_product` finishes with), rounded once: the plain multiply, the factor and the owed power of
+    two one multiplier where that is finite (a subnormal factor raised exactly), else the product times the
+    power of two, exact (a subnormal product raised; one it overflows is one whose owed product past a factor
+    of 2**(128 - raised) overflows too), then times the factor, rounded once (train 1450's review: the
+    product times the factor first rounded a subnormal one on the subnormal grid before the power raised
+    it). A power past fp32's (`raised` 128 or more, which no float32 multiplier holds) is
+    `lowered_product`'s one rounding in integer arithmetic."""
+    # The side's columns broadcast to the accumulator's tile explicitly (an epilogue's `[columns]` factor).
     product, factor = jnp.broadcast_arrays(product, jnp.asarray(factor, product.dtype))
     if not raised:
         return product * factor
@@ -569,8 +576,8 @@ class _Transpose:
             for cotangent, index in slots:
                 held, like = (scales[index], cotangents[index]) if cotangent else (cotangents[index],
                                                                                     scales[index])
-                terms.append(_placed_like(generation.unbroadcast(owed_exactly(product, held, self.raised),
-                                                                 jnp.shape(like)), like))
+                terms.append(_placed_like(unbroadcast(owed_exactly(product, held, self.raised),
+                                                      jnp.shape(like)), like))
             return tuple(terms)
 
         # Its joint derivative in the moving tangents and the residuals the declared pair sum's own

@@ -258,17 +258,21 @@ def _chosen(index: fusion.Index, places: tuple[int, ...], members: Sequence[Cand
             accurate: bool) -> int | None:
     """The first of one region's candidates whose call takes a kernel, which the e-graph proves equal to the
     region (`_equalities`, of the taken ones alone), and whose post-match training probe holds (`training_ok`,
-    checked only after equivalence is proven so rejected candidates stage no VJP); None where none is."""
+    checked only after equivalence is proven so rejected candidates stage no VJP); None where none is. A
+    candidate equal to the region as written is decided there, taken or refused by its probe; the e-graph
+    weighs only the rest, so one refused hides none equal only after saturation (row 14103)."""
+    undecided = []
     for number, candidate in enumerate(members):
-        if (candidate.taken()
-                and _equalities(index, [(candidate, places)], accurate, saturating=False)[0]
-                and _training_ok(candidate)):
+        if not candidate.taken():
+            continue
+        if not _equalities(index, [(candidate, places)], accurate, saturating=False)[0]:
+            undecided.append(number)
+        elif _training_ok(candidate):
             return number
-    taken = [number for number, candidate in enumerate(members) if candidate.taken()]
-    if not taken:
+    if not undecided:
         return None
-    equal = _equalities(index, [(members[number], places) for number in taken], accurate)
-    return next((number for number, same in zip(taken, equal, strict=True)
+    equal = _equalities(index, [(members[number], places) for number in undecided], accurate)
+    return next((number for number, same in zip(undecided, equal, strict=True)
                  if same and _training_ok(members[number])), None)
 
 

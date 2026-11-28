@@ -20,9 +20,9 @@ from jax.experimental.pallas import mosaic_gpu as plgpu
 from dew.algebra import bits
 from dew.nn.kernels.templates import product as product_formats, resources
 
-NVFP4_GROUP = 128
-"""Dew: the depths an NVFP4 matrix's staged order groups (`nvfp4_staged_depth`): a group's sixteen word rows
-decode, code by code, into its eight sixteen-depth slices."""
+NVFP4_GROUP = product_formats.NVFP4.depth * 32 // bits.E2M1.width
+"""Dew: the depths an NVFP4 matrix's staged order groups (`nvfp4_staged_depth`): a block's depth of word rows
+(sixteen), decoding code by code (eight a word) into as many block-deep slices, 128."""
 
 
 def nvfp4_staged_depth(group, word, code):
@@ -262,15 +262,17 @@ def packed_blocks(fmt: str, depth: int) -> int:
 def taken(rhs, scales, tiles, *, transpose_rhs: bool, hooked: tuple, transpose_lhs: bool, depth: int,
           width: int) -> None:
     """Dew: refuses a packed matrix's call (`gmm`'s `scales`) its decode does not take: its words read
-    transposed, its scales its blocks', in `NVFP4_STEP`-deep steps and 64-column tiles, with no hook, pair,
-    transposed rows, cluster, split or swap (its exact sums, each step's product apart, read the decoded
-    stage as any)."""
+    transposed, its scales its blocks', in `NVFP4_STEP`-deep steps and 64-column tiles, with no prologue,
+    pair, transposed rows, cluster, split or swap (its exact sums, each step's product apart, read the
+    decoded stage as any); an epilogue (`hooked`'s second) reads its finished accumulator as any launch's
+    (its tensor scale's, `gemm.nvfp4_product`'s finish, row 13743)."""
+    prologue, _, paired = hooked
     if (not transpose_rhs or rhs.dtype != jnp.uint32 or scales.shape != (rhs.shape[0], width, depth // 16)
-            or tiles.block_k % NVFP4_STEP or tiles.block_n % 64 or any(hook is not None for hook in hooked)
+            or tiles.block_k % NVFP4_STEP or tiles.block_n % 64 or prologue is not None or paired is not None
             or transpose_lhs or tiles.cluster > 1 or tiles.splits > 1 or tiles.swapped):
         raise ValueError(f"an NVFP4 matrix {rhs.shape} with scales {scales.shape} is read transposed in "
-                         f"256-deep steps and 64-column tiles with no hooks, pair, cluster or split, not by "
-                         f"{tiles}")
+                         f"256-deep steps and 64-column tiles with no prologue, pair, cluster or split, not "
+                         f"by {tiles}")
 
 
 def word_taken(rhs, fmt: str, tiles, *, transpose_rhs: bool, prologue, paired, transpose_lhs: bool,

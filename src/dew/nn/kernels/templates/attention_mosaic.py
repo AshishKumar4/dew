@@ -118,6 +118,7 @@ from dew.nn.kernels.templates.attention_mosaic_program import (
     launch_scope,
     layouts,
     loads_parts,
+    mixed_operands,
     most_consumers,
     placed_draws,
     placed_scratch,
@@ -1131,6 +1132,8 @@ class MosaicForward(_Mainloop[Tiles]):
         steps = padded_k // config.block_k
         training = ba.arguments.get("residuals") is Kept.SPLIT
         out_dtype = None if self.out_dtype is None else jnp.dtype(self.out_dtype)
+        # The forward's plan of its columns (`forward_block_plan`): its output's dtype and the hook's place,
+        # which no program of the hook decides.
         plan = forward_block_plan(full_v, config.columns, out_dtype,
                                   has_output_mod=self.output_mod is not None, training=training)
         # A paged call's key tile of several pages loaded as its launch loads it (`paged_reads`).
@@ -1295,7 +1298,9 @@ class MosaicForward(_Mainloop[Tiles]):
                                           else (self.query_mod, self.query_kinds, self.query_dtypes)),
                                 prescaled=spec.prescale != 1.0, rewalk_prescaled=taken != 1.0,
                                 out_dtype=self.out_dtype,
-                                has_output_mod=self.output_mod is not None)
+                                has_output_mod=self.output_mod is not None,
+                                output=(None if self.output_mod is None
+                                        else (self.output_mod, self.output_kinds, self.output_dtypes)))
 
     def refusal(self, ba: tokamax.BoundArguments, family: mosaic.Family) -> Refusal | None:
         query, value = ba.arguments["query"], ba.arguments["value"]
@@ -1322,6 +1327,10 @@ class MosaicForward(_Mainloop[Tiles]):
             return Refusal('dtype', f"the Mosaic mainloop's fp32 parts load in pieces, which {family.name}'s "
                            "pipeline does not")
         if family.places_on_role and (reason := self._placed_refusal(ba, hooks, family)) is not None:
+            return reason
+        # Values read from the key's slot are its columns, its dtype (`in_key`).
+        if (reason := mixed_operands(query, ba.arguments["key"], value,
+                                     coded=ba.arguments.get("scales") is not None)) is not None:
             return reason
         return refused(query.dtype, query.shape[3], value.shape[3], hooks, backward=False, family=family)
 
@@ -1417,6 +1426,7 @@ def forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans,
     ...
 
 
+@tuning.one_call
 def forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks | None = None,
             *, scale: float | None = None, natural: bool = NATURAL, residuals: Kept = Kept.NONE,
             interpret: bool = False, out_dtype=None, masked: bool = False, splits: int = 1,
@@ -2396,6 +2406,8 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
             form = "accurate form" if self.accurate else "hook"
             return Refusal('family', f"the backward's {form} takes two launches, whose dQ launch streams "
                            f"through a producer {family.name} has not")
+        if (reason := mixed_operands(query, ba.arguments["key"], value)) is not None:
+            return reason
         return refused(query.dtype, query.shape[3], value.shape[3], hooks, backward=True, family=family)
 
 

@@ -41,7 +41,6 @@ This page is generated from the maintainers' findings ledger as each change land
 - A gathered gemm call through a narrow prologue rounds each route's operand cotangent at the prologue's dtype before the token's wide sum. [13508]
 - A paged decode step whose pages are smaller than its key tile (page 16, the reads a key a run) at width 128 never finishes under the Mosaic interpreter on sm90. [13656]
 - Recurrent layers on the template's hooks, decode and conv on the toolkit, and entering memory. [14093, 14095, 14108]
-- An NVFP4 matrix or bank whose depth an Explicit axis splits (its packed words' and scales' last axis) has no portable product. [14097]
 - The fork takes no static register cap for a Mosaic GPU kernel. [12686]
 - Sm120's scaled GEMM forwards are derived at a tile their compile spills. [12687]
 - Mosaic GPU async_copy's 1D bulk shortcut (jax fork, launch_context.py is_simple_contiguous_copy) clips a contiguous slice at the whole buffer's end, linearly. [12692]

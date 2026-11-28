@@ -85,19 +85,22 @@ def _segmented(segments: jax.Array | None, count: int, axes: tuple[str, ...]) ->
     return reduction
 
 
-def _aligned_terms(terms: Sequence[Sequence[jax.Array]], spec: tuple,
-                   pooled: tuple[str, ...] = ()) -> jax.Array:
+def _aligned_terms(terms: Sequence[Sequence[jax.Array]], spec: tuple, pooled: tuple[str, ...] = (),
+                   varies: tuple[str, ...] = ()) -> jax.Array:
     """`aligned_sum` of `terms`, each product summed over its `spec` entry's axis (kept) and, where it gives
     `(held, shape)`, broadcast to `held` and reshaped to `shape` (a gradient's term in its factor's); with
     `pooled` manual axes, its digits summed over them too before its one rounding (`_segmented`'s axes: a
-    replicated factor's cotangent, `_factor_cotangents`). Every order differentiates it by its declared rule
-    (`_aligned_tangent`), the pooled sum's among them (train 1470's review: a pooled sum taken bare had no
-    tangent)."""
+    replicated factor's cotangent, `_factor_cotangents`); with `varies` manual axes, the sum made to vary over
+    them as well (a split factor's cotangent of terms that do not vary there). Every order differentiates it
+    by its declared rule (`_aligned_tangent`), the pooled sum's and the varied one's among them, so a
+    transpose pools exact products before its one rounding (trains 1470 and 1473's reviews: a pooled sum
+    taken bare had no tangent; a cast to vary outside the rule transposed to a float `psum` that
+    overflowed)."""
     _, factors, shape, spec = _laid_out(terms, spec)
     from dew.nn.kernels.launches import interpreting
 
     # A compiled kernel's body bare, as Mosaic lowers no symbolic zeros' rule; an interpreted one declared.
-    return (_aligned_value if interpreting() is False else _aligned)(shape, spec, pooled, *factors)
+    return (_aligned_value if interpreting() is False else _aligned)(shape, spec, pooled, varies, *factors)
 
 
 def _laid_out(terms: Sequence[Sequence[jax.Array]], spec: tuple) -> tuple[list, list, tuple, tuple]:
@@ -143,11 +146,13 @@ def _regrouped(shape: tuple[tuple[int, ...], ...], flat: Sequence[jax.Array]) ->
 
 
 def _aligned_value(shape: tuple[tuple[int, ...], ...], spec: tuple, pooled: tuple[str, ...],
-                   *flat: jax.Array) -> jax.Array:
+                   varies: tuple[str, ...], *flat: jax.Array) -> jax.Array:
     """`_aligned_terms` of its terms' factors in a row (`_regrouped`), summed exactly (`_exact_sum`), over
-    the `pooled` manual axes too where any are given (each term reduced as its own, `_segmented`)."""
+    the `pooled` manual axes too where any are given (each term reduced as its own, `_segmented`), and made
+    to vary over the `varies` ones."""
     segments = (None, 0, pooled) if pooled else None
-    return _exact_sum(_regrouped(shape, flat), spec, flat[0].dtype, segments=segments)
+    summed = _exact_sum(_regrouped(shape, flat), spec, flat[0].dtype, segments=segments)
+    return jax.lax.pcast(summed, varies, to="varying") if varies else summed
 
 
 class _Product(NamedTuple):
@@ -396,18 +401,18 @@ def _written(lead, kept, sticky, negative, lowest: int, digit: int, limits) -> j
     return jax.lax.bitcast_convert_type(signed, jnp.dtype(limits.dtype))
 
 
-def _aligned_tangent(shape: tuple[tuple[int, ...], ...], spec: tuple, pooled: tuple[str, ...], primals,
-                     tangents):
+def _aligned_tangent(shape: tuple[tuple[int, ...], ...], spec: tuple, pooled: tuple[str, ...],
+                     varies: tuple[str, ...], primals, tangents):
     """`_aligned_terms`' value (`_aligned`'s) and tangent in the factors it reaches, over its `pooled` manual
-    axes as its value is."""
+    axes and varying over its `varies` ones as its value is."""
     from jax.custom_derivatives import SymbolicZero
 
-    value = _aligned(shape, spec, pooled, *primals)
+    value = _aligned(shape, spec, pooled, varies, *primals)
     live = tuple(index for index, direction in enumerate(tangents) if not isinstance(direction, SymbolicZero))
     if not live:
         return value, jnp.zeros_like(value)
-    return value, _aligned_directions(shape, spec, pooled, primals, [tangents[index] for index in live],
-                                      jax.typeof(value), live)
+    return value, _aligned_directions(shape, spec, pooled, varies, primals,
+                                      [tangents[index] for index in live], jax.typeof(value), live)
 
 
 def _placed_as(x: jax.Array, like: ShapedArray) -> jax.Array:
@@ -482,7 +487,7 @@ def _factor_cotangents(shape: tuple[tuple[int, ...], ...], spec: tuple, factors,
     2^-23)(1 - 2^-23)` beside `-1` summed to 0, not `-2^-46` (train 1461's review). The pullback of a declared
     rule (`generation.linear_map`'s, `traced_tangent`), its value alone: reverse mode past it takes `apply`'s
     declared derivatives."""
-    from dew.nn.sharding import varying, varying_like
+    from dew.nn.sharding import varying
 
     gradients = []
     for place in live:
@@ -499,15 +504,17 @@ def _factor_cotangents(shape: tuple[tuple[int, ...], ...], spec: tuple, factors,
                     laid.append(held)
         # The manual axes its terms vary over and the factor does not, its digits pooled over them; and those
         # the factor varies over that its terms do not, the cotangent of each shard its own (a pooled sum's
-        # transpose, its cotangent replicated beside a replicated weight: train 1470's review).
-        excess = tuple(sorted(varying(terms) - jax.typeof(factor).mat.varying))
-        summed = varying_like(_aligned_terms(terms, tuple(laid), excess), factor)
+        # transpose, its cotangent replicated beside a replicated weight: train 1470's review), varied
+        # inside the declared rule, so its transpose pools exact products too (train 1473's review).
+        held, wanted = varying(terms), jax.typeof(factor).mat.varying
+        pooled, varies = tuple(sorted(held - wanted)), tuple(sorted(wanted - held))
+        summed = _aligned_terms(terms, tuple(laid), pooled, varies)
         gradients.append(_placed_as(summed.astype(factor.dtype), jax.typeof(factor)))
     return gradients
 
 
-def _aligned_directions(shape: tuple[tuple[int, ...], ...], spec: tuple, pooled: tuple[str, ...], primals,
-                        tangents, value, live: tuple[int, ...]):
+def _aligned_directions(shape: tuple[tuple[int, ...], ...], spec: tuple, pooled: tuple[str, ...],
+                        varies: tuple[str, ...], primals, tangents, value, live: tuple[int, ...]):
     """`aligned_sum`'s tangent in its `live` factors' `tangents` (`value` the sum's type alone, row 8757),
     over its `pooled` manual axes as its value is."""
     from dew.nn.kernels import generation
@@ -522,7 +529,7 @@ def _aligned_directions(shape: tuple[tuple[int, ...], ...], spec: tuple, pooled:
         # In the value's layout inside the sum, which reverse mode then sums inside it too (row 8757).
         laid = tuple((axis, (value.shape, value.shape) if held is None else held)
                      for axis, held in (spec[index] for _, index in placed))
-        return _placed_as(_aligned_terms(moved, laid, pooled), value)
+        return _placed_as(_aligned_terms(moved, laid, pooled, varies), value)
 
     def pulled(factors, cotangent):
         return _factor_cotangents(shape, spec, factors, cotangent, live)
@@ -532,5 +539,5 @@ def _aligned_directions(shape: tuple[tuple[int, ...], ...], spec: tuple, pooled:
 
 
 _aligned = contracted("test_an_aligned_sum_holds_every_order")(
-    declared_tangent(Protected(), _aligned_value, _aligned_tangent, nondiff_argnums=(0, 1, 2),
+    declared_tangent(Protected(), _aligned_value, _aligned_tangent, nondiff_argnums=(0, 1, 2, 3),
                      symbolic_zeros=True))

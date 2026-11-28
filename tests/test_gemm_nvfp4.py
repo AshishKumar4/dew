@@ -829,8 +829,8 @@ def test_a_bank_carries_its_forms_version_and_a_load_refuses_another(tmp_path):
 
 @pytest.mark.parametrize("group_sizes", [None, (8, 8)], ids=["matrix", "expert bank"])
 def test_an_nvfp4_product_over_operands_a_mesh_splits_decodes_its_matrix(group_sizes):
-    """An NVFP4 product at the H100's 16-row decode cell (`gemm.NVFP4_CELLS`), a matrix's or an expert
-    bank's, takes its packed launch over whole operands and decodes its matrix where a mesh XLA places
+    """An NVFP4 product at the H100's 16-row decode cell (`grouped_cells.NVFP4_CELLS`), a matrix's or an
+    expert bank's, takes its packed launch over whole operands and decodes its matrix where a mesh XLA places
     splits them (an automatic axis of two, `sharding.automatic_axes`), as every GEMM selector's launch reads
     one device's operands whole (row 11642: a Linear forced XLA by hand beside it, and an expert bank's
     product took the packed launch under such a mesh)."""
@@ -859,23 +859,26 @@ def test_an_nvfp4_product_over_operands_a_mesh_splits_decodes_its_matrix(group_s
     assert taken(split) == {"xla"}
 
 
-@INTERPRETS
-@pytest.mark.parametrize(("minifloat", "out_dtype"),
-                         [(bits.E4M3, jnp.float8_e4m3fn), (bits.E5M2, jnp.float8_e5m2)], ids=["e4m3", "e5m2"])
-def test_gemm_quantize_epilogue_matches_bits_encoded(minifloat, out_dtype):
-    """`quantized.gemm_quantized` encodes the GEMM accumulator via `bits.encode_form` bit-exact with
-    `bits.encoded` across E4M3 and E5M2, dividing by `tensor_scale` on encode and returning `(codes, scale)`
-    consistent with `NvFp4Block` (rows 8547, 12037, 12160)."""
+def the_quantize_epilogue_encodes_as_bits_encoded(minifloat: bits.Minifloat, interpret_on_cpu: bool = False
+                                                   ) -> None:
+    """`quantized.gemm_quantized` through the template encodes the GEMM accumulator via `bits.encode_form`
+    bit-exact with `bits.encoded`, dividing by `tensor_scale` on encode and returning `(codes, scale)`
+    consistent with `NvFp4Block` (rows 8547, 12037, 12160): interpreted, the form's evaluation
+    (`BitForm.traced`); compiled on a GPU, its PTX inline in the epilogue (`inline_forms.registers`, row
+    14105)."""
     rng = np.random.default_rng(17)
     lhs = jnp.asarray(rng.integers(-3, 4, size=(128, 128)), jnp.bfloat16)
     rhs = jnp.asarray(rng.integers(-3, 4, size=(128, 128)), jnp.bfloat16)
     acc = jnp.dot(lhs, rhs, preferred_element_type=jnp.float32)
     words = jax.lax.bitcast_convert_type(acc, jnp.uint32)
     expected_u8 = bits.encoded(words, minifloat).astype(jnp.uint8)
-    with generation.assumed("sm90"), generation.chosen(grouped_matmul="mosaic"):
-        got, scale = quantized.gemm_quantized(lhs, rhs, minifloat=minifloat, interpret_on_cpu=True)
+    with generation.chosen(grouped_matmul="mosaic"), generation.routes() as routes:
+        got, scale = quantized.gemm_quantized(lhs, rhs, minifloat=minifloat,
+                                              interpret_on_cpu=interpret_on_cpu)
         got_s, scale_s = quantized.gemm_quantized(lhs, rhs, minifloat=minifloat, tensor_scale=2.0,
-                                             interpret_on_cpu=True)
+                                                  interpret_on_cpu=interpret_on_cpu)
+    assert ("grouped_matmul", "mosaic") in {(route.choice, route.kernel) for route in routes}
+    out_dtype = quantized.minifloat_dtype(minifloat)
     assert isinstance(got, jax.Array) and got.dtype == out_dtype and float(scale) == 1.0
     got_u8 = jax.lax.bitcast_convert_type(got, jnp.uint8)
     np.testing.assert_array_equal(np.asarray(got_u8), np.asarray(expected_u8))
@@ -884,6 +887,15 @@ def test_gemm_quantize_epilogue_matches_bits_encoded(minifloat, out_dtype):
                              minifloat).astype(jnp.uint8)
     np.testing.assert_array_equal(np.asarray(jax.lax.bitcast_convert_type(got_s, jnp.uint8)),
                                   np.asarray(scaled_u8))
+
+
+@INTERPRETS
+@pytest.mark.parametrize("minifloat", [bits.E4M3, bits.E5M2], ids=["e4m3", "e5m2"])
+def test_gemm_quantize_epilogue_matches_bits_encoded(minifloat):
+    """The quantize epilogue's encode, interpreted on an H100's template, is `bits.encoded`
+    (`the_quantize_epilogue_encodes_as_bits_encoded`; its compiled PTX is tests/test_gpu_gemm.py's)."""
+    with generation.assumed("sm90"):
+        the_quantize_epilogue_encodes_as_bits_encoded(minifloat, interpret_on_cpu=True)
 
 
 @pytest.mark.parametrize("gpu", [pytest.param("sm80", marks=lowers("sm80")),
@@ -900,6 +912,117 @@ def test_gemm_quantize_epilogue_lowers_inline_ptx(gpu):
             lowering_platforms=("cuda",))
         jax.jit(lambda a, b: quantized.gemm_quantized(a, b, minifloat=formats.MxFp8)).trace(x, w).lower(
             lowering_platforms=("cuda",))
+
+
+def _columned_case(rows: int, *, grouped: bool):
+    """Rows of a call and an NVFP4 matrix (or a bank of two experts with its group sizes) whose tensor scale
+    is one a column (`NvFp4.columned`)."""
+    rng = np.random.default_rng(13743)
+    experts = (2,) if grouped else ()
+    matrix = formats.NvFp4.of(jnp.asarray(rng.integers(-2, 3, (*experts, 512, 128)), jnp.float32),
+                              jnp.ones((*experts, 32, 128), jnp.float8_e4m3fn),
+                              jnp.asarray(np.exp2(rng.integers(-4, 4, (*experts, 128))), jnp.float32))
+    sizes = jnp.asarray([rows // 2, rows - rows // 2], jnp.int32) if grouped else None
+    return jax.ShapeDtypeStruct((rows, 512), jnp.bfloat16), matrix, sizes
+
+
+def a_packed_nvfp4_call_placed_on_its_hosts_cpu_keeps_a_subnormal_scale():
+    """On a GPU process, a packed NVFP4 prefill (named packed, its tensor scale one a column) whose operands
+    are committed to the host's CPU, interpretation asked: it runs on the CPU as the plain launch
+    interpreted, `factored`'s exact finish after it, never the GPU's hooked launch interpreted there, whose
+    epilogue's product by 2^8 flushed a column scale of 2^-127 to zero (the review of row 13743's restack):
+    two experts of 256-deep ones over 256 rows of ones, each value 2^-119. Run by tests/test_gpu_gemm.py's
+    cells: a CPU process plans no hooked launch."""
+    cpu = jax.devices("cpu")[0]
+    bank = formats.NvFp4.of(jnp.ones((2, 256, 128), jnp.float32), jnp.ones((2, 16, 128), jnp.float8_e4m3fn),
+                            jnp.full((2, 128), 2.0 ** -127, jnp.float32))
+    rows, sizes = jnp.ones((256, 256), jnp.bfloat16), jnp.asarray([128, 128], jnp.int32)
+    rows, bank, sizes = jax.device_put((rows, bank, sizes), cpu)
+    # The interpreter's GPU stated, as every interpreted call states it; the process's default stays its GPU.
+    with generation.assumed("sm90"), generation.chosen(nvfp4="packed"):
+        out = gemm.nvfp4_product(rows, bank, sizes, out_dtype=jnp.float32, interpret_on_cpu=True)
+    np.testing.assert_array_equal(np.asarray(out), np.full((256, 128), 2.0 ** -119, np.float32))
+
+
+def _packed_epilogues(launched) -> list:
+    """The epilogue of each packed NVFP4 launch a trace took (`tuning.seen`)."""
+    return [observed.keyed.arguments["hooks"].epilogue for observed in launched
+            if isinstance(observed.op, grouped_quantized.MosaicPackedGmm)]
+
+
+@pytest.mark.parametrize("grouped", [False, True], ids=["matrix", "bank"])
+def test_a_packed_nvfp4_call_finishes_its_scale_in_its_launch_where_it_runs_unswapped(grouped):
+    """An NVFP4 product named packed on an H100 whose tensor scale is one a column, as a matrix and as a bank
+    of two experts: a prefill's launch takes the scale and the decode's owed 2^8 in its epilogue
+    (`gemm._packed_finish`, row 13743), no factor's rows formed; a decode's 16 rows (swapped or not) take
+    none, the factor XLA's after it, as its receipts timed it; interpreted on this CPU (whose float32 flushes
+    the subnormals `factored`'s own rounding keeps) no launch takes it either."""
+
+    def epilogues(rows, *, interpret):
+        spec, matrix, sizes = _columned_case(rows, grouped=grouped)
+        with generation.assumed("sm90"), generation.chosen(nvfp4="packed"), tuning.seen() as launched:
+            jax.eval_shape(lambda x: gemm.nvfp4_product(x, matrix, sizes, out_dtype=jnp.float32,
+                                                        interpret_on_cpu=interpret), spec)
+        found = _packed_epilogues(launched)
+        assert found, rows
+        return found
+
+    assert all(epilogue is not None for epilogue in epilogues(256, interpret=False))
+    assert all(epilogue is None for epilogue in epilogues(256, interpret=True))
+    # A decode's rows (the receipts' decode cells, `NVFP4_DECODE_ROWS`) keep the factor after the launch.
+    assert all(epilogue is None for epilogue in epilogues(16, interpret=False))
+
+
+@pytest.mark.parametrize("interpret", [False, True], ids=["native", "interpretation asked on a GPU"])
+def test_a_packed_nvfp4_pin_its_finish_cannot_take_keeps_the_plain_launch(interpret):
+    """A prefill's packed NVFP4 product on an H100's abstract mesh (its launch native, whatever it asks of a
+    CPU), its finished launch's tile refused by a compile (`report.refuse_launch`, as a spill refuses it)
+    while another finished tile still derives, and that tile pinned, which the plain launch takes: the call
+    keeps the plain launch at the pin, the factor XLA's after it, where the finish's refused pin would have
+    raised (`gemm._packed_finish`: the optional finish bound as its native launch is, row 13743's review)."""
+    from dew.nn.kernels.templates import report
+
+    spec, matrix, _ = _columned_case(256, grouped=False)
+    launch = grouped_quantized.MosaicPackedGmm()
+    mesh = generation.gpu_mesh(Mesh(np.array(jax.devices()[:1]), ("data",)), "sm90")
+
+    def packed(pins):
+        with generation.chosen(nvfp4="packed"), tuning.pinned(pins), tuning.seen() as launched:
+            jax.jit(lambda x: gemm.nvfp4_product(x, matrix, out_dtype=jnp.float32,
+                                                 interpret_on_cpu=interpret)).trace(spec)
+        return [(observed.config, observed.arguments) for observed in launched.held()
+                if isinstance(observed.arguments.op, grouped_quantized.MosaicPackedGmm)]
+
+    with report.refusals(), generation.assumed("sm90"), jax.sharding.use_abstract_mesh(mesh):
+        target = generation.gpu_target()
+        [(config, hooked)] = [(config, ba) for config, ba in packed({})
+                              if ba.arguments["hooks"].epilogue is not None]
+        assert not hooked.arguments["interpret"]
+        plain = launch.bind(**{name: value for name, value in hooked.arguments.items()
+                               if name not in ("hooks", "epilogue_operands")})
+        assert launch.pinnable(plain, launch.completed(plain, config))
+        report.refuse_launch(launch, hooked, launch.completed(hooked, config), {launch.KERNEL})
+        assert launch.derived(hooked, target) not in (None, config)
+        after = packed({grouped_quantized.MosaicPackedGmm: config})
+    assert after and all(ba.arguments["hooks"].epilogue is None for _, ba in after), after
+    assert all(taken == launch.completed(plain, config) for taken, _ in after), after
+
+
+@pytest.mark.parametrize("grouped", [False, True], ids=["matrix", "bank"])
+@pytest.mark.parametrize("gpu", [pytest.param("sm80", marks=lowers("sm80")),
+                                 pytest.param("sm90", marks=lowers("sm90"))])
+def test_a_packed_nvfp4_prefill_finishing_its_scale_lowers_for_cuda(gpu, grouped):
+    """A prefill-sized NVFP4 product named packed whose tensor scale is one a column (a matrix's, a bank's
+    of two experts) lowers for CUDA on an A100 and an H100 with its launch's epilogue taking the scale, a
+    side each tile reads where it lands (row 13743)."""
+    spec, matrix, sizes = _columned_case(256, grouped=grouped)
+    mesh = generation.gpu_mesh(Mesh(np.array(jax.devices()[:1]), ("data",)), gpu)
+    with (generation.assumed(gpu), jax.sharding.use_abstract_mesh(mesh), generation.chosen(nvfp4="packed"),
+          tuning.seen() as launched):
+        traced = jax.jit(lambda x: gemm.nvfp4_product(x, matrix, sizes, out_dtype=jnp.float32)).trace(spec)
+        finished = _packed_epilogues(launched)
+        assert finished and all(epilogue is not None for epilogue in finished), finished
+        traced.lower(lowering_platforms=("cuda",))
 
 
 def test_packed_rows_supported_reads_bundle_fragment_name():
@@ -1224,6 +1347,68 @@ def test_an_nvfp4_products_gathered_gradient_keeps_far_routes_apart_and_routes_n
     _, pull = jax.vjp(routed, token)
     (d_none,) = pull(jnp.zeros((0, 128), jnp.float32))
     np.testing.assert_array_equal(np.asarray(d_none), np.zeros((1, 512), np.float32))
+
+
+@pytest.mark.parametrize("depth, devices", [(768, 3), (256, 4)],
+                         ids=["whole groups a device", "groups cut by the devices"])
+@pytest.mark.mesh(devices=4)
+def test_a_depth_split_nvfp4_projection_decodes_and_pulls_back_on_an_explicit_mesh(depth, devices):
+    """A dense NVFP4 matrix whose depth an Explicit 'tensor' axis splits (its words' and scales' last axis:
+    768 deep three ways, whole 128-deep groups a device; 256 deep four ways, each device half a group),
+    jitted: its decode is the codes' values placed by the same depth, its values (`packed_values`) the
+    unsplit matrix's, and its projection of rows split by that depth, forward and the rows' gradient, the
+    product written plainly over its values, exactly over small integers. Each group's staged order is
+    undone where it lies, the devices that cut a group gathered off its words while it is (row 14097: a
+    gather across the split depth had no placement; train 1466's review: the four-way split met a reshape
+    of two groups, which JAX refused)."""
+    from jax.sharding import AxisType, PartitionSpec
+
+    from dew.nn.kernels.templates import product
+    from dew.quantization import packed_values
+
+    rng = np.random.default_rng(14097)
+    codes = jnp.asarray(rng.integers(-2, 3, (depth, 128)), jnp.float32)
+    blocks = depth // product.NVFP4.depth
+    matrix = formats.NvFp4.of(codes, jnp.ones((blocks, 128), jnp.float8_e4m3fn), jnp.float32(2.0 ** -8))
+    values = np.asarray(packed_values(matrix), np.float64)
+    rows = rng.integers(-3, 4, (8, depth)).astype(np.float32)
+    cotangent = rng.integers(-3, 4, (8, 128)).astype(np.float32)
+    mesh = jax.make_mesh((devices,), ("tensor",), axis_types=(AxisType.Explicit,),
+                         devices=jax.devices()[:devices])
+
+    @jax.jit
+    def run(x, matrix, cotangent):
+        out, pull = jax.vjp(lambda x: gemm.nvfp4_product(x, matrix, out_dtype=jnp.float32), x)
+        return (matrix.decoded(), jax.reshard(packed_values(matrix), PartitionSpec()),
+                jax.reshard(out, PartitionSpec()), jax.reshard(pull(cotangent)[0], PartitionSpec()))
+
+    with jax.set_mesh(mesh):
+        deep = PartitionSpec(None, "tensor")
+        placed = formats.NvFp4(jax.device_put(matrix.words, deep), jax.device_put(matrix.scales, deep),
+                               jax.device_put(matrix.scale, PartitionSpec()))
+        decoded, found, out, grad = run(jax.device_put(rows, deep), placed,
+                                        jax.device_put(cotangent, PartitionSpec()))
+    assert jax.typeof(decoded).sharding.spec[0] == "tensor"
+    np.testing.assert_array_equal(np.asarray(decoded, np.float64), np.asarray(matrix.decoded(), np.float64))
+    np.testing.assert_array_equal(np.asarray(found, np.float64), values)
+    np.testing.assert_array_equal(np.asarray(out, np.float64), rows.astype(np.float64) @ values)
+    np.testing.assert_array_equal(np.asarray(grad, np.float64), cotangent.astype(np.float64) @ values.T)
+
+
+def test_a_staged_order_no_transposition_states_is_refused_its_portable_decode():
+    """The portable decode undoes a staged order by transposing each group's words and codes
+    (`formats._unstaging`), so a declaration that no such transposition states is refused at the depth it
+    decodes, not decoded wrong: NVFP4's own order with words 0 and 1 of code 0 exchanged in the third group
+    alone, which the first two groups' strides cannot show (the review of row 14097's respin)."""
+    from dew.nn.kernels.templates.gemm import packed
+
+    def exchanged(group, word, code):
+        depth = packed.nvfp4_staged_depth(group, word, code)
+        moved = (group == 2) & (code == 0) & (word < 2)
+        return np.where(moved, depth + 1 - 2 * word, depth)
+
+    with pytest.raises(ValueError):
+        formats._unstaging(768, packed.NVFP4_GROUP, bits.E2M1.width, exchanged, "NVFP4")
 
 
 def _small_integer_projection(seed: int) -> tuple:

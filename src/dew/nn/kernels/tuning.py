@@ -996,8 +996,8 @@ class KernelOp(tokamax.Op):
                            if field.name not in (*self.HOOKS, "config", "vjp")))
             hash(place)
         except TypeError:
-            # A part no hash holds (an array): traced each time.
-            return self.traced(name, value)
+            # A part no hash holds (an array, a closure over a list): traced once a call (`one_call`).
+            return self._traced_once(name, value)
         found = _TRACED.get(place)
         if found is not None and all(ref() is leaf for ref, leaf in zip(found[0], leaves, strict=True)):
             return found[1]
@@ -1010,6 +1010,24 @@ class KernelOp(tokamax.Op):
             return key
         _TRACED[place] = (refs, key)
         return key
+
+    def _traced_once(self, name: str, value) -> str | None:
+        """`traced`, once a kernel call's making (`one_call`) for each value, this op's layouts and the
+        trace's configuration, the value kept beside its key while the call lasts; each time outside one (a
+        decode step's planning and launch read one trace of a closure hook, train 1472's review)."""
+        table = call_scoped()
+        if table is None:
+            return self.traced(name, value)
+        place = ("identified", type(self), name, id(value), jax_config.trace_context(),
+                 tuple((field.name, getattr(self, field.name)) for field in dataclasses.fields(self)
+                       if field.name not in (*self.HOOKS, "config", "vjp")))
+        try:
+            hash(place)
+        except TypeError:
+            return self.traced(name, value)
+        if place not in table:
+            table[place] = (value, self.traced(name, value))
+        return table[place][1]
 
     def lowering(self, ba: tokamax.BoundArguments, config) -> tuple[Callable, tuple]:
         """The launch of `ba` at `config` as a resource derivation lowers it (never run), or with `config`
@@ -1791,6 +1809,34 @@ class Observed(NamedTuple):
     def launch(self) -> Launch:
         """The launch as the store keys it (`_launch_key`): its op and keyed arguments."""
         return self.op, self.keyed
+
+
+_CALL_SCOPED: contextvars.ContextVar[dict | None] = _cache.untraced(
+    contextvars.ContextVar("call_scoped", default=None))
+"""What a kernel call's making has read once (`one_call`, `call_scoped`): a call's own, which no trace reads
+to make its program (`_cache.untraced`), so no trace kept past the call is keyed by it."""
+
+
+def one_call[**P, R](function: Callable[P, R]) -> Callable[P, R]:
+    """`function`, a kernel call's whole making (its route's choice, its config's derivation and pricing,
+    its launch's emission), within which `call_scoped` is one table: a hook a launch reads traced once
+    across them, where each traced it (train 1452's and 1461's reviews), nothing of it held past the
+    outermost call."""
+    @functools.wraps(function)
+    def within(*args: P.args, **kwargs: P.kwargs) -> R:
+        outer = _CALL_SCOPED.get()
+        token = _CALL_SCOPED.set({} if outer is None else outer)
+        try:
+            return function(*args, **kwargs)
+        finally:
+            _CALL_SCOPED.reset(token)
+
+    return within
+
+
+def call_scoped() -> dict | None:
+    """The table of the kernel call being made (`one_call`), None outside one."""
+    return _CALL_SCOPED.get()
 
 
 class Seen(list[Observed]):

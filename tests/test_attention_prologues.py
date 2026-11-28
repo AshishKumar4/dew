@@ -244,8 +244,11 @@ def test_a_prologued_route_call_over_narrowed_operands_differentiates_the_prolog
         hooked = template.Hooks(
             query=Hook(by_dtype, (Side(query_weight, template.Kind.WIDTH), frequency)),
             key=Hook(by_dtype, (Side(key_weight, template.Kind.WIDTH), frequency)))
-        wide = [operand.astype(jnp.float32) for operand in (query, key, value)]
-        return attention_route.attend(*wide, spans, hooked, operand_dtype=jnp.bfloat16).astype(query.dtype)
+        # The key and value wide, narrowed by the route (`operand_dtypes`); the bf16 query as it comes, so
+        # both prologues read bf16 operands.
+        wide = [operand.astype(jnp.float32) for operand in (key, value)]
+        return attention_route.attend(query, *wide, spans, hooked,
+                                      operand_dtypes=(jnp.bfloat16, jnp.bfloat16)).astype(query.dtype)
 
     assert_as_exact(jax.jit(with_gradients(ours)), jax.jit(with_gradients(written_reference(spans, width))),
                     drawing(jnp.bfloat16, width), "prologued route narrowed", seeds=SEEDS)

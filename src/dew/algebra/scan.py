@@ -1799,8 +1799,14 @@ def _scaled_exp_tangent(primals, tangents):
 
 def _times_decayed_value(exponent, value, *factors):
     """`value` decayed by `exp(exponent)` (`scaled_exp`), then times each of `factors` in turn: the decay
-    applied before any factor meets the value."""
-    return functools.reduce(jnp.multiply, factors, _scaled_exp(value, exponent))
+    applied before any factor meets the value, and the product zero where a factor is (an overflowed
+    decayed value times a zero cotangent or direction, `inf * 0`, was NaN: a reset's zero cotangent met
+    an overflowed read's decay, train 1455's review)."""
+    product = functools.reduce(jnp.multiply, factors, _scaled_exp(value, exponent))
+    # A factor storing a zero (`float_bits.stored_zero`, a complex direction's both parts: train 1466's
+    # review).
+    vanishing = functools.reduce(jnp.logical_or, map(float_bits.stored_zero, factors), jnp.zeros((), bool))
+    return jnp.where(vanishing, jnp.zeros_like(product), product)
 
 
 def _times_decayed_tangent(primals, tangents):
@@ -1855,7 +1861,8 @@ def _decayed_terms_value(terms, exponent, *operands):
     product or sum leaves the format's range where the whole is in it: 2^127 by 2^127 under `e^-90`, 2^120
     by 1 under `e^-120`, 2^100 by 2^-120 under `e^-25`, a term past the range beside one it cancels. An
     exponent past the cutoff, -inf or fp32's most negative among them, decays a finite sum to zero (a
-    non-finite one to NaN, no product of the operands formed: 2^127 by 2^127 at -inf is zero)."""
+    non-finite one to NaN, no product of the operands formed: 2^127 by 2^127 at -inf is zero). A term one of
+    whose operands is zero is zero, whatever the others (`_times_decayed_value`'s rule at every order)."""
     used = sorted({index for term in terms for index in term})
     dtype = jnp.result_type(exponent, *operands)
     # The decomposition in at least fp32, each operand widened exactly (a 16-bit subnormal a normal fp32),
@@ -1880,9 +1887,22 @@ def _decayed_terms_value(terms, exponent, *operands):
     remainder = accurate_exp(((high - whole) + low) * np.asarray(math.log(2.0), work))
     decay = scaled.normalized(remainder, jnp.clip(whole, -cutoff, 0).astype(jnp.int32), cutoff + 1)
     parts = {index: scaled.scaled(operands[index]) for index in used}
-    products = [functools.reduce(scaled.mul, [parts[index] for index in term], decay) for term in terms]
-    found = scaled.landed(functools.reduce(scaled.add, products))
-    unbounded = functools.reduce(jnp.logical_or, [~jnp.isfinite(operands[index]) for index in used])
+    # Each term zero where one of its factors stores a zero (its scaled significand's, read from its bits: a
+    # subnormal a flushing comparison reads as zero is no zero), whatever the others (an overflowed value
+    # times a zero cotangent, `inf * 0`, at any order of `_times_decayed`'s derivatives; train 1455's review).
+    zeros = [functools.reduce(jnp.logical_or, [parts[index].significand == 0 for index in term])
+             for term in terms]
+
+    def product(term, zero) -> scaled.Scaled:
+        formed = functools.reduce(scaled.mul, [parts[index] for index in term], decay)
+        return scaled.Scaled(jnp.where(zero, 0.0, formed.significand), jnp.where(zero, 0, formed.exponent),
+                             formed.reach)
+
+    found = scaled.landed(functools.reduce(scaled.add, map(product, terms, zeros)))
+    # A spent decay's sum NaN where a term no zero annihilates holds a non-finite operand.
+    unbounded = functools.reduce(jnp.logical_or, [
+        functools.reduce(jnp.logical_or, [~jnp.isfinite(operands[index]) for index in term]) & ~zero
+        for term, zero in zip(terms, zeros, strict=True)])
     return jnp.where(gone, jnp.where(unbounded, np.asarray(np.nan, work), 0), found).astype(dtype)
 
 

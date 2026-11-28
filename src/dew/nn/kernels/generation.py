@@ -1887,22 +1887,6 @@ def linear_tangent(forward: Callable, backward: Callable, portable: Callable, *,
         declared_tangent(kind, bounding, bounded_jvp, symbolic_zeros=True))
 
 
-def unbroadcast(cotangent, shape: tuple[int, ...]):
-    """`cotangent`, of the shape an operand of `shape` was broadcast to, summed back to `shape`, as JAX pulls
-    a broadcast back: every axis the broadcast added or widened from one reduced at once, in the
-    cotangent's dtype (one `reduce_sum`, as JAX's own broadcast transpose: one rounding of each sum), then
-    reshaped to `shape`. Summed from the cotangent itself, so the sum keeps its type (an Explicit placement,
-    a manual axis's variation; train 1437's review: a broadcast's pullback traced from plain zeros refused
-    a split cotangent)."""
-    import jax
-
-    from dew.nn.sharding import broadcast_axes
-
-    reduced = broadcast_axes(tuple(shape), cotangent.shape)
-    summed = jax.lax.reduce_sum(cotangent, reduced) if reduced else cotangent
-    return summed.reshape(shape)
-
-
 def linear_map(apply: Callable, pullback: Callable, residuals, moving, *, out_aval=None,
                zero_cotangents: bool = False, traced_tangent: bool = False, summed_first: bool = False):
     """`apply(residuals, moving)`, linear in `moving`, whose transpose is `pullback(residuals, cotangent)`

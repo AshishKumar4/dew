@@ -493,6 +493,40 @@ is not its kind's route (`grouped_matmul.DECLARED`), its kind's otherwise (`grou
 every other product its kind's."""
 
 
+class PackedRows(enum.Enum):
+    """An NVFP4 call's size as its receipts measure it (`gemm.PackedCase.cell`): decode-sized (at most
+    `NVFP4_DECODE_ROWS` rows, the packed matrix's bytes its time) or a prefill."""
+
+    DECODE = 'decode'
+    PREFILL = 'prefill'
+
+
+NVFP4_DECODE_ROWS = 64
+"""The most rows a decode-sized NVFP4 call has (`gemm.PackedCase.cell`): the receipts' largest decode row
+count."""
+
+PACKED_FASTER = ("W13-a100-4-M-NS-8b-a100 (base/kernels 8d23bb9872, CUPTI, arms rotated): Llama-3-8B's "
+                 "q/o, up and down projections at 1, 16 and 64 rows on an A100-SXM4-40GB, the packed kernel "
+                 "0.119-0.398 ms against the matrix decoded once a call's 0.309-1.418 (2.6-3.6x), its "
+                 "temporary memory 0.66-3.7 MB against 71-250 MB; at 4096 rows 4.4-4.7x slower, each row "
+                 "tile decoding the matrix again")
+"""The receipt behind the packed NVFP4 kernel's declared A100 cell (`NVFP4_CELLS`)."""
+PACKED_FASTER_SM90 = (
+    "W7-gh200-8-M-NS-8-h100 (base/kernels d4bb24d4f8, CUPTI, arms rotated): Llama-3-8B's q/o, up and down "
+    "projections at 1, 16 and 64 rows on a GH200, the packed kernel 0.059-0.193 ms against the matrix "
+    "decoded once a call's 0.142-0.505 (2.4x q/o, 4.5x up, 2.6x down), its temporary memory 0.2-3.7 MB "
+    "against 71-250 MB; at 4096 rows 5.2-5.3x slower, its stage decode unhidden under the products")
+"""The receipt behind the packed NVFP4 kernel's declared H100 cell (`NVFP4_CELLS`)."""
+
+NVFP4_CELLS: dict[tuple[str, PackedRows], str] = {
+    ('sm80', PackedRows.DECODE): PACKED_FASTER,
+    ('sm90', PackedRows.DECODE): PACKED_FASTER_SM90,
+}
+"""The NVFP4 product's declared cells (`gemm.NVFP4`), (device generation, call size) to the receipt by which
+the packed kernel runs them: a literal of them, which the selector reads and thresh's declared-set seam
+registers (.thresh/thresh.cue)."""
+
+
 class Blockwise(NamedTuple):
     """A blockwise-scaled FP8 product as a receipt timed it (`BLOCKWISE_CELLS`, `gemm.ScaledCase`): its
     `rows`, the `depth` its blocks' steps walk, its `width`, its `groups`' matrices and the columns a column
