@@ -30,28 +30,46 @@ import jax.numpy as jnp
 from dew.nn import sharding
 from dew.nn.aligned import aligned_sum
 from dew.nn.inputs import sequence_blocks
+from dew.nn.norms import row_shift
 from dew.nn.precision import at_least_fp32
 from dew.nn.residuals import memory_chunks
 
 
-def layer_normed(x, eps: float):
-    """`x`'s LayerNorm over its last axis without an affine, `(x - mean x) / sqrt(var + eps)`: the plain
-    formula, fla's reference's and the token recurrence's, its derivatives autodiff's, so every order is
-    finite wherever the plain formula's is (docs/design/testing.md, the derivative contract). A quotient by
-    the root, not a product by `rsqrt`, whose derivative `rsqrt(v) / v` passes the range first (2^150 at
+def layer_normed(x, weight, bias, eps: float):
+    """`x`'s LayerNorm over its last axis under the affine `weight` and `bias`, `(x - mean x) / sqrt(var +
+    eps) w + b`: its rows less their shift first (`norms.row_shift`, Dew's layer norm's own, which the
+    memory's general path reads: train 1484's review, `[2^24, 2^24 + 2]` normalized unshifted to `[0, 1.15]`
+    where it is `[-1, 1] / 1.41` at an epsilon of one), then the formula over the shifted rows, its
+    derivatives autodiff's (the shift a constant, whose term a layer norm's invariance makes zero), so every
+    order is finite wherever the formula's is (docs/design/testing.md, the derivative contract). An entry
+    whose weight and row's root both pass one takes its weight into the inverse root first, as flax's layer
+    norm takes its scale, `x (w / root)`, whose every step, the pullback's `g (w / root)` too, stays within
+    the range its result is in: the plain order `(x / root) w` there rounded a centered `2^-100` under an
+    epsilon of `2^100` to zero before a weight of `2^100` (79g's review), and its pullback's `g w` overflowed
+    at a cotangent of `2^50` (its second). Every other entry keeps fla's reference's order, `(x / root) w`,
+    whose steps stay in range there (`x / root` at most the row width's root, `g w` at most the result where
+    the root is at most one), where `w / root` alone would leave it: a weight of `2^-101` over a root of
+    `2^50` underflows, a weight of `2^100` over a small root overflows (its third). Each order's operands are
+    held at zero in the other's entries, so no derivative meets a range its value does not reach. A quotient
+    by the root, not a product by `rsqrt`, whose derivative `rsqrt(v) / v` passes the range first (2^150 at
     `eps` 2^-100, its product with a zero NaN)."""
-    centered = x - jnp.mean(x, axis=-1, keepdims=True)
-    return centered / jnp.sqrt(jnp.mean(centered * centered, axis=-1, keepdims=True) + eps)
+    shifted = x - row_shift(x, -1)
+    centered = shifted - jnp.mean(shifted, axis=-1, keepdims=True)
+    root = jnp.sqrt(jnp.mean(centered * centered, axis=-1, keepdims=True) + eps)
+    folds = (root > 1) & (jnp.abs(weight) > 1)
+    folded = jnp.where(folds, centered, 0) * (jnp.where(folds, weight, 0) / jnp.where(folds, root, 1))
+    plain = (jnp.where(folds, 0, centered) / jnp.where(folds, 1, root)) * jnp.where(folds, 0, weight)
+    return jnp.where(folds, folded, plain) + bias
 
 
 def inner_gradient(k, v, km, weight, bias, eps: float):
     """Half the inner loss's gradient at the memory's readout `km` (`k M`), `[..., D]`: the memory's output
     `k + (LN(km) w + b)` (the residual around its key, as `dew.nn.memory`'s `ResidualMemory`) against the
-    value `v`, its error times `w`, through the LayerNorm's pullback (autodiff's, `layer_normed`). The
-    residual first, as the memory computes its output: against `v - k`, a key of 2^100 beside a value of 1
-    rounded the target and erased the error (a head review)."""
-    normed, pullback = jax.vjp(functools.partial(layer_normed, eps=eps), km)
-    (gradient,) = pullback(((k + (normed * weight + bias)) - v) * weight)
+    value `v`, through the affine LayerNorm's pullback (autodiff's, `layer_normed`). The residual first, as
+    the memory computes its output: against `v - k`, a key of 2^100 beside a value of 1 rounded the target and
+    erased the error (a head review)."""
+    normed, pullback = jax.vjp(functools.partial(layer_normed, weight=weight, bias=bias, eps=eps), km)
+    (gradient,) = pullback((k + normed) - v)
     return gradient
 
 
@@ -85,7 +103,7 @@ def read_out(walked, queries, weight, bias, eps: float, dtype):
     out = jnp.moveaxis(walked.reshape(-1, *walked.shape[2:]), 0, 2)[:, :, :queries.shape[2]]
     # The affine whole before the residual, as the memory's norm applies it (`ResidualMemory`): `q + (LN w +
     # c)`, where `(q + LN w) + c` lost the query to an affine its bias cancels.
-    return jnp.moveaxis(queries + (layer_normed(out, eps) * weight + bias), 1, 2).astype(dtype)
+    return jnp.moveaxis(queries + layer_normed(out, weight, bias, eps), 1, 2).astype(dtype)
 
 
 def placed_alike(affine, *operands):

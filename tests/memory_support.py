@@ -31,6 +31,10 @@ CONFIGURATIONS = {
     # Its inner loop updates W and b alone; the layer norm's scale and bias are outer-loop parameters
     # (the authors' ttt.py, `TTTCache.ttt_param_names`).
     "ttt_linear": {"network": ResidualMemory(hidden=None, norm=True), "slow": ("norm",)},
+    # Titans' linear memory with its layer norm (fla's `chunk_titans_linear_ref`): f(x) = x + LN(x M), no
+    # bias, with momentum and forgetting (Eq 12-14), the norm outer-loop only.
+    "titans_linear": {"network": ResidualMemory(hidden=None, norm=True, bias=False), "slow": ("norm",),
+                      "momentum": Gate(), "retention": Gate(bias=-2.0)},
     # TTT-MLP: a 4x GELU MLP inside the residual and norm, the norm outer-loop only.
     "ttt_mlp": {"network": ResidualMemory(hidden=4 * FEATURES, activation="gelu"), "slow": ("norm",)},
     # Titans' deep memory with momentum and forgetting (Eq 12-14).

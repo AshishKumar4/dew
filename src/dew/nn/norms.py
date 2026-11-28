@@ -423,6 +423,16 @@ SHIFT = "layer_norm_shift"
 (`LayerNorm`)."""
 
 
+def row_shift(x: jax.Array, axes, *, mask: jax.Array | None = None) -> jax.Array:
+    """Each row's mean over `axes`, kept, in at least float32 and constant to the gradient: what a layer norm
+    takes from its rows before their statistics (`_Shifted`), which a layer norm does not change, so a row
+    whose mean dwarfs its spread rounds as a row near zero does (`[2^24, 2^24 + 2]` is `[-1, 1]` over the
+    root of its variance and epsilon; its statistics read unshifted, `[0, 2]` over another). The one shift
+    of Dew's layer norm and of the kernels that compute one (`dew.nn.kernels.titans.layer_normed`)."""
+    wide = jnp.promote_types(x.dtype, jnp.float32)
+    return jax.lax.stop_gradient(jnp.mean(x, axis=axes, keepdims=True, dtype=wide, where=mask))
+
+
 class _Shifted(nn.LayerNorm):
     """flax's `nn.LayerNorm` over its input less each row's mean, which a layer norm does not change: its
     statistics read rows centered near zero, so a row whose mean dwarfs its spread rounds as a row near
@@ -434,12 +444,11 @@ class _Shifted(nn.LayerNorm):
     @nn.compact
     def __call__(self, x, *, mask=None):
         axes = (self.reduction_axes,) if isinstance(self.reduction_axes, int) else tuple(self.reduction_axes)
-        wide = jnp.promote_types(x.dtype, jnp.float32)
-        shift = jnp.mean(x, axis=axes, keepdims=True, dtype=wide, where=mask)
+        shift = row_shift(x, axes, mask=mask)
         if self.axis_name is not None:
             shift = jax.lax.pmean(shift, self.axis_name, axis_index_groups=self.axis_index_groups)
-        shift = checkpoint_name(jax.lax.stop_gradient(shift), SHIFT)
-        normed = super().__call__(x.astype(wide) - shift, mask=mask)
+        shift = checkpoint_name(shift, SHIFT)
+        normed = super().__call__(x.astype(shift.dtype) - shift, mask=mask)
         # The parameters' values, out of the partitioning box a norm declaring its axes stores them in.
         held = [nn.unbox(self.get_variable("params", name)) for name in ("scale", "bias")
                 if self.has_variable("params", name)]

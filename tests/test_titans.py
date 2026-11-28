@@ -146,6 +146,26 @@ def test_the_mini_batches_are_as_exact_as_the_recurrence_a_token_at_a_time(form,
     assert_as_exact(chunked, stepped, operands(form, dtype), f'{form}, {jnp.dtype(dtype).name}', seeds=SEEDS)
 
 
+@pytest.mark.parametrize("form", ["titans", "ttt"])
+def test_a_small_weight_over_a_large_root_reads_its_normal_output(form):
+    """One token whose memory reads `[-2^32, 2^32]` under an epsilon of `2^100` and a norm weight of `2^-101`
+    normalizes to `[-2^-18, 2^-18]` and reads `2^-119`, a normal float32, on either kernel: the weight is
+    taken into the inverse root only where it and the root both pass one, so `2^-101 / 2^50` never rounds to
+    zero first (79g's review)."""
+    query = jnp.asarray([[[[1.0, 0.0]]]], jnp.float32)
+    zeros = jnp.zeros_like(query)
+    weight, bias = jnp.full((1, 2), 2.0**-101, jnp.float32), jnp.zeros((1, 2), jnp.float32)
+    rate = jnp.zeros((1, 1, 1), jnp.float32)
+    memory = jnp.asarray([[[[-(2.0**32), 2.0**32], [0.0, 0.0]]]], jnp.float32)
+    if form == "titans":
+        out, _ = titans(query, zeros, zeros, weight, bias, rate, rate, rate, (memory, jnp.zeros_like(memory)),
+                        chunk=1, eps=2.0**100)
+    else:
+        out, _ = ttt_linear(query, zeros, zeros, weight, bias, rate, (memory, jnp.zeros((1, 1, 1, 2))),
+                            chunk=1, scale=1.0, eps=2.0**100)
+    assert np.asarray(out)[0, 0, 0, 1] == np.float32(2.0**-119)
+
+
 def _pair(*rows):
     """`[1, len(rows), 1, len(rows[0])]` fp32 from `rows`."""
     return jnp.asarray(rows, jnp.float32).reshape(1, len(rows), 1, len(rows[0]))
