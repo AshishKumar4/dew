@@ -439,9 +439,13 @@ def test_a_guarded_products_terms_survive_as_their_stored_factors_say(a, b, expe
     head review)."""
     from dew.nn.kernels import log_linear
 
-    found = log_linear._product('tk,pk->tp', log_linear.GUARDED, None, jnp.asarray([a], jnp.float32),
-                                jnp.asarray([b], jnp.float32))
-    np.testing.assert_array_equal(np.asarray(found), np.asarray([[expected]], np.float32))
+    def product(a, b):
+        return log_linear._product('tk,pk->tp', log_linear.GUARDED, None, a, b)
+
+    # Each one computation, as XLA compiles and fuses it, under jit and op by op.
+    for run in (product, jax.jit(product)):
+        found = run(jnp.asarray([a], jnp.float32), jnp.asarray([b], jnp.float32))
+        np.testing.assert_array_equal(np.asarray(found), np.asarray([[expected]], np.float32))
 
 
 def test_a_plain_products_tangent_along_a_zero_direction_keeps_its_finite_channel():
