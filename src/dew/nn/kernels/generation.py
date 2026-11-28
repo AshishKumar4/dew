@@ -1927,14 +1927,17 @@ def _unmapped(*axes) -> bool:
     return all(axis is None for axis in jax.tree.leaves(axes, is_leaf=lambda axis: axis is None))
 
 
-def _summed_batch(cotangent):
-    """A batch's cotangent (a tree, the batch its leaves' first axis) summed over the batch in each leaf's own
-    type (`lax.reduce_sum`), whatever x64 scope a pullback runs in; a `float0` leaf's zeros without it."""
+def _batch_summed(leaf):
+    """A cotangent leaf's batch (its first axis) summed in its own type (`lax.reduce_sum`, as JAX's own
+    transpose of a broadcast sums it), whatever x64 scope a pullback runs in: a float64 cotangent an exact
+    widening's pullback forms, summed outside x64, is never asked for as float32 first (two of 2^127 an
+    infinity; row 14083's review); a `float0` leaf's zeros."""
     import jax
     import numpy as np
 
-    return jax.tree.map(lambda leaf: np.zeros(leaf.shape[1:], jax.dtypes.float0)
-                        if leaf.dtype == jax.dtypes.float0 else jax.lax.reduce_sum(leaf, (0,)), cotangent)
+    if leaf.dtype == jax.dtypes.float0:
+        return np.zeros(leaf.shape[1:], jax.dtypes.float0)
+    return jax.lax.reduce_sum(leaf, (0,))
 
 
 @functools.cache
@@ -1942,7 +1945,6 @@ def _linear_primitive() -> type:
     """`linear_map`'s primitive, defined at its first call: this module imports no JAX of its own."""
     import jax
     import jax.numpy as jnp
-    import numpy as np
     from jax.experimental import hijax
 
     from dew.nn import programs
@@ -1973,12 +1975,6 @@ def _linear_primitive() -> type:
             return nothing(out_aval)
         return jax.jvp(lambda *moved: apply(*fill(moved)), tuple(moving),
                        tuple(itertools.compress(directions, live)))[1]
-
-    def unbatched(cotangent):
-        """An unbatched operand's cotangent: its batch's sum."""
-        if cotangent.dtype == jax.dtypes.float0:
-            return np.zeros(cotangent.shape[1:], jax.dtypes.float0)
-        return cotangent.sum(0)
 
     class Linear(hijax.HiPrim):
         apply: Callable
@@ -2045,12 +2041,12 @@ def _linear_primitive() -> type:
 
             def pulled(residuals, cotangent):
                 if self.summed_first and _unmapped(residual_axes, moving_axes):
-                    return self.pullback(residuals, _summed_batch(cotangent))
+                    return self.pullback(residuals, jax.tree.map(_batch_summed, cotangent))
                 back = jax.vmap(self.pullback, in_axes=(residual_axes, 0), **mapped)(residuals, cotangent)
                 leaves, tree = jax.tree.flatten(back)
                 axes = jax.tree.leaves(moving_axes, is_leaf=lambda axis: axis is None)
                 return jax.tree.unflatten(tree, [
-                    unbatched(leaf) if axis is None else jnp.moveaxis(leaf, 0, axis)
+                    _batch_summed(leaf) if axis is None else jnp.moveaxis(leaf, 0, axis)
                     for leaf, axis in zip(leaves, axes, strict=True)])
 
             return (linear_map(applied, pulled, *args, zero_cotangents=self.zero_cotangents,

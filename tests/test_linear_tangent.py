@@ -172,3 +172,29 @@ def test_a_linear_maps_batched_pullback_sums_after_it_pulls_back():
     lanes = jax.vmap(quartered, in_axes=None, axis_size=2)
     (pulled,) = jax.linear_transpose(lanes, jnp.float32(1.0))(jnp.full((2,), 2.0 ** 127, jnp.float32))
     assert pulled.dtype == jnp.float32 and float(pulled) == 2.0 ** 126
+
+
+def test_a_linear_maps_batched_pullback_sums_each_cotangent_in_its_own_type():
+    """A linear map of a float64 operand (`generation.linear_map`), shared by two lanes of a `jax.vmap`,
+    transposed after each lane pulls back (not `summed_first`): the batch's float64 cotangents of `2^127`
+    summed as float64 to `2^128` whether the pullback runs in x64 or outside it, never as float32 first (an
+    infinity; row 14083's review); and a bfloat16 lane's sum in bfloat16, bit for bit JAX's own transpose
+    of the batch's broadcast (`lax.reduce_sum`, Train 1474's review)."""
+    from dew.nn.kernels.generation import linear_map
+
+    def kept(x):
+        return linear_map(lambda _, moving: moving, lambda _, cotangent: cotangent, (), x)
+
+    with jax.enable_x64(new_val=True):
+        _, pull = jax.vjp(jax.vmap(kept, in_axes=None, axis_size=2), jnp.float64(1.0))
+        lanes = jnp.full((2,), 2.0 ** 127, jnp.float64)
+        (inside,) = pull(lanes)
+    (outside,) = pull(lanes)
+    for found in (inside, outside):
+        assert found.dtype == jnp.float64 and float(found) == 2.0 ** 128
+    small = jnp.asarray([1.0, 2.0 ** -8, 2.0 ** -8], jnp.bfloat16)
+    (ours,), (theirs,) = (jax.linear_transpose(jax.vmap(f, in_axes=None, axis_size=3), small[0])(small)
+                          for f in (kept, lambda x: x))
+    assert ours.dtype == jnp.bfloat16
+    assert np.asarray(ours).view(np.uint16) == np.asarray(theirs).view(np.uint16)
+
