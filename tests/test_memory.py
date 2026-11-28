@@ -114,14 +114,39 @@ def test_a_self_generated_target_carries_the_outer_gradient():
     assert np.abs(np.asarray(gradient)).max() > 0
 
 
-@pytest.mark.parametrize("name", ["titans", "self_modifying"])
+@pytest.mark.parametrize("name", ["titans", "self_modifying", "ttt_linear", "titans_linear"])
 def test_the_chunk_parallel_memory_is_the_token_by_token_one(name):
-    """A row of one document runs chunk by chunk; the same row as a packed call runs token by token,
-    the definition. The two are on par against float64 (check 1)."""
+    """A row of one document runs chunk by chunk, TTT-Linear's and Titans' linear memories on their
+    mini-batched kernels (`InContextMemory._mini_batch`); the same row as a packed call runs token by
+    token, the definition. The two are on par against float64 (check 1)."""
     module = layer(name)
     stepped = applied(module, packed(np.ones((ROWS, LENGTH), np.int32)))
     assert_as_exact(applied(module), stepped, drawn(module), f"{name} chunked", seeds=MEMORY_SEEDS,
                     truth_fn=written(module, dtype=jnp.float64))
+
+
+PADDED = ((np.arange(LENGTH)[None] >= np.asarray([0, 1, 3, 0, 5, 2, 0, 7])[:, None])
+          & (np.arange(LENGTH)[None] < np.asarray([12, 12, 12, 10, 12, 12, 8, 12])[:, None]))
+"""Each row's real tokens: rows left-padded by 1 to 7 tokens, two right-padded by 2 and 4, three whole."""
+
+
+@pytest.mark.parametrize("name", ["ttt_linear", "titans_linear"])
+def test_a_mini_batched_memory_reads_padded_rows_as_the_token_path_does(name):
+    """Rows of one document padded left and right (`PADDED`, a `valid` mask) run on the mini-batched
+    kernels, their real tokens compacted and their chunks counted from each row's first real token, and
+    read every real token as the token path does over the same rows packed (pads a segment of none), on
+    par against that path in float64 (check 1); a padding token's readout is no real token's."""
+    module = layer(name)
+    valid = jnp.asarray(PADDED)
+    by_mask = MixerCall(metadata=AttentionMetadata(coordinates=coordinates(valid=valid)))
+    by_tokens = packed(np.where(PADDED, 1, 0).astype(np.int32))
+
+    def real(run):
+        return jax.jit(lambda x, params: jnp.where(valid[..., None], run(x, params), 0))
+
+    assert_as_exact(real(applied(module, by_mask)), real(applied(module, by_tokens)), drawn(module),
+                    f"{name} padded", seeds=MEMORY_SEEDS,
+                    truth_fn=real(applied(layer(name, dtype=jnp.float64), by_tokens)))
 
 
 def test_packed_documents_read_as_each_alone():

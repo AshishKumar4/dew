@@ -65,6 +65,13 @@ readout adds P_t W_0^T q (P_t one for the delta rule). That readout is computed 
 rounded once to the layer's dtype. Its decode cache holds the recurrence's state whichever route a call
 takes, as a call's wrappers may take it off the recurrence (an adapter's dropout on a training
 forward), whose general path steps the weights that state makes (`_stepped_from_recurrence`).
+
+TTT-Linear's memory and Titans' linear one (a linear residual memory with its layer norm, `ResidualMemory`
+with and without its bias, the norm slow, on the l2 objective, each token reading its own step) run a call
+of rows of one document on their mini-batched kernels (`dew.nn.kernels.ttt`, `dew.nn.kernels.titans`,
+`_mini_batch`): the rows compacted as the chunked path compacts them, each mini-batch its chunk, the kernel
+its whole computation in at least float32. A packed row, a cached call, a call over forks and a head a
+wrapper computes otherwise take the general path.
 """
 
 from __future__ import annotations
@@ -195,27 +202,31 @@ class LinearMemory(nn.Module):
 
 class ResidualMemory(nn.Module):
     """`x + N(f_res(x))`: f_res linear (`hidden` None) or `Dense(D) . activation . Dense(hidden)`, the
-    ungated `GatedMLP` (`up`, `down`), N a layer norm or none. TTT's f (Sec 2.7: LN and residual, f_lin
-    or a 4x GELU MLP), Nested Learning's memories (Eq 89, no norm) and Miras' (Sec 5.3). `activation`
-    names one of `dew.nn.activations.UNGATED`."""
+    ungated `GatedMLP` (`up`, `down`), N a layer norm of `epsilon` or none. TTT's f (Sec 2.7: LN and
+    residual, f_lin or a 4x GELU MLP), Titans' linear memory with its layer norm (a linear f_res without
+    its `bias`, fla's `chunk_titans_linear_ref`), Nested Learning's memories (Eq 89, no norm) and Miras'
+    (Sec 5.3). `activation` names one of `dew.nn.activations.UNGATED`; `bias` is the linear f_res's."""
 
     hidden: int | None = None
     activation: Literal["gelu", "silu", "relu"] = "gelu"
     norm: bool = True
+    bias: bool = True
+    epsilon: float = 1e-6
     dtype: Dtype | None = None
     precision: PrecisionLike = None
 
     @nn.compact
     def __call__(self, x: jax.Array) -> jax.Array:
         if self.hidden is None:
-            branch = Dense(x.shape[-1], dtype=self.dtype, precision=self.precision, name="down")(x)
+            branch = Dense(x.shape[-1], use_bias=self.bias, dtype=self.dtype, precision=self.precision,
+                           name="down")(x)
         else:
             mlp = GatedMLP(self.hidden, x.shape[-1], self.activation, use_bias=True, linear=Dense,
                            names=("up", "down"), dtype=self.dtype, precision=self.precision)
             nn.share_scope(self, mlp)
             branch = mlp(x)
         if self.norm:
-            branch = LayerNorm(epsilon=1e-6, dtype=self.dtype, name="norm")(branch)
+            branch = LayerNorm(epsilon=self.epsilon, dtype=self.dtype, name="norm")(branch)
         return x + branch
 
 
@@ -342,22 +353,24 @@ class InContextMemory(LinearProducts):
             return rows_like(jnp.full((*x.shape[:2], self.heads), gate.value, at_least_fp32(self.dtype)), x)
         return gate.scale * logistic(self._logit(name, gate, x))
 
-    def _kept(self, x: jax.Array) -> tuple[jax.Array, jax.Array]:
-        """The share `a = 1 - alpha` of the network each token keeps `[B, S, H]` and its log, in at least
-        float32: one and zero without a retention."""
+    def _kept(self, x: jax.Array) -> tuple[jax.Array, jax.Array, jax.Array]:
+        """The share `a = 1 - alpha` of the network each token keeps `[B, S, H]`, its log and the share
+        `alpha` it forgets, in at least float32: one, zero and zero without a retention. `alpha` is the
+        gate's own value, not `1 - a`, which rounds a small one away (`_mini_batch`'s Titans)."""
         wide = at_least_fp32(self.dtype)
         gate = self.retention
         if gate is None:
             nothing = rows_like(jnp.zeros((*x.shape[:2], self.heads), wide), x)
-            return nothing + 1, nothing
+            return nothing + 1, nothing, nothing
         if gate.value is not None:
             alpha = rows_like(jnp.full((*x.shape[:2], self.heads), gate.value, wide), x)
-            return 1 - alpha, jnp.log1p(-alpha)
+            return 1 - alpha, jnp.log1p(-alpha), alpha
         logit = self._logit("retention", gate, x)
         # log(1 - s sigmoid(z)) = log((1 - s) + e^-z) - log(1 + e^-z): finite wherever s is at most one,
         # where the sigmoid rounds to one included.
         log_kept = jnp.logaddexp(jnp.log1p(-gate.scale), -logit) - softplus(-logit)
-        return 1 - gate.scale * logistic(logit), log_kept
+        alpha = gate.scale * logistic(logit)
+        return 1 - alpha, log_kept, alpha
 
     def _heads(self, features: int) -> tuple[_Head, ...]:
         """Each head's network as this call computes it (`_Head`).
@@ -406,7 +419,7 @@ class InContextMemory(LinearProducts):
         query, key, value, features = self._views(x)
         theta = self._gate("learning_rate", self.learning_rate, x)
         mu = (jnp.zeros_like(theta) if self.momentum is None else self._gate("momentum", self.momentum, x))
-        a, log_kept = self._kept(x)
+        a, log_kept, alpha = self._kept(x)
         wide = at_least_fp32(self.dtype)
         heads = self._heads(features)
         tokens = coordinates_of(call.metadata, batch, length)
@@ -444,6 +457,8 @@ class InContextMemory(LinearProducts):
             read = self._decoded(heads, cached)
         elif tokens.max_segments > 1:
             read = self._stepped(heads, steps)[0]
+        elif (form := self._mini_batched(heads, steps)) is not None:
+            read = self._mini_batch(form, heads, steps, alpha)
         else:
             read = self._chunked(heads, steps)
         # A call over forks leaves the cache as it was, its count too (`_recurrent`).
@@ -677,6 +692,67 @@ class InContextMemory(LinearProducts):
         after = jnp.stack([_kernel(state[index]) - _lead(last[:, index], _kernel(head.initial)[None])
                            * _kernel(head.initial)[None] for index, head in enumerate(heads)], axis=1)
         return reads, jnp.where(_lead(jnp.any(real, axis=1), held), after, held), share
+
+    # TTT-Linear's and Titans' linear memories on their mini-batched kernels.
+
+    MINI_BATCHED: ClassVar[dict[str, frozenset[tuple[str, ...]]]] = {
+        "ttt": frozenset({("down", "kernel"), ("down", "bias")}),
+        "titans": frozenset({("down", "kernel")})}
+    """Each mini-batched kernel's form (`_mini_batched`) by the moving weights a head steps: TTT-Linear's
+    memory and bias (`dew.nn.kernels.ttt`), Titans' memory alone (`dew.nn.kernels.titans`)."""
+
+    def _mini_batched(self, heads: tuple[_Head, ...], steps: _Steps) -> str | None:
+        """The mini-batched kernel this call of rows of one document runs (`_mini_batch`), or None where it
+        runs none: a linear residual memory with its layer norm (`ResidualMemory(hidden=None, norm=True)`)
+        on its given target, its layer norm slow and its linear map fast, each token reading its own step,
+        no orthogonalized step, on the l2 objective; TTT-Linear's (`ttt`) with its bias and no momentum or
+        retention, Titans' (`titans`) without its bias, any momentum and retention. Each head computes the
+        plain network: its weights its network's own (no adapter, no other collection), its linear map of
+        its input by the kernel its state moves (`linear_product`), no RNG stream drawn."""
+        network = self.network
+        if not (isinstance(network, ResidualMemory) and network.hidden is None and network.norm
+                and self.objective.kind == "l2" and self.target == "given" and self.commit == "token"
+                and not self.orthogonalize and tuple(self.slow) == ("norm",) and steps.keys is None):
+            return None
+        form = "ttt" if network.bias else "titans"
+        if form == "ttt" and (self.momentum is not None or self.retention is not None):
+            return None
+        plain = all(set(traverse_util.flatten_dict(head.initial)) == self.MINI_BATCHED[form]
+                    and set(traverse_util.flatten_dict(head.held)) == {("norm", "scale"), ("norm", "bias")}
+                    and not head.collections and self.linear_product(f"head_{index}")
+                    for index, head in enumerate(heads))
+        return form if plain else None
+
+    def _mini_batch(self, form: str, heads: tuple[_Head, ...], steps: _Steps,
+                    alpha: jax.Array) -> jax.Array:
+        """The readouts `[B, S, H, F]` of rows of one document on `form`'s kernel (`_mini_batched`): its real
+        tokens compacted to the front (`valid_order`), as the chunked path compacts them, so its
+        mini-batches are its chunks counted from its first real token, the compacted tail absent (`valid`),
+        each head's W_0 the state it enters, its layer norm's affine the inner loss's. The kernels take each
+        gradient at its mini-batch's start and step it at its own token's rate, as the general path does;
+        the l2 objective's half makes Titans' doubled write (`2 theta k u`) its rate halved, exactly. A
+        padding token's readout is the kernel's of an absent token, none the general path's own."""
+        from dew.nn.kernels import titans, ttt
+
+        order, _ = valid_order(steps.real)
+        fields = (steps.query, steps.key, steps.value, steps.theta, steps.mu, alpha, steps.real)
+        query, key, value, theta, mu, alpha, real = (gather_positions(field, order) for field in fields)
+        network = self.network
+        assert isinstance(network, ResidualMemory)
+        rows = [_rows(head.initial, steps.real)["down"] for head in heads]
+        weight, bias = (jnp.stack([head.held["norm"][name] for head in heads]) for name in ("scale", "bias"))
+        memory = jnp.stack([row["kernel"] for row in rows], axis=1)
+        eps = network.epsilon
+        if form == "ttt":
+            offset = jnp.stack([row["bias"] for row in rows], axis=1)[:, :, None]
+            read, _ = ttt.ttt_linear(query, key, value, weight, bias, theta, state=(memory, offset),
+                                     chunk=self.chunk, scale=1.0, eps=eps, valid=real)
+        else:
+            read, _ = titans.titans(query, key, value, weight, bias, theta / 2, alpha, mu,
+                                    state=(memory, jnp.zeros_like(memory)), chunk=self.chunk, eps=eps,
+                                    valid=real)
+        inverse = jnp.argsort(order, axis=1)
+        return jnp.take_along_axis(read, inverse.reshape(*inverse.shape, 1, 1), axis=1)
 
     # The function, token by token and chunk by chunk.
 
