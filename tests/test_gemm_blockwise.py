@@ -639,9 +639,9 @@ def test_an_integer_bank_quantizes_as_its_widened_values(k_major):
     """`projections.blocks_quantized` of an int8 bank, which has no float word to reduce: its codes and
     scales bitwise those of its values widened to fp32, an exact widening (theme 22's review)."""
     w = np.random.default_rng(4518).integers(-127, 128, size=(2, 256, 256)).astype(np.int8)
-    got = projections.blocks_quantized(jnp.asarray(w), k_major=k_major)
-    want = projections.blocks_quantized(jnp.asarray(w, jnp.float32), k_major=k_major)
-    for got, want in zip(got, want, strict=True):
+    integers = projections.blocks_quantized(jnp.asarray(w), k_major=k_major)
+    widened = projections.blocks_quantized(jnp.asarray(w, jnp.float32), k_major=k_major)
+    for got, want in zip(integers, widened, strict=True):
         np.testing.assert_array_equal(np.asarray(got).view(np.uint8), np.asarray(want).view(np.uint8))
 
 
