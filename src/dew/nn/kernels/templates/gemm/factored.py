@@ -19,7 +19,15 @@ from dew.nn import float_bits, precision
 from dew.nn.derivatives import KernelGlue, contracted, declared_tangent
 from dew.nn.kernels import generation
 from dew.nn.kernels.templates import axes as side_axes
-from dew.nn.sharding import explicit_placement, explicit_spec, summed_to, unbroadcast, varying_like
+from dew.nn.sharding import (
+    concrete_mesh,
+    explicit_placement,
+    explicit_spec,
+    placed_zeros,
+    summed_to,
+    unbroadcast,
+    varying_like,
+)
 
 
 def factored(run: Callable, operands: tuple, factor: jax.Array, rows: jax.Array, *, wide: Callable,
@@ -70,7 +78,7 @@ def factored(run: Callable, operands: tuple, factor: jax.Array, rows: jax.Array,
         return transpose.paired(ran, routed, (cotangent.astype(jnp.float32),), (scale,)).astype(rows.dtype)
 
     # An Explicit placement of the rows kept as a residual of no rows (`rows[:0]`, no memory): an eager
-    # pullback's allocations and transfers take its concrete devices (`_zeros`, `_placed`).
+    # pullback's allocations and transfers take its concrete devices (`sharding.placed_zeros`, `_placed`).
     anchor = None if transpose.placed is None else jax.lax.stop_gradient(rows[:0])
     routed = (gather, wide_operands, anchor)
     return generation.linear_map(apply, pullback, (factor, groups, operands, routed), rows)
@@ -285,7 +293,7 @@ class _Transpose:
         before = self.alone(ran, near)
         near = jax.lax.psum(near, before) if before else near
         # The pullback at zeros typed as the rows are: placed, and varying as the cotangent's partials do.
-        zeros = _zeros(self.shape, jnp.bfloat16, self.placed, anchor)
+        zeros = placed_zeros(self.shape, jnp.bfloat16, self.placed, anchor)
         at = varying_like(zeros, near, *jax.tree.leaves(ran))
         out, pull = jax.vjp(lambda each: self.run(each, *ran), at)
         # The cotangent typed as the product is (a split column scale's product split as it is not: train
@@ -463,7 +471,8 @@ class _Transpose:
         # The rows' gradient, typed and placed as the plain transpose's is (its devices' sums taken, as each
         # chunk's are; on its Explicit mesh where it has one, replicated too), so the loop's carry and the
         # branch it returns from keep its type.
-        out = varying_like(_zeros(self.shape, jnp.float32, explicit_placement(jax.typeof(plain))), plain)
+        zeros = placed_zeros(self.shape, jnp.float32, explicit_placement(jax.typeof(plain)))
+        out = varying_like(zeros, plain)
         return jax.lax.fori_loop(0, depth // chunk, pulled_chunk, out)
 
     def grids(self, binade, gather, shared) -> tuple[jax.Array, jax.Array]:
@@ -605,7 +614,7 @@ def _placed(value: jax.Array, sharding: jax.sharding.NamedSharding, anchor=None)
         if held == sharding:
             return value
         # A concrete value (an uncommitted one's single device too) beside a concrete anchor: run eagerly.
-        mesh = _concrete_mesh(anchor)
+        mesh = concrete_mesh(anchor)
         if not isinstance(value, Tracer) and mesh is not None:
             return jax.device_put(value, jax.sharding.NamedSharding(mesh, sharding.spec))
         with jax.sharding.use_abstract_mesh(sharding.mesh.abstract_mesh):
@@ -615,28 +624,6 @@ def _placed(value: jax.Array, sharding: jax.sharding.NamedSharding, anchor=None)
             return jax.sharding.reshard(value, jax.sharding.PartitionSpec())
     return value
 
-
-
-def _concrete_mesh(value) -> jax.sharding.Mesh | None:
-    """The named mesh of devices placing `value` where it is an array this process holds, run eagerly; None
-    for a tracer, None, or an array placed otherwise."""
-    if value is None or isinstance(value, Tracer):
-        return None
-    sharding = value.sharding
-    held = sharding.mesh if isinstance(sharding, jax.sharding.NamedSharding) else None
-    return held if isinstance(held, jax.sharding.Mesh) else None
-
-
-def _zeros(shape: tuple, dtype, sharding: jax.sharding.NamedSharding | None, anchor=None) -> jax.Array:
-    """Zeros of `shape` placed at `sharding` (a type's, or None), made under its own abstract mesh, so their
-    placement holds outside any mesh context (`_placed`); run eagerly (`anchor` a concrete array), made on
-    the devices of `anchor`'s own mesh, which an eager allocation needs (train 1426's review)."""
-    if sharding is None or not sharding.mesh.explicit_axes:
-        return jnp.zeros(shape, dtype)
-    if (mesh := _concrete_mesh(anchor)) is not None:
-        return jnp.zeros(shape, dtype, device=jax.sharding.NamedSharding(mesh, sharding.spec))
-    with jax.sharding.use_abstract_mesh(sharding.mesh.abstract_mesh):
-        return jnp.zeros(shape, dtype, out_sharding=sharding.spec)
 
 
 FACTORED_SLICE = 6
@@ -702,7 +689,7 @@ def _limbs(count: int, operands: tuple, columns: int, read: tuple) -> jax.Array:
                 None)
     spec = None if not meshes else jax.sharding.NamedSharding(
         meshes[0], jax.sharding.PartitionSpec(None, rows, None))
-    return _zeros((count, operands[0].shape[0], columns), jnp.int32, spec)
+    return placed_zeros((count, operands[0].shape[0], columns), jnp.int32, spec)
 
 
 def _routed(tokens: jax.Array, gather: jax.Array, limbs: jax.Array,
