@@ -13,6 +13,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from flax import linen as nn
+from jax.core import ShapedArray
 from jax.custom_derivatives import SymbolicZero
 from jax.experimental import checkify
 from jax.sharding import Mesh, PartitionSpec
@@ -135,6 +136,45 @@ def test_a_declared_derivative_is_one_marked_call_and_differentiates_as_its_rule
     np.testing.assert_array_equal(np.asarray(jax.vmap(declared)(x[:, None], factor[:, None])),
                                   np.asarray(jax.vmap(bare)(x[:, None], factor[:, None])))
 
+
+def test_a_scanned_declared_derivative_saves_its_operand_as_the_scan_holds_it():
+    """A declared derivative whose forward saves an operand its backward reads (`x @ w` saving `w`), scanned
+    over four layers' `[8, 8]` weights and differentiated: the forward scan stacks no copy of the weights, the
+    saved weight the scanned one itself, as the scan forwards its own inputs, where the span's output of its
+    own operand was a value of the step and every layer's weight was stacked again (row 14222); and the
+    gradient is the layers' unrolled, each layer's backward reading its own weight, exact either way (halves
+    and small integers, every product and sum of them a float32's)."""
+    def value(w, x):
+        return x @ w
+
+    def forward(w, x):
+        return x @ w, (w, x)
+
+    def backward(saved, cotangent):
+        w, x = saved
+        return x.T @ cotangent, cotangent @ w.T
+
+    product = derivatives.declared_derivative(KernelGlue(), value, forward, backward)
+    # Each layer's weights its own, in {-1, -1/2, 0, 1/2, 1}; the rows in {-1, 0, 1}; a linear loss.
+    weights = (jnp.arange(4 * 8 * 8, dtype=jnp.float32).reshape(4, 8, 8) % 5 - 2) / 2
+    x = jnp.arange(2 * 8, dtype=jnp.float32).reshape(2, 8) % 3 - 1
+    along = jnp.arange(2 * 8, dtype=jnp.float32).reshape(2, 8) % 4 - 1.5
+
+    def scanned(weights, x):
+        return jnp.sum(along * jax.lax.scan(lambda x, w: (product(w, x), None), x, weights)[0])
+
+    def unrolled(weights, x):
+        for w in weights:
+            x = product(w, x)
+        return jnp.sum(along * x)
+
+    gradient = jax.make_jaxpr(jax.grad(scanned))(weights, x)
+    loop = next(equation for equation in gradient.jaxpr.eqns if equation.primitive.name == "scan")
+    # Its carry is `x`'s `[2, 8]`: an output of the weights' shape is a stack of a step's values.
+    stacked = [var.aval.shape for var in loop.outvars if isinstance(var.aval, ShapedArray)]
+    assert weights.shape not in stacked, stacked
+    np.testing.assert_array_equal(np.asarray(jax.grad(scanned)(weights, x)),
+                                  np.asarray(jax.grad(unrolled)(weights, x)))
 
 @pytest.mark.parametrize("kind", [kind() for kind in typing.get_args(derivatives.TangentKind.__value__)],
                          ids=lambda kind: type(kind).__name__)
