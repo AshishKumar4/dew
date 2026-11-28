@@ -1958,9 +1958,9 @@ def test_a_packed_steps_price_counts_its_decodes_integer_pipes():
     """A step whose NVFP4 operand its consumers decode (`pricing.step_seconds`, the form's work in its
     `Decoded`, row 14106): on an H100's narrowest legal packed tile (two consumers decoding a 256-deep stage
     of 128 rows for 8 tokens, each weight's half byte and its block's scale stored) the decode ties the
-    shared bytes, so its price stands; and two operands' decodes on one pipe add, not overlap, each pipe's
-    work summed before the busiest is read (its review: a 64x64x256 step's two decodes 512 clocks, not
-    256)."""
+    shared bytes, so its price stands, and a decode of four times its work outlasts them, the step priced
+    at it; and two operands' decodes on one pipe add, not overlap, each pipe's work summed before the
+    busiest is read (its review: a 64x64x256 step's two decodes 384 clocks, not 192)."""
     from dew.nn.kernels.templates import cost
     from dew.nn.kernels.templates.gemm import packed, pricing
 
@@ -1972,6 +1972,7 @@ def test_a_packed_steps_price_counts_its_decodes_integer_pipes():
         return pricing.step_seconds(narrow, h100, (stored, 2), (form, None), issued=jnp.bfloat16)
 
     assert priced(pricing.Decoded(0, 1, work)) == priced(pricing.Decoded(0, 1))
+    assert priced(pricing.Decoded(0, 1, cost.repeated(work, 4))) > priced(pricing.Decoded(0, 1))
     rates, square = cost.rates(h100, device=False), tiling.Tiles(64, 64, 256, 2, 1, family="wgmma")
     one = pricing.Decoded(2, 1, work)
     alone = [pricing.decode_seconds(square, forms, rates) for forms in ((one, None), (None, one))]
