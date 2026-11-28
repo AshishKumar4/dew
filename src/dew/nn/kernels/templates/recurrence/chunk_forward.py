@@ -241,14 +241,13 @@ def kept_forward(q, k, v, g, beta, h0=None, *, tiles: Tiles, starts=None, firsts
     fused = skip if call.gated_keys else None
     epilogue, sides = None, ()
     if normed is not None:
-        # The norm a row hook over the head's real values (`recurrence.norm_row_hook`), its sides laid over
-        # the output's `[R, HV * Dv]`: the gate as the output is, the weight each head's alike, each padded
-        # to the launch's value width.
+        # The norm a row hook over the head's real values (`recurrence.norm_row_hook`): its gate laid as the
+        # output's rows and heads are, its weight every head's, each padded to the launch's value width.
         columns = call.value_width
         hook = recurrence.norm_row_hook(normed, run.value_width, out_dtype,
-                                        run.laid(zero_padded(gate, 3, columns)).reshape(call.rows, -1),
-                                        jnp.tile(zero_padded(weight, 0, columns).astype(jnp.float32),
-                                                 call.heads))
+                                        run.laid(zero_padded(gate, 3, columns)).reshape(call.rows, call.heads,
+                                                                                         columns),
+                                        zero_padded(weight, 0, columns).astype(jnp.float32))
         epilogue = Normed.of(hook, jnp.dtype(normed.read_in or jnp.float32).name, kept=keeps)
         sides = tuple(side.value for side in hook.sides)
     o = output_launch(run.q, run.k, run.h, run.corrected, run.prefix, run.taken, run.beta, call, tiles,

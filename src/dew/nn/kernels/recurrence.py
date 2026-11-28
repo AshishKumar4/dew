@@ -47,9 +47,8 @@ from dew.nn.precision import (
 )
 
 from ..sharding import explicit_spec, grouped_heads, manual_map
-from . import chunked_launch, short_conv
-from .generation import INHERENT, Choice, linear_tangent, published, routed
-from .selection import KernelRefused, Refusal, forced
+from . import chunked_launch, norm_swiglu, short_conv
+from .generation import linear_tangent
 
 
 @dataclasses.dataclass(frozen=True)
@@ -119,19 +118,23 @@ def gated_rows(norm: OutputNorm, rows, gate, *, activate):
     return rows * activate(gate) if norm.gate_first else rows
 
 
-def gated_norm_rows(norm: OutputNorm, rows, inverse, gate, weight, dtype, *, activate):
-    """`norm`'s arithmetic past its statistics, in `dtype`: the gated rows (`gated_rows`) times their
-    `inverse` RMS and the `weight` (`precision.rms_weighted`, in the rows' dtype, or where `rounded` the
-    normalized rows rounded to `dtype` first and the weight taken in it), then where the gate comes after,
-    times `activate(gate)` in the rows' dtype, rounded once to `dtype`. The one form the layers' gated norms,
-    the recurrence's norm after its launches and its output launch's epilogue take (`norm_row_hook`)."""
-    wide = rows.dtype
+def weighted_rows(norm: OutputNorm, rows, inverse, weight, dtype):
+    """`norm`'s gated rows (`gated_rows`) times their `inverse` RMS and the `weight`
+    (`precision.rms_weighted`), in the rows' dtype, or where `rounded` the normalized rows rounded to `dtype`
+    first and the weight taken in it."""
     if norm.rounded:
-        normed = rms_weighted(rows, inverse, weight=weight.astype(dtype), rounded=lambda x: x.astype(dtype))
-    else:
-        normed = rms_weighted(rows, inverse, weight=weight.astype(wide))
+        return rms_weighted(rows, inverse, weight=weight.astype(dtype), rounded=lambda x: x.astype(dtype))
+    return rms_weighted(rows, inverse, weight=weight.astype(rows.dtype))
+
+
+def gated_norm_rows(norm: OutputNorm, rows, inverse, gate, weight, dtype, *, activate):
+    """`norm`'s arithmetic past its statistics, in `dtype`: its weighted rows (`weighted_rows`), then where
+    the gate comes after, times `activate(gate)` in the rows' dtype, rounded once to `dtype`. The one form
+    the recurrence's norm after its launches, its output launch's epilogue (`norm_row_hook`) and its decode
+    step's take; `MambaRMSNormGated` takes its `weighted_rows` over its groups, its gate broadcast after."""
+    normed = weighted_rows(norm, rows, inverse, weight, dtype)
     if not norm.gate_first:
-        normed = normed.astype(wide) * activate(gate)
+        normed = normed.astype(rows.dtype) * activate(gate)
     return normed.astype(dtype)
 
 
@@ -168,9 +171,9 @@ class _NormApplied(_NormStatistic):
 
 def norm_row_hook(norm: OutputNorm, width: int, dtype, gate, weight) -> RowHook:
     """`norm` as a launch's row epilogue (`templates.hooks.RowHook`): its statistic and its application to the
-    head's `width` values in `dtype`, its gate `[rows, columns]` and weight `[columns]` its sides, the
-    statistic reading the gate where it comes first alone."""
-    sides = (Side(gate, RowHook.TILE), Side(weight, ('columns',)))
+    head's `width` values in `dtype`, its gate `[rows, heads, columns]` and weight `[columns]` (every head's)
+    its sides, the statistic reading the gate where it comes first alone."""
+    sides = (Side(gate, ('rows', 'heads', 'columns')), Side(weight, ('columns',)))
     return RowHook(_NormStatistic(norm), _NormApplied(norm, width, jnp.dtype(dtype).name), sides,
                    reads=(0,) if norm.gate_first else ())
 
@@ -734,15 +737,12 @@ def output_normed(norm: OutputNorm, out, z, weight, dtype, work, *, axes=None):
         out = out if at_least_fp32(out.dtype) == jnp.dtype(work) else out.astype(work)
     if not (norm.gate_first or norm.rounded):
         return gated_rms_normalized(out, z, weight, norm.epsilon, dtype, norm.activation, axes=axes)
-    # The other forms XLA's alone (the fused gated norm gates after the norm and weighs wide): a call naming
-    # another kernel for the norm is refused, and the route reported (train 1473's head review).
-    refusal = Refusal('form', "the fused gated norm gates after the norm and weighs wide, not "
-                      f"{'the gate first' if norm.gate_first else 'the normalized rows rounded first'}",
-                      row=INHERENT)
-    named = forced(Choice.RMS_NORM)
-    if named not in (None, 'xla'):
-        raise KernelRefused(Choice.RMS_NORM, named, refusal, iter(()))
-    published(routed(Choice.RMS_NORM, kernel='xla', refusal=refusal, forced=named))
+    # The other forms XLA's alone: the norm's selector refuses its kernel their form (`norm_swiglu.NORM`'s
+    # 'form'), a call naming it refused, the route reported (train 1473's head review).
+    form = f"gate {'first' if norm.gate_first else 'after'}{', rounded' if norm.rounded else ''}"
+    chosen = norm_swiglu.gated_rms_kernel('auto', out, z, weight, dtype, norm.activation, axes=axes,
+                                          form=form)
+    assert chosen == 'xla', f"the norm's kernel takes no {form!r} form"
     wide = at_least_fp32(out.dtype)
     activate = GATE_ACTIVATIONS[norm.activation]
     rows = gated_rows(norm, out.astype(wide), z.astype(wide), activate=activate)
@@ -804,7 +804,10 @@ def step_reference(hooks: Hooks, operands: Step, *, dtype=None):
                               erase=_erasing(hooks, given, work), additive=hooks.erase == 'additive',
                               across=accurate_exp(given['value_decay'].astype(work)) if hooks.value_decay
                               else None, reader=_reader(hooks, given, work))
-    out = normed(hooks, skipped(hooks, out, value, given, work), given, work)
+    # A form rounding its normalized rows rounds them to the token's output dtype, as the launch does.
+    rounding = hooks.output is not None and hooks.output.rounded
+    out = normed(hooks, skipped(hooks, out, value, given, work), given, work,
+                 dtype=(operand if dtype is None else dtype) if rounding else None)
     # A pair's keys and values salt both its states alike (`round_to_bf16`).
     paired = hooks.coupled is not None
     held = _held(updated, key[:, :, None] if paired else key, value[:, :, None] if paired else value,

@@ -13,7 +13,6 @@ from jax.experimental.pallas import mosaic_gpu as plgpu
 
 from dew.nn.kernels import recurrence_algebra as algebra
 from dew.nn.kernels.templates import mosaic, operands, product, resources, swizzling
-from dew.nn.kernels.templates.hooks import RowHook
 from dew.nn.kernels.templates.operands import Issuer, Parts
 from dew.nn.kernels.templates.recurrence.mainloop import (
     Call,
@@ -40,8 +39,8 @@ class Normed:
     """The output launch's epilogue: each token's value row of a head read back in `read` (its norm's
     `read_in`, else fp32) through a row hook (`templates.hooks.RowHook`, `recurrence.norm_row_hook`): its
     `statistic` of each value block (and the `reads` of its sides) summed across the blocks, and its `fn`
-    applying each block past the walk with every side, each side loaded at the block as its `axes` lay it
-    over the launch's `[R, HV * Dv]` rows (`_side`); with `kept`, the read-back output stored beside it, the
+    applying each block past the walk with every side, each side loaded at the block along its `axes`
+    (`_sides`); with `kept`, the read-back output stored beside it, the
     norm's backward's residual (a training forward's). The hook's static part: its side operands are the
     launch's inputs (`output_launch`'s `sides`)."""
 
@@ -227,8 +226,8 @@ def _output_held(call: Call, bv: int, swizzle: int | None = None, *, normed: boo
                         *_normed_phases(chunk, bv, normed)))
 
 
-def _normed_step(normed: Normed, family, out, index, carry, *, steps: int, bv: int, columns, refs: tuple,
-                 rows, landing) -> tuple:
+def _normed_step(normed: Normed, family, out, index, carry, *, steps: int, bv: int, columns, place: tuple,
+                 refs: tuple, rows, landing) -> tuple:
     """The epilogue's step (`Normed`): the value block's output `out` read back and its hook's statistic of
     it (and its block of the sides) summed into each row's sums (`carry`'s first), the block held for the
     walk's read (`_normed_read`): carried itself where the row is one block, else in the rows' own shared
@@ -238,7 +237,7 @@ def _normed_step(normed: Normed, family, out, index, carry, *, steps: int, bv: i
     kept_ref = refs[1]
     read = out.astype(normed.read)
     wide = read.astype(jnp.float32)
-    sides = _sides(normed, family, refs, columns, index, normed.reads)
+    sides = _sides(normed, family, refs, place, index, bv, normed.reads)
     sums = carry[0] + normed.statistic(wide, *sides)
     if kept_ref is not None:
         family.stored([read], [kept_ref.at[columns(index)]], smem=landing["kept"])
@@ -251,8 +250,8 @@ def _normed_step(normed: Normed, family, out, index, carry, *, steps: int, bv: i
     return (sums,)
 
 
-def _normed_read(normed: Normed, family, carry, *, steps: int, bv: int, columns, refs: tuple, rows,
-                 landing) -> None:
+def _normed_read(normed: Normed, family, carry, *, steps: int, bv: int, columns, place: tuple, refs: tuple,
+                 rows, landing) -> None:
     """The epilogue's read past the walk (`mosaic.Walk.read`): each block of each row through its hook's
     `fn` with the rows' totals (`carry`'s first) and its block of the sides, stored to the output (`refs`'
     first): the one block carried, or each read back from the rows' shared tile, each thread the entries it
@@ -261,23 +260,31 @@ def _normed_read(normed: Normed, family, carry, *, steps: int, bv: int, columns,
     every = tuple(range(len(normed.axes)))
     for block in range(steps):
         row = carry[1] if steps == 1 else family.tile_of(rows.at[block])
-        sides = _sides(normed, family, refs, columns, block, every)
+        sides = _sides(normed, family, refs, place, block, bv, every)
         normalized = normed.fn(row.astype(jnp.float32), carry[0], *sides)
         family.stored([normalized.astype(out_ref.dtype)], [out_ref.at[columns(block)]], smem=landing["out"])
 
 
-def _sides(normed: Normed, family, refs: tuple, columns, block, taken: tuple[int, ...]) -> tuple:
-    """The epilogue's sides `taken` at value block `block` (`_output_refs`' sides), fp32, each loaded as its
-    axes lay it over the launch's `[R, HV * Dv]` rows: a block's tile on the rows and columns
-    (`RowHook.TILE`), or its columns' vector on the columns alone (a weight laid each head's alike)."""
-    loads = {RowHook.TILE: lambda ref: plgpu.load(ref.at[columns(block)], layout=family.layout,
-                                                  optimized=False),
-             ('columns',): lambda ref: family.columns_of(ref.at[columns(block)[1]])}
-    return tuple(loads[normed.axes[side]](refs[2 + side]).astype(jnp.float32) for side in taken)
+def _sides(normed: Normed, family, refs: tuple, place: tuple, block, bv: int,
+           taken: tuple[int, ...]) -> tuple:
+    """The epilogue's sides `taken` at value block `block` (`_output_refs`' sides), fp32, each indexed along
+    its axes by the program's `place` (`(rows, head)`: the chunk's rows and its value head) and the block's
+    head-local columns, so a side names a head only where it holds one (a gate `[R, HV, Dv]`, a weight
+    `[Dv]` every head shares): a tile where it has rows, else its columns' vector."""
+    rows, head = place
+    at = {'rows': rows, 'heads': head, 'columns': pl.ds(block * bv, bv)}
+
+    def loaded(axes, ref):
+        view = ref.at[tuple(at[axis] for axis in axes)]
+        if 'rows' in axes:
+            return plgpu.load(view, layout=family.layout, optimized=False)
+        return family.columns_of(view)
+
+    return tuple(loaded(normed.axes[side], refs[2 + side]).astype(jnp.float32) for side in taken)
 
 
 def _output_walk(normed: Normed | None, family, views: dict, produced, *, prologue, chunk: int, steps: int,
-                 bv: int, refs: tuple, rows, columns, landing) -> mosaic.Walk:
+                 bv: int, refs: tuple, rows, columns, place: tuple, landing) -> mosaic.Walk:
     """`output_launch`'s walk of its `steps` value blocks, each step's output `produced(index, slots,
     loaded)` stored at its block's columns (`columns`, `refs`' first, `_output_refs`); under an epilogue
     (`normed`) its rows' sums of squares carried across the steps, zero as the chunk starts, with a row of
@@ -291,7 +298,8 @@ def _output_walk(normed: Normed | None, family, views: dict, produced, *, prolog
 
         return mosaic.Walk(views, step, steps=steps, prologue=prologue)
     norm = normed
-    epilogue = {"steps": steps, "bv": bv, "refs": refs, "rows": rows, "columns": columns, "landing": landing}
+    epilogue = {"steps": steps, "bv": bv, "refs": refs, "rows": rows, "columns": columns, "place": place,
+                "landing": landing}
 
     def normed_step(index, slots, carry, accumulators, loaded=None):
         out = produced(index, slots, loaded)
@@ -428,7 +436,8 @@ def output_launch(q, k, h, corrected, prefix: tuple, taken, beta, call: Call, ti
 
         return _output_walk(normed, family, views, produced, prologue=None if call.per_key else prologue,
                             chunk=chunk, steps=steps, bv=bv, refs=outputs, rows=rows[0] if rows else None,
-                            columns=functools.partial(_columns, span, h * value_width, bv), landing=landing)
+                            columns=functools.partial(_columns, span, h * value_width, bv), place=(span, h),
+                            landing=landing)
 
     blocks, staging = _output_streams(call, bv)
     out_type = jax.ShapeDtypeStruct((call.rows, call.heads * value_width), out_dtype)

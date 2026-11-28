@@ -65,9 +65,11 @@ class RowHook:
     `statistic(block_tile, *read_tiles) -> [rows]`, fp32 partials the launch sums across its walk's steps
     (summation the only combiner: another combiner is another seam), and its `fn(block_tile, total,
     *side_tiles) -> out_tile`, applied to each block past the walk with every block's total. Both static, as
-    `Hook.fn`, its `sides` (`Side`s on the tile's 'rows' and 'columns') loaded at each block. The launch owns
-    the carry, the staging and the read past the walk; a row hook holds no launch's facts. A launch keys its
-    build by the two functions (each a frozen dataclass of its form, so two forms key apart)."""
+    `Hook.fn`, its `sides` (`Side`s on `SIDE_AXES`, a side's tile its block on the tile's rows and columns)
+    loaded at each block, the launch resolving each axis a side names (its head's where it names 'heads', the
+    block's columns its head's own) and none it does not. The launch owns the carry, the staging and the read
+    past the walk; a row hook holds no launch's facts. A launch keys its build by the two functions (each a
+    frozen dataclass of its form, so two forms key apart)."""
 
     statistic: Callable = dataclasses.field(metadata={"static": True})
     fn: Callable = dataclasses.field(metadata={"static": True})
@@ -78,6 +80,15 @@ class RowHook:
 
     TILE = ('rows', 'columns')
     """The axes of a row hook's tile: a block's rows and columns."""
+
+    SIDE_AXES = ('rows', 'heads', 'columns')
+    """The axes a side lays its operand on: the tile's rows, the launch's heads and a head's columns."""
+
+    def __post_init__(self):
+        for side in self.sides:
+            if not set(side.axes) <= set(self.SIDE_AXES) or 'columns' not in side.axes:
+                raise ValueError(f"a row hook's side lies on its columns and some of {self.SIDE_AXES}, not "
+                                 f"{side.axes}")
 
 
 def laid(tile: Sequence[str], axes: Sequence[str | None], extents: Mapping[str, int]) -> tuple[int, ...]:

@@ -14,7 +14,7 @@ from generation_support import COMPILES_ON_CPU, lowers
 from reference_error import assert_as_exact
 from test_recurrence_chunk import CHUNK, KEY_WIDTH, PACKED, chunk_on, draw, hosted, token_by_token
 
-from dew.nn.kernels import generation, recurrence
+from dew.nn.kernels import generation, norm_swiglu, recurrence
 from dew.nn.kernels.recurrence_chunk import Chunk, chunk
 from dew.nn.kernels.templates.recurrence import mainloop, template
 from dew.nn.linear import GatedDeltaNet
@@ -408,7 +408,41 @@ def test_a_norm_form_the_fused_kernel_lacks_is_xlas_alone():
 
     with generation.routes() as found:
         jax.eval_shape(normed)
-    assert [(route.kernel, route.refusal.code) for route in found
-            if route.choice == generation.Choice.RMS_NORM] == [('xla', 'form')], found
-    with kernels.use(rms_norm='pallas'), pytest.raises(KernelRefused, match='gates after the norm'):
+    assert [route.kernel for route in found if route.choice == generation.Choice.RMS_NORM] == ['xla'], found
+    with kernels.use(rms_norm='pallas'), pytest.raises(KernelRefused) as refused:
         jax.eval_shape(normed)
+    assert refused.value.first.code == 'form'
+
+
+@pytest.mark.parametrize('form', norm_swiglu.GATED_FORMS)
+def test_the_norm_selector_takes_its_kernel_for_its_own_gated_form_alone(form):
+    """The norm selector's fused kernel (`norm_swiglu.NORM`) over a bf16 gated norm on an H100's facts: no
+    'form' refusal of the gate-after form, Qwen3-Next's, and that refusal of every other
+    (`norm_swiglu.GATED_FORMS`), which XLA computes; a form not among them raises."""
+    rows = jax.ShapeDtypeStruct((4, 128), jnp.bfloat16)
+    case = norm_swiglu.norm_case(rows, jax.ShapeDtypeStruct((128,), jnp.float32), jnp.bfloat16, None,
+                                 gate=rows, activation='silu', form=form)
+    with generation.assumed('sm90'):
+        codes = [refusal.code for refusal in norm_swiglu.NORM.kernels[0].refusals(case)]
+    assert ('form' in codes) == (form != 'gate after'), codes
+    with pytest.raises(ValueError, match='form'):
+        dataclasses.replace(case, form='gate between')
+
+
+def test_a_rounding_norm_forms_decode_token_is_its_reference_bit_for_bit():
+    """A bf16 decode token through the step launch (interpreted off a GPU) with Mamba-2's gate-first rounding
+    norm (`OutputNorm(gate_first=True, rounded=True)`, `eps` 0.39) over a head of 128 values reading ones,
+    its sigmoid gate's logits zero and its weight `1 + 7/2048`: bit for bit `recurrence.step_reference`,
+    both rounding the normalized rows to the token's bf16 output before the weight, where the reference
+    rounded them in its fp32 work (a head review)."""
+    hooks = recurrence.Hooks(decay='scalar', output=recurrence.OutputNorm(0.39, 'sigmoid', gate_first=True,
+                                                                          rounded=True))
+    unit = jnp.zeros((1, 1, 128), jnp.bfloat16).at[..., 0].set(1.0)
+    given = recurrence.Step(state=jnp.zeros((1, 1, 128, 128), jnp.float32), query=unit, key=unit,
+                            value=jnp.ones((1, 1, 128), jnp.bfloat16), log_decay=jnp.zeros((1, 1)),
+                            beta=jnp.ones((1, 1)), z=jnp.zeros((1, 1, 128)),
+                            weight=jnp.full((128,), 1 + 7 / 2048, jnp.float32))
+    found = jax.jit(functools.partial(recurrence.step, hooks))(given)[0]
+    expected = recurrence.step_reference(hooks, given)[0]
+    assert found.dtype == expected.dtype == jnp.bfloat16
+    np.testing.assert_array_equal(np.asarray(found, np.float32), np.asarray(expected, np.float32))
