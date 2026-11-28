@@ -860,8 +860,7 @@ def test_a_softmaxs_tangent_of_a_replicated_direction_beside_split_probabilities
     def sharded(probability, weights, direction):
         placed = (jax.device_put(probability, rows), jax.device_put(weights, rows),
                   jax.device_put(direction, held))
-        with jax.set_mesh(mesh):
-            return jax.grad(split, argnums=2)(*placed)
+        return jax.grad(split, argnums=2)(*placed)
 
     def halves(probability, weights, direction):
         def both(direction):
