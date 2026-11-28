@@ -241,9 +241,11 @@ def staged(smem, value: jax.Array, ref, place: tuple, *, write: Callable = writt
             raise ValueError("a scattered output's rows land a row at a time as computed, none packed")
     elif transposed:
         _whole_shares(smem.shape[-1], width, ref.shape[-1], first, stored)
-    elif divisor > 1 and not narrowed:
+    elif not narrowed:
+        # Every chunk's rows start a tensor copy at an aligned shared address, packed or not (row 14182: an
+        # ordinary 32-column bf16 chunk of a grouped tile started its copy 64 bytes into a row).
         _aligned_ladder(width * jax.dtypes.itemsize_bits(smem.dtype) // 8, first, ladder)
-        if (ladder[1] if len(ladder) > 1 else 1) == 1 and ref.shape[-1] % width:
+        if divisor > 1 and (ladder[1] if len(ladder) > 1 else 1) == 1 and ref.shape[-1] % width:
             # A rung of one row is one contiguous run, which Mosaic GPU copies by a linear bulk copy clamped
             # at the whole tensor's end, not its row's (`launch_context.async_copy`): a last chunk past the
             # row's end would write into the next row.
@@ -289,15 +291,16 @@ def _static(value, expected: int) -> bool:
 
 
 def _aligned_ladder(row_bytes: int, first, ladder: list) -> None:
-    """Refuse a packed chunk's row ladder (`store_rows`: copies of a power of two of rows from `first`, the
-    smallest `least`, `ladder`'s second) whose copies may start a shared row at no `copies.SHARED_ALIGNMENT`
-    bytes: a row of `row_bytes` that is no whole number of them starts aligned only at a static first row 0
-    and rungs of whole aligned rows (a dense call's 8-row least of a 16-byte NVFP4 scale row)."""
+    """Refuse a chunk's row ladder (`store_rows`: copies of a power of two of rows from `first`, the smallest
+    `least`, `ladder`'s second) whose copies may start a shared row at no `copies.SHARED_ALIGNMENT` bytes, a
+    bulk tensor copy's shared address (the CUDA Programming Guide's asynchronous copies: "should be 128 byte
+    aligned"): a row of `row_bytes` that is no whole number of them starts aligned only at a static first row
+    0 and rungs of whole aligned rows (a dense call's 8-row least of a 16-byte NVFP4 scale row)."""
     least = ladder[1] if len(ladder) > 1 else 1
     aligned = least * row_bytes % copies.SHARED_ALIGNMENT == 0
     if row_bytes % copies.SHARED_ALIGNMENT and not (_static(first, 0) and aligned):
-        raise ValueError(f"a packed chunk's {row_bytes}-byte rows copied from row {first} in rungs of "
-                         f"{least} start a tensor copy at no {copies.SHARED_ALIGNMENT}-byte shared address")
+        raise ValueError(f"a chunk's {row_bytes}-byte rows copied from row {first} in rungs of {least} start "
+                         f"a tensor copy at no {copies.SHARED_ALIGNMENT}-byte shared address")
 
 
 def transposed_rows(smem, value: jax.Array, o_gmem, row_start, column, *, write: Callable = written) -> None:
