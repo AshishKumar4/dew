@@ -190,9 +190,9 @@ def _float64_quotient(numerator: jax.Array, denominator: jax.Array) -> jax.Array
     GPU's is at a fraction of its fp32 rate and a TPU's is not, so every other backend divides by
     `software_divide`."""
     numerator, denominator = jnp.broadcast_arrays(numerator, denominator)
+    wide = jnp.dtype(jnp.float64)
     with jax.enable_x64(new_val=True):
-        quotient = _widened_bits(numerator, jnp.float64) / jax.lax.optimization_barrier(
-            _widened_bits(denominator, jnp.float64))
+        quotient = _widened_bits(numerator, wide) / jax.lax.optimization_barrier(_widened_bits(denominator, wide))
         magnitude = jnp.abs(quotient)
         below = magnitude < np.float64(2.0 ** -126)
         # Normal quotients held at zero here, so no conversion of one past the grid's range is read.
