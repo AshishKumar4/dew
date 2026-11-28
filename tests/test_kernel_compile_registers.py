@@ -10,7 +10,7 @@ from fla_gdn_support import KernelCase
 from generation_support import lowers
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
-from dew.nn.kernels.templates import assembled
+from dew.nn.kernels.templates import assembled, swizzling
 
 SERIALIZING = ("ptxas info    : (C7512) Potential Performance Loss: wgmma.mma_async instructions are "
                "serialized due to insufficient register resources for the function "
@@ -109,7 +109,6 @@ def _register_bound_product(depth: int):
     leaves its MMA pipeline short of registers: ptxas serializes it (FS-6456-SCAN5: C7511 spill-free at
     depth 128, C7512 at 64)."""
     from jax._src.pallas.mosaic_gpu import pallas_call as mosaic_pallas_call
-    from jax.experimental import pallas as pl
 
     swizzled = (plgpu.TilingTransform((8, 64)), plgpu.SwizzleTransform(128))
 
@@ -118,7 +117,7 @@ def _register_bound_product(depth: int):
             plgpu.wgmma(acc_ref, a_ref[...], b_ref)
             return acc_ref[...]
 
-        o_ref[...] = pl.run_scoped(scope, plgpu.ACC((64, 128), jnp.float32))
+        o_ref[...] = swizzling.run_scoped(scope, plgpu.ACC((64, 128), jnp.float32))
 
     return mosaic_pallas_call.pallas_call(
         kernel,

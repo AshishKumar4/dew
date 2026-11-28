@@ -555,7 +555,7 @@ def _issued_sums(a, b, c, d, exponent, *, retired: bool):
                              ("plain", c_gmem[...], operands.Parts((d_smem,), jnp.bfloat16))])
             out_gmem[...] = issuer.summed(products, retired=retired)
 
-        pl.run_scoped(scoped, *(plgpu.SMEM(*tile) for _ in range(3)), collective_axes="wg")
+        swizzling.run_scoped(scoped, *(plgpu.SMEM(*tile) for _ in range(3)), collective_axes="wg")
 
     out = jax.ShapeDtypeStruct((ISSUED, ISSUED), jnp.float32)
     return family.kernel(body, out_type=out, grid=(1,), grid_names=("programs",), consumers=1,
@@ -593,8 +593,8 @@ def _carried_sums(a, b, c, d):
                         ("plain", c_gmem[...], operands.Parts((d_smem,), jnp.bfloat16)))
             out_gmem[...] = issuer.summed(products, retired=True, into=family.zeros((ISSUED, ISSUED)))
 
-        pl.run_scoped(scoped, *(plgpu.SMEM((ISSUED, ISSUED), jnp.bfloat16) for _ in range(3)),
-                      collective_axes="wg")
+        swizzling.run_scoped(scoped, *(plgpu.SMEM((ISSUED, ISSUED), jnp.bfloat16) for _ in range(3)),
+                             collective_axes="wg")
 
     out = jax.ShapeDtypeStruct((ISSUED, ISSUED), jnp.float32)
     return family.kernel(body, out_type=out, grid=(1,), grid_names=("programs",), consumers=1,
@@ -733,7 +733,7 @@ def _vector_scaled(scale, x, axis: str, *, interpret: bool):
             acc = plgpu.load(x_gmem, layout=family.layout, optimized=False)
             out_gmem[...] = acc * (vector[:, None] if axis == "rows" else vector[None, :])
 
-        pl.run_scoped(scoped, plgpu.SMEM(scale.shape, scale.dtype), plgpu.Barrier(num_barriers=1))
+        swizzling.run_scoped(scoped, plgpu.SMEM(scale.shape, scale.dtype), plgpu.Barrier(num_barriers=1))
 
     out = jax.ShapeDtypeStruct(x.shape, jnp.float32)
     return family.kernel(body, out_type=out, grid=(1,), grid_names=("programs",), consumers=1,
@@ -1035,12 +1035,12 @@ def _relayed_products(q, k, v, *, interpret, weighed=lambda scores, side: scores
                 for each in (q, k, v)]
         signals = [family.signals().scratch(), family.signals(by_products=False).scratch(),
                    family.signals().scratch()]
-        pl.run_scoped(scoped, *smem, plgpu.SMEM((rows, columns), jnp.float32),
-                      plgpu.Barrier(num_barriers=3 + len(sides)),
-                      family.tensor_memory((rows, k.shape[1])),
-                      family.tensor_memory((rows, k.shape[1]), jnp.bfloat16),
-                      family.tensor_memory((rows, columns)), *signals,
-                      *(plgpu.SMEM(each.shape, each.dtype) for each in sides), collective_axes="wg")
+        swizzling.run_scoped(scoped, *smem, plgpu.SMEM((rows, columns), jnp.float32),
+                             plgpu.Barrier(num_barriers=3 + len(sides)),
+                             family.tensor_memory((rows, k.shape[1])),
+                             family.tensor_memory((rows, k.shape[1]), jnp.bfloat16),
+                             family.tensor_memory((rows, columns)), *signals,
+                             *(plgpu.SMEM(each.shape, each.dtype) for each in sides), collective_axes="wg")
 
     out = jax.ShapeDtypeStruct((rows, columns), jnp.float32)
     return family.kernel(body, out_type=out, grid=(1,), grid_names=("programs",), consumers=1,
@@ -1136,7 +1136,8 @@ def test_a_launch_walks_the_widest_column_block_its_tensor_memory_holds_as_palla
 
     def scoping(columns):
         def body(x_gmem, o_gmem):
-            pl.run_scoped(lambda *tmem: None, *_backward_tensor_memory(64, columns), collective_axes="wg")
+            swizzling.run_scoped(lambda *tmem: None, *_backward_tensor_memory(64, columns),
+                                 collective_axes="wg")
         return mosaic_sm100.RINGS.kernel(body, out_type=jax.ShapeDtypeStruct((8,), jnp.float32), grid=(1,),
                                          grid_names=("programs",), consumers=1, interpret=False,
                                          name="scoping")
@@ -1159,7 +1160,7 @@ def test_a_four_bit_tile_takes_the_tensor_memory_columns_pallas_allocates_it():
     assert resources.tensor_memory_columns(held) == generation.gpu_target("sm100").tmem_columns
 
     def body(x_gmem, o_gmem):
-        pl.run_scoped(lambda *tmem: None, *held, collective_axes="wg")
+        swizzling.run_scoped(lambda *tmem: None, *held, collective_axes="wg")
 
     mesh = generation.gpu_mesh(Mesh(np.array(jax.devices()[:1]), ("data",)), "sm100")
     launch = issuer.kernel(body, out_type=jax.ShapeDtypeStruct((8,), jnp.float32), grid=(1,),
@@ -1243,10 +1244,10 @@ def _chained(a, b, c, *, m_warps: int, interpret: bool):
                               widest=resources.copied_rows(RELAYED, jnp.float32))
 
         swizzle = resources.widest_swizzle(jnp.bfloat16, RELAYED)
-        pl.run_scoped(scoped, swizzling.plain((rows, RELAYED), jnp.bfloat16),
-                      *(swizzling.staged((RELAYED, RELAYED), jnp.bfloat16, swizzle) for _ in range(2)),
-                      swizzling.plain((rows, RELAYED), jnp.bfloat16),
-                      swizzling.plain((rows, RELAYED), jnp.float32))
+        swizzling.run_scoped(scoped, swizzling.plain((rows, RELAYED), jnp.bfloat16),
+                             *(swizzling.staged((RELAYED, RELAYED), jnp.bfloat16, swizzle) for _ in range(2)),
+                             swizzling.plain((rows, RELAYED), jnp.bfloat16),
+                             swizzling.plain((rows, RELAYED), jnp.float32))
 
     out = jax.ShapeDtypeStruct((rows, RELAYED), jnp.float32)
     return family.kernel(body, out_type=out, grid=(1,), grid_names=("programs",), consumers=1,
@@ -1307,8 +1308,8 @@ def _negated(a, b, *, path: str, interpret: bool):
                               copy=swizzling.coalesced, widest=resources.copied_rows(LANDED, jnp.float32))
 
         swizzle = resources.widest_swizzle(jnp.bfloat16, LANDED)
-        pl.run_scoped(scoped, *(swizzling.staged(shape, jnp.bfloat16, swizzle) for _ in range(2)),
-                      swizzling.plain(shape, jnp.float32), collective_axes="wg")
+        swizzling.run_scoped(scoped, *(swizzling.staged(shape, jnp.bfloat16, swizzle) for _ in range(2)),
+                             swizzling.plain(shape, jnp.float32), collective_axes="wg")
 
     out = jax.ShapeDtypeStruct((LANDED, LANDED), jnp.float32)
     return family.kernel(body, out_type=out, grid=(1,), grid_names=("programs",), consumers=1,
@@ -1343,8 +1344,8 @@ def _read_past(a, b, *, between: str):
                     def _():
                         family.products(first, a_smem, b_smem)
                 else:
-                    pl.run_scoped(lambda third: family.products(third, a_smem, b_smem),
-                                  plgpu.WGMMAAccumulatorRef(shape, jnp.float32))
+                    swizzling.run_scoped(lambda third: family.products(third, a_smem, b_smem),
+                                         plgpu.WGMMAAccumulatorRef(shape, jnp.float32))
 
             _, value = family.product_with(a_smem, b_smem, shape, issued)
             plgpu.store(out_smem, value, optimized=False)
@@ -1357,8 +1358,8 @@ def _read_past(a, b, *, between: str):
 
         swizzle = resources.widest_swizzle(jnp.bfloat16, LANDED)
         accumulators = (plgpu.WGMMAAccumulatorRef(shape, jnp.float32),) * 2
-        pl.run_scoped(scoped, *(swizzling.staged(shape, jnp.bfloat16, swizzle) for _ in range(2)),
-                      swizzling.plain(shape, jnp.float32), *accumulators, collective_axes="wg")
+        swizzling.run_scoped(scoped, *(swizzling.staged(shape, jnp.bfloat16, swizzle) for _ in range(2)),
+                             swizzling.plain(shape, jnp.float32), *accumulators, collective_axes="wg")
 
     out = jax.ShapeDtypeStruct((2 * LANDED, LANDED), jnp.float32)
     return family.kernel(body, out_type=out, grid=(2,), grid_names=("programs",), consumers=1,
@@ -1416,20 +1417,29 @@ def _chained_operands(rows: int):
 @pytest.mark.parametrize(("rows", "m_warps"), [(16, 1), (32, 2)])
 def test_an_accumulator_feeds_the_next_product_on_any_warp_split(rows, m_warps):
     """Register values read as mma.sync's left operands, an accumulator's among them, on warps that split
-    its columns (one or two along its rows): lowered for an A100 on any host, and on a GPU exactly `(a @ b)
-    @ c` (each warp's columns relayed through the bound tile, where no register cast crosses warps)."""
-    a, b, c = _chained_operands(rows)
+    its columns (one or two along its rows): lowered for an A100 on a CPU (each warp's columns relayed
+    through the bound tile, where no register cast crosses warps); exact on a GPU
+    (`test_an_accumulator_feeds_the_next_product_on_a_gpu`)."""
     if here() != "cpu":
-        f32 = [np.asarray(x, np.float32) for x in (a, b, c)]
-        chained = ahead_arm(jax.jit(functools.partial(_chained, m_warps=m_warps, interpret=False)),
-                            f"chained products: {rows} rows, {m_warps} warps")(a, b, c)
-        np.testing.assert_array_equal(np.asarray(chained), (f32[0] @ f32[1]) @ f32[2])
-        return
+        pytest.skip(f"lowers for an A100 on a CPU, not on this {here()}")
+    a, b, c = _chained_operands(rows)
     shapes = [jax.ShapeDtypeStruct(x.shape, x.dtype) for x in (a, b, c)]
     mesh = generation.gpu_mesh(Mesh(np.array(jax.devices()[:1]), ("data",)), "sm80")
     with generation.assumed("sm80"), jax.sharding.use_abstract_mesh(mesh):
         jax.jit(functools.partial(_chained, m_warps=m_warps, interpret=False)).trace(*shapes).lower(
             lowering_platforms=("cuda",))
+
+
+@pytest.mark.gpu(reason="chained mma.sync products run on the device alone")
+@pytest.mark.parametrize(("rows", "m_warps"), [(16, 1), (32, 2)])
+def test_an_accumulator_feeds_the_next_product_on_a_gpu(rows, m_warps):
+    """`test_an_accumulator_feeds_the_next_product_on_any_warp_split`'s products on a GPU: exactly
+    `(a @ b) @ c`, its program compiled in a tier's prepare (`ahead_arm`)."""
+    a, b, c = _chained_operands(rows)
+    f32 = [np.asarray(x, np.float32) for x in (a, b, c)]
+    chained = ahead_arm(jax.jit(functools.partial(_chained, m_warps=m_warps, interpret=False)),
+                        f"chained products: {rows} rows, {m_warps} warps")(a, b, c)
+    np.testing.assert_array_equal(np.asarray(chained), (f32[0] @ f32[1]) @ f32[2])
 
 
 def _bounded(a, b, c, bounds, *, family, interpret):
@@ -1453,11 +1463,30 @@ def _bounded(a, b, c, bounds, *, family, interpret):
 
         staged = (swizzling.staged(shape, jnp.bfloat16, resources.widest_swizzle(jnp.bfloat16, RELAYED))
                   for shape in ((rows, RELAYED), (RELAYED, RELAYED)))
-        pl.run_scoped(scoped, *staged, *(swizzling.plain((rows, RELAYED), jnp.float32) for _ in range(count)))
+        swizzling.run_scoped(scoped, *staged,
+                             *(swizzling.plain((rows, RELAYED), jnp.float32) for _ in range(count)))
 
     out = jax.ShapeDtypeStruct((count, rows, RELAYED), jnp.float32)
     return family.kernel(body, out_type=out, grid=(1,), grid_names=("programs",), consumers=1,
                          interpret=interpret, name="bounded")(a, b, c, bounds)
+
+
+_BOUND_CASES = (((-1, 65), -1), ((0, 64), 65), ((1, 47), 16), ((16, 17), 47))
+"""Two run-time row bounds a call reads, and the constant one its family carries."""
+
+
+def _bound_operands(m_warps: int):
+    """mma.sync's bounded products' family, operands and each bound's expected outputs (`_BOUND_CASES`):
+    `c + a @ b` issued for the 16-row blocks before a bound, `c` kept in the rest."""
+    family = mosaic_sm80.Mma(jnp.dtype(jnp.bfloat16), m_warps=m_warps)
+    rng = np.random.default_rng(9)
+    a, b = (rng.integers(-2, 3, shape).astype(jnp.bfloat16) for shape in ((64, RELAYED), (RELAYED, RELAYED)))
+    c = np.broadcast_to(np.arange(1, 65, dtype=np.float32)[:, None] * 0.5, (64, RELAYED)).copy()
+    full = c + np.asarray(a, np.float32) @ np.asarray(b, np.float32)
+    starts = np.arange(64)[:, None] // 16 * 16
+    expected = [np.stack([np.where(starts < bound, full, c) for bound in (*bounds, constant)])
+                for bounds, constant in _BOUND_CASES]
+    return family, (a, b, c), expected
 
 
 @pytest.mark.parametrize("m_warps", [1, 2, 4])
@@ -1465,36 +1494,38 @@ def test_mma_sync_products_within_a_row_bound_keep_the_accumulator_past_it(m_war
     """mma.sync's products by a family bounded at a tile's rows (`Issuer.bounded`: a ragged group's last tile)
     issue for the 16-row blocks before the bound alone, a nonzero accumulator, each row its own, kept in the
     rest: two run-time bounds in one trace (-1 keeping every row, 65 issuing all), and a constant one a family
-    carries into one jitted helper at each bound (M-FS-56b; exact on a GPU, its program compiled in a tier's
-    prepare, `ahead_arm`; rows 7091, 12108, 12109)."""
-    family = mosaic_sm80.Mma(jnp.dtype(jnp.bfloat16), m_warps=m_warps)
-    rng = np.random.default_rng(9)
-    a, b = (rng.integers(-2, 3, shape).astype(jnp.bfloat16) for shape in ((64, RELAYED), (RELAYED, RELAYED)))
-    c = np.broadcast_to(np.arange(1, 65, dtype=np.float32)[:, None] * 0.5, (64, RELAYED)).copy()
-    full = c + np.asarray(a, np.float32) @ np.asarray(b, np.float32)
-    starts, on_gpu = np.arange(64)[:, None] // 16 * 16, here() != "cpu"
+    carries into one jitted helper at each bound (M-FS-56b; rows 7091, 12108, 12109), interpreted and lowered
+    for an A100 on a CPU; exact on a GPU (`test_mma_sync_products_within_a_row_bound_on_a_gpu`)."""
+    if here() != "cpu":
+        pytest.skip(f"interpreted and lowered on a CPU, not on this {here()}")
+    family, (a, b, c), expected = _bound_operands(m_warps)
     run = jax.jit(_bounded, static_argnames=("family", "interpret"))
-    cases = (((-1, 65), -1), ((0, 64), 65), ((1, 47), 16), ((16, 17), 47))
-    # Every bound's arm called before any is judged, so a GPU tier's prepare, whose arms give zeros, reaches
-    # each (row 10697: it stopped at the first one's check).
-    got = []
-    for bounds, constant in cases:
-        operands, bounded = (a, b, c, np.asarray(bounds, np.int32)), family.bounded(constant)
-        if on_gpu:
-            got.append(ahead_arm(jax.jit(functools.partial(_bounded, family=bounded, interpret=False)),
-                                 f"bounded products: {m_warps} warps at {constant}")(*operands))
-        else:
-            with generation.assumed("sm80"):
-                got.append(run(*operands, family=bounded, interpret=INTERPRETED))
-    for (bounds, constant), found in zip(cases, got, strict=True):
-        expected = [np.where(starts < bound, full, c) for bound in (*bounds, constant)]
-        np.testing.assert_array_equal(np.asarray(found), np.stack(expected))
-    if on_gpu:
-        return
+    for (bounds, constant), held in zip(_BOUND_CASES, expected, strict=True):
+        with generation.assumed("sm80"):
+            found = run(a, b, c, np.asarray(bounds, np.int32), family=family.bounded(constant),
+                        interpret=INTERPRETED)
+        np.testing.assert_array_equal(np.asarray(found), held)
     shapes = [jax.ShapeDtypeStruct(x.shape, x.dtype) for x in (a, b, c, np.zeros(2, np.int32))]
     mesh = generation.gpu_mesh(Mesh(np.array(jax.devices()[:1]), ("data",)), "sm80")
     with generation.assumed("sm80"), jax.sharding.use_abstract_mesh(mesh):
         run.trace(*shapes, family=family, interpret=False).lower(lowering_platforms=("cuda",))
+
+
+@pytest.mark.gpu(reason="bounded mma.sync products run on the device alone")
+@pytest.mark.parametrize("m_warps", [1, 2, 4])
+def test_mma_sync_products_within_a_row_bound_on_a_gpu(m_warps):
+    """`test_mma_sync_products_within_a_row_bound_keep_the_accumulator_past_it`'s products on a GPU: exact,
+    each bound's program compiled in a tier's prepare (`ahead_arm`). Every bound's arm called before any is
+    judged, so a GPU tier's prepare, whose arms give zeros, reaches each (row 10697: it stopped at the first
+    one's check)."""
+    family, (a, b, c), expected = _bound_operands(m_warps)
+    got = []
+    for bounds, constant in _BOUND_CASES:
+        native = jax.jit(functools.partial(_bounded, family=family.bounded(constant), interpret=False))
+        got.append(ahead_arm(native, f"bounded products: {m_warps} warps at {constant}")(
+            a, b, c, np.asarray(bounds, np.int32)))
+    for found, held in zip(got, expected, strict=True):
+        np.testing.assert_array_equal(np.asarray(found), held)
 
 
 CODES = (64, 64)
@@ -1537,49 +1568,66 @@ def _codes(dtype):
     return codes, np.ldexp(np.ones((CODES[0],), np.float32), rng.integers(-3, 4, (CODES[0],)))
 
 
+def _quantized(generation_name: str, dtype, scaled: bool) -> tuple[np.ndarray, np.ndarray, np.ndarray] | None:
+    """`_codes` of `dtype` and the bf16 tile they convert into, `codes * scale` (each row's scale where
+    `scaled`); None where the generation converts no such codes in registers (FP8 on an A100), its
+    conversion refused, never assembled (`mosaic.converts`)."""
+    codes, scale = _codes(dtype)
+    with generation.assumed(generation_name):
+        converts = mosaic.converts(dtype)
+    if not converts:
+        with pytest.raises(ValueError), generation.assumed(generation_name):
+            _converted(codes, scale, generation_name=generation_name, interpret=INTERPRETED)
+        return None
+    return codes, scale, np.asarray(codes, np.float32) * (np.asarray(scale)[:, None] if scaled else 1)
+
+
 @pytest.mark.parametrize("scaled", [True, False], ids=["scaled", "unscaled"])
 @pytest.mark.parametrize("dtype", [jnp.int8, jnp.float8_e4m3fn])
 @pytest.mark.parametrize("generation_name", gate_generations())
 def test_a_quantized_stage_converts_into_the_tile_its_products_read(generation_name, dtype, scaled):
     """Int8 and e4m3 codes in shared memory converted into a bf16 tile, each row scaled in fp32: exactly
-    `codes * scale` interpreted (on a CPU) or on a GPU of the generation, and lowered for one on any host;
-    FP8 codes refused where the device converts none (an A100). A host neither a CPU nor a GPU of the
-    generation (a TPU, another GPU) runs none of it (row 9003). On a GPU its program is compiled in a tier's
-    prepare (`here`, `ahead_arm`)."""
-    if here() not in ("cpu", generation_name):
-        pytest.skip(f"converts interpreted on a CPU or natively on a {generation_name} GPU, not on this "
-                    f"{here()}")
-    codes, scale = _codes(dtype)
-    expected = np.asarray(codes, np.float32) * (np.asarray(scale)[:, None] if scaled else 1)
-    with generation.assumed(generation_name):
-        converts = mosaic.converts(dtype)
-    if not converts:
-        # An A100 converts no FP8 in registers: the conversion is refused, never assembled.
-        with pytest.raises(ValueError), generation.assumed(generation_name):
-            _converted(codes, scale, generation_name=generation_name, interpret=INTERPRETED)
+    `codes * scale` interpreted on a CPU, and lowered and compiled for a GPU of the generation there; FP8
+    codes refused where the device converts none (an A100). Its native arm is a GPU's alone
+    (`test_a_quantized_stage_converts_natively_on_its_gpu`); a host no CPU runs none of it (row 9003)."""
+    if here() != "cpu":
+        pytest.skip(f"converts interpreted on a CPU, not on this {here()}")
+    if (quantized := _quantized(generation_name, dtype, scaled)) is None:
         return
-    if here() == "cpu":
-        with generation.assumed(generation_name):
-            converted = _converted(codes, scale, generation_name=generation_name, interpret=INTERPRETED,
-                                   scaled=scaled)
-        np.testing.assert_array_equal(np.asarray(converted, np.float32), expected)
-        # Compiled for the device on any host, its PTX through ptxas (a process of the device's capability,
-        # `compile_mosaic_kernels`): an integer conversion's fold into sm_90's packed int8-to-bf16 assembly
-        # fails there, not in the lowering.
-        from fla_gdn_support import KernelCase
-        from kernel_compile import compile_mosaic_kernels, mosaic_failures
+    codes, scale, expected = quantized
+    with generation.assumed(generation_name):
+        converted = _converted(codes, scale, generation_name=generation_name, interpret=INTERPRETED,
+                               scaled=scaled)
+    np.testing.assert_array_equal(np.asarray(converted, np.float32), expected)
+    # Compiled for the device on any host, its PTX through ptxas (a process of the device's capability,
+    # `compile_mosaic_kernels`): an integer conversion's fold into sm_90's packed int8-to-bf16 assembly
+    # fails there, not in the lowering.
+    from fla_gdn_support import KernelCase
+    from kernel_compile import compile_mosaic_kernels, mosaic_failures
 
-        shapes = [jax.ShapeDtypeStruct(x.shape, x.dtype) for x in (codes, scale)]
-        compiled = functools.partial(_converted, generation_name=generation_name, interpret=False,
-                                     scaled=scaled)
-        found = compile_mosaic_kernels([KernelCase("converted", lambda: (compiled, shapes))], generation_name)
-        assert not mosaic_failures(found), mosaic_failures(found)
-    else:
-        native = jax.jit(functools.partial(_converted, generation_name=generation_name, interpret=False,
-                                           scaled=scaled))
-        converted = ahead_arm(native, f"a {jnp.dtype(dtype).name} stage: scaled {scaled}")(codes, scale)
-        np.testing.assert_array_equal(np.asarray(converted, np.float32), expected)
+    shapes = [jax.ShapeDtypeStruct(x.shape, x.dtype) for x in (codes, scale)]
+    compiled = functools.partial(_converted, generation_name=generation_name, interpret=False, scaled=scaled)
+    found = compile_mosaic_kernels([KernelCase("converted", lambda: (compiled, shapes))], generation_name)
+    assert not mosaic_failures(found), mosaic_failures(found)
 
+
+@pytest.mark.gpu(reason="a quantized stage's native conversion runs on the device alone")
+@pytest.mark.parametrize("scaled", [True, False], ids=["scaled", "unscaled"])
+@pytest.mark.parametrize("dtype", [jnp.int8, jnp.float8_e4m3fn])
+@pytest.mark.parametrize("generation_name", gate_generations())
+def test_a_quantized_stage_converts_natively_on_its_gpu(generation_name, dtype, scaled):
+    """`test_a_quantized_stage_converts_into_the_tile_its_products_read`'s codes converted natively on a GPU
+    of the generation: exactly `codes * scale`, its program compiled in a tier's prepare (`ahead_arm`); FP8
+    codes refused where the device converts none (an A100); another host runs none of it."""
+    if here() != generation_name:
+        pytest.skip(f"converts natively on a {generation_name} GPU, not on this {here()}")
+    if (quantized := _quantized(generation_name, dtype, scaled)) is None:
+        return
+    codes, scale, expected = quantized
+    native = jax.jit(functools.partial(_converted, generation_name=generation_name, interpret=False,
+                                       scaled=scaled))
+    converted = ahead_arm(native, f"a {jnp.dtype(dtype).name} stage: scaled {scaled}")(codes, scale)
+    np.testing.assert_array_equal(np.asarray(converted, np.float32), expected)
 
 CHUNK_DEPTH = 64
 
@@ -2276,7 +2324,7 @@ def _staged_launch(waits: tuple[int, ...], stored: tuple[int, ...] = (STAGED[0],
                 staging(smem, value, out_gmem, (tile * rows, 0, jnp.int32(count), 0, rows, rows), waits=waits)
             plgpu.wait_smem_to_gmem(0)
 
-        pl.run_scoped(scoped, plgpu.SMEM((2, rows, width), jnp.float32))
+        swizzling.run_scoped(scoped, plgpu.SMEM((2, rows, width), jnp.float32))
 
     out = jax.ShapeDtypeStruct((len(stored) * rows, chunks * width), jnp.float32)
     return plgpu.kernel(body, out_type=out, **launch)

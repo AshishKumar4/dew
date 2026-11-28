@@ -12,7 +12,7 @@ from generation_support import on_a_v5e, on_the_host
 from jax.experimental import pallas as pl
 
 from dew.nn.kernels import generation
-from dew.nn.kernels.templates import resources
+from dew.nn.kernels.templates import resources, swizzling
 
 
 def _read_through(x, rows, index, *, interpret):
@@ -31,7 +31,7 @@ def _read_through(x, rows, index, *, interpret):
             held[...] = value
             pltpu.sync_copy(held, out_hbm)
 
-        pl.run_scoped(write, pltpu.VMEM(x.shape, jnp.float32))
+        swizzling.run_scoped(write, pltpu.VMEM(x.shape, jnp.float32))
 
     launch = family.kernel(body, out_type=jax.ShapeDtypeStruct(x.shape, jnp.float32), grid=(1,),
                            grid_names=("programs",), consumers=1, interpret=interpret, name="reads")
@@ -73,7 +73,7 @@ def _added_in_place(x, *, interpret):
             held[...] = jnp.full(held.shape, index, jnp.int32)
             pltpu.sync_copy(held, out_hbm.at[pl.ds(index, 1)])
 
-        pl.run_scoped(write, pltpu.VMEM((1, 128), jnp.int32))
+        swizzling.run_scoped(write, pltpu.VMEM((1, 128), jnp.int32))
 
     launch = family.kernel(body, out_type=jax.ShapeDtypeStruct((3, 128), jnp.int32), grid=(3,),
                            grid_names=("programs",), consumers=1, interpret=interpret, name="added")
