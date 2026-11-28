@@ -986,10 +986,16 @@ def test_a_subnormal_term_decays_and_raises_before_it_rounds():
     """`attention_parallax.exp_scaled` of fp32 subnormals raised back into the normal range: `2^-149` by
     `2^149` is 1 and `3 · 2^-149` by `2^148` is 1.5, their bits read before any multiply (a flushing
     backend's, XLA's CPU, reads a subnormal operand as 0) and every power applied at once, where halving it
-    first rounded `2^-149` to 0 (train 1478's K-F2)."""
+    first rounded `2^-149` to 0 (train 1478's K-F2). The least normal's neighbour below `2^-125`
+    (`0x00ffffff`) raised by `2^253` is fp32's largest: halved first it rounds up to `2^-126` on a backend
+    that keeps subnormals, whose `2^254` overflowed (the confirm review of 0e164c5af8), which only such a
+    backend shows (tests/test_gpu_attention.py runs this on a GPU)."""
     least = jnp.float32(2.0 ** -149)
     assert float(attention_parallax.exp_scaled(least, jnp.float32(0.0), 149)) == 1.0
     assert float(attention_parallax.exp_scaled(jnp.float32(3 * 2.0 ** -149), jnp.float32(0.0), 148)) == 1.5
+    below = jax.lax.bitcast_convert_type(jnp.uint32(0x00FFFFFF), jnp.float32)
+    largest = float(np.finfo(np.float32).max)
+    assert float(attention_parallax.exp_scaled(below, jnp.float32(0.0), 253)) == largest
     # Past fp32's largest, its infinity, no NaN of the exact value's difference (round 2 of the confirm).
     assert float(attention_parallax.exp_scaled(jnp.float32(1.0), jnp.float32(0.0), 128)) == float("inf")
 
