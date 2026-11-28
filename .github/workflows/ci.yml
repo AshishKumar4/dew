@@ -27,6 +27,10 @@ concurrency:
   cancel-in-progress: true
 
 env:
+  # The CUDA generations a release's wheel carries derivations of, each one at least: the one list the release's
+  # derivations job (`derived`) maps and its package job checks (tools/ci/package.sh's DEW_GENERATIONS). sm120 joins
+  # once its Mosaic kernel's layout inference holds there (row 14034).
+  DERIVED_GENERATIONS: sm80 sm90 sm100
   # The armada runner every armada job uses: one that waits out a redeploy's refusal of a new job (armada 1626e08),
   # so a deploy's drain delays a run and never fails it (Main, 2026-11-06), and whose judge's red row says how each
   # failed map task ended and the tail of what it said (armada f6cc2b3; Main, 2026-11-09), and that shares a run's
@@ -141,10 +145,55 @@ jobs:
         python3 tools/armada/gates_told.py "$RUNNER_TEMP/lint.jsonl" || status=1
         exit "$status"
 
-  # What a release attaches and Dew's index serves, installed the way a user installs it (tools/ci/package.sh).
+  # The template derivations a release's wheel ships (tools/ci/derived.sh), each CUDA generation's on an armada
+  # container of its own in the commit's environment, whose locks are the egglog and JAX builds every entry's key
+  # states, for each of DERIVED_GENERATIONS: a release's run alone, as a pull request's holds no armada credentials.
+  derived:
+    if: github.event_name == 'release'
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - uses: oven-sh/setup-bun@v2
+    - name: Install the armada CLI
+      run: bun install --global "$ARMADA"
+    - name: Each generation's derivations, on armada
+      env:
+        ARMADA_URL: ${{ secrets.ARMADA_URL }}
+        ARMADA_TOKEN: ${{ secrets.ARMADA_TOKEN }}
+      run: |
+        # Each generation's row read whatever armada's exit (1 where an item's command failed, 2 where one could
+        # not run), and printed where any is not green: a generation green with its artifacts lost (`artifactsLost`)
+        # is no catalogue. Each generation's entries are moved to a directory named for it (armada's are by index),
+        # and every one must hold one entry at least (tools/ci/package.sh checks it again before it builds).
+        set +e
+        printf '%s\n' $DERIVED_GENERATIONS | armada map --commit=${{ github.sha }} --items=- --size=large \
+          --label="derived-$GITHUB_REF_NAME" --artifacts="$RUNNER_TEMP/runs" --json -- \
+          sh -c 'sh tools/ci/derived.sh "$1" "$2/derived"' sh '{item}' '{artifacts}' > "$RUNNER_TEMP/derived.jsonl"
+        mapped=$?
+        set -e
+        jq -c 'select(has("index")) | {index, item, kind, exitCode, artifacts, artifactsLost}' \
+          "$RUNNER_TEMP/derived.jsonl" | tee "$RUNNER_TEMP/rows.jsonl"
+        [ "$mapped" = 0 ] || { echo "armada map exited $mapped"; exit 1; }
+        mkdir -p "$RUNNER_TEMP/derived"
+        for generation in $DERIVED_GENERATIONS; do
+          from=$(jq -r --arg g "$generation" 'select(.item == $g and .kind == "ok" and .exitCode == 0
+            and (.artifactsLost | not) and .artifacts != null) | .artifacts' "$RUNNER_TEMP/rows.jsonl")
+          [ -n "$from" ] && [ -n "$(ls "$from/derived"/*.json 2> /dev/null)" ] ||
+            { echo "$generation derived no catalogue"; exit 1; }
+          mv "$from/derived" "$RUNNER_TEMP/derived/$generation"
+          echo "$generation: $(ls "$RUNNER_TEMP/derived/$generation" | wc -l) derivations"
+        done
+    - uses: actions/upload-artifact@v4
+      with:
+        name: derived
+        path: ${{ runner.temp }}/derived/
+        if-no-files-found: error
+
+  # What a release attaches and Dew's index serves, installed the way a user installs it (tools/ci/package.sh):
+  # a release's with the derivations its run made (`derived`), every other run's without.
   package:
-    needs: proven
-    if: needs.proven.outputs.run == ''
+    needs: [proven, derived]
+    if: ${{ !cancelled() && needs.proven.outputs.run == '' && needs.derived.result != 'failure' }}
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v4
@@ -152,7 +201,15 @@ jobs:
       with:
         python-version-file: .python-version
     - uses: astral-sh/setup-uv@v6
+    - if: github.event_name == 'release'
+      uses: actions/download-artifact@v4
+      with:
+        name: derived
+        path: ${{ runner.temp }}/derived/
     - name: Build, check, install and run the sdist and wheel; resolve the accelerator extras
+      env:
+        DEW_DERIVED: ${{ github.event_name == 'release' && format('{0}/derived', runner.temp) || '' }}
+        DEW_GENERATIONS: ${{ github.event_name == 'release' && env.DERIVED_GENERATIONS || '' }}
       run: sh tools/ci/package.sh dist
     # A release publishes this sdist and wheel, the ones built and smoked here (python-publish.yml).
     - if: github.event_name == 'release'
