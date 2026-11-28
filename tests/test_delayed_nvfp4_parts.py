@@ -203,7 +203,10 @@ def test_a_ppo_steps_records_are_its_own_passes_its_critics_among_them():
         trainer = Trainer(objective, optax.adamw(1e-3), key=0)
         initial = trainer.initial_state()
         observing = Step(np.int32(0), jax.random.key(1), None, amax=True)
-        _, aux = objective.loss(initial.variables, batch, observing)
+        # The records' structure, read off the loss's abstract evaluation: run eagerly, the loss compiled a
+        # program an operation (1,964 of them, row 14078).
+        _, aux = jax.eval_shape(lambda variables: objective.loss(variables, batch, observing),
+                                initial.variables)
         state, *_ = trainer.compile(initial, batch)(initial, batch)
     assert NVFP4_AMAX not in initial.variables, sorted(initial.variables)
     calls = jax.tree.leaves(aux.amax["critic"], is_leaf=lambda node: isinstance(node, tuple))
