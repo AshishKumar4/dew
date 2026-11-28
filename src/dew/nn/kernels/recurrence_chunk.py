@@ -53,7 +53,16 @@ from dew.nn.precision import (
     rounds_products,
 )
 from dew.nn.residuals import Residual, recomputed_memory
-from dew.nn.sharding import HEADS, grouped_heads, manual_map, rows_like, rows_spec, shard_shapes, varying_like
+from dew.nn.sharding import (
+    HEADS,
+    grouped_heads,
+    manual_map,
+    rows_like,
+    rows_spec,
+    shard_shapes,
+    varying,
+    varying_like,
+)
 
 from . import fla_gdn, fla_kda, generation, mamba_ssd, recurrence, recurrence_algebra as algebra
 from .chunked_launch import Forked, zero_padded
@@ -449,8 +458,9 @@ def _normed_runs(hooks: recurrence.Hooks, run, product_kernel, given: dict, work
     in the operands' dtype, read back in it) and their plan for the product holds it (the forward's alone,
     or the training's forward and backward: the norm's residual kept and its gradient the layers' norm's,
     `template.mosaic_rule`); elsewhere each kernel's output, named as the recurrence's (a remat keeps it and
-    forms the norm again), through the layers' norm (`recurrence.normed`). A plan that does not hold
-    declines the fusion, the selected kernel's own route kept."""
+    forms the norm again), through the layers' norm (`recurrence.normed`). A plan that does not hold, or a
+    gate or weight varying over a manual axis the recurrence's operands do not, declines the fusion, the
+    selected kernel's own route kept."""
     def fits(product: str, gate, weight) -> bool:
         try:
             return product_kernel(product, normed=hooks.output, gate=gate, weight=weight) == 'mosaic_gpu'
@@ -461,7 +471,10 @@ def _normed_runs(hooks: recurrence.Hooks, run, product_kernel, given: dict, work
         def normed_run(kernel, *given_operands):
             head, (gate, weight), walked = (given_operands[:operands], given_operands[operands:operands + 2],
                                             given_operands[operands + 2:])
-            if fuses and kernel == 'mosaic_gpu' and fits(product, gate, weight):
+            # A gate or weight varying where the recurrence does not (a checked `shard_map`'s) keeps the
+            # norm apart, whose pullback sums back to the recurrence's output as JAX types it.
+            alike = varying(gate, weight) <= varying(*head[:5], head[6])
+            if fuses and alike and kernel == 'mosaic_gpu' and fits(product, gate, weight):
                 return run(kernel, *head, *walked, normed=hooks.output, gate=gate, weight=weight)
             out, final = run(kernel, *head, *walked)
             assert hooks.output is not None, "a gate is the epilogue's"

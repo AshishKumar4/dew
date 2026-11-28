@@ -11,6 +11,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from reference_error import assert_as_exact
+from jax.sharding import Mesh, PartitionSpec as P
 from test_recurrence_chunk import CHUNK, KEY_WIDTH, PACKED, chunk_on, draw, hosted, token_by_token
 
 from dew.nn.kernels import generation, recurrence
@@ -119,3 +120,38 @@ def test_a_padded_token_keeps_the_memory_its_value_decay_would_halve():
                      valid=jnp.zeros((1, 1), bool))
     _, final = chunk_on('xla', hooks, operands)
     np.testing.assert_array_equal(np.asarray(final), np.ones((1, 1, 4, 4), np.float32))
+
+
+@pytest.mark.mesh(devices=2)
+def test_a_gate_split_across_a_checked_shard_map_sums_a_replicated_values_gradient():
+    """The template's bf16 chunked call in a checked `shard_map` over two devices, its queries, keys, values,
+    decays, write gates and norm weight replicated and its output gate alone split: the gradient of its
+    outputs' sum by the replicated values each device's gate's own, summed, as the call apart on each
+    device's gate gives them, the norm kept apart from the output launch (its gate varying where the
+    recurrence does not), where the fused norm's pullback left the values' cotangent varying (a head
+    review)."""
+    hooks = recurrence.Hooks(decay='scalar', scale=0.125, write_bound=1.0,
+                             output=recurrence.OutputNorm(1e-6, read_in='bfloat16'))
+    rng = np.random.default_rng(1967)
+
+    def normal(*shape, dtype=jnp.bfloat16):
+        return jnp.asarray(rng.standard_normal(shape), dtype)
+
+    unit = normal(1, 64, 1, 64)
+    unit = (unit / jnp.linalg.norm(unit.astype(jnp.float32), axis=-1, keepdims=True)).astype(jnp.bfloat16)
+    shared = {'query': unit, 'key': unit, 'log_decay': -jnp.abs(normal(1, 64, 1, dtype=jnp.float32)),
+              'beta': jax.nn.sigmoid(normal(1, 64, 1, dtype=jnp.float32)), 'weight': jnp.ones((64,))}
+    gates = normal(2, 64, 1, 64)
+
+    def total(value, z):
+        operands = Chunk(shared['query'], shared['key'], value, log_decay=shared['log_decay'],
+                         beta=shared['beta'], z=z, weight=shared['weight'])
+        return jnp.sum(chunk_on('mosaic_gpu', hooks, operands, dtype=jnp.bfloat16)[0].astype(jnp.float32))
+
+    value = normal(1, 64, 1, 64)
+    mesh = Mesh(np.asarray(jax.devices()[:2]), ('data',))
+    split = jax.shard_map(lambda value, z: jax.lax.psum(total(value, z), 'data'), mesh=mesh,
+                          in_specs=(P(), P('data')), out_specs=P(), check_vma=True)
+    found = jax.jit(jax.grad(split))(value, gates)
+    apart = sum(jax.jit(jax.grad(total))(value, gates[at:at + 1]).astype(jnp.float32) for at in range(2))
+    np.testing.assert_allclose(np.asarray(found, np.float32), np.asarray(apart), rtol=2 ** -6, atol=2 ** -10)

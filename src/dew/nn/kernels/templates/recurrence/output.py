@@ -400,6 +400,6 @@ def output_launch(q, k, h, corrected, prefix: tuple, taken, beta, call: Call, ti
                          held=_output_held(call, bv, swizzle, normed=normed is not None), staging=staging,
                          landing=landing,
                          # A 16-bit call's takes no reduction (an A100's asked for its tiles' 49152 bytes
-                         # alone).
-                         persistent=True, reduces=held.parts > 1, swizzles=keys)(
+                         # alone), but its epilogue's rows' sums of squares.
+                         persistent=True, reduces=held.parts > 1 or normed is not None, swizzles=keys)(
         *inputs, beta, *(() if skip is None else (skip.astype(jnp.float32),)), *sides)
