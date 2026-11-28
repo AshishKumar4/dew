@@ -561,16 +561,27 @@ def _prologue(hooks: Hooks, given: dict, work):
     return query, key, value, history
 
 
-def log_gates(hooks: Hooks, given: dict, work):
+def log_gates(hooks: Hooks, given: dict, work, valid=None):
     """The log decay and the write gate, each in `work`, from the operands `given` by name (`read`): the
     gates' (`gated`), a rated decay's (the rate times the write gate), or as given; None for a decay
-    or a write gate the hooks have not."""
+    or a write gate the hooks have not. Where `valid` marks a token or row absent (its leading axes'),
+    its gates are formed from zeros, its head's rate and bias among them, so no absent one forms the rate's
+    exponential (a rate of `exp(100)` beside an absent token's zero cotangent was NaN in its gradient:
+    train 1473's review); its caller keeps its memory."""
     if hooks.gates is not None:
         beta = given['beta'].astype(work) if hooks.gates.write == 'sigmoid' else None
         # A head's rate over each of its key dimensions' gates, in `work` as every gate operand.
         log_a = given['log_a'].astype(work)
         log_a = log_a[..., None] if hooks.decay == 'vector' else log_a
-        return gated(hooks.gates, given['gate'].astype(work), log_a, given['bias'].astype(work), beta)
+        gate, bias = given['gate'].astype(work), given['bias'].astype(work)
+        if valid is not None:
+            def kept(x, like):
+                present = jnp.reshape(valid, (*jnp.shape(valid), *(1,) * (like.ndim - jnp.ndim(valid))))
+                return jnp.where(present, x, jnp.zeros((), work))
+
+            log_a, gate, bias = (kept(x, gate) for x in (log_a, gate, bias))
+            beta = None if beta is None else kept(beta, beta)
+        return gated(hooks.gates, gate, log_a, bias, beta)
     if hooks.rated:
         beta = given['beta'].astype(work)
         return given['rate'].astype(work) * beta, beta
@@ -652,10 +663,10 @@ def normed(hooks: Hooks, out, given: dict, work, *, dtype=None, axes=None):
     return output_normed(hooks.output, out, given['z'], given['weight'], dtype, work, axes=axes)
 
 
-def _gates(hooks: Hooks, given: dict, work, key_width: int):
+def _gates(hooks: Hooks, given: dict, work, key_width: int, active=None):
     """The reference's decay `[rows, Hv, Dk]` per key dimension, `[rows, Hv, 1]` a head's (none's one), and
-    write gate `[rows, Hv]`."""
-    g, beta = log_gates(hooks, given, work)
+    write gate `[rows, Hv]`, an idle row's (`active`) gates formed from zeros (`log_gates`)."""
+    g, beta = log_gates(hooks, given, work, valid=None if active is None else jnp.asarray(active, bool))
     rows, heads = given['state'].shape[:2]
     if g is None:
         decay = jnp.ones((rows, heads, 1), work)
@@ -689,7 +700,7 @@ def step_reference(hooks: Hooks, operands: Step, *, dtype=None):
         out, updated = _values_erased(hooks, given, state.astype(work), query, key, value, work)
     else:
         query, key, value, history = _prologue(hooks, given, work)
-        decay, write = _gates(hooks, given, work, key_width)
+        decay, write = _gates(hooks, given, work, key_width, operands.active)
         own = given['own'].astype(work) if hooks.own_weight else None
         turn = given['turn'].astype(work) if hooks.turns else None
         out, updated = update(state.astype(work), query, key, value, decay, write[..., None],

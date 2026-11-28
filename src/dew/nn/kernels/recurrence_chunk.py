@@ -68,7 +68,7 @@ from . import fla_gdn, fla_kda, generation, mamba_ssd, recurrence, recurrence_al
 from .chunked_launch import Forked, zero_padded
 from .generation import INHERENT, Choice, triton_runs
 from .recurrence_forked import forked_adjoint, forked_replay, forked_steps, most_segments, taken_up
-from .selection import Kernel, KernelRefused, Op, Refusal, Requirement, select, selected
+from .selection import Kernel, KernelRefused, Op, Refusal, Requirement, forced, select, selected
 from .ssd import _chunk_scan, ssd_kernel_platform
 from .templates import base, copies, report as launch_report, scan as block_scan
 
@@ -284,7 +284,9 @@ def _prologue_of(hooks: recurrence.Hooks, operands: Chunk, dtype) -> tuple:
         # memory 30 to 41 times fla's distance from float64 in two parts (row 184's GDN cell, acb1301632c).
         query, key = (l2norm(x.astype(work)).astype(x.dtype) for x in (query, key))
     scale = (key.shape[-1] ** -0.5 if hooks.l2norm else 1.0) if hooks.scale is None else hooks.scale
-    g, beta = recurrence.log_gates(hooks, given, work)
+    # A padded token's gates formed from zeros, its head's rate among them (`log_gates`).
+    g, beta = recurrence.log_gates(hooks, given, work,
+                                   None if operands.valid is None else jnp.asarray(operands.valid, bool))
     # No decay a token's (the queries' tokens: a token of updates, `Hooks.substeps`, decays once), and every
     # update's own write gate of one.
     g = jnp.zeros((*query.shape[:2], value.shape[2]), work) if g is None else g
@@ -458,7 +460,10 @@ def _on_kernels(hooks: recurrence.Hooks, given: dict, laid: tuple, forked, *, er
     if not normed:
         # The skip's `D` (operand 5) is the call's parameter.
         return _per_product(GATED_DELTA.bound(product_kernel), run, *operands, *walked, parameters=(5,))
-    fuses = not hooks.skip and given.get('turn') is None and dtype == operand and narrow
+    # The norm in the launch where no kernel is named for it: a call naming its gated norm's kernel
+    # (`dew.kernels.use(rms_norm=...)`) runs that kernel after the launches (train 1473's review).
+    fuses = (not hooks.skip and given.get('turn') is None and dtype == operand and narrow
+             and forced(Choice.RMS_NORM) is None)
     training, alone = _normed_runs(hooks, run, product_kernel, given, work, dtype, fuses=fuses,
                                    operands=len(operands))
     # The skip's `D` (operand 5) and the epilogue's weight (operand 14) are the call's parameters.

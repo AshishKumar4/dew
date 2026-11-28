@@ -10,6 +10,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from generation_support import COMPILES_ON_CPU, lowers
 from reference_error import assert_as_exact
 from test_recurrence_chunk import CHUNK, KEY_WIDTH, PACKED, chunk_on, draw, hosted, token_by_token
 
@@ -264,6 +265,25 @@ def test_the_output_launchs_norm_is_on_par_with_the_norm_after_it(block, trainin
                     truth_fn=truth)
 
 
+@COMPILES_ON_CPU
+@lowers('sm90')
+@pytest.mark.parametrize('training', [False, True], ids=['forward', 'training'])
+@pytest.mark.parametrize('block', EPILOGUE_BLOCKS.values(), ids=EPILOGUE_BLOCKS)
+def test_the_output_launchs_norm_lowers_on_a_hopper(block, training):
+    """`epilogue_run`'s fused rule at each value block, its forward and its training, compiled ahead for an
+    H100 (`kernel_compile.compile_mosaic_kernels`, compile-only): every launch lowers within its shared
+    memory, where the epilogue's rows staged in a plain tile had no Hopper transfer plan for a product
+    layout's store (M-JS-324c2's GH200 run)."""
+    from fla_gdn_support import KernelCase
+    from kernel_compile import compile_mosaic_kernels, failures
+
+    run = epilogue_run(block, True, training)
+    operands = tuple(jax.ShapeDtypeStruct(x.shape, x.dtype) for x in epilogue_draw(0))
+    case = KernelCase(f'the epilogue at {block} {training=}', lambda: (run, operands))
+    found = compile_mosaic_kernels([case], 'sm90')
+    assert not failures(found), failures(found)
+
+
 def test_a_skip_beside_the_norm_declines_the_epilogue_on_par_with_the_portable_rule():
     """A bf16 chunked call on the template without the delta rule, with a skip and the gated norm: the
     epilogue declined (the output launch adds no skip before a norm, `_normed_runs`' `fuses`), the norm
@@ -298,3 +318,41 @@ def test_a_padded_tokens_infinite_gate_leaves_the_norm_weights_gradient_finite()
     found = jax.grad(live)(weight, jnp.asarray([1.0, np.inf]).reshape(1, 2, 1, 1), valid)
     expected = jax.grad(live)(weight, jnp.ones((1, 2, 1, 1)), valid)
     np.testing.assert_array_equal(np.asarray(found), np.asarray(expected))
+
+
+def test_a_named_norm_kernel_keeps_the_norm_after_the_launches():
+    """A bf16 gated delta rule on the template whose norm reads its output back in bf16, the output launch's
+    epilogue taking it (no norm's route reported), and under `dew.kernels.use(rms_norm='xla')` that kernel
+    after the launches, its route reported (train 1473's review)."""
+    from dew import kernels
+
+    hooks = recurrence.Hooks(decay='scalar', scale=0.125,
+                             output=recurrence.OutputNorm(1e-6, 'sigmoid', read_in='bfloat16'))
+    q, k, v, g, beta, z, weight = epilogue_draw(0)
+    operands = Chunk(q, k, v, log_decay=g, beta=beta, z=z, weight=weight)
+
+    def norm_routes(*named):
+        with kernels.use(**dict(named)), generation.routes() as found:
+            jax.eval_shape(functools.partial(chunk_on, 'mosaic_gpu', hooks), operands)
+        return [route.kernel for route in found if route.choice == generation.Choice.RMS_NORM]
+
+    assert norm_routes() == []
+    assert norm_routes(('rms_norm', 'xla')) == ['xla']
+
+
+def test_an_idle_chunks_rate_gradient_is_zero_whatever_its_rate():
+    """A gated delta rule's two tokens on the portable path, both padded (`Chunk.valid`, a runtime mask), its
+    head's rate `log_a` 100: its gradient by the rate exactly zero, a padded token's gates formed from zeros,
+    its rate among them (`recurrence.log_gates`), where `exp(100)` overflowed fp32 before the padding masked
+    its decay and its zero cotangent times it was NaN (train 1473's review)."""
+    hooks = recurrence.Hooks(decay='scalar', gates=recurrence.Gates())
+    rng = np.random.default_rng(1473)
+    q, k, v = (jnp.asarray(rng.standard_normal((1, 2, 1, 16)) / 4, jnp.float32) for _ in range(3))
+
+    def total(log_a, valid):
+        operands = Chunk(q, k, v, gate=jnp.zeros((1, 2, 1)), beta=jnp.zeros((1, 2, 1)), log_a=log_a,
+                         bias=jnp.zeros((1,)), valid=valid)
+        return jnp.sum(chunk_on('xla', hooks, operands)[0])
+
+    found = jax.jit(jax.grad(total))(jnp.full((1,), 100.0), jnp.asarray([[False, False]]))
+    np.testing.assert_array_equal(np.asarray(found), np.zeros((1,), np.float32))

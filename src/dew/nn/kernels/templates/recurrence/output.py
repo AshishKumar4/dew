@@ -234,7 +234,10 @@ def _normed_step(normed: Normed, family, out, index, carry, *, steps: int, bv: i
         family.stored([read], [kept_ref.at[columns(index)]], smem=landing["kept"])
     if steps == 1:
         return sums, wide
-    rows.at[:, pl.ds(index * bv, bv)][...] = read
+    # Each block its own `[chunk, bv]` tile staged as layout inference stages a landing's (`swizzling.staged`
+    # unstated): a product layout's store into a plain tile has no transfer plan on a Hopper (M-JS-324c2's
+    # GH200 lowering).
+    rows.at[index][...] = read
     return (sums,)
 
 
@@ -247,7 +250,7 @@ def _normed_read(normed: Normed, family, carry, *, steps: int, bv: int, columns,
     out_ref, gate_ref, weight_ref, _ = refs
     _, inverse = rms_of_total(carry[0], normed.width, normed.epsilon)
     for block in range(steps):
-        row = carry[1] if steps == 1 else family.tile_of(rows.at[:, pl.ds(block * bv, bv)])
+        row = carry[1] if steps == 1 else family.tile_of(rows.at[block])
         row = row.astype(jnp.float32)
         gate = plgpu.load(gate_ref.at[columns(block)], layout=family.layout, optimized=False)
         weight = family.columns_of(weight_ref.at[pl.ds(block * bv, bv)]).astype(jnp.float32)
@@ -311,7 +314,7 @@ def _normed_layout(normed: Normed | None, chunk: int, bv: int, value_width: int,
     assert gate is not None and weight is not None, "an epilogue reads its gate and weight"
     read = jnp.dtype(normed.read)
     if bv < value_width:
-        staging = (*staging, swizzling.plain((chunk, value_width), read))
+        staging = (*staging, swizzling.staged((value_width // bv, chunk, bv), read))
     if normed.kept:
         out_type = (out_type, jax.ShapeDtypeStruct(out_type.shape, read))
         landing = {**landing, "kept": ((chunk, bv), read)}
