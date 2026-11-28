@@ -148,24 +148,25 @@ def test_a_mini_batched_memory_under_a_method_interceptor_reads_the_intercepted_
 
 
 @pytest.mark.parametrize("name", ["ttt_linear", "titans_linear"])
-def test_a_mini_batched_memory_under_a_direct_qwix_rule_runs_its_heads_through_the_rule(name):
-    """A direct Qwix provider's int8 rule on a head's `down` (`qwix.quantize_model`, ODML's QAT, a module path
-    `head_0/down`) quantizes that product's input on a call of one document, which a linear residual
-    memory's mini-batched kernel would otherwise take unrounded: the rule is used, its statistics kept at
-    the head's `down`, and the call reads apart from the unquantized memory's over the same weights (train
-    1484's review: the kernel left the rule unused and read the memory's own products)."""
+def test_a_mini_batched_memory_under_a_direct_qwix_provider_takes_the_general_path(name):
+    """A direct Qwix provider on (`qwix.quantize_model`, whose rules may name a head's `down`, a product the
+    mini-batched kernels never form) keeps a call of one document on the general path, as a method
+    interceptor does: under a provider whose rule names no module of it, the call reads, bit for bit, as
+    under an interceptor that passes every call through (train 1484's review: the kernel took the call, its
+    products beyond every rule's reach)."""
     qwix = pytest.importorskip("qwix")
 
     module = layer(name)
-    provider = qwix.OdmlQatProvider([qwix.QtRule(module_path=".*head_0/down", act_qtype=jnp.int8)],
-                                    strict=False)
-    quantized = qwix.quantize_model(module, provider)
-    x, _ = drawn(module)(0)
-    variables = quantized.init(jax.random.key(0), x)
-    one_document = np.asarray(quantized.apply(variables, x))
-    assert provider.get_unused_rules() == []
-    plain = np.asarray(module.apply({"params": variables["params"]}, x))
-    assert not np.array_equal(one_document, plain)
+    x, params = drawn(module)(0)
+    provider = qwix.QtProvider([qwix.QtRule(module_path="no module", weight_qtype=jnp.int8)])
+    provided = qwix.quantize_model(module, provider).apply(params, x)
+
+    def passing(next_fun, args, kwargs, context):
+        return next_fun(*args, **kwargs)
+
+    with nn.intercept_methods(passing):
+        general = module.apply(params, x)
+    np.testing.assert_array_equal(np.asarray(provided), np.asarray(general))
 
 
 PADDED = ((np.arange(LENGTH)[None] >= np.asarray([0, 1, 3, 0, 5, 2, 0, 7])[:, None])
