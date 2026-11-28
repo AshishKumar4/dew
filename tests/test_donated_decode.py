@@ -4,9 +4,9 @@ delta net's conv taps read in their checkpoint's order, no launch transposing it
 import jax
 import jax.numpy as jnp
 from flax import linen as nn
+from generation_support import COMPILES_ON_CPU
 from jax.experimental.mosaic.gpu import core as mgpu_core
 from jax.sharding import NamedSharding, PartitionSpec
-from generation_support import COMPILES_ON_CPU
 from kernel_compile import _device, assumed, gpu_target
 
 from dew.nn.kernels import generation
