@@ -23,6 +23,7 @@ from dew.nn.kernels.templates import (
     attention as template,
     attention_algebra as algebra,
     attention_decode,
+    cost,
     emission,
     merged,
     merged_mosaic,
@@ -704,6 +705,25 @@ def _mosaic_expected_bytes(*, rows: int, slices: int, width: int, read_width: in
     read_cols = min(width, read_width)
     return float(rows * ((3 * slices * read_cols + width) * itemsize
                          + (blocks * 3 * slices + 1) * 2 * itemsize))
+
+
+def test_a_gh200s_triton_merge_prices_its_slots_at_its_own_step():
+    """A GH200's merge of one row's 64 channels over 16 slices against 8 (M-NA-20-gh200's, 3.84 and 7.10
+    us): its waited path grows by its slots' at the GH200's own in-kernel step (`_triton_slot_steps`, three
+    steps a slot, `GpuTarget.kernel_step_seconds`: M-FS-114's, no longer the H100's it borrowed), priced
+    beside its copies' path, never dropped (Train 1493's review: with no step of its own the GH200 priced
+    its merge's slots by none)."""
+    target = generation.gpu_target("NVIDIA GH200 480GB")
+    assert target.kernel_step_seconds is not None
+
+    def waited(slices: int) -> float:
+        padded = jax.ShapeDtypeStruct((1, slices, 1, 1, 64), jnp.float32)
+        stacked = jax.ShapeDtypeStruct((2, 1, 1, slices, 1), jnp.float32)
+        return cost.chained(merged.launch_work(SPECS["fold"], padded, stacked, 1, 64, target), target)
+
+    # Eight slots more, each a step of each of its three passes (`means.merged_state_chunked`'s joining,
+    # placing and summing), each step the GH200's.
+    assert waited(16) - waited(8) == pytest.approx(8 * 3 * target.kernel_step_seconds, rel=2 ** -40)
 
 
 def test_a_padded_merges_launch_work_counts_common_passes_unmasked_bytes_and_span():

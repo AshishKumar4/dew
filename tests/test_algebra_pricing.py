@@ -249,10 +249,10 @@ def test_a_dies_step_latencies_are_its_parts_at_its_clock_and_a_parts_memory_its
     server, workstation = (facts(f"NVIDIA RTX PRO 6000 Blackwell {edition} Edition")
                            for edition in ("Server", "Workstation"))
     assert None not in server[0] and workstation[0] == (None,) * 4
-    # A GH200 its own (M-FS-114), never the H100 SXM's of another power limit.
-    gh200, h100 = (generation.gpu_target(kind).kernel_step_seconds
-                   for kind in ("NVIDIA GH200 480GB", "NVIDIA H100 80GB HBM3"))
-    assert None not in (gh200, h100) and gh200 != h100
+    # A GH200 its own on both paths (M-FS-114), never the H100 SXM's of another power limit.
+    gh200, h100 = ((target.step_seconds, target.kernel_step_seconds) for target in
+                   map(generation.gpu_target, ("NVIDIA GH200 480GB", "NVIDIA H100 80GB HBM3")))
+    assert None not in (*gh200, *h100) and gh200[0] != h100[0] and gh200[1] != h100[1]
 
 
 @pytest.mark.parametrize("tpu", ["v5e", "v6e"])
