@@ -12,7 +12,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from diffusion_support import SourceOracle, relative_gap, source_final, walk
+from diffusion_support import SourceOracle, relative_gap, source_final, source_walked, walk
 from float64_replay import float64_replay
 from reference_error import (
     as_given,
@@ -86,16 +86,18 @@ def test_source_config_rebuilds_its_scheduler_trajectory_and_gradient(name):
     tree answered, whose interval the reconstruction is checked to prepare.
     Every native walk and VJP runs in float32.
 
-    The VJP is held to the source's own rounding from its float64
-    evaluation, which widens every scheduler table and keeps that gradient
-    in float64, so its truth shares no float32 arithmetic with the reference
-    whose rounding it measures. Every pointwise case is on par over the
-    seeds its recording declares (check 1, source_seeds.npz), each seed an
-    independent initial state and cotangent of 768 entries, a thresholding
-    case's draws clear of its clip, and DDIM's thresholding over its first
-    two steps (tools/diffusers_source_reference.py's `SEEDED_STEPS`). CFG
-    epsilon instead averages 52 pixel orders of its per-sample variance
-    reductions.
+    The walk is held to the source's own rounding from its float64
+    evaluation, which widens every scheduler table, so its truth shares no
+    float32 arithmetic with the reference whose rounding it measures: every
+    case is on par over the seeds its recording declares (check 1,
+    source_seeds.npz), each seed an independent initial state and cotangent
+    of 768 entries, its latents (a guided case's last, as its pipeline
+    returns it) and their VJP, a thresholding case's draws clear of its
+    clip, and DDIM's thresholding over its first two steps
+    (tools/diffusers_source_reference.py's `SEEDED_STEPS`), its whole walk
+    beside them within 1e-4 of the source's. CFG epsilon's
+    seeds hold its walk; its VJP instead averages 52 pixel orders of its
+    per-sample variance reductions.
     """
     schedule, process, times, x_T = source_case(name)
     rescale = SOURCE["cases"][name]["guidance"]
@@ -108,25 +110,23 @@ def test_source_config_rebuilds_its_scheduler_trajectory_and_gradient(name):
     np.testing.assert_allclose(model_times, expected_times, atol=1e-3, rtol=1e-6)
     prior = float(process.sampler_schedule.prior_scale())
     assert abs(prior - float(SOURCE_ARRAYS[f"{name}.prior"])) < 1e-5 * max(prior, 1.0)
-    expected = SOURCE_ARRAYS[f"{name}.latents"]
-    cotangent = jnp.asarray(SOURCE_ARRAYS[f"{name}.cotangent"])
-    final = source_final(schedule, process, times, rescale, SOURCE["label"], SOURCE["guidance_scale"])
-    if rescale is None:
+    seeds = declared_seeds(SOURCE_SEEDS)[name]
+    seeded_steps = int(SOURCE_SEEDED[f"{name}.steps"])
+    if seeded_steps != len(times) - 1:
+        # A case whose seeds walk a shorter grid (`SEEDED_STEPS`: DDIM's thresholding conditioned over its
+        # first two steps) walks its whole grid as well, from the recorded start (train 1419).
+        expected = SOURCE_ARRAYS[f"{name}.latents"]
         latents = walk(schedule.solver, process, SourceOracle(), x_T, times)
-        assert latents.shape == expected.shape
-        assert relative_gap(latents, expected) < 1e-4
-    else:
-        assert relative_gap(final(x_T)[None], expected[-1:]) < 1e-4
+        assert latents.shape == expected.shape and relative_gap(latents, expected) < 1e-4
+    walked, grid = schedule.sampling(seeded_steps)
+    arm = source_walked(schedule, walked, grid, rescale, SOURCE["label"], SOURCE["guidance_scale"],
+                        gradient=name != "cfg.epsilon")
+    draw, recorded, truth = indexed_recording(SOURCE_SEEDED, name, seeds)
+    seeded = jax.jit(arm)
+    assert_as_exact(lambda index, inputs: seeded(inputs), recorded, draw, name, seeds=seeds, truth_fn=truth)
     if name == "cfg.epsilon":
-        source_gradient_over_orders(final, x_T, cotangent)
-    else:
-        seeds = declared_seeds(SOURCE_SEEDS)[name]
-        draw, recorded, truth = indexed_recording(SOURCE_SEEDED, name, seeds)
-        walked, grid = schedule.sampling(int(SOURCE_SEEDED[f"{name}.steps"]))
-        seeded = source_final(schedule, walked, grid, rescale, SOURCE["label"], SOURCE["guidance_scale"])
-        gradient = jax.jit(lambda value, cot: {"grad": jax.vjp(seeded, value)[1](cot)[0]})
-        assert_as_exact(lambda index, inputs: gradient(inputs["x_T"], inputs["cotangent"]), recorded, draw,
-                        name, seeds=seeds, truth_fn=truth)
+        final = source_final(schedule, process, times, rescale, SOURCE["label"], SOURCE["guidance_scale"])
+        source_gradient_over_orders(final, x_T, jnp.asarray(SOURCE_ARRAYS[f"{name}.cotangent"]))
 
 
 @pytest.mark.parametrize("config", [
@@ -172,8 +172,8 @@ REPEATED_EULER_RANGE = {"sigma_min": 30000, "sigma_max": 80000}
 def test_source_grids_walk_repeated_initial_model_times(kind, extra):
     """Repeated model times keep their own sigma rows, as an explicitly indexed source walk does:
     over drawn starting latents, each walked latent on par with the source's own float32 walk against
-    the source's float64 walk (check 1). The float64 walk builds its tables in float64
-    (`float64_scheduler`), at the float32 walk's integer times."""
+    the class's independent float64 oracle's walk (check 1, tools/float64_schedulers.py), at the float32
+    walk's integer times."""
     _check_repeated_walk(kind, extra)
 
 
@@ -189,15 +189,13 @@ def test_source_euler_walk_rounds_as_the_source_on_its_stored_rates():
 
 
 def _check_repeated_walk(kind, extra, *, stored_rates=False):
-    import contextlib
-
     import torch
     from diffusers.schedulers import (
         scheduling_dpmsolver_multistep,
         scheduling_euler_discrete,
         scheduling_k_dpm_2_discrete,
     )
-    from tool_support import load
+    from tool_support import scheduler_oracles
 
     from dew.diffusion.schedules.source import SourceSchedule
 
@@ -225,7 +223,7 @@ def _check_repeated_walk(kind, extra, *, stored_rates=False):
                            times=times, final_denoise=False, record=lambda x, state, denoised: x)
         return {f"step {index}": np.asarray(latent) for index, latent in enumerate(walked)}
 
-    precision = load("diffusers_wan_reference")
+    oracles = scheduler_oracles()
 
     published = getattr(module, kind + "Scheduler").from_config(config)
     published.set_timesteps(6)
@@ -233,25 +231,24 @@ def _check_repeated_walk(kind, extra, *, stored_rates=False):
     published = published.timesteps.clone()
 
     def source_walk(initial, dtype):
-        context = precision.float64_scheduler(module) if dtype == torch.float64 else contextlib.nullcontext()
-        with context:
-            source = getattr(module, kind + "Scheduler").from_config(config)
-            source.set_timesteps(6)
-            if stored_rates:
-                source.sigmas = published_sigmas.to(dtype)
-            # A pipeline can choose its first sigma by index, without a model-time lookup.
-            source.set_begin_index(0)
-            if dtype == torch.float64 and not published.is_floating_point():
-                # Integer conditioning times are the published ones, not a float64 rounding of them.
-                source.timesteps = published
-            x = torch.tensor(initial, dtype=dtype)
-            latents = []
-            for index, time in enumerate(source.timesteps):
-                scaled = source.scale_model_input(x, time)
-                prediction = torch.sin(scaled) * 0.07 + time * 0.001
-                x = source.step(prediction, time, x).prev_sample
-                if kind != "KDPM2Discrete" or index % 2 == 1 or index == len(source.timesteps) - 1:
-                    latents.append(x.numpy().copy())
+        library = getattr(module, kind + "Scheduler").from_config(config)
+        source = oracles.oracle_of(library) if dtype == torch.float64 else library
+        source.set_timesteps(6)
+        if stored_rates:
+            source.sigmas = published_sigmas.to(dtype)
+        # A pipeline can choose its first sigma by index, without a model-time lookup.
+        source.set_begin_index(0)
+        if dtype == torch.float64 and not published.is_floating_point():
+            # Integer conditioning times are the published ones, not a float64 rounding of them.
+            source.timesteps = published
+        x = torch.tensor(initial, dtype=dtype)
+        latents = []
+        for index, time in enumerate(source.timesteps):
+            scaled = source.scale_model_input(x, time)
+            prediction = torch.sin(scaled) * 0.07 + time * 0.001
+            x = source.step(prediction, time, x).prev_sample
+            if kind != "KDPM2Discrete" or index % 2 == 1 or index == len(source.timesteps) - 1:
+                latents.append(x.numpy().copy())
         # A leaf a step, so each step is judged on its own, as the walk records it.
         return {f"step {index}": latent for index, latent in enumerate(latents)}
 

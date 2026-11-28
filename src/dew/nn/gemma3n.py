@@ -24,7 +24,7 @@ from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
 from dew.nn.dense import Dense
-from dew.nn.fake_quant import straight_through
+from dew.nn.derivatives import straight_through
 from dew.nn.flops import projection_flops
 from dew.nn.norms import RMSNorm
 from dew.nn.precision import accumulated, at_least_fp32, float32_dot_general, float32_einsum, sqrt_or_zero

@@ -486,11 +486,11 @@
    "lane": "Training"
   },
   "tests/test_samplers.py": {
-   "comparisons": 8,
+   "comparisons": 7,
    "lane": "Models, Serving & RL"
   },
   "tests/test_sd3_source.py": {
-   "comparisons": 10,
+   "comparisons": 6,
    "lane": "Models, Serving & RL"
   },
   "tests/test_source_schedulers.py": {

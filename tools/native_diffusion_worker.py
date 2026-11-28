@@ -199,11 +199,10 @@ def flax_call(task: str, case: dict[str, np.ndarray], wide: bool, wanted) -> dic
 @contextlib.contextmanager
 def torch_drawing(noise, wide: bool):
     """A PyTorch pipeline's calls at float32, or at float64 (built and run in `_dew_torch.precision.float64`,
-    DDIM's tables its module's own widened, the image processor's NumPy too), every noise its call draws
-    the case's drawn `noise`."""
+    its scheduler DDIM's float64 oracle, `torch_pipeline`, the image processor's NumPy widened too), every
+    noise its call draws the case's drawn `noise`."""
     import flax_precision
     import torch
-    from diffusers_wan_reference import float64_scheduler
 
     from _dew_torch.precision import float64
 
@@ -221,7 +220,6 @@ def torch_drawing(noise, wide: bool):
             scope.enter_context(patch.object(importlib.import_module(name), "randn_tensor", drawn))
         if wide:
             scope.enter_context(float64())
-            scope.enter_context(float64_scheduler(importlib.import_module("diffusers.schedulers.scheduling_ddim")))
             # The image processor's pixels and mask, which it reads and normalizes in NumPy's float32.
             scope.enter_context(flax_precision.float64(("diffusers.image_processor",), library="np"))
         scope.enter_context(torch.no_grad())
@@ -230,7 +228,8 @@ def torch_drawing(noise, wide: bool):
 
 @functools.cache
 def torch_pipeline(task: str, wide: bool):
-    """The saved PyTorch pipeline of `task`, at float64 where `wide`."""
+    """The saved PyTorch pipeline of `task`, at float64 where `wide`: its modules widened and its scheduler
+    the class's independent float64 oracle (tools/float64_schedulers.py)."""
     import torch
     from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion import StableDiffusionPipeline
     from diffusers.pipelines.stable_diffusion_xl.pipeline_stable_diffusion_xl_img2img import (
@@ -239,6 +238,7 @@ def torch_pipeline(task: str, wide: bool):
     from diffusers.pipelines.stable_diffusion_xl.pipeline_stable_diffusion_xl_inpaint import (
         StableDiffusionXLInpaintPipeline,
     )
+    from float64_schedulers import oracle_of
 
     from _dew_torch.precision import float64
 
@@ -248,6 +248,7 @@ def torch_pipeline(task: str, wide: bool):
         pipe = cls.from_pretrained(saved() / task, local_files_only=True)
         if wide:
             pipe = pipe.to(torch.float64)
+            pipe.scheduler = oracle_of(pipe.scheduler)
     pipe.set_progress_bar_config(disable=True)
     return pipe
 

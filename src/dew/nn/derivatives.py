@@ -69,6 +69,7 @@ __all__ = [
     "marked",
     "marked_call_p",
     "portable_formed",
+    "straight_through",
     "surrogate",
     "with_gradients_formed",
     "with_gradients_formed_at",
@@ -669,3 +670,22 @@ def formed_together_at(operands: tuple, parameters: Collection[int]) -> tuple:
     leave only with the parameters' formed, every operand back at its position (`_apart`, `_together`)."""
     inputs, held = formed_together(*_apart(operands, parameters))
     return _together(inputs, held, parameters)
+
+
+def _rounded_value(x, rounded):
+    """`rounded` in `x`'s dtype, bit for bit, a negative zero included, which the kernels keep."""
+    return rounded.astype(x.dtype)
+
+
+def rounded_tangent(primals, tangents, value):
+    """The straight-through quantizer propagates only the written input's tangent."""
+    return tangents[0]
+
+
+straight_through = contracted("test_a_straight_through_rounding_holds_every_order")(
+    surrogate(_rounded_value, rounded_tangent))
+"""`rounded` forward, bit for bit in `x`'s dtype (`_rounded_value`), and the identity's derivative, `x`'s
+tangent, at every order, declared (`surrogate`): `x + (rounded - x)` would re-round wherever `rounded` lies
+far from `x` (a quantizer's clamp in bf16, a compensated value beside its plain form,
+`dew.diffusion.schedules.karras`), and turn a -0 into +0. A quantizer's estimator is Dew's choice
+(`dew.nn.fake_quant`)."""

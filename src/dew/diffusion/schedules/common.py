@@ -20,11 +20,16 @@ def expand(coefficient, x):
     return jnp.reshape(coefficient, (-1,) + (1,) * (x.ndim - 1))
 
 
-def ancestral_variance(sigma, following):
-    """following^2 (sigma^2 - following^2) / sigma^2, the variance of the fresh noise an ancestral
-    step from `sigma` to `following` adds (k-diffusion's `get_ancestral_step` at eta 1, before its
-    root), on a number or an array of either library: each caller takes its own root, cap or clamp."""
-    return following ** 2 * (sigma ** 2 - following ** 2) / sigma ** 2
+def ancestral_step(sigma, following):
+    """k-diffusion's `get_ancestral_step` at eta 1 on a descending grid, from `sigma` to `following`, on
+    a number or an array of either library: `(sigma_down, sigma_up)`, the level a deterministic step goes
+    down to and the fresh noise that brings the marginal back to `following`. With r = following / sigma,
+    sigma_up is following sqrt((1 - r)(1 + r)), never past the source's cap of `following`, and
+    sigma_down, the source's sqrt(following^2 - sigma_up^2), is following r: the source's squares cancel
+    where the two levels are near (1 and 1e-12 apart, a stage of zero), these take no difference of squares
+    and neither is read off the other's rounding (row 13657)."""
+    ratio = following / sigma
+    return following * ratio, following * ((1 - ratio) * (1 + ratio)) ** 0.5
 
 
 def times(t) -> jax.Array:

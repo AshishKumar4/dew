@@ -51,7 +51,8 @@ from quantized_arms import QUANTIZERS
 from reference_error import distance
 
 from dew.interop import Pretrained
-from dew.nn.fake_quant import FakeQuantizing, straight_through
+from dew.nn.derivatives import straight_through
+from dew.nn.fake_quant import FakeQuantizing
 from dew.nn.inputs import ModelInputs
 from dew.nn.kernels import generation
 from dew.objectives.base import Step

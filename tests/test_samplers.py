@@ -12,14 +12,27 @@ Each solver's order of accuracy is measured against that closed form.
 import dataclasses
 import functools
 import json
+import statistics
 from dataclasses import dataclass
 from pathlib import Path
+from typing import NamedTuple
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from diffusion_support import SourceOracle, relative_gap, walk
+from arm_forms import dew_programs
+from diffusion_support import (
+    DATA_STD,
+    SourceOracle,
+    karras_raw,
+    relative_gap,
+    scheduler_draw,
+    seeded_schedule,
+    ve_epsilon,
+    vp_epsilon,
+    walk,
+)
 from flax import linen as nn
 from reference_error import as_given, assert_as_exact, declared_seeds, indexed_recording, recording
 from sampling_gate import assert_draws_as_declared
@@ -41,6 +54,7 @@ from dew.diffusion import (
     expand,
 )
 from dew.diffusion.discrete import DiscreteProcess, LogLinear
+from dew.nn.programs import on_host
 from dew.registry import solvers
 from dew.sampling import (
     CFG,
@@ -62,45 +76,76 @@ from dew.sampling import (
     sample,
 )
 
-DATA_STD = 0.3
-
 
 def solver_id(solver) -> str:
     return repr(solver).replace(" ", "")
 
 
+def handed_exactly(oracle, x, *handed):
+    """`oracle(x, *handed)` evaluated in float64 from the arrays the model is handed (`x` and `handed`,
+    each broadcast against `x`, in their own dtypes), each entry rounded once to `x`'s dtype, as a model's
+    output is an array whose entries are each rounded once. The oracle is linear in `x`, so its
+    vector-Jacobian product is the same map of the cotangent, rounded alike; what the model is handed
+    besides `x` (its time) takes none. Diffusers' walks in tools/diffusers_reference.py read their oracles
+    so (rows 13662, 13335): an oracle that rounds its own coefficient scales every entry by one error,
+    which a walk's conversion of eps to x_0 amplifies past any solver's rounding."""
+    handed = tuple(jnp.broadcast_to(value, x.shape) for value in handed)
+
+    def host(value, *rest):
+        wide = oracle(np.asarray(value, np.float64), *(np.asarray(item, np.float64) for item in rest))
+        return np.asarray(wide, value.dtype)
+
+    def evaluated(value, rest):
+        return jax.pure_callback(host, jax.ShapeDtypeStruct(value.shape, value.dtype), value, *rest,
+                                 vmap_method="broadcast_all")
+
+    @jax.custom_vjp
+    def read(value, rest):
+        return evaluated(value, rest)
+
+    def forward(value, rest):
+        return evaluated(value, rest), rest
+
+    def backward(rest, cotangent):
+        return evaluated(cotangent, rest), jax.tree.map(jnp.zeros_like, rest)
+
+    read.defvjp(forward, backward)
+    return read(x, handed)
+
+
 class VPOracle(nn.Module):
-    """Optimal epsilon-predictor for x0 ~ N(0, DATA_STD^2) on a VP schedule.
+    """Optimal epsilon-predictor for x0 ~ N(0, DATA_STD^2) on a VP schedule (`vp_epsilon`).
 
     The model is conditioned on the raw timestep for discrete schedules, so
-    rates are recomputed from the schedule inside the module.
+    rates are recomputed from the schedule inside the module. `exact` reads it
+    exactly from those rates (`handed_exactly`), as the Diffusers walks read it.
     """
     schedule: CosineNoiseScheduler | LinearNoiseScheduler
+    exact: bool = False
 
     @nn.compact
     def __call__(self, x, temb):
         alpha, sigma = broadcast_rates(self.schedule, temb, x)
-        return x * sigma / (alpha**2 * DATA_STD**2 + sigma**2)
+        if self.exact:
+            return handed_exactly(vp_epsilon, x, alpha, sigma)
+        return vp_epsilon(x, alpha, sigma)
 
 
 class KarrasOracle(nn.Module):
-    """Optimal raw-F predictor under the Karras preconditioning (VE, alpha=1).
+    """Optimal raw-F predictor under the Karras preconditioning (VE, alpha=1; `karras_raw`).
 
-    Receives x * c_in and temb = log(sigma)/4; must output F such that
-    c_skip * x + c_out * F = E[x0 | x] = s^2/(s^2 + sigma^2) * x.
+    Receives x * c_in and temb = log(sigma)/4. `exact` reads it exactly from
+    those (`handed_exactly`), as the Diffusers walks read it.
     """
     sigma_data: float = 0.5
+    exact: bool = False
 
     @nn.compact
     def __call__(self, x_scaled, temb):
-        sigma = expand(jnp.exp(4.0 * temb), x_scaled)
-        sd = self.sigma_data
-        c_in = 1 / jnp.sqrt(sigma**2 + sd**2)
-        c_skip = sd**2 / (sd**2 + sigma**2)
-        c_out = sigma * sd / jnp.sqrt(sd**2 + sigma**2)
-        x = x_scaled / c_in
-        x0 = DATA_STD**2 / (DATA_STD**2 + sigma**2) * x
-        return (x0 - c_skip * x) / c_out
+        if self.exact:
+            return handed_exactly(lambda x, t: karras_raw(x, np.exp(4.0 * t), self.sigma_data), x_scaled,
+                                  expand(temb, x_scaled))
+        return karras_raw(x_scaled, expand(jnp.exp(4.0 * temb), x_scaled), self.sigma_data)
 
 
 def vp_process():
@@ -113,18 +158,61 @@ def karras_process():
     return Process(schedule, KarrasPredictionTransform(sigma_data=0.5)), KarrasOracle()
 
 
-def assert_gaussian_stats(samples, std=DATA_STD, tol=0.05):
-    assert jnp.all(jnp.isfinite(samples)), "sampler produced non-finite values"
-    assert abs(float(jnp.mean(samples))) < tol
-    assert abs(float(jnp.std(samples)) - std) < tol
+LAW_SEEDS = 4
+"""The seeds a Gaussian walk's samples are drawn at against its own law (`assert_walks_its_law`)."""
+
+LAW_DRAWS = 16
+"""How many times a walk's draws its float64 twin takes to state its law: the law's spread then errs by
+about 1/sqrt(2 x 16 x 49152), 0.08%, a twentieth of the narrowing the gate resolves at one seed's draws."""
+
+REACH = 0.05
+"""How far a walk's law may spread from its data's (`DATA_STD`): a walk over a finite grid takes the
+oracle's linear map to its own c (row 13668: DDIM's and Euler's 3-4% narrow at a hundred steps,
+sde-dpmsolver++'s 3% wide), its discretization's and no defect's."""
+
+
+class Walk(NamedTuple):
+    """A walk of `steps` steps of `solver` over `process` and its oracle `model`, of samples of `shape`."""
+
+    process: Process
+    model: nn.Module
+    solver: object
+    steps: int
+    shape: tuple[int, ...]
+
+    def __call__(self, count: int, seed: int, dtype=None) -> jax.Array:
+        """`count` samples walked from the prior's draws at `seed`, in `dtype` where given: a float64 walk
+        from the float32 walk's draws widened, each step's innovations too (`_unit_noise`)."""
+        params = self.model.init(jax.random.PRNGKey(1), jnp.ones((1, *self.shape)), jnp.ones((1,)))
+        denoise = self.process.denoiser(self.model, params, {})
+        key = jax.random.PRNGKey(seed)
+        x_T = self.process.noise(jax.random.fold_in(key, 0), (count, *self.shape))
+        x_T = x_T if dtype is None else x_T.astype(dtype)
+        return sample(denoise, x_T, self.steps, solver=self.solver, key=jax.random.fold_in(key, 1))
 
 
 def generate(process, model, solver, steps=100, count=256, shape=(8, 8, 3), seed=2):
-    params = model.init(jax.random.PRNGKey(1), jnp.ones((1, *shape)), jnp.ones((1,)))
-    denoise = process.denoiser(model, params, {})
-    key = jax.random.PRNGKey(seed)
-    x_T = process.noise(jax.random.fold_in(key, 0), (count, *shape))
-    return sample(denoise, x_T, steps, solver=solver, key=jax.random.fold_in(key, 1))
+    return Walk(process, model, solver, steps, shape)(count, seed)
+
+
+def assert_walks_its_law(walk: Walk, count: int = 256):
+    """`walk`'s samples, each entry a draw of the law the walk takes its prior to, drawn at that law's
+    deciles as a fair draw would (the sampling gate, over LAW_SEEDS seeds), and that law near its data's.
+    The oracle is linear in the sample, so a walk takes the prior's Gaussian to a Gaussian of mean zero: a
+    deterministic walk's samples are c x_T at its own c, a stochastic one's add its innovations' spread
+    (row 13668); its spread is its float64 twin's over LAW_DRAWS times the draws, from other seeds."""
+    with jax.enable_x64(new_val=True):
+        wide = np.asarray(walk(count * LAW_DRAWS, LAW_SEEDS + 1, np.float64))
+    spread = float(np.sqrt(np.mean(wide ** 2)))
+    assert abs(spread - DATA_STD) < REACH, spread
+    edges = np.asarray([statistics.NormalDist(0.0, spread).inv_cdf(decile / 10) for decile in range(1, 10)])
+
+    def counts(seed: int) -> np.ndarray:
+        samples = np.asarray(walk(count, seed), np.float64).ravel()
+        assert np.all(np.isfinite(samples)), "the walk drew non-finite samples"
+        return np.bincount(np.searchsorted(edges, samples), minlength=10)
+
+    assert_draws_as_declared(counts, np.full(10, 0.1), "the Gaussian walk's samples", seeds=LAW_SEEDS)
 
 
 class EndpointOracle(nn.Module):
@@ -202,30 +290,27 @@ TOKEN_SEEDS = 4
 """The walks the masked case's frequencies pool, each 256 samples of 16 independent positions."""
 
 
-def assert_token_frequencies(walked):
-    """Each of `walked(seed)`'s positions, a full reveal holding no mask, drawn at TOKEN_PROBS as a fair
-    sampler would (the sampling gate, over TOKEN_SEEDS walks)."""
+def assert_token_frequencies(walk: Walk):
+    """Each of `walk`'s positions, a full reveal holding no mask, drawn at TOKEN_PROBS as a fair sampler
+    would (the sampling gate, over TOKEN_SEEDS walks)."""
     def counts(seed: int) -> np.ndarray:
-        held = np.bincount(np.asarray(walked(seed)).ravel(), minlength=len(TOKEN_PROBS) + 1)
+        held = np.bincount(np.asarray(walk(256, seed)).ravel(), minlength=len(TOKEN_PROBS) + 1)
         assert held[-1] == 0, "a sample kept the mask"
         return held[:-1]
 
     assert_draws_as_declared(counts, TOKEN_PROBS, "the masked walk's tokens", seeds=TOKEN_SEEDS)
 
 
-def assert_gaussian_walk(walked):
-    """`walked`'s samples at the generator's default seed, the oracle's Gaussian (`assert_gaussian_stats`)."""
-    assert_gaussian_stats(walked(2))
 
 
 IMAGE = (8, 8, 3)
 PROCESS_CASES = {
-    "vp": (vp_process, IMAGE, assert_gaussian_walk),
-    "linear": (linear_process, IMAGE, assert_gaussian_walk),
-    "endpoint": (endpoint_process, IMAGE, assert_gaussian_walk),
-    "karras": (karras_process, IMAGE, assert_gaussian_walk),
-    "ve_endpoint": (ve_endpoint_process, IMAGE, assert_gaussian_walk),
-    "flow": (flow_process, IMAGE, assert_gaussian_walk),
+    "vp": (vp_process, IMAGE, assert_walks_its_law),
+    "linear": (linear_process, IMAGE, assert_walks_its_law),
+    "endpoint": (endpoint_process, IMAGE, assert_walks_its_law),
+    "karras": (karras_process, IMAGE, assert_walks_its_law),
+    "ve_endpoint": (ve_endpoint_process, IMAGE, assert_walks_its_law),
+    "flow": (flow_process, IMAGE, assert_walks_its_law),
     "masked": (masked_process, (16,), assert_token_frequencies),
 }
 """Each process family over an oracle of known data: the process and its
@@ -290,8 +375,7 @@ threshold every masked position reveals from its first draw, which samples the o
 
 def assert_reaches_its_data(case, solver, steps=100):
     build, shape, reaches = PROCESS_CASES[case]
-    process, model = build()
-    reaches(lambda seed: generate(process, model, solver, steps, shape=shape, seed=seed))
+    reaches(Walk(*build(), solver, steps, shape))
 
 
 @pytest.mark.parametrize("name", sorted(solvers))
@@ -540,8 +624,7 @@ def test_rk4_and_the_multistep_integrator_are_flaxdiffs(name, solver, barriered)
 def test_video_samples_converge(solver):
     """The frame axis is one more sample axis: the rates broadcast over it and
     the statistics come out the same as for images."""
-    process, model = karras_process()
-    assert_gaussian_stats(generate(process, model, solver, steps=50, count=64, shape=(3, 8, 8, 3)))
+    assert_walks_its_law(Walk(*karras_process(), solver, 50, (3, 8, 8, 3)), count=64)
 
 
 @pytest.mark.parametrize("solver, times, walks", [
@@ -587,7 +670,11 @@ def test_a_key_reproduces_a_trajectory():
 
 DIFFUSERS_FIXTURES = Path(__file__).resolve().parent / "fixtures" / "diffusers"
 REFERENCE = json.loads((DIFFUSERS_FIXTURES / "schedulers.json").read_text())
+SCHEDULER_SEEDS = DIFFUSERS_FIXTURES / "scheduler_seeds"
 ARRAYS = np.load(DIFFUSERS_FIXTURES / "schedulers.npz")
+BETAS = np.load(DIFFUSERS_FIXTURES.parent / "schedules" / "betas.npz")["improved_diffusion_linear_1000"]
+"""improved-diffusion's linear table, the VP and VE cases' (tools/diffusers_reference.py's BETAS)."""
+"""Each scheduler family's seeded walks over check 1's seeds (tools/diffusers_reference.py seeds)."""
 
 # Each fixture case's Dew solver. The scheduler, its config and the model
 # convention a case was recorded under are in schedulers.json.
@@ -638,14 +725,13 @@ DIFFUSERS_CASES = {
 
 
 class VEOracle(nn.Module):
-    """The epsilon oracle on a variance-exploding latent x = x_0 + sigma eps,
-    read at c_noise = log(sigma) / 4, the model under the k-diffusion
-    schedulers."""
+    """The epsilon oracle on a variance-exploding latent x = x_0 + sigma eps
+    (`ve_epsilon`), read at c_noise = log(sigma) / 4, the model under the
+    k-diffusion schedulers, exactly from those (`handed_exactly`)."""
 
     @nn.compact
     def __call__(self, x, temb):
-        sigma = expand(jnp.exp(4.0 * temb), x)
-        return x * sigma / (DATA_STD**2 + sigma**2)
+        return handed_exactly(lambda value, t: ve_epsilon(value, np.exp(4.0 * t)), x, expand(temb, x))
 
 
 def reference_process(name: str) -> tuple[Process, nn.Module]:
@@ -659,7 +745,7 @@ def reference_process(name: str) -> tuple[Process, nn.Module]:
         prediction = EpsilonPredictionTransform()
         if name.startswith("lcm"):
             prediction = ConsistencyBoundary(prediction)
-        return Process(schedule, prediction), VPOracle(schedule=schedule)
+        return Process(schedule, prediction), VPOracle(schedule=schedule, exact=True)
     if convention == "ve":
         karras = REFERENCE["karras"]
         return Process(KarrasVENoiseScheduler(karras["sigma_min"], karras["sigma_max"], karras["rho"]),
@@ -669,20 +755,73 @@ def reference_process(name: str) -> tuple[Process, nn.Module]:
                       KarrasPredictionTransform(edm["sigma_data"]),
                       sampling=KarrasVENoiseScheduler(edm["sigma_min"], edm["sigma_max"], edm["rho"],
                                                       edm["sigma_data"]))
-    return process, KarrasOracle(sigma_data=edm["sigma_data"])
+    return process, KarrasOracle(sigma_data=edm["sigma_data"], exact=True)
 
 
-@pytest.mark.parametrize("name", sorted(DIFFUSERS_CASES))
+def diffusers_walked(name: str, grid):
+    """Dew's arm of a Diffusers 0.34.0 case's seeded walk over `grid` (tools/diffusers_reference.py
+    seeds), a function of a draw's x_T, cotangent and schedule jitter: the latent after each interval of
+    the seed's grid (`seeded_schedule`; `after <i>`) and the VJP of the last against the cotangent
+    (`grad`), on the case's process and oracle and the per-step draws `sample` folds from key 0. A seed's
+    grid is its own, so the solver's state is built on it on the host and the walk, compiled once, takes
+    the grid and that state as values (`sample`'s `initial`)."""
+    from dew.nn.inputs import request_key
+
+    solver = DIFFUSERS_CASES[name]
+    process, model = reference_process(name)
+    case = REFERENCE["cases"][name]
+
+    @jax.jit
+    def walked_over(x_T, cotangent, times, initial):
+        latents, pullback = jax.vjp(lambda value: walk(solver, process, model, value, times, initial=initial),
+                                    x_T)
+        (gradient,) = pullback(jnp.zeros_like(latents).at[-1].set(cotangent.astype(latents.dtype)))
+        return {**{f"after {index}": latent for index, latent in enumerate(latents)}, "grad": gradient}
+
+    @dew_programs
+    def walked(inputs):
+        times = seeded_schedule(case["scheduler"], case["convention"], grid, np.asarray(inputs["jitter"]),
+                                betas=BETAS, karras=REFERENCE["karras"], edm=REFERENCE["edm"]).times
+        x_T = jnp.asarray(inputs["x_T"])
+        with on_host():
+            initial = solver.init(x_T, jnp.asarray(times), process, key=request_key(0))
+        return walked_over(x_T, jnp.asarray(inputs["cotangent"]), jnp.asarray(times), initial)
+
+    return walked
+
+
+OPEN_CASES = {"kdpm2.plain": 13657, "kdpm2.ancestral": 13657}
+"""The cases whose seeds no recording of Diffusers' public setup sizes, by their open ledger row: KDPM2's
+Karras levels read the table's ends alone, which no public input moves level by level, and over a range's
+draws its reference's error is heavy-tailed past check 1's 512 seeds. Each is held on the one draw main
+held it on (`test_open_solver_matches_diffusers_on_one_draw`) until its row closes."""
+
+
+@pytest.mark.parametrize("name", sorted(set(DIFFUSERS_CASES) - set(OPEN_CASES)))
 def test_solver_matches_diffusers_latents_and_gradient(name):
-    """Every latent of the walk, within 1e-4 of that latent's own scale
-    (1 for the VP cases, up to 392 at the top of the k-diffusion ones), and
-    the vector-Jacobian product of the final latent against the fixture's
-    cotangent through the whole trajectory, within 1e-4 of its scale,
-    against Diffusers 0.34.0 on the same grid, oracle and per-step noise.
-    Observed at most 3.0e-5 on the Karras grid, whose float32 sigmas differ
-    from the reference's float64 ones, 1.5e-5 for DEIS at third order, whose
-    coefficients cancel logarithms, and 8.7e-6 elsewhere for the latents;
-    1.3e-5 for the gradients."""
+    """Every latent of the walk and the vector-Jacobian product of the final
+    latent through the whole trajectory, on par with Diffusers 0.34.0's own
+    float32 walk on the same grid, oracle and per-step noise over the seeds
+    its recording declares (check 1): each seed an independent x_T at the
+    walk's top marginal deviation, cotangent of 96 entries and schedule
+    (`seeded_schedule`), the oracle exact from what it is handed on both
+    sides (`handed_exactly`), the truth the scheduler's float64 twin, every
+    table it builds widened (tools/diffusers_reference.py seeds)."""
+    path = SCHEDULER_SEEDS / f"{name.split('.')[0]}.npz"
+    stored = recording(path)
+    seeds = declared_seeds(path)[name]
+    walked = diffusers_walked(name, stored[f"{name}.grid"])
+    draw, recorded, truth = indexed_recording(
+        stored, name, seeds, inputs_of=functools.partial(scheduler_draw, scale=stored[f"{name}.scale"]))
+    assert_as_exact(dew_programs(lambda index, inputs: walked(inputs)), recorded, draw, name, seeds=seeds,
+                    truth_fn=truth)
+
+
+@pytest.mark.parametrize("name", sorted(OPEN_CASES))
+def test_open_solver_matches_diffusers_on_one_draw(name):
+    """An open case's walk (`OPEN_CASES`) against Diffusers 0.34.0's on one draw, on the same grid, oracle
+    and per-step noise: every latent within 1e-4 of that latent's own scale, and the vector-Jacobian
+    product of the final latent against the fixture's cotangent within 1e-4 of its scale."""
     solver = DIFFUSERS_CASES[name]
     process, model = reference_process(name)
     x_T = jnp.asarray(ARRAYS[f"{name}.x_T"])
@@ -1046,6 +1185,588 @@ def test_a_step_between_equal_levels_draws_no_noise(solver):
     np.testing.assert_array_equal(first, second)
 
 
+@pytest.mark.parametrize("solver", [DPMSolverMultistep(2, "dpmsolver++"), DPMSolverMultistep(2, "dpmsolver"),
+                                    DEIS(2), UniPC(2, "bh2")], ids=["dpm-pp", "dpm", "deis", "unipc"])
+def test_a_solved_step_between_equal_levels_keeps_x(solver):
+    """A step of a solver whose weights are solved before the walk, between two equal levels of a
+    variance-exploding process, moves x by nothing and keeps it bit for bit: its weights leave x
+    unshifted (`common._shifted`), where x less its scaled clean prediction and back would round x away
+    (a clean prediction 2^26 times x's)."""
+    process, _ = karras_process()
+    x = jnp.ones((2, 4), jnp.float32)
+    level = jnp.full((2,), 0.4, jnp.float32)
+    state = solver.init(x, jnp.stack([level[0], level[0]]), process, key=jax.random.key(0))
+    huge = jnp.full_like(x, 2.0 ** 26)
+    stepped = solver.step(x, level, level, huge, -huge, state, jax.random.key(1), process, None)[0]
+    np.testing.assert_array_equal(np.asarray(stepped), np.asarray(x))
+
+
+class ConstantOutput(nn.Module):
+    """A model whose output is `value` everywhere."""
+
+    value: float
+
+    @nn.compact
+    def __call__(self, x, temb):
+        return jnp.full_like(x, self.value)
+
+
+@pytest.mark.parametrize(("solver", "transform", "end", "x", "output", "expected"), [
+    (DPMSolverMultistep(1, "dpmsolver++"), DirectPredictionTransform(), 0.5, 2.0 ** 127, -(2.0 ** 127), 0.0),
+    (DPMSolverSinglestep(1, "dpmsolver++"), DirectPredictionTransform(), 0.5, 2.0 ** 127, -(2.0 ** 127), 0.0),
+    (UniPC(1), DirectPredictionTransform(), 0.5, 2.0 ** 127, -(2.0 ** 127), 0.0),
+    (DPMSolverMultistep(1, "dpmsolver++"), DirectPredictionTransform(), 0.75, 1.5 * 2.0 ** 127,
+     -1.5 * 2.0 ** 127, 0.75 * 2.0 ** 127),
+    (DPMSolverMultistep(1, "dpmsolver"), EpsilonPredictionTransform(), 0.5, 2.0 ** 127, -(2.0 ** 127),
+     1.5 * 2.0 ** 127),
+    (DEIS(1), EpsilonPredictionTransform(), 0.5, 2.0 ** 127, -(2.0 ** 127), 1.5 * 2.0 ** 127),
+    (DPMSolverMultistep(1, "dpmsolver++"), DirectPredictionTransform(), 0.5, 2.0 ** -125, 2.5 * 2.0 ** -126,
+     2.25 * 2.0 ** -126),
+    (DPMSolverMultistep(1, "dpmsolver++"), DirectPredictionTransform(), 1 - 2.0 ** -23, -1.5 * 2.0 ** 104,
+     -float(np.finfo(np.float32).max), -(3.5 - 2.0 ** -22) * 2.0 ** 104),
+], ids=["dpm-pp", "dpm-pp-singlestep", "unipc", "dpm-pp-wide", "dpm-eps", "deis", "least-normal",
+        "largest-difference"])
+def test_a_solved_step_whose_sample_and_prediction_are_the_floats_extremes_steps_as_unshifted(
+        solver, transform, end, x, output, expected):
+    """A first-order step of a solver whose weights are solved before the walk, from sigma 1 to `end` of a
+    variance-exploding process, from a sample `x` at an extreme of float32 whose model output (its clean
+    prediction, or its noise) is `output`, is the step its weights take unshifted, a x + b m, in float32:
+    the sample less its rate times the output (`common._moved`) is past float32's range there, though the
+    step is not (2^127 less -2^127; train 1362's P-F2), and so is its half-scale form at its weight doubled
+    (1.5 2^127 from 1 to 0.75); each value exact in float32, whichever order its products round in. At
+    float32's least normal the same: from 2 2^-126 at a clean 2.5 2^-126, 2.25 2^-126, where the shifted
+    difference, -2^-127, is a subnormal a device flushes (train 1423's P0). And from 1 to 1 - 2^-23, from
+    -1.5 2^104 at a clean of float32's most negative, the correctly rounded -(3.5 - 2^-22) 2^104, where the
+    shifted difference lands at the float's largest and TwoSum's rounding of it overflowed, dropped
+    (train 1430's P0)."""
+    from dew.diffusion.schedules.source_grids import SigmaGrid
+
+    sigmas = np.asarray([1.0, end])
+    denoiser = Process(SigmaGrid(sigmas, sigmas, 1.0), transform).denoiser(ConstantOutput(output), {}, {})
+    x_T = jnp.full((2, 4), x, jnp.float32)
+    times = np.asarray([1, 0], np.float32)
+    stepped = sample(denoiser, x_T, solver=solver, key=jax.random.key(0), times=times, final_denoise=False)
+    np.testing.assert_array_equal(np.asarray(stepped), np.full((2, 4), expected, np.float32))
+
+
+@pytest.mark.parametrize(("x", "noise", "expected"), [(2, 1.25, 2.75), (4, 1.5, 6.5)],
+                         ids=["shift", "partner"])
+def test_a_solved_step_whose_weighed_product_flushes_steps_as_unshifted(x, noise, expected):
+    """A first-order noise-prediction DPM-Solver step of a rectified flow from 0.75 to 0.5 (x and its noise
+    in units of 2^-126) is its unshifted step, 2 x - eps, exactly: from 2 whose noise is 1.25, 2.75, its
+    shift's product, 0.75 times the noise, a subnormal a device flushes, which the shifted step read as zero
+    (train 1430's P0); from 4 whose noise is 1.5, 6.5, its shift's product and difference normal but the
+    noise's shifted weight, a half, weighing it to a subnormal, the shifted step's 5.75 (train 1452's P0)."""
+    least = 2.0 ** -126
+    denoiser = Process(FlowMatchingScheduler(), EpsilonPredictionTransform()).denoiser(
+        ConstantOutput(noise * least), {}, {})
+    stepped = sample(denoiser, jnp.full((2, 4), x * least, jnp.float32),
+                     solver=DPMSolverMultistep(1, "dpmsolver"), key=jax.random.key(0),
+                     times=np.asarray([0.75, 0.5], np.float32), final_denoise=False)
+    np.testing.assert_array_equal(np.asarray(stepped), np.full((2, 4), expected * least, np.float32))
+
+
+def _midpoint_walk(sigmas: tuple[float, float, float]):
+    """A second-order midpoint noise-prediction DPM-Solver walk over the variance-exploding grid `sigmas`
+    (its coordinates 2, 1 and 0) from x = 0, as a function of the noise each of its two steps reads."""
+    from dew.diffusion.schedules.source_grids import SigmaGrid
+
+    levels = np.asarray(sigmas)
+    process = Process(SigmaGrid(levels, levels, 1.0), EpsilonPredictionTransform())
+    solver = DPMSolverMultistep(2, "dpmsolver", lower_order_final=False)
+    times = jnp.asarray([2.0, 1.0, 0.0])
+    start = jnp.zeros((2, 4))
+    with on_host():
+        state = solver.init(start, times, process, key=jax.random.key(0))
+
+    def walk(first, second):
+        x, held = start, state
+        for index, eps in enumerate((first, second)):
+            x, held = solver.step(x, times[index], times[index + 1], x - levels[index] * eps, eps, held,
+                                  jax.random.key(0), process, None)
+        return x
+
+    return walk
+
+
+def test_a_second_order_step_whose_weighed_history_difference_flushes_weighs_it_apart():
+    """A second-order midpoint DPM-Solver walk over a variance-exploding grid of sigmas 4, 2 and 1 from
+    x = 0, its noise predictions 2.5 and then 4 (in units of 2^-126), steps first to -2 2.5 = -5 and then by
+    -(2 - 1) 4 and its history difference's -1/2 of 4 - 2.5: -9.75 exactly, the difference weighed apart,
+    -2 + 1.25, where weighing it whole is -0.75, a subnormal a device flushes, -9 (train 1452's review)."""
+    least = 2.0 ** -126
+    stepped = _midpoint_walk((4.0, 2.0, 1.0))(*(jnp.full((2, 4), noise * least, jnp.float32)
+                                                 for noise in (2.5, 4.0)))
+    np.testing.assert_array_equal(np.asarray(stepped), np.full((2, 4), -9.75 * least, np.float32))
+
+
+def test_a_tapered_step_reads_no_flushed_difference_of_a_history_it_does_not_weigh():
+    """A third-order noise-prediction DPM-Solver walk of a rectified flow over times 0.625, 0.5625, 0.5 and
+    0.125 from 1.125 2^127, its noise 2 2^-126, 2.5 2^-126 and then 2^127, takes its last step at first order
+    (its taper) to 1.875 2^127, finite as its shifted step forms it: the second history difference it weighs
+    by zero, a half 2^-126 a device flushes, is none of the step's, where reading it took the step apart,
+    1.75 times 1.5 2^127, past the float's range (train 1452's review)."""
+    least, most = 2.0 ** -126, 2.0 ** 127
+    process = Process(FlowMatchingScheduler(), EpsilonPredictionTransform())
+    solver = DPMSolverMultistep(3, "dpmsolver")
+    times = jnp.asarray([0.625, 0.5625, 0.5, 0.125])
+    x = jnp.full((2, 4), 1.125 * most, jnp.float32)
+    with on_host():
+        held = solver.init(x, times, process, key=jax.random.key(0))
+    for index, noise in enumerate((2 * least, 2.5 * least, most)):
+        eps = jnp.full((2, 4), noise, jnp.float32)
+        # A noise prediction's step reads its noise alone (`DPMSolverMultistep.step`).
+        x, held = solver.step(x, times[index], times[index + 1], x, eps, held, jax.random.key(0), process,
+                              None)
+    np.testing.assert_array_equal(np.asarray(x), np.full((2, 4), 1.875 * most, np.float32))
+
+
+def test_a_second_order_step_keeps_a_history_weight_below_the_normals():
+    """A second-order midpoint noise-prediction DPM-Solver walk over a variance-exploding grid of sigmas 64,
+    16 and 12 times 2^-126, from x = 0, its noise predictions 0 and then 2^100, weighs its history's
+    difference by its weight below float32's normals, about -0.415 2^-126: the walk is float64's own walk
+    rounded once, its history term kept, where a weight stored as a subnormal a device flushes drops it
+    (train 1461's P0)."""
+    least = 2.0 ** -126
+
+    def walk():
+        from dew.diffusion.schedules.source_grids import SigmaGrid
+
+        levels = np.asarray([64 * least, 16 * least, 12 * least])
+        process = Process(SigmaGrid(levels, levels, 1.0), EpsilonPredictionTransform())
+        solver = DPMSolverMultistep(2, "dpmsolver", lower_order_final=False)
+        times = jnp.asarray([2.0, 1.0, 0.0])
+        x = jnp.zeros((2, 4))
+        with on_host():
+            held = solver.init(x, times, process, key=jax.random.key(0))
+        for index, noise in enumerate((0.0, 2.0 ** 100)):
+            eps = jnp.full((2, 4), noise, x.dtype)
+            x, held = solver.step(x, times[index], times[index + 1], x - levels[index] * eps, eps, held,
+                                  jax.random.key(0), process, None)
+        return np.asarray(x)
+
+    found = walk()
+    with jax.enable_x64(new_val=True):
+        truth = walk()
+    np.testing.assert_array_equal(found, truth.astype(np.float32))
+
+
+def test_a_first_order_step_weighs_a_term_of_the_normals_size_by_a_weight_below_them():
+    """A first-order noise-prediction DPM-Solver step of a variance-exploding grid from 3 to 1.5 times
+    2^-126, from x = 0 whose noise is 0.75, is -1.125 2^-126 exactly: its weight of 1.5 2^-126 split with
+    the term, 0.75 taking none of its power where 0.75 2^-126 alone flushes (train 1461's review)."""
+    from dew.diffusion.schedules.source_grids import SigmaGrid
+
+    least = 2.0 ** -126
+    levels = np.asarray([3 * least, 1.5 * least])
+    process = Process(SigmaGrid(levels, levels, 1.0), EpsilonPredictionTransform())
+    solver, times = DPMSolverMultistep(1, "dpmsolver"), jnp.asarray([1.0, 0.0])
+    x, eps = jnp.zeros((2, 4)), jnp.full((2, 4), 0.75, jnp.float32)
+    with on_host():
+        state = solver.init(x, times, process, key=jax.random.key(0))
+    stepped, _ = solver.step(x, times[0], times[1], x - levels[0] * eps, eps, state, jax.random.key(0),
+                             process, None)
+    np.testing.assert_array_equal(np.asarray(stepped), np.full((2, 4), -1.125 * least, np.float32))
+
+
+def test_a_heun_step_of_no_length_leaves_x_as_it_is():
+    """A Heun walk of a rectified flow between equal times, 0.5 and 0.5, from x = 0 under a clean
+    prediction of 2^127 leaves x at 0: a step of no length takes no corrector, whose derivative, -2^128,
+    times the zero interval was NaN (train 1474's P0)."""
+    denoiser = Process(FlowMatchingScheduler(), DirectPredictionTransform()).denoiser(
+        ConstantOutput(2.0 ** 127), {}, {})
+    stepped = sample(denoiser, jnp.zeros((2, 4), jnp.float32), solver=Heun(), key=jax.random.key(0),
+                     times=np.asarray([0.5, 0.5], np.float32), final_denoise=False)
+    np.testing.assert_array_equal(np.asarray(stepped), np.zeros((2, 4), np.float32))
+
+
+def test_a_heun_step_masks_its_corrector_by_row_and_keeps_a_repeated_levels_slope():
+    """A Heun step of a rectified flow whose first row's interval has no length (0.5 to 0.5, x 0 under a
+    clean prediction of 2^127) and whose second's has (0.5 to 0.375, x 1 under 0, then 0.375 at the
+    corrector) leaves the first at 0 and corrects the second to 0.8125, its slopes 2 and 1 (its Euler step
+    0.75); and a repeated level's step differentiates in its target as its slope, 2 at x 1, 2^127 at slopes
+    of 2^127, 2^-126 at slopes of the least normal (review of train 1474's P0)."""
+    process = Process(FlowMatchingScheduler(), DirectPredictionTransform())
+    x = jnp.stack([jnp.zeros(4), jnp.ones(4)])
+    clean = jnp.stack([jnp.full(4, 2.0 ** 127), jnp.zeros(4)])
+
+    def step(x, clean, after, t_next):
+        return Heun().step(x, jnp.asarray([0.5, 0.5]), t_next, clean, None, (), jax.random.key(0), process,
+                           lambda value, time: (after, None))[0]
+
+    after = jnp.stack([jnp.full(4, 2.0 ** 127), jnp.full(4, 0.375)])
+    stepped = step(x, clean, after, jnp.asarray([0.5, 0.375]))
+    np.testing.assert_array_equal(np.asarray(stepped), np.stack([np.zeros(4), np.full(4, 0.8125)]))
+    nothing = jnp.zeros((2, 4))
+    _, moved = jax.jvp(lambda level: step(jnp.ones((2, 4)), nothing, nothing, level), (jnp.full((2,), 0.5),),
+                       (jnp.ones((2,)),))
+    np.testing.assert_array_equal(np.asarray(moved), np.full((2, 4), 2.0, np.float32))
+
+    def unit(x, clean, level):
+        return Heun().step(x, jnp.ones(2), level, clean, None, (), jax.random.key(0), process,
+                           lambda value, time: (clean, None))[0]
+
+    # From sigma 1 to itself: at x 2^127 under clean predictions of 0, slopes of 2^127 whose mean is in the
+    # range though their sum is not, each slope's own derivative (-2^127) in it too; at x 0 under -2^-126,
+    # slopes of the least normal, whose halves a device flushes.
+    for x, clean, slope in ((2.0 ** 127, 0.0, 2.0 ** 127), (0.0, -(2.0 ** -126), 2.0 ** -126)):
+        _, moved = jax.jvp(lambda level, x=x, clean=clean: unit(jnp.full((2, 4), x), jnp.full((2, 4), clean),
+                                                                level),
+                           (jnp.ones(2),), (jnp.ones(2),))
+        np.testing.assert_array_equal(np.asarray(moved), np.full((2, 4), slope, np.float32))
+
+
+def test_a_solved_steps_tangent_is_its_unshifted_updates():
+    """The tangent of a first-order DPM-Solver++ step of a variance-exploding process from sigma 1 to 0.5,
+    half x and half its clean prediction, from x = 1 whose clean prediction 2 - x follows it, is its
+    unshifted update's: a tangent of 2^127 steps to 0, where the shifted difference's, 2^127 less -2^127,
+    passes the float's range before it is weighed (train 1430's P0)."""
+    from dew.diffusion.schedules.source_grids import SigmaGrid
+
+    sigmas = np.asarray([1.0, 0.5])
+    process = Process(SigmaGrid(sigmas, sigmas, 1.0), DirectPredictionTransform())
+    solver, times = DPMSolverMultistep(1, "dpmsolver++"), jnp.asarray([1, 0], jnp.float32)
+    start = jnp.ones((2, 4), jnp.float32)
+    with on_host():
+        state = solver.init(start, times, process, key=jax.random.key(0))
+
+    def step(value):
+        clean = 2 - value
+        return solver.step(value, times[0], times[1], clean, value - clean, state, jax.random.key(0), process,
+                           None)[0]
+
+    _, moved = jax.jvp(step, (start,), (jnp.full((2, 4), 2.0 ** 127, jnp.float32),))
+    np.testing.assert_array_equal(np.asarray(moved), np.zeros((2, 4), np.float32))
+
+
+def test_a_second_order_steps_tangent_cancels_equal_history_tangents():
+    """The tangent of a second-order midpoint DPM-Solver walk in its noise predictions over a
+    variance-exploding grid of sigmas 0.5 + 2^-8, 0.5 and 0.25 (its coordinates 2, 1 and 0), from x = 0,
+    both predictions moved alike by 2^127, is 2^127 times its unit tangent, a power of two scaling every term
+    exactly: its history's difference moves by nothing, where taking each prediction apart under its
+    history weight, about 11, passes the range (train 1430's review)."""
+    walk = _midpoint_walk((0.5 + 2.0 ** -8, 0.5, 0.25))
+
+    def tangent(size):
+        moved = jnp.full((2, 4), size, jnp.float32)
+        return np.asarray(jax.jvp(lambda eps: walk(eps, eps), (jnp.zeros((2, 4)),), (moved,))[1])
+
+    unit = tangent(1.0)
+    assert np.all(unit != 0), unit
+    np.testing.assert_array_equal(tangent(2.0 ** 127), unit * np.float32(2.0 ** 127))
+
+
+def test_a_second_order_steps_tangent_weighs_its_history_difference_formed_whole():
+    """The tangent of a second-order midpoint DPM-Solver walk over a variance-exploding grid of sigmas 8, 4
+    and 2, from x = 0, in its second noise prediction alone, moved by 1.5 2^-126: its first-order part,
+    -(4 - 2) of it, and its history difference's, -(4 - 2) / 2 of the difference 1.5 2^-126 less 0, both
+    normal, -4.5 2^-126; halving the difference's operands first flushes each and drops the second (train
+    1452's P0)."""
+    least = 2.0 ** -126
+    zeros = jnp.zeros((2, 4))
+    _, moved = jax.jvp(_midpoint_walk((8.0, 4.0, 2.0)), (zeros, zeros),
+                       (zeros, jnp.full((2, 4), 1.5 * least, jnp.float32)))
+    np.testing.assert_array_equal(np.asarray(moved), np.full((2, 4), -4.5 * least, np.float32))
+
+
+def test_a_flowed_steps_tangent_in_its_level_forms_no_fraction():
+    """A rectified flow's Euler step from sigma 2^-16 to 3 2^-18 at x = 2^-16 and a clean prediction of
+    zero, its target level moved by 2^115, moves x by 2^115 (the interval's tangent times x over sigma),
+    where forming the fraction's tangent first, 2^115 / 2^-16, passes the range (train 1461's P0)."""
+    clean = jnp.zeros((2, 4), jnp.float32)
+    source = jnp.full((2,), 2.0 ** -16, jnp.float32)
+    x = jnp.full((2, 4), 2.0 ** -16, jnp.float32)
+    _, moved = jax.jvp(lambda level: _flowed_step(x, clean, source, level),
+                       (jnp.full((2,), 3 * 2.0 ** -18, jnp.float32),),
+                       (jnp.full((2,), 2.0 ** 115, jnp.float32),))
+    np.testing.assert_array_equal(np.asarray(moved), np.full((2, 4), 2.0 ** 115, np.float32))
+
+
+def test_a_flowed_steps_pullback_takes_its_interval_before_its_level():
+    """A rectified flow's Euler step from sigma 1/2 to 3/8 pulls a cotangent of 2^127 back to x as 0.75 2^127
+    and to its clean prediction as 0.25 2^127, the interval -1/8 taken before the level divides (train
+    1461's review: over the level first, 2^128 passed the range)."""
+    source = jnp.full((2,), 0.5, jnp.float32)
+
+    def step(x, clean):
+        return _flowed_step(x, clean, source, jnp.full((2,), 0.375, jnp.float32))
+
+    _, pullback = jax.vjp(step, jnp.ones((2, 4), jnp.float32), jnp.zeros((2, 4), jnp.float32))
+    x, clean = pullback(jnp.full((2, 4), 2.0 ** 127, jnp.float32))
+    np.testing.assert_array_equal(np.asarray(x), np.full((2, 4), 0.75 * 2.0 ** 127, np.float32))
+    np.testing.assert_array_equal(np.asarray(clean), np.full((2, 4), 0.25 * 2.0 ** 127, np.float32))
+
+
+@pytest.mark.mesh(devices=2)
+def test_a_flowed_step_pulls_a_replicated_prediction_back_across_its_split_rows():
+    """Under a checked `jax.shard_map` splitting x's rows over two devices beside a replicated clean
+    prediction, a near Euler update from sigma 1 to 1/2 (`sigma._flowed`, x + (x - x_0) dt / sigma) pulls
+    its global sum back to the prediction as each device's partial summed: its weight 1/2 a row, both rows'
+    1 (train 1461's P0: unsummed, the replicated prediction's cotangent varied and the transpose refused
+    it)."""
+    from jax.sharding import NamedSharding, PartitionSpec
+
+    from dew.sampling.solvers.sigma import _flowed
+
+    mesh = jax.make_mesh((2,), ("rows",), devices=jax.devices()[:2])
+
+    def summed(x, clean):
+        def local(x, clean):
+            one, half = jnp.ones_like(x), jnp.full_like(x, -0.5)
+            return jax.lax.psum(jnp.sum(_flowed(x, one, clean, half, one)), "rows")
+
+        return jax.shard_map(local, mesh=mesh, in_specs=(PartitionSpec("rows"), PartitionSpec()),
+                             out_specs=PartitionSpec())(x, clean)
+
+    x = jax.device_put(jnp.ones((2, 4), jnp.float32), NamedSharding(mesh, PartitionSpec("rows")))
+    pulled = jax.jit(jax.grad(summed, argnums=1))(x, jnp.ones((1, 4), jnp.float32))
+    np.testing.assert_array_equal(np.asarray(pulled), np.full((1, 4), 1.0, np.float32))
+
+
+def test_an_euler_steps_tangent_in_its_clean_prediction_forms_its_difference_whole():
+    """A variance-exploding Euler step from sigma 1 to 1/2 at x = 1 and a clean prediction of 1, its
+    prediction moved by 2^-125, moves x by (1/2) 2^-125 = 2^-126: halving the difference's operands
+    first, each half's product with the fraction a subnormal, flushes both (train 1452's P0)."""
+    from dew.diffusion.schedules.source_grids import SigmaGrid
+
+    least = 2.0 ** -126
+    sigmas = np.asarray([1.0, 0.5])
+    process = Process(SigmaGrid(sigmas, sigmas, 1.0), DirectPredictionTransform())
+    ones = jnp.ones((2, 4), jnp.float32)
+
+    def step(clean):
+        return Euler().step(ones, jnp.full((2,), 1.0), jnp.full((2,), 0.0), clean, None, (),
+                            jax.random.key(0), process, None)[0]
+
+    _, moved = jax.jvp(step, (ones,), (jnp.full((2, 4), 2 * least, jnp.float32),))
+    np.testing.assert_array_equal(np.asarray(moved), np.full((2, 4), least, np.float32))
+
+
+def _flowed_step(x, clean, source, target):
+    """A rectified flow's Euler step from level `source` to `target` (rows of two), its clean prediction
+    `clean`."""
+    process = Process(FlowMatchingScheduler(), DirectPredictionTransform())
+    return Euler().step(x, source, target, clean, None, (), jax.random.key(0), process, None)[0]
+
+
+def test_an_euler_steps_derivative_in_its_level_of_its_derivative_in_x_is_the_updates():
+    """The derivative in its target level of an Euler step's derivative in x, a rectified flow's interior
+    step from sigma 0.5 at a clean prediction of zero, x (1 + (sigma_next - 0.5) / 0.5), is 1 / 0.5 exactly:
+    its fraction live in its tangent, not stopped (train 1430's review)."""
+    clean = jnp.zeros((2, 4), jnp.float32)
+    source = jnp.full((2,), 0.5, jnp.float32)
+
+    def slope(level):
+        return jax.jvp(lambda x: _flowed_step(x, clean, source, level), (jnp.ones((2, 4), jnp.float32),),
+                       (jnp.ones((2, 4), jnp.float32),))[1]
+
+    _, mixed = jax.jvp(slope, (jnp.full((2,), 0.375, jnp.float32),), (jnp.ones((2,), jnp.float32),))
+    np.testing.assert_array_equal(np.asarray(mixed), np.full((2, 4), 2.0, np.float32))
+
+
+@pytest.mark.parametrize(("x", "along", "expected"), [(1.0, 2.0 ** 126, 2.0 ** 127),
+                                                       (3 * 2.0 ** -126, 0.25, 1.5 * 2.0 ** -126)],
+                         ids=["near-the-largest", "near-the-least-normal"])
+def test_an_euler_steps_tangent_in_its_level_weighs_its_difference_by_its_fractions(x, along, expected):
+    """An Euler step's tangent in its target level, a rectified flow's interior step from sigma 0.5 to
+    0.375 at a clean prediction of zero, is its fraction's tangent (along / 0.5) times the difference
+    x - x_0 = x: 2^127 at x = 1 moved by 2^126, finite where the fraction doubled before weighing passes the
+    range; 1.5 2^-126 at x = 3 2^-126 moved by 1/4, normal where weighing each half of x flushes (train
+    1430's review)."""
+    clean = jnp.zeros((2, 4), jnp.float32)
+    source = jnp.full((2,), 0.5, jnp.float32)
+    _, moved = jax.jvp(lambda level: _flowed_step(jnp.full((2, 4), x, jnp.float32), clean, source, level),
+                       (jnp.full((2,), 0.375, jnp.float32),), (jnp.full((2,), along, jnp.float32),))
+    np.testing.assert_array_equal(np.asarray(moved), np.full((2, 4), expected, np.float32))
+
+
+def test_an_euler_steps_tangent_in_its_levels_is_its_formed_differences():
+    """The tangent in its target level of an Euler step of a linear variance-exploding grid from sigma 1
+    to 0.75, from x = 2^127 at the same clean prediction, is the difference the step formed, zero, times
+    the fraction's: no product of the fraction's tangent with x and with its clean prediction apart (2
+    2^127 less 2 2^127; train 1430's P0)."""
+    schedule = KarrasVENoiseScheduler(sigma_min=0.75, sigma_max=1.0, rho=1.0)
+    process = Process(schedule, DirectPredictionTransform())
+    x = jnp.full((2, 4), 2.0 ** 127, jnp.float32)
+    top, bottom = jnp.full((2,), schedule.T, jnp.float32), jnp.zeros((2,), jnp.float32)
+
+    def step(level):
+        return Euler().step(x, top, level, x, None, (), jax.random.key(0), process, None)[0]
+
+    _, moved = jax.jvp(step, (bottom,), (jnp.full((2,), 8 * schedule.T, jnp.float32),))
+    np.testing.assert_array_equal(np.asarray(moved), np.zeros((2, 4), np.float32))
+
+
+def test_a_solved_step_whose_sum_lands_near_the_largest_float_steps_finite():
+    """A first-order noise-prediction step over a variance-exploding process from sigma 2 to 1, from x =
+    -3 2^103 whose noise is float32's most negative: its shifted difference passes float32's range, so the
+    step is taken unshifted, x + FLT_MAX, which rounds to FLT_MAX - 2^104, finite, though the rounding a
+    compensated sum carries there passes the range (train 1407's P0)."""
+    from dew.diffusion.schedules.source_grids import SigmaGrid
+
+    most = float(np.finfo(np.float32).max)
+    sigmas = np.asarray([2.0, 1.0])
+    denoiser = Process(SigmaGrid(sigmas, sigmas, 1.0), EpsilonPredictionTransform()).denoiser(
+        ConstantOutput(-most), {}, {})
+    x_T = jnp.full((2, 4), -3 * 2.0 ** 103, jnp.float32)
+    stepped = sample(denoiser, x_T, solver=DPMSolverMultistep(1, "dpmsolver"), key=jax.random.key(0),
+                     times=np.asarray([1, 0], np.float32), final_denoise=False)
+    np.testing.assert_array_equal(np.asarray(stepped), np.full((2, 4), most - 2.0 ** 104, np.float32))
+
+
+def test_a_solved_step_whose_weighted_difference_overflows_steps_as_unshifted():
+    """A first-order noise-prediction step over a rectified flow from t 0.75 to 0.5, from x = 0 whose noise
+    is 1.5 2^127: its shifted difference, -1.125 2^127, is finite, its product with its weight 2 is not, and
+    the step is the one its weights take unshifted, -1.5 2^127 (train 1373's F1)."""
+    process = Process(FlowMatchingScheduler(), EpsilonPredictionTransform())
+    denoiser = process.denoiser(ConstantOutput(1.5 * 2.0 ** 127), {}, {})
+    x_T = jnp.zeros((2, 4), jnp.float32)
+    stepped = sample(denoiser, x_T, solver=DPMSolverMultistep(1, "dpmsolver"), key=jax.random.key(0),
+                     times=np.asarray([0.75, 0.5], np.float32), final_denoise=False)
+    np.testing.assert_array_equal(np.asarray(stepped), np.full((2, 4), -1.5 * 2.0 ** 127, np.float32))
+
+
+def test_an_endpoint_step_at_the_floats_extremes_keeps_every_term_it_weighs():
+    """A first-order clean-prediction step from a variance-preserving table's pure-noise end, from x at 1.5
+    2^127 whose clean prediction is the same: its row shifts nothing and weighs the clean prediction and the
+    noise as they are, so its overflowing sum is the walk's own, no term of it dropped for a shift it never
+    took (train 1373's F1 review)."""
+    from dew.diffusion.schedules.discrete import DiscreteNoiseScheduler
+
+    process = Process(DiscreteNoiseScheduler(np.asarray([0.5, 1.0])), DirectPredictionTransform())
+    denoiser = process.denoiser(ConstantOutput(1.5 * 2.0 ** 127), {}, {})
+    x_T = jnp.full((2, 4), 1.5 * 2.0 ** 127, jnp.float32)
+    stepped = sample(denoiser, x_T, solver=DPMSolverMultistep(1, "dpmsolver++"), key=jax.random.key(0),
+                     times=np.asarray([1, 0], np.float32), final_denoise=False)
+    assert np.all(np.isposinf(np.asarray(stepped)))
+
+
+class Flipping(nn.Module):
+    """A model whose output is -2^127 above model time `at` and +2^127 below it."""
+
+    at: float
+
+    @nn.compact
+    def __call__(self, x, temb):
+        later = jnp.reshape(temb, (-1,) + (1,) * (x.ndim - 1)) > self.at
+        return jnp.where(later, -(2.0 ** 127), 2.0 ** 127) * jnp.ones_like(x)
+
+
+@pytest.mark.parametrize(("solver", "expected"), [
+    (DEIS(order=2, lower_order_final=False), None),
+    (DPMSolverMultistep(2, "dpmsolver", lower_order_final=False), -0.5 * 2.0 ** 127),
+    (UniPC(order=2, predict_x0=False, lower_order_final=False), None)], ids=["deis", "dpm", "unipc"])
+def test_a_second_order_step_whose_history_spans_the_floats_extremes_stays_finite(solver, expected):
+    """Two noise-prediction steps over a variance-exploding grid of sigmas 1, 0.5 and 0.25 from x at
+    -2^126, its noise -2^127 then +2^127: the first lands at zero, and the second order step's history
+    difference, 2^128, is past float32's range though its weighted outputs are not, so the step weighs them
+    apart: finite, DPM-Solver's midpoint step -0.25 2^127 less half its weight on 2^128, -0.5 2^127 exactly
+    (train 1379's P-F1). The grid's times count its levels from its last (`SigmaGrid`: 2, 1, 0)."""
+    from dew.diffusion.schedules.source_grids import SigmaGrid
+
+    sigmas = np.asarray([1.0, 0.5, 0.25])
+    process = Process(SigmaGrid(sigmas, sigmas, 1.0), EpsilonPredictionTransform())
+    denoiser = process.denoiser(Flipping(0.75), {}, {})
+    x_T = jnp.full((2, 4), -(2.0 ** 126), jnp.float32)
+    stepped = np.asarray(sample(denoiser, x_T, solver=solver, key=jax.random.key(0),
+                                times=np.asarray([2.0, 1.0, 0.0], np.float32), final_denoise=False))
+    assert np.all(np.isfinite(stepped)), stepped
+    if expected is not None:
+        np.testing.assert_array_equal(stepped, np.full((2, 4), expected, np.float32))
+
+
+def test_a_tapered_final_step_reads_no_history_it_does_not_weigh():
+    """An order-2 noise-prediction walk whose last step tapers to first order (`lower_order_final`) over a
+    rectified flow's times 0.875, 0.75 and 0.25 from zero, its noise -2^127 then +2^127: the history it no
+    longer weighs, 2^128 apart, decides nothing, and the last step is its first-order one, 2^127."""
+    # The flow's model reads its time in thousandths (`FlowMatchingScheduler.model_time`).
+    process = Process(FlowMatchingScheduler(), EpsilonPredictionTransform())
+    denoiser = process.denoiser(Flipping(800.0), {}, {})
+    x_T = jnp.zeros((2, 4), jnp.float32)
+    stepped = sample(denoiser, x_T, solver=DPMSolverMultistep(2, "dpmsolver"), key=jax.random.key(0),
+                     times=np.asarray([0.875, 0.75, 0.25], np.float32), final_denoise=False)
+    np.testing.assert_array_equal(np.asarray(stepped), np.full((2, 4), 2.0 ** 127, np.float32))
+
+
+@pytest.mark.parametrize(("x", "clean", "levels", "expected"), [
+    (1.0, -1 + 2.0 ** -24, (1.0, 0.5), 2.0 ** -25),
+    (1.0, -1.0, (47 / 64, 47 / 128), 0.0),
+    (2.0 ** -126, -(2.0 ** -126), (1.0, 0.5), 0.0),
+    (2.0 ** -125, 2.5 * 2.0 ** -126, (1.0, 0.5), 2.25 * 2.0 ** -126),
+], ids=["residual", "fraction", "least-normal", "subnormal-difference"])
+def test_a_flow_step_between_near_levels_steps_as_ddim_exactly(x, clean, levels, expected):
+    """One Euler step of a rectified flow between near levels, from `x` whose clean prediction is `clean`,
+    lands where DDIM's exact step does: from sigma 1 to 0.5 at 1 and -1 + 2^-24, its difference, 2 -
+    2^-24, rounds to 2, and the step keeps what rounding took, 2^-25 exactly, not 0 (train 1389's P0); from
+    47/64 to 47/128 at 1 and -1, half the way to its clean prediction, 0 exactly, not the 2^-24 that
+    dividing by the level and multiplying by the interval round to (train 1407's P0); at float32's least
+    normal and its negative, 0, its values not halved into subnormals a device flushes (train 1419's P0);
+    and from 2 2^-126 at 2.5 2^-126, 2.25 2^-126, the half-step its difference makes, a subnormal, not
+    flushed (train 1419's review)."""
+    process = Process(FlowMatchingScheduler(), DirectPredictionTransform())
+    denoiser = process.denoiser(ConstantOutput(clean), {}, {})
+    stepped = sample(denoiser, jnp.full((2, 4), x, jnp.float32), solver=Euler(), key=jax.random.key(0),
+                     times=np.asarray(levels, np.float32), final_denoise=False)
+    np.testing.assert_array_equal(np.asarray(stepped), np.full((2, 4), expected, np.float32))
+
+
+@pytest.mark.parametrize(("x", "follows", "tangent", "expected"), [
+    (2.0 ** -126, False, 2.0 ** 120, 2.0 ** 119),
+    (2.0 ** 127, True, 2.0 ** 127, 0.0),
+], ids=["least-normal", "largest"])
+def test_a_flow_steps_tangent_is_its_weighed_updates(x, follows, tangent, expected):
+    """The tangent of one Euler step of a rectified flow from sigma 1 to 0.5, half x and half its clean
+    prediction, is that update's: at float32's least normal, x = 2^-126 whose clean prediction is its
+    negative, held, an input tangent of 2^120 steps to 2^119, where the primal's own scale at these values
+    (2^24) would carry it past the range (train 1423's P0); at 2^127 whose clean prediction is its negative,
+    following x, a tangent of 2^127 steps to 0, where the difference of the operands' tangents before they
+    are weighed, 2^128, is past it (its review)."""
+    process = Process(FlowMatchingScheduler(), DirectPredictionTransform())
+    held = jnp.full((2, 4), -x, jnp.float32)
+    times = jnp.full((2,), 1.0, jnp.float32), jnp.full((2,), 0.5, jnp.float32)
+
+    def step(value):
+        clean = -value if follows else held
+        return Euler().step(value, *times, clean, None, (), jax.random.key(0), process, None)[0]
+
+    start = jnp.full((2, 4), x, jnp.float32)
+    _, moved = jax.jvp(step, (start,), (jnp.full((2, 4), tangent, jnp.float32),))
+    np.testing.assert_array_equal(np.asarray(moved), np.full((2, 4), expected, np.float32))
+
+
+@pytest.mark.parametrize(("x", "expected"), [(2.0 ** -26, 9 * 2.0 ** -26), (3 * 2.0 ** -26, 11 * 2.0 ** -26)],
+                         ids=["whole", "part"])
+def test_a_short_step_from_a_small_sample_keeps_the_sample_its_shift_rounds_away(x, expected):
+    """A first-order DPM-Solver++ step of a variance-exploding grid from sigma 1 to 1 - 2^-23, from a small
+    x whose clean prediction is 1: the shifted difference x - 1 rounds x away, whole or in part, and the step
+    keeps what it rounded away, the unshifted step's exactly: 9 2^-26 from 2^-26, not 8, and 11 2^-26 from
+    3 2^-26, not 12 (train 1389's P0)."""
+    from dew.diffusion.schedules.source_grids import SigmaGrid
+
+    sigmas = np.asarray([1.0, 1.0 - 2.0 ** -23])
+    process = Process(SigmaGrid(sigmas, sigmas, 1.0), DirectPredictionTransform())
+    denoiser = process.denoiser(ConstantOutput(1.0), {}, {})
+    stepped = sample(denoiser, jnp.full((2, 4), x, jnp.float32), solver=DPMSolverMultistep(1, "dpmsolver++"),
+                     key=jax.random.key(0), times=np.asarray([1.0, 0.0], np.float32), final_denoise=False)
+    np.testing.assert_array_equal(np.asarray(stepped), np.full((2, 4), expected, np.float32))
+
+
+def test_a_third_order_step_whose_shift_overflows_keeps_its_finite_history_whole():
+    """Three noise-prediction DEIS steps of a variance-exploding grid of sigmas 1, 0.5, 0.25 and 0.125 from
+    x = -2^126, its noise 1.5 2^127 throughout: the third step's shifted difference passes float32's range,
+    and its history's differences, zero, are weighed whole, not apart (whose products, inf less inf, are no
+    number), so the walk lands finite (train 1389's P0)."""
+    from dew.diffusion.schedules.source_grids import SigmaGrid
+
+    sigmas = np.asarray([1.0, 0.5, 0.25, 0.125])
+    process = Process(SigmaGrid(sigmas, sigmas, 1.0), EpsilonPredictionTransform())
+    denoiser = process.denoiser(ConstantOutput(1.5 * 2.0 ** 127), {}, {})
+    stepped = sample(denoiser, jnp.full((2, 4), -(2.0 ** 126), jnp.float32),
+                     solver=DEIS(order=3, lower_order_final=False), key=jax.random.key(0),
+                     times=np.asarray([3.0, 2.0, 1.0, 0.0], np.float32), final_denoise=False)
+    assert np.all(np.isfinite(np.asarray(stepped))), stepped
+
+
 WALK_SEEDS = 8
 """The DDIM-against-Diffusers walk's declared draws (check 1), sized by `seeds_for` paired with Dew's walk on
 armada."""
@@ -1054,13 +1775,11 @@ armada."""
 def test_ddim_at_eta_one_walks_as_diffusers_ddim_scheduler_on_the_same_draws():
     """DDIM at eta 1 over a variance-preserving source grid walks as Diffusers 0.34.0's
     `DDIMScheduler(eta=1)` given the same draws (`variance_noise`): every walked latent on par with the
-    source's float32 walk over the draws (check 1), truth the source's float64 walk
-    (`float64_scheduler`)."""
-    import contextlib
-
+    source's float32 walk over the draws (check 1), truth DDIM's independent float64 oracle
+    (tools/float64_schedulers.py) on the same draws."""
     import torch
     from diffusers.schedulers import scheduling_ddim
-    from tool_support import load
+    from tool_support import scheduler_oracles
 
     from dew.diffusion.schedules.source import SourceSchedule
     from dew.nn.inputs import request_key
@@ -1072,7 +1791,7 @@ def test_ddim_at_eta_one_walks_as_diffusers_ddim_scheduler_on_the_same_draws():
     schedule = SourceSchedule.from_config(config)
     process, times = schedule.sampling(steps)
     denoise = process.denoiser(SourceOracle(), {}, {})
-    precision = load("diffusers_wan_reference")
+    oracles = scheduler_oracles()
 
     def draw(seed):
         return np.random.default_rng([9, seed]).normal(size=(2, 3, 64)).astype(np.float32), np.int32(seed)
@@ -1086,17 +1805,16 @@ def test_ddim_at_eta_one_walks_as_diffusers_ddim_scheduler_on_the_same_draws():
         def run(initial, seed):
             draws = [np.asarray(jax.random.normal(jax.random.fold_in(request_key(int(seed)), index),
                                                   initial.shape, jnp.float32)) for index in range(steps)]
-            wide = dtype == torch.float64
-            with precision.float64_scheduler(scheduling_ddim) if wide else contextlib.nullcontext():
-                scheduler = scheduling_ddim.DDIMScheduler.from_config(config)
-                scheduler.set_timesteps(steps)
-                x = torch.tensor(np.asarray(initial), dtype=dtype)
-                latents = []
-                for time, noise in zip(scheduler.timesteps, draws, strict=True):
-                    prediction = torch.sin(scheduler.scale_model_input(x, time)) * 0.07 + time * 0.001
-                    x = scheduler.step(prediction, time, x, eta=1.0,
-                                       variance_noise=torch.tensor(noise, dtype=dtype)).prev_sample
-                    latents.append(x.numpy().copy())
+            library = scheduling_ddim.DDIMScheduler.from_config(config)
+            scheduler = oracles.oracle_of(library) if dtype == torch.float64 else library
+            scheduler.set_timesteps(steps)
+            x = torch.tensor(np.asarray(initial), dtype=dtype)
+            latents = []
+            for time, noise in zip(scheduler.timesteps, draws, strict=True):
+                prediction = torch.sin(scheduler.scale_model_input(x, time)) * 0.07 + time * 0.001
+                x = scheduler.step(prediction, time, x, eta=1.0,
+                                   variance_noise=torch.tensor(noise, dtype=dtype)).prev_sample
+                latents.append(x.numpy().copy())
             return tuple(latents)
         return run
 

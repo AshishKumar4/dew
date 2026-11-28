@@ -23,15 +23,29 @@ Three model conventions cover the schedulers:
 - EDM preconditioning on Karras' own grid, sigma 0.002 to 80 at sigma_data
   0.5: the EDM DPM-Solver scheduler.
 
+Check 1 holds Dew's walk of each case over seeds (`seeds`): per scheduler
+family, each case's float32 walk and its float64 truth (the class's
+independent oracle, tools/float64_schedulers.py) from a seed's x_T and
+cotangent, the latents and the VJP kept whole (Dew's float64 walk reads its
+schedule's float32 tables, so it is no truth of the scheduler's), under
+tests/fixtures/diffusers/scheduler_seeds/.
+
     PYTHONPATH=src python tools/diffusers_reference.py
+    PYTHONPATH=src:tools:tests python tools/diffusers_reference.py seeds <family>
 """
 
 from __future__ import annotations
 
+import contextlib
+import functools
+import importlib
+import itertools
 import json
 import os
+import sys
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass, field
+from contextlib import AbstractContextManager
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from types import ModuleType
 
@@ -43,11 +57,19 @@ os.environ["JAX_PLATFORMS"] = "cpu"
 import numpy as np
 import torch
 from diffusers_reference_helpers import fed_noise as fed_noise, scheduler_module, step_noise as step_noise
+from float64_schedulers import ORACLES as SCHEDULER_ORACLES
+from scheduler_cases import Case as Stepping, calls
 
 from dew.diffusion import EpsilonPredictionTransform, LinearNoiseScheduler, Process
 
 FIXTURES = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "diffusers"
-DATA_STD = 0.3
+SEEDS = FIXTURES / "scheduler_seeds"
+"""Each scheduler family's seeded walks (`seeds`), one recording a family, `<family>.npz`."""
+sys.path.insert(0, str(FIXTURES.parents[1]))
+ORACLES = importlib.import_module("diffusion_support")
+"""The oracles' closed forms, which Dew's arm reads too (tests/diffusion_support.py)."""
+DATA_STD = ORACLES.DATA_STD
+
 TRAIN_STEPS = 1000
 STEPS = 21
 SHAPE = (2, 2, 4, 4)
@@ -76,30 +98,47 @@ def published_grid(scheduler: str, config: dict, steps: int) -> np.ndarray:
     return np.concatenate([published.timesteps.numpy(), [0]])
 
 
+def handed_exactly(x: torch.Tensor, oracle: Callable[[torch.Tensor], torch.Tensor]) -> torch.Tensor:
+    """`oracle` of `x` in float64, its handed inputs read in their own precision, each entry rounded once
+    to `x`'s dtype, its gradient alike: as a model's output is an array whose entries are each rounded once,
+    and as Dew's oracles read theirs (tests/test_samplers.py's `handed_exactly`). An oracle that rounds its
+    own coefficient scales every entry by one error, which a walk's conversion of eps to x_0 amplifies past
+    any solver's rounding (row 13662)."""
+    return oracle(x.double()).to(x.dtype)
+
+
 def vp_epsilon(x: torch.Tensor, index: int) -> torch.Tensor:
     """E[eps | x_t] for x0 ~ N(0, DATA_STD^2) at the table's index:
-    x sigma / (alpha^2 s^2 + sigma^2)."""
+    x sigma / (alpha^2 s^2 + sigma^2), the table's rates rounded to the
+    latent's precision as Dew's model reads its own table, the rest exact
+    (`handed_exactly`; tests/test_samplers.py's `VPOracle`)."""
     alpha_cumprod = ALPHAS_CUMPROD[index]
-    alpha, sigma = alpha_cumprod.sqrt(), (1 - alpha_cumprod).sqrt()
-    return x * sigma / (alpha ** 2 * DATA_STD ** 2 + sigma ** 2)
+    alpha, sigma = (rate.to(x.dtype).double() for rate in (alpha_cumprod.sqrt(), (1 - alpha_cumprod).sqrt()))
+    return handed_exactly(x, lambda wide: ORACLES.vp_epsilon(wide, alpha, sigma))
+
+
+def read_sigma(x: torch.Tensor, sigma: torch.Tensor) -> torch.Tensor:
+    """The sigma a model reads at its noise level `sigma`: the model time c_noise = log(sigma) / 4 it is
+    handed in the latent's precision, read back exactly, as Dew's oracles read it (tests/test_samplers.py's
+    `VEOracle` and `KarrasOracle`)."""
+    return torch.exp(4.0 * (torch.log(sigma.to(x.dtype)) / 4.0).double())
 
 
 def ve_epsilon(x: torch.Tensor, sigma: torch.Tensor) -> torch.Tensor:
     """The same oracle on the variance-exploding latent x = x0 + sigma eps
-    the k-diffusion schedulers carry: x sigma / (s^2 + sigma^2)."""
-    sigma = sigma.to(x.dtype)
-    return x * sigma / (DATA_STD ** 2 + sigma ** 2)
+    the k-diffusion schedulers carry: x sigma / (s^2 + sigma^2), at the sigma
+    the model reads (`read_sigma`), exact (`handed_exactly`)."""
+    sigma = read_sigma(x, sigma)
+    return handed_exactly(x, lambda wide: ORACLES.ve_epsilon(wide, sigma))
 
 
-def edm_raw(x: torch.Tensor, sigma: torch.Tensor) -> torch.Tensor:
+def edm_raw(scaled: torch.Tensor, sigma: torch.Tensor) -> torch.Tensor:
     """The raw F whose EDM preconditioning c_skip x + c_out F is the optimal
-    x0 = x s^2 / (s^2 + sigma^2)."""
-    sigma = sigma.to(x.dtype)
-    sigma_data = EDM["sigma_data"]
-    c_skip = sigma_data ** 2 / (sigma ** 2 + sigma_data ** 2)
-    c_out = sigma * sigma_data / (sigma ** 2 + sigma_data ** 2) ** 0.5
-    x0 = x * DATA_STD ** 2 / (DATA_STD ** 2 + sigma ** 2)
-    return (x0 - c_skip * x) / c_out
+    x0 = x s^2 / (s^2 + sigma^2), from the input the scheduler scales for its
+    model (`scale_model_input`, c_in x) at the sigma the model reads
+    (`read_sigma`), as Dew's `KarrasOracle` computes it."""
+    sigma = read_sigma(scaled, sigma)
+    return handed_exactly(scaled, lambda wide: ORACLES.karras_raw(wide, sigma, EDM["sigma_data"]))
 
 
 @dataclass(frozen=True)
@@ -113,51 +152,72 @@ class Case:
     grid: np.ndarray
     convention: str = "vp"
     step_kwargs: dict[str, object] = field(default_factory=dict)
+    timesteps: np.ndarray | None = None
+    """A seed's timesteps (`seeded`), where they are not the scheduler's own."""
+    betas: np.ndarray = field(default_factory=lambda: BETAS)
+    """The trained table the scheduler is built on, a seed's (`seeded`)."""
 
 
-def lambda_walk(module: ModuleType, case: Case, x: torch.Tensor,
-                noises: list[np.ndarray]) -> list[torch.Tensor]:
+def made(module: ModuleType, case: Case, noises: list[np.ndarray], *, rederived: bool
+         ) -> tuple[Callable[..., object], Callable[[], AbstractContextManager[object]]]:
+    """What builds the scheduler `case` walks from its config, and the context its steps' draws are fed in:
+    the unmodified library class, its module's draws the walk's `noises` (`fed_noise`); where `rederived`
+    (a seed's float64 truth) the class's independent oracle (tools/float64_schedulers.py), every table its
+    own, the same `noises` its own tape, no module touched."""
+    if not rederived:
+        return getattr(module, case.scheduler), functools.partial(fed_noise, module, noises)
+
+    def oracle(**config: object) -> object:
+        built = SCHEDULER_ORACLES[case.scheduler](torch.float64, **config)
+        built.draws = list(noises)
+        return built
+
+    return oracle, contextlib.nullcontext
+
+
+def stepped(scheduler, case: Case, x: torch.Tensor, model, calls_taken: int | None = None, *,
+            reads_latent: bool = False) -> list[torch.Tensor]:
+    """The latents `scheduler`'s first `calls_taken` steps (every one where None) reach from `x` under
+    `model`, told each step's time and place (`scheduler_cases.calls`, the one walk every recorder takes:
+    its input scaled as the class's pipeline scales it, or the latent where the model `reads_latent`;
+    PNDM's time an integer; `case`'s step options)."""
+    walk = calls(scheduler, Stepping(case.scheduler, step_with=case.step_kwargs), x, model,
+                 reads_latent=reads_latent)
+    return [call.after for call in itertools.islice(walk, calls_taken)]
+
+
+def lambda_walk(build, fed, case: Case, x: torch.Tensor) -> list[torch.Tensor]:
     """The VP-table schedulers whose model runs once per grid point at an
     integer timestep: DPM-Solver multistep and singlestep, DEIS, UniPC, LCM
     and TCD."""
-    scheduler = getattr(module, case.scheduler)(trained_betas=BETAS, **case.config)
+    scheduler = build(trained_betas=case.betas, **case.config)
     timesteps = case.grid[:-1].tolist()
     if "timestep_spacing" in case.config:
         # The grid is the scheduler's own (`published_grid`).
         scheduler.set_timesteps(len(timesteps))
     else:
-        scheduler.set_timesteps(timesteps=timesteps)
-    latents = []
-    with fed_noise(module, noises):
-        for timestep in scheduler.timesteps:
-            eps = vp_epsilon(x, int(timestep))
-            x = scheduler.step(eps, timestep, x, **case.step_kwargs).prev_sample
-            latents.append(x)
-    return latents
+        scheduler.set_timesteps(timesteps=timesteps if case.timesteps is None else case.timesteps.tolist())
+    with fed():
+        return stepped(scheduler, case, x, lambda read, time, at: vp_epsilon(read, int(time)))
 
 
-def pndm_walk(module: ModuleType, case: Case, x: torch.Tensor,
-              noises: list[np.ndarray]) -> list[torch.Tensor]:
+def pndm_walk(build, fed, case: Case, x: torch.Tensor) -> list[torch.Tensor]:
     """PNDM runs its own timestep list: the first interval twice (predictor,
     then corrector) under `skip_prk_steps`, otherwise three Runge-Kutta
     intervals of four evaluations, then one evaluation per interval, and a
     last step below index 0 that `set_alpha_to_one=False` makes the
     identity. The latents at the grid points are kept."""
-    scheduler = module.PNDMScheduler(trained_betas=BETAS, **case.config)
+    scheduler = build(trained_betas=BETAS, **case.config)
     points = len(case.grid)
     scheduler.set_timesteps(points)
     stride = TRAIN_STEPS // points
     assert set(case.grid.tolist()) <= set(scheduler.timesteps.tolist())
     assert all(case.grid[:-1] - case.grid[1:] == stride), (case.grid, stride)
-    outputs = []
-    for timestep in scheduler.timesteps:
-        eps = vp_epsilon(x, int(timestep))
-        x = scheduler.step(eps, int(timestep), x).prev_sample
-        outputs.append(x)
+    outputs = stepped(scheduler, case, x, lambda read, time, at: vp_epsilon(read, int(time)))
     if case.config["skip_prk_steps"]:
         latents = outputs[1:-1]
     else:
-        latents = [outputs[3], outputs[7], outputs[11]] + outputs[12:-1]
+        latents = [outputs[3], outputs[7], outputs[11], *outputs[12:-1]]
     assert len(latents) == points - 1
     return latents
 
@@ -168,64 +228,48 @@ def karras_config() -> dict[str, float]:
     return dict(sigma_min=float(SIGMA_VE[0]), sigma_max=float(SIGMA_VE[-1]), rho=7.0)
 
 
-def kdpm2_walk(module: ModuleType, case: Case, x: torch.Tensor,
-               noises: list[np.ndarray]) -> list[torch.Tensor]:
+def kdpm2_walk(build, fed, case: Case, x: torch.Tensor) -> list[torch.Tensor]:
     """Two scheduler calls per interval, the first at the grid sigma and the
     second at the interpolated one; the final Euler step onto sigma 0, past
     Dew's grid, is not taken."""
-    scheduler = getattr(module, case.scheduler)(trained_betas=BETAS, **case.config)
+    scheduler = build(trained_betas=case.betas, **case.config)
     points = len(case.grid)
     scheduler.set_timesteps(points)
     ancestral = case.scheduler == "KDPM2AncestralDiscreteScheduler"
-    latents = []
-    with fed_noise(module, noises):
-        for call in range(2 * (points - 1)):
-            first = call % 2 == 0
-            if first:
-                sigma = scheduler.sigmas[call]
-            else:
-                sigma = scheduler.sigmas_interpol[call - 1 if ancestral else call]
-            eps = ve_epsilon(x, sigma)
-            x = scheduler.step(eps, scheduler.timesteps[call], x).prev_sample
-            if not first:
-                latents.append(x)
-    return latents
+
+    def sigma(at: int) -> torch.Tensor:
+        if at % 2 == 0:
+            return scheduler.sigmas[at]
+        return scheduler.sigmas_interpol[at - 1 if ancestral else at]
+
+    with fed():
+        latents = stepped(scheduler, case, x, lambda read, time, at: ve_epsilon(read, sigma(at)),
+                          2 * (points - 1), reads_latent=True)
+    # The latents at the grid points, each interval's second call's.
+    return latents[1::2]
 
 
-def lms_walk(module: ModuleType, case: Case, x: torch.Tensor,
-             noises: list[np.ndarray]) -> list[torch.Tensor]:
+def lms_walk(build, fed, case: Case, x: torch.Tensor) -> list[torch.Tensor]:
     """One call per interval on the same Karras grid; `scale_model_input`
     is called as a pipeline would, and the final step onto sigma 0 is not
     taken."""
-    scheduler = module.LMSDiscreteScheduler(trained_betas=BETAS, **case.config)
+    scheduler = build(trained_betas=case.betas, **case.config)
     points = len(case.grid)
     scheduler.set_timesteps(points)
-    latents = []
-    for call in range(points - 1):
-        timestep = scheduler.timesteps[call]
-        scheduler.scale_model_input(x, timestep)
-        eps = ve_epsilon(x, scheduler.sigmas[call])
-        x = scheduler.step(eps, timestep, x, **case.step_kwargs).prev_sample
-        latents.append(x)
-    return latents
+    return stepped(scheduler, case, x, lambda read, time, at: ve_epsilon(read, scheduler.sigmas[at]),
+                   points - 1, reads_latent=True)
 
 
-def edm_walk(module: ModuleType, case: Case, x: torch.Tensor,
-             noises: list[np.ndarray]) -> list[torch.Tensor]:
+def edm_walk(build, fed, case: Case, x: torch.Tensor) -> list[torch.Tensor]:
     """EDM's Karras grid already ends at sigma_min, and the `sigma_min`
     terminal repeats it, so the scheduler's last step is the identity and
     is not taken."""
-    scheduler = module.EDMDPMSolverMultistepScheduler(**case.config)
+    scheduler = build(**case.config)
     points = len(case.grid)
     scheduler.set_timesteps(points)
-    latents = []
-    with fed_noise(module, noises):
-        for call in range(points - 1):
-            sigma = scheduler.sigmas[call]
-            raw = edm_raw(x, sigma)
-            x = scheduler.step(raw, scheduler.timesteps[call], x).prev_sample
-            latents.append(x)
-    return latents
+    with fed():
+        return stepped(scheduler, case, x, lambda scaled, time, at: edm_raw(scaled, scheduler.sigmas[at]),
+                       points - 1)
 
 
 WALKS: dict[str, Callable[..., list[torch.Tensor]]] = {
@@ -374,7 +418,9 @@ def run(name: str, case: Case) -> dict[str, np.ndarray]:
     cotangent = torch.randn(SHAPE, generator=generator, dtype=torch.float64)
     x_T.requires_grad_(True)
     module, walk = scheduler_module(case.scheduler), WALKS[case.scheduler]
-    latents = walk(module, case, x_T, step_noise(SHAPE, len(case.grid) - 1, np.float32))
+    noises = step_noise(SHAPE, len(case.grid) - 1, np.float32)
+    # Diffusers' own walk, its float64 input's (the open cases' one-draw check, `OPEN_CASES`).
+    latents = walk(*made(module, case, noises, rederived=False), case, x_T)
     assert len(latents) == len(case.grid) - 1, (name, len(latents), len(case.grid))
     (grad,) = torch.autograd.grad((latents[-1] * cotangent).sum(), x_T)
     return {
@@ -384,6 +430,84 @@ def run(name: str, case: Case) -> dict[str, np.ndarray]:
         "grad": grad.numpy().astype(np.float32),
         "grid": np.asarray(case.grid, np.float32),
     }
+
+
+def seeded(case: Case, inputs: Mapping[str, np.ndarray]) -> Case:
+    """`case` on its draw's own schedule (`diffusion_support.seeded_schedule`, which Dew's walk reads too):
+    its timesteps, its table's tail or its config's ends moved, each an input of its public setup."""
+    sys.path.insert(0, str(FIXTURES.parents[1]))
+    from diffusion_support import seeded_schedule
+
+    schedule = seeded_schedule(case.scheduler, case.convention, case.grid, np.asarray(inputs["jitter"]),
+                               betas=BETAS, karras=karras_config(), edm=EDM)
+    offset = schedule.config.get("steps_offset", 0) - case.config.get("steps_offset", 0)
+    return replace(case, config={**case.config, **schedule.config}, timesteps=schedule.timesteps,
+                   betas=BETAS if schedule.betas is None else schedule.betas, grid=case.grid + offset)
+
+
+def trajectory(case: Case, inputs: Mapping[str, np.ndarray], dtype: torch.dtype,
+               noises: list[np.ndarray]) -> dict[str, np.ndarray]:
+    """`case`'s walk in `dtype` from a draw's x_T on its own schedule (`seeded`): its latent after each grid
+    interval (`after <i>`) and the VJP of the last against the draw's cotangent (`grad`), the per-step draws
+    `noises`."""
+    case = seeded(case, inputs)
+    module, walk = scheduler_module(case.scheduler), WALKS[case.scheduler]
+    x_T = torch.from_numpy(inputs["x_T"]).to(dtype).requires_grad_()
+    latents = walk(*made(module, case, noises, rederived=dtype == torch.float64), case, x_T)
+    assert len(latents) == len(case.grid) - 1, (case.scheduler, len(latents), len(case.grid))
+    (grad,) = torch.autograd.grad((latents[-1] * torch.from_numpy(inputs["cotangent"]).to(dtype)).sum(), x_T)
+    return {**{f"after {index}": latent.detach().numpy() for index, latent in enumerate(latents)},
+            "grad": grad.numpy()}
+
+
+def seeds(family: str) -> Path:
+    """Family `family`'s cases (the name before the dot) over the seeds check 1 draws (`record_case`): a
+    seed's x_T at the case's top marginal deviation and its cotangent (tests/diffusion_support.py's
+    `scheduler_draw`), the float32 walk from it and its float64 twin, each fed the draws Dew's solver
+    makes at its key 0, the count confirmed paired with Dew's own walk (tests/test_samplers.py's
+    `diffusers_walked`); with each case's grid (`<case>.grid`) and the deviation x_T was drawn at
+    (`<case>.scale`). Returns the file written."""
+    import functools
+
+    import diffusers
+    import jax
+
+    sys.path.insert(0, str(FIXTURES.parents[1]))
+    from diffusion_support import SCHEDULER_SHAPE, scheduler_draw
+    from recorded_references import provenance, record_case, save
+    from reference_releases import require
+    from test_samplers import diffusers_walked
+
+    require("diffusers-0.34")
+    torch.set_num_threads(2)
+    named = {name: case for name, case in CASES.items() if name.split(".")[0] == family}
+    if not named:
+        raise SystemExit(f"no cases in a family named {family!r}")
+    arrays: dict[str, np.ndarray] = {}
+    for name, case in named.items():
+        grid, scale = np.asarray(case.grid, np.float32), np.float32(initial_scale(case))
+        noises = step_noise(SCHEDULER_SHAPE, len(case.grid) - 1, np.float64)
+
+        def evaluate(inputs, case=case, noises=noises):
+            single = trajectory(case, inputs, torch.float32, noises)
+            wide = trajectory(case, inputs, torch.float64, noises)
+            return single, wide
+
+        walked = diffusers_walked(name, grid)
+
+        def dew(inputs, walked=walked):
+            return jax.tree.map(np.asarray, walked(inputs))
+
+        # Sized paired, as check 1's verdict pairs Dew with the reference.
+        arrays.update(record_case(name, functools.partial(scheduler_draw, scale=scale), evaluate,
+                                  store_inputs=False, dew=dew))
+        arrays[f"{name}.grid"], arrays[f"{name}.scale"] = grid, np.asarray(scale)
+        print(f"{name}: {int(arrays[f'{name}.seeds'])} seeds")
+    version = diffusers.__version__
+    command = f"PYTHONPATH=src:tools:tests python tools/diffusers_reference.py seeds {family}"
+    return save(SEEDS / f"{family}.npz", {**arrays, "provenance": provenance(
+        "diffusers", version, "cpu", command, torch=torch.__version__)},
+        reference=f"huggingface/diffusers {version}", license="Apache-2.0")
 
 
 def main() -> None:
@@ -415,4 +539,7 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    if sys.argv[1:2] == ["seeds"]:
+        print(seeds(sys.argv[2]))
+    else:
+        main()

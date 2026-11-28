@@ -47,6 +47,7 @@ from diffusers_reference_helpers import (
     saved_pipeline,
     tiny_qwen3_encoder,
 )
+from float64_schedulers import oracle_of
 from reference_releases import RELEASES
 
 from _dew_torch.precision import float64, float64_twin
@@ -79,12 +80,8 @@ CASES: dict[str, Case] = {
 
 
 def widened_walk(walk, model) -> dict[str, np.ndarray]:
-    """`walk(model, torch.float64)` inside `float64`, the flow-matching scheduler's own tables widened
-    around every call into it (`float64_scheduler`)."""
-    from diffusers.schedulers import scheduling_flow_match_euler_discrete
-    from diffusers_wan_reference import float64_scheduler
-
-    with float64(), float64_scheduler(scheduling_flow_match_euler_discrete):
+    """`walk(model, torch.float64)` inside `float64`."""
+    with float64():
         return walk(model, torch.float64)
 
 
@@ -311,6 +308,8 @@ def pipeline_record(root: Path) -> dict[str, np.ndarray]:
     for name, component in pipe.components.items():
         if isinstance(component, torch.nn.Module):
             setattr(twin, name, float64_twin(component))
+    # Its scheduler the class's independent float64 oracle (tools/float64_schedulers.py).
+    twin.scheduler = oracle_of(pipe.scheduler)
     wide = widened_walk(walk, twin)
     print(f"pipeline: latents {narrow['latents.0'].shape} images {narrow['images.0'].shape}")
     return {"pipeline.x_T": latents.numpy(), **{f"pipeline.{key}": value for key, value in narrow.items()},

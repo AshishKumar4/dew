@@ -86,9 +86,23 @@ def recording(destination: str, cohort: str) -> Path:
     return root
 
 
+def float64_paired[M, I, R](run: Callable[[M, I, torch.dtype], R], narrow: M,
+                            wide: M) -> Callable[[I], tuple[R, R]]:
+    """A recording's `evaluate` (`record_case`): `run(narrow, inputs, float32)`, the reference, and
+    `run(wide, inputs, float64)` inside `_dew_torch.precision.float64`, its truth."""
+    from _dew_torch.precision import float64
+
+    def evaluate(inputs: I) -> tuple[R, R]:
+        reference = run(narrow, inputs, torch.float32)
+        with float64():
+            return reference, run(wide, inputs, torch.float64)
+
+    return evaluate
+
+
 def scheduler_module(name: str) -> ModuleType:
     """The module that defines Diffusers' exported scheduler class `name` (its `__module__`), which a
-    reference patches (`fed_noise`) and widens (`float64_scheduler`) where its steps read their names."""
+    reference patches (`fed_noise`) where its steps read their names."""
     import importlib
 
     import diffusers

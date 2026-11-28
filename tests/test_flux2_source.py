@@ -333,22 +333,17 @@ def words(*rows) -> list[str]:
 @pytest.fixture(scope="module")
 def klein_pipelines(source):
     """The saved [klein] pipeline Diffusers loads in float32, and its float64 twin (each module's
-    `float64_twin`) with the run that widens it: `walk(pipe, torch.float64)` inside `float64`, the
-    flow-matching scheduler's own tables widened around every call into it (`float64_scheduler`)."""
+    `float64_twin`, its scheduler the class's independent float64 oracle, tools/float64_schedulers.py)
+    with the run that widens it: `walk(pipe, torch.float64)` inside `float64`."""
     import copy
 
     import torch
     from diffusers import Flux2KleinPipeline
-    from diffusers.schedulers import scheduling_flow_match_euler_discrete
 
     from _dew_torch.precision import float64, float64_twin
 
-    with pytest.MonkeyPatch.context() as patched:
-        patched.syspath_prepend(str(ROOT / "tools"))
-        tool = tool_support.load("diffusers_wan_reference")
-
     def widened_walk(walk, model):
-        with float64(), tool.float64_scheduler(scheduling_flow_match_euler_discrete):
+        with float64():
             return walk(model, torch.float64)
     narrow = Flux2KleinPipeline.from_pretrained(source / "pipeline", torch_dtype=torch.float32,
                                                 local_files_only=True)
@@ -357,6 +352,7 @@ def klein_pipelines(source):
     for name, component in narrow.components.items():
         if isinstance(component, torch.nn.Module):
             setattr(wide, name, float64_twin(component))
+    wide.scheduler = tool_support.scheduler_oracles().oracle_of(narrow.scheduler)
     return narrow, wide, widened_walk
 
 

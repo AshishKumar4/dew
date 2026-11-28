@@ -43,7 +43,8 @@ from diffusers_reference_helpers import (
     seeded,
     tiny_qwen3_encoder,
 )
-from diffusers_wan_reference import float64_scheduler
+from diffusers_wan_reference import float64_module
+from float64_schedulers import oracle_of
 from reference_releases import RELEASES
 
 from _dew_torch.precision import float64
@@ -167,10 +168,10 @@ def pipeline_record(root: Path) -> dict[str, np.ndarray]:
     """The prompt states each prompt (and the empty negative) encodes to, and
     the unmodified call's walk from fixed latents at `STEPS` steps, guided at
     its default scale: the latent it ends on and the image it decodes; in
-    float32 and, the saved pipeline loaded widened, in float64 (`fp64.`)."""
+    float32 and, the saved pipeline loaded widened, its scheduler its class's independent float64 oracle
+    (tools/float64_schedulers.py), in float64 (`fp64.`)."""
     from diffusers.pipelines.z_image import pipeline_z_image
     from diffusers.pipelines.z_image.pipeline_z_image import ZImagePipeline
-    from diffusers.schedulers import scheduling_flow_match_euler_discrete
 
     pipe = build_pipeline(root)
     generator = torch.Generator().manual_seed(SEED + 9)
@@ -193,10 +194,10 @@ def pipeline_record(root: Path) -> dict[str, np.ndarray]:
 
     narrow = walk(pipe, torch.float32)
     # The call keeps its latents in float32, which it names and asserts in its own module.
-    with (float64(), float64_scheduler(pipeline_z_image),
-          float64_scheduler(scheduling_flow_match_euler_discrete)):
+    with float64(), float64_module(pipeline_z_image):
         wide_pipe = ZImagePipeline.from_pretrained(root / "pipeline", torch_dtype=torch.float64,
                                                    local_files_only=True)
+        wide_pipe.scheduler = oracle_of(wide_pipe.scheduler)
         wide_pipe.set_progress_bar_config(disable=True)
         wide = walk(wide_pipe, torch.float64)
     print(f"pipeline: latents {narrow['latents.0'].shape} images {narrow['images.0'].shape}")

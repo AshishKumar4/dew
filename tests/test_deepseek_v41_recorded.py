@@ -297,7 +297,7 @@ def test_a_quantization_aware_training_steps_float64_gradients_are_the_releases(
     and every quantizer's input, the release's own followed float64 step's at each recorded draw, each
     within float64's rounding of the step (`assert_truths_as_recorded`). The release's quantizers are
     inference kernels with no backward: its recording passes a rounding's gradient straight through
-    (tools/deepseek_v41_kernels.py), so Dew's (`dew.nn.fake_quant.straight_through`) is held to that rule
+    (tools/deepseek_v41_kernels.py), so Dew's (`dew.nn.derivatives.straight_through`) is held to that rule
     here, and a rounding's input to the release's before it."""
     from model_support import float64_twin
     from recorded_truths import assert_truths_as_recorded

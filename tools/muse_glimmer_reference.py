@@ -17,6 +17,7 @@ from typing import Any
 
 import numpy as np
 import torch
+from diffusers_reference_helpers import float64_paired
 from mimo_reference import FIXTURES, packed_rows, padded, scatter, write
 from transformers.models.muse_glimmer.configuration_muse_glimmer import (
     MuseGlimmerConfig,
@@ -194,11 +195,7 @@ def record_muse_glimmer_vision() -> None:
         return np.concatenate(out)
 
     def both(run):
-        def evaluate(inputs):
-            reference = run(narrow, inputs, torch.float32)
-            with float64():
-                return reference, run(wide, inputs, torch.float64)
-        return evaluate
+        return float64_paired(run, narrow, wide)
 
     def pixels_case(modules, inputs, dtype):
         rows = [inputs["pixels"][index, :int(np.prod(grid))] for index, grid in enumerate(MUSE_GRIDS)]
