@@ -38,6 +38,7 @@ from dew.algebra.derive import FORMS_HELD
 from dew.algebra.scan import RESET_DECAY, Reads
 from dew.batch import document_firsts
 from dew.mesh import mesh_axes
+from dew.nn import norms
 from dew.nn.attention_masks import repeat_kv_heads
 from dew.nn.derivatives import KernelGlue, Protected, contracted, with_gradients_formed_at
 from dew.nn.inputs import cu_seqlens
@@ -92,7 +93,8 @@ def chunk_gated_delta_rule(query, key, value, g, beta, state=None, chunk_size: i
                            starts=None, max_segments: int | None = None,
                            write_bound: float | None = None, decay_bound: float | None = None,
                            unit_queries: bool = False, firsts=None, loads=None, stores=None, held: int = 0,
-                           output: recurrence.OutputNorm | None = None, z=None, weight=None, dtype=None):
+                           output: norms.OutputNorm | None = None, z=None, weight=None, dtype=None,
+                           valid=None):
     """`torch_chunk_gated_delta_rule` (modeling_qwen3_next.py:374-453) with one
     log decay per head, `g` `[B, S, H]`, or `chunk_kimi_delta_attention`
     (modeling_glm5_next.py:482-578) with one per key dimension, `[B, S, H,
@@ -121,13 +123,15 @@ def chunk_gated_delta_rule(query, key, value, g, beta, state=None, chunk_size: i
     (`recurrence.Hooks.unit_queries`). `loads`, `stores` and `held` are a forked call's (`Chunk.loads`).
     `output`, where given, is the mixer's gated norm after the rule (`recurrence.Hooks.output`), its gate `z`
     `[B, S, Hv, Dv]` and `weight` `[Dv]`, the output then normed in `dtype` (`chunk`'s epilogue, the
-    template's output launch where it fuses it): a gated delta net's or Kimi delta attention's own.
+    template's output launch where it fuses it): a gated delta net's or Kimi delta attention's own. `valid`
+    `[B, S]`, where given, marks the tokens present, a padded one keeping the memory (`Chunk.valid`).
     """
     hooks = recurrence.Hooks(decay='vector' if g.ndim == 4 else 'scalar', scale=key.shape[-1] ** -0.5,
                              write_bound=write_bound, decay_bound=decay_bound, unit_queries=unit_queries,
                              output=output)
     return chunk(hooks, Chunk(query, key, value, log_decay=g, beta=beta, state=state, starts=starts,
-                              firsts=firsts, loads=loads, stores=stores, held=held, z=z, weight=weight),
+                              firsts=firsts, loads=loads, stores=stores, held=held, z=z, weight=weight,
+                              valid=valid),
                  chunk_size=chunk_size, max_segments=max_segments, dtype=dtype)
 
 
@@ -1338,7 +1342,7 @@ def port_kernel(query, key, value, g, beta, state=None, starts=None, *, max_segm
                 firsts=None, readout: bool = True, apart: int = 0, values_gated: bool = False,
                 unit_pairs: bool = False,
                 decay_bound: float | None = None, turns: int = 0, turn=None, transition: bool = False,
-                reads=None, normed: recurrence.OutputNorm | None = None, gate=None, weight=None) -> str:
+                reads=None, normed: norms.OutputNorm | None = None, gate=None, weight=None) -> str:
     """The kernel the delta rule's selector (`GATED_DELTA`) gives a call over these operands for `product`
     ('forward', 'training'), of the form `delta` and `decayed` state and the chunk inverse's `bound` its form
     proves (`recurrence.Hooks.inverse_bound`; `PortCase`), the template's

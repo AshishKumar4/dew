@@ -15,6 +15,7 @@ from generation_support import COMPILES_ON_CPU
 from reference_error import assert_as_exact
 from test_recurrence_chunk import ROUTES, on_route
 
+from dew.nn import norms
 from dew.nn.kernels import generation, recurrence
 from dew.nn.precision import FP32_SUMS
 
@@ -24,7 +25,7 @@ template step's warpgroup a value column a thread; three rows, the second idle (
 rows took 6.2 s, armada jsf-steptime)."""
 """A decode token with grouped heads, idle rows and a four-tap history."""
 
-NORMS = (None, recurrence.OutputNorm(1e-6, 'silu'), recurrence.OutputNorm(1e-6, 'sigmoid'))
+NORMS = (None, norms.OutputNorm(1e-6, 'silu'), norms.OutputNorm(1e-6, 'sigmoid'))
 AXES = {"conv": (None, recurrence.Conv('silu')), "l2norm": (False, True),
         "decay": ('none', 'scalar', 'vector', 'gates'), "delta": (False, True), "write_gate": (False, True),
         "skip": (False, True), "output": NORMS}
@@ -90,9 +91,9 @@ FORMED = [
     recurrence.Hooks(decay='vector', gates=recurrence.Gates(limit=(0.0, 0.5))),
     recurrence.Hooks(decay='scalar', gates=recurrence.Gates(bound=-5.0)),
     # Mamba-2's gated norm forms (`OutputNorm.gate_first`, `rounded`) in the step launch's epilogue.
-    recurrence.Hooks(decay='scalar', output=recurrence.OutputNorm(1e-6, 'silu', gate_first=True)),
+    recurrence.Hooks(decay='scalar', output=norms.OutputNorm(1e-6, 'silu', gate_first=True)),
     recurrence.Hooks(decay='scalar',
-                     output=recurrence.OutputNorm(1e-6, 'silu', gate_first=True, rounded=True)),
+                     output=norms.OutputNorm(1e-6, 'silu', gate_first=True, rounded=True)),
 ]
 """The launch's other prologue values: Mamba2's step gates clipped with the skip, the gated delta rule's
 gates with a clipped step, a scale without the l2 norm and one under it, a rated decay with the

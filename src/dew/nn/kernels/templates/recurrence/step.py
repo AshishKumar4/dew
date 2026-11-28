@@ -21,6 +21,7 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
+from dew.nn import norms
 from dew.nn.kernels import generation, recurrence, recurrence_algebra, short_conv, tuning
 from dew.nn.kernels.templates import cost, mosaic, resources, scan
 from dew.nn.precision import (
@@ -619,12 +620,12 @@ def _epilogue(hooks, inputs, token: _Token, out, value, exchanged, *, dtype, int
     def activate(gate):
         return activation_and_slope(gate, norm.activation)[0]
 
-    # Each form as the layers' gated norms compute it (`recurrence.gated_norm_rows`), its statistics as
+    # Each form as the layers' gated norms compute it (`norms.gated_norm_rows`), its statistics as
     # `precision.rms_statistics` takes them, over a head's columns (`rms_of_total`), its rows rounded to the
     # token's output dtype where the form rounds them.
-    rows = recurrence.gated_rows(norm, out, gate, activate=activate)
+    rows = norms.gated_rows(norm, out, gate, activate=activate)
     total = scan.summed((rows * rows).reshape(-1), exchanged, interpret=interpret)
     _, inverse = rms_of_total(total, token.block.columns, norm.epsilon)
     rounded_in = dtype if norm.rounded else jnp.float32
-    return recurrence.gated_norm_rows(norm, rows, inverse, gate, weight, rounded_in,
+    return norms.gated_norm_rows(norm, rows, inverse, gate, weight, rounded_in,
                                       activate=activate).astype(jnp.float32)
