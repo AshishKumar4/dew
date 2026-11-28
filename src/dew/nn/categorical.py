@@ -27,6 +27,7 @@ import optax
 from jax.custom_derivatives import SymbolicZero
 
 from dew.nn.derivatives import Protected, contracted, declared_tangent
+from dew.nn.float_bits import exact_power2
 from dew.nn.precision import at_least_fp32
 
 __all__ = ["brier", "cross_entropy", "entropy", "group_divergence", "kl_divergence", "label_derivative",
@@ -118,13 +119,23 @@ def _softmax_moved(probability: jax.Array, moving: jax.Array) -> jax.Array:
     high = jnp.where(reached & (~top | ~pivoted), jnp.where(pivoted, high, moving), 0)
     low = jnp.where(pivoted & reached & ~top, low, 0)
     mass = _pair_sum(probability, jnp.zeros_like(probability), axis)
-    weighed_high, weighed_low = _weighed(probability, high, axis)
+    # A row whose largest difference is below one weighed at a power of two that brings it to [1, 2) (at most
+    # 2^100, whose inverse is normal) and its quotients brought back, so the row's largest terms are weighed
+    # at a normal scale, where a CPU flushing subnormals keeps them (train 1493's review: weights of 1/256
+    # over differences of -2^-121, each term -2^-129, flushed, and a tangent of 2^-124 read zero); a term far
+    # below the row's largest may still flush. The power alone moves no bit of a term in range, and is
+    # constant to the derivatives.
+    largest = jnp.max(jnp.abs(high), axis=-1, keepdims=True)
+    raised = jnp.where((largest > 0) & (largest < 1), jnp.minimum(1 - jnp.frexp(largest)[1], 100), 0)
+    power = jax.lax.stop_gradient(exact_power2(raised, largest.dtype))
+    weighed_high, weighed_low = _weighed(probability, high * power, axis)
     held = jnp.isfinite(weighed_high)
     # A weighted sum past the range taken 2^-4 times smaller; one in range at its own scale.
     shrunk_high, shrunk_low = _weighed(probability, jnp.where(held, 0, high) * 2.0**-4, axis)
-    native = _over((jnp.where(held, weighed_high, 0), jnp.where(held, weighed_low, 0)), mass)
+    native = tuple(part / power for part in _over((jnp.where(held, weighed_high, 0),
+                                                   jnp.where(held, weighed_low, 0)), mass))
     scaled = _over((jnp.where(held, 0, shrunk_high), jnp.where(held, 0, shrunk_low)), mass)
-    lows = _over(_weighed(probability, low, axis), mass)
+    lows = tuple(part / power for part in _over(_weighed(probability, low * power, axis), mass))
     large = jnp.where(held, 0, _added(jnp.where(held, 0, pivot) * 2.0**-4, *scaled))
     small = jnp.where(held, _added(pivot, *native), 0) + (lows[0] + lows[1])
     mean = large * 2.0**4 + small

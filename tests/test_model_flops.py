@@ -117,8 +117,9 @@ def test_a_traced_program_counts_its_products_convolutions_scans_and_branches():
     """A traced count is two FLOPs a multiply-add of each product and convolution the program runs: a batched
     matrix product's, a strided convolution's of its output's elements by its kernel's taps and inputs, a
     scan's body times its length, a branch's costliest arm, a platform choice's the branch an accelerator
-    runs, a gradient's backward products beside its forward's; a while loop doing one and a linear solve,
-    whose run programs a trace does not tell, are refused."""
+    runs, a gradient's backward products beside its forward's, a high-level operation's its expansion's, a
+    gamma draw none; a while loop doing one and a linear solve, whose run programs a trace does not tell, are
+    refused."""
     def shaped(*shape):
         return jax.ShapeDtypeStruct(shape, jnp.float32)
 
@@ -154,6 +155,18 @@ def test_a_traced_program_counts_its_products_convolutions_scans_and_branches():
 
     gradient = jax.grad(lambda w, x: jnp.sum(jax.nn.relu(x @ w)))
     assert traced_flops(gradient, shaped(5, 7), shaped(3, 5)) == 2 * (2 * 3 * 5 * 7)
+
+    from dew.nn import categorical
+
+    # A softmax's tangent, a high-level operation (`generation.linear_map`), counted by its expansion, and a
+    # gamma draw, a key's operation, as no product: the products beside them alone count (train 1493's
+    # review: each was refused).
+    def tangent(x, w, direction):
+        return jax.jvp(categorical.probabilities, (x @ w,), (direction,))[1]
+
+    assert traced_flops(tangent, shaped(4, 5), shaped(5, 8), shaped(4, 8)) == 2 * 4 * 5 * 8
+    assert traced_flops(lambda a, w: jax.random.gamma(jax.random.key(0), a) @ w, shaped(2, 3),
+                        shaped(3, 4)) == 2 * 2 * 3 * 4
     with pytest.raises(MissingFlopsCount):
         traced_flops(lambda x: jax.lax.while_loop(lambda c: c.sum() < 9, lambda c: c @ c, x), shaped(2, 2))
     def solved(b):
@@ -229,6 +242,53 @@ def test_a_loop_doing_no_product_costs_nothing_and_one_hiding_a_product_is_refus
             traced_flops(loop, *(_shaped(*shape) for shape in operands))
     else:
         assert traced_flops(loop, *(_shaped(*shape) for shape in operands)) == flops
+
+
+@pytest.mark.mesh(devices=2)
+def test_a_high_level_operation_counts_its_expansion_in_the_context_it_was_staged_in():
+    """A linear map (`generation.linear_map`, a high-level operation) whose product places its output on an
+    Explicit mesh the counted function enters itself counts that product: its expansion is traced in its
+    equation's own context, the mesh among it, as JAX's lowering expands it (train 1493's review of theme 87:
+    traced apart from it, its placement named no mesh and the count failed)."""
+    from jax.sharding import AxisType, PartitionSpec
+
+    from dew.nn.kernels.generation import linear_map
+
+    mesh = jax.make_mesh((2,), ("rows",), axis_types=(AxisType.Explicit,), devices=jax.devices()[:2])
+
+    def apply(weight, x):
+        rows = PartitionSpec("rows", None)
+        return jax.lax.dot_general(x, weight, (((1,), (0,)), ((), ())), out_sharding=rows)
+
+    def pullback(weight, cotangent):
+        return jax.lax.dot_general(cotangent, weight, (((1,), (1,)), ((), ())))
+
+    def counted(weight, x):
+        with jax.sharding.use_abstract_mesh(mesh.abstract_mesh):
+            return linear_map(apply, pullback, weight, x)
+
+    assert traced_flops(counted, _shaped(3, 5), _shaped(4, 3)) == 2 * 4 * 3 * 5
+
+
+def test_a_high_level_operation_counts_its_expansion_at_its_literal_operands():
+    """A linear map whose residuals hold a literal flag beside its weight (`generation.linear_map`, its output
+    typed as given) counts the product its flag chooses: a literal operand reaches its expansion as its
+    value, as JAX's lowering hands it (theme 87's review: traced as a type, the flag was a tracer a branch
+    could not read)."""
+    from dew.nn.kernels.generation import linear_map
+
+    def apply(residuals, x):
+        flag, weight = residuals
+        return x @ weight if flag else x
+
+    def pullback(residuals, cotangent):
+        flag, weight = residuals
+        return cotangent @ weight.T if flag else cotangent
+
+    def counted(weight, x):
+        return linear_map(apply, pullback, (True, weight), x, out_aval=jax.typeof(x))
+
+    assert traced_flops(counted, _shaped(5, 5), _shaped(4, 5)) == 2 * 4 * 5 * 5
 
 
 def test_a_traced_program_counts_a_grouped_product_and_refuses_work_it_does_not_count():
