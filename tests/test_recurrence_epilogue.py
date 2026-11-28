@@ -19,8 +19,7 @@ from dew.nn.linear import GatedDeltaNet
 
 LAYER_HOOKS = {
     'gated delta net': recurrence.Hooks(decay='scalar', gates=recurrence.Gates(), scale=KEY_WIDTH ** -0.5,
-                                        output=recurrence.OutputNorm(1e-6, read_in='bfloat16'),
-                                        write_bound=1.0),
+                                        output=recurrence.OutputNorm(1e-6), write_bound=1.0),
     'kimi delta attention': recurrence.Hooks(decay='vector', gates=recurrence.Gates(bound=-5.0),
                                              scale=KEY_WIDTH ** -0.5,
                                              output=recurrence.OutputNorm(1e-5, 'sigmoid'), write_bound=1.0,
@@ -28,8 +27,9 @@ LAYER_HOOKS = {
     'a key dimension softplus step': recurrence.Hooks(decay='vector', gates=recurrence.Gates(), l2norm=True),
 }
 """The layers' chunked calls (`GatedDeltaNet._chunk_hooks`, `KimiDeltaAttention._chunk_hooks`): the gated
-delta rule's gates and gated norm, its output read back in bf16 first; Kimi's decay a key dimension's bounded
-below and its sigmoid-gated norm; and a decay a key dimension's softplus step, unbounded."""
+delta rule's gates and gated norm; Kimi's decay a key dimension's bounded below and its sigmoid-gated norm;
+and a decay a key dimension's softplus step, unbounded. Their norms read the output as it comes (a read-back
+dtype narrows the float64 truth)."""
 
 
 def keyed_draw(hooks: recurrence.Hooks, packed: bool, seed: int):
