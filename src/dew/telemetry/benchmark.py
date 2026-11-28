@@ -287,6 +287,8 @@ def _lexer():
 
     spec = importlib.util.spec_from_file_location("_dew_xla_flags",
                                                   Path(__file__).resolve().parents[1] / "_xla_flags.py")
+    if spec is None or spec.loader is None:
+        raise ImportError("dew/_xla_flags.py beside the instrument cannot be loaded")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
