@@ -1737,44 +1737,6 @@ def tiles_walked[C](lo, hi, step: Callable[[jax.Array, C], C], carry: C, most: i
                               (jnp.int32(0), carry))[1]
 
 
-def plain_walk(spec: Forward, lo, hi, keys_at: Callable[[jax.Array], Keys], start: Partial, *,
-               most: int | None = None) -> Partial:
-    """A program's walk of its key tiles `lo` to `hi` (`keys_at(index)`, of at most `most`, `tiles_walked`)
-    from `start`, its sums compensated where its form takes them so (`compensated`, `settled`)."""
-    return settled(tiles_walked(lo, hi, lambda index, state: plain_step(spec, state, keys_at(index)),
-                                compensated(spec, start), most))
-
-
-def training_walk(spec: Forward, lo, hi, keys_at: Callable[[jax.Array], Keys],
-                  rows: Callable[[jax.Array], jax.Array], start: Partial, dropping: bool = False, *,
-                  most: int | None = None) -> Carry:
-    """A training forward's walk (`plain_walk`), its carry also holding the anchor key and the split
-    sums, from none (`training_step`)."""
-    nothing = jnp.zeros(start.total.shape, jnp.float32)
-    state, arg, own, others_total = tiles_walked(
-        lo, hi, lambda index, carry: training_step(spec, carry, keys_at(index), rows)[0],
-        (compensated(spec, start), no_argmax(start.total.shape[0], dropping), nothing, nothing), most)
-    return settled(state), arg, own, others_total
-
-
-def anchored_walk(spec: Forward, lo, hi, keys_at: Callable[[jax.Array], Keys], start: Partial, *,
-                  most: int | None = None) -> Carry:
-    """A training forward's walk (`training_walk`'s carry) at each row's maximum and anchor found before it:
-    a walk of `argmax` over the logits alone, then `anchored_step`s from `anchored`'s carry, as the Mosaic
-    training launch walks a peak walk's anchors; a quantized call's (`Forward.rounds`), whose weights round
-    at that maximum."""
-
-    def peaked(index, arg):
-        keys = keys_at(index)
-        return argmax(arg, keys.logits, keys.coords.k_pos)
-
-    arg = tiles_walked(lo, hi, peaked, no_argmax(start.total.shape[0]), most)
-    state, arg, own, others_total = tiles_walked(
-        lo, hi, lambda index, carry: anchored_step(spec, carry, keys_at(index)), anchored(spec, start, arg),
-        most)
-    return settled(state), arg, own, others_total
-
-
 def joined(carry: Carry, rows: Callable[[jax.Array], jax.Array], power: float = 1.0) -> Partial:
     """A training walk's state with its split sums joined, the anchor's term added back (`split_output`, kept
     at `power`, `kept`), the weighted values the output normalizes, at its rows' scale on the scaled walk."""

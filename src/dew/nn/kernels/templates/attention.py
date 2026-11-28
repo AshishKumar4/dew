@@ -1423,6 +1423,10 @@ def reference(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpan
     p = jnp.exp(logits - safe[..., None])
     carried = jnp.where(jnp.isfinite(m0), jnp.exp(m0 - safe), 0)
     total = total0 * carried + jnp.sum(p, axis=-1)
+    # An unmasked call's row of no mass reads NaN, its value and its derivative, as jax.nn's softmax reads it
+    # (`attention_algebra.Forward.massless_nan`, row 14116): its sums over a NaN, which no other row's
+    # derivative meets.
+    massless = (total == 0) if spans.form == "full" and spans.keys > 0 and hooks.initial is None else None
 
     def valued(weights: jax.Array, *, bound: float | None = None) -> jax.Array:
         # The weights narrowed to the values' dtype times the values, a query group's over its key head.
@@ -1446,11 +1450,18 @@ def reference(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpan
                    else grouped.astype(rounded_to).astype(grouped.dtype))
         return product(straight_through(grouped, rounded), value.astype(grouped.dtype))
 
+    def nan_massless(normalized: jax.Array, acc: jax.Array) -> jax.Array:
+        # A row of no mass its sums over a NaN, its derivative NaN through them (`massless`).
+        if massless is None:
+            return normalized
+        return jnp.where(massless[..., None], acc / jnp.where(massless, jnp.nan, 1.0)[..., None], normalized)
+
     drop = hooks.drop
     if hooks.rounds is not None:
         # The codes at the row's maximum (`Hooks.rounds`), its denominator the weights' own.
         acc = acc0 * carried[..., None] + valued(coded(p, hooks.rounds))
-        normalized = jnp.where(total[..., None] > 0, acc / jnp.where(total > 0, total, 1)[..., None], 0)
+        normalized = nan_massless(
+            jnp.where(total[..., None] > 0, acc / jnp.where(total > 0, total, 1)[..., None], 0), acc)
     elif drop is None:
         acc = acc0 * carried[..., None] + valued(p)
         normalized = jnp.where(total[..., None] > 0, acc / jnp.where(total > 0, total, 1)[..., None], 0)
@@ -1460,6 +1471,7 @@ def reference(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpan
         if hooks.output.fn is None and jnp.dtype(query.dtype).itemsize == 2:
             # Rounded to odd for its narrowing, as the kernels' quotients outside a register epilogue are.
             normalized = narrowing_settled(normalized, acc, total, query.dtype)
+        normalized = nan_massless(normalized, acc)
     else:
         # Normalized before the draw's multiplier narrows them, as the kernels take them: a kept weight's z
         # times its normalized weight stays in the values' range where z times the unnormalized one may not
@@ -1474,14 +1486,11 @@ def reference(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpan
 
         drawn = jax.vmap(jax.vmap(multiplier, in_axes=(None, 0)), in_axes=(0, None))(jnp.arange(batch),
                                                                                     jnp.arange(heads))
+        if massless is not None:
+            inverse = jnp.where(massless, jnp.nan, inverse)
         normalized = acc0 * (carried * inverse)[..., None] + valued((p * inverse[..., None]) * drawn,
                                                                    bound=drop.bound)
-
-    if spans.form == "full" and spans.keys > 0 and hooks.initial is None:
-        # An unmasked call's row of no mass reads NaN, its value and its derivative, as jax.nn's softmax
-        # reads it (`attention_algebra.Forward.massless_nan`, row 14116).
-        massless = total == 0
-        normalized = jnp.where(massless[..., None], acc * jnp.nan, normalized)
+    if massless is not None:
         total = jnp.where(massless, jnp.nan, total)
     out = output_hooked(normalized, hooks.output.fn, hooks.output.sides)
     out = jnp.swapaxes(out.astype(query.dtype), 1, 2)

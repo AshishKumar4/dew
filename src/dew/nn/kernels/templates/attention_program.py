@@ -17,21 +17,62 @@ from dew.nn.kernels.templates.attention import Kind, by_power
 from dew.nn.kernels.templates.attention_backward_algebra import derived_backward
 
 
+def plain_walk(spec: algebra.Forward, lo, hi, keys_at: Callable[[jax.Array], algebra.Keys],
+               start: algebra.Partial, *, most: int | None = None) -> algebra.Partial:
+    """A program's walk of its key tiles `lo` to `hi` (`keys_at(index)`, of at most `most`,
+    `algebra.tiles_walked`) from `start`, its sums compensated where its form takes them so
+    (`algebra.compensated`, `algebra.settled`)."""
+    return algebra.settled(algebra.tiles_walked(
+        lo, hi, lambda index, state: algebra.plain_step(spec, state, keys_at(index)),
+        algebra.compensated(spec, start), most))
+
+
+def training_walk(spec: algebra.Forward, lo, hi, keys_at: Callable[[jax.Array], algebra.Keys],
+                  rows: Callable[[jax.Array], jax.Array], start: algebra.Partial, dropping: bool = False, *,
+                  most: int | None = None) -> algebra.Carry:
+    """A training forward's walk (`plain_walk`), its carry also holding the anchor key and the split
+    sums, from none (`algebra.training_step`)."""
+    nothing = jnp.zeros(start.total.shape, jnp.float32)
+    state, arg, own, others_total = algebra.tiles_walked(
+        lo, hi, lambda index, carry: algebra.training_step(spec, carry, keys_at(index), rows)[0],
+        (algebra.compensated(spec, start), algebra.no_argmax(start.total.shape[0], dropping), nothing,
+         nothing), most)
+    return algebra.settled(state), arg, own, others_total
+
+
+def anchored_walk(spec: algebra.Forward, lo, hi, keys_at: Callable[[jax.Array], algebra.Keys],
+                  start: algebra.Partial, *, most: int | None = None) -> algebra.Carry:
+    """A training forward's walk (`training_walk`'s carry) at each row's maximum and anchor found before it:
+    a walk of `algebra.argmax` over the logits alone, then `algebra.anchored_step`s from `algebra.anchored`'s
+    carry, as the Mosaic training launch walks a peak walk's anchors; a quantized call's (`Forward.rounds`),
+    whose weights round at that maximum."""
+
+    def peaked(index, arg):
+        keys = keys_at(index)
+        return algebra.argmax(arg, keys.logits, keys.coords.k_pos)
+
+    arg = algebra.tiles_walked(lo, hi, peaked, algebra.no_argmax(start.total.shape[0]), most)
+    state, arg, own, others_total = algebra.tiles_walked(
+        lo, hi, lambda index, carry: algebra.anchored_step(spec, carry, keys_at(index)),
+        algebra.anchored(spec, start, arg), most)
+    return algebra.settled(state), arg, own, others_total
+
+
 def walk(spec: algebra.Forward, lo, hi, keys_at: Callable[[jax.Array], algebra.Keys],
          rows: Callable[[jax.Array], jax.Array], resumed: tuple[jax.Array, jax.Array, jax.Array] | None,
          block_q: int, width: int, *, training: bool, dropping: bool = False, most: int | None = None):
     """A program's walk of its key tiles `lo` to `hi` (`keys_at(index)`, in `spec`'s form) from the initial
     state `resumed` `(m0, total0, acc0)` or none (`algebra.started`, at its rows' scale where the walk is
-    scaled): the plain walk (`algebra.plain_walk`), or with `training` the training walk carrying the anchor
-    key and split sums (`algebra.training_walk`, `rows(keys)` each key's value row), at each row's maximum
-    found first where its weights round there (`algebra.anchored_walk`, `Forward.rounds`); its tiles at most
+    scaled): the plain walk (`plain_walk`), or with `training` the training walk carrying the anchor
+    key and split sums (`training_walk`, `rows(keys)` each key's value row), at each row's maximum
+    found first where its weights round there (`anchored_walk`, `Forward.rounds`); its tiles at most
     `most` (`algebra.tiles_walked`)."""
     start = algebra.started(spec, resumed, block_q, width)
     if training and spec.rounds is not None:
-        return algebra.anchored_walk(spec, lo, hi, keys_at, start, most=most)
+        return anchored_walk(spec, lo, hi, keys_at, start, most=most)
     if training:
-        return algebra.training_walk(spec, lo, hi, keys_at, rows, start, dropping=dropping, most=most)
-    return algebra.plain_walk(spec, lo, hi, keys_at, start, most=most)
+        return training_walk(spec, lo, hi, keys_at, rows, start, dropping=dropping, most=most)
+    return plain_walk(spec, lo, hi, keys_at, start, most=most)
 
 
 def finished(spec: algebra.Forward, walked, rows: Callable[[jax.Array], jax.Array],

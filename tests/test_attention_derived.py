@@ -27,6 +27,7 @@ from dew.nn.kernels.templates import (
     attention_algebra as algebra,
     attention_backward_algebra,
     attention_portable,
+    attention_program,
 )
 from dew.nn.kernels.templates.hooks import Hook, Side
 from dew.nn.precision import float32_einsum
@@ -117,8 +118,8 @@ def sliced_walk(mask: str, merged: bool):
                                 algebra.Operand(tile_values.shape, tile_values.dtype, lambda: tile_values),
                                 lambda a, b: jnp.dot(a, b, preferred_element_type=jnp.float32))
 
-        states = [algebra.plain_walk(spec, tile, tile + 1, keys_at,
-                                     algebra.started(spec, None, ROWS, WIDTH))
+        states = [attention_program.plain_walk(spec, tile, tile + 1, keys_at,
+                                               algebra.started(spec, None, ROWS, WIDTH))
                   for tile in range(KEYS // TILE)]
         if merged:
             state = algebra.merged(spec, jax.tree.map(lambda *parts: jnp.stack(parts), *states), 0)

@@ -198,7 +198,7 @@ def _attend(query: jax.Array, span: tuple, read, block: int, spec: "algebra.Forw
     a step's keys and values `[block, D]`, as a softmax state (`algebra.Partial`). A `sink` `[QUERIES]`
     (each query row's value-free logit, -inf for a slice that does not carry it) starts the softmax as
     its first term."""
-    from .templates import attention_algebra as algebra
+    from .templates import attention_algebra as algebra, attention_program
 
     first_key, length = span
     rows = jnp.arange(QUERIES)
@@ -219,7 +219,7 @@ def _attend(query: jax.Array, span: tuple, read, block: int, spec: "algebra.Forw
     # Its rows' sums scaled in the walk where they could pass fp32's largest (`algebra.SCALED_WALK`), each
     # tile's values' largest magnitude read from the loaded tile beside its product, which the memory bounds;
     # a merge of slices joins them at their joined scale (`algebra.merge`).
-    return algebra.plain_walk(spec, first, last, keys_at, start)
+    return attention_program.plain_walk(spec, first, last, keys_at, start)
 
 
 def _slice(span: tuple, block: int, split, splits: int) -> tuple:
