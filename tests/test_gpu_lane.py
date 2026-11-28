@@ -158,7 +158,8 @@ def test_the_gpu_lane_runs_a_files_gpu_marked_tests_alone(tmp_path, lane):
     ("--xla_dump_to='/x y' --b --xla_dump_to='/z'", "--b --xla_dump_to='/z'"),
     ('--p="a \\" b" --q=1 --p=2', "--q=1 --p=2"),
     ("  --x=1   --x=2  ", "--x=2"),
-    ("--x=1 stray --y=2", "--x=1 stray --y=2")])
+    ("--x=1 stray --y=2", "--x=1 stray --y=2"),
+    ("--x=1\x0b--x=2", "--x=1\x0b--x=2")])
 def test_a_flag_is_stated_once_whole_as_xla_reads_it(flags, once):
     """Each XLA flag stated once, its last value, read whole as XLA reads XLA_FLAGS
     (xla/parse_flags_from_env.cc): a quoted value holding spaces one flag, its quotes kept, a backslash
@@ -166,6 +167,20 @@ def test_a_flag_is_stated_once_whole_as_xla_reads_it(flags, once):
     import lane_environment
 
     assert lane_environment._each_once(flags) == once
+
+
+@pytest.mark.parametrize(("flags", "kept"), [
+    ('--xla_dump_to="/logs/a --xla_gpu_deterministic_ops b" --xla_gpu_deterministic_ops=true --y=1',
+     '--xla_dump_to="/logs/a --xla_gpu_deterministic_ops b" --y=1'),
+    ("--xla_gpu_deterministic_ops=true\t--y='1 2'", "--y='1 2'"),
+    ("--y=1\x0b--xla_gpu_deterministic_ops=true", "--y=1\x0b--xla_gpu_deterministic_ops=true")])
+def test_a_flag_taken_out_is_read_whole_as_xla_reads_it(flags, kept):
+    """A flag taken out of XLA's flags (`without_flags`) is the flag XLA reads: a quoted value naming it is no
+    flag of its own and stays whole, a tab parts two flags, and a vertical tab, which XLA reads as no space,
+    parts none (the run of flags read as one, the flag within it untouched)."""
+    import lane_environment
+
+    assert lane_environment.without_flags(flags, "--xla_gpu_deterministic_ops") == kept
 
 
 def test_a_lane_configured_again_states_each_xla_flag_once():

@@ -396,7 +396,7 @@ def hardware_status(row: Row, device_kind: str) -> str | None:
 
 def measure(tree: Path, python: Path, args: argparse.Namespace, newer: Path, is_head: bool = True,
             cache: Path | None = None, settings: dict[str, str] | None = None,
-            name: str | None = None) -> dict:
+            role: str | None = None) -> dict:
     """One sample of every row in `tree`, run by `python` with `settings` in its environment: a number, or
     why the row could not run there, and beside each the seconds its probe's process took (`seconds <row>`). The head's external references (`Row.head_only`), each a judged
     pairing of its own, run in its first round alone (`is_head`)."""
@@ -428,9 +428,10 @@ def measure(tree: Path, python: Path, args: argparse.Namespace, newer: Path, is_
                                    if reason is not None})
                     continue
                 # A step this tree's prepare compiled ahead (`ahead_battery`) runs as its first step, so the
-                # GPU compiles none of it: its arm's own (`name`, the tree's name in the run, base or head),
-                # never its checkout's directory name, which a base and a head may share (row 14123).
-                handed = Path(getattr(args, "ahead", None) or "/nonexistent") / (name or tree.name)
+                # GPU compiles none of it: its role's own (`role`, base or head, the A/A the base's), never a
+                # name the caller chose or its checkout's directory name, which two trees may share (rows
+                # 14123, P-F5).
+                handed = Path(getattr(args, "ahead", None) or "/nonexistent") / (role or tree.name)
                 stepped = probe.tool == "benchmark_step.py" and handed.is_dir()
                 handoff = ["--ahead", str(handed)] if stepped else []
                 began = time.perf_counter()
@@ -470,8 +471,7 @@ def run(args: argparse.Namespace) -> int:
     """Every row of the battery (`--only`'s) in the three arms (`arms`), `--rounds` rounds of them (`rounds`);
     the machine's lock recorded (`lock`), which the run's compile ahead installs (`compile`)."""
     unmatched(args.only, [row.name for row in BATTERY])
-    trees = dict(spec.split("=", 1) for spec in (args.base, args.head))
-    (base, base_path), (head, head_path) = ((name, Path(path)) for name, path in trees.items())
+    (base, base_path), (head, head_path) = arm_trees(args)
     settings = dict(setting.split("=", 1) for setting in getattr(args, "head_env", None) or [])
     lock = machine_lock()
     pythons, unbuilt = environments(((base, base_path), (head, head_path)), lock, args.environments)
@@ -495,7 +495,8 @@ def run(args: argparse.Namespace) -> int:
             if tree in unbuilt:
                 return dict.fromkeys((row.name for row in rows if not row.head_only), unbuilt[tree])
             return measure(path, pythons[tree], args, head_path / "tools", arm == "head" and round_ == 0,
-                           Path(caches) / arm, settings=settings if arm == "head" else None, name=tree)
+                           Path(caches) / arm, settings=settings if arm == "head" else None,
+                           role="head" if arm == "head" else "base")
 
         # A timed step's window warms first (`rounds`); a compile's or a server's, measured cold, needs none.
         rounds(args, results, sample, warm=any(row.name.startswith("step ") for row in rows))
@@ -504,6 +505,15 @@ def run(args: argparse.Namespace) -> int:
 
 ARMS = ("base", "head", "alone")
 """A run's three arms (`arms_of`), as its samples, orders and plans key them, whatever its trees are named."""
+
+
+def arm_trees(args: argparse.Namespace) -> tuple[tuple[str, Path], tuple[str, Path]]:
+    """`--base` and `--head` (`NAME=PATH`), each its name and tree: two names, or the run's samples, its
+    environments and its results would read one tree's as both."""
+    (base, base_path), (head, head_path) = (spec.split("=", 1) for spec in (args.base, args.head))
+    if base == head:
+        raise SystemExit(f"--base and --head are both named {base!r}: name each its own")
+    return (base, Path(base_path)), (head, Path(head_path))
 
 
 def arms_of(base: str, head: str, base_path: Path, head_path: Path) -> dict[str, tuple[str, Path]]:
@@ -645,17 +655,18 @@ def chosen(probe: "Probe", only: list[str] | None) -> bool:
 def ahead_battery(args: argparse.Namespace) -> int:
     """Each step of `--kind`'s compiled ahead of its run (benchmark_step --compile-ahead, for one
     compile-only GPU of the kind, `COMPILE_TARGETS`), in each tree's environment of `--lock`, into
-    `--out`/<the tree's directory name>: what `run --ahead` hands each arm's step rows, so the GPU compiles
+    `--out`/<its role, base or head>: what `run --ahead` hands each arm's step rows, so the GPU compiles
     none of a step that is the program compiled ahead (the fleet's perf jobs, in their GPU-free prepare). A
     tree whose own benchmark_step has no `--compile-ahead` (one older than the handoff), asked of the tool
     itself, is named and runs as before, its GPU compiling. A tree that has it and fails to compile ahead,
     or whose tool cannot say what it takes, fails the battery (exit 1), and so the prepare that ran it: a
     failure printed and passed over left the run to compile on the GPU unremarked (2026-11-12)."""
     generation, gib, device = COMPILE_TARGETS[args.kind]
-    trees = dict(spec.split("=", 1) for spec in (args.base, args.head))
-    head_path = Path(trees[args.head.split("=", 1)[0]])
-    pythons, unbuilt = environments(tuple((name, Path(path)) for name, path in trees.items()), args.lock,
-                                    args.environments)
+    roles = dict(zip(("base", "head"), arm_trees(args), strict=True))
+    trees = dict(roles.values())
+    role_of = {name: role for role, (name, _) in roles.items()}
+    head_path = roles["head"][1]
+    pythons, unbuilt = environments(tuple(roles.values()), args.lock, args.environments)
     # The step probes `run` would run (`chosen`, by any of its rows' names: its step's, its peak's, its
     # MFU's), each compiled ahead, so a run handed this directory finds every step it measures (row 10796).
     cases = [STEP_CASES[probe.rows[0].name] for probe in PROBES
@@ -680,7 +691,7 @@ def ahead_battery(args: argparse.Namespace) -> int:
     target = ["--capacity-gib", str(gib)]
     for name, path in built.items():
         done = _run(Path(path), pythons[name], "benchmark_step.py",
-                    ["--cases", json.dumps(cases), "--compile-ahead", str(Path(args.out) / name),
+                    ["--cases", json.dumps(cases), "--compile-ahead", str(Path(args.out) / role_of[name]),
                      "--generation", generation, *target], head_path / "tools", 3600)
         said = f"into {args.out}" if done.returncode == 0 else f"not: {done.stderr[-400:]}"
         print(f"{name}: steps compiled ahead {said}", flush=True)
@@ -704,8 +715,7 @@ def compile_battery(args: argparse.Namespace) -> int:
                          "gate compiles as a run does with no GPU attached, so unset it")
     generation, gib, device = COMPILE_TARGETS[args.kind]
     unmatched(args.only, list(STEP_CASES))
-    trees = dict(spec.split("=", 1) for spec in (args.base, args.head))
-    (base, base_path), (head, head_path) = ((name, Path(path)) for name, path in trees.items())
+    (base, base_path), (head, head_path) = arm_trees(args)
     pythons, unbuilt = environments(((base, base_path), (head, head_path)), args.lock, args.environments)
     cases = {f"compile {name.removeprefix('step ')} ({AHEAD_ATTENTION} attention)": case
              for name, case in STEP_CASES.items()
