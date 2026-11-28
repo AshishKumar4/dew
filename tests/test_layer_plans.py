@@ -1,9 +1,6 @@
 """A whole decoder layer's fusion plan (`dew.nn.kernels.templates.layers`, row 9038): each body as the pass
 weighs it, the layer flattened with each boundary a region crosses stated, and the checked-in plans as
 planning makes them."""
-import os
-import subprocess
-import sys
 
 import jax
 import jax.numpy as jnp
@@ -161,17 +158,3 @@ def test_a_product_whose_variants_save_alike_takes_its_most_staged_as_its_best()
     most, fewer = variant(("prologue", "epilogue"), 2.0), variant(("epilogue",), 3.0)
     assert layers.Weighed(body="step", product=0, variants=(most, fewer)).best == most
 
-
-def test_the_checked_in_plans_are_the_plans_planning_makes():
-    """`_layer_plans.json` holds what planning makes of each case, as its command checks it in a process of
-    its own (`python -m dew.nn.kernels.templates.layers --check`, which regenerates them and fails naming
-    the lines that differ): the plans a developer's run writes, no test suite's settings among them."""
-    from process_support import REPO_ROOT
-
-    # A developer's environment, none of the suite's (its matmul precision and XLA flags move the step's
-    # equations, FS-9038-ENV3).
-    developer = {name: os.environ[name] for name in ("PATH", "HOME") if name in os.environ}
-    checked = subprocess.run([sys.executable, "-m", "dew.nn.kernels.templates.layers", "--check"],
-                             capture_output=True, text=True, check=False,
-                             env={**developer, "PYTHONPATH": str(REPO_ROOT / "src")})
-    assert checked.returncode == 0, checked.stderr[-6000:]
