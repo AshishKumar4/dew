@@ -204,8 +204,8 @@ def _scattered(x):
 
     def body(c):
         values, step = c
-        return jax.lax.scatter_apply(values, jnp.zeros((1, 1), jnp.int32), updated,
-                                     jax.lax.ScatterDimensionNumbers((), (0,), (0,))), step + 1
+        # `at[...].apply`: a scatter whose updater is `updated` (`jax.lax.scatter_apply`).
+        return values.at[0].apply(updated), step + 1
 
     return jax.lax.while_loop(lambda c: c[1] < 3, body, (x, 0))[0]
 
