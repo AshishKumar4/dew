@@ -773,15 +773,25 @@ def _dense_tangent(dtype: str, primals, tangents, value) -> jax.Array:
         return _dense_value(dtype, logits, seconds, values, powers)
 
     _, moved = jax.jvp(held, (logits, seconds), (dlogits, dseconds))
+    # The values' coefficients `w (1 - τ)` as mantissas at their row's power `2^E` (each pair's product
+    # decayed with its weight, `exp_scaled`), their contraction with the direction taken back by it after:
+    # a coefficient past fp32 (`w τ` of `2^138`) meets a small direction, or its pullback a small cotangent,
+    # before it would overflow.
     seen = logits > -jnp.inf
-    m = jax.lax.stop_gradient(jnp.max(logits, axis=-1, keepdims=True))
-    p = jnp.where(seen, jnp.exp(logits - jnp.where(jnp.isfinite(m), m, 0.0)), 0.0)
-    weights = p / jnp.maximum(jnp.sum(p, axis=-1, keepdims=True), jnp.finfo(p.dtype).tiny)
-    centre = jnp.sum(weights * seconds, axis=-1, keepdims=True)
-    apart = power2(jnp.where(seen, seconds - centre, 0.0), -powers[..., None])
-    coefficients = weights * (1 - apart)
-    valued = float32_einsum("bhgqk,bkhd->bhgqd", coefficients, dvalues, precision=REFERENCE_PRECISION,
-                            preferred_element_type=dvalues.dtype)
+    level = jax.lax.stop_gradient(jnp.max(logits, axis=-1, keepdims=True))
+    below = logits - jnp.where(jnp.isfinite(level), level, 0.0)
+    total = jnp.sum(jnp.where(seen, jnp.exp(below), 0.0), axis=-1, keepdims=True)
+    over = jnp.where(total > 0, total, 1.0)
+    hi = jax.lax.stop_gradient(jnp.sum(exp_scaled(seconds / over, below, 0), axis=-1, keepdims=True))
+    lo = jnp.sum(exp_scaled((seconds - hi) / over, below, 0), axis=-1, keepdims=True)
+    apart = jnp.where(seen, (seconds - hi) - lo, 0.0)
+    rows = powers[..., None]
+    reach = jnp.where(seen & (apart != 0), _reach(below) + _exponent(apart) - rows, _NONE)
+    power = jnp.maximum(jnp.max(reach, axis=-1, keepdims=True), 1)
+    coefficients = (exp_scaled(jnp.broadcast_to(1.0 / over, below.shape), below, -power)
+                    - exp_scaled(apart / over, below, -rows - power))
+    valued = power2(float32_einsum("bhgqk,bkhd->bhgqd", coefficients, dvalues, precision=REFERENCE_PRECISION,
+                                   preferred_element_type=dvalues.dtype), power)
     return moved + _ungrouped(valued).astype(dtype)
 
 
