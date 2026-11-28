@@ -338,7 +338,9 @@ def knowing(cells: AbstractSet[Cell], label_prefix: str | None = None) -> Callab
     where (its file, at any line, `_placed`), label and site (its line's source text, which an edit above it
     does not change), and its kind, or, where either side kept no kind (an older record's), whatever its kind;
     two kinds both stated and different are two cells, as are two sites both stated and different, so a run
-    that fixed one site of a test and broke another is red for the other. A cell either side kept no site for
+    that fixed one site of a test and broke another is red for the other: two labels by their labels, a label
+    and an older record's line text by the text the label's record holds beside it. A cell either side kept no
+    site for
     (a baseline written before sites were kept) is answered by its place alone. A run that leaves more cells
     of a place than main's left is answered for main's many alone. A cell the run left twice (two reasons at
     one where) is one cell, as a baseline's set keeps it."""
@@ -346,10 +348,17 @@ def knowing(cells: AbstractSet[Cell], label_prefix: str | None = None) -> Callab
     answered: dict[Cell, bool] = {}
 
     def fits(stated: str | None, given: str | None) -> bool:
-        # Two sites of one kind alone are compared: a label (tests/truths_ahead.py's `LABELED`) and a line's
-        # text (a record's before labels were kept) say nothing of each other.
-        return stated is None or given is None or stated == given or (
-            label_prefix is not None and stated.startswith(label_prefix) != given.startswith(label_prefix))
+        # Two labels are compared as labels (tests/tier_wire.py's `LABELED`); a label and a record's before
+        # labels were kept, a line's text alone, by the text the label's record holds beside it.
+        if stated is None or given is None or stated == given or label_prefix is None:
+            return stated is None or given is None or stated == given
+        labeled = [site.startswith(label_prefix) for site in (stated, given)]
+        if all(labeled):
+            return stated.partition("\n")[0] == given.partition("\n")[0]
+        if any(labeled):
+            return (stated.partition("\n")[2] if labeled[0] else stated) == (
+                given.partition("\n")[2] if labeled[1] else given)
+        return False
 
     def known(cell: Cell) -> bool:
         if cell not in answered:

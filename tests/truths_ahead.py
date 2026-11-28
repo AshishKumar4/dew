@@ -172,6 +172,11 @@ class CompiledTruths:
             # Stopped by its cap between draws (`tier_wire.stop_past_cap`): untried, its run prepares it.
             self.tried.difference_update(labels)
             raise
+        except BaseException as error:
+            # The innermost site an error escapes names it (`stopped_in`), whatever outer site it escapes too.
+            if not hasattr(error, SITE_OF_ERROR):
+                setattr(error, SITE_OF_ERROR, labels[0])
+            raise
         self.done.update(labels)
 
     def judged_its_zeros(self, error: BaseException, before: frozenset[str] = frozenset()) -> bool:
@@ -636,24 +641,36 @@ def running() -> tuple[CompiledTruths, str] | None:
     return ran
 
 
+SITE_OF_ERROR = "_dew_check1_site"
+"""The attribute an error escaping a site's prepare carries its label in (`CompiledTruths.preparing`, the
+innermost site's), which the suite's failure recorder names it by (tests/conftest.py's
+`recorded_unprepared`): no site an earlier failure, caught, left unfinished."""
+
+
+def stopped_in(error: BaseException) -> str | None:
+    """The Check 1 site `error` escaped (`SITE_OF_ERROR`), None where it escaped none."""
+    return getattr(error, SITE_OF_ERROR, None)
+
+
 def unprepared(directory: Path, test: str, frames: Sequence[tuple[str, int]], why: str,
                record: str = UNPREPARED, cell: str | None = None, *, site: str | None = None) -> None:
     """The writer of a test's record that it ran unprepared (`UNPREPARED`, in its store `directory`),
     compiling a site or an arm on its devices with every site judged: its node id and each reason it gives,
     where (`frames`, innermost first, `(file, line)`: the first of the test's own file, else the test's file)
-    and why (`reasoned`), and which site it is (`site`: its Check 1 label, an arm's role beside it, else the
-    source text of that line), which an edit above it does not move as it moves its line, nor share with
-    another site of one opening line (prepares.py's `knowing`). Under `tier_wire.DEFERRED`, a GPU flow's cell
-    its prepare deferred to its run (`gpu_flow.run_cells`), which its run's store still serves, and which the
-    run names unprepared (tests/conftest.py's `compiled_ahead`); `cell` its label, so the flow's cells
-    deferred at one line are each their own."""
+    and why (`reasoned`), and which site it is (`site`: its Check 1 label, an arm's role beside it, with the
+    source text of that line beside, else that text alone), which an edit above it does not move as it moves
+    its line, nor share with another site of one opening line (prepares.py's `knowing`). Under
+    `tier_wire.DEFERRED`, a GPU flow's cell its prepare deferred to its run (`gpu_flow.run_cells`), which its
+    run's store still serves, and which the run names unprepared (tests/conftest.py's `compiled_ahead`);
+    `cell` its label, so the flow's cells deferred at one line are each their own."""
     # The test's file as CI's grading reads a node id (`tools/armada/grading.py`'s `owning`).
     path = Path(load("grading", "tools/armada").owning(test))
     lines = [(file, line) for file, line in frames if Path(file).name == path.name]
-    # A label's identity says so (`tier_wire.LABELED`), a line's text, the fallback outside any site, as
-    # records before labels were kept: two kinds a grade never compares (prepares.py's `knowing`).
-    site = f"{LABELED}{site}" if site else (
-        linecache.getline(lines[0][0], lines[0][1]).strip() if lines else "")
+    # A label's identity says so (`tier_wire.LABELED`), its line's text beside it; a line's text alone, the
+    # fallback outside any site, as records before labels were kept (prepares.py's `knowing`).
+    text = linecache.getline(lines[0][0], lines[0][1]).strip() if lines else ""
+    # A label's identity holds its line's text beside it, which a record before labels were kept compares by.
+    site = f"{LABELED}{site}\n{text}" if site else text
     reasoned(directory / record, test, f"{path}:{lines[0][1]}" if lines else str(path), why, cell,
              site=site or None)
 
