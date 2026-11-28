@@ -17,6 +17,8 @@ def _dew_xla_flags():
     first."""
     spec = importlib.util.spec_from_file_location(
         "_dew_xla_flags", Path(__file__).resolve().parents[1] / "src" / "dew" / "_xla_flags.py")
+    if spec is None or spec.loader is None:
+        raise ImportError("src/dew/_xla_flags.py of this checkout cannot be loaded")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module

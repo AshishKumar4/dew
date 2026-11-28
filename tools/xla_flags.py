@@ -7,6 +7,8 @@ from pathlib import Path
 
 _SPEC = importlib.util.spec_from_file_location(
     "_dew_xla_flags", Path(__file__).resolve().parents[1] / "src" / "dew" / "_xla_flags.py")
+if _SPEC is None or _SPEC.loader is None:
+    raise ImportError("src/dew/_xla_flags.py of this checkout cannot be loaded")
 _LEXER = importlib.util.module_from_spec(_SPEC)
 _SPEC.loader.exec_module(_LEXER)
 
