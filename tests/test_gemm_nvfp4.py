@@ -977,6 +977,39 @@ def a_packed_nvfp4_call_placed_on_its_hosts_cpu_keeps_a_subnormal_scale():
     np.testing.assert_array_equal(np.asarray(out), np.full((256, 128), 2.0 ** -119, np.float32))
 
 
+def a_packed_nvfp4_prefills_finish_is_its_products_finished_apart():
+    """On a GPU, a packed NVFP4 prefill (named packed, 256 rows of two experts' groups) whose tensor scale is
+    one a column, the columns' scales 1, 2^-127 (subnormal, the 2^8 it owes taking it to a normal 2^-119)
+    and 2^121 (finite, its product by 2^8 past float32's largest) by turns and each expert's its own: its
+    launch's finish (`gemm._packed_finish`, the scale and the owed 2^8 in the epilogue) is bitwise its
+    products finished apart (XLA's decoded product, `factored`'s one rounding after it) and the float64
+    truth, over small integer codes and rows (train 1474's review: the finish was lowered and run on the
+    host, never natively against the finish apart). Run by tests/test_gpu_gemm.py's cells."""
+    rng = np.random.default_rng(13743)
+    # Codes of E2M1's half steps and rows of units: every sum small, so 2^121 times it stays finite.
+    codes = rng.integers(-2, 3, (2, 256, 128)).astype(np.float32) / 2
+    scales = np.tile(np.asarray([1.0, 2.0 ** -127, 2.0 ** 121], np.float32), 43)[:128]
+    scale = np.stack([scales, np.roll(scales, 1)])
+    bank = formats.NvFp4.of(jnp.asarray(codes), jnp.ones((2, 16, 128), jnp.float8_e4m3fn), jnp.asarray(scale))
+    rows = rng.integers(-1, 2, (256, 256)).astype(np.float32)
+    sizes = jnp.asarray([128, 128], jnp.int32)
+
+    def product(route):
+        with generation.chosen(nvfp4=route), tuning.seen() as launched:
+            out = np.asarray(jax.jit(lambda x: gemm.nvfp4_product(x, bank, sizes, out_dtype=jnp.float32))(
+                jnp.asarray(rows, jnp.bfloat16)))
+        return out, _packed_epilogues(launched)
+
+    truth = np.concatenate([rows[group * 128:(group + 1) * 128].astype(np.float64) @ codes[group]
+                            * scale[group].astype(np.float64) for group in range(2)]).astype(np.float32)
+    (finished, hooked), (apart, _) = product("packed"), product("xla")
+    # The packed call's launch took the finish in its epilogue (its review: else the finish was XLA's).
+    assert hooked and all(epilogue is not None for epilogue in hooked), hooked
+    assert np.isfinite(truth).all()
+    np.testing.assert_array_equal(apart.view(np.uint32), truth.view(np.uint32))
+    np.testing.assert_array_equal(finished.view(np.uint32), apart.view(np.uint32))
+
+
 def _packed_epilogues(launched) -> list:
     """The epilogue of each packed NVFP4 launch a trace took (`tuning.seen`)."""
     return [observed.keyed.arguments["hooks"].epilogue for observed in launched
@@ -984,12 +1017,13 @@ def _packed_epilogues(launched) -> list:
 
 
 @pytest.mark.parametrize("grouped", [False, True], ids=["matrix", "bank"])
-def test_a_packed_nvfp4_call_finishes_its_scale_in_its_launch_where_it_runs_unswapped(grouped):
-    """An NVFP4 product named packed on an H100 whose tensor scale is one a column, as a matrix and as a bank
-    of two experts: a prefill's launch takes the scale and the decode's owed 2^8 in its epilogue
-    (`gemm._packed_finish`, row 13743), no factor's rows formed; a decode's 16 rows (swapped or not) take
-    none, the factor XLA's after it, as its receipts timed it; interpreted on this CPU (whose float32 flushes
-    the subnormals `factored`'s own rounding keeps) no launch takes it either."""
+def test_a_packed_nvfp4_call_finishes_its_scale_in_its_launch_where_it_varies_by_group(grouped):
+    """An NVFP4 product named packed on an H100 whose tensor scale is one a column, as a bank of two experts
+    and as a matrix: a bank's prefill launch takes the scale and the decode's owed 2^8 in its epilogue
+    (`gemm._packed_finish`, row 13743), no row's expert's scales gathered after it; a matrix's takes none,
+    its one scale XLA's in the output's conversion, which the epilogue's finish only slowed (M-NG-68t4,
+    GH200); a decode's 16 rows (swapped or not) take none, as its receipts timed it; interpreted on this CPU
+    (whose float32 flushes the subnormals `factored`'s own rounding keeps) no launch takes it either."""
 
     def epilogues(rows, *, interpret):
         spec, matrix, sizes = _columned_case(rows, grouped=grouped)
@@ -1000,7 +1034,7 @@ def test_a_packed_nvfp4_call_finishes_its_scale_in_its_launch_where_it_runs_unsw
         assert found, rows
         return found
 
-    assert all(epilogue is not None for epilogue in epilogues(256, interpret=False))
+    assert all((epilogue is not None) == grouped for epilogue in epilogues(256, interpret=False))
     assert all(epilogue is None for epilogue in epilogues(256, interpret=True))
     # A decode's rows (the receipts' decode cells, `NVFP4_DECODE_ROWS`) keep the factor after the launch.
     assert all(epilogue is None for epilogue in epilogues(16, interpret=False))
@@ -1015,13 +1049,13 @@ def test_a_packed_nvfp4_pin_its_finish_cannot_take_keeps_the_plain_launch(interp
     raised (`gemm._packed_finish`: the optional finish bound as its native launch is, row 13743's review)."""
     from dew.nn.kernels.templates import report
 
-    spec, matrix, _ = _columned_case(256, grouped=False)
+    spec, matrix, sizes = _columned_case(256, grouped=True)
     launch = grouped_quantized.MosaicPackedGmm()
     mesh = generation.gpu_mesh(Mesh(np.array(jax.devices()[:1]), ("data",)), "sm90")
 
     def packed(pins):
         with generation.chosen(nvfp4="packed"), tuning.pinned(pins), tuning.seen() as launched:
-            jax.jit(lambda x: gemm.nvfp4_product(x, matrix, out_dtype=jnp.float32,
+            jax.jit(lambda x: gemm.nvfp4_product(x, matrix, sizes, out_dtype=jnp.float32,
                                                  interpret_on_cpu=interpret)).trace(spec)
         return [(observed.config, observed.arguments) for observed in launched.held()
                 if isinstance(observed.arguments.op, grouped_quantized.MosaicPackedGmm)]
@@ -1041,14 +1075,13 @@ def test_a_packed_nvfp4_pin_its_finish_cannot_take_keeps_the_plain_launch(interp
     assert all(taken == launch.completed(plain, config) for taken, _ in after), after
 
 
-@pytest.mark.parametrize("grouped", [False, True], ids=["matrix", "bank"])
 @pytest.mark.parametrize("gpu", [pytest.param("sm80", marks=lowers("sm80")),
                                  pytest.param("sm90", marks=lowers("sm90"))])
-def test_a_packed_nvfp4_prefill_finishing_its_scale_lowers_for_cuda(gpu, grouped):
-    """A prefill-sized NVFP4 product named packed whose tensor scale is one a column (a matrix's, a bank's
-    of two experts) lowers for CUDA on an A100 and an H100 with its launch's epilogue taking the scale, a
-    side each tile reads where it lands (row 13743)."""
-    spec, matrix, sizes = _columned_case(256, grouped=grouped)
+def test_a_packed_nvfp4_prefill_finishing_its_scale_lowers_for_cuda(gpu):
+    """A prefill-sized NVFP4 product named packed whose tensor scale is one a column of each of a bank's
+    two experts lowers for CUDA on an A100 and an H100 with its launch's epilogue taking the scale, a side
+    each tile reads where it lands (row 13743)."""
+    spec, matrix, sizes = _columned_case(256, grouped=True)
     mesh = generation.gpu_mesh(Mesh(np.array(jax.devices()[:1]), ("data",)), gpu)
     with (generation.assumed(gpu), jax.sharding.use_abstract_mesh(mesh), generation.chosen(nvfp4="packed"),
           tuning.seen() as launched):
@@ -2026,3 +2059,29 @@ def test_a_grouped_nvfp4_product_of_no_depth_is_zero(generation_name):
         out = gemm.nvfp4_product(jnp.zeros((8, 0), jnp.float32), matrix, jnp.asarray([8], jnp.int32),
                                  out_dtype=jnp.float32, interpret_on_cpu=True)
     np.testing.assert_array_equal(np.asarray(out), np.zeros((8, 64), np.float32))
+
+
+def test_a_packed_steps_price_counts_its_decodes_integer_pipes():
+    """A step whose NVFP4 operand its consumers decode (`pricing.step_seconds`, the form's work in its
+    `Decoded`, row 14106): on an H100's narrowest legal packed tile (two consumers decoding a 256-deep stage
+    of 128 rows for 8 tokens, each weight's half byte and its block's scale stored) the decode ties the
+    shared bytes, so its price stands, and a decode of four times its work outlasts them, the step priced
+    at it; and two operands' decodes on one pipe add, not overlap, each pipe's work summed before the
+    busiest is read (its review: a 64x64x256 step's two decodes 384 clocks, not 192)."""
+    from dew.nn.kernels.templates import cost
+    from dew.nn.kernels.templates.gemm import packed, pricing
+
+    h100, work = generation.gpu_target("sm90"), packed.nvfp4_decode_work()
+    stored = 0.5 + 1 / 16
+    narrow = tiling.Tiles(128, 8, 256, 2, 1, warpgroups=2, family="wgmma")
+
+    def priced(form):
+        return pricing.step_seconds(narrow, h100, (stored, 2), (form, None), issued=jnp.bfloat16)
+
+    assert priced(pricing.Decoded(0, 1, work)) == priced(pricing.Decoded(0, 1))
+    assert priced(pricing.Decoded(0, 1, cost.repeated(work, 4))) > priced(pricing.Decoded(0, 1))
+    rates, square = cost.rates(h100, device=False), tiling.Tiles(64, 64, 256, 2, 1, family="wgmma")
+    one = pricing.Decoded(2, 1, work)
+    # The square tile's two operands alike, each decode's seconds the other's; doubled exactly.
+    left, right = (pricing.decode_seconds(square, forms, rates) for forms in ((one, None), (None, one)))
+    assert left == right and pricing.decode_seconds(square, (one, one), rates) == 2 * left

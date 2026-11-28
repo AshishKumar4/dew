@@ -1170,24 +1170,21 @@ def nvfp4_product(lhs: jax.Array, matrix: NvFp4, group_sizes: jax.Array | None =
 
 
 def _packed_finish(launch, bound, bank: NvFp4, count: int, *, dense: bool, interpret_on_cpu: bool):
-    """The packed product finished in its launch's epilogue (`factored`'s `finished`, row 13743): the tensor
-    scale (its tile's columns') and the owed 2^8 (`factored.owed_native`), CUDA's alone. None for a decode's
-    rows (`NVFP4_DECODE_ROWS`, a swapped launch's), interpreted or on a TPU (whose float32 flushes the
-    subnormals `factored`'s rounding keeps), or a placed scale; a call its operands place on the CPU when it
-    runs finishes there by `owed_exactly` (its review: 2^-127 times 256 flushed to zero there)."""
-    if (xla_products.interpreted(interpret_on_cpu) or generation.tpu(generation.gpu_target())
-            or count <= NVFP4_DECODE_ROWS or not launched_whole(bank.scale)):
+    """A bank's packed product finished in its launch's epilogue (row 13743): its experts' column scales and
+    the owed 2^8 (`factored.owed_native`, CUDA's alone), the measured case, whose finish after the launch
+    gathers each row's expert's columns (M-NG-68t4: 735.8 us to 200.4). None elsewhere: a matrix's scale
+    (XLA's output conversion takes it free; the epilogue slowed it 0.5-1.6%), a bank's scalar scales (their
+    gather unmeasured), a decode's rows, interpreted, a TPU's or a placed scale."""
+    if (dense or not bank.columned or bank.shape[0] < 2 or xla_products.interpreted(interpret_on_cpu)
+            or generation.tpu(generation.gpu_target()) or count <= NVFP4_DECODE_ROWS
+            or not launched_whole(bank.scale)):
         return None
-    raised, lead = round(np.log2(bits.NVFP4_OWED)), () if dense else (bank.shape[0],)
+    raised = round(np.log2(bits.NVFP4_OWED))
+    # Its side the experts' column scales as they lie, each tile reading its group's columns.
     hooks = Hooks(epilogue=functools.partial(owed_native, raised=raised),
-                  epilogue_axes=((*(() if dense else (GROUPS,)), 'columns'),))
-
-    def side_of(factor):
-        factor = factor if bank.columned else jnp.asarray(factor)[..., None]
-        return jnp.broadcast_to(factor, (*lead, bank.shape[-1]))
-
+                  epilogue_axes=((GROUPS, 'columns'),))
     finishing = {name: value for name, value in bound.arguments.items() if name not in ('hooks', 'interpret')}
-    finishing['epilogue_operands'] = (jax.eval_shape(side_of, bank.scale),)
+    finishing['epilogue_operands'] = (jax.eval_shape(jnp.asarray, bank.scale),)
     # An optional form, bound as its native launch is (uninterpreted): a pin the hooked call cannot take, or
     # no tile of it, keeps the plain launch.
     hooked = launch.bind(**finishing, hooks=hooks, interpret=False)
@@ -1207,7 +1204,7 @@ def _packed_finish(launch, bound, bank: NvFp4, count: int, *, dense: bool, inter
             return owed(_packed_portable(*operands[:-1]))
 
         return xla_products.dispatched(kernel, portable, interpret_on_cpu, rows, words, scales, sizes, gather,
-                                       first, side_of(factor))
+                                       first, factor)
 
     return finish
 

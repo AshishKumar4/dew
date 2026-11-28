@@ -270,6 +270,9 @@ def _scale_edge_cells() -> tuple[Cell, ...]:
         Cell("a packed NVFP4 call placed on its host's CPU keeps a subnormal column scale",
              gemm_nvfp4.a_packed_nvfp4_call_placed_on_its_hosts_cpu_keeps_a_subnormal_scale, "sm90",
              at_run=EXACT_OVERFLOW, native={"launch": "nvfp4 packed", "pass": "host-placed finish"}),
+        Cell("a packed NVFP4 prefill's finish is its products finished apart",
+             gemm_nvfp4.a_packed_nvfp4_prefills_finish_is_its_products_finished_apart, "sm90",
+             at_run=EXACT_OVERFLOW, native={"launch": "nvfp4 packed", "pass": "native finish"}),
     )
 
 
