@@ -308,14 +308,11 @@ def pytest_runtest_setup(item):
     if jax.device_count() < needed:
         pytest.skip(f"needs a {needed}-device mesh; this run has "
                     f"{jax.device_count()} {jax.default_backend()} device(s)")
-    # A GPU tier part, its prepare and its run alike (`tier_wire.TRUTHS`), runs its files' gpu-marked tests
-    # alone: a file enters the tier where any of its tests is marked so (tools/armada/prepares.py's
-    # `tier_files`), and the rest are the CPU lane's, which runs them already, never the tier's twice over
-    # (1,568 of the tier's 1,862 tests, 2026-11-28), nor prepared on its compute-nothing device, where one
-    # that reads its devices failed the part's prepare (#4577's test_dc_ae.py, train 1448's
-    # test_bf16_window.py). A test whose GPU run matters says so with the mark.
-    if tier_wire.TRUTHS in os.environ and item.get_closest_marker("gpu") is None:
-        pytest.skip("the CPU lane's: a GPU tier part runs its files' gpu-marked tests alone")
+    # The GPU lane runs and prepares a file's gpu-marked tests alone (`tier_wire.GPU_TIER`); the file's other
+    # tests are other lanes'. Skipped at setup, not deselected, so a file's split cuts and keys stay as
+    # they are.
+    if os.environ.get(tier_wire.GPU_TIER) == "1" and item.get_closest_marker("gpu") is None:
+        pytest.skip("the GPU tier runs gpu-marked tests alone")
     users = os.environ.get(lane_environment.USERS_ARITHMETIC) == "1"
     if item.get_closest_marker("gpu") and users != bool(item.get_closest_marker("users_process")):
         # A GPU test runs in the process of its variant alone (tests/model_flows.py): XLA parses a process's
@@ -400,8 +397,8 @@ def stack_scan(request):
 @pytest.fixture(autouse=True)
 def compiled_ahead(request):
     """A GPU tier part's test's check-1 sites on the part's store of programs compiled ahead
-    (tests/truths_ahead.py, its own directory of the part's, `DEW_TIER_TRUTHS`), whatever marks the test (a
-    `gpu`, `kernel` or `runs` test alike: the part runs each on its GPU), but a flow's, which opens its own
+    (tests/truths_ahead.py, its own directory of the part's, `DEW_TIER_TRUTHS`), a gpu-marked test's, the
+    only kind the part runs (`tier_wire.GPU_TIER`), but a flow's, which opens its own
     (tests/model_flows.py): its prepare, on the node's CPU, compiles each site's truths and arms for the
     node's GPU with that GPU's compile-only device this process's default, on which nothing computes, so a
     test computing more than its draws before its sites fails there (bible §8: no dense math on a node's

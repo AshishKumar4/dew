@@ -11,6 +11,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from xml.etree import ElementTree
 
 import jax
 import pytest
@@ -111,36 +112,33 @@ def test_a_gpu_lane_given_the_whole_gpu_hands_its_files_jaxs_default_share(ci, t
     assert float(share) == float(ci.WHOLE_GPU)
 
 
-@pytest.mark.parametrize("phase", ["prepare", "cpu lane"])
-def test_a_gpu_tier_part_runs_its_files_gpu_marked_tests_alone(tmp_path, phase):
-    """The suite's conftest: a GPU tier part (its store named, `tier_wire.TRUTHS`), its prepare and its run
-    alike, runs a file's gpu-marked tests alone and skips the rest as the CPU lane's, so a CPU test in a file
-    that also holds a GPU one is neither prepared on the tier's compute-nothing device (#4577, train 1448) nor
-    run on a GPU beside the CPU lane's run of it; the CPU lane, naming no store, runs them as ever. Its
-    prepare here, as it runs on a CPU host (its run's conftest reads the host's GPUs first)."""
+@pytest.mark.parametrize("lane", ["gpu", "cpu"])
+def test_the_gpu_lane_runs_a_files_gpu_marked_tests_alone(tmp_path, lane):
+    """The suite's conftest under the GPU lane's word (`tier_wire.GPU_TIER`, which the lane sets for a file
+    it runs or prepares, whoever launched it): a file's test not marked gpu is skipped as another lane's, so
+    a CPU test in a file that also holds a GPU one is neither prepared on the tier's compute-nothing device
+    (#4577, train 1448) nor run on a GPU beside the CPU lane's run of it; its gpu-marked test is not; the CPU
+    lane, without the word, runs the CPU test."""
     site = tmp_path / "test_mixed.py"
     site.write_text("import pytest\n\n\n@pytest.mark.gpu\ndef test_gpu():\n    pass\n\n\n"
                     "def test_cpu():\n    pass\n")
     tests = Path(__file__).resolve().parent
     environ = {key: value for key, value in os.environ.items()
-               if key not in (tier_wire.TRUTHS, tier_wire.PREPARE)}
-    environ["PYTHONPATH"] = os.pathsep.join([str(tests), os.environ.get("PYTHONPATH", "")])
-    if phase != "cpu lane":
-        environ[tier_wire.TRUTHS] = str(tmp_path / "truths")
-    if phase == "prepare":
-        # As a dry prepare runs a part on a CPU host (prepares.py's `run`): the one GPU its part will see.
-        environ.update({tier_wire.PREPARE: "1", "CUDA_VISIBLE_DEVICES": "0"})
-    done = subprocess.run([sys.executable, "-m", "pytest", "-q", "-rs", "-p", "conftest", "-p",
-                           "no:cacheprovider", str(site)], cwd=tmp_path, env=environ, capture_output=True,
+               if key not in (tier_wire.GPU_TIER, tier_wire.TRUTHS, tier_wire.PREPARE)}
+    environ.update({"PYTHONPATH": os.pathsep.join([str(tests), os.environ.get("PYTHONPATH", "")]),
+                    "CUDA_VISIBLE_DEVICES": "0", **({tier_wire.GPU_TIER: "1"} if lane == "gpu" else {})})
+    report = tmp_path / "report.xml"
+    done = subprocess.run([sys.executable, "-m", "pytest", "-q", "-p", "conftest", "-p", "no:cacheprovider",
+                           f"--junitxml={report}", str(site)], cwd=tmp_path, env=environ, capture_output=True,
                           text=True)
-    skipped = re.findall(r"SKIPPED \[1\] \S+: (.*)", done.stdout)
-    if phase == "cpu lane":
-        # Its CPU test runs; its GPU test is the GPU's (here none).
-        assert "1 passed" in done.stdout and not any("the CPU lane's" in why for why in skipped), done.stdout
-    else:
-        why = "the CPU lane's: a GPU tier part runs its files' gpu-marked tests alone"
-        assert why in skipped, done.stdout
-        assert "1 passed" not in done.stdout, done.stdout
+    assert done.returncode == 0, done.stdout + done.stderr
+    cases = ElementTree.parse(report).iter("testcase")
+    skipped = {case.get("name"): node.get("message", "") for case in cases for node in case.iter("skipped")}
+    why = "the GPU tier runs gpu-marked tests alone"
+    assert why not in skipped.get("test_gpu", ""), skipped
+    assert (why in skipped.get("test_cpu", "")) == (lane == "gpu"), skipped
+    if lane == "cpu":
+        assert "test_cpu" not in skipped, skipped
 
 
 def test_a_lanes_prepare_runs_on_the_cpu_what_its_run_will_hold_and_records_nothing(
