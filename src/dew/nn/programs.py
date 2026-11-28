@@ -30,6 +30,7 @@ from jax._src import (
     xla_metadata as jax_xla_metadata,
 )
 from jax._src.interpreters import partial_eval
+from jax._src.lax import lax as jax_lax_internal
 from jax._src.literals import TypedNdArray
 from jax._src.pallas.mpmd import mpmd_map_p
 from jax.core import ShapedArray, Tracer
@@ -488,6 +489,7 @@ def inlined(body: jcore.Jaxpr, operands: Sequence[jcore.Var | jcore.Literal],
 _LAX = jax.lax
 _EXTENDED = jax_primitives
 _XLA_METADATA = jax_xla_metadata
+_LAX_INTERNAL = jax_lax_internal
 
 _KINDS: dict[str, tuple[tuple[ModuleType, tuple[str, ...]], ...]] = {
     # A call JAX lowers to its program in the caller (`called`): a `jit`'s, an evaluated jaxpr's, a
@@ -518,7 +520,7 @@ _KINDS: dict[str, tuple[tuple[ModuleType, tuple[str, ...]], ...]] = {
     "positionwise": (
         (_LAX, ("bitcast_convert_type_p", "polynomial_p", "stage_p")),
         (_EXTENDED, ("random_bits_p", "random_clone_p", "random_fold_in_p", "random_seed_p", "random_split_p",
-                     "random_unwrap_p")),
+                     "random_unwrap_p", "random_wrap_p")),
         # The identity `jax.experimental.xla_metadata.set_xla_metadata` tags a value with, which JAX
         # defines in its private module alone and batches as a vectorized operation (train 1368's review).
         (_XLA_METADATA, ("xla_metadata_value_p",))),
@@ -531,6 +533,11 @@ _KINDS: dict[str, tuple[tuple[ModuleType, tuple[str, ...]], ...]] = {
     "cumulative": ((_LAX, ("cumlogsumexp_p", "cummax_p", "cummin_p", "cumprod_p", "cumsum_p")),),
     "scatter": ((_LAX, ("scatter_add_p", "scatter_max_p", "scatter_min_p", "scatter_mul_p", "scatter_p",
                         "scatter_sub_p")),),
+    # A value made from no operand: a counting sequence, a device's place along a mesh axis, an ordering
+    # token, the index of the platform a program is lowered for (`platform_dependent`'s choice), and an
+    # unwritten buffer, which JAX defines in its private module alone.
+    "generated": ((_LAX, ("axis_index_p", "create_token_p", "iota_p")), (_EXTENDED, ("platform_index_p",)),
+                  (_LAX_INTERNAL, ("empty_p",))),
 }
 """Each kind of operation the analyses of a program read, by the JAX primitives of it, named where JAX's
 public modules export them (`jax.lax`, `jax.extend.core.primitives`), or where JAX defines one it exports
@@ -695,17 +702,6 @@ def positionwise(primitive: jcore.Primitive) -> bool:
     return entrywise(primitive) or _is("positionwise", primitive)
 
 
-def prng_operation(equation: jcore.JaxprEqn) -> bool:
-    """Whether `equation` is a primitive operation on PRNG keys (`jax.dtypes.prng_key`), not a call,
-    kernel or control flow: wrapping or unwrapping key data, seeding, splitting, folding in or drawing
-    bits, none of which does a product."""
-    if opaque(equation) or bodies(equation):
-        return False
-    return any(isinstance(var.aval, ShapedArray)
-               and jnp.issubdtype(var.aval.dtype, jax.dtypes.prng_key)
-               for var in (*equation.invars, *equation.outvars))
-
-
 def rearranges(primitive: jcore.Primitive) -> bool:
     """Whether `primitive` only moves entries, each output entry one operand's entry or a fill, with no
     arithmetic and no rounding (a reshape, a squeeze, a broadcast, a transpose, a reversal, a slice, a
@@ -723,6 +719,13 @@ def scatter(primitive: jcore.Primitive) -> bool:
     """Whether `primitive` writes updates into its first operand at indices, replacing or combining (a
     scatter, and its add, subtract, multiply, minimum and maximum; `_KINDS`)."""
     return _is("scatter", primitive)
+
+
+def generated(primitive: jcore.Primitive) -> bool:
+    """Whether `primitive` makes its value from no operand and nothing outside the program (an `iota`, a
+    device's `axis_index`, an ordering token, an unwritten buffer, a lowering's platform index; `_KINDS`): a
+    host callback reading no operand is none."""
+    return _is("generated", primitive)
 
 
 def cumulative(primitive: jcore.Primitive) -> bool:

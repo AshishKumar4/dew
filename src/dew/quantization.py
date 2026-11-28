@@ -90,7 +90,6 @@ from dew.nn.kernels.generation import linear_map
 from dew.nn.kernels.options import owned_program
 from dew.nn.precision import (
     EXACT_FLOAT32,
-    accumulated,
     at_least_fp32,
     correctly_rounded_divide,
     float32_einsum,
@@ -906,12 +905,32 @@ def _fp8_rows(values: jax.Array, rows: jax.Array, row_scales: jax.Array) -> jax.
     FP8 contract (testing.md, FP8 products: 2.8 to 12.8 times closer to float64 than cuBLASLt's FP8 GEMM, 1.36
     times its time at a training shape, row 3620); elsewhere the codes as exact bfloat16 values summed in
     fp32, held apart from XLA's FP8 GEMM, whose sum is narrower (ledger 1625), the matrix's converted in the
-    template's stages where its selector takes them (row 8548). Both rows' scales apply after (`_scaled`)."""
+    template's stages where its selector takes them (row 8548). Both rows' scales apply after (`_scaled`).
+    Float64 `values` take the product the casts stand for in float64 (`_fp8_rows_exactly`)."""
     from dew.nn.kernels import gemm
 
     codes, scales = fp8_block_cast(values, (1, values.shape[1]))
+    if values.dtype == jnp.float64:
+        return _fp8_rows_exactly(codes, scales, rows, row_scales)
     product = gemm.fp8_codes_product(codes, rows, out_dtype=jnp.float32)
     return twice_scaled(product, scales, row_scales.T)
+
+
+def _fp8_rows_exactly(codes: jax.Array, scales: jax.Array, rows: jax.Array,
+                      row_scales: jax.Array) -> jax.Array:
+    """`_fp8_rows` of float64 values, the product its FP8 rows stand for: the cast's `codes` times their
+    `scales` against `rows` times theirs, every product and sum in float64 unrounded, so the computation
+    rounds where the FP8 cast rounds (its float32 input's, `fp8_block_cast`) and nowhere else. Check 1's
+    truth of a run over a frozen FP8 kernel, forward and for its input's gradient alike (row 14107): the
+    packed rows, widened or as stored, stand for the same float64 values."""
+    from dew.nn.kernels.xla_products import xla_dot
+
+    cast = codes.astype(jnp.float64) * scales.astype(jnp.float64)
+    stood = rows.astype(jnp.float64) * row_scales.astype(jnp.float64)
+    # Through XLA's dense product as the narrower product's portable route multiplies (`xla_dot`), so a
+    # contraction Explicit axes split on both sides lands where JAX asks to be told (train 1478's review:
+    # a bare `jnp.dot` refused activations and rows both split over a tensor axis).
+    return xla_dot(cast, stood.T, precision=EXACT_FLOAT32, preferred_element_type=jnp.float64)
 
 
 def _frozen_fp8_value(x: jax.Array, forward: jax.Array, forward_scale: jax.Array, dgrad: jax.Array,
@@ -926,14 +945,20 @@ def _frozen_fp8_tangent(primals, tangents, value):
     transpose is the FP8 input gradient, in `x`'s dtype (`generation.linear_map`). Its residuals are
     the packed leaves and an empty array of `x`'s dtype, all a backward reads, so a staged pullback, a
     remat or a scan keeps no copy of `x`."""
+    from dew.nn.kernels.xla_products import xla_dot
+
     x, forward, forward_scale, dgrad, dgrad_scale = primals
 
     def tangent(residuals, direction):
         rows, row_scales = (jax.lax.stop_gradient(leaf) for leaf in residuals[:2])
-        decoded = rows.astype(jnp.float32) * row_scales.astype(jnp.float32)
-        return accumulated(functools.partial(jax.lax.dot_general, dimension_numbers=(((1,), (1,)), ((), ())),
-                                             precision=EXACT_FLOAT32),
-                           direction.astype(jnp.float32), decoded, preferred_element_type=jnp.float32)
+        # In float64 where the direction is (check 1's truth, `_fp8_rows_exactly`), else float32; through
+        # XLA's dense product as the value's float64 product (`xla_dot`), so a contraction Explicit axes split
+        # on both sides is placed (train 1484's review P-F6: a bare dot refused the tangent where the value
+        # took it).
+        wide = jnp.promote_types(direction.dtype, jnp.float32)
+        decoded = rows.astype(wide) * row_scales.astype(wide)
+        return xla_dot(direction.astype(wide), decoded.T, precision=EXACT_FLOAT32,
+                       preferred_element_type=wide)
 
     def transposed(residuals, cotangent):
         _, _, rows, row_scales, like = residuals

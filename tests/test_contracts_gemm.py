@@ -12,7 +12,15 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from arm_arithmetic import ahead_on_the_host
-from contract_support import EDGES, FORWARD_ORDERS, assert_contract, assert_drawn_contract, normal_draw
+from contract_support import (
+    EDGES,
+    FORWARD_ORDERS,
+    ORDER_SETS,
+    assert_contract,
+    assert_drawn_contract,
+    contract_draw,
+    normal_draw,
+)
 from reference_error import Followed, Rounded, as_given, assert_as_exact, widened
 
 from dew.nn import precision
@@ -649,6 +657,314 @@ def test_a_routers_differentiation_report_holds_every_order(edge):
     assert_contract(reported, (kernel,), (direction,), cotangent, f"a router's report {edge}",
                     plain_fn=lambda kernel: kernel)
     assert reports
+
+
+@pytest.mark.parametrize("edge", EDGES)
+def test_an_expert_softmax_holds_every_order(edge):
+    """A router's softmax over its experts (`moe.expert_softmax`, a custom derivative: its value summed once
+    and divided as IEEE divides, its tangent a softmax's, `categorical.softmax_tangent`): every order finite
+    wherever float64 is a normal float32 and the plain formula, jax.nn's softmax as written, is."""
+    from dew.nn import moe
+
+    def plain(logits):
+        return jax.nn.softmax(logits, axis=-1)
+
+    # A seed's router logits over eight experts and their direction at the edge, and a cotangent.
+    assert_drawn_contract(moe.expert_softmax, contract_draw(14084, ((3, 8),), (3, 8)), EDGES[edge],
+                          f"an expert softmax {edge}", truth_fn=plain, plain_fn=plain)
+
+
+FLOAT32_LARGEST = float(np.finfo(np.float32).max)
+EXTREME_COTANGENTS = {"balanced": ([0.0, 0.0], [2.0**127, -(2.0**127)]),
+                      "unequal": ([0.0, -1.0], [-3 * 2.0**126, 3 * 2.0**126]),
+                      "three experts": ([0.0, 0.0, -16.0], [FLOAT32_LARGEST, FLOAT32_LARGEST, 3 * 2.0**126]),
+                      "a pivot at the largest": ([0.0, 0.0], [FLOAT32_LARGEST, 3 * 2.0**103]),
+                      "an expert no probability reaches": ([0.0, 0.0, -16.0, -1e4],
+                                                           [FLOAT32_LARGEST, FLOAT32_LARGEST, 3 * 2.0**126,
+                                                            -FLOAT32_LARGEST])}
+"""Logits and a cotangent near float32's largest at which a softmax's pullback overflowed before its result
+came back in range: at balanced logits through the top class's correction, at unequal ones through centering,
+over three experts through the weighted mean (theme 75's review); a TwoSum against a pivot at the largest, and
+a weighted mean past the range beside an expert no probability reaches (theme 76b's review)."""
+
+
+def _softmax(name: str):
+    """A softmax of Dew's whose derivative is `categorical.softmax_tangent`'s: a router's or a loss's."""
+    from dew.nn import categorical, moe
+
+    return moe.expert_softmax if name == "expert" else categorical.probabilities
+
+
+@pytest.mark.parametrize("point", EXTREME_COTANGENTS)
+@pytest.mark.parametrize("softmax", ["expert", "categorical"])
+def test_a_softmaxs_pullback_of_a_cotangent_near_the_largest_holds_every_order(softmax, point):
+    """A softmax's derivative (`categorical.softmax_tangent`, a router's `moe.expert_softmax` and
+    `categorical.probabilities` alike) at a cotangent near float32's largest (`EXTREME_COTANGENTS`): its first
+    orders finite wherever float64 is a normal float32 and its sums stay in range; and every order, reverse
+    over forward and (but at unequal logits, row 14098) reverse over reverse among them, wherever the plain
+    formula's is too.
+    Past the first order a probability's own cotangent, `g - sum p g` at the logits' scale, lies past the
+    range where the logits' does not, and reverse mode forms it before the softmax's pullback weighs it back,
+    as JAX's own softmax does (train 1455's review: a where's unselected `-inf` made reverse over forward NaN
+    where the plain formula's is finite)."""
+    logits, cotangent = EXTREME_COTANGENTS[point]
+    (direction,) = normal_draw(14087, (1, len(logits)))
+    args = ((jnp.asarray([logits], jnp.float32),), (direction,), jnp.asarray([cotangent], jnp.float32),
+            f"{softmax} softmax's pullback, {point}")
+
+    def plain(x):
+        return jax.nn.softmax(x, axis=-1)
+
+    assert_contract(_softmax(softmax), *args, truth_fn=plain, taking=ORDER_SETS["first orders"])
+    # At unequal logits reverse over reverse's probabilities' cotangent lies past the range before the outer
+    # pullback weighs it back (row 14098).
+    without = ("grad of grad",) if point == "unequal" else ()
+    assert_contract(_softmax(softmax), *args, truth_fn=plain, plain_fn=plain, without=without)
+
+
+def test_a_softmax_tangents_derivative_in_its_probabilities_is_finite_where_a_centering_overflows():
+    """`categorical.softmax_tangent`'s derivative in its probabilities, at `[0, -1]`'s probabilities and a
+    direction `[A, -A]` (`A = 3 2^126`) whose second entry's centering overflows, which reverse over reverse
+    and reverse over forward take: finite, as float64's is (`[0.067 A, 0.298 A]`), its every operand past the
+    range replaced before arithmetic reads it (train 1455's review, F2: the unselected branch's
+    `p (m - mean)`, `-inf`, times its zero cotangent gave NaN)."""
+    from dew.nn import categorical
+
+    probability = jax.nn.softmax(jnp.asarray([[0.0, -1.0]], jnp.float32), axis=-1)
+    moving = jnp.asarray([[3 * 2.0**126, -3 * 2.0**126]], jnp.float32)
+    weights = jnp.asarray([[0.5, 0.25]], jnp.float32)
+    found = jax.grad(lambda p: jnp.sum(weights * categorical.softmax_tangent(p, moving)))(probability)
+    assert np.all(np.isfinite(np.asarray(found))), found
+
+
+def test_a_softmax_tangents_second_derivative_in_its_probabilities_is_finite_near_the_largest():
+    """`categorical.softmax_tangent`'s derivative in its probabilities differentiated again, at `[0, -1]`'s
+    probabilities and a direction `[A, -A]` (`A = 3 2^126`) whose second entry's centering alone overflows:
+    finite, as its float64 is, `A [-p1^2, p0 p1] / (p0 + p1)^3` (`[-0.072 A, 0.197 A]`), its every operand
+    past the range replaced before arithmetic reads it (train 1455's review: an unselected branch's `-inf`
+    times a zero cotangent gave NaN where the derivative is finite)."""
+    from dew.nn import categorical
+
+    probability = jax.nn.softmax(jnp.asarray([[0.0, -1.0]], jnp.float32), axis=-1)
+    moving = jnp.asarray([[3 * 2.0**126, -3 * 2.0**126]], jnp.float32)
+    # Along the first probability alone, so the mean's tangent and the derivative are in range.
+    along, weights = jnp.asarray([[1.0, 0.0]], jnp.float32), jnp.asarray([[0.5, 0.25]], jnp.float32)
+
+    def tangent(probability):
+        return jnp.sum(weights * jax.jvp(lambda p: categorical.softmax_tangent(p, moving), (probability,),
+                                         (along,))[1])
+
+    found = np.asarray(jax.grad(tangent)(probability))
+    assert np.all(np.isfinite(found)), found
+
+
+@pytest.mark.parametrize("softmax", ["expert", "categorical"])
+def test_a_softmaxs_derivative_whose_weighted_sum_cancels_is_exact_whatever_its_mass(softmax):
+    """A softmax's tangent and pullback at three equal logits, whose rounded probabilities' mass is not one
+    (`3 float32(1/3) = 1 + 2^-25`), along `[2^100, -2^100, 0]`, whose weighted sum cancels: `[p 2^100,
+    -p 2^100, 0]` exactly, its mean the weighted sum over the mass, zero (train 1468's review: a mean that
+    took the mass for one left `p 2^75` in the third entry)."""
+    logits = jnp.zeros((3,), jnp.float32)
+    row = jnp.asarray([2.0**100, -(2.0**100), 0.0], jnp.float32)
+    probability = np.asarray(_softmax(softmax)(logits))
+    expected = np.asarray([probability[0] * 2.0**100, -probability[1] * 2.0**100, 0.0], np.float32)
+    _, tangent = jax.jvp(_softmax(softmax), (logits,), (row,))
+    _, pullback = jax.vjp(_softmax(softmax), logits)
+    (pulled,) = pullback(row)
+    for found in (tangent, pulled):
+        np.testing.assert_array_equal(np.asarray(found), expected)
+
+
+@pytest.mark.parametrize("softmax", ["expert", "categorical"])
+def test_a_softmaxs_tied_class_keeps_its_share_beside_a_pivot_of_one(softmax):
+    """A softmax's pullback at logits `[0, 0, -20]` (`p = [1/2, 1/2, 1.03e-9]`) along `[1, 1, 0]` gives the
+    tied class its share `p_1 p_2 / sum p`, rounded once, and its tangent along `[0, 0, 1]` that share's
+    negative: each entry's difference to the pivot less the mean's, the pivot of one never rounded into the
+    mean (train 1474's review: `1 - 1.03e-9` rounded to one gave the tied class zero and the pivot twice its
+    share)."""
+    logits = jnp.asarray([0.0, 0.0, -20.0], jnp.float32)
+    probability = np.asarray(_softmax(softmax)(logits), np.float64)
+    share = np.float32(probability[1] * probability[2] / probability.sum())
+    _, pullback = jax.vjp(_softmax(softmax), logits)
+    (pulled,) = pullback(jnp.asarray([1.0, 1.0, 0.0], jnp.float32))
+    _, tangent = jax.jvp(_softmax(softmax), (logits,), (jnp.asarray([0.0, 0.0, 1.0], jnp.float32),))
+    assert np.asarray(pulled)[1] == share
+    assert np.asarray(tangent)[1] == -share
+
+
+@pytest.mark.parametrize("softmax", ["expert", "categorical"])
+def test_a_softmaxs_derivative_over_no_rows_is_empty(softmax):
+    """A softmax's tangent and pullback over a batch of no rows are empty, as its value is (theme 76b's
+    review: a bound read off the first row raised `IndexError`)."""
+    logits = jnp.zeros((0, 4), jnp.float32)
+    _, tangent = jax.jvp(_softmax(softmax), (logits,), (logits,))
+    _, pullback = jax.vjp(_softmax(softmax), logits)
+    (pulled,) = pullback(logits)
+    assert tangent.shape == pulled.shape == (0, 4)
+
+
+@pytest.mark.parametrize(("softmax", "dtype"), [("expert", jnp.float32), ("expert", jnp.bfloat16),
+                                                ("categorical", jnp.float32)])
+def test_a_softmaxs_derivative_of_a_constant_is_zero_whatever_its_probabilities_round_to(softmax, dtype):
+    """A softmax's derivative maps a constant direction to zero and pulls a constant cotangent back to zero,
+    exactly, near the format's largest, where its probabilities' rounded sum is not one (`[0, -17]`:
+    `[1, 4.1e-8]` in float32): each entry taken from its difference to the pivot's (train 1455's review:
+    centering on `sum p g` gave `3 2^126` twice a gradient of `+-8.4e23`)."""
+    logits = jnp.asarray([0.0, -17.0], dtype)
+    constant = jnp.full((2,), 3 * 2.0**126, dtype)
+    _, tangent = jax.jvp(_softmax(softmax), (logits,), (constant,))
+    _, pullback = jax.vjp(_softmax(softmax), logits)
+    (pulled,) = pullback(constant)
+    np.testing.assert_array_equal(np.asarray(tangent, np.float32), np.zeros(2, np.float32))
+    np.testing.assert_array_equal(np.asarray(pulled, np.float32), np.zeros(2, np.float32))
+
+
+@pytest.mark.mesh
+def test_a_softmaxs_tangent_of_a_replicated_direction_beside_split_probabilities_sums_back_in_a_checked_map():
+    """`categorical.softmax_tangent` in a checked `shard_map` over two devices, its probabilities' rows split
+    across them and its direction held whole: the direction's gradient each shard's partial summed over the
+    axis, the unsharded call's sum of both halves', where its unsummed pullback reached JAX's replicated
+    accumulator (train 1455's review)."""
+    from jax.sharding import NamedSharding, PartitionSpec
+
+    from dew.nn import categorical
+
+    mesh = jax.make_mesh((2,), ("data",), devices=jax.devices()[:2])
+    probability = jax.nn.softmax(jnp.asarray(normal_draw(14088, (4, 3))[0]), axis=-1)
+    (weights, direction) = normal_draw(14089, (4, 3), (2, 3))
+
+    def summed(probability, weights, direction):
+        return jnp.sum(categorical.softmax_tangent(probability, direction) * weights)
+
+    def local(probability, weights, direction):
+        return jax.lax.psum(summed(probability, weights, direction), "data")
+
+    split = jax.shard_map(local, mesh=mesh, in_specs=(PartitionSpec("data"), PartitionSpec("data"),
+                                                      PartitionSpec()), out_specs=PartitionSpec(),
+                          check_vma=True)
+    def halves(direction):
+        return sum(summed(probability[half], weights[half], direction) for half in (slice(0, 2), slice(2, 4)))
+
+    whole = jax.grad(halves)(direction)
+    rows, held = (NamedSharding(mesh, spec) for spec in (PartitionSpec("data"), PartitionSpec()))
+    with jax.set_mesh(mesh):
+        found = jax.grad(split, argnums=2)(jax.device_put(probability, rows), jax.device_put(weights, rows),
+                                           jax.device_put(direction, held))
+    np.testing.assert_array_equal(np.asarray(found), np.asarray(whole))
+
+
+@pytest.mark.mesh
+def test_a_softmaxs_tangent_over_classes_an_explicit_axis_splits_is_the_unsplit_ones():
+    """`categorical.softmax_tangent` of probabilities and a direction whose classes an Explicit axis of two
+    devices splits: the tangent and the direction's gradient each placed as the direction is and the
+    unsplit call's, exactly, at dyadic operands whose every product and sum is exact however a program fuses
+    them (theme 76b's review: a concatenation of the class-split terms with their replicated pivot was
+    refused)."""
+    from jax.sharding import AxisType, NamedSharding, PartitionSpec
+
+    from dew.nn import categorical
+
+    mesh = jax.make_mesh((2,), ("class",), axis_types=(AxisType.Explicit,), devices=jax.devices()[:2])
+    probability = jnp.asarray([[0.5, 0.25, 0.125, 0.125], [0.125, 0.5, 0.25, 0.125]])
+    weights = jnp.asarray([[1.0, -2.0, 4.0, 2.0], [-1.0, 3.0, 2.0, 1.0]])
+    direction = jnp.asarray([[2.0, -1.0, 1.0, 4.0], [1.0, 1.0, -2.0, 3.0]])
+
+    def both(probability, weights, direction):
+        tangent = categorical.softmax_tangent(probability, direction)
+        def weighed(d):
+            return jnp.sum(categorical.softmax_tangent(probability, d) * weights)
+
+        return tangent, jax.grad(weighed)(direction)
+
+    whole = both(probability, weights, direction)
+    classes = NamedSharding(mesh, PartitionSpec(None, "class"))
+    with jax.set_mesh(mesh):
+        placed = [jax.device_put(each, classes) for each in (probability, weights, direction)]
+        found = jax.jit(both)(*placed)
+    for split, plain in zip(found, whole, strict=True):
+        assert split.sharding.is_equivalent_to(classes, 2), split.sharding
+        np.testing.assert_array_equal(np.asarray(split), np.asarray(plain))
+
+
+@pytest.mark.mesh
+def test_a_softmaxs_tangent_of_a_replicated_direction_beside_explicit_split_probabilities_is_placed_so():
+    """`categorical.softmax_tangent` of a replicated direction beside probabilities whose rows an Explicit
+    axis of two devices splits: the direction's gradient placed as the direction is and the unsharded call's,
+    exactly, at dyadic probabilities, weights and direction whose every product and sum is exact however a
+    program fuses them (train 1455's review: the pullback's split placement reached the replicated
+    accumulator)."""
+    from jax.sharding import AxisType, NamedSharding, PartitionSpec
+
+    from dew.nn import categorical
+
+    mesh = jax.make_mesh((2,), ("data",), axis_types=(AxisType.Explicit,), devices=jax.devices()[:2])
+    probability = jnp.asarray([[0.5, 0.25, 0.25], [0.25, 0.5, 0.25], [0.25, 0.25, 0.5], [0.5, 0.25, 0.25]])
+    weights = jnp.asarray([[1.0, -2.0, 4.0], [-1.0, 3.0, 2.0], [2.0, 1.0, -3.0], [4.0, -4.0, 1.0]])
+    direction = jnp.asarray([[2.0, -1.0, 1.0], [1.0, 1.0, -2.0], [-4.0, 2.0, 1.0], [3.0, 0.0, -1.0]])
+
+    def gradient(probability, weights, direction):
+        return jax.grad(lambda d: jnp.sum(categorical.softmax_tangent(probability, d) * weights))(direction)
+
+    whole = gradient(probability, weights, direction)
+    rows, held = (NamedSharding(mesh, spec) for spec in (PartitionSpec("data"), PartitionSpec()))
+    with jax.set_mesh(mesh):
+        placed = jax.device_put(direction, held)
+        found = jax.jit(gradient)(jax.device_put(probability, rows), jax.device_put(weights, rows), placed)
+    assert found.sharding.is_equivalent_to(placed.sharding, 2), (found.sharding, placed.sharding)
+    np.testing.assert_array_equal(np.asarray(found), np.asarray(whole))
+
+
+SMALL_BESIDE_LARGE = {
+    "beside unreached experts": ([0.0, 0.0, -1e4, -1e4], [2.0**-122, -(2.0**-122), 2.0**126, -(2.0**126)],
+                                 [2.0**-123, -(2.0**-123), 0, 0]),
+    "beside a large pivot": ([0.0, 0.0, 0.0, 0.0], [2.0**100, -(2.0**100), 1.0, -1.0],
+                             [2.0**98, -(2.0**98), 0.25, -0.25]),
+    "beside a large pivot, a mean of their own": ([0.0, 0.0, 0.0, 0.0],
+                                                  [2.0**70, -(2.0**70), 2.0**44, 2.0**44],
+                                                  [2.0**68, -(2.0**68), 2.0**41, 2.0**41]),
+    "beside differences past the range": ([0.0, 0.0, 0.0, 0.0, -1e4],
+                                          [2.0**127, -(2.0**127), 2.0**-122, -(2.0**-122), -(2.0**127)],
+                                          [2.0**125, -(2.0**125), 2.0**-124, -(2.0**-124), 0]),
+    "beside a scaled mean, a mean of their own": ([0.0, 0.0, 0.0, 0.0],
+                                                  [2.0**127, -(2.0**127), 2.0**-123, 2.0**-123],
+                                                  [2.0**125, -(2.0**125), 2.0**-126, 2.0**-126]),
+    "beside a scaled mean, low limbs of their own": ([0.0, 0.0, 0.0, 0.0],
+                                                     [2.0**127, -(2.0**127), 2.0**-122, 2.0**-122],
+                                                     [2.0**125, -(2.0**125), 2.0**-125, 2.0**-125]),
+    "beside a zero pivot": ([0.0, 0.0, 0.0, 0.0], [0.0, 2.0**127, -(2.0**127), 2.0**-122],
+                            [-3 * 2.0**-126, 2.0**125, -(2.0**125), 3 * 2.0**-126]),
+    "cancelling across sizes": ([0.0] * 8, [0.0, 2.0**125, -(2.0**124), -(2.0**124), 1.0, 0.0, 0.0, 0.0],
+                                [-1 / 16, 2.0**122, -(2.0**121), -(2.0**121), 7 / 64, *[-1 / 64] * 3]),
+    "balanced near the largest": ([0.0, 0.0], [2.0**127, -(2.0**127)], [2.0**126, -(2.0**126)]),
+    "beside a mean's cancelling limbs": (
+        [0.0] * 8, [2.0**60, 2.0**37 - 2.0**60, -(2.0**36), -(2.0**36), 256.0, -256.0, 0, 0],
+        [2.0**57, 2.0**34 - 2.0**57, -(2.0**33), -(2.0**33), 32.0, -32.0, 0, 0]),
+    "beside a mean's low limbs": (
+        [0.0] * 8, [2.0**60, -(2.0**60), *[2.0**35] * 5, 3 * 2.0**35 + 2.0**14],
+        [2.0**57 - 2.0**33, -(2.0**57), *[-256.0] * 5, 2.0**33 + 2048])}
+"""Logits, a direction or cotangent whose row holds small entries beside large ones, and the derivative it
+takes exactly: at classes no probability reaches beside entries near float32's largest; at four equal
+probabilities beside a pivot of 2^100, and beside one of 2^70 whose small entries make a mean of their own;
+beside differences to the pivot past the range, beside a mean whose small entries make a mean of their own,
+and beside a zero pivot (its own entry the others' rounded sum negated, so the row sums to zero); and
+PyTorch's backward at two balanced logits."""
+
+
+@pytest.mark.parametrize("case", SMALL_BESIDE_LARGE)
+@pytest.mark.parametrize("softmax", ["expert", "categorical"])
+def test_a_softmaxs_derivative_keeps_a_small_entrys_result_beside_large_entries(softmax, case):
+    """A softmax's tangent and pullback of a row whose small entries lie beside large ones keep each small
+    entry's result, exactly (`SMALL_BESIDE_LARGE`): computed as written where its intermediates are in range,
+    never the whole row scaled past the normal range (theme 75's review: flushed to zero on a CPU), each
+    entry centered on its own value, never on its difference to the pivot (theme 76b's review: `1` beside
+    `2^100` rounded away)."""
+    logits, row, expected = SMALL_BESIDE_LARGE[case]
+    logits, row = jnp.asarray(logits, jnp.float32), jnp.asarray(row, jnp.float32)
+    _, tangent = jax.jvp(_softmax(softmax), (logits,), (row,))
+    _, pullback = jax.vjp(_softmax(softmax), logits)
+    (pulled,) = pullback(row)
+    for found in (tangent, pulled):
+        np.testing.assert_array_equal(np.asarray(found), np.asarray(expected, np.float32))
 
 
 LINEAR_EDGES = {"normal": 1.0, "near the largest": 2.0**122, "near the least normal": 2.0**-122}
