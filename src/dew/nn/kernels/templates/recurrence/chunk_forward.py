@@ -244,6 +244,7 @@ def kept_forward(q, k, v, g, beta, h0=None, *, tiles: Tiles, starts=None, firsts
         # The norm a row hook over the head's real values (`recurrence.norm_row_hook`): its gate laid as the
         # output's rows and heads are, its weight every head's, each padded to the launch's value width.
         columns = call.value_width
+        assert gate is not None and weight is not None, "an epilogue reads its gate and weight"
         hook = recurrence.norm_row_hook(normed, run.value_width, out_dtype,
                                         run.laid(zero_padded(gate, 3, columns)).reshape(call.rows, call.heads,
                                                                                          columns),

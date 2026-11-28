@@ -84,13 +84,7 @@ from dew.nn.linear import (
 )
 from dew.nn.mixer_base import MixerBase, MixerContext
 from dew.nn.mixers.mamba import inverse_softplus_step, log_index
-from dew.nn.precision import (
-    accurate_exp,
-    at_least_fp32,
-    float32_dot_general,
-    rms_statistics,
-    softplus,
-)
+from dew.nn.precision import accurate_exp, at_least_fp32, float32_dot_general, rms_statistics, softplus
 from dew.nn.residuals import Residual
 
 CHUNK_SIZE = 256

@@ -149,9 +149,9 @@ class _NormStatistic:
     squares, its gate activated as a kernel's body activates it (`activation_and_slope`)."""
     norm: OutputNorm
 
-    def __call__(self, block, *gate):
+    def __call__(self, block, *sides):
         # The gate read where it comes first alone (`norm_row_hook`'s `reads`).
-        rows = block * self._activate(gate[0].astype(block.dtype)) if self.norm.gate_first else block
+        rows = block * self._activate(sides[0].astype(block.dtype)) if self.norm.gate_first else block
         return jnp.sum(rows * rows, axis=-1)
 
     def _activate(self, gate):
@@ -166,7 +166,8 @@ class _NormApplied(_NormStatistic):
     width: int = 0
     dtype: str = 'float32'
 
-    def __call__(self, block, total, gate, weight):
+    def __call__(self, block, *sides):
+        total, gate, weight = sides
         gate = gate.astype(block.dtype)
         rows = gated_rows(self.norm, block, gate, activate=self._activate)
         _, inverse = rms_of_total(total, self.width, self.norm.epsilon)
