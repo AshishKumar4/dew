@@ -305,17 +305,18 @@ def _shifted_tangent(product: Callable, primals, tangents, value) -> jax.Array:
     the rows taken toward their own size first, by as much of the row's `lift` as keeps their largest within
     `2^125` (all of it where it is negative), the rest of the power after: a lift of `2^60` taken off before
     a direction of `2^125` meets them, and a positive one put back before a direction of `2^-124` does (its
-    products `2^-165` otherwise, train 1444's review). The rows' direction meets `by` with the channels'
-    powers `restored` put back (`(by's, the output's)`: `by` taken down by them before the value's
-    product), so its pullback takes no channel's power on a cotangent before `by` meets it."""
+    products `2^-165` otherwise, train 1444's review). Each direction meets `by` with the channels' powers
+    `restored` put back (`(by's, the output's)`: `by` taken down by them before the value's product), so a
+    pullback takes no channel's power on a cotangent before `by` meets it."""
     del value
     rows, by, lift, scale, (by_powers, out_power) = primals
     drows, dby, _, _, _ = tangents
     largest = jnp.max(_exponent(jax.lax.stop_gradient(rows)), axis=-1, keepdims=True)
     take = jnp.minimum(lift, 125 - largest)
     whole = jax.tree.map(power2, by, by_powers)
+    moved = jax.tree.map(power2, dby, by_powers)
     return (power2(product(drows, whole), lift + scale - out_power)
-            + power2(product(power2(rows, take), dby), lift - take + scale))
+            + power2(product(power2(rows, take), moved), lift - take + scale - out_power))
 
 
 _shifted = contracted("test_parallax_holds_every_order")(
