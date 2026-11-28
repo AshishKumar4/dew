@@ -57,9 +57,6 @@
 "tests/test_algebra_generated.py::test_the_interpreted_ssd_backward_takes_its_generated_skip_pullback",
 "tests/test_algebra_generated.py::test_the_written_math_runs_and_nothing_is_counted_by_default"
 ],
-"tests/test_algebra_laws.py": [
-"tests/test_algebra_laws.py::test_every_structure_of_the_backward_tile_is_certified[True-False-False]"
-],
 "tests/test_algebra_merged_state.py": [
 "tests/test_algebra_merged_state.py::test_a_merged_state_is_on_par_with_its_output_and_its_total_and_their_derivatives[jitted-batched]",
 "tests/test_algebra_merged_state.py::test_a_merged_state_is_on_par_with_its_output_and_its_total_and_their_derivatives[op by op-its value]"
@@ -476,7 +473,7 @@
 "tests/test_attention_mosaic_compile.py::test_the_backward_compiles_spill_free_as_its_model_decides[sm90-128-fast-custom-vjp]",
 "tests/test_attention_mosaic_compile.py::test_the_backward_compiles_spill_free_as_its_model_decides[sm90-128-fast-sinks]",
 "tests/test_attention_mosaic_compile.py::test_the_backward_compiles_spill_free_as_its_model_decides[sm90-128-fast-temperature]",
-"tests/test_attention_mosaic_compile.py::test_the_backward_compiles_spill_free_as_its_model_decides[sm90-64-acc-none]",
+"tests/test_attention_mosaic_compile.py::test_the_backward_compiles_spill_free_as_its_model_decides[sm90-256-fast-softcap]",
 "tests/test_attention_mosaic_compile.py::test_the_backward_under_every_score_hook_lowers_for_an_h100[sinks-default]",
 "tests/test_attention_mosaic_compile.py::test_the_forward_compiles_spill_free_as_its_model_decides[sm100-128-NONE-bfloat16-none]",
 "tests/test_attention_mosaic_compile.py::test_the_forward_compiles_spill_free_as_its_model_decides[sm100-128-NONE-bfloat16-tile-bias]",
@@ -608,9 +605,6 @@
 "tests/test_attention_route.py::test_bare_attention_route_supports_jvp_and_higher_order_with_hooks",
 "tests/test_attention_route.py::test_partly_split_key_heads_keep_the_kernel_contract_on_a_tensor_and_expert_mesh[eight-key-heads]",
 "tests/test_attention_route.py::test_the_accurate_form_is_one_option_away"
-],
-"tests/test_attention_sinks.py": [
-"tests/test_attention_sinks.py::test_a_querys_own_sinks_stream_where_the_kernels_taking_a_heads_alone_refuse_them"
 ],
 "tests/test_attention_splash.py": [
 "tests/test_attention_splash.py::test_splash_agrees_with_the_reference_the_oracle_holds[cross]",
@@ -819,7 +813,7 @@
 ],
 "tests/test_attention_witness.py": [
 "tests/test_attention_witness.py::test_each_backward_fault_is_refused_at_its_elements[accurate]",
-"tests/test_attention_witness.py::test_each_backward_fault_is_refused_at_its_elements[delta]",
+"tests/test_attention_witness.py::test_each_backward_fault_is_refused_at_its_elements[combine]",
 "tests/test_attention_witness.py::test_each_backward_fault_is_refused_at_its_elements[masked]",
 "tests/test_attention_witness.py::test_each_backward_fault_is_refused_at_its_elements[scaled]",
 "tests/test_attention_witness.py::test_each_fault_is_refused_at_its_elements[capped]",
@@ -1080,25 +1074,25 @@
 "tests/test_contracts_algebra.py::test_the_convex_mean_holds_every_order[jvp of grad, scanned]"
 ],
 "tests/test_contracts_attention.py": [
-"tests/test_contracts_attention.py::test_a_fused_attention_kernel_holds_every_order[template-near the largest]",
-"tests/test_contracts_attention.py::test_a_fused_attention_kernel_holds_every_order[template-near the least normal]",
-"tests/test_contracts_attention.py::test_a_fused_attention_kernel_holds_every_order[template-normal]",
-"tests/test_contracts_attention.py::test_a_fused_attention_kernel_holds_every_order[tpu-near the largest]",
-"tests/test_contracts_attention.py::test_a_giant_heads_clip_holds_every_order[jvp of grad, scanned]",
+"tests/test_contracts_attention.py::test_a_fused_attention_kernel_holds_every_order[template-near the largest-jvp of grad, nested jit]",
+"tests/test_contracts_attention.py::test_a_fused_attention_kernel_holds_every_order[template-near the largest-second jvp, remat]",
+"tests/test_contracts_attention.py::test_a_fused_attention_kernel_holds_every_order[template-near the least normal-jvp of grad, nested jit]",
+"tests/test_contracts_attention.py::test_a_fused_attention_kernel_holds_every_order[template-near the least normal-second jvp, remat]",
+"tests/test_contracts_attention.py::test_a_fused_attention_kernel_holds_every_order[template-normal-jvp of grad, nested jit]",
+"tests/test_contracts_attention.py::test_a_fused_attention_kernel_holds_every_order[template-normal-jvp of grad, remat]",
+"tests/test_contracts_attention.py::test_a_fused_attention_kernel_holds_every_order[template-normal-jvp of grad]",
+"tests/test_contracts_attention.py::test_a_fused_attention_kernel_holds_every_order[template-normal-second jvp]",
+"tests/test_contracts_attention.py::test_a_giant_heads_clip_holds_every_order[grad of grad]",
+"tests/test_contracts_attention.py::test_a_giant_heads_clip_holds_every_order[second jvp]",
 "tests/test_contracts_attention.py::test_a_padded_merges_derivatives_are_the_laws[near the largest-jvp of grad, remat]",
-"tests/test_contracts_attention.py::test_a_padded_merges_derivatives_are_the_laws[near the largest-second jvp, remat]",
-"tests/test_contracts_attention.py::test_a_padded_merges_derivatives_are_the_laws[near the least normal-jvp of grad, nested jit]",
+"tests/test_contracts_attention.py::test_a_padded_merges_derivatives_are_the_laws[near the least normal-first orders]",
 "tests/test_contracts_attention.py::test_a_padded_merges_derivatives_are_the_laws[near the least normal-jvp of grad, scanned]",
-"tests/test_contracts_attention.py::test_a_padded_merges_derivatives_are_the_laws[near the least normal-jvp of grad]",
-"tests/test_contracts_attention.py::test_a_padded_merges_derivatives_are_the_laws[near the least normal-second jvp]",
-"tests/test_contracts_attention.py::test_a_padded_merges_derivatives_are_the_laws[normal-grad of grad]",
+"tests/test_contracts_attention.py::test_a_padded_merges_derivatives_are_the_laws[normal-first orders]",
 "tests/test_contracts_attention.py::test_a_padded_merges_derivatives_are_the_laws[normal-jvp of grad, nested jit]",
-"tests/test_contracts_attention.py::test_a_padded_merges_derivatives_are_the_laws[normal-jvp of grad, remat]",
 "tests/test_contracts_attention.py::test_a_padded_merges_derivatives_are_the_laws[normal-jvp of grad, scanned]",
-"tests/test_contracts_attention.py::test_a_padded_merges_derivatives_are_the_laws[normal-jvp of grad]",
 "tests/test_contracts_attention.py::test_a_padded_merges_derivatives_are_the_laws[normal-second jvp, remat]",
-"tests/test_contracts_attention.py::test_a_padded_merges_derivatives_are_the_laws[normal-second jvp]",
-"tests/test_contracts_attention.py::test_the_paged_decode_kernel_holds_every_order[normal]",
+"tests/test_contracts_attention.py::test_a_template_calls_value_tangent_is_finite_past_its_raw_products",
+"tests/test_contracts_attention.py::test_the_sparse_latent_kernel_holds_every_order[near the largest]",
 "tests/test_contracts_attention.py::test_the_sparse_latent_kernel_holds_every_order[normal]"
 ],
 "tests/test_contracts_gemm.py": [
@@ -1773,9 +1767,6 @@
 "tests/test_examples.py::test_train_flowers_trains_on_every_record_and_its_profiling_run_draws_nothing",
 "tests/test_examples.py::test_train_masked_lm_smoke_trains_its_run_and_reads_it_back_as_a_masked_generator",
 "tests/test_examples.py::test_train_rlvr_turns_smoke_trains_through_environment_source"
-],
-"tests/test_fit_admission.py": [
-"tests/test_fit_admission.py::test_a_step_built_with_its_evaluations_needs_their_room_beside_the_state_once[host]"
 ],
 "tests/test_fla_gdn.py": [
 "tests/test_fla_gdn.py::test_a_gated_delta_net_on_fla_matches_it_on_xla[bfloat16]",
@@ -3324,6 +3315,11 @@
 "tests/test_recurrence_chunk.py::test_the_portable_maths_products_state_ieee_float32_as_a_gpu_runs_them[Hooks(conv=None, l2norm=False, scale=0.25, decay='scalar', gates=None, delta=True, write_gate=False, rated=False, skip=False, output=None, write_bound=1.0, unit_queries=False, unit_reads=False, decay_bound=None, reads='after', own_weight=False, ranks=1, turns=0, erase='tied', value_decay=False, substeps=1, coupled=None)]",
 "tests/test_recurrence_chunk.py::test_turned_gradient_p0_regressions_f1_f2_f3"
 ],
+"tests/test_recurrence_epilogue.py": [
+"tests/test_recurrence_epilogue.py::test_an_idle_chunks_rate_gradient_is_zero_whatever_its_rate",
+"tests/test_recurrence_epilogue.py::test_the_output_launchs_norm_is_on_par_with_the_norm_after_it[two value blocks-forward-gate before norm, weight rounded]",
+"tests/test_recurrence_epilogue.py::test_the_output_launchs_norm_lowers_on_a_hopper[one value block-training]"
+],
 "tests/test_recurrence_forked_gate.py": [
 "tests/test_recurrence_forked_gate.py::test_a_forked_calls_walks_keep_its_table_spilling_none[sm100-kimi-linear-kda-True]",
 "tests/test_recurrence_forked_gate.py::test_a_forked_calls_walks_keep_its_table_spilling_none[sm100-minimax-text-01-lightning-True]",
@@ -3737,10 +3733,6 @@
 "tests/test_samplers.py::test_every_registered_solver_samples_its_processes_and_refuses_the_rest[unmask]",
 "tests/test_samplers.py::test_heun_walks_edms_algorithm_2_with_its_churn[deterministic]",
 "tests/test_samplers.py::test_solver_matches_diffusers_latents_and_gradient[deis.3_short]"
-],
-"tests/test_saved_models.py": [
-"tests/test_saved_models.py::test_a_dreamer_run_exports_its_world_model_and_agent_whole",
-"tests/test_saved_models.py::test_a_jepa_run_exports_and_loads_as_its_encoder"
 ],
 "tests/test_saved_runs.py": [
 "tests/test_saved_runs.py::test_a_decision_run_this_dew_saves_resumes_when_its_command_runs_again_or_from_its_record[decision]",
