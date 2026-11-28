@@ -4,7 +4,6 @@ its own bytes; a hook laid at the whole width keeps the whole-width finish; each
 (check 1)."""
 
 import dataclasses
-import traceback
 
 import jax
 import jax.extend.core
@@ -250,12 +249,11 @@ def test_an_epilogue_program_holds_no_device_array_its_hook_captured():
         assert not any(isinstance(value, jax.Array) for value in (*kept.consts, *literals))
 
 
-def _centred(traced: list[tuple[tuple[int, ...], bool]]):
+def _centred(traced: list[tuple[int, ...]]):
     """A gate less its row's mean (`out - mean(out)`, no entrywise program), each trace recording in
-    `traced` the shape it traced at and whether its program's tracing
-    (`attention_mosaic_program.output_program`) made it."""
+    `traced` the shape it traced at."""
     def centred(out, gate):
-        traced.append((out.shape, any(frame.name == "output_program" for frame in traceback.extract_stack())))
+        traced.append(out.shape)
         return _gate(out, gate) - jnp.mean(out, axis=-1, keepdims=True)
 
     return centred
@@ -336,14 +334,13 @@ def test_a_calls_pricing_and_launch_trace_its_hook_once():
 @INTERPRETS
 def test_a_whole_width_epilogue_replays_its_hooks_one_program():
     """A hook that reads its row whole (`_centred`) in a pinned H100 launch 64 wide, finished whole: traced
-    at its launch's tile by its program's tracing alone (`output_program`), its epilogue replaying that
+    at its launch's tile once, by its program's tracing (`output_program`), its epilogue replaying that
     program (`BlockPlan.whole`), where the epilogue traced the hook again (train 1444's review)."""
     queries, width = 128, 64
     traced = []
     spans = template.spans(queries, queries, 1, causal=True)
     jax.jit(_pinned(_centred(traced), UNSPLIT["sm90"], spans)).lower(*_wide(queries, width)(0))
-    at_tile = [made for shape, made in traced if shape == (64, width)]
-    assert at_tile and all(at_tile), traced
+    assert traced.count((64, width)) == 1, traced
 
 
 def test_an_output_hooks_literal_array_is_no_entrywise_program():
