@@ -817,20 +817,25 @@ def test_every_gemm_form_derives_a_tile_at_every_shape(generation_name, shape):
 
 def _grouped_unaligned(generation_name: str, shape: str) -> set[str]:
     """The gate's forms at `shape` that store a grouped call's rows by TMA (a `gmm` launch, neither dense nor
-    scattered, on a family staging its outputs by TMA, `Transport.stores_chunks`) into output rows of no
-    whole 128-byte units: those a grouped call's alignment may leave without a Mosaic tile (row 14182)."""
+    scattered, on a family staging its outputs by TMA, `Transport.stores_chunks`) into rows of no whole
+    128-byte units at the width its launch runs (`_aligned_extents`: padded to its tiles, or partial) in a
+    dtype it stores (`_stored_dtypes`, its epilogue's outputs'): those a grouped call's alignment may leave
+    without a Mosaic tile (row 14182)."""
     families = {form: group[0] for group in bundles.groups(generation_name, jnp.bfloat16, stated=True)
                 for form in _emitted_forms(group[0])}
     found = set()
-    for form, launch, operands, options in _gemm_forms(*GEMM_SHAPES[shape]):
-        family = families.get(form)
-        if (family is None or not isinstance(launch, grouped_matmul.MosaicGmm) or options.get("dense")
-                or options.get("scatter") is not None or not family.stores_chunks):
-            continue
-        rhs = operands[1]
-        columns = rhs.shape[1] if options.get("trans_rhs") else rhs.shape[2]
-        if columns * jnp.dtype(options["out_dtype"]).itemsize % copies.SHARED_ALIGNMENT:
-            found.add(form)
+    with generation.assumed(generation_name):
+        target = generation.gpu_target()
+        for form, launch, operands, options in _gemm_forms(*GEMM_SHAPES[shape]):
+            family = families.get(form)
+            if (family is None or not isinstance(launch, grouped_matmul.MosaicGmm) or options.get("dense")
+                    or options.get("scatter") is not None or not family.stores_chunks):
+                continue
+            ba = launch.bind(*operands, **options)
+            width = launch._aligned_extents(ba, family, target)[1]["width"]
+            if any(width * jnp.dtype(dtype).itemsize % copies.SHARED_ALIGNMENT
+                   for dtype in grouped_matmul._stored_dtypes(ba)):
+                found.add(form)
     return found
 
 def _gate_forms(generation_name: str) -> set[str]:
