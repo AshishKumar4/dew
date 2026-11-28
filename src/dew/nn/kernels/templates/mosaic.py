@@ -2359,7 +2359,7 @@ class Family[Allocated, Opened, Accumulator](Issuer[Accumulator], Transport[Allo
         # A partial past what a merge reads ahead (a GEMM tile's) is merged a slice of its widest leaf's
         # columns at a time, its other leaves (a softmax merge's row statistics) read whole each slice, so the
         # running value and one slice are live, not two whole tiles (`across.merge_spans`).
-        widest, spans = across.merge_spans(summed, held)
+        widest, spans = across.merge_spans(summed, held, self.atom_columns)
 
         def combined(running) -> None:
             def merged(chunk, running):

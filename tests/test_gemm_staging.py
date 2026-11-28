@@ -198,3 +198,38 @@ def test_a_refusal_at_a_fed_rings_least_depth_leaves_its_deeper_restaging_derive
         report.refuse([(report._identity(gmm, ba, sm120), shallow, frozenset({gmm.KERNEL}))])
         assert report.refused(gmm, ba, shallow, sm120) and not gmm.legal(ba, shallow, sm120)
         assert gmm.derived(ba, sm120) == tile, tile
+
+
+def test_a_partials_merge_slices_whole_atoms_of_its_family():
+    """`across.merge_spans` cuts a partial's widest leaf into spans of whole 8-column atoms and of its
+    family's atom (row 14073): 160 columns at mma.sync's 32-column atom in five spans of 32 (not two of 80,
+    which its layout casts to no tile); 96 columns at a 64-column atom, which no whole split holds, in one
+    span; and at an atom of one, the 8-column spans it took before."""
+    from dew.nn.kernels.templates import across
+
+    def spans(columns, held, atom):
+        return across.merge_spans(np.zeros((64, columns), np.float32), held, atom)
+
+    over = 2 * across.MERGED_REGISTERS
+    assert spans(160, over, 32) == (0, [(start, 32) for start in range(0, 160, 32)])
+    assert spans(96, over, 64) == (None, [(0, None)])
+    assert spans(160, over, 1) == (0, [(0, 80), (80, 80)])
+
+
+def test_a_pinned_sm120_tile_whose_balanced_tail_merges_its_partials_lowers():
+    """The 128 x 160 x 64 two-stage mma.sync tile pinned at Qwen3.5-4B's down projection (8192 x 9216 ->
+    2560) lowers on a compile-only RTX PRO 6000: its balanced tail merges each consumer's 64 x 160 partial
+    in spans of whole 32-column atoms of mma.sync's one-row-warp layout, where spans of 80 cast to no
+    layout (row 14073, M-NG-34b's down forward: 'Cannot cast to layout ... (64, 80)')."""
+    from jax.sharding import Mesh
+
+    bf16 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
+    arm = tiling.Tiles(128, 160, 64, 2, 8, warpgroups=2, family="mma.sync.fed")
+
+    def compiled(x, w):
+        with generation.chosen(grouped_matmul="mosaic"), tuning.pinned({grouped_matmul.MosaicGmm: arm}):
+            return gemm.gemm(x, w, None, out_dtype=jnp.bfloat16)
+
+    mesh = generation.gpu_mesh(Mesh(np.array(jax.devices()[:1]), ("data",)), "sm120")
+    with generation.assumed("sm120"), jax.sharding.use_abstract_mesh(mesh):
+        jax.jit(compiled).trace(bf16((8192, 9216)), bf16((9216, 2560))).lower(lowering_platforms=("cuda",))
