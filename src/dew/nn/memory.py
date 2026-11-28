@@ -725,15 +725,18 @@ class InContextMemory(LinearProducts):
         form = "ttt" if network.bias else "titans"
         if form == "ttt" and (self.momentum is not None or self.retention is not None):
             return None
-        from dew.nn.dense import intercepting
+        from dew.nn.dense import watched_or_owned
 
-        # No Flax method interceptor that may intercept a head's own call (`dense.intercepting`, as a joined
-        # projection asks): the kernels read its weights, never its call (train 1478's review: an
-        # interceptor zeroing `head_0`'s call, the general path read zeros and the kernel the weights).
+        # No call of a head a wrapper must see (`dense.watched_or_owned`, as a joined projection asks): a
+        # Flax method interceptor that may intercept it, a capture of its outputs, a quantization scope of
+        # Dew's or a direct Qwix provider, whose rules may name its `down` (`head_0/down`): the kernels read
+        # its weights, never its call (train 1478's review: an interceptor zeroing `head_0`'s call, the
+        # general path read zeros and the kernel the weights; train 1484's: a direct Qwix rule on
+        # `head_0/down` left unused).
         plain = all(set(traverse_util.flatten_dict(head.initial)) == self.MINI_BATCHED[form]
                     and set(traverse_util.flatten_dict(head.held)) == {("norm", "scale"), ("norm", "bias")}
                     and not head.collections and self.linear_product(f"head_{index}")
-                    and not intercepting(getattr(self, f"head_{index}"))
+                    and not watched_or_owned(getattr(self, f"head_{index}"))
                     for index, head in enumerate(heads))
         return form if plain else None
 

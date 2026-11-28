@@ -147,6 +147,27 @@ def test_a_mini_batched_memory_under_a_method_interceptor_reads_the_intercepted_
     np.testing.assert_array_equal(np.asarray(intercepted), np.asarray(token_path))
 
 
+@pytest.mark.parametrize("name", ["ttt_linear", "titans_linear"])
+def test_a_mini_batched_memory_under_a_direct_qwix_rule_runs_its_heads_through_the_rule(name):
+    """A direct Qwix provider's dynamic int8 rule on a head's `down` (`qwix.quantize_model`, a module path
+    `head_0/down`) quantizes that product on a call of one document, which a linear residual memory's
+    mini-batched kernel would otherwise take with its weights unrounded: the rule is used, and the call, as
+    the same call packed (the token path), reads apart from the unquantized memory's (train 1484's review:
+    the kernel left the rule unused and read the memory's own weights)."""
+    qwix = pytest.importorskip("qwix")
+
+    module = layer(name)
+    provider = qwix.QtProvider([qwix.QtRule(module_path=".*head_0/down", weight_qtype=jnp.int8,
+                                           act_qtype=jnp.int8)])
+    quantized = qwix.quantize_model(module, provider)
+    x, params = drawn(module)(0)
+    one_document = np.asarray(quantized.apply(params, x))
+    assert provider.get_unused_rules() == []
+    stepped = np.asarray(quantized.apply(params, x, packed(np.ones((ROWS, LENGTH), np.int32))))
+    plain = np.asarray(module.apply(params, x))
+    assert not np.array_equal(one_document, plain) and not np.array_equal(stepped, plain)
+
+
 PADDED = ((np.arange(LENGTH)[None] >= np.asarray([0, 1, 3, 0, 5, 2, 0, 7])[:, None])
           & (np.arange(LENGTH)[None] < np.asarray([12, 12, 12, 10, 12, 12, 8, 12])[:, None]))
 """Each row's real tokens: rows left-padded by 1 to 7 tokens, two right-padded by 2 and 4, three whole."""
