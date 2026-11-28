@@ -447,13 +447,21 @@ def test_a_nan_in_a_quantizing_epilogues_product_takes_the_nan_scale():
     np.testing.assert_array_equal(held, np.asarray(jax.lax.bitcast_convert_type(expected, jnp.uint8)))
 
 
+NAN_ROWS, NAN_COLUMNS = (3, 50, 99), (37, 70)
+"""`_nan_among_normal_rows`' product's NaNs: at these rows, in these columns alone."""
+
+
 def _nan_among_normal_rows():
-    """Rows of normal draws holding one NaN each at its own column, by an identity: a product whose blocks
-    mix a NaN with finite values (row 14083's train 1477 and 1484 reviews)."""
+    """Finite rows of normal draws by an identity whose columns `NAN_COLUMNS` also take twice the first two
+    depths' values, minus: at rows `NAN_ROWS`, whose first two values are 2^127, those columns' sums are an
+    infinity less one, NaN, beside every other block of theirs finite (train 1484's confirm: a NaN in the
+    rows had poisoned every column of its row)."""
     rng = np.random.default_rng(14084)
     x = rng.normal(size=(128, 128)).astype(np.float32)
-    x[np.arange(128), (np.arange(128) * 37) % 128] = np.nan
-    return jnp.asarray(x, jnp.bfloat16), jnp.eye(128, dtype=jnp.bfloat16)
+    x[list(NAN_ROWS), :2] = 2.0 ** 127
+    w = np.eye(128, dtype=np.float32)
+    w[0, list(NAN_COLUMNS)], w[1, list(NAN_COLUMNS)] = 2.0, -2.0
+    return jnp.asarray(x, jnp.bfloat16), jnp.asarray(w, jnp.bfloat16)
 
 
 def test_a_launchs_quantizing_epilogue_scales_a_mixed_nan_block_as_the_quantizer():
@@ -468,11 +476,15 @@ def test_a_launchs_quantizing_epilogue_scales_a_mixed_nan_block_as_the_quantizer
         fused = quantized.gemm_quantized(x, w, minifloat=formats.MxFp8, interpret_on_cpu=True)
     assert isinstance(fused, formats.MxFp8)
     assert ("grouped_matmul", "mosaic") in {(route.choice, route.kernel) for route in routes}, routes
-    want = formats.MxFp8.quantized(jnp.dot(x, w, preferred_element_type=jnp.float32))
+    product = jnp.dot(x, w, preferred_element_type=jnp.float32)
+    want = formats.MxFp8.quantized(product)
     np.testing.assert_array_equal(np.asarray(fused.scales).view(np.uint8),
                                   np.asarray(want.scales).view(np.uint8))
-    assert (np.asarray(want.scales).view(np.uint8) == 0xFF).any()
-    finite = ~np.isnan(np.asarray(jnp.dot(x, w, preferred_element_type=jnp.float32)))
+    holding = np.zeros((128, 4), bool)
+    holding[np.ix_(list(NAN_ROWS), [column // 32 for column in NAN_COLUMNS])] = True
+    np.testing.assert_array_equal(np.asarray(want.scales).view(np.uint8) == 0xFF, holding)
+    finite = ~np.isnan(np.asarray(product))
+    assert finite.sum() == 128 * 128 - len(NAN_ROWS) * len(NAN_COLUMNS)
     np.testing.assert_array_equal(np.asarray(fused.codes).view(np.uint8)[finite],
                                   np.asarray(want.codes).view(np.uint8)[finite])
 
