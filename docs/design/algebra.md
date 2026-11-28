@@ -500,7 +500,7 @@ All accuracy checks are the [accuracy gate](testing.md)'s, with no tolerance of 
 
 Draft, 2026-11-01. Every part of the work builds against this section, so a change to it is a change to the design.
 The engine runs egglog 14.0.0 (MIT; wheels for CPython 3.12–3.14 on Linux, macOS and Windows; on Linux Dew's
-own build of that release, 14.0.0.post1, from its package index), pinned exactly,
+own build of that release from its package index, the post release pyproject.toml pins), pinned exactly,
 because its Python API is still marked as subject to change.
 
 ### 6.1 Modules

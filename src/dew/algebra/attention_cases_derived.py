@@ -9,7 +9,7 @@ Declarations: dew.algebra.attention_cases.key_dropped_cotangents,
   dew.algebra.attention_cases.softcap_tile, dew.algebra.attention_cases.split_kv_merge,
   dew.algebra.attention_cases.values_gradient, dew.algebra.attention_cases.walk_output.
 Rule sets: identities, contracted, stable, linear, reuse, joined.
-egglog 14.0.0.post1; measured on cpu.
+egglog 14.0.0.post2; measured on cpu.
 
 Receipts:
 - identities: docs/design/algebra.md §1; measured M-DC-1 (four diffusion training steps, GH200) and M-DC-3

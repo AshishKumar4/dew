@@ -12,7 +12,7 @@ Declarations: dew.algebra.format_cases.decode_e4m3, dew.algebra.format_cases.dec
   dew.algebra.format_cases.rounded, dew.algebra.format_cases.rounded_fp16,
   dew.algebra.format_cases.rounded_fp16_tangent, dew.algebra.format_cases.rounded_tangent.
 Rule sets: identities, contracted, stable, linear, reuse, joined.
-egglog 14.0.0.post1; measured on cpu.
+egglog 14.0.0.post2; measured on cpu.
 
 Receipts:
 - identities: docs/design/algebra.md §1; measured M-DC-1 (four diffusion training steps, GH200) and M-DC-3

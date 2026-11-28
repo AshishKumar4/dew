@@ -9,8 +9,8 @@ A derivation is a pure function of what it reads: its declaration's traced progr
 its numerics' class and limits, the context its forms are priced and traced in (`derive.context`), the rule
 sets it saturates with (by name, each as the source registers it, immutable, `rules.sourced`; a set
 registered at run time stores nothing), the algebra's code (`dew._code.code_digest`) and egglog's and JAX's
-versions, each its exact build's (egglog `14.0.0.post1` where Dew pins its patched build, `14.0.0` where it
-pins upstream's): an entry is read only by the egglog that derived it, so a shipped one is read where the
+versions, each its exact build's (Dew's patched egglog build where pyproject.toml pins one, upstream's
+release elsewhere): an entry is read only by the egglog that derived it, so a shipped one is read where the
 package's build was derived and derived afresh elsewhere, never an entry another build could saturate or
 extract otherwise. The program's digest states each primitive by its name, so a program is keyed only where
 each of its primitives, at every depth, is the one JAX binds to that name (`_bound`): a region tells

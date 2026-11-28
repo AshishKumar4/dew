@@ -11,7 +11,7 @@ Declarations: dew.algebra.recurrence_cases.chunk_carry, dew.algebra.recurrence_c
   dew.algebra.recurrence_cases.selective_token, dew.algebra.recurrence_cases.skipped_back,
   dew.algebra.recurrence_cases.ssd_chunk_forward, dew.algebra.recurrence_cases.ssd_chunk_pullback.
 Rule sets: identities, contracted, stable, linear, reuse, joined.
-egglog 14.0.0.post1; measured on cpu.
+egglog 14.0.0.post2; measured on cpu.
 
 Receipts:
 - identities: docs/design/algebra.md §1; measured M-DC-1 (four diffusion training steps, GH200) and M-DC-3

@@ -3,7 +3,7 @@
 Declarations: dew.algebra.acceptance.lse_folded_probabilities,
   dew.algebra.acceptance.normalized_values_product.
 Rule sets: identities, contracted, stable, linear, reuse, joined.
-egglog 14.0.0.post1; measured on cpu.
+egglog 14.0.0.post2; measured on cpu.
 
 Receipts:
 - identities: docs/design/algebra.md §1; measured M-DC-1 (four diffusion training steps, GH200) and M-DC-3
