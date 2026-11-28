@@ -174,11 +174,12 @@ class CompiledTruths:
             raise
         except BaseException as error:
             # The innermost site an error escapes names it (`stopped_in`), whatever outer site it escapes too:
-            # its label kept with the traceback it escaped with, which an outer site's sees again within its
-            # own; an error caught and raised again elsewhere starts a traceback of its own.
+            # its label kept with the innermost entry of the traceback it escaped with, which stays in its
+            # traceback on its way out (each frame it leaves prepended); an error caught and raised again with
+            # a traceback of its own holds that entry no more.
             held = getattr(error, SITE_OF_ERROR, None)
             if held is None or not _within(held[1], error.__traceback__):
-                setattr(error, SITE_OF_ERROR, (labels[0], error.__traceback__))
+                setattr(error, SITE_OF_ERROR, (labels[0], _innermost(error.__traceback__)))
             raise
         self.done.update(labels)
 
@@ -648,6 +649,13 @@ SITE_OF_ERROR = "_dew_check1_site"
 """The attribute an error escaping a site's prepare carries its label in (`CompiledTruths.preparing`, the
 innermost site's), which the suite's failure recorder names it by (tests/conftest.py's
 `recorded_unprepared`): no site an earlier failure, caught, left unfinished."""
+
+
+def _innermost(traceback):
+    """The last entry of `traceback`'s chain: the frame its error was raised in."""
+    while traceback is not None and traceback.tb_next is not None:
+        traceback = traceback.tb_next
+    return traceback
 
 
 def _within(inner, traceback) -> bool:
