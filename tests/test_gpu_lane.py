@@ -547,6 +547,9 @@ def test_a_sites_label_is_compared_as_a_label_and_else_its_lines_text(ci):
     assert graded([site], {(test, where, None, "site", "assert_as_exact(")})["exitCode"] == 0
     legacy = {ci.prepares.decoded([test, where, None, "site", "label:merged forward\nassert_as_exact("])}
     assert legacy == {(test, where, None, "site", "assert_as_exact(", "merged forward")}
+    # A label of several lines kept whole, the text its last line.
+    multiline = ci.prepares.decoded([test, where, None, "site", "label:merged\nforward\nassert_as_exact("])
+    assert multiline[4:] == ("assert_as_exact(", "merged\nforward")
     assert graded([site], legacy)["exitCode"] == 0
     swapped = {(test, where, None, "site", "assert_as_exact(", "merged backward")}
     assert graded([site], swapped)["new_unprepared"] == [f"{test} @ {where}"]

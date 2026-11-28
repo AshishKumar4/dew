@@ -314,7 +314,8 @@ def _unlabeled(site: str | None, check: str | None) -> tuple[str | None, str | N
     """A record's site text and Check 1 label (`Cell`'s last two fields), a legacy record's label read out of
     its text (`_LEGACY_LABELED`)."""
     if check is None and site is not None and site.startswith(_LEGACY_LABELED) and "\n" in site:
-        check, _, site = site.removeprefix(_LEGACY_LABELED).partition("\n")
+        # The text one stripped line, the label any before it, newlines and all (train 1513).
+        check, _, site = site.removeprefix(_LEGACY_LABELED).rpartition("\n")
     return site or None, check
 
 
