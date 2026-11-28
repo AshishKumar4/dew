@@ -778,3 +778,48 @@ def test_an_aligned_segment_sum_sums_its_segments_over_a_checked_maps_devices():
     got = jax.jit(jax.shard_map(each_device, mesh=mesh, in_specs=(data, data, data), out_specs=whole,
                                 check_vma=True))(values, scales, tables)
     np.testing.assert_array_equal(np.asarray(got), np.asarray([[2.0 ** -38]], np.float32))
+
+
+@pytest.mark.mesh(devices=2)
+def test_a_replicated_factors_cotangent_pools_its_digits_over_the_axis_before_it_rounds():
+    """The gradient of a checked `shard_map`'s summed `aligned_sum([(a, b)])` times `w` by a replicated `a`
+    beside `b` and `w` split over two devices, `(1 - 2^-23)` and `1` on the first, `-1` and `1` on the second
+    (`w` `1 + 2^-23` and `1`): exactly `-2^-46`, the cotangent's terms' digits pooled over the axis before the
+    one rounding, where each device rounded first (`1` and `-1`) summed to 0 (train 1461's review)."""
+    mesh = jax.sharding.Mesh(np.asarray(jax.devices()[:2]), ("data",))
+    split = jax.sharding.PartitionSpec("data")
+    b = jnp.asarray([1 - 2.0 ** -23, -1.0], jnp.float32)
+    w = jnp.asarray([1 + 2.0 ** -23, 1.0], jnp.float32)
+
+    def total(a):
+        def local(a, b, w):
+            return jax.lax.psum(jnp.sum(aligned_sum([(a, b)]) * w), "data")
+
+        return jax.shard_map(local, mesh=mesh, in_specs=(jax.sharding.PartitionSpec(), split, split),
+                             out_specs=jax.sharding.PartitionSpec(), check_vma=True)(a, b, w)
+
+    found = jax.jit(jax.grad(total))(jnp.ones((1,), jnp.float32))
+    np.testing.assert_array_equal(np.asarray(found), np.asarray([-(2.0 ** -46)], np.float32))
+
+
+@pytest.mark.mesh(devices=2)
+def test_a_split_factors_cotangent_in_a_checked_shard_map_is_the_unsplit_calls():
+    """The gradient of a checked `shard_map`'s summed `aligned_sum([(a, b)])` times `w` by `b`, split over two
+    devices as `w` is beside a replicated `a`: the unsplit call's bit for bit, no axis in excess, its terms
+    summed as they were."""
+    mesh = jax.sharding.Mesh(np.asarray(jax.devices()[:2]), ("data",))
+    split = jax.sharding.PartitionSpec("data")
+    a = jnp.asarray([3.0], jnp.float32)
+    w = jnp.asarray([1 + 2.0 ** -23, -(2.0 ** 100)], jnp.float32)
+
+    def total(b):
+        def local(a, b, w):
+            return jax.lax.psum(jnp.sum(aligned_sum([(a, b)]) * w), "data")
+
+        return jax.shard_map(local, mesh=mesh, in_specs=(jax.sharding.PartitionSpec(), split, split),
+                             out_specs=jax.sharding.PartitionSpec(), check_vma=True)(a, b, w)
+
+    b = jnp.asarray([1 - 2.0 ** -23, -1.0], jnp.float32)
+    found = jax.jit(jax.grad(total))(b)
+    unsplit = jax.jit(jax.grad(lambda b: jnp.sum(aligned_sum([(a, b)]) * w)))(b)
+    np.testing.assert_array_equal(np.asarray(found), np.asarray(unsplit))

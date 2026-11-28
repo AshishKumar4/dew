@@ -55,30 +55,32 @@ def aligned_segment_sum(terms: Sequence[Sequence[jax.Array]], segments: jax.Arra
                       segments=(segments, count, tuple(axes)))
 
 
-def _segmented(segments: jax.Array, count: int, axes: tuple[str, ...]) -> Callable:
+def _segmented(segments: jax.Array | None, count: int, axes: tuple[str, ...]) -> Callable:
     """`_reduction`'s counterpart for `aligned_segment_sum`: a term's rows scatter-added into `count`
-    segments by `segments`, then summed over each of `axes` its sums vary over (each device's sum alone where
-    every device holds the same), and the most products one sum holds."""
+    segments by `segments` (each row its own where None, the term then reduced over its own axes and laid as
+    `_reduction` reduces it: a factor's cotangent's terms, `_factor_cotangents`), then summed over each of
+    `axes` its sums vary over (each device's sum alone where every device holds the same), and the most
+    products one sum holds."""
     from dew.nn.sharding import varying_like
 
     devices = math.prod(jax.lax.axis_size(axis) for axis in axes)
 
     def reduction(shape: tuple[int, ...], axis, laid) -> tuple[Callable, int]:
-        del axis, laid
+        own, extent = _reduction(shape, axis, laid) if segments is None else (None, shape[0])
 
         def reduced(x: jax.Array, op: Callable = jnp.sum, **options) -> jax.Array:
             assert op is jnp.sum, "a segment's digits are summed"
             x = jnp.asarray(x, options.get("dtype", jnp.asarray(x).dtype))
             x = jnp.broadcast_to(x, shape)
-            if segments is None:
-                summed = x
+            if own is not None:
+                summed = own(x, op, **options)
             else:
                 zeros = varying_like(jnp.zeros((count, *shape[1:]), x.dtype), x, segments)
                 summed = zeros.at[segments].add(x)
             over = tuple(axis for axis in axes if axis in jax.typeof(summed).mat.varying)
             return jax.lax.psum(summed, over) if over else summed
 
-        return reduced, (1 if segments is None else shape[0]) * devices
+        return reduced, extent * devices
 
     return reduction
 
@@ -464,7 +466,14 @@ def _factor_cotangents(shape: tuple[tuple[int, ...], ...], spec: tuple, factors,
     """Each `live` factor's cotangent of the aligned sum of `shape`'s terms of `factors` at `cotangent`: each
     of the factor's places a term of one aligned sum in its shape (`_transposed_term`), the cotangent inside
     its products, so an overflowing partial sum or one bit-formed is none, in the factor's type and
-    placement."""
+    placement. Where its terms vary over manual axes the factor does not (a replicated factor beside split
+    ones in a checked `shard_map`), their digits are pooled over those axes before the one rounding
+    (`_segmented`'s axes, every device walking the same digits): rounded on each device first, `(1 +
+    2^-23)(1 - 2^-23)` beside `-1` summed to 0, not `-2^-46` (train 1461's review). The pullback of a declared
+    rule (`generation.linear_map`'s, `traced_tangent`), its value alone: reverse mode past it takes `apply`'s
+    declared derivatives."""
+    from dew.nn.sharding import varying
+
     gradients = []
     for place in live:
         factor = factors[place]
@@ -478,8 +487,13 @@ def _factor_cotangents(shape: tuple[tuple[int, ...], ...], spec: tuple, factors,
                     products, held = _cotangent_term(others, spot, axis, given, factor.shape)
                     terms.append(products)
                     laid.append(held)
-        gradients.append(_placed_as(_aligned_terms(terms, tuple(laid)).astype(factor.dtype),
-                                    jax.typeof(factor)))
+        excess = tuple(sorted(varying(terms) - jax.typeof(factor).mat.varying))
+        if excess:
+            _, flat, places, laid_out = _laid_out(terms, tuple(laid))
+            summed = _exact_sum(_regrouped(places, flat), laid_out, flat[0].dtype, segments=(None, 0, excess))
+        else:
+            summed = _aligned_terms(terms, tuple(laid))
+        gradients.append(_placed_as(summed.astype(factor.dtype), jax.typeof(factor)))
     return gradients
 
 
