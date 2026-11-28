@@ -1523,6 +1523,31 @@ def test_a_refusals_roles_travel_with_it_into_derivations_and_handed_plans():
     assert keys[0] != keys[1]
 
 
+def test_a_spilled_launch_moving_no_registers_steps_to_a_program_fewer_at_its_families_share():
+    """Kimi's packed 16-bit training on an sm90, its key-scores backward refused for a spill (a launch with
+    no producer to raise, three `[C, C]` accumulators at 128 registers: JAX 0.12.1's compile spilled 176
+    bytes there, row 14169): its derivation keeps the tiles with that launch a program a multiprocessor
+    (`Mosaic._fewer`), stating its family's share there (`Family.registers`), its launches held; read
+    exhausted at its first refusal, its tiles were dropped for the next ring depth, which plans the launch
+    alike, down to no tiles."""
+    name, dtype, kernel = 'kimi-linear-kda', jnp.bfloat16, 'recurrence_key_scores_back'
+    facts = generation.gpu_target('sm90')
+    args = resource_operands(name, dtype, 1, 256)
+    starts = jax.ShapeDtypeStruct((1, 256), jnp.bool_)
+    bound = template.MOSAIC.bind(*args, starts, max_segments=8, bound=None if name in RATED else 1.0,
+                                 **_form(name, dtype), **_skipped(name))
+    with report.refusals(), generation.assumed(facts):
+        derived = template.MOSAIC.derived(bound, facts)
+        report.refuse_launch(template.MOSAIC, bound, derived, {kernel})
+        stepped = template.MOSAIC.derived(bound, facts)
+        family = template.bundle(facts)
+        launches = tuple(template.MOSAIC.launches(bound, stepped, facts, backward=True))
+    (launch,) = (launch for launch in launches if launch.name == kernel)
+    assert stepped == dataclasses.replace(derived, residents=resources.Residents(((kernel, 1),)))
+    assert (launch.resident, launch.registers) == (1, family.registers(launch.consumers, 1))
+    assert template.holds(launches, family, generation.shared_budget(facts))
+
+
 def test_a_kernel_is_held_to_its_own_launchs_plan_where_another_launchs_name_begins_its_own():
     """`planned_failures` holds `recurrence_intra_own` to its own launch's shared memory, not to the larger
     plan of `recurrence_intra`, whose name begins its own, and `recurrence_intra` to its own."""
