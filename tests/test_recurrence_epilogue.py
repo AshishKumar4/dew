@@ -137,26 +137,27 @@ def test_a_padded_token_keeps_the_memory_its_value_decay_would_halve():
 
 
 
-def test_a_padded_tokens_overflowing_key_leaves_the_live_memory_as_without_it():
-    """A delta rule's chunk of four tokens, the third padded (`Chunk.valid`) with its key and value `2^70`:
-    the final memory and the live tokens' outputs those of the same call with the padded token's operands
+@pytest.mark.parametrize('kernel', ['fla', 'xla'])
+def test_a_padded_tokens_overflowing_key_leaves_the_live_memory_as_without_it(kernel):
+    """A bf16 delta rule's two tokens on `kernel`, the second padded (`Chunk.valid`) with its key `2^70 e0`:
+    the final memory and the live token's output those of the same call with the padded token's operands
     zero, bit for bit, every token operand of a padded token zeroed before any product, where its key's
-    self-product overflowed and `inf * 0` crossed the chunk's inverse into the live memory, NaN (train 1461's
-    review)."""
+    self-product overflowed fp32 and neither the pairs' zero diagonal nor the zero write gate erased the
+    infinity, NaN through the chunk's inverse into the live memory (train 1461's review)."""
     hooks = recurrence.Hooks(decay='scalar')
     rng = np.random.default_rng(1967)
-    q, k, v = (jnp.asarray(rng.standard_normal((1, 4, 1, 8)) / 4, jnp.float32) for _ in range(3))
-    valid = jnp.asarray([[True, True, False, True]])
+    q, k, v = (jnp.asarray(rng.standard_normal((1, 2, 1, 64)) / 8, jnp.bfloat16) for _ in range(3))
+    valid = jnp.asarray([[True, False]])
 
-    def call(k, v):
-        operands = Chunk(q, k, v, log_decay=jnp.full((1, 4, 1), -0.25), beta=jnp.full((1, 4, 1), 0.5),
+    def call(k):
+        operands = Chunk(q, k, v, log_decay=jnp.full((1, 2, 1), -0.25), beta=jnp.full((1, 2, 1), 0.5),
                          valid=valid)
-        return chunk_on('xla', hooks, operands)
+        return chunk_on(kernel, hooks, operands)
 
-    found = call(k.at[0, 2].set(2.0 ** 70), v.at[0, 2].set(2.0 ** 70))
-    expected = call(k.at[0, 2].set(0.0), v.at[0, 2].set(0.0))
-    live = np.asarray([0, 1, 3])
-    np.testing.assert_array_equal(np.asarray(found[0])[0, live], np.asarray(expected[0])[0, live])
+    found = call(k.at[0, 1].set(0.0).at[0, 1, 0, 0].set(2.0 ** 70))
+    expected = call(k.at[0, 1].set(0.0))
+    live = (np.asarray(out, np.float32)[0, 0] for out in (found[0], expected[0]))
+    np.testing.assert_array_equal(*live)
     np.testing.assert_array_equal(np.asarray(found[1]), np.asarray(expected[1]))
 
 
