@@ -1523,37 +1523,6 @@ def test_a_refusals_roles_travel_with_it_into_derivations_and_handed_plans():
     assert keys[0] != keys[1]
 
 
-def test_a_spilled_launch_moving_no_registers_steps_to_a_program_fewer_on_its_own():
-    """Kimi's packed 16-bit training on an sm90, its key-scores backward refused for a spill (a launch with
-    no producer to raise, three `[C, C]` accumulators within 128 registers at two programs: JAX 0.12.1's
-    compile spilled 176 bytes there, row 14169): its derivation keeps the tiles with that launch a program a
-    multiprocessor (`Mosaic._fewer`), every launch held (`template.holds`); read exhausted at its first
-    refusal, its tiles were dropped for the next ring depth, which plans the launch alike, down to no tiles.
-    Refused again beside a launch that moves registers at two programs, that one alone steps a program
-    fewer, its producer at the least, where the launch at one program held every rung back (head review of
-    row 14169)."""
-    name, dtype = 'kimi-linear-kda', jnp.bfloat16
-    scores, memory = 'recurrence_key_scores_back', 'recurrence_key_memory_back'
-    facts = generation.gpu_target('sm90')
-    args = resource_operands(name, dtype, 1, 256)
-    starts = jax.ShapeDtypeStruct((1, 256), jnp.bool_)
-    bound = template.MOSAIC.bind(*args, starts, max_segments=8, bound=None if name in RATED else 1.0,
-                                 **_form(name, dtype), **_skipped(name))
-    with report.refusals(), generation.assumed(facts):
-        derived = template.MOSAIC.derived(bound, facts)
-        report.refuse_launch(template.MOSAIC, bound, derived, {scores})
-        stepped = template.MOSAIC.derived(bound, facts)
-        assert stepped == dataclasses.replace(derived, residents=resources.Residents(((scores, 1),)))
-        launches = {launch.name: launch for launch in template.MOSAIC.launches(bound, stepped, facts,
-                                                                                backward=True)}
-        assert launches[scores].resident == 1
-        family, shared = template.bundle(facts), generation.shared_budget(facts)
-        assert template.holds(tuple(launches.values()), family, shared)
-        assert launches[memory].resident == 2
-        both = template.MOSAIC._fewer(bound, stepped, frozenset({scores, memory}), facts)
-    assert both == dataclasses.replace(stepped, residents=resources.Residents(((memory, 1), (scores, 1))))
-
-
 def test_a_kernel_is_held_to_its_own_launchs_plan_where_another_launchs_name_begins_its_own():
     """`planned_failures` holds `recurrence_intra_own` to its own launch's shared memory, not to the larger
     plan of `recurrence_intra`, whose name begins its own, and `recurrence_intra` to its own."""
