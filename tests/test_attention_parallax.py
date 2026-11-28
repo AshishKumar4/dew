@@ -1030,7 +1030,8 @@ def test_a_float64_keys_query_takes_its_power_of_two_wide():
         second = jnp.zeros((1, 1, 1, width), jnp.float32)
         out = attention_parallax.attend(query, second, key, jnp.zeros((1, 2, 1, width), jnp.float32), value,
                                         spans, scale=2.0 ** -24)
-    np.testing.assert_array_equal(np.asarray(out), np.full((1, 1, 1, width), 1 / (1 + np.exp(-1.0)), np.float32))
+    sigmoid = 1 / (1 + np.exp(-1.0))
+    np.testing.assert_array_equal(np.asarray(out), np.full((1, 1, 1, width), sigmoid, np.float32))
 
 
 def test_a_float64_second_product_keeps_its_keys_apart():

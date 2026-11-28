@@ -2080,8 +2080,9 @@ def output_program(hook: Callable | None, kinds: tuple[Kind, ...], dtypes: tuple
     # its emission take a prepared hook (`tuning.Prepared`) apart, one wrapper each, its dtypes each as it
     # names them.
     source = hook.source if isinstance(hook, tuning.Prepared) else hook
-    return tuning.once_a_call(source, ("output_program", kinds, tuple(jnp.dtype(dtype).name for dtype in dtypes),
-                                       tile), lambda: _held_program(hook, kinds, dtypes, tile))
+    named = tuple(jnp.dtype(dtype).name for dtype in dtypes)
+    return tuning.once_a_call(source, ("output_program", kinds, named, tile),
+                              lambda: _held_program(hook, kinds, dtypes, tile))
 
 
 def _held_program(hook: Callable, kinds: tuple[Kind, ...], dtypes: tuple[str, ...], tile: tuple[int, int]):
