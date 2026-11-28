@@ -264,11 +264,12 @@ def blocks_quantized(w: jax.Array) -> tuple[jax.Array, jax.Array]:
     largest magnitude reduced over both where they lie, so no transposed copy of the matrix is made either
     way (row 4518)."""
     from dew.nn import fake_quant
+    from dew.nn.float_bits import largest_magnitude
 
     groups, depth, width = w.shape
     edge = SCALE_DEPTH
     tiles = w.astype(at_least_fp32(w.dtype)).reshape(groups, depth // edge, edge, width // edge, edge)
-    scale = fake_quant.fp8_block_scale(jnp.max(jnp.abs(tiles), axis=(2, 4), keepdims=True))
+    scale = fake_quant.fp8_block_scale(largest_magnitude(tiles, (2, 4), keepdims=True))
     codes = fake_quant.fp8_codes(tiles / scale)
     return codes.reshape(w.shape).astype(jnp.float8_e4m3fn), scale[:, :, 0, :, 0]
 
