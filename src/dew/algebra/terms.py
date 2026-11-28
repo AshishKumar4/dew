@@ -19,7 +19,7 @@ import math
 import threading
 import types
 import weakref
-from collections.abc import Callable, Hashable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Hashable, Iterable, Iterator, Mapping, Sequence
 from typing import Literal, NamedTuple, overload
 
 import jax
@@ -2218,6 +2218,23 @@ def pattern_of[Sort: BaseExpr](owner: type[Sort], constructor, name: str) -> tup
         else:
             arguments.append(var(f"{name}_{index}", kind))
     return constructor(*arguments), tuple(read)
+
+
+def propagated[Sort: BaseExpr](owner: type[Sort], constructors: Iterable, fact: Callable[[Sort], i64],
+                                name: str) -> list:
+    """The rules that carry a monotone fact of `owner`'s values (`fact`, 1 where it holds: a value reads the
+    state) from each operand to the value: one rule an operand of `owner`'s sort of each of `constructors`
+    (`pattern_of`), its variables named from `name`. A pass seeds the fact and schedules the rules itself
+    (`dew.algebra.carry`'s state readers, `dew.algebra.linear_scan`'s)."""
+    from egglog import eq, rule, set_, var
+
+    made_by = var(f"{name}_made", owner)
+    marked = []
+    for index, constructor in enumerate(constructors):
+        made, operands = pattern_of(owner, constructor, f"{name}{index}")
+        marked += [rule(eq(made_by).to(made), eq(fact(operand)).to(i64(1)))
+                   .then(set_(fact(made_by)).to(i64(1))) for operand in operands]
+    return marked
 
 
 def subterms(form: Term) -> Iterator[Term]:
