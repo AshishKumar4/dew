@@ -140,20 +140,32 @@ def record_units(label: str, payload: Callable[[int, int], object], upto: int | 
     return True
 
 
-def sharded(label: str, payload: Callable[[int, int], object], units: int | None = None, *,
-            upto: int | None = None) -> list | None:
+def sharded[P](label: str, payload: Callable[[int, int], P], units: int | None = None, *,
+                upto: int | None = None,
+                held: Callable[[int, int, P], object] | None = None) -> list[P] | None:
     """A site's units over armada's map tasks, each `payload(start, stop)`: a map task records its units'
     (`record_units`, cut at `upto` where a site takes at most that many) and gets None, the judge gets the
     tasks' payloads in order (`pooled_units`, refused short of `units`), and a run whole gets
-    `[payload(0, units)]`."""
-    if record_units(label, payload, upto=upto):
+    `[payload(0, units)]`. With `held`, each payload is held to the units it was drawn for
+    (`held(start, stop, payload)`, which raises where it is not): a map task's before it publishes it, and
+    each pooled one before the judge reads it, so no shard's surplus fills another's gap (row 9047)."""
+    def drawn(start: int, stop: int) -> P:
+        found = payload(start, stop)
+        if held is not None:
+            held(start, stop, found)
+        return found
+
+    if record_units(label, drawn, upto=upto):
         return None
     pooled = pooled_units(label, units)
     if pooled is not None:
+        if held is not None:
+            for start, stop, found in pooled:
+                held(start, stop, found)
         return [found for _, _, found in pooled]
     if units is None:
         raise ValueError(f"{label}: a run whole of a sharded site takes its units' count")
-    return [payload(0, units)]
+    return [drawn(0, units)]
 
 
 def _published(path: Path, data: bytes) -> None:

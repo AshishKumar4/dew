@@ -488,8 +488,13 @@ All accuracy checks are the [accuracy gate](testing.md)'s, with no tolerance of 
     Code: a fact from its one source):
     `program`'s static arguments by JAX's own inference, `nn.programs`' precision presets by JAX's own
     conversion.
-- **XLA keeps** fusion and code generation; it does not reassociate floating-point math by default, so chosen forms
-  reach it intact.
+- **XLA keeps** fusion and code generation, and its algebraic simplifier and constant folding still rewrite some
+  floating-point forms the pass hands it (tests/arm_arithmetic.py's `AS_WRITTEN`: `(A/B)/C` as `A/(B*C)`, a
+  division by a broadcast through its reciprocal, a constant folded into a scale), so a chosen form is not
+  guaranteed to reach code generation as chosen. Two things hold that: a candidate is admitted by its error as
+  XLA compiles it (`generate.admits`, the gate running each form through the compile point), and a form whose
+  roundings must stand as written holds them itself, a `Protected` span's error-free transforms and an
+  `optimization_barrier` where no marking stands in for one (`dew.nn.blocks`' Fourier table).
 
 ## 5. Prior art
 
@@ -1153,7 +1158,10 @@ chunk algorithm side by side:
 - a solve is linear in its given values, so the part of the system that reads the state is off it.
 
 The cheapest under the work-span model is the chunk's form, which `scan.py` evaluates and `carry.py`
-splits. At a kernel's chunk on an A100 or an H100 (64 tokens, 128 keys and values) the extraction is the
+splits; a forward substitution of values that read the entering state is priced past every form, its row
+walk over the state no equation of the program's language and so no split's, so the linearity's two solves
+are taken (a 128-wide gated delta net's chunk on an A10, an L4, a T4 or a B300, whose pricing had made the
+state's substitution the cheapest and its split refused). At a kernel's chunk on an A100 or an H100 (64 tokens, 128 keys and values) the extraction is the
 compact WY form with its inverse by doubling, the hand-written chunk's form. Both rule sets are proven
 sound over the reals from their declarations (tests/test_linear_scan.py), at every chunk size by
 induction: each identity holds exactly at a symbolic chunk of three tokens (so at one, two and three, each

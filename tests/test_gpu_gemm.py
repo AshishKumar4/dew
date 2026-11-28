@@ -74,6 +74,7 @@ import test_mosaic_toolkit as mosaic_toolkit
 import test_warpgroup_scan as warpgroup_scan
 from gpu_flow import Cell, cells_of, covering, in_parts, parted, run_cells, when
 from jax.experimental.pallas import fuser
+from kernel_compile import gate_generations
 from reference_error import ahead_arm, assert_as_exact
 from test_gemm_template import rms_norm as template_rms_norm
 
@@ -263,6 +264,9 @@ def _scale_edge_cells() -> tuple[Cell, ...]:
         Cell("an owed product's native fold rounds once below the normals",
              gemm_nvfp4.an_owed_products_native_fold_rounds_once_below_the_normals, "sm90",
              at_run=EXACT_OVERFLOW, native={"launch": "owed fold", "pass": "subnormal product"}),
+        Cell("a gathered packed NVFP4 bank is its values' product",
+             gemm_nvfp4.a_gathered_packed_nvfp4_bank_is_its_values_product, "sm90", mosaic=True,
+             at_run=EXACT_OVERFLOW, native={"launch": "nvfp4 packed", "pass": "gathered rows"}),
         Cell("a packed NVFP4 call placed on its host's CPU keeps a subnormal column scale",
              gemm_nvfp4.a_packed_nvfp4_call_placed_on_its_hosts_cpu_keeps_a_subnormal_scale, "sm90",
              at_run=EXACT_OVERFLOW, native={"launch": "nvfp4 packed", "pass": "host-placed finish"}),
@@ -311,6 +315,11 @@ RING = "a ring's asynchronous slots, which the interpreter walks in one order"
 """Why the toolkit's rings stay on the GPU (the GEMM lane, 11-11)."""
 
 SHARED = "a collective cp.async pipeline's meets, which the interpreter takes as no-ops (row 5272)"
+
+MMA_SYNC = "mma.sync's products, which the interpreter sums by a dot (`mosaic_sm80.MmaIssuer.products`)"
+
+CONVERTED = ("a quantized stage's conversion in registers (its cvt, its packed int8 assembly), which the "
+             "interpreter computes in fp32 (row 8549)")
 """Why two mma.sync consumers' shared walk stays on an A100 (row 12652)."""
 
 CLUSTER = "a cluster's multicast of a shared block, which the interpreter loads whole in each program"
@@ -349,7 +358,9 @@ balances: a 128 x 128 tile holds no merge (280 registers a thread, `MosaicTgmm.b
 
 def _toolkit_cells() -> list[Cell]:
     """The toolkit's rings and walks on the GPUs whose waits the interpreter takes as no-ops: an H100's rings
-    and reads, an A100's shared cp.async pipeline (each kept by name for its fault)."""
+    and reads, an A100's shared cp.async pipeline; and the products and conversions the interpreter computes
+    by a dot and in fp32: mma.sync's chained and row-bounded products, each generation's quantized stage
+    (each kept by name for its fault)."""
     return [
         *(Cell(f"a ring streams tiles of their own trip counts: {consumers} consumers",
                functools.partial(mosaic_toolkit.a_ring_streams_tiles_of_their_own_trip_counts_on_an_h100,
@@ -369,6 +380,19 @@ def _toolkit_cells() -> list[Cell]:
                # GPU copying by TMA (`lowers_as`; train 1378's sm90 prepare).
                "sm80", mosaic=True, fault=SHARED)
           for consumers, split in ((1, False), (2, False), (2, True))),
+        *(Cell(f"an accumulator feeds the next product: {rows} rows, {m_warps} warps",
+               functools.partial(mosaic_toolkit.an_accumulator_feeds_the_next_product_on_a_gpu, rows,
+                                 m_warps),
+               "sm80", fault=MMA_SYNC)
+          for rows, m_warps in mosaic_toolkit.CHAINED),
+        *(Cell(f"mma.sync products within a row bound: {m_warps} warps",
+               functools.partial(mosaic_toolkit.mma_sync_products_within_a_row_bound_on_a_gpu, m_warps),
+               "sm80", fault=MMA_SYNC)
+          for m_warps in mosaic_toolkit.BOUND_WARPS),
+        *(Cell(f"a quantized stage converts natively: {name}, {jnp.dtype(dtype).name}, scaled {scaled}",
+               functools.partial(mosaic_toolkit.a_quantized_stage_converts_natively, name, dtype, scaled),
+               name, fault=CONVERTED)
+          for name in gate_generations() for dtype in mosaic_toolkit.QUANTIZED for scaled in (True, False)),
     ]
 
 

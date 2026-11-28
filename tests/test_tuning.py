@@ -7,11 +7,14 @@ import dataclasses
 import functools
 import gc
 import json
+import operator
 import os
+import threading
 import weakref
 from collections.abc import Mapping
 from pathlib import Path
 from types import MappingProxyType
+from typing import ClassVar
 
 import jax
 import jax.numpy as jnp
@@ -20,8 +23,10 @@ import tokamax
 from lane_environment import DETERMINISTIC_OPS, without_flags
 from process_support import READ_ONLY, fresh, keeping_picks, run_pool
 from reference_error import equations
+from tokamax._src import config as tokamax_config
 from tuned import recorded
 
+from dew import _cache
 from dew.nn.activations import gated_product
 from dew.nn.kernels import generation, norm_swiglu, tuning
 from dew.nn.kernels.templates import assembled
@@ -114,7 +119,7 @@ with tuning.reading():
     # Whether every launch of the step has a stored pick, every process taking process 0's (`_settle`).
     with tuning.seen() as traced:
         step().lower(*operands(15))
-    settled = tuning._settle(traced, measure=False) == 0
+    settled = tuning._settle(traced, measurer=None) == 0
 print(json.dumps([found, settled]))
 """
 
@@ -198,18 +203,20 @@ def test_a_pools_processes_agree_on_their_reach_as_the_store_names_it():
     no JSON names (an object its static) fails as its reach is stated, within the agreement."""
     with tuning.seen() as traced:
         jax.make_jaxpr(step())(*operands(15))
-    reached = tuning.Reach(tuning._distinct(traced), ("a foreign kernel",))
+    reached = tuning.Reach(tuple(traced), ("a foreign kernel",))
     stated = []
     tuning._agreed_reach(reached, agree=lambda phase, find: stated.append(find()))
-    [(launched, models, foreign)] = stated
+    [(launches, models, foreign)] = stated
+    launched = [named for named, _ in launches]
     op, ba = reached.launches[0].launch
     revised = tokamax.BoundArguments(op.replace(revision=op.revision + 1), ba.arguments)
     assert tuning._launch_json(ba) in launched and tuning._launch_json(revised) not in launched
     assert models == [jax.devices()[0].device_kind] and foreign == ["a foreign kernel"]
-    static = next(name for name in ba.arguments if name not in op.HOOKS)
+    static = next(name for name, value in ba.arguments.items() if name not in (*op.HOOKS, *op.ROWS)
+                  and not isinstance(value, jax.ShapeDtypeStruct))
     unnamed = tokamax.BoundArguments(op, {**ba.arguments, static: object()})
     with pytest.raises(TypeError):
-        tuning._agreed_reach(tuning.Reach([reached.launches[0]._replace(keyed=unnamed)], ()))
+        tuning._agreed_reach(tuning.Reach((reached.launches[0]._replace(keyed=unnamed),), ()))
 
 
 def test_a_launch_reached_for_two_gpu_models_is_refused_as_one_settlements():
@@ -225,7 +232,7 @@ def test_a_launch_reached_for_two_gpu_models_is_refused_as_one_settlements():
             for name in ("sm80", "sm90")]
     assert len(tuning._distinct(both)) == 2 and len(tuning._distinct(both[:1] * 2)) == 1
     with pytest.raises(ValueError):
-        tuning._settle(both, measure=False)
+        tuning._settle(both, measurer=None)
 
 
 def test_a_steps_launches_take_pins_stored_picks_and_heuristics(tmp_path):
@@ -474,7 +481,7 @@ stamp = os.stat(path).st_mtime_ns if os.path.exists(path) else None
 with tuning.reading():
     with tuning.seen() as traced:
         step().lower(*operands(int(sys.argv[1])))
-    settled = tuning._settle(traced, measure=False) == 0
+    settled = tuning._settle(traced, measurer=None) == 0
 print(json.dumps([path, stamp, settled, lowered]))
 """
 
@@ -685,7 +692,7 @@ launch = versioned_op.Versioned().bind(*(shape for _ in versioned_op.OPERANDS))
 timing = tokamax.BenchmarkData(compile_time_ms=1.0, lower_time_ms=1.0, evaluation_times_ms=(1.0,),
                                metadata={})
 pick = tuning.Timings({versioned_op.Rows(*json.loads(sys.argv[1])): timing})
-tuning._store(jax.devices()[0].device_kind, {tuning._launch_key(launch): tuning._entry(launch, pick)})
+tuning._store(jax.devices()[0].device_kind, {tuning._launch_key(launch): (tuning._described(launch), pick)})
 path = _cache.kernel_picks_path(jax.devices()[0].device_kind)
 read, foreign = tuning._read(path)
 picks = {json.dumps(sorted(ba.arguments)): [timings.fastest_config.rows, timings.fastest_config.warps]
@@ -743,6 +750,248 @@ def test_a_launch_is_settled_against_the_target_it_traced_for():
         with tuning._placed_in(at):
             assert generation.gpu_target().multiprocessors == 76
         assert tuning._mesh_kind(at) == catalog.device_kind
+
+
+def _rtx_4080_placements() -> tuple[tuning.Placement, tuning.Placement]:
+    """An RTX 4080's placement as its catalog states it (58 multiprocessors) and as a target assumed with 76
+    (`Trainer.lower_for`'s own facts), both under its model's abstract mesh: one model, two GPUs' facts."""
+    catalog = generation.gpu_target("NVIDIA GeForce RTX 4080")
+    own = dataclasses.replace(catalog, multiprocessors=76)
+    mesh = jax.make_mesh((1,), ("data",), axis_types=(jax.sharding.AxisType.Explicit,))
+    placed = []
+    for target in (catalog, own):
+        with generation.assumed(target), jax.sharding.use_abstract_mesh(generation.gpu_mesh(mesh, target)):
+            placed.append(tuning.Placement.current())
+    return placed[0], placed[1]
+
+
+class _Facted(norm_swiglu.RmsForward):
+    """The norm's forward, its space and its configs read at the GPU in effect: on a GPU of 76
+    multiprocessors its space lacks one of its configs (`UNSPACED`) and it refuses another (`REFUSED`) as a
+    pin, a tile one GPU's budget holds and another's of the same model does not; each GPU its space and its
+    configs were read at recorded (`asked`)."""
+
+    REFUSED: ClassVar = None
+    UNSPACED: ClassVar = None
+    asked: ClassVar[list] = []
+
+    def _get_autotuning_configs(self, ba):
+        target = generation.gpu_target()
+        _Facted.asked.append(target.multiprocessors)
+        lacking = {_Facted.UNSPACED} if target.multiprocessors == 76 else set()
+        return super()._get_autotuning_configs(ba) - lacking
+
+    def pinnable(self, ba, config):
+        target = generation.gpu_target()
+        _Facted.asked.append(target.multiprocessors)
+        refused = config == _Facted.REFUSED and target.multiprocessors == 76
+        return not refused and super().pinnable(ba, config)
+
+
+def _facted_calls(*placements: tuning.Placement, rows: int = 15) -> list[tuning.Observed]:
+    """One call of `_Facted` at each of `placements`, of a step of `rows` rows (its key's 16 of 13 to 16):
+    its keyed arguments its key's, its own the call's."""
+    [norm] = [ba for ba in recorded(step(), *operands(16)) if type(ba.op) is norm_swiglu.RmsForward]
+    with tuning.seen() as traced:
+        jax.make_jaxpr(step())(*operands(rows))
+    [own] = [observed.arguments for observed in traced if type(observed.op) is norm_swiglu.RmsForward]
+    fields = {field.name: getattr(norm.op, field.name) for field in dataclasses.fields(norm.op) if field.init}
+    op = _Facted(**fields)
+    # Two of the configs an RTX 4080's catalog placement spaces, neither placement's heuristic (which every
+    # space holds, tokamax's `autotuning_configs`), restricted at 76 multiprocessors.
+    _Facted.REFUSED = _Facted.UNSPACED = None
+    spaces, heuristics = [], set()
+    for placed in _rtx_4080_placements():
+        with tuning._placed_in(placed):
+            probe = tokamax.BoundArguments(op, norm.arguments)
+            spaces.append(probe.autotuning_configs)
+            heuristics.add(probe.heuristics_config)
+    _Facted.REFUSED, _Facted.UNSPACED = sorted(spaces[0] - heuristics, key=repr)[:2]
+    keyed, arguments = tokamax.BoundArguments(op, norm.arguments), tokamax.BoundArguments(op, own.arguments)
+    return [tuning.Observed(op, keyed, None, arguments, None, placed) for placed in placements]
+
+
+def _timed(ms: float) -> tokamax.BenchmarkData:
+    return tokamax.BenchmarkData(compile_time_ms=0.0, lower_time_ms=0.0, evaluation_times_ms=(ms,),
+                                 metadata={})
+
+
+
+def test_a_launch_measured_for_some_calls_keeps_the_timings_its_other_calls_take():
+    """A launch whose held timings give no pick every call of a group takes, measured for that group
+    (`tuning._settle`, `_measured`: the configs each of its calls takes), merges what it measures into what is
+    held in this process (`_TIMINGS`), its store given what it measured alone (`Measurer.store`, which merges
+    it into what the store holds as it writes, `_store`), so a later settlement of its other calls still
+    takes their pick from the timings that give it (Train 1444's review: a narrower remeasurement replaced
+    the whole entry, its other calls' fastest lost)."""
+    catalog, own = _rtx_4080_placements()
+    calls = _facted_calls(catalog, own)
+    others = [config for config in calls[0].keyed.autotuning_configs
+              if config not in (_Facted.REFUSED, _Facted.UNSPACED)]
+    kind, (op, key) = tuning._mesh_kind(catalog), tuning._launch_key(calls[0].keyed)
+    held = tuning._TIMINGS.setdefault((op, kind), tuning._Picks())
+    # The fastest absent from the restricted placement's space, the next refused there: the pair of calls
+    # takes none held.
+    held[key] = tuning.Timings({_Facted.UNSPACED: _timed(1.0), _Facted.REFUSED: _timed(1.5)})
+    # A GPU of the launch's model, its measurement timing one config its calls take, its store recorded.
+    stored = []
+    measurer = tuning.Measurer(kind, lambda *_: tuning.Timings({others[0]: _timed(2.0)}),
+                               lambda _, fresh: stored.append(fresh))
+    picks = calls[0].op.get_autotuning_cache(kind)
+    try:
+        assert tuning._settle(calls, measurer=measurer) == 0
+        assert picks[key].fastest_config == others[0]
+        times = {config: timing.median_evaluation_time_ms for config, timing in held[key].items()}
+        assert times == {_Facted.UNSPACED: 1.0, _Facted.REFUSED: 1.5, others[0]: 2.0}
+        [fresh] = stored
+        assert set(fresh[(op, key)][1]) == {others[0]}
+        tuning._settle(calls[:1], measurer=None)
+        assert picks[key].fastest_config == _Facted.UNSPACED
+    finally:
+        held.pop(key, None)
+        picks.pop(key, None)
+
+def test_a_launchs_candidates_are_read_taken_and_compiled_at_its_placement():
+    """A launch measured at its call's placement (`tuning._candidate_compiles`, `_measured`'s): its space is
+    read there and each candidate asked of there (`KernelOp.pinnable`), against its GPU's facts, so a config
+    that GPU's space lacks or refuses is not timed; and each compile runs on a worker of the compile pool at
+    it, the placement's target assumed and its mesh in context, where they were read at the caller's
+    context and compiled with none (Train 1444's review)."""
+    catalog, own = _rtx_4080_placements()
+    [call] = _facted_calls(own)
+    _Facted.asked.clear()
+
+    def compiled(config):
+        return threading.get_ident(), generation.assumption(), jax.sharding.get_abstract_mesh()
+
+    futures = tuning._candidate_compiles(call.op, call.keyed, [call], compiled)
+    ran = [future.result() for future in futures.values()]
+    assert ran and set(_Facted.asked) == {76}
+    assert all(thread != threading.get_ident() for thread, _, _ in ran)
+    assert all((assumed, mesh) == (own.assumption, own.abstract) for _, assumed, mesh in ran)
+    assert {_Facted.REFUSED, _Facted.UNSPACED}.isdisjoint(futures)
+    [plain] = _facted_calls(catalog)
+    assert {_Facted.REFUSED, _Facted.UNSPACED} <= set(tuning._measurable(plain.op, plain.keyed, [plain]))
+
+
+def test_a_pick_is_one_every_call_of_its_launch_takes_and_the_pool_agrees_on_their_calls():
+    """One launch called at two placements of one GPU model, its catalog's and a target assumed with other
+    facts (`_rtx_4080_placements`): settled from every timing its store holds (every config that ran, as its
+    store is read, `_kernel_launches`), whatever the first call's space lacks, its pick is the fastest each
+    call takes (`tuning._settle`, `_usable`) in either order of its calls, none where only one takes it, so
+    no call falls back to its own derivation; a pick that changes at any call, the first's none before and
+    after, lowers the step again (`KERNEL_TUNES`); and the pool's agreement on a reach (`_agreed_reach`)
+    states each launch's calls, each by its own arguments and its placement's facts, so two processes calling
+    it otherwise (at another placement, or another row count its key buckets) disagree before settling
+    (Train 1444's review: a tile one placement's budget refused was picked for both, one rank falling
+    back)."""
+    catalog, own = _rtx_4080_placements()
+    calls = _facted_calls(catalog, own)
+    others = [config for config in calls[0].keyed.autotuning_configs
+              if config not in (_Facted.REFUSED, _Facted.UNSPACED)]
+    # The fastest absent from the restricted placement's space, the next refused there.
+    stored = tuning.Timings({_Facted.UNSPACED: _timed(1.0), _Facted.REFUSED: _timed(1.5),
+                             **{config: _timed(2.0) for config in others}})
+    [(_, key, read)] = tuning._kernel_launches({tuning._launch_key(calls[0].keyed): (calls[0].keyed, stored)})
+    assert set(read) == set(stored)
+    assert tuning._usable(read, calls[:1]).fastest_config == _Facted.UNSPACED
+    assert tuning._usable(tuning.Timings({_Facted.REFUSED: _timed(1.0)}), calls) is None
+    picks = calls[0].op.get_autotuning_cache(tuning._mesh_kind(catalog))
+    for ordered in (calls, calls[::-1]):
+        picks[key] = read
+        try:
+            assert tuning._settle(ordered, measurer=None) == 0
+            assert picks[key].fastest_config in others
+        finally:
+            picks.pop(key, None)
+    # The restricted call first: it reads no pick of the fastest alone before or after, its peer one.
+    tunes = _cache.KERNEL_TUNES.get_global()
+    picks[key] = tuning.Timings({_Facted.UNSPACED: _timed(1.0)})
+    try:
+        assert tuning._settle(calls[::-1], measurer=None) == 1
+        assert key not in picks and _cache.KERNEL_TUNES.get_global() == tunes + 1
+    finally:
+        picks.pop(key, None)
+
+    # Two settlements of one key in turn, the second's calls taking none of the first's pick: each chooses
+    # from every timing its store held (`_TIMINGS`), not the pick the first installed.
+    held = tuning._TIMINGS.setdefault((tuning._launch_key(calls[0].keyed)[0], tuning._mesh_kind(catalog)),
+                                      tuning._Picks())
+    held[key] = read
+    try:
+        tuning._settle(calls[:1], measurer=None)
+        assert picks[key].fastest_config == _Facted.UNSPACED
+        tuning._settle(calls, measurer=None)
+        assert picks[key].fastest_config in others
+    finally:
+        held.pop(key, None)
+        picks.pop(key, None)
+
+    stated = []
+    for reached in ([catalog], [catalog, own], [catalog, catalog]):
+        rows = [15, 13][:len(reached)]
+        observed = [call for placed, count in zip(reached, rows, strict=True)
+                    for call in _facted_calls(placed, rows=count)]
+        tuning._agreed_reach(tuning.Reach(tuple(observed), ()), agree=lambda _, state: stated.append(state()))
+    assert stated[0] != stated[1] and stated[0] != stated[2] and stated[1] != stated[2]
+
+
+def _scaled_by(factor: float):
+    """A norm epilogue scaling its rows by `factor`: each made a function of its own, at its own address."""
+    def epilogue(rows):
+        return rows * factor
+
+    return epilogue
+
+
+def test_a_calls_signature_names_its_hooks_as_their_programs_the_same_in_every_process():
+    """A call as the pool's processes agree on it (`tuning._call_signature`, `_agreed_reach`'s): its hooks
+    named by what they compute, as its key names them (`KernelOp.keyed`), so two calls of equivalent
+    epilogues made apart (each a function at its own address, as each process makes its own) are named
+    alike and another epilogue otherwise (Train 1444's review: a hook's `repr`, its address, made every
+    rank's plan its own)."""
+    [call] = _facted_calls(_rtx_4080_placements()[0])
+
+    def hooked(factor):
+        hooked = {**call.arguments.arguments, "epilogue": _scaled_by(factor)}
+        arguments = tokamax.BoundArguments(call.op, hooked)
+        return tuning._call_signature(call._replace(keyed=call.op.keyed(arguments), arguments=arguments))
+
+    assert hooked(2.0) == hooked(2.0) != hooked(3.0)
+
+
+def test_a_calls_signature_holds_its_nested_operands_at_their_own_shapes():
+    """A call's signature (`tuning._call_signature`) holds an operand nested in a tuple at the call's own
+    shape (a grouped product's gathered table, `gather=(table, None)`), so two calls of one key whose tables
+    differ in length are two calls a pick is held to, not one (Train 1444's review)."""
+    [call] = _facted_calls(_rtx_4080_placements()[0])
+
+    def gathered(rows):
+        keyed = {**call.keyed.arguments, "gate": (jax.ShapeDtypeStruct((16, 64), jnp.float32), None)}
+        own = {**call.arguments.arguments, "gate": (jax.ShapeDtypeStruct((rows, 64), jnp.float32), None)}
+        return tuning._call_signature(call._replace(keyed=tokamax.BoundArguments(call.keyed.op, keyed),
+                                                    arguments=tokamax.BoundArguments(call.op, own)))
+
+    assert gathered(13) == gathered(13) != gathered(15)
+
+
+def test_a_settlement_reads_no_timing_where_tokamaxs_cache_is_ignored():
+    """With tokamax's cache ignored (`--tokamax_ignore_autotuning_cache`), as a launch's own read takes no
+    pick, a settlement chooses none from the timings its store holds (`tuning._timings_of`): its calls keep
+    their own derivations, and a measuring run measures them, where history was chosen from (Train 1444's
+    review)."""
+    catalog, _ = _rtx_4080_placements()
+    [call] = _facted_calls(catalog)
+    identity, key = tuning._launch_key(call.keyed)
+    held = tuning._TIMINGS.setdefault((identity, tuning._mesh_kind(catalog)), tuning._Picks())
+    held[key] = tuning.Timings({config: _timed(1.0) for config in call.keyed.autotuning_configs})
+    try:
+        assert tuning._timings_of(call) is not None
+        with tokamax_config.ignore_autotuning_cache("true"):
+            assert tuning._timings_of(call) is None
+            assert tuning._settle([call], measurer=None) == 1
+    finally:
+        held.pop(key, None)
 
 
 class _Holding:
@@ -928,14 +1177,18 @@ def test_a_launch_whose_hooks_mutable_default_changes_computes_it_as_it_is_then(
 def test_an_unchangeable_mapping_is_changed_by_nothing_it_gives_out():
     """`generation.Frozen`, the one mapping a launch's cache holds as a value (`tuning.holdable`): its
     reconstruction's data (`__reduce__`, a pickle's) is a copy, which changed leaves it as it was; its items
-    are read-only; and a pickle of it rebuilds it equal."""
+    are read-only, its backing never set again or deleted, and a second `__init__` leaves it as it was (Train
+    1444's review: a slot set anew changed a held mapping); and a pickle of it rebuilds it equal."""
     import pickle
 
     frozen = generation.Frozen({0: 2.0})
     _, (data,) = frozen.__reduce__()
     data[0] = 3.0
-    with pytest.raises(TypeError):
-        frozen._items[0] = 3.0
+    for change in (lambda: operator.setitem(frozen._items, 0, 3.0),
+                   lambda: setattr(frozen, "_items", {0: 3.0}), lambda: delattr(frozen, "_items")):
+        with pytest.raises(TypeError):
+            change()
+    frozen.__init__({0: 3.0})
     assert frozen[0] == 2.0 and pickle.loads(pickle.dumps(frozen)) == frozen == {0: 2.0}
 
 def test_a_launch_whose_trace_reads_a_value_of_the_trace_around_it_runs_itself():

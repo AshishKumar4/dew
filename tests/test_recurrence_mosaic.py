@@ -27,7 +27,7 @@ import pytest
 from fla_sites import RECORDED, the_template_is_as_exact_as_fla
 from generation_support import COMPILES_ON_CPU, lowers, production_refusals
 from identity_cover import COVER_PRECISION, IDENTITY_COVER
-from kernel_compile import gate_generations, runs
+from kernel_compile import compile_mosaic_kernels, each_build, gate_generations, mosaic_failures, runs, spills
 from reference_error import assert_as_exact, declared_seeds
 from test_recurrence_chunk import (
     FORMED,
@@ -50,7 +50,7 @@ from test_recurrence_chunk import (
 )
 
 from dew.nn.kda import KimiDeltaAttention
-from dew.nn.kernels import chunked_launch, generation, recurrence, recurrence_chunk
+from dew.nn.kernels import generation, recurrence, recurrence_chunk
 from dew.nn.kernels.recurrence_chunk import Chunk, chunk, chunk_rounding, fast_rounding
 from dew.nn.kernels.selection import KernelRefused
 from dew.nn.kernels.templates import assembled, bundles, mosaic, product, report, resources, sass
@@ -977,7 +977,6 @@ def test_the_resource_gate_reads_each_launch_of_one_kernel_apart():
     distinct forward tiles (`_ran`): a kernel's name compiled under both launches (`report.launching`) is
     gated on each launch's evidence, the second's shared memory its own; one read by its name kept one's."""
     from fla_gdn_support import KernelCase
-    from kernel_compile import compile_mosaic_kernels
 
     target = 'sm90'
     facts = generation.gpu_target(target)
@@ -1480,7 +1479,6 @@ def apart_failures(found: list, apart: dict) -> list[str]:
     """Each compiled case's launches held apart (`apart`, the names its model refuses by its label) in each
     build's run (`kernel_compile.runs`): every one its model admits as a required case's (`mosaic_failures`:
     spill-free, every report read), and every one it refuses free to spill, as certification refuses it."""
-    from kernel_compile import mosaic_failures
 
     failed = []
     for record, run in [(each, run) for each in found for run in runs([each])]:
@@ -1494,7 +1492,7 @@ def apart_failures(found: list, apart: dict) -> list[str]:
 def resource_failures(cases: list, found: list, plans: dict, apart: dict) -> list[str]:
     """The resource gate's verdict on compiled cases: every case reports within its plan, every required
     launch holds, and forced variants' model-refused launches may spill."""
-    from kernel_compile import failures, mosaic_failures
+    from kernel_compile import failures
 
     failed = failures(runs(found)) + planned_failures(found, plans)
     required = [record for case, record in zip(cases, found, strict=True)
@@ -1567,15 +1565,18 @@ def test_the_mosaic_mainloop_compiles_within_each_gpus_resources_as_its_model_de
         local = generation.capability(generation.device_generation())
         if local is not None and local < generation.capability(target):
             pytest.skip(f"this host's ptxas builds for its {local} GPU and before, not {target}")
-    plans, refused, apart = {}, [], {}
-    with report.refusals():
-        cases, found, spilled = stepped_down(target, group, plans, refused, apart)
-    # Every case compiles and reports; a required case's spill fails, a held-apart one's launch by launch.
-    failed = resource_failures(cases, found, plans, apart) + production_refusals(target, group, refused,
-                                                                                 spilled)
-    if target == 'sm100':
-        failed += [f"{case}: no tiles derived" for case in refused
-                   if case.startswith("a write gate bfloat16")]
+    failed = []
+    # Each build's ladder its own (`kernel_compile.each_build`): a build that holds keeps its derived tiles.
+    for build in each_build(target):
+        plans, refused, apart = {}, [], {}
+        cases, found, spilled = stepped_down(target, group, plans, refused, apart, build)
+        # Every case compiles and reports; a required case's spill fails, a held-apart one's launch by launch.
+        failed += [f"{build}: {failure}" for failure in
+                   resource_failures(cases, found, plans, apart) + production_refusals(target, group, refused,
+                                                                                       spilled)]
+        if target == 'sm100':
+            failed += [f"{build}: {case}: no tiles derived" for case in refused
+                       if case.startswith("a write gate bfloat16")]
     assert not failed, "\n".join(failed)
 
 
@@ -1590,7 +1591,6 @@ def test_a_persistent_launch_walking_many_tiles_holds_within_its_model_on_a_blac
     three tiles or more and ptxas allocated the consumers past their live set around them (row 5693: the 4B
     SSD's scores' gradient spilled 16 bytes at its 248 registers, its model 223)."""
     from fla_gdn_support import KernelCase
-    from kernel_compile import compile_mosaic_kernels, mosaic_failures
 
     dtype, rows, length = jnp.bfloat16, 1, 2048
     facts = generation.gpu_target('sm100')
@@ -1601,37 +1601,39 @@ def test_a_persistent_launch_walking_many_tiles_holds_within_its_model_on_a_blac
     # The output's and the final memory's cotangents.
     cotangents = [jax.ShapeDtypeStruct(args[2].shape, dtype),
                   jax.ShapeDtypeStruct(args[5].shape, jnp.float32)]
-    stepped = set()
-    while True:
-        # Derived as a run derives them, a launch spilling at the tiles before refused (`stepped_down`).
-        with generation.assumed(facts):
-            tiles = template.MOSAIC.derived(bound, facts)
-            models = _models(template.MOSAIC.launches(bound, tiles, facts, backward=True), family, facts)
-        call = functools.partial(_gate_call, name, dtype, [*args, *cotangents], None, tiles, family,
-                                 training=True)
-        (record,) = compile_mosaic_kernels([KernelCase(name, call, models)], 'sm100')
-        spilling = {kernel["kernel"] for kernel in record.get("kernels", ()) if kernel.get("spilled")}
-        if not spilling or tiles in stepped:
-            break
-        stepped.add(tiles)
-        with generation.assumed(facts):
-            report.refuse_launch(template.MOSAIC, bound, tiles, spilling)
-    assert not mosaic_failures([record]), mosaic_failures([record])
+    # Each build's ladder its own (`each_build`): a build that holds keeps its derived tiles.
+    for build in each_build('sm100'):
+        stepped = set()
+        while True:
+            # Derived as a run derives them, a launch spilling at the tiles before refused (`stepped_down`).
+            with generation.assumed(facts):
+                tiles = template.MOSAIC.derived(bound, facts)
+                models = _models(template.MOSAIC.launches(bound, tiles, facts, backward=True), family, facts)
+            call = functools.partial(_gate_call, name, dtype, [*args, *cotangents], None, tiles, family,
+                                     training=True)
+            (record,) = compile_mosaic_kernels([KernelCase(name, call, models)], 'sm100', builds=(build,))
+            spilling = set().union(*spills([record]).values())
+            if not spilling or tiles in stepped:
+                break
+            stepped.add(tiles)
+            with generation.assumed(facts):
+                report.refuse_launch(template.MOSAIC, bound, tiles, spilling)
+        assert not mosaic_failures([record]), (build, mosaic_failures([record]))
 
 
-def stepped_down(target: str, group: tuple, plans: dict, refused: list, apart: dict) -> tuple:
+def stepped_down(target: str, group: tuple, plans: dict, refused: list, apart: dict, build: str) -> tuple:
     """The gate's cases of `group` on `target` (`compiled_cases`), their records and the kernels refused for
-    spilling, compiled, then, for as long as a required launch spills or serializes its warpgroup MMAs
-    (`assembled.refuses`, which a run's certification reads too, `assembled.Binary.refused`) at a config not
+    spilling, compiled under the CUDA `build` alone (its ladder's, `kernel_compile.each_build`), then, for as
+    long as a required launch spills or serializes its warpgroup MMAs (`assembled.refuses`, which a run's
+    certification reads too, `assembled.Binary.refused`) at a config not
     refused before, its launch refused (`report.refuse_launch`) and the group derived and compiled again, as a
     run's compile steps such a launch down through its derivation's configs (`report.settled`): a launch
     whose every config spills derives none and leaves the template. `refused` holds the calls the template
     refuses, at its first derivation or a retry's; the plans and launches held apart are the cases'."""
-    from kernel_compile import compile_mosaic_kernels
 
     launched, stepped, spilled = {}, set(), set()
     cases = compiled_cases(target, plans, refused, apart, only=group, launched=launched)
-    found = compile_mosaic_kernels(cases, target)
+    found = compile_mosaic_kernels(cases, target, builds=(build,))
     while True:
         spilling = {case.name: {kernel["kernel"] for run in runs([record])
                                 for kernel in run.get("kernels", ())
@@ -1656,7 +1658,7 @@ def stepped_down(target: str, group: tuple, plans: dict, refused: list, apart: d
         apart.clear()
         launched.clear()
         cases = compiled_cases(target, plans, refused, apart, only=group, launched=launched)
-        found = compile_mosaic_kernels(cases, target)
+        found = compile_mosaic_kernels(cases, target, builds=(build,))
     return cases, found, spilled
 
 
@@ -1700,7 +1702,6 @@ def test_a_packed_key_decay_training_call_checks_forward_and_recomputed_kernels(
     producer's need is the assembler's alone, `resources.producer_floor`; sm100's decayed keys spilled 16
     bytes in its producer at the least, row 6747), and holds there."""
     from fla_gdn_support import KernelCase
-    from kernel_compile import compile_mosaic_kernels
 
     facts = generation.gpu_target('sm100')
     family = template.bundle(facts)
@@ -1732,108 +1733,6 @@ def test_a_packed_key_decay_training_call_checks_forward_and_recomputed_kernels(
         tiles = dataclasses.replace(tiles, producers=producers)
         case, launches, apart, found = compiled(tiles)
     assert resource_failures([case], found, {label: launches}, apart) == []
-
-
-FORKED_GATE = [(target, name, training) for target in ('sm80', 'sm90', 'sm100') for name in RESOURCE_SHAPES
-               if name != 'a 192-wide value head' for training in (False, True)]
-"""The forked gate's cases (`forked_case`): each scoreboard geometry's 16-bit forward and training pass over
-a forked call on each family's bundle."""
-
-
-def forked_case(target: str, name: str, training: bool) -> tuple:
-    """`name`'s 16-bit call over a forked call's three documents a row, entering a table of a given memory
-    and two stored slots (`chunked_launch.Forked`), the gated delta net's with an entry write, at the
-    template's derived tiles on `target` (a forward alone at its own, `_ran`), its forward or training pass
-    as a gate case (`KernelCase`): its documents laid as a packed call's and its table as the walks take
-    it (`template.forked_table`). Returns the case (None where the template derives no tiles), the bound
-    call, its derived tiles and the same call unforked, bound."""
-    from fla_gdn_support import KernelCase
-
-    facts = generation.gpu_target(target)
-    family = template.bundle(facts)
-    q, k, v, g, beta, h0 = resource_operands(name, jnp.bfloat16, 1, 256)
-    given = jax.ShapeDtypeStruct((1, 1, *h0.shape[1:]), jnp.float32)
-    slots = jax.ShapeDtypeStruct((1, 3), jnp.int32)
-    entry = None if name != 'qwen3.5-27b-gdn' else (
-        jax.ShapeDtypeStruct((1, 3, 1, *k.shape[2:]), jnp.float32),
-        jax.ShapeDtypeStruct((1, 3, 1, *v.shape[2:]), jnp.float32),
-        jax.ShapeDtypeStruct((1, 3, v.shape[2]), jnp.float32))
-    forked = chunked_launch.Forked(slots, slots, slots, entry, 2)
-    skip = list(_skipped(name).values())
-    bind = functools.partial(template.MOSAIC.bind, bound=None if name in RATED else 1.0,
-                             **_form(name, jnp.bfloat16), **_skipped(name))
-    bound, unforked = bind(q, k, v, g, beta, given, None, forked=forked), bind(q, k, v, g, beta, h0, None)
-    with generation.assumed(facts):
-        tiles = template.MOSAIC.derived(bound, facts)
-    if tiles is None:
-        return None, bound, tiles, unforked
-    table, starts, firsts, _ = jax.eval_shape(
-        lambda given, forked: template.forked_table(given, forked, *q.shape[:2], tiles.chunk), given, forked)
-    segments = forked.loads.shape[1]
-    formed = {key: value for key, value in _form(name, jnp.bfloat16).items() if key != 'wide' or not training}
-    cotangents = [jax.ShapeDtypeStruct(v.shape, jnp.bfloat16), h0] if training else []
-    tabled, laid_table = jax.tree.flatten(table)
-
-    def call():
-        def fn(*operands):
-            (q, k, v, g, beta, starts, firsts), leaves, rest = (operands[:7], operands[7:7 + len(tabled)],
-                                                                operands[7 + len(tabled):])
-            *rest, fused = rest if skip else (*rest, None)
-            forked = jax.tree.unflatten(laid_table, leaves)
-            documents = {'starts': starts, 'firsts': firsts, 'max_segments': segments}
-            if training:
-                return mainloop_backward.gradients(q, k, v, g, beta, None, *rest, tiles=tiles, family=family,
-                                                   forked=forked, skip=fused, **documents, **formed)
-            return chunk_forward.forward(q, k, v, g, beta, None, tiles=_ran(tiles, training=False),
-                                         family=family, forked=forked, skip=fused, **documents, **formed)
-
-        return fn, (q, k, v, g, beta, starts, firsts, *tabled, *cotangents, *skip)
-
-    label = f"{name} bfloat16 {'training' if training else 'forward'} forked {_ran(tiles, training=training)}"
-    return KernelCase(label, call), bound, tiles, unforked
-
-
-@COMPILES_ON_CPU
-@pytest.mark.parametrize(('target', 'name', 'training'), FORKED_GATE)
-def test_a_forked_calls_walks_keep_its_table_spilling_none(target, name, training):
-    """A forked call's launches (`forked_case`) compiled by Mosaic on this CPU for `target`: its walks taking
-    each document's memory up from the call's table and keeping its stored finals (`table.Taking`,
-    `table.Returning`; ledger 5376) lower, every kernel spilling none and every report read
-    (`kernel_compile.mosaic_failures`), at the tiles a run settles on: a launch spilling at its derived tiles
-    refused and the call derived again, as a run's compile steps it down (`report.refuse_launch`,
-    `stepped_down`; such a spill the register model's miss, row 5357). A call whose table walk the template
-    derives no tiles for is one it derives none for unforked, the template ineligible for it alike: the
-    table's slice a step holds no call out the walk takes otherwise; and a training pass whose gradient the
-    fast backward takes for neither (`Mosaic.trains`: a write gate without the delta rule, unrounded) is
-    one it trains for neither."""
-    from kernel_compile import compile_mosaic_kernels, mosaic_failures
-
-    facts, stepped = generation.gpu_target(target), set()
-    while True:
-        case, bound, tiles, unforked = forked_case(target, name, training)
-        if case is not None and training:
-            with generation.assumed(facts):
-                if not template.MOSAIC.trains(bound, facts):
-                    assert not template.MOSAIC.trains(unforked, facts), name
-                    return
-        if case is None:
-            with generation.assumed(facts):
-                assert template.MOSAIC.derived(unforked, facts) is None, f"{name}: forked alone derives none"
-                assert not template.MOSAIC.eligible(bound, facts)
-            return
-        found = compile_mosaic_kernels([case], target)
-        spilling = {kernel["kernel"] for record in found for kernel in record.get("kernels", ())
-                    if kernel.get("spilled")}
-        if not spilling or tiles in stepped:
-            break
-        stepped.add(tiles)
-        # The roles each spill stood in, as a run's certification states them, which its ladder steps by.
-        spilled_in = {binary["kernel"]: None if binary["spilled_in"] is None else tuple(binary["spilled_in"])
-                      for record in found for binary in record.get("binaries", ())
-                      if binary["kernel"] in spilling}
-        with generation.assumed(facts):
-            report.refuse_launch(template.MOSAIC, bound, tiles, spilling, spilled_in)
-    assert mosaic_failures(found) == []
 
 
 @lowers('sm90')
@@ -1938,27 +1837,6 @@ def test_an_h100_training_steps_start_certifies_each_kernel_at_most_twice():
     statement's share holds; from the top down that start took ten certifications in three rounds (row 6743).
     Proposed first, the statements' shares traded the output walk's ladder for the scores' backward's."""
     assert_a_start_certifies_each_kernel_at_most_twice(_step_certified('sm90', 4, packed=True)[0])
-
-
-@lowers('sm90')
-def test_a_write_gated_training_calls_start_certifies_its_consumers_spill_three_times_at_most():
-    """The unrounded write gate's forked training call (`forked_case`, no delta rule) at its derived tiles on
-    a compile-only H100, certified as reverse mode runs it (`tuning.KernelOp._certified`): its scores'
-    backward, which spills 16 bytes in its consumers' code at its producer's least, is certified there, at
-    its consumers' statement's share, and at a program fewer, which holds; every other kernel once, none
-    kept spilled. From its producer's top down, every rung spilled more in its consumers, and the ladder
-    compiled about a hundred rounds of the launch before the program fewer (row 6744)."""
-    from dew.nn.kernels.generation import compile_only_gpus
-
-    _, bound, tiles, _ = forked_case('sm90', 'a write gate', training=True)
-    before = {id(certified) for certified in report.certifications()}
-    with (report.refusals(), generation.assumed('sm90'), report.certifying(compile_only_gpus('sm90')[0]),
-          report.pulled()):
-        template.MOSAIC._certified(bound, tiles)
-    bodies = _certified_bodies([each for each in report.certifications() if id(each) not in before])
-    spilling = bodies.pop('recurrence_scores_back')
-    assert len(spilling) <= 3 and not spilling[-1].refused, spilling
-    assert bodies and all(len(found) == 1 and not found[-1].refused for found in bodies.values()), bodies
 
 
 @lowers('sm90')
