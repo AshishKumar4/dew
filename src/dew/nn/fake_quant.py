@@ -3,9 +3,12 @@
 Each rounds fp32 values the way the release's tilelang kernels store them
 (inference/kernel.py at the revision tools/deepseek_v41_reference.py pins)
 and passes the gradient straight through. The rounding is arithmetic on the
-fp32 values and bits, never an `astype` round trip through a narrow dtype:
-XLA GPU's default xla_allow_excess_precision deletes an f32 -> f8 -> f32
-convert pair under jit, and the quantization silently does not happen.
+fp32 values and bits, never a bare `astype` round trip through a narrow
+dtype: XLA GPU's default xla_allow_excess_precision deletes an
+f32 -> f8 -> f32 convert pair under jit, and the quantization silently does
+not happen. One cast rounds instead, `fp8_codes`' float32 E4M3 on CUDA, held
+by an optimization barrier between its two converts, and witnessed bit for
+bit against the arithmetic (row 14171).
 """
 
 import jax
@@ -15,7 +18,7 @@ import numpy as np
 from flax import linen as nn
 
 from dew.nn.derivatives import contracted, surrogate
-from dew.nn.float_bits import exact_power2, raw_fields
+from dew.nn.float_bits import exact_power2, largest_magnitude, raw_fields
 from dew.nn.precision import at_least_fp32, correctly_rounded_divide, divided
 
 E2M1 = np.arange(16, dtype=np.uint8).view(ml_dtypes.float4_e2m1fn).astype(np.float32)
@@ -61,11 +64,12 @@ def _round(values, mantissa: int, lowest: int):
     """Round fp32 values to a float format of `mantissa` bits whose smallest
     normal exponent is `lowest`, ties to even, by arithmetic: the quantum is
     the power of two of the value's binade less the mantissa bits, floored
-    at the subnormal spacing; dividing by it is exact, and `round` ties to
-    the even multiple, the one whose last mantissa bit is 0."""
+    at the subnormal spacing; a product by its reciprocal (a normal power of
+    two too) is the exact quotient, with no division (row 14171), and
+    `round` ties to the even multiple, the one whose last mantissa bit is 0."""
     biased = raw_fields(values.astype(jnp.float32))[2].astype(jnp.int32)
-    quantum = exact_power2(jnp.maximum(biased - 127, lowest) - mantissa, jnp.float32)
-    return jnp.round(values / quantum) * quantum
+    exponent = jnp.maximum(biased - 127, lowest) - mantissa
+    return jnp.round(values * exact_power2(-exponent, jnp.float32)) * exact_power2(exponent, jnp.float32)
 
 
 def _round_e4m3fn(values):
@@ -129,13 +133,34 @@ def fp8_block_scale(amax):
 def fp8_scaled_blocks(x, block: int):
     """`x` in fp32 blocks of `block` channels and each block's power-of-two scale (`fp8_block_scale`)."""
     blocks = x.astype(at_least_fp32(x.dtype)).reshape(*x.shape[:-1], -1, block)
-    return blocks, fp8_block_scale(jnp.max(jnp.abs(blocks), -1, keepdims=True))
+    return blocks, fp8_block_scale(largest_magnitude(blocks, -1, keepdims=True))
 
 
 def fp8_codes(values):
     """`values` (fp32, a block over its scale) rounded to E4M3FN, ties to even, clamped to +-448: an FP8
-    block's codes (`fp8_rounded`'s, before its scale)."""
-    return _round_e4m3fn(jnp.clip(values, -E4M3_MAX, E4M3_MAX))
+    block's codes (`fp8_rounded`'s, before its scale). On CUDA, float32 values, clipped first, take XLA's own
+    conversion to E4M3FN and back, an optimization barrier between (`lax.platform_dependent`; without it,
+    XLA GPU's excess precision deletes the pair), one hardware rounding to nearest even where the
+    arithmetic took a dozen operations an element (row 14171: a bank's codes pass 6.6 ms on a GH200), the
+    same codes bit for bit (tests/test_gemm_blockwise.py's `fp8_codes_convert_as_the_rounding_does`, a
+    native cell of tests/test_gpu_gemm.py: every code, the midpoints between them and their neighbours, the
+    subnormal codes' range, past 448); a NaN its canonical NaN there, its own payload elsewhere, which no
+    stored code holds. Elsewhere, and at any other width (a float64 truth's), the rounding by arithmetic
+    (`_round_e4m3fn`)."""
+    clipped = jnp.clip(values, -E4M3_MAX, E4M3_MAX)
+    if clipped.dtype != jnp.float32:
+        return _round_e4m3fn(clipped)
+    return jax.lax.platform_dependent(clipped, cuda=_converted, default=_round_e4m3fn)
+
+
+def _converted(clipped):
+    """`fp8_codes`' CUDA branch: float32 `clipped` to E4M3FN and back, the narrow value held past XLA GPU's
+    excess precision, which deletes a bare f32 -> f8 -> f32 pair (row 14171's review: 1.0625 kept, where E4M3
+    ties it to 1.0); its derivative zero, the rounding's (`_round_e4m3fn`'s `lax.round`), where the casts'
+    own would pass the tangent through (train 1495's review K-F1: `jvp` of `MxFp8.quantized(x).decoded()`
+    on CUDA gave ones for zeros). A rounding's straight-through estimate is its caller's (`fp8_rounded`)."""
+    return jax.lax.stop_gradient(
+        jax.lax.optimization_barrier(clipped.astype(jnp.float8_e4m3fn)).astype(jnp.float32))
 
 
 def fp4_codes(values):
@@ -164,7 +189,7 @@ def fp4_scaled_blocks(x, block: int, e4m3_scale: bool):
     at 6 * 2**-126 (the indexer)."""
     wide = at_least_fp32(x.dtype)
     blocks = x.astype(wide).reshape(*x.shape[:-1], -1, block)
-    amax = jnp.max(jnp.abs(blocks), -1, keepdims=True)
+    amax = largest_magnitude(blocks, -1, keepdims=True)
     if e4m3_scale:
         # the kernel's cast saturates at E4M3's 448 (cvt.rn.satfinite)
         floored = jnp.maximum(amax, E2M1_MAX * 2 ** -9)
@@ -250,9 +275,9 @@ def fp8_block_cast(x, block: Block) -> tuple[jax.Array, jax.Array]:
     ue8m0 here."""
     rows, cols = block_sides(block)
     # XLA divides through a reciprocal; the cast's two divisions round as IEEE's do. The codes round to
-    # E4M3 in Dew's arithmetic (`fp8_codes`), which the cast then holds exactly: XLA GPU's default excess
-    # precision deletes an f32 -> E4M3 -> f32 convert pair, and XLA:CPU converts a hoisted small loop's
-    # narrow floats through float16, rounding twice.
+    # E4M3 by `fp8_codes` (arithmetic, or on CUDA its barred convert, bit for bit the same), which the cast
+    # then holds exactly: XLA GPU's default excess precision deletes a bare f32 -> E4M3 -> f32 convert pair,
+    # and XLA:CPU converts a hoisted small loop's narrow floats through float16, rounding twice.
     return _cast_blocks(jnp.asarray(x, jnp.float32), rows, cols, xp=jnp, divide=correctly_rounded_divide,
                         rounded=jnp.asarray, coded=fp8_codes)
 
@@ -260,7 +285,8 @@ def fp8_block_cast(x, block: Block) -> tuple[jax.Array, jax.Array]:
 def _cast_blocks(values, rows: int, cols: int, *, xp, divide, rounded, coded):
     """The FP8 block cast of a float32 `values` matrix under `xp`, NumPy or jax.numpy, dividing by `divide`,
     rounding each block's scale by `rounded` and each value over it to E4M3 by `coded` before the cast:
-    `per_block_cast_to_fp8`'s rule, its 1e-4 amax floor `AMAX_FLOOR`."""
+    `per_block_cast_to_fp8`'s rule, its 1e-4 amax floor `AMAX_FLOOR`. Its block maximum the float one's, whose
+    derivative the traced cast's scale keeps (a word maximum's is zero: the head review of a5929cace9)."""
     height, width = values.shape
     padded = xp.pad(values, ((0, -height % rows), (0, -width % cols)))
     tiles = padded.reshape(padded.shape[0] // rows, rows, padded.shape[1] // cols, cols)
