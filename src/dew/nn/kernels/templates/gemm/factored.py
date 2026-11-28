@@ -177,12 +177,13 @@ def _scaled_value(raised: int, product: jax.Array, factor: jax.Array) -> jax.Arr
 
 
 def owed_native(product: jax.Array, factor: jax.Array, *, raised: int) -> jax.Array:
-    """`owed_exactly`'s value where the platform keeps subnormals (CUDA's float32): the plain multiply, the
-    factor and the owed power of two one multiplier where that is finite (a subnormal factor raised
-    exactly), else the product times the factor, rounded once, then times the power of two, exact: no
-    nonzero float32 times a factor of 2**(128 - raised) or more falls below the normals, where it rounds. A
-    power past fp32's (`raised` 128 or more, which no float32 multiplier holds: train 1450's review) is
-    `lowered_product`'s one rounding in integer arithmetic."""
+    """`owed_exactly`'s value where the platform keeps subnormals (CUDA's float32), rounded once: the plain
+    multiply, the factor and the owed power of two one multiplier where that is finite (a subnormal factor
+    raised exactly), else the product times the power of two, exact (a subnormal product raised; one it
+    overflows is one whose owed product past a factor of 2**(128 - raised) overflows too), then times the
+    factor, rounded once (train 1450's review: the product times the factor first rounded a subnormal one on
+    the subnormal grid before the power raised it). A power past fp32's (`raised` 128 or more, which no
+    float32 multiplier holds) is `lowered_product`'s one rounding in integer arithmetic."""
     product, factor = jnp.broadcast_arrays(product, jnp.asarray(factor, product.dtype))
     if not raised:
         return product * factor
@@ -191,7 +192,7 @@ def owed_native(product: jax.Array, factor: jax.Array, *, raised: int) -> jax.Ar
     power = np.float32(2.0 ** raised)
     whole = factor * power
     together = jnp.isfinite(whole) | ~jnp.isfinite(factor)
-    return product * jnp.where(together, whole, factor) * jnp.where(together, np.float32(1), power)
+    return jnp.where(together, product * whole, product * power * factor)
 
 
 def _scaled_tangent(raised: int, primals, tangents):
