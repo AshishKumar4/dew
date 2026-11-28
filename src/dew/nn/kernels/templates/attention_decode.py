@@ -556,7 +556,7 @@ def planned(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans,
     # its heads (`merged_finished`), an unfinished one's to its state (`merged_split`).
     planned_walk = functools.partial(plan, rows, key, value, row_spans, whole, scale=scale, target=target,
                                      table=table, sources=sources, scales=scales, in_key=in_key,
-                                     defer_output=defer_merge,
+                                     defer_output=defer_merge or not finished,
                                      finished=(hooks.output, query.shape[2]) if finished else None)
     # values' bounds choose between (`WALKS`), the one fallback of a launch whose scaled walk's registers its
     # unscaled walk's config does not hold (`MosaicForward.decided`).
