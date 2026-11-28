@@ -140,29 +140,30 @@ class Tiles:
             raise ValueError(f"{self}: {refusal}")
         return self.staging
 
-    def staging_refusal(self, dtypes, family) -> str | None:
+    def staging_refusal(self, dtypes, family, *, first: int | None = 0) -> str | None:
         """Why the output staging this tile states (`staging`) holds no chunk of the call's outputs of
         `dtypes` (or `stores.Output`s, a packed one's chunk its own, `stores.staging_refusal`'s `packed`) on
         `family` (its issuer as the tile specializes it), None where it does or states none: a
         chunk slices its accumulator in whole slices of the issuer's (`mosaic.Issuer.sliced_columns`: two row
         warps of mma.sync tile 16 columns), and divides the tile and
         the issuer's pieces in whole TMA rows of each dtype (`stores.staging_refusal`, the one owner of
-        those)."""
-        if self.staging is None:
+        those), stored from `first` (None: a group's row, known only as it runs)."""
+        if self.staging is None and first is not None:
             return None
         unit = family.sliced_columns
-        if self.staging[0] % unit:
+        if self.staging is not None and self.staging[0] % unit:
             return f"a stated chunk of {self.staging[0]} columns slices the accumulator's {unit}-column atoms"
         columns, piece = self.issued(family)
         forms = [each for each in dtypes if isinstance(each, (stores.Output, tuple))]
         if not forms:
-            return stores.staging_refusal(columns, dtypes, self.staging, piece=piece)
+            return stores.staging_refusal(columns, dtypes, self.staging, piece=piece, first=first)
         # Each output on its own, a packed one's chunk its own (`stores.Output.of` of a `(shape, dtype)`).
         outputs = [stores.Output.of(each) if isinstance(each, (stores.Output, tuple))
                    else stores.Output.of(((0, columns), each)) for each in dtypes]
         return next((refusal for output in outputs if (refusal := stores.staging_refusal(
             columns, (output.dtype,), self.staging, piece=piece,
-            packed=(output,) if output.divisor > 1 or output.transposed else ())) is not None), None)
+            packed=(output,) if output.divisor > 1 or output.transposed else (), first=first)) is not None),
+            None)
 
 
 CONSUMERS = 2

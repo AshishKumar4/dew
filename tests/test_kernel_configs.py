@@ -35,7 +35,7 @@ from dew.nn.kernels import (
     recurrence,
     tuning,
 )
-from dew.nn.kernels.templates import assembled, bundles, report, resources, swizzling
+from dew.nn.kernels.templates import assembled, bundles, copies, report, resources, swizzling
 from dew.nn.kernels.templates.gemm import mosaic_gpu, pricing, tiling
 from dew.nn.kernels.templates.gemm.hooks import Hooks
 
@@ -806,8 +806,38 @@ def test_every_gemm_form_derives_a_tile_at_every_shape(generation_name, shape):
     bundle refuses, on mma.sync's (row 4727). An eligibility regression fails here rather than leaving the
     compile gate fewer cases."""
     cases = _gemm_mainloop_cases(generation_name, shape)
-    assert {case.form for case in cases} == _gate_forms(generation_name)
+    forms, wanted = {case.form for case in cases}, _gate_forms(generation_name)
+    # A grouped call's tile stores each group's rows by TMA from a row known only as it runs, so its staged
+    # rows must be whole 128-byte units (row 14182: an RTX PRO 6000 faults otherwise, M-FS-115); a grouped
+    # form whose output rows are none may derive no Mosaic tile, its call routed elsewhere. Every other form,
+    # and every form at an aligned width, derives one.
+    assert forms <= wanted and wanted - forms <= _grouped_unaligned(generation_name, shape), wanted - forms
 
+
+
+def _grouped_unaligned(generation_name: str, shape: str) -> set[str]:
+    """The gate's forms at `shape` that store a grouped call's rows by TMA (a `gmm` launch, neither dense nor
+    scattered, its padding family, `_families`' first as `_aligned` reads it, staging its outputs by TMA,
+    `Transport.stores_chunks`) into rows of no whole 128-byte units at the width its launch's tiles pad it
+    to (`_aligned_extents`' whole tiles, as its derivation reads it: a partial last tile's chunks are its
+    whole tiles') in a dtype it stores (`_stored_dtypes`, its epilogue's outputs'): those a grouped call's
+    alignment may leave without a Mosaic tile (row 14182)."""
+    found = set()
+    with generation.assumed(generation_name):
+        target = generation.gpu_target()
+        for form, launch, operands, options in _gemm_forms(*GEMM_SHAPES[shape]):
+            if (form not in _gate_forms(generation_name) or not isinstance(launch, grouped_matmul.MosaicGmm)
+                    or options.get("dense") or options.get("scatter") is not None):
+                continue
+            ba = launch.bind(*operands, **options)
+            families = launch._families(ba, target)
+            if not families or not families[0].stores_chunks:
+                continue
+            width = launch._aligned_extents(ba, families[0], target, whole_tiles=True)[1]["width"]
+            if any(width * jnp.dtype(dtype).itemsize % copies.SHARED_ALIGNMENT
+                   for dtype in grouped_matmul._stored_dtypes(ba)):
+                found.add(form)
+    return found
 
 def _gate_forms(generation_name: str) -> set[str]:
     """The forms a generation's GEMM launches emit (`_emitted_forms`), each on the most capable issuer
