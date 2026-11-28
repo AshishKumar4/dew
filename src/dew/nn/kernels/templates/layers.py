@@ -232,7 +232,7 @@ class Weighed(NamedTuple):
         saved = [(segment.unfused - segment.fused, place) for place, segment in enumerate(self.variants)
                  if segment.takes and segment.cheaper and segment.fused is not None
                  and segment.unfused is not None and PLATFORM not in segment.crossings]
-        return self.variants[max(saved)[1]] if saved else None
+        return self.variants[max(saved, key=lambda entry: entry[0])[1]] if saved else None
 
 
 class Plan(NamedTuple):

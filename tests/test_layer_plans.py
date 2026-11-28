@@ -137,6 +137,17 @@ def test_a_candidate_inside_a_platform_choices_portable_branch_is_never_ranked()
                for found in planned.search for variant in found.variants)
     assert all(found.best is None and found.passed is None for found in planned.search)
 
+def test_a_product_whose_variants_save_alike_takes_its_most_staged_as_its_best():
+    """`Weighed.best` among variants saving the same seconds is the first, the one holding the most stages
+    (`Weighed.variants`' order): a tie never reads a later, smaller region as the better plan."""
+    def variant(stages: tuple[str, ...], fused: float) -> layers.Segment:
+        return layers.Segment(places=(0,), stages=stages, kernel="gemm", refusal=None, refused=None,
+                              takes=True, cheaper=True, fused=fused, unfused=fused + 1.0)
+
+    most, fewer = variant(("prologue", "epilogue"), 2.0), variant(("epilogue",), 3.0)
+    assert layers.Weighed(body="step", product=0, variants=(most, fewer)).best == most
+
+
 def test_the_checked_in_plans_are_the_plans_planning_makes():
     """`_layer_plans.json` holds what planning makes of each case, as its command checks it in a process of
     its own (`python -m dew.nn.kernels.templates.layers --check`, which regenerates them and fails naming
