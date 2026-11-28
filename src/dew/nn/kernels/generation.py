@@ -1752,9 +1752,13 @@ def _held_still(forward: Callable, portable: Callable, kind: TangentKind) -> Cal
     return run
 
 
-def _symbolic_tangent(portable: Callable, operands, tangents, output):
-    """`portable`'s tangent at `operands` along `tangents`, a tree like them whose symbolic zeros
-    (`SymbolicZero`) hold their operands still (`_perturbed_tangent`)."""
+def symbolic_tangent(portable: Callable, operands, tangents, output):
+    """`portable(*operands)`'s tangent along `tangents`, for a custom JVP rule declared with symbolic zeros:
+    `operands` a tree (a call's arguments, None leaves dropped as JAX flattens them) and `tangents` a tree
+    like it whose `SymbolicZero` leaves hold their operands still, the moving operands alone perturbed, so a
+    held one's zero direction never meets an infinite factor (`_perturbed_tangent`); with none moving,
+    `output`'s symbolic zero (`zero_from_primal`). A kernel's portable tangent (`linear_tangent`) and a
+    group's exact sum's (`dew.algebra.scan._portable_pair_jvp`) alike."""
     import jax
     from jax.custom_derivatives import SymbolicZero
 
@@ -1766,14 +1770,16 @@ def _symbolic_tangent(portable: Callable, operands, tangents, output):
 def _perturbed_tangent(portable: Callable, operands, live: Sequence[bool], moving, output=None):
     """`portable`'s tangent at `operands` along `moving`, the directions of the leaves `live` masks alone,
     the others held as constants: a zero direction would meet an infinite factor (inf * 0, NaN, where a
-    bias's own tangent was 1: rows 8757, 6740). With none live, `output`'s zeros, in its dtypes."""
+    bias's own tangent was 1: rows 8757, 6740). With none live, `output`'s symbolic zeros, in its dtypes:
+    an instantiated zero met the next infinite factor past the rule (a held group of
+    `scan._portable_pairs`, its pairs zero, through a `sqrt`: 0 * (0.5 / 0), NaN; train 1484's K-F2)."""
     import jax
     from jax.custom_derivatives import zero_from_primal
 
     from dew.nn import programs
 
     if not any(live):
-        return zero_from_primal(output)
+        return zero_from_primal(output, symbolic_zeros=True)
     perturbed, fill = programs.holes(operands, live)
     return jax.jvp(lambda *values: portable(*fill(values)), tuple(perturbed), tuple(moving))[1]
 
@@ -1822,7 +1828,7 @@ def linear_tangent(forward: Callable, backward: Callable, portable: Callable, *,
 
     def produced_jvp(primals, tangents):
         output, saved = produced(*primals)
-        moved = _symbolic_tangent(portable, primals, tangents, output)
+        moved = symbolic_tangent(portable, primals, tangents, output)
         # `saved` reaches only `pulled`, whose tangent reads the operands' instead.
         return (output, saved), (moved, zero_from_primal(saved))
 
@@ -1847,7 +1853,7 @@ def linear_tangent(forward: Callable, backward: Callable, portable: Callable, *,
             return whole if live is None else tuple(jax.tree.leaves(whole)[index] for index in live)
 
         value = pulled(saved, operands, cotangent, live)
-        return value, _symbolic_tangent(pullback, (operands, cotangent), (doperands, dcotangent), value)
+        return value, symbolic_tangent(pullback, (operands, cotangent), (doperands, dcotangent), value)
 
     pulled = pulled_by if traced else contracted("test_an_embedding_lookup_holds_every_order")(
         declared_tangent(kind, pulled_by, pulled_jvp, nondiff_argnums=(3,), symbolic_zeros=True))
