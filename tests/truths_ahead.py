@@ -49,7 +49,7 @@ from typing import Any
 import jax
 import numpy as np
 from store_wire import COMPILED, SITE_IN_PROGRESS
-from tier_wire import LABELED, UNPREPARED, PastCap
+from tier_wire import UNPREPARED, PastCap
 from tool_support import load
 
 
@@ -173,9 +173,13 @@ class CompiledTruths:
             self.tried.difference_update(labels)
             raise
         except BaseException as error:
-            # The innermost site an error escapes names it (`stopped_in`), whatever outer site it escapes too.
-            if not hasattr(error, SITE_OF_ERROR):
-                setattr(error, SITE_OF_ERROR, labels[0])
+            # The innermost site an error escapes names it (`stopped_in`), whatever outer site it escapes too:
+            # its label kept with the innermost entry of the traceback it escaped with, which stays in its
+            # traceback on its way out (each frame it leaves prepended); an error caught and raised again with
+            # a traceback of its own holds that entry no more.
+            held = getattr(error, SITE_OF_ERROR, None)
+            if held is None or not _within(held[1], error.__traceback__):
+                setattr(error, SITE_OF_ERROR, (labels[0], _innermost(error.__traceback__)))
             raise
         self.done.update(labels)
 
@@ -647,9 +651,28 @@ innermost site's), which the suite's failure recorder names it by (tests/conftes
 `recorded_unprepared`): no site an earlier failure, caught, left unfinished."""
 
 
+def _innermost(traceback):
+    """The last entry of `traceback`'s chain: the frame its error was raised in."""
+    while traceback is not None and traceback.tb_next is not None:
+        traceback = traceback.tb_next
+    return traceback
+
+
+def _within(inner, traceback) -> bool:
+    """Whether traceback entry `inner` is one of `traceback`'s chain: the error it was taken from still on its
+    way out, not caught and raised again since."""
+    while traceback is not None:
+        if traceback is inner:
+            return True
+        traceback = traceback.tb_next
+    return False
+
+
 def stopped_in(error: BaseException) -> str | None:
-    """The Check 1 site `error` escaped (`SITE_OF_ERROR`), None where it escaped none."""
-    return getattr(error, SITE_OF_ERROR, None)
+    """The Check 1 site `error` escaped on its way out (`SITE_OF_ERROR`), None where it escaped none, or was
+    caught and raised again since it did."""
+    held = getattr(error, SITE_OF_ERROR, None)
+    return held[0] if held is not None and _within(held[1], error.__traceback__) else None
 
 
 def unprepared(directory: Path, test: str, frames: Sequence[tuple[str, int]], why: str,
@@ -666,23 +689,22 @@ def unprepared(directory: Path, test: str, frames: Sequence[tuple[str, int]], wh
     # The test's file as CI's grading reads a node id (`tools/armada/grading.py`'s `owning`).
     path = Path(load("grading", "tools/armada").owning(test))
     lines = [(file, line) for file, line in frames if Path(file).name == path.name]
-    # A label's identity says so (`tier_wire.LABELED`), its line's text beside it; a line's text alone, the
-    # fallback outside any site, as records before labels were kept (prepares.py's `knowing`).
+    # The site's Check 1 label its own field (`check`) beside its line's text, which a record kept before
+    # labels compares by (prepares.py's `knowing`).
     text = linecache.getline(lines[0][0], lines[0][1]).strip() if lines else ""
-    # A label's identity holds its line's text beside it, which a record before labels were kept compares by.
-    site = f"{LABELED}{site}\n{text}" if site else text
     reasoned(directory / record, test, f"{path}:{lines[0][1]}" if lines else str(path), why, cell,
-             site=site or None)
+             site=text or None, check=site)
 
 
 def reasoned(record: Path, test: str, where: str, why: str, cell: str | None = None,
-             site: str | None = None) -> None:
+             site: str | None = None, check: str | None = None) -> None:
     """Into a test's `record` (`UNPREPARED`, `tier_wire.DEFERRED`), a reason it ran unprepared, `where` and
     `why`, each reason once in the order given, its first's its record's own `where` and `error` (a
     prepare's, before its run's): a test with three unprepared arms names three (Main); `cell` a flow's cell's
-    label, where the reason is one; `site` the source text of the line `where` names (`unprepared`)."""
+    label, where the reason is one; `site` the source text of the line `where` names and `check` the Check 1
+    site's label (`unprepared`)."""
     reason = {"where": where, "error": why, **({"cell": cell} if cell else {}),
-              **({"site": site} if site else {})}
+              **({"site": site} if site else {}), **({"check": check} if check else {})}
     if record.exists():
         held = json.loads(record.read_text())
         if reason not in held["reasons"]:

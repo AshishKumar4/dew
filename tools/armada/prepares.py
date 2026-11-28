@@ -291,36 +291,53 @@ def unprepared_in(truths: Path, records: Mapping[str, str],
                     {"test": record["test"], "where": reason.get("where", "?"),
                      "error": reason.get("error", "?"), "kind": kind,
                      **({"cell": reason["cell"]} if reason.get("cell") else {}),
-                     **({"site": reason["site"]} if reason.get("site") else {})})
+                     **({"site": reason["site"]} if reason.get("site") else {}),
+                     **({"check": reason["check"]} if reason.get("check") else {})})
     return found
 
 
-Cell = tuple[str, str, str | None, str | None, str | None]
+Cell = tuple[str, str, str | None, str | None, str | None, str | None]
 """An unprepared cell as a row and its baseline keep it (`unprepared_cells`): its test, where in it, its label
 or None, the kind of record it is (`unprepared_in`'s: a site's or a flow's; None in a baseline written
-before it was kept), and its site, the source text of the line it names (tests/truths_ahead.py's
-`unprepared`; None before it was kept), each a field, so no node id reading like a where or a label (" @ ",
-" [") is parsed for one, and no site's cell is taken for a flow's. Strings (`identity`) only say a cell."""
+before it was kept), the source text of the line it names (`site`, tests/truths_ahead.py's `unprepared`; None
+before it was kept) and the Check 1 site it is (`check`, its label; None outside a site or before it was
+kept), each a field, so no node id reading like a where or a label (" @ ", " [") is parsed for one, no site's
+cell is taken for a flow's, and no line's text for a label. Strings (`identity`) only say a cell."""
+
+_LEGACY_LABELED = "label:"
+"""What started a site's text that held its Check 1 label before the label was a field of its own (train
+1499's records: "label:<label>\n<line's text>"), read back as the two fields (`_unlabeled`); a line's text
+holds no newline, so only such a record has one."""
+
+
+def _unlabeled(site: str | None, check: str | None) -> tuple[str | None, str | None]:
+    """A record's site text and Check 1 label (`Cell`'s last two fields), a legacy record's label read out of
+    its text (`_LEGACY_LABELED`)."""
+    if check is None and site is not None and site.startswith(_LEGACY_LABELED) and "\n" in site:
+        check, _, site = site.removeprefix(_LEGACY_LABELED).partition("\n")
+    return site or None, check
 
 
 def cell_of(record: Mapping) -> Cell:
     """`record`'s cell (`Cell`), its where "?" where it names none, as `identity` names it."""
     return (record["test"], record.get("where") or "?", record.get("cell"), record.get("kind"),
-            record.get("site"))
+            *_unlabeled(record.get("site"), record.get("check")))
 
 
 def decoded(kept: Sequence) -> Cell:
-    """A cell as a row or a baseline keeps it (`unprepared_cells`: five fields, or an older record's four, its
-    site unknown, or three, its kind unknown too, each None), as `Cell`: every reader of a kept cell reads it
-    so, and grades `Cell`s alone."""
-    return (kept[0], kept[1], kept[2], *[*kept[3:5], None, None][:2])
+    """A cell as a row or a baseline keeps it (`unprepared_cells`: six fields, or an older record's five, its
+    label unknown or held in its text (`_unlabeled`), four, its site unknown too, or three, its kind unknown
+    too, each None), as `Cell`: every reader of a kept cell reads it so, and grades `Cell`s alone."""
+    kind, site, check = [*kept[3:6], None, None, None][:3]
+    return (kept[0], kept[1], kept[2], kind, *_unlabeled(site, check))
 
 
 def record_of(cell: Cell) -> dict:
     """The record of cell `cell` (`Cell`), as `unprepared_in` gives one, its `identity` beside it."""
-    test, where, label, kind, site = cell
+    test, where, label, kind, site, check = cell
     record = {"test": test, "where": where, **({"cell": label} if label else {}),
-              **({"kind": kind} if kind else {}), **({"site": site} if site else {})}
+              **({"kind": kind} if kind else {}), **({"site": site} if site else {}),
+              **({"check": check} if check else {})}
     return {**record, "identity": identity(record)}
 
 
@@ -333,41 +350,34 @@ def _placed(cell: Cell) -> tuple[str, str, str | None]:
     return test, file if colon and line.isdigit() else where, label
 
 
-def knowing(cells: AbstractSet[Cell], label_prefix: str | None = None) -> Callable[[Cell], bool]:
+def knowing(cells: AbstractSet[Cell]) -> Callable[[Cell], bool]:
     """Whether a baseline's `cells` hold a cell, each of them answering one cell of a run alone: by its test,
-    where (its file, at any line, `_placed`), label and site (its line's source text, which an edit above it
-    does not change), and its kind, or, where either side kept no kind (an older record's), whatever its kind;
-    two kinds both stated and different are two cells, as are two sites both stated and different, so a run
-    that fixed one site of a test and broke another is red for the other: two labels by their labels, a label
-    and an older record's line text by the text the label's record holds beside it. A cell either side kept no
-    site for
-    (a baseline written before sites were kept) is answered by its place alone. A run that leaves more cells
-    of a place than main's left is answered for main's many alone. A cell the run left twice (two reasons at
-    one where) is one cell, as a baseline's set keeps it."""
-    left = collections.Counter((_placed(cell), cell[3], cell[4]) for cell in cells)
+    where (its file, at any line, `_placed`) and label, its kind, and which site it is: its Check 1 label
+    where both kept one (`check`), else its line's source text (`site`, which an edit above it does not
+    change); a field either side kept none of (a record before it was kept) answers any. Two kinds, labels or
+    texts both stated and different are two cells, so a run that fixed one site of a test and broke another
+    is red for the other. A flow's cell is its label already (`_placed`): its site is no part of it. A run
+    that leaves more cells of a place than main's left is answered for main's many alone. A cell the run left
+    twice (two reasons at one where) is one cell, as a baseline's set keeps it."""
+    left = collections.Counter((_placed(cell), cell[3], *(cell[4:6] if not cell[2] else (None, None)))
+                               for cell in cells)
     answered: dict[Cell, bool] = {}
 
     def fits(stated: str | None, given: str | None) -> bool:
-        # Two labels are compared as labels (tests/tier_wire.py's `LABELED`); a label and a record's before
-        # labels were kept, a line's text alone, by the text the label's record holds beside it.
-        if stated is None or given is None or stated == given or label_prefix is None:
-            return stated is None or given is None or stated == given
-        labeled = [site.startswith(label_prefix) for site in (stated, given)]
-        if all(labeled):
-            return stated.partition("\n")[0] == given.partition("\n")[0]
-        if any(labeled):
-            return (stated.partition("\n")[2] if labeled[0] else stated) == (
-                given.partition("\n")[2] if labeled[1] else given)
-        return False
+        return stated is None or given is None or stated == given
+
+    def same_site(key: tuple, site: str | None, check: str | None) -> bool:
+        # Two labels compared as labels; otherwise the line's text, either side's unstated answering any.
+        return key[3] == check if key[3] is not None and check is not None else fits(key[2], site)
 
     def known(cell: Cell) -> bool:
         if cell not in answered:
-            # A flow's cell is its label already (`_placed`): its site is no part of it.
-            place, kind, site = _placed(cell), cell[3], None if cell[2] else cell[4]
-            # The baseline's own cell first: its kind and site both its, then either left unstated.
+            place, kind = _placed(cell), cell[3]
+            site, check = cell[4:6] if not cell[2] else (None, None)
+            # The baseline's own cell first: its kind and site both its, then any left unstated.
             held = sorted((key for key, count in left.items() if count and key[0] == place
-                           and fits(key[1], kind) and fits(key[2], site)),
-                          key=lambda key: (key[1] != kind, key[2] != site))
+                           and fits(key[1], kind) and same_site(key, site, check)),
+                          key=lambda key: (key[1] != kind, key[3] != check, key[2] != site))
             if held:
                 left[held[0]] -= 1
             answered[cell] = bool(held)
@@ -424,8 +434,7 @@ def as_ran(row: dict, stale: str) -> dict:
 
 def graded(rows: list[dict], unprepared: Mapping[str, list[dict]], before: AbstractSet[Cell | str] | str,
            generation: str,
-           file_of: Callable[[str], str], stale: str, capped_at: str, *, label_prefix: str | None = None
-           ) -> list[dict]:
+           file_of: Callable[[str], str], stale: str, capped_at: str) -> list[dict]:
     """A dry prepare's `rows` (`file_of` a row's name its test file), each keeping the cells it left
     unprepared (`identity`) as its `unprepared`: a row this run prepared, its file's records (`unprepared`,
     from `unprepared_in`); a row reused from its record, the list that record keeps. A row is red, its new
@@ -467,10 +476,10 @@ def graded(rows: list[dict], unprepared: Mapping[str, list[dict]], before: Abstr
             # Kept apart: main's cells by their fields, compared and read for its caps by field alone, and an
             # older baseline's identities, parsed for its caps as they always were.
             fields = {decoded(cell) for cell in before if isinstance(cell, tuple)}
-            known = knowing(fields, label_prefix)
+            known = knowing(fields)
             legacy = {cell for cell in before if isinstance(cell, str)}
             untried = {test for test, where, label, *_ in fields if where == capped_at and label is None}
-            untried_cells = {(test, label) for test, where, label, kind, _ in fields
+            untried_cells = {(test, label) for test, where, label, kind, *_ in fields
                              if where == capped_at and label is not None and kind != "site"}
             whole = f" @ {capped_at}"
             untried |= {cell[:-len(whole)] for cell in legacy if cell.endswith(whole)}
@@ -599,9 +608,10 @@ def cells_of(record: dict | None) -> set[Cell] | set[str] | None:
         return None
     if "unprepared_cells" in record:
         kept = record["unprepared_cells"]
-        # Five fields each, an older record's four (its site unknown) or three (its kind unknown too).
+        # Six fields each, an older record's five (its label unknown), four (its site too) or three (its
+        # kind too).
         if not (isinstance(kept, list) and all(
-                isinstance(cell, list) and len(cell) in (3, 4, 5) and isinstance(cell[0], str)
+                isinstance(cell, list) and len(cell) in (3, 4, 5, 6) and isinstance(cell[0], str)
                 and isinstance(cell[1], str)
                 and all(field is None or isinstance(field, str) for field in cell[2:])
                 for cell in kept)):
@@ -766,7 +776,7 @@ def run(ci, python: str, tests: list[str], split: str, out: Path, deadline: floa
                     found, unprepared_in(truths, {wire.UNPREPARED: "site", wire.DEFERRED: "flow"},
                                          ci.grading.owning),
                     before_, generation, lambda named: ci.grading.owning(ci.parsed_row(named)[1]),
-                    ci.grading.STALE, wire.CAPPED, label_prefix=wire.LABELED))
+                    ci.grading.STALE, wire.CAPPED))
             rows_ += [nothing_timed(found) for found in json.loads(verdict.read_text())["rows"]]
             if index < len(units) - 1:
                 ci.restored(written[-1] if written else set(), untouched, out)
