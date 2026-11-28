@@ -583,6 +583,10 @@ class Measured:
     launch: float | None = None
     handoff: float | None = None
     loaded_clock: float | None = None
+    l2_bytes_per_second: float | None = None
+    """The L2's read plateau: bytes a second a read of an array the L2 holds streams at
+    (tools/device_facts.py's warm reads past a launch's floor), the rate a tile's repeated reads meet
+    (`templates.cost.Work.l2_bytes`, rows 12699, 14180). None where not measured."""
     copy: tuple[float, float] | None = None
     """A tile copy into shared memory waited on, read from device memory past an L2 eviction (a tile walk's
     step's, `templates.cost.Chain`, `chained`): its fixed seconds and its seconds a byte. None where not
@@ -893,6 +897,11 @@ class GpuTarget:
         return self.clocks.barrier
 
     @property
+    def l2_rate(self) -> float | None:
+        """The L2's read plateau on the part (`Measured.l2_bytes_per_second`); None where unmeasured."""
+        return None if self.part is None else self.part.l2_bytes_per_second
+
+    @property
     def copy_latency(self) -> tuple[float, float] | None:
         """A waited tile copy's fixed seconds and seconds a byte from device memory on the part
         (`Measured.copy`); None where unmeasured."""
@@ -1132,9 +1141,15 @@ TARGETS = {target.generation: target for target in (
               # 2.5%.
               clocked={'NVIDIA RTX PRO 6000 Blackwell Server Edition': Clocked(
                   step=3.68e-6, kernel_step=137.7e-9, product=(38.08e-9, 3.607e-9), barrier=140.0e-9)},
-              # Its memory's: a tile copied by TMA from device memory past an L2 eviction, waited on, 476.5 ns
-              # and 12.90 ps a byte over 4 to 64 KiB (from L2, 199.5 ns and 13.71 ps; M-NG-69Lb-g4).
-              measured={'NVIDIA RTX PRO 6000 Blackwell Server Edition': Measured(copy=(476.5e-9, 12.90e-12))},
+              # Its memory's: tools/device_facts.py's read stream past an L2 eviction, 2.877 us and 1.535 TB/s
+              # over 1 MiB to 1 GiB, its L2's warm read 6.74 TB/s over 4 to 64 MiB (6.737 and 6.751, each
+              # within 2.5% of its line), its launch 1.19 us and its hand-off 0.50 us (M-FS-113-g4, two rounds
+              # within 0.2%; its copy fit, L2-resident below 128 MiB, is none); a tile copied by TMA from
+              # device memory past an L2 eviction, waited on, 476.5 ns and 12.90 ps a byte over 4 to 64 KiB
+              # (from L2, 199.5 ns and 13.71 ps; M-NG-69Lb-g4).
+              measured={'NVIDIA RTX PRO 6000 Blackwell Server Edition': Measured(
+                  2.877e-6, 1.535e12, launch=1.19e-6, handoff=0.50e-6, l2_bytes_per_second=6.74e12,
+                  copy=(476.5e-9, 12.90e-12))},
               # PCIe Gen5 x16 (the Server Edition's datasheet, 128 GB/s both ways).
               host_links={'NVIDIA RTX PRO 6000 Blackwell': 64e9}),
     # A TPU's host link is stated where a primary source states it: v6e's alone (below); the others stream

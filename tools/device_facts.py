@@ -1,7 +1,11 @@
 #!/usr/bin/env python3
 """A GPU's memory facts as its kernels meet them, measured rather than read off its datasheet (row 3612): the
-device seconds one kernel takes to stream N bytes from cold HBM, against N, and the fit `seconds = fixed +
-bytes / plateau` over them, with the least kernel's seconds (a launch's floor on the device), and the wall
+device seconds one kernel takes to stream N bytes from cold HBM, against N, and the read's fit `seconds =
+fixed + bytes / plateau` over them (a copy's points kept unfitted: its timed interval ends before its writes
+leave the L2, an RTX PRO 6000's fit a fixed time below zero, M-FS-113); the same read of an array the L2
+holds, warm, and its fit over 4 MiB to half the L2, where a launch's floor no longer
+dominates it (the L2's plateau, the rate a tile's repeated reads meet: rows 12699, 14180); with the least
+kernel's seconds (a launch's floor on the device), and the wall
 seconds a launch adds to a program that runs kernels one after another and a hand-off's between two programs
 of one launch (row 3613's fixed costs of a launch and of the balanced tail's partials).
 
@@ -38,6 +42,10 @@ SIZES = tuple(2 ** power for power in range(20, 31))
 
 CHAINS = (1, 2, 4, 8, 16, 32, 64)
 """The kernels each chain launches one after another."""
+
+L2_FITTED = 4 * 2 ** 20
+"""The least warm read the L2's fit reads: below it a launch's floor holds the read (an RTX PRO 6000's
+256 KiB to 2 MiB reads all took 2.2 to 2.7 us, M-FS-113)."""
 
 ROUND_TRIPS = (16, 64, 256, 1024)
 """The rounds each hand-off kernel's two programs make, each one hand-off."""
@@ -113,13 +121,20 @@ def main() -> None:
             row[name] = {"seconds": seconds, "bytes_per_second": moved / seconds}
         rows.append(row)
         print(json.dumps(row), flush=True)
+    # Each array read once to bring it into the L2, then timed warm (no eviction): its reads hit the L2.
+    held = []
+    l2_bytes = generation.gpu_facts().l2_bytes
+    for size in (2 ** power for power in range(18, 64) if 2 ** power <= (l2_bytes or 0) // 2):
+        x = jnp.ones((size // 2,), jnp.bfloat16)
+        held.append({"bytes": size, "seconds": timed(read, (x,), warmup=args.warmup, repeats=args.repeats)})
+        print(json.dumps({"l2_read": held[-1]}), flush=True)
     tiny = jnp.ones((256,), jnp.float32)
     least = timed(copy, (tiny,), warmup=args.warmup, repeats=args.repeats)
     chains = [(length, statistics.median(samples(chained(length), tiny, warmup=args.warmup,
                                                  repeats=args.repeats)))
               for length in CHAINS]
     slope, intercept = np.polyfit([length for length, _ in chains], [seconds for _, seconds in chains], 1)
-    facts = {"device": device.device_kind, "l2_bytes": generation.gpu_facts().l2_bytes,
+    facts = {"device": device.device_kind, "l2_bytes": l2_bytes,
              "least_kernel_seconds": least, "points": rows,
              "chain": {"launch_seconds": float(slope), "call_seconds": float(intercept),
                        "points": [{"kernels": length, "seconds": seconds} for length, seconds in chains]}}
@@ -129,9 +144,12 @@ def main() -> None:
         hop, _ = np.polyfit([count for count, _ in trips], [seconds for _, seconds in trips], 1)
         facts["handoff"] = {"seconds": float(hop), "points": [{"round_trips": count, "seconds": seconds}
                                                               for count, seconds in trips]}
-    for name, moved in (("read", 1), ("copy", 2)):
-        fixed, plateau = fitted([(row["bytes"] * moved, row[name]["seconds"]) for row in rows])
-        facts[name] = {"fixed_seconds": fixed, "plateau_bytes_per_second": plateau}
+    fixed, plateau = fitted([(row["bytes"], row["read"]["seconds"]) for row in rows])
+    facts["read"] = {"fixed_seconds": fixed, "plateau_bytes_per_second": plateau}
+    fitting = [(point["bytes"], point["seconds"]) for point in held if point["bytes"] >= L2_FITTED]
+    if len(fitting) > 1:
+        fixed, plateau = fitted(fitting)
+        facts["l2_read"] = {"fixed_seconds": fixed, "plateau_bytes_per_second": plateau, "points": held}
     print(json.dumps({key: value for key, value in facts.items() if key != "points"}), flush=True)
     with open(args.out, "w") as handle:
         json.dump(facts, handle, indent=1)

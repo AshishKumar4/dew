@@ -148,6 +148,14 @@ class Work:
     exponentials: float = 0.0
     conversions: float = 0.0
     device_bytes: float = dataclasses.field(default=0.0, metadata=_NOT_ISSUED)
+    l2_bytes: float = dataclasses.field(default=0.0, metadata=_NOT_ISSUED)
+    """The bytes a launch's copies read from device memory past its operands' and outputs' whole, each
+    once (`emission.launch_work`), so at most its rereads: a tile's repeated reads of an operand other
+    programs read, met in the L2 (`GpuTarget.l2_rate`), the device memory's own unit's rate a level up
+    (`units`: row 14180, the two-level memory a launch's body counts)."""
+    device_reads: float = dataclasses.field(default=0.0, metadata=_NOT_ISSUED)
+    """The bytes of a body's `device_bytes` its copies into shared memory read (no store or reduction),
+    which a launch's `l2_bytes` reads past its buffers (`emission.launch_work`)."""
     shared_bytes: float = 0.0
     tf32_flops: float = 0.0
     span: float = dataclasses.field(default=0.0, metadata=_NOT_ISSUED)
@@ -231,6 +239,7 @@ class Rates(NamedTuple):
     integer: float | None
     multiply_adds: float | None
     device: float | None
+    l2: float | None
     reductions: float | None
     issue: float | None
     fused: float | None
@@ -290,6 +299,9 @@ def rates(target: generation.GpuTarget, *, device: bool) -> Rates:
                  integer=rate(architecture.integer_per_clock),
                  multiply_adds=rate(architecture.integer_multiply_adds_per_clock),
                  device=target.memory_rate if device else math.inf,
+                 # A part with no measured L2 prices its rereads at none, as every part did before row
+                 # 14180, rather than leave every candidate with rereads priced in part (`units`' second).
+                 l2=(target.l2_rate or math.inf) if device else math.inf,
                  reductions=rate(architecture.global_reduction_bytes_per_clock), issue=issue,
                  fused=rate(vector) if held is None else math.inf)
 
@@ -314,7 +326,9 @@ def units(work: Work, at: Rates) -> tuple[UnitSeconds, tuple[float, ...]]:
     a multiply, `Work.fused_multiply_adds`, at their own rate; and the integer multiply-adds their FMA pipe
     issues beside them at its own rate), the special-function units, on-chip memory (shared memory's bytes,
     then what XLA's
-    fusion keeps there, one memory's two levels, so a TPU's one VMEM is one unit), device memory, the integer
+    fusion keeps there, one memory's two levels, so a TPU's one VMEM is one unit), device memory (its
+    compulsory bytes at its stream, `Work.device_bytes`, then the bytes a launch's copies read again at the
+    L2's plateau, `Work.l2_bytes`: one memory's two levels, none where the part measured no L2), the integer
     units, the element-wise reductions into global memory, the issue slots every instruction of those units
     takes (`issued`) and the operations no rule prices (`Work.unpriced_operations`, at no rate); and, level
     by level, the work at a rate the target states none of, which no time prices (0 where one does)."""
@@ -323,7 +337,7 @@ def units(work: Work, at: Rates) -> tuple[UnitSeconds, tuple[float, ...]]:
                         (work.integer_multiply_adds, at.multiply_adds)),
                "special": ((work.exponentials, at.special),),
                "on_chip": ((work.shared_bytes, at.shared), (work.kept_bytes, at.kept)),
-               "device": ((work.device_bytes, at.device),),
+               "device": ((work.device_bytes, at.device), (work.l2_bytes, at.l2)),
                "integer": ((work.integer_operations, at.integer),),
                "reductions": ((work.global_reductions, at.reductions),), "issue": ((issued(work), at.issue),),
                "unpriced": ((work.unpriced_operations, None),)}
