@@ -81,6 +81,7 @@ from jax.custom_derivatives import zero_from_primal
 from dew.algebra import means
 from dew.algebra.windows import Units
 from dew.nn.derivatives import KernelGlue, contracted, surrogate
+from dew.nn.float_bits import raised_exactly
 from dew.nn.kernels import generation
 from dew.nn.kernels.templates.attention import REFERENCE_PRECISION, KeySpans, dense, logit_scale, prescaled
 from dew.nn.precision import accurate_exp, float32_einsum, ln2_remainder, power2, two_sum
@@ -161,13 +162,20 @@ def exp_scaled(z: jax.Array, exponent: jax.Array, power) -> jax.Array:
     # powers together, decay's and `power`, held within `±400` after they meet, never apart (a decay of
     # -9744 beside a power of 13862 is `2^-195`, where either held alone read infinity).
     fraction = jnp.where(jnp.abs(whole) < 2.0 ** 16, ln2_remainder(decay, whole), 0.0)
-    # `z` as its mantissa in [1/2, 1) and its own power of two, read from its bits (`frexp`, a subnormal's
-    # too), so `z e^f` stays inside [1/2, 2) and its power joins the rest before any rounding: halving `z`
-    # first rounded `2^-149` to 0, which `2^149` then raised to 0, not 1 (train 1478's K-F2).
-    _, own = jnp.frexp(jax.lax.stop_gradient(z))
-    lifted = power2(z, -own) * accurate_exp(fraction)
-    powers = jnp.clip(jnp.asarray(power, jnp.float32) + whole + own.astype(jnp.float32), -400.0, 400.0)
-    return jnp.where(finite, power2(lifted, powers.astype(jnp.int32)), 0.0)
+    # A tiny fp32 `z` raised by 2^64 from its bits first (`raised_exactly`, its derivative `power2`'s), so a
+    # subnormal is no operand a flushing multiply reads (XLA's CPU), and only `|z| >= 1` halved against
+    # `e^f`'s overflow: halving `2^-149` first rounded it to 0, which `2^149` then raised to 0, not 1 (train
+    # 1478's K-F2). Every power then applied at once, as before.
+    up = 0
+    if jnp.dtype(z.dtype) == jnp.float32:
+        held = jax.lax.stop_gradient(z)
+        tiny = jnp.abs(held) < 2.0 ** -100
+        raised = power2(z, 64) + jax.lax.stop_gradient(raised_exactly(held, jnp.int32(64)) - power2(held, 64))
+        z, up = jnp.where(tiny, raised, z), jnp.where(tiny, 64.0, 0.0)
+    big = jnp.abs(jax.lax.stop_gradient(z)) >= 1
+    lifted = jnp.where(big, z * 0.5, z) * accurate_exp(fraction)
+    powers = jnp.asarray(power, jnp.float32) + whole + jnp.where(big, 1.0, 0.0) - up
+    return jnp.where(finite, power2(lifted, jnp.clip(powers, -400.0, 400.0).astype(jnp.int32)), 0.0)
 
 
 def _pair_bound(left: jax.Array, right: jax.Array) -> jax.Array:
