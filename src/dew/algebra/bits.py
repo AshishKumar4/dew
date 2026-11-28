@@ -992,15 +992,20 @@ def nvfp4_quantized(x: jax.Array) -> tuple[jax.Array, jax.Array, jax.Array]:
     return packed(codes.T, E2M1).T, scales, tensor
 
 
+def _amax(value):
+    """A tensor's largest magnitude, its words' (`largest_magnitude` over every axis)."""
+    return largest_magnitude(value)
+
+
 def _amax_tangent(primals, tangents):
     (value,), (moved,) = primals, tangents
-    # The value its words' (`largest_magnitude`); the floating maximum's derivative, its tie pullback kept.
+    # The floating maximum's derivative, its tie pullback kept.
     _, tangent = jax.jvp(lambda value: jnp.max(jnp.abs(value)), (value,), (moved,))
     return _nvfp4_amax(value), tangent
 
 
 _nvfp4_amax = contracted("test_an_nvfp4_tensor_scale_keeps_its_ordinary_maximum_derivative")(
-    declared_tangent(Protected(), largest_magnitude, _amax_tangent))
+    declared_tangent(Protected(), _amax, _amax_tangent))
 
 
 def nvfp4_tensor_scale(largest: jax.Array, quotient=None) -> jax.Array:

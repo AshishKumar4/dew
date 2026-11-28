@@ -1924,26 +1924,12 @@ def _summed_batch(cotangent):
                         if leaf.dtype == jax.dtypes.float0 else jax.lax.reduce_sum(leaf, (0,)), cotangent)
 
 
-def _unbatched(cotangent):
-    """An unbatched operand's cotangent (`linear_map`'s batch rule, its pullback mapped): its batch's sum, in
-    its own type whatever x64 scope a pullback runs in (a float64 cotangent an exact widening's pullback
-    forms, summed outside x64, was asked for as float32 first: two of 2^127 an infinity; row 14083's
-    review); a `float0` one's zeros."""
-    import jax
-    import numpy as np
-
-    if cotangent.dtype == jax.dtypes.float0:
-        return np.zeros(cotangent.shape[1:], jax.dtypes.float0)
-    kept = jax.dtypes.canonicalize_dtype(cotangent.dtype) == cotangent.dtype
-    with contextlib.nullcontext() if kept else jax.enable_x64(new_val=True):
-        return cotangent.sum(0)
-
-
 @functools.cache
 def _linear_primitive() -> type:
     """`linear_map`'s primitive, defined at its first call: this module imports no JAX of its own."""
     import jax
     import jax.numpy as jnp
+    import numpy as np
     from jax.experimental import hijax
 
     from dew.nn import programs
@@ -1974,6 +1960,12 @@ def _linear_primitive() -> type:
             return nothing(out_aval)
         return jax.jvp(lambda *moved: apply(*fill(moved)), tuple(moving),
                        tuple(itertools.compress(directions, live)))[1]
+
+    def unbatched(cotangent):
+        """An unbatched operand's cotangent: its batch's sum."""
+        if cotangent.dtype == jax.dtypes.float0:
+            return np.zeros(cotangent.shape[1:], jax.dtypes.float0)
+        return cotangent.sum(0)
 
     class Linear(hijax.HiPrim):
         apply: Callable
@@ -2045,7 +2037,7 @@ def _linear_primitive() -> type:
                 leaves, tree = jax.tree.flatten(back)
                 axes = jax.tree.leaves(moving_axes, is_leaf=lambda axis: axis is None)
                 return jax.tree.unflatten(tree, [
-                    _unbatched(leaf) if axis is None else jnp.moveaxis(leaf, 0, axis)
+                    unbatched(leaf) if axis is None else jnp.moveaxis(leaf, 0, axis)
                     for leaf, axis in zip(leaves, axes, strict=True)])
 
             return (linear_map(applied, pulled, *args, zero_cotangents=self.zero_cotangents,
