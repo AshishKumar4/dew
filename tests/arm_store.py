@@ -355,53 +355,57 @@ def _stored_arm(store: CompiledTruths, label: str, given_fn, arm, role: str, *, 
 
 def _library_checked(arm, given_fn, label: str):
     """`arm`, a site's arm its run compiles on its GPU (unprepared, unnamed, or at run), held to its library's
-    call where `given_fn`, or the program a window loop or run-to-run declaration holds (as `_ahead_arm`
-    reads them), is a library arm (`truths_ahead.library_arm`) and it runs on a GPU
-    (`truths_ahead.library_checked`), no prepare having compiled it (row 14096); `arm` as it is otherwise."""
-    if isinstance(given_fn, _RunToRun):
-        return _RunToRun(_library_checked(arm.fn, given_fn.fn, label), given_fn.why)
-    if isinstance(given_fn, _Windowed):
-        return _Windowed(_library_checked(arm.fn, given_fn.fn, label))
-    call = library_call(given_fn)
-    if call is None or jax.default_backend() != "gpu":
-        return arm
-    return _LibraryChecked(arm, given_fn, call, label)
+    call where `given_fn`'s program (`_adapted`) is a library arm (`truths_ahead.library_arm`) and it runs on
+    a GPU (`truths_ahead.library_checked`), no prepare having compiled it (row 14096); `arm` as it is
+    otherwise."""
+    def checked(given, compiled):
+        call = library_call(given)
+        if call is None or jax.default_backend() != "gpu":
+            return compiled
+        return _LibraryChecked(compiled, call, label)
+
+    return _adapted(given_fn, arm, checked)
 
 
 class _LibraryChecked:
-    """A library arm (`arm`, as the gate runs it) checked to call `call` at each call's signature
-    (`arm_forms._signature`), once (`_library_checked`): where the arm is one program (its `lower`, under its
-    switches: `Unrewritten`'s, a twin's as written), that program compiled, checked and run; where it is a
-    pair (`arm_forms._Paired`, whose call picks its program), the library's program as given (`given_fn`)
-    compiled and checked, and the arm run, its other attributes the arm's."""
+    """A library arm (`arm`, as the gate runs it) whose program at each call's signature
+    (`arm_forms._signature`), the one it runs (its `lower`, under its switches: `Unrewritten`'s, a twin's as
+    written, a pair's selected), is compiled, checked to call `call` and run, once a signature
+    (`_library_checked`), its other attributes the arm's."""
 
-    def __init__(self, arm, given_fn, call: str, label: str):
-        self.arm, self.given_fn, self.call, self.label, self.executables = arm, given_fn, call, label, {}
+    def __init__(self, arm, call: str, label: str):
+        self.arm, self.call, self.label, self.executables = arm, call, label, {}
 
     def __call__(self, *inputs):
         key = _signature(inputs)
         if key not in self.executables:
-            own = self.arm if callable(getattr(self.arm, "lower", None)) else None
-            executable = (self.given_fn if own is None else own).lower(*inputs).compile()
+            executable = self.arm.lower(*inputs).compile()
             library_checked(executable, self.call, self.label)
-            self.executables[key] = None if own is None else executable
-        executable = self.executables[key]
-        return self.arm(*inputs) if executable is None else executable(*inputs)
+            self.executables[key] = executable
+        return self.executables[key](*inputs)
 
     def __getattr__(self, name):
         return getattr(self.arm, name)
+
+
+def _adapted(given, compiled, leaf: Callable):
+    """A site's arm (`given`, as the site passed it; `compiled`, as the gate runs it) with `leaf(given,
+    compiled)` in place of the program it holds, within a run-to-run declaration and a window loop, which
+    keep their meaning: the one walk of the arm's adapters, for its prepared calls (`_ahead_arm`) and its
+    run's checks (`_library_checked`) alike."""
+    if isinstance(given, _RunToRun):
+        return _RunToRun(_adapted(given.fn, compiled.fn, leaf), given.why)
+    if isinstance(given, _Windowed):
+        return _Windowed(_adapted(given.fn, compiled.fn, leaf))
+    return leaf(given, compiled)
 
 
 def _ahead_arm(given, compiled, call: Callable, role: str):
     """A site's arm (`given`, as the site passed it) whose programs a store compiled ahead (`_compile_arms`),
     as the gate runs it (`compiled`, `arm_forms._compiled`'s): each plain program's call its draw's executable
     (`call(role, inputs)`, `truths_ahead.CompiledTruths.ran`), within a run-to-run declaration and a window
-    loop (an arm that holds a program, `_holds_program`)."""
-    if isinstance(given, _RunToRun):
-        return _RunToRun(_ahead_arm(given.fn, compiled.fn, call, role), given.why)
-    if isinstance(given, _Windowed):
-        return _Windowed(_ahead_arm(given.fn, compiled.fn, call, role))
-    return _Ahead(compiled, functools.partial(call, role))
+    loop (an arm that holds a program, `_holds_program`, `_adapted`)."""
+    return _adapted(given, compiled, lambda _, leaf: _Ahead(leaf, functools.partial(call, role)))
 
 
 class _Ahead:
