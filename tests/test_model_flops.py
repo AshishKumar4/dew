@@ -270,6 +270,27 @@ def test_a_high_level_operation_counts_its_expansion_in_the_context_it_was_stage
     assert traced_flops(counted, _shaped(3, 5), _shaped(4, 3)) == 2 * 4 * 3 * 5
 
 
+def test_a_high_level_operation_counts_its_expansion_at_its_literal_operands():
+    """A linear map whose residuals hold a literal flag beside its weight (`generation.linear_map`, its output
+    typed as given) counts the product its flag chooses: a literal operand reaches its expansion as its
+    value, as JAX's lowering hands it (theme 87's review: traced as a type, the flag was a tracer a branch
+    could not read)."""
+    from dew.nn.kernels.generation import linear_map
+
+    def apply(residuals, x):
+        flag, weight = residuals
+        return x @ weight if flag else x
+
+    def pullback(residuals, cotangent):
+        flag, weight = residuals
+        return cotangent @ weight.T if flag else cotangent
+
+    def counted(weight, x):
+        return linear_map(apply, pullback, (True, weight), x, out_aval=jax.typeof(x))
+
+    assert traced_flops(counted, _shaped(5, 5), _shaped(4, 5)) == 2 * 4 * 5 * 5
+
+
 def test_a_traced_program_counts_a_grouped_product_and_refuses_work_it_does_not_count():
     """A grouped product (`ragged_dot_general`, a mixture's experts on a CPU) counts each row against its own
     group's matrix, `2 x rows x depth x width` whatever the groups, and its gradient's two grouped products

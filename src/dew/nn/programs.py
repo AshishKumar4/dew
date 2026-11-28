@@ -661,18 +661,26 @@ def _of(equation: jcore.JaxprEqn, primitive: jcore.Primitive) -> Mapping:
 
 def high_expansion(equation: jcore.JaxprEqn) -> jcore.Jaxpr | None:
     """The program a high-level operation (`jax.experimental.hijax.HiPrim`, bound as JAX's
-    `call_hi_primitive`) runs as it lowers, its expansion (`HiPrim.expand`, JAX's `to_lojax`) traced over its
-    operands' types in the context its equation was staged in (`equation.ctx`: its mesh, its metadata), as
-    JAX's own lowering expands it (`partial_eval.lower_jaxpr`); None for any other equation. Its own
-    derivatives and transpose are the operation's rules, not its expansion's: a reader of the work it does
-    reads this (`flops.traced_flops`)."""
+    `call_hi_primitive`) runs as it lowers, its expansion (`HiPrim.expand`, JAX's `to_lojax`) traced as JAX's
+    own lowering expands it (`partial_eval.lower_jaxpr`): in the context its equation was staged in
+    (`equation.ctx`: its mesh, its metadata), a literal operand its value and every other its type; None for
+    any other equation. Its own derivatives and transpose are the operation's rules, not its expansion's: a
+    reader of the work it does reads this (`flops.traced_flops`)."""
     from jax._src import hijax
 
     if equation.primitive is not hijax.call_hi_primitive_p:
         return None
-    expansion = functools.partial(equation.primitive.to_lojax, **equation.params)
+    literal = [isinstance(operand, jcore.Literal) for operand in equation.invars]
+
+    def expansion(*traced):
+        given = iter(traced)
+        operands = [operand.val if held else next(given) for operand, held in zip(equation.invars, literal,
+                                                                                  strict=True)]
+        return equation.primitive.to_lojax(*operands, **equation.params)
+
+    avals = [operand.aval for operand, held in zip(equation.invars, literal, strict=True) if not held]
     with equation.ctx.manager:
-        return jax.make_jaxpr(expansion)(*(variable.aval for variable in equation.invars)).jaxpr
+        return jax.make_jaxpr(expansion)(*avals).jaxpr
 
 
 def scan_body(equation: jcore.JaxprEqn) -> jcore.Jaxpr:
