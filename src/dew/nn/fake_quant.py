@@ -61,11 +61,12 @@ def _round(values, mantissa: int, lowest: int):
     """Round fp32 values to a float format of `mantissa` bits whose smallest
     normal exponent is `lowest`, ties to even, by arithmetic: the quantum is
     the power of two of the value's binade less the mantissa bits, floored
-    at the subnormal spacing; dividing by it is exact, and `round` ties to
-    the even multiple, the one whose last mantissa bit is 0."""
+    at the subnormal spacing; a product by its reciprocal (a normal power of
+    two too) is the exact quotient, with no division (row 14171), and
+    `round` ties to the even multiple, the one whose last mantissa bit is 0."""
     biased = raw_fields(values.astype(jnp.float32))[2].astype(jnp.int32)
-    quantum = exact_power2(jnp.maximum(biased - 127, lowest) - mantissa, jnp.float32)
-    return jnp.round(values / quantum) * quantum
+    exponent = jnp.maximum(biased - 127, lowest) - mantissa
+    return jnp.round(values * exact_power2(-exponent, jnp.float32)) * exact_power2(exponent, jnp.float32)
 
 
 def _round_e4m3fn(values):
@@ -134,8 +135,22 @@ def fp8_scaled_blocks(x, block: int):
 
 def fp8_codes(values):
     """`values` (fp32, a block over its scale) rounded to E4M3FN, ties to even, clamped to +-448: an FP8
-    block's codes (`fp8_rounded`'s, before its scale)."""
-    return _round_e4m3fn(jnp.clip(values, -E4M3_MAX, E4M3_MAX))
+    block's codes (`fp8_rounded`'s, before its scale). On CUDA, float32 values, clipped first, take XLA's own
+    conversion to E4M3FN and back (`lax.platform_dependent`), one hardware rounding to nearest even where the
+    arithmetic took a dozen operations an element (row 14171: a bank's codes pass 6.6 ms on a GH200), the
+    same codes bit for bit (tests/test_gemm_blockwise.py's `fp8_codes_convert_as_the_rounding_does`, a
+    native cell of tests/test_gpu_gemm.py: every code, the midpoints between them and their neighbours, the
+    subnormal codes' range, past 448); a NaN its canonical NaN there, its own payload elsewhere, which no
+    stored code holds. Elsewhere, and at any other width (a float64 truth's), the rounding by arithmetic
+    (`_round_e4m3fn`)."""
+    clipped = jnp.clip(values, -E4M3_MAX, E4M3_MAX)
+    if clipped.dtype != jnp.float32:
+        return _round_e4m3fn(clipped)
+
+    def converted(clipped):
+        return clipped.astype(jnp.float8_e4m3fn).astype(jnp.float32)
+
+    return jax.lax.platform_dependent(clipped, cuda=converted, default=_round_e4m3fn)
 
 
 def fp4_codes(values):

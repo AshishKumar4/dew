@@ -261,6 +261,9 @@ def _scale_edge_cells() -> tuple[Cell, ...]:
               ("kernel gradient", gemm_blockwise.an_e5m2_blockwise_kernel_gradient_at_fp32s_largest_is_finite,
                "blockwise fp8 tgmm"))
           for edge in gemm_blockwise.E5M2_EDGES),
+        Cell("fake_quant's E4M3 codes convert as their rounding does",
+             gemm_blockwise.fp8_codes_convert_as_the_rounding_does, "sm90", at_run=EXACT_CODES,
+             native={"launch": "fp8 codes", "pass": "convert"}),
         Cell("an owed product's native fold rounds once below the normals",
              gemm_nvfp4.an_owed_products_native_fold_rounds_once_below_the_normals, "sm90",
              at_run=EXACT_OVERFLOW, native={"launch": "owed fold", "pass": "subnormal product"}),
