@@ -47,6 +47,7 @@ from dew.nn.kernels.templates.cost import (
     most,
     multiplied,
     repeated,
+    stored,
 )
 from dew.nn.kernels.templates.product import product_mode
 
@@ -1561,7 +1562,7 @@ def _launched(kernel, stated: Stated) -> "Launched":
     # them all, so at most its rereads: a first read a statement omits is no reread (an operand's, an
     # output's read back), nor a store or a reduction; a buffer read in part or written alone only hides
     # another's.
-    footprint = sum(_bytes(var.aval) for var in (*kernel.invars, *kernel.outvars))
+    footprint = stored(*(var.aval for var in (*kernel.invars, *kernel.outvars)))
     reads = counted.issued(lambda work: work.device_reads, stated.steps, programs)
     work = Work(**{unit: issued(unit) for unit in ISSUED_UNITS if unit != "issue_excess"},
                 device_bytes=stated.bytes_accessed, l2_bytes=max(0.0, reads - footprint),

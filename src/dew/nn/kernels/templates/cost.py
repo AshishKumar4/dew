@@ -361,10 +361,12 @@ def most(works: Sequence[Work]) -> Work:
     """The most of each unit any of `works` holds, alternatives of which one runs (a conditional's branches,
     `emission`'s and `inline_work`'s; none, `Work()`): its span the longest, every path none of the others
     outlasts (as works side by side keep them), and its issue slots the most any one of them issues
-    (`Work.issue_excess`), none issuing another's mix."""
+    (`Work.issue_excess`), none issuing another's mix; its copies' reads (`Work.device_reads`) the least,
+    the ones every alternative makes, as the L2 term's bound on rereads reads them (`Work.l2_bytes`)."""
     if not works:
         return Work()
-    taken = Work(**{field.name: max(getattr(work, field.name) for work in works)
+    taken = Work(**{field.name: (min if field.name == "device_reads" else max)(getattr(work, field.name)
+                                                                               for work in works)
                     for field in dataclasses.fields(Work) if field.name not in ("chains", "issue_excess")},
                  chains=sum(works, Work()).chains)
     return dataclasses.replace(taken, issue_excess=max(0.0, issued(taken) - max(map(issued, works))))
