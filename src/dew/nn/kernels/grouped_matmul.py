@@ -657,21 +657,17 @@ class _Mosaic(tiling.TilesTemplate, _GroupedLaunch[tiling.Tiles]):
                 or not self._divides(ba, config, target) or self._refused(ba, config, target)):
             return False
         hooks = ba.arguments['hooks']
-        stored = _stored_dtypes(ba)
         columns = pricing.tile_columns(config, family)
+        # The outputs its runs stage, a depth split's its fp32 partials (`_partials`), a grouped call's rows
+        # each stored by TMA from its group's first, known only as it runs (`gmm`'s `_stored_rows`): whole
+        # 128-byte units (row 14182).
+        staged = ba if config.splits == 1 else self._partials(ba)
+        stored = _stored_dtypes(staged)
         if not self._granular(ba, config, family, target) or config.staging_refusal(
                 quantized.outputs((config.share, columns), stored,
-                                  quantized.forms_of(hooks.out_forms, stored)),
-                family.specialized(config.share, columns)) is not None:
-            return False
-        # A grouped call's tile stores each group's rows by TMA from its first, known only as it runs (`gmm`'s
-        # `_stored_rows`): every row it stages, a depth split's fp32 partial's where it splits, whole
-        # 128-byte units (row 14182).
-        staged = stored if config.splits == 1 else (jnp.dtype(jnp.float32),)
-        if self._stores_group_rows(ba, family) and config.staging_refusal(
-                quantized.outputs((config.share, columns), staged,
-                                  quantized.forms_of(hooks.out_forms, staged) if config.splits == 1 else ()),
-                family.specialized(config.share, columns), first=None) is not None:
+                                  quantized.forms_of(staged.arguments['hooks'].out_forms, stored)),
+                family.specialized(config.share, columns),
+                first=None if self._stores_group_rows(staged, family) else 0) is not None:
             return False
         if hooks.out_forms and (not self.STORES_FORMS or quantized.forms_refusal(
                 hooks.out_forms, config, dense=bool(ba.arguments.get('dense')))):
@@ -723,6 +719,10 @@ class _Mosaic(tiling.TilesTemplate, _GroupedLaunch[tiling.Tiles]):
         """The call and tile a launch at `config` runs, which its legality, registers and launch read: the
         call as it runs it (`_aligned`) by default."""
         return self._aligned(ba, target), config
+
+    def _partials(self, ba):
+        """The call `ba` writing fp32 partials, as a depth split's runs do (`mosaic_gpu.gmm`)."""
+        return self.bind(*ba.args, **{**ba.kwargs, 'out_dtype': 'float32'})
 
     def _aligned(self, ba, target, *, whole_tiles: bool = False):
         """The call as the launch runs it (`_fwd`'s `_padded`): its depth and width each padded with zeros to
@@ -1285,13 +1285,11 @@ class MosaicGmm(_Mosaic):
         if not config.swapped:
             if config.splits == 1:
                 return ba, config
-            return (self.bind(*ba.args, **{**ba.kwargs, 'out_dtype': 'float32'}),
-                    dataclasses.replace(config, splits=1))
+            return self._partials(ba), dataclasses.replace(config, splits=1)
         swapped = self._swapped(ba, target)
         assert swapped is not None, "a swapped tile is a swappable call's (`legal`)"
         if config.splits > 1:
-            # A split's runs write fp32 partials (`mosaic_gpu.gmm`), each at the tile unsplit.
-            swapped = self.bind(*swapped.args, **{**swapped.kwargs, 'out_dtype': 'float32'})
+            swapped = self._partials(swapped)
         return swapped, dataclasses.replace(config, swapped=False, splits=1)
 
     def _legal(self, ba, config: tiling.Tiles, target) -> bool:
