@@ -311,7 +311,7 @@ def test_a_one_member_batched_projection_runs_as_the_dense_product_it_is():
     params = jax.eval_shape(layer.init, jax.random.key(0), x)
     with generation.assumed("sm100"), tuning.seen() as launches:
         jax.eval_shape(layer.apply, params, x)
-    assert launches.taken and all(bound.arguments["dense"] for _, bound in launches.taken), launches.taken
+    assert launches and all(observed.arguments.arguments["dense"] for observed in launches), launches
 
 
 def test_a_batched_projection_runs_its_members_as_one_grouped_gemm():

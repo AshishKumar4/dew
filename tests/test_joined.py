@@ -381,7 +381,7 @@ def test_an_attention_layers_query_key_and_value_side_by_side_are_as_exact_as_ap
         draw = drawing(params, (2, 64, 256), jnp.bfloat16)
         assert_joined_as_exact("qkv", with_gradients(layer.apply), draw, with_gradients(wide.apply),
                                "query, key and value side by side", seeds=JOINED_SEEDS["qkv", bias])
-    assert any(bound.arguments.get("beside") for _, bound in launches.taken), launches.taken
+    assert any(observed.arguments.arguments.get("beside") for observed in launches), launches
 
 
 def test_an_attention_layers_training_step_takes_its_input_gradient_chained():
@@ -424,7 +424,7 @@ def _chained_step(layer, params, x, *contexts) -> list:
             stack.enter_context(context)
         launches = stack.enter_context(tuning.seen())
         jax.eval_shape(_training_step(layer), params, x)
-    return [bound for _, bound in launches.taken if bound.arguments.get("chained")]
+    return [observed.arguments for observed in launches if observed.arguments.arguments.get("chained")]
 
 
 def _llama_8b() -> CausalSelfAttention:
@@ -491,7 +491,7 @@ def test_projections_side_by_side_on_a_mesh_splitting_their_rows_take_each_devic
         routes = stack.enter_context(generation.routes())
         graph = jax.make_jaxpr(_training_step(layer))(params, x)
     assert [route.kernel for route in routes if route.choice == "qkv"][:1] == ["joined"]
-    chained = [bound for _, bound in launches.taken if bound.arguments.get("chained")]
+    chained = [observed.arguments for observed in launches if observed.arguments.arguments.get("chained")]
     assert chained and {bound.arguments["tokens"].shape[0] for bound in chained} == {2 * 64}, chained
     gathered = any(equation.primitive.name == "all_gather" for equation in equations(graph))
     assert gathered == (axis == "fsdp"), axis

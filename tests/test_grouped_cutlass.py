@@ -99,3 +99,33 @@ def test_a_cutlass_launch_forms_a_singleton_sides_rows_as_xla_forms_them():
     formed = grouped_cutlass._formed(rows, squeezed, hooks)
     want = prologue(rows, scale).astype(jnp.bfloat16)
     np.testing.assert_array_equal(np.asarray(formed).view(np.uint16), np.asarray(want).view(np.uint16))
+
+
+def test_a_steps_reach_holds_its_live_cutlass_launch_and_not_its_dead_one(monkeypatch):
+    """A step lowered for an sm90 running CUTLASS's grouped product at two shapes, one in its own flow and
+    one in a loop no run enters: its FFI calls carry their launches' digests (`instrumentation.LAUNCH`), so a
+    tuning run's reach holds the live launch alone (`tuning.reach`, what `tune` settles and
+    tools/kernel_picks.py counts), though both traced, and names no foreign kernel. Traced on the CPU, the
+    library's targets named as a stand-in (no CPU runs its kernels)."""
+    from kernel_compile import live_and_dead, lowered_for
+
+    from dew.nn.kernels import tuning
+
+    _stand_in_cutlass(monkeypatch)
+    sizes = jnp.asarray([64, 64], jnp.int32)
+
+    def product(x, w):
+        return gemm.gemm(x, w, sizes, out_dtype=jnp.bfloat16)
+
+    bf16 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
+    shapes = [bf16((128, 64)), bf16((2, 64, 128)), bf16((128, 128)), bf16((2, 128, 128))]
+    with generation.assumed("sm90"), generation.chosen(grouped_matmul="cutlass"):
+        with tuning.seen() as found:
+            lowered = lowered_for(live_and_dead(product), shapes, "sm90")
+        # The live launch's own step, its key the one a reach holds.
+        with tuning.seen() as alone:
+            lowered_for(product, shapes[:2], "sm90")
+    reached = tuning.reach(found, lowered)
+    assert len(tuning._distinct(found)) == 2 and reached.foreign == ()
+    assert [observed.keyed.autotuning_cache_key for observed in reached.launches] == [
+        observed.keyed.autotuning_cache_key for observed in tuning._distinct(alone)]

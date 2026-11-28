@@ -614,7 +614,7 @@ def test_gemm_over_a_window_into_bf16_at_the_highest_precision_takes_the_windows
     with (generation.assumed("sm90"), generation.chosen(grouped_matmul="mosaic"),
           jax.default_matmul_precision("highest"), tuning.seen() as seen):
         got = gemm.gemm(rows, window, None, out_dtype=jnp.bfloat16, interpret_on_cpu=True)
-    assert any(isinstance(call.op, grouped_quantized.MosaicWordPackedGmm) for _, call in seen.taken), seen
+    assert any(isinstance(observed.op, grouped_quantized.MosaicWordPackedGmm) for observed in seen), seen
     np.testing.assert_array_equal(np.asarray(got).view(np.uint16), weights.view(np.uint16))
 
 
@@ -629,8 +629,9 @@ def test_gemm_over_a_window_sums_exactly_where_its_call_asks():
           jax.default_matmul_precision("highest"), tuning.seen() as seen):
         jax.eval_shape(lambda x: gemm.gemm(x, window, None, out_dtype=jnp.float32, interpret_on_cpu=True),
                        rows)
-    assert [call.arguments["exact_sums"] for _, call in seen.taken
-            if isinstance(call.op, grouped_matmul.MosaicGmm) and call.arguments["interpret"]] == [True]
+    assert [observed.arguments.arguments["exact_sums"] for observed in seen
+            if isinstance(observed.op, grouped_matmul.MosaicGmm) and observed.arguments.arguments["interpret"]
+            ] == [True]
 
 
 def _dot_arithmetics(lowered: jax.stages.Lowered) -> list:

@@ -425,8 +425,8 @@ def test_every_variant_of_the_mosaic_launches_holds_check_1(generation_name):
         for kernel, dew, plain in calls:
             configs = each_config(kernel, dew, *draw(0))
             assert len(configs) > 1, kernel.__name__
-            for config in configs:
-                with tuning.pinned({kernel: config}):
+            for pin, config in configs:
+                with tuning.pinned({pin: config}):
                     assert_as_exact(dew, jax.jit(plain), draw, f"{kernel.__name__} at {config}", seeds=SEEDS,
                                     truth_fn=functools.partial(plain, wide=jnp.float64, out=jnp.float64))
 
@@ -2232,8 +2232,7 @@ def test_a_pin_names_only_a_config_the_launchs_kernel_takes():
                 jax.jit(run).trace(*args)
             with tuning.pinned({launch: legal}), tuning.seen() as launches:
                 jax.jit(run).trace(*args)
-        assert legal in {config for (op, _), (config, _) in zip(launches, launches.taken, strict=True)
-                         if isinstance(op, launch)}
+        assert legal in {observed.config for observed in launches if isinstance(observed.op, launch)}
 
 
 @pytest.mark.parametrize("trans_rhs", [False, True], ids=["forward", "input gradient"])

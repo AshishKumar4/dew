@@ -60,8 +60,11 @@ def main() -> None:
         raise SystemExit("this process shares its GPU, where no pick is measured: "
                          "run it under gpu-run without -n")
     model = model_of(arguments)
+    # Lowered for this GPU's own SKU (`gpu_target()`: a GH200's, not its generation's canonical H100), so
+    # its launches are this GPU model's, measured here and stored under its kind; traced on its abstract
+    # devices, never run on them.
     trainer = Trainer(LMObjective(model, arguments.seq), optax.adamw(1e-4), key=jax.random.key(0),
-                      advanced=TrainerAdvanced(lower_for=generation.device_generation()))
+                      advanced=TrainerAdvanced(lower_for=generation.gpu_target()))
     state = jax.eval_shape(trainer.initial_state, trainer.objective.initializer, trainer.key)
     batch = {"text": jax.ShapeDtypeStruct((arguments.batch, arguments.seq + 1), jnp.int32)}
 
@@ -76,12 +79,13 @@ def main() -> None:
             return lowered.lowered
         raise AssertionError("a trainer under lower_for raises its lowered step")
 
-    tuning.tune(step, measure=True)
+    tuned = tuning.tuned(step, measure=True)
     print(json.dumps({"kernels": reports[-1].record()}))
-    # The step's distinct launches, as its lowering traces them and the pool decides each once.
-    with tuning.reading(), tuning.seen() as traced:
-        step()
-    launches = tuning._distinct(list(traced))
+    # The step's distinct launches a run may make, as its last lowering traced them and the pool decided each
+    # once (`tuning.tuned`'s reach): the step lowered no third time to count them.
+    if tuned.reached is None:
+        raise SystemExit("this process's device runs no kernel the tuner times")
+    launches = tuned.reached.launches
     path = Path(_cache.kernel_picks_path(jax.devices()[0].device_kind))
     # A store exists once a launch has been measured on this GPU model: a step with no Pallas launch
     # there (the dense 1.1B on an RTX PRO 6000 Blackwell) leaves none.

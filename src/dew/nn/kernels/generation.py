@@ -19,7 +19,8 @@ import inspect
 import itertools
 import logging
 import os
-from collections.abc import Callable, Hashable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Hashable, Iterable, Iterator, Mapping, Sequence
+from types import MappingProxyType
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -70,7 +71,7 @@ def assumed(generation: str | GpuTarget | None, *, interpreted: bool = False,
     GPU's model alone (cuDNN's) does not lower in it. None assumes nothing. JAX keys its trace and compile
     caches on the device assumed (`dew._cache.KERNEL_ASSUMED`), so a function jitted for one traces again
     for another."""
-    from dew import _cache, _facts
+    from dew import _facts
 
     if isinstance(generation, GpuTarget):
         value = Assumption(generation.generation, generation, _facts.stated(generation), interpreted,
@@ -78,6 +79,17 @@ def assumed(generation: str | GpuTarget | None, *, interpreted: bool = False,
     else:
         value = None if generation is None else Assumption(generation, interpreted=interpreted,
                                                            portable=portable)
+    with reassumed(value):
+        yield
+
+
+@contextlib.contextmanager
+def reassumed(value: Assumption | None) -> Iterator[None]:
+    """Within the block, the device assumed is `value`, as `assumption` read it where `assumed` held it (a
+    launch's placement, `tuning.Placement`): its generation, its target's facts and its modes alike; none
+    where None."""
+    from dew import _cache
+
     with _cache.KERNEL_ASSUMED(value), _cross_compiled(value):
         yield
 
@@ -579,6 +591,40 @@ class Measured:
     copy: tuple[float, float] | None = None
 
 
+class Frozen(Mapping):
+    """A mapping no one changes: its own copy of the items it is given, held behind a read-only view and
+    pickled as a copy of them, so a cache may hold it as a value (`tuning.holdable`, which trusts this type
+    alone, no subclass), where a read-only view of a dict its caller keeps changes with the dict. A GPU
+    target's mappings (`GpuTarget.__post_init__`)."""
+
+    __slots__ = ("_items",)
+
+    def __init__(self, entries: Mapping | Iterable = ()):
+        self._items = MappingProxyType(dict(entries))
+
+    def __getitem__(self, key):
+        return self._items[key]
+
+    def __iter__(self) -> Iterator:
+        return iter(self._items)
+
+    def __len__(self) -> int:
+        return len(self._items)
+
+    def __repr__(self) -> str:
+        return f"Frozen({self._items!r})"
+
+    def __reduce__(self) -> tuple:
+        return Frozen, (dict(self._items),)
+
+
+def _frozen(value):
+    """`value` unchangeable: a mapping as a `Frozen` copy of its items, each frozen in turn."""
+    if isinstance(value, Mapping):
+        return Frozen({key: _frozen(entry) for key, entry in value.items()})
+    return value
+
+
 @dataclasses.dataclass(frozen=True)
 class GpuTarget:
     """One generation's device prefixes, dense peaks, block memory and measured kernel row.
@@ -668,6 +714,12 @@ class GpuTarget:
     together (an H100's "PCIe Gen5: 128 GB/s" is 64e9 here, a GH200's 900 GB/s C2C 450e9). What a step that
     streams its parameters from the host moves them over (`dew.training.memory.streamed_seconds`); a part
     this states none of streams nothing priced (`host_link_rate`)."""
+
+    def __post_init__(self) -> None:
+        # Its mappings its own and unchangeable, nested ones too (`Frozen`): a launch's cache holds a target
+        # whole as its key does (`tuning.holdable`, which refuses what may change after it is held).
+        for name in ("dense_peaks", "measured", "host_links"):
+            object.__setattr__(self, name, _frozen(getattr(self, name)))
 
     @property
     def architecture(self) -> Architecture:
@@ -1166,7 +1218,7 @@ def built_target(generation: str, multiprocessors: int | None = None, memory: in
                                memory=memory or target.memory)
 
 
-def gpu_mesh(mesh: Mesh | AbstractMesh, generation: str) -> AbstractMesh:
+def gpu_mesh(mesh: Mesh | AbstractMesh, generation: str | GpuTarget) -> AbstractMesh:
     """`mesh`'s axes over abstract devices of the CUDA `generation` ('sm80'), none of which this process
     needs: a program traced on it, under `assumed(generation)`, lowers its Pallas kernels to Triton, and
     its Mosaic GPU kernels to that GPU's instructions, for that GPU on any host (`dew.training.ahead.Lowered`;
@@ -1180,8 +1232,9 @@ def gpu_mesh(mesh: Mesh | AbstractMesh, generation: str) -> AbstractMesh:
     cores and capability are. A program traced on it lowers with `lowering_platforms=('cuda',)`: JAX resolves
     a `gpu` platform it is not given through the backends this process has."""
     from jax.sharding import AbstractDevice, AbstractMesh
-    target = gpu_target(generation)
-    version = capability(generation)
+    # A generation's canonical GPU, or a target's own SKU (an attached GPU's facts, `gpu_target()`).
+    target = generation if isinstance(generation, GpuTarget) else gpu_target(generation)
+    version = capability(target.generation)
     if not target.generation.startswith('sm') or target.shared_limit is None or version is None:
         raise ValueError(f"no CUDA target for {generation!r}")
     device = AbstractDevice(device_kind=target.device_kind, num_cores=target.multiprocessors, platform='gpu',
@@ -1481,8 +1534,6 @@ def gpu_facts(part: str | None = None) -> GpuFacts:
     itself (multiprocessors, shared memory, clocks and L2, `runtime_facts`), or, within `assumed`, the
     assumed part's; else a named part's, by generation ('sm90'), device kind ('NVIDIA H100 80GB HBM3') or
     alias ('a100'). Raises `ValueError` for a call placed on no GPU and for a part Dew knows nothing of."""
-    from types import MappingProxyType
-
     from dew.nn.kernels.templates import bundles
 
     if part is None and assumption() is None and (placed := placed_device()).platform != 'gpu':

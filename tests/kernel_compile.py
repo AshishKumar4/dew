@@ -283,11 +283,25 @@ def _device(generation: str, axes: tuple[tuple[str, int], ...] = (("data", 1),),
     return Mesh(np.array(devices).reshape(sizes), tuple(name for name, _ in axes))
 
 
-def lowered_for(fn, args, generation: str, expected: Expected | None = None, *, memory: int | None = None):
+def live_and_dead(launch: Callable) -> Callable:
+    """A step running `launch` on its first two arguments and tracing it on its last two in a loop no run
+    enters: one launch live, one traced and dead (what `tuning.reach` tells apart)."""
+
+    def step(x, operand, wide, wide_operand):
+        held = jax.lax.while_loop(lambda _: False, lambda held: (launch(*held), held[1]),
+                                  (wide, wide_operand))
+        return launch(x, operand), held[0]
+
+    return step
+
+
+def lowered_for(fn, args, generation: str, expected: Expected | None = None, *, memory: int | None = None,
+                kept: list | None = None):
     """`fn` traced on `args`, its abstract leaves placed on compile-only devices of the CUDA `generation`
     (`_device`: one, replicated, or `expected`'s mesh, each argument by its spec, each device stating
     `memory` where given), and lowered as on that GPU (`assumed`, the mesh's abstract devices) within its
-    block's shared memory: what XLA compiles for it, never run."""
+    block's shared memory: what XLA compiles for it, never run. Its trace (`jax.stages.Traced`) appended to
+    `kept` where given."""
     mesh = (_device(generation, memory=memory) if expected is None
             else _device(generation, expected.axes, memory=memory))
     specs = (None,) * len(args) if expected is None else expected.specs
@@ -308,7 +322,10 @@ def lowered_for(fn, args, generation: str, expected: Expected | None = None, *, 
     placing = jax.set_mesh(mesh) if mesh.size == 1 else jax.sharding.use_abstract_mesh(mesh.abstract_mesh)
     with (assumed(generation), placing,
           mgpu_core.artificial_shared_memory_limit(gpu_target(generation).shared_limit)):
-        return jax.jit(fn).trace(*placed).lower()
+        traced = jax.jit(fn).trace(*placed)
+        if kept is not None:
+            kept.append(traced)
+        return traced.lower()
 
 
 def refused(record: dict) -> bool:
@@ -649,7 +666,9 @@ def _route(lowered, executable, mesh: Mesh) -> dict:
     calls = kernel_calls(lowered)
     shards: dict[str, list] = {}
     for call in calls:
-        shards.setdefault(call.name, []).append([list(shape) for shape in call.operands])
+        # By its kernel's name less its launch's digest (`report.named`), as a route states it.
+        kernel = assembled.kernel_of(call.name)[0]
+        shards.setdefault(kernel, []).append([list(shape) for shape in call.operands])
     return {"launches": sorted(shards), "shards": shards,
             "collectives": sorted([op, sorted(axes)]
                                   for op, axes in collective_axes(executable, mesh))}

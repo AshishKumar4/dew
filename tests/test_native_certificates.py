@@ -258,8 +258,7 @@ def depth_step(launch: type, fn, *operands) -> tuple[int, bool]:
     keep, and unsplit, as exact sums are."""
     with as_run(), tuning.seen() as launches:
         jax.jit(fn).trace(*operands)
-    [tile] = [config for (op, _), (config, _) in zip(launches, launches.taken, strict=True)
-              if isinstance(op, launch)]
+    [tile] = [observed.config for observed in launches if isinstance(observed.op, launch)]
     field, aligned = STEPS[launch]
     width = getattr(tile, field)
     assert width >= 16 and width & (width - 1) == 0 and getattr(tile, "splits", 1) == 1, tile

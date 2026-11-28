@@ -236,8 +236,9 @@ def test_the_pallas_kernels_hold_the_contract_on_one_device(sizes, input_dtype):
 
 
 def every_tile_of_the_grouped_kernels_holds_the_float64_gate(kernel, width, features):
-    """Each config a launch may take (`each_config`: the tile it derives and
-    the variants an opt-in tuning run times), of the implementation the
+    """Each launch at the config it takes, then each config a launch's key
+    is pinned to (`each_config`: the tiles its launches derive and the
+    variants an opt-in tuning run times there), of the implementation the
     launch is forced to, over groups ragged against every tile size, one
     empty and one of a single row: the output and both gradients of a bf16
     projection over an fp32 master hold check 1 against XLA's ragged dot,
@@ -248,9 +249,9 @@ def every_tile_of_the_grouped_kernels_holds_the_float64_gate(kernel, width, feat
     gate = _tile_gate(kernel, width, features)
     with kernel_choices(grouped_matmul=kernel.name):
         configs = each_config(kernel, _tile_gate_arm('pallas'), *gate.draw(0))
-    assert configs
-    for config in configs:
-        gate.check(config)
+    # Each launch at the config it takes, then each config pinned at the key of the launches that take it.
+    for pin in (None, *configs):
+        gate.check(pin)
 
 
 def test_the_tile_gate_fails_a_launch_off_by_a_rounding():
@@ -286,8 +287,8 @@ def _tile_gate_arm(implementation, fault=1.0):
 
 def _tile_gate(kernel, width, features):
     """The tile gate of `kernel`'s launch at one shape: its draws, and `check(config, fault)`, check 1 of
-    the launch at `config` against XLA's ragged dot, which runs under its own choice so the forced kernel
-    never reaches it."""
+    the launch at `config` (each launch at the config it takes where None) against XLA's ragged dot, which
+    runs under its own choice so the forced kernel never reaches it."""
     rows = int(TILE_SIZES.sum())
 
     def draw(seed):
@@ -309,10 +310,14 @@ def _tile_gate(kernel, width, features):
         with kernel_choices(grouped_matmul='xla'):
             return xla(*inputs)
 
-    def check(config, fault=1.0):
-        with kernel_choices(grouped_matmul=kernel.name), tuning.pinned({kernel: config}):
+    def check(pin, fault=1.0):
+        # A pin a launch's key's (`each_config`'s), a kind's config, or none.
+        pins = (contextlib.nullcontext() if pin is None
+                else tuning.pinned(dict([pin]) if isinstance(pin, tuple) else {kernel: pin}))
+        with kernel_choices(grouped_matmul=kernel.name), pins:
             assert_as_exact(jax.jit(_tile_gate_arm('pallas', fault)), reference, draw,
-                            f"{kernel.__name__} at {config}", seeds=TILE_SEEDS, truth_fn=truth)
+                            f"{kernel.__name__} at {pin or 'the configs its launches take'}",
+                            seeds=TILE_SEEDS, truth_fn=truth)
 
     return types.SimpleNamespace(draw=draw, check=check)
 

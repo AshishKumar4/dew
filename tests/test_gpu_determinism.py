@@ -95,8 +95,7 @@ def a_split_products_partials_repeat_bit_for_bit(sizes: tuple[int, ...], *, grad
     with generation.chosen(grouped_matmul="mosaic"), tuning.pinned({type(launch): tile}), \
             tuning.seen() as launches:
         repeats_bit_for_bit(jax.jit(step), *operands, runs=RUNS)
-    assert tile in {config for (op, _), (config, _) in zip(launches, launches.taken, strict=True)
-                    if isinstance(op, type(launch))}, tile
+    assert tile in {observed.config for observed in launches if isinstance(observed.op, type(launch))}, tile
 
 
 def a_decode_merge_of_eight_slices_repeats_bit_for_bit() -> None:

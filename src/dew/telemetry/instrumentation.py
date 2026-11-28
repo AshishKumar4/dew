@@ -775,6 +775,10 @@ def _instruction_flops(instruction: _Instruction,
     return None if flops is None else (flops, flops)
 
 
+LAUNCH = "dew_launch"
+"""The frontend attribute an FFI kernel's call carries its launch's digest by (`report.launch_digest`):
+dew_cutlass's, whose target names no launch (`lowered.KernelCall.launched`)."""
+
 MODEL_FLOPS = "dew_model_flops"
 """The frontend attribute a kernel's launch declares the model's share of the work it states by (`declared`):
 the rest its own recomputation (attention's scores, `attention_mosaic_program.stated`)."""

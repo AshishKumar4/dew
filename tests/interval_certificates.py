@@ -11,6 +11,7 @@ ulp, a mainloop's `approx_math`). A lane (`Lane`) states the arithmetic a launch
 holds the values its launches pass between them."""
 
 import dataclasses
+from collections.abc import Callable
 from typing import Literal, NamedTuple
 
 import numpy as np
@@ -311,6 +312,20 @@ def tanh(x: Iv, lane: Lane) -> Iv:
     return Iv(np.maximum(lo, -1.0), np.minimum(hi, 1.0))
 
 
+def _rounded_of(found: np.ndarray, x: np.ndarray, name: str, ranged: Callable,
+                exact: np.ndarray | None = None) -> None:
+    """Refuse a probe's results (`tanh_reach`'s, `exp2_reach`'s) that are no rounding of `name` at all, whose
+    steps from the correct one are no reach (a NaN's word read as a grid index lies two billion steps off, a
+    walk of them a timeout, not a verdict): one outside the function's range (`ranged`), and one non-finite
+    where the correctly rounded value `exact` is finite or another non-finite (where no `exact`, every
+    non-finite one: tanh's results are all finite)."""
+    finite = np.isfinite(found)
+    wrong = ~finite if exact is None else (finite != np.isfinite(exact)) | (~finite & (found != exact))
+    if (bad := np.flatnonzero(wrong | ~ranged(np.where(finite, found, 0.0)))).size:
+        raise ArithmeticError(f"the lane's {name} gives {found[bad[:4]]} at {x[bad[:4]]}, no rounding of "
+                              f"{name}")
+
+
 def tanh_reach(native, low: float = -12.0, high: float = 12.0) -> int:
     """The most steps of the fp32 grid `native(x)`, an fp32 `tanh` of fp32 operands, lies from tanh(x)
     correctly rounded (`tanh_rounding`'s nearer end), over (`low`, `high`), the operands a capped score
@@ -322,6 +337,7 @@ def tanh_reach(native, low: float = -12.0, high: float = 12.0) -> int:
     found = np.asarray(native(x), np.float64)
     if tier_wire.preparing():
         return 0
+    _rounded_of(found, x, "tanh", lambda values: np.abs(values) <= 1.0)
     lower, upper = tanh_rounding(x)
     below_by, above_by = grid_index(lower) - grid_index(found), grid_index(found) - grid_index(upper)
     return int(np.max(np.maximum(np.maximum(below_by, above_by), 0)))
@@ -352,8 +368,10 @@ def exp2_reach(native, low: float = -2.0, high: float = 2.0) -> int:
     rounded (`op_certificates.exp2_rounded`), over the operands a mainloop takes, (`low`, `high`): by
     default the fractions `algebra.raised` and `algebra.decayed` take, (-2, 2); 2^17 of them, densely and
     drawn, the integers there (exact cases) among them. A zero is the flush `exp2` admits (its enclosure is
-    zero where its lower end, that many steps down, falls below the normal range), not a step: measured
-    over the nonzero results, and a zero where that end is normal refuses the lane. In a GPU tier's prepare,
+    zero where its lower end, that many steps down, falls below the normal range), not a step, and an
+    infinity where the correctly rounded value is one (an overflow, from 128 up) is exact: measured over the
+    finite nonzero results, and a zero where that end is normal, or an infinity where the rounded value is
+    finite, refuses the lane. In a GPU tier's prepare,
     whose arms give zeros and compute nothing (`reference_error.ahead_arm`), `native` is compiled at its
     operands and no reach is read: none, so a cell's later arms are prepared too (row 8497)."""
     rng = np.random.default_rng(2084)
@@ -363,12 +381,14 @@ def exp2_reach(native, low: float = -2.0, high: float = 2.0) -> int:
     found, exact = np.asarray(native(x), np.float64), exp2_rounded(x, FLOAT32)
     if tier_wire.preparing():
         return 0
+    _rounded_of(found, x, "exp2", lambda values: values >= 0.0, exact)
     flushed = found == 0
-    reach = int(np.max(np.abs(grid_index(found) - grid_index(exact))[~flushed]))
-    lowest = exact[flushed]
-    for _ in range(reach):
-        lowest = stepped(lowest, FLOAT32, -np.inf)
-    normal = lowest >= 2.0 ** FLOAT32.emin
+    measured = ~flushed & np.isfinite(found)
+    reach = int(np.max(np.abs(grid_index(found) - grid_index(exact))[measured], initial=0))
+    # Each flushed result's enclosure's lower end, `reach` places below its exact value on the grid, in places
+    # past the least normal value: at or below none, it is normal.
+    below_normal = grid_index(2.0 ** FLOAT32.emin) - grid_index(exact[flushed]) + reach
+    normal = below_normal <= 0
     if np.any(normal):
         raise ArithmeticError(f"the lane's exp2 flushes a normal result at {x[flushed][normal][:4]}")
     return reach

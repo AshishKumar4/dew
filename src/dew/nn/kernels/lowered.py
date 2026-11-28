@@ -21,7 +21,7 @@ from jax.extend.mlir import ir
 from jax.extend.mlir.dialects import stablehlo
 
 from dew.nn.kernels.templates import assembled
-from dew.telemetry.instrumentation import MODEL_FLOPS, call_weights, counted_trips, custom_call_kind
+from dew.telemetry.instrumentation import LAUNCH, MODEL_FLOPS, call_weights, counted_trips, custom_call_kind
 
 Typed = tuple[tuple[int, ...], str]
 """An array as a kernel call reads or returns it: its shape and its element type."""
@@ -54,7 +54,8 @@ class KernelCall:
     array's otherwise; what a device's call is, operand for operand and result for result."""
     caller: str | None = None
     """The launch that traced a Mosaic GPU kernel, as its call's caller states it (`report.launch_metadata`),
-    beside its name; None where its call states none."""
+    beside its name, or an FFI kernel, as its call's frontend attribute states it (`instrumentation.LAUNCH`);
+    None where its call states none."""
 
     @property
     def operands(self) -> tuple[tuple[int, ...], ...]:
@@ -142,10 +143,12 @@ def _walked(operation: ir.Operation, times: float, largest: Iterator[int] | None
     `stablehlo.case`'s or `stablehlo.if`'s regions) the one `largest` gives next (`_Branches.of`, its
     conditionals' in this order: the branch whose kernels state the most FLOPs) as often as the
     conditional and every other none, as `hlo_flops` counts a conditional's largest branch: it runs one;
-    with no `largest`, every branch as often as the conditional; any other region (a reduction's body) as
-    often as its operation."""
+    with no `largest`, every branch as often as the conditional; a conditional whose selector is a constant
+    (a `lax.cond` its trace decided, whose arms JAX lowers both) its selected branch alone, whatever
+    `largest` gives; any other region (a reduction's body) as often as its operation."""
     yield operation, times
-    chosen = next(largest) if largest is not None and _branched(operation) else None
+    ranked = next(largest) if largest is not None and _branched(operation) else None
+    chosen = selected if _branched(operation) and (selected := _selected(operation)) is not None else ranked
     for index, region in enumerate(operation.regions):
         within = times
         if operation.name == "stablehlo.while" and index == 1:
@@ -163,11 +166,23 @@ def _branched(operation: ir.Operation) -> bool:
     return operation.name in ("stablehlo.case", "stablehlo.if") and len(operation.regions) > 1
 
 
+def _selected(conditional: ir.Operation) -> int | None:
+    """The branch a conditional runs where its selector is a constant: a `stablehlo.case`'s index (one past
+    its branches its last, as the case clamps it), a `stablehlo.if`'s predicate its first branch where true;
+    None where the selector is decided as it runs."""
+    held = _constant(conditional.operands[0])
+    if held is None:
+        return None
+    if conditional.name == "stablehlo.if":
+        return 0 if held else 1
+    return held if 0 <= held < len(conditional.regions) else len(conditional.regions) - 1
+
+
 class _Branches:
     """A module's `functions`' stated FLOPs (`KernelCall.flops`, a library call's none) a run, each
     function's computed once with every function it calls, and each function's conditionals' largest
     branches, in the program order `_walked` meets them: a loop's body counted its trips, a conditional
-    its branch of the most stated FLOPs, a call its callee's own."""
+    its branch of the most stated FLOPs (a constant selector's, its own), a call its callee's own."""
 
     def __init__(self, functions: dict[str, ir.Operation]):
         self.functions = functions
@@ -208,8 +223,10 @@ class _Branches:
         regions = [sum(self._stated(nested.operation, chosen) for block in region.blocks
                        for nested in block.operations) for region in operation.regions]
         if slot is not None:
-            chosen[slot] = regions.index(max(regions))
-            return total + max(regions)
+            # A constant selector's branch runs whatever the others state (`_walked`), and is charged so.
+            taken = _selected(operation)
+            chosen[slot] = regions.index(max(regions)) if taken is None else taken
+            return total + regions[chosen[slot]]
         if operation.name == "stablehlo.while":
             trips = _trips(operation)
             body = 0.0 if not trips or not regions[1] else regions[1] * trips
@@ -388,7 +405,8 @@ def _kernel_call(kind: str | None, target: str, operation: ir.Operation) -> Kern
         config = json.loads(ir.StringAttr(attributes["backend_config"]).value)["custom_call_config"]
         return KernelCall(kind, ir.StringAttr(attributes["kernel_name"]).value, config["body"].encode(), "",
                           config.get("cost_estimate", {}).get("flops"))
-    return KernelCall(kind, target, b"", "", None)
+    # Another's (an FFI kernel's) launch its frontend attribute's (`instrumentation.LAUNCH`).
+    return KernelCall(kind, target, b"", "", None, caller=_frontend(attributes).get(LAUNCH))
 
 
 def _frontend(attributes) -> dict[str, str]:
