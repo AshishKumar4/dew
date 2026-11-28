@@ -916,8 +916,8 @@ def _columned_case(rows: int, *, grouped: bool):
 
 def _packed_epilogues(launched) -> list:
     """The epilogue of each packed NVFP4 launch a trace took (`tuning.seen`)."""
-    return [bound.arguments["hooks"].epilogue for op, bound in launched
-            if isinstance(op, grouped_quantized.MosaicPackedGmm)]
+    return [observed.keyed.arguments["hooks"].epilogue for observed in launched
+            if isinstance(observed.op, grouped_quantized.MosaicPackedGmm)]
 
 
 @pytest.mark.parametrize("grouped", [False, True], ids=["matrix", "bank"])
@@ -960,8 +960,8 @@ def test_a_packed_nvfp4_pin_its_finish_cannot_take_keeps_the_plain_launch(interp
         with generation.chosen(nvfp4="packed"), tuning.pinned(pins), tuning.seen() as launched:
             jax.jit(lambda x: gemm.nvfp4_product(x, matrix, out_dtype=jnp.float32,
                                                  interpret_on_cpu=interpret)).trace(spec)
-        taken = launched.held().taken
-        return [(config, ba) for config, ba in taken if isinstance(ba.op, grouped_quantized.MosaicPackedGmm)]
+        return [(observed.config, observed.arguments) for observed in launched.held()
+                if isinstance(observed.arguments.op, grouped_quantized.MosaicPackedGmm)]
 
     with report.refusals(), generation.assumed("sm90"), jax.sharding.use_abstract_mesh(mesh):
         target = generation.gpu_target()
