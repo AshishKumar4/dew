@@ -8,7 +8,7 @@ This page is generated from the maintainers' findings ledger as each change land
 
 ## Kernels and performance
 
-- GEMM cells at parity: the template the default on every NVIDIA cell. [1295, 153, 2109, 5623, 5634, 5666, 13557, 13562, 13588, 13592, 13734, 13740, 13743, 13751, 14202, 14207, 14208]
+- GEMM cells at parity: the template the default on every NVIDIA cell. [1295, 153, 2109, 5623, 5634, 5666, 13557, 13562, 13588, 13592, 13734, 13740, 13743, 13751, 14207, 14208]
 - One recurrence algebra, the template for every form and product, and port retirement. [2076, 3426, 3427]
 - Family toolkit: resources derived and checked against ptxas, one planner, one traversal. [2987, 6010, 14179, 14181, 14184, 14187, 14188, 14189, 14190, 14206, 14210]
 - The kernel challenge's lessons in the templates. [5271]
@@ -29,6 +29,7 @@ This page is generated from the maintainers' findings ledger as each change land
 - Log-linear bf16 training backward regression. [13750]
 - Log-linear NaN across live spans. [13991]
 - A per-key decay's recurrence walk traced the portable pairs once per sub-chunk block. [14081]
+- Memory Planner Miss-Driven ≤2-Step Search, Fast XLA Sizing & Cold-Compile Elimination. [14220, 14222]
 - Model consumers fused through the template's hooks. [1376, 3422, 3428, 822, 14084]
 - Further attention variants. [1461, 1462, 1463, 1465, 1317, 1466]
 - Native TPU GEMM dispatch. [1560]
@@ -43,6 +44,7 @@ This page is generated from the maintainers' findings ledger as each change land
 - Spec-alignment pass (kernel-templates.md §4:208-211). [14191]
 - Parallax exp_scaled's derivative (attention_parallax._exp_scaled_tangent) is a fixed-order JAX tangent, so joint directions at fp32's extremes overflow before…. [14203]
 - A split decode merge's fused output hook (merged.merged_finished, native merged_mosaic) reads a row of no mass as zero where a call's spans do not exclude it. [14204]
+- Nested batching of a linear map under a checked shard_map. [14224]
 - The fork takes no static register cap for a Mosaic GPU kernel. [12686]
 - Sm120's scaled GEMM forwards are derived at a tile their compile spills. [12687]
 - Mosaic GPU async_copy's 1D bulk shortcut (jax fork, launch_context.py is_simple_contiguous_copy) clips a contiguous slice at the whole buffer's end, linearly. [12692]
