@@ -314,15 +314,11 @@ def test_a_calls_pricing_and_launch_trace_its_hook_once():
     1461's review)."""
     queries, width = 128, 64
     traced = []
-
-    def gated(out, gate):
-        traced.append(out.shape)
-        return _gate(out, gate) - jnp.mean(out, axis=-1, keepdims=True)
-
+    centred = _centred(traced)
     spans = template.spans(queries, queries, 1, causal=True)
 
     def ours(query, key, value, gate):
-        hooks = template.Hooks(output=Hook(gated, (Side(gate, template.Kind.OUTPUT),)))
+        hooks = template.Hooks(output=Hook(centred, (Side(gate, template.Kind.OUTPUT),)))
         with generation.assumed("sm90", interpreted=True), tuning.pinned(
                 {attention_mosaic.MosaicForward: UNSPLIT["sm90"]}):
             return attention_mosaic.forward(query, key, value, spans, hooks, interpret=True)

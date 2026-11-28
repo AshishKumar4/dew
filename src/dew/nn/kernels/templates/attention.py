@@ -1954,53 +1954,38 @@ def hook_program(name: str, hook, kinds: tuple[Kind, ...], dtypes: tuple[str, ..
     (`SITES`, `hooks.laid`), in its dtype in the kernels (`dtypes`); `differentiated`, a score hook's
     pullback too, so a hook whose derivative is its own rule (`jax.custom_vjp`) keys by that rule (a
     prologue's pullback runs past the kernels, `jax.vjp` of `prologued`). None or an already traced key as
-    it is. Within a kernel call's making (`tuning.one_call`), traced once for each hook at these arguments,
-    whichever of the call's launches reads it and under whichever context: a decode step's planning, pricing
-    and launches, each an op of its own under a context of its own, keyed a closure hook five times, its
-    program the same at each (train 1474's K-F1)."""
+    it is. Traced once a kernel call (`tuning.one_call`) for each hook at these arguments, as `output_program`
+    holds a call's programs, whichever launch of it asks (train 1474's K-F1: a decode step's, five times)."""
     if hook is None or isinstance(hook, str):
         return hook
-    if (call := tuning.call_scoped()) is not None:
-        source = hook.source if isinstance(hook, tuning.Prepared) else hook
-        # Keyed as `output_program` keys a call's programs, by the hook and its arguments: a call's planning,
-        # pricing and launches trace under contexts of their own (a target assumed, a launch's refusals), the
-        # one call's alike.
-        place = ("hook_program", name, id(source), kinds, tuple(map(str, dtypes)), differentiated, width,
-                 str(operand))
-        if place not in call:
-            # The hook kept beside its key, so its identity names no other hook while the call lasts.
-            call[place] = (hook, _hook_program(name, hook, kinds, dtypes, differentiated=differentiated,
-                                               width=width, operand=operand))
+    call = tuning.call_scoped()
+    place = ("hook_program", name, id(hook.source if isinstance(hook, tuning.Prepared) else hook), kinds,
+             tuple(map(str, dtypes)), differentiated, width, str(operand))
+    if call is not None and place in call:
         return call[place][1]
-    return _hook_program(name, hook, kinds, dtypes, differentiated=differentiated, width=width,
-                         operand=operand)
-
-
-def _hook_program(name: str, hook, kinds: tuple[Kind, ...], dtypes: tuple[str, ...], *, differentiated: bool,
-                  width: int, operand: str) -> str:
-    """`hook_program`'s trace of `hook`."""
     tile = TRACED_TILE
-    prologue = name in ("query_mod", "key_mod")
     extents = {"queries": tile, "keys": tile, "width": width}
     params = [jax.ShapeDtypeStruct(laid(SITES[name], tiled(kind), extents), dtype)
               for kind, dtype in zip(kinds, dtypes, strict=True)]
+    positions = (jax.ShapeDtypeStruct((tile, 1), jnp.int32), jax.ShapeDtypeStruct((1, tile), jnp.int32))
     square = jax.ShapeDtypeStruct((tile, tile), jnp.float32)
     if name == "output_mod":
-        return tuning.program(hook, jax.ShapeDtypeStruct((tile, width), jnp.float32), *params)
-    if prologue:
-        return tuning.program(hook, jax.ShapeDtypeStruct((tile, width), operand),
-                              jax.ShapeDtypeStruct((tile, 1), jnp.int32), *params)
-    positions = (jax.ShapeDtypeStruct((tile, 1), jnp.int32), jax.ShapeDtypeStruct((1, tile), jnp.int32))
-    if not differentiated:
-        return tuning.program(hook, square, *positions, *params)
-    floating = floating_params(params)
+        key = tuning.program(hook, jax.ShapeDtypeStruct((tile, width), jnp.float32), *params)
+    elif name in ("query_mod", "key_mod"):
+        key = tuning.program(hook, jax.ShapeDtypeStruct((tile, width), operand),
+                             jax.ShapeDtypeStruct((tile, 1), jnp.int32), *params)
+    elif not differentiated:
+        key = tuning.program(hook, square, *positions, *params)
+    else:
+        floating = floating_params(params)
 
-    def pulled(s, q_pos, k_pos, *values):
-        hooked = differentiable(hook, q_pos, k_pos, values, floating)
-        out, pull = jax.vjp(hooked, s, *(values[index] for index in floating))
-        return out, pull(jnp.ones_like(out))
+        def pulled(s, q_pos, k_pos, *values):
+            hooked = differentiable(hook, q_pos, k_pos, values, floating)
+            out, pull = jax.vjp(hooked, s, *(values[index] for index in floating))
+            return out, pull(jnp.ones_like(out))
 
-    return tuning.program(pulled, square, *positions, *params)
+        key = tuning.program(pulled, square, *positions, *params)
+    return key if call is None else call.setdefault(place, (hook, key))[1]  # the hook kept beside its key
 
 
 class AttentionLaunch(tuning.KernelOp):
@@ -2010,8 +1995,7 @@ class AttentionLaunch(tuning.KernelOp):
     it (`DIFFERENTIATED`, a backward's), a forward's output hook at its parameters' and the padded value
     width (`output_kinds`, `output_dtypes`, `output_width`), a forward's query prologue at its parameters'
     and the query's width and dtype (`query_kinds`, `query_dtypes`, `query_width`, `query_dtype`); and its
-    timing operands' spans whole
-    (`tuning.KernelOp.operands`, `spanned`), the spans' starts at its arrays' place `SPANS`."""
+    timing operands' spans whole (`tuning.KernelOp.operands`, `spanned`), the spans' starts at `SPANS`."""
 
     DIFFERENTIATED: ClassVar[bool] = False
     SPANS: ClassVar[int] = 3
