@@ -219,7 +219,8 @@ def narrowed_float32(x: jax.Array) -> jax.Array:
     subnormal to zero; past the largest finite an infinity, an infinity its own, a NaN a quiet one. The
     narrowing is a linear map (`generation.linear_map`), as `widened_exactly`'s widening is: its tangent
     the tangent narrowed alike, a cast's derivative (an NVFP4 tensor scale's at a float64 truth's width:
-    row 14083's review), its transpose the cotangent widened exactly (`widened_exactly`)."""
+    row 14083's review), its transpose the cotangent widened exactly (`_widened_back`, whose transpose is
+    this narrowing)."""
     from dew.nn.kernels.generation import linear_map
 
     x = jnp.asarray(x, jnp.float64)
@@ -231,14 +232,30 @@ def narrowed_float32(x: jax.Array) -> jax.Array:
         return _bitwise(_narrowed_bits, moving, wide=True)
 
     def pullback(_, cotangent):
-        # The cotangent widened from its bits (`widened_exactly`), a subnormal float32 one kept, which a
-        # flushing convert zeroes (train 1455's review), placed as it is, in x64 whatever scope a pullback
-        # runs in.
+        # The cotangent widened from its bits, a subnormal float32 one kept, which a flushing convert zeroes
+        # (train 1455's review), placed as it is, in x64 whatever scope a pullback runs in.
         with jax.enable_x64(new_val=True):
-            return widened_exactly(cotangent, jnp.float64)
+            return _widened_back(cotangent)
 
     narrowed = source.update(dtype=jnp.dtype(jnp.float32), weak_type=False)
     return linear_map(apply, pullback, (), x, out_aval=narrowed, summed_first=True)
+
+
+def _widened_back(cotangent: jax.Array) -> jax.Array:
+    """`narrowed_float32`'s transpose: a float32 `cotangent` widened exactly into float64 on its bits (as
+    `widened_exactly` widens), a linear map whose own transpose is `narrowed_float32`, so every order of
+    reverse mode rounds on the bits (the review of row 14083: `widened_exactly`'s transpose, a convert, zeroed
+    a subnormal at reverse over reverse)."""
+    from dew.nn.kernels.generation import linear_map
+
+    wide = np.dtype(np.float64)
+
+    def apply(_, moving):
+        return _bitwise(lambda part: _widened_bits(part, wide), moving, wide=True)
+
+    widened = jax.typeof(cotangent).update(dtype=wide, weak_type=False)
+    return linear_map(apply, lambda _, back: narrowed_float32(back), (), cotangent, out_aval=widened,
+                      summed_first=True)
 
 
 def _narrowed_bits(x: jax.Array) -> jax.Array:

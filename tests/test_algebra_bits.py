@@ -671,8 +671,9 @@ def test_a_one_operand_lop3_reads_its_immediate_as_both_other_operands():
 
 def test_a_float64_narrowing_is_exact_on_this_cpu_its_transpose_too():
     """`float_bits.narrowed_float32` of float64 values whose float32 rounding is subnormal keeps them, where
-    this CPU's convert flushes them, and its transpose widens a subnormal float32 cotangent (2^-149)
-    exactly, not to the zero a convert back gives (train 1455's review), under x64."""
+    this CPU's convert flushes them; its transpose widens a subnormal float32 cotangent (2^-149) exactly, not
+    to the zero a convert back gives (train 1455's review), and that transpose's own narrows 2^-140 on its
+    bits again (reverse over reverse), under x64."""
     from dew.nn.float_bits import narrowed_float32
 
     with jax.enable_x64(new_val=True):
@@ -685,6 +686,11 @@ def test_a_float64_narrowing_is_exact_on_this_cpu_its_transpose_too():
         (back,) = jax.jit(pull)(jnp.full((3,), least, jnp.float32))
         assert back.dtype == jnp.float64
         np.testing.assert_array_equal(np.asarray(back), np.full(3, 2.0 ** -149))
+        # Reverse over reverse: the pullback's own transpose narrows on the bits, 2^-140 kept.
+        _, again = jax.vjp(lambda cotangent: pull(cotangent)[0], jnp.zeros((3,), jnp.float32))
+        (forth,) = jax.jit(again)(jnp.full((3,), 2.0 ** -140, jnp.float64))
+        assert forth.dtype == jnp.float32
+        np.testing.assert_array_equal(np.asarray(forth), np.full(3, 2.0 ** -140, np.float32))
 
 
 @pytest.mark.mesh(devices=2)
