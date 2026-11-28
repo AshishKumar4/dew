@@ -447,45 +447,48 @@ def test_a_nan_in_a_quantizing_epilogues_product_takes_the_nan_scale():
     np.testing.assert_array_equal(held, np.asarray(jax.lax.bitcast_convert_type(expected, jnp.uint8)))
 
 
-NAN_ROWS, NAN_COLUMNS = (3, 50, 99), (37, 70)
-"""`_nan_among_normal_rows`' product's NaNs: at these rows, in these columns alone."""
-
-
-def _nan_among_normal_rows():
-    """Finite rows of normal draws by an identity whose columns `NAN_COLUMNS` also take twice the first two
-    depths' values, minus: at rows `NAN_ROWS`, whose first two values are 2^127, those columns' sums are an
-    infinity less one, NaN, beside every other block of theirs finite (train 1484's confirm: a NaN in the
-    rows had poisoned every column of its row)."""
-    rng = np.random.default_rng(14084)
-    x = rng.normal(size=(128, 128)).astype(np.float32)
-    x[list(NAN_ROWS), :2] = 2.0 ** 127
-    w = np.eye(128, dtype=np.float32)
-    w[0, list(NAN_COLUMNS)], w[1, list(NAN_COLUMNS)] = 2.0, -2.0
-    return jnp.asarray(x, jnp.bfloat16), jnp.asarray(w, jnp.bfloat16)
+NAN_AT = ((3, 37), (50, 70), (99, 37), (99, 70))
+"""The accumulator entries `test_a_launchs_quantizing_epilogue_scales_a_mixed_nan_block_as_the_quantizer`'s
+epilogue side makes NaN, each in a block of finite values."""
 
 
 def test_a_launchs_quantizing_epilogue_scales_a_mixed_nan_block_as_the_quantizer():
     """The template's launch (an H100's, interpreted, its epilogue in the accumulator's register layout)
-    quantizing a product to MXFP8 (`quantized.gemm_quantized`): each 32-column block mixing a NaN with
-    finite values takes the NaN scale, as `formats.MxFp8.quantized` of the product does, and every other
-    block's scale and code is the quantizer's (train 1484's review: the launch's arm reduced float
-    magnitudes, apart from the quantizer's words)."""
-    x, w = _nan_among_normal_rows()
+    quantizing a product of finite operands to MXFP8, its epilogue adding a side tile of zeros with a NaN at
+    `NAN_AT`: each 32-column block mixing that NaN with finite values takes the NaN scale and every other
+    block its own, each finite code the quantizer's (`formats.MxFp8.quantized` of the same sum), as the
+    quantizer scales the product (train 1484's review: the launch's arm reduced float magnitudes; its
+    confirm: the NaN made after the dot, where an overflow inside it need not make one)."""
+    from dew.nn.kernels.templates.hooks import Hook, Side
+
+    rng = np.random.default_rng(14084)
+    x = jnp.asarray(rng.normal(size=(128, 128)), jnp.bfloat16)
+    w = jnp.eye(128, dtype=jnp.bfloat16)
+    side = np.zeros((128, 128), np.float32)
+    side[tuple(np.transpose(NAN_AT))] = np.nan
+
+    def epilogue(acc, nan):
+        return quantized.quantize_mxfp8_epilogue()(acc + nan)
+
     with (generation.assumed("sm90"), generation.chosen(grouped_matmul="mosaic"),
           generation.routes() as routes):
-        fused = quantized.gemm_quantized(x, w, minifloat=formats.MxFp8, interpret_on_cpu=True)
-    assert isinstance(fused, formats.MxFp8)
+        out = gemm.gemm(x, w, None, epilogue=Hook(epilogue, (Side(jnp.asarray(side), ("rows", "columns")),)),
+                        out_dtype=jnp.float8_e4m3fn, out_dtypes=(jnp.float8_e4m3fn, jnp.float8_e8m0fnu),
+                        interpret_on_cpu=True)
+    assert isinstance(out, tuple)
+    codes, scales = out
     assert ("grouped_matmul", "mosaic") in {(route.choice, route.kernel) for route in routes}, routes
-    product = jnp.dot(x, w, preferred_element_type=jnp.float32)
-    want = formats.MxFp8.quantized(product)
-    np.testing.assert_array_equal(np.asarray(fused.scales).view(np.uint8),
-                                  np.asarray(want.scales).view(np.uint8))
+    summed = jnp.dot(x, w, preferred_element_type=jnp.float32) + side
+    want = formats.MxFp8.quantized(summed)
+    held = np.asarray(scales).view(np.uint8)[:, ::32]
+    np.testing.assert_array_equal(held, np.asarray(want.scales).view(np.uint8))
     holding = np.zeros((128, 4), bool)
-    holding[np.ix_(list(NAN_ROWS), [column // 32 for column in NAN_COLUMNS])] = True
-    np.testing.assert_array_equal(np.asarray(want.scales).view(np.uint8) == 0xFF, holding)
-    finite = ~np.isnan(np.asarray(product))
-    assert finite.sum() == 128 * 128 - len(NAN_ROWS) * len(NAN_COLUMNS)
-    np.testing.assert_array_equal(np.asarray(fused.codes).view(np.uint8)[finite],
+    for row, column in NAN_AT:
+        holding[row, column // 32] = True
+    np.testing.assert_array_equal(held == 0xFF, holding)
+    finite = ~np.isnan(np.asarray(summed))
+    assert finite.sum() == 128 * 128 - len(NAN_AT)
+    np.testing.assert_array_equal(np.asarray(codes).view(np.uint8)[finite],
                                   np.asarray(want.codes).view(np.uint8)[finite])
 
 
