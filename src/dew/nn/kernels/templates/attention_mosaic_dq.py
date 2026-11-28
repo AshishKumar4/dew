@@ -375,16 +375,15 @@ def _dq_columns(query, key, value, dout, peak, prior, anchor, delta, key_index, 
     sums = outputs.output(jnp.float32, *head_slice(family, rows, heads_of, positions, jnp.float32),
                           column_share(query, share[1]))
     stats_shape = outputs.output(jnp.float32, rows_count, rows, heads_of, positions)
+    out_type = (sums, sums, stats_shape) if walk.accurate else (sums, stats_shape)
+    grid = (heads, batch, queries // pair)
     launch = family.kernel(
-        entry, out_type=(sums, sums, stats_shape) if walk.accurate else (sums, stats_shape),
-        grid=(heads, batch, queries // pair), grid_names=("heads", "batch", "q_tiles"), consumers=consumers,
-        interpret=walk.interpret, approx_math=walk.approx_math,
-        name=name,
-        reducing_warpgroups=reducing(family, consumers, walk.reduces),
-        registers=walk.registers(dq=True),
+        entry, out_type=out_type, grid=grid, grid_names=("heads", "batch", "q_tiles"), consumers=consumers,
+        interpret=walk.interpret, approx_math=walk.approx_math, name=name,
+        reducing_warpgroups=reducing(family, consumers, walk.reduces), registers=walk.registers(dq=True),
         # Its walk's statement, its work its emission's (`stated`); its share of dQ's product the model's it
         # owns (`modelled`).
-        cost=stated(walk.spec, batch, heads, query, key, value, dout,
+        cost=stated(walk.spec, batch, heads, query, key, value, dout, *out_type,
                     tile_walk=TileWalk((queries, key.shape[1]), (block_q, block_k), consumers,
                                        common=family.feeds_itself)),
         model_flops=modelled(walk.spec, batch, heads, walk.spec.queries or queries, share[1]))
