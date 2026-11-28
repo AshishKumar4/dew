@@ -378,6 +378,48 @@ def test_a_calls_absent_tail_leaves_it_the_call_on_its_real_tokens(memory):
         np.testing.assert_array_equal(np.asarray(state), np.asarray(alone))
 
 
+def test_titans_write_coefficient_is_one_factor_of_its_product():
+    """Titans' write at `coefficient` 1 and its rate `theta` is bit for bit its write at the default 2 and
+    half the rate (an in-context memory's half-squared loss), each one factor of the write's exact
+    product."""
+    query, key, value, weight, bias, theta, alpha, eta, state, _ = operands('titans', jnp.float32)(0)
+    run = functools.partial(titans, query, key, value, weight, bias, chunk=CHUNK, state=state)
+    halved = run(theta / 2, alpha, eta)
+    unit = run(theta, alpha, eta, coefficient=1.0)
+    for found, expected in zip(jax.tree.leaves(unit), jax.tree.leaves(halved), strict=True):
+        np.testing.assert_array_equal(np.asarray(found), np.asarray(expected))
+
+
+@pytest.mark.parametrize('form', sorted(FORMS))
+def test_a_memorys_mini_batches_hold_the_in_context_memorys_remat_seams(form):
+    """Each mini-batched memory names its mini-batches' entering states `CARRY` and their outputs and leaving
+    states `CHUNK` (`titans.walked_batches`, as `dew.nn.memory`'s chunks), and where the run's remat
+    recomputes the chunks its gradients are the stored run's bit for bit."""
+    from dew.nn.kernels.titans import CARRY, CHUNK
+    from dew.nn.residuals import recomputing
+
+    *given, states, cotangent = operands(form, jnp.float32)(1)
+    memory = functools.partial(FORMS[form][0], chunk=CHUNK)
+    run = jax.jit(with_gradients(memory))
+
+    def names(jaxpr) -> set:
+        found = {eqn.params['name'] for eqn in jaxpr.eqns if eqn.primitive.name == 'name'}
+        for eqn in jaxpr.eqns:
+            for param in eqn.params.values():
+                for inner in param if isinstance(param, (tuple, list)) else (param,):
+                    inner = getattr(inner, 'jaxpr', inner)
+                    if hasattr(inner, 'eqns'):
+                        found |= names(inner)
+        return found
+
+    assert {CARRY, CHUNK} <= names(jax.make_jaxpr(memory)(*given, states).jaxpr)
+    stored = run(*given, states, cotangent)
+    with recomputing((CHUNK,)):
+        recomputed = jax.jit(with_gradients(memory))(*given, states, cotangent)
+    for found, expected in zip(jax.tree.leaves(recomputed), jax.tree.leaves(stored), strict=True):
+        np.testing.assert_array_equal(np.asarray(found), np.asarray(expected))
+
+
 def test_titans_partial_mini_batch_leaves_the_state_its_last_token_does():
     """Titans over one token in a mini-batch of two, its key, value and affine bias zero (no write), its
     momentum entering zero, under `alpha` 1/2: its memory leaving half the entering one and its momentum

@@ -27,10 +27,17 @@ import functools
 import jax
 import jax.numpy as jnp
 
+from jax.ad_checkpoint import checkpoint_name
+
 from dew.nn import sharding
 from dew.nn.aligned import aligned_sum
 from dew.nn.inputs import sequence_blocks
 from dew.nn.precision import at_least_fp32
+from dew.nn.residuals import MEMORY_RESIDUALS, RECOMPUTED
+
+CARRY, CHUNK = MEMORY_RESIDUALS
+"""The in-context memory's remat names (`dew.nn.memory.CARRY`, `CHUNK`): a mini-batch's entering state, and
+its outputs with the state it leaves."""
 
 
 def layer_normed(x, eps: float):
@@ -84,6 +91,19 @@ def real_gradients(k, v, readout, real, weight, bias, eps: float):
     readout zero before the LayerNorm sees it (an entering bias of 2^127 overflowed its variance, NaN)."""
     live, zeros = real[..., None], jnp.zeros_like(readout)
     return jnp.where(live, inner_gradient(k, v, jnp.where(live, readout, zeros), weight, bias, eps), zeros)
+
+
+def walked_batches(mini_batch, states, batches):
+    """`mini_batch(entering, at)` over `batches` in turn (`lax.scan`) from `states`, with the in-context
+    memory's remat seams (`dew.nn.memory`'s chunks'): each mini-batch's entering state named `CARRY`, its
+    leaving state and outputs `CHUNK`, and where the run's remat recomputes the chunks (`RECOMPUTED`) each
+    mini-batch recomputed from the state it entered with."""
+    def named(entering, at):
+        return checkpoint_name(mini_batch(checkpoint_name(entering, CARRY), at), CHUNK)
+
+    if CHUNK in RECOMPUTED.get():
+        named = jax.checkpoint(named, prevent_cse=False)
+    return jax.lax.scan(named, states, batches)
 
 
 def read_out(walked, queries, weight, bias, eps: float, dtype):
@@ -145,7 +165,7 @@ def prepared_operands(query, key, value, weight, bias, gates, state, shapes, sca
 
 
 def titans(query, key, value, weight, bias, theta, alpha, eta, state=None, *, chunk: int = 16,
-           eps: float = 1e-6, valid=None):
+           eps: float = 1e-6, valid=None, coefficient: float = 2.0):
     """Titans' linear memory a mini-batch of `chunk` tokens at a time: `query`, `key` and `value`
     `[B, T, H, D]`, the inner loss's LayerNorm affine `weight` and `bias` `[H, D]`, the learning rate
     `theta`, forgetting `alpha` and momentum `eta` `[B, T, H]`, and `state` the entering `(M, S)`
@@ -159,7 +179,9 @@ def titans(query, key, value, weight, bias, theta, alpha, eta, state=None, *, ch
     (fla/ops/titans/naive.py:332-342 at 413ad2c), decaying the state again (one real token at `alpha` 1/2 in
     a mini-batch of two keeps a quarter of the memory where the recurrence keeps half). A token `valid`
     (`[B, T]`) marks absent is none: its operands zero (`absent_zeroed`), its readout what the walk reads,
-    the state as it was."""
+    the state as it was. `coefficient` is the write's factor before its rate, `coefficient theta k u` (2,
+    the squared loss's gradient; 1 where the caller's loss is half of it, as the in-context memory's), one
+    factor of the exact product, so no rate is halved or doubled first."""
     dtype = jnp.result_type(query, key, value)
     # Titans' memory and momentum each `[D, Dv]`.
     shapes = ((key.shape[-1], value.shape[-1]),) * 2
@@ -179,8 +201,8 @@ def titans(query, key, value, weight, bias, theta, alpha, eta, state=None, *, ch
             # 1430's review; doubled onto a key of 2^127 first, a zero gradient wrote NaN, train 1455's;
             # doubled onto a cotangent of 2^127 first, the transpose overflowed, a head review; the rate of
             # 2^127 doubled first overflowed, train 1461's).
-            write = aligned_sum([[jnp.asarray(2.0, theta.dtype), theta[..., None, None], k[..., :, None],
-                                  gradient[..., None, :]]])
+            write = aligned_sum([[jnp.asarray(coefficient, theta.dtype), theta[..., None, None],
+                                  k[..., :, None], gradient[..., None, :]]])
             momentum = eta[..., None, None] * pair[1] - write
             memory = (1.0 - alpha)[..., None, None] * pair[0] + momentum
             # A padded token leaves the pair as it was.
@@ -192,5 +214,5 @@ def titans(query, key, value, weight, bias, theta, alpha, eta, state=None, *, ch
         return jax.lax.scan(token, pair, tokens)
 
     keys, *rest = mini_batches(chunk, k, q, v, theta, alpha, eta, valid=valid)
-    final, out = jax.lax.scan(mini_batch, states, (rest[0], keys, *rest[1:]))
+    final, out = walked_batches(mini_batch, states, (rest[0], keys, *rest[1:]))
     return read_out(out, q, weight, bias, eps, dtype), final

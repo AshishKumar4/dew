@@ -23,7 +23,14 @@ import jax
 import jax.numpy as jnp
 
 from dew.nn.aligned import aligned_sum
-from dew.nn.kernels.titans import absent_zeroed, mini_batches, prepared_operands, read_out, real_gradients
+from dew.nn.kernels.titans import (
+    absent_zeroed,
+    mini_batches,
+    prepared_operands,
+    read_out,
+    real_gradients,
+    walked_batches,
+)
 
 
 def ttt_linear(query, key, value, weight, bias, eta, state=None, *, chunk: int = 16, scale=None,
@@ -61,5 +68,5 @@ def ttt_linear(query, key, value, weight, bias, eta, state=None, *, chunk: int =
         return jax.lax.scan(token, entering, tokens)
 
     keys, *rest = mini_batches(chunk, k, q, v, eta, valid=valid)
-    final, out = jax.lax.scan(mini_batch, states, (rest[0], keys, *rest[1:]))
+    final, out = walked_batches(mini_batch, states, (rest[0], keys, *rest[1:]))
     return read_out(out, q, weight, bias, eps, dtype), final
