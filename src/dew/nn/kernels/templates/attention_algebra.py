@@ -535,20 +535,27 @@ def unfolded(spec: Forward) -> Forward:
 
 def walked[C: (Partial, tuple), O](spec: Forward, walk: Callable[[Forward], C],
                                    finished: Callable[[Forward, C], O]) -> O:
-    """A program's walk and its outputs under the fold's guard: `walk(form)` its walk in `form`, its carry a
-    `Partial` or a tuple whose first element is one, and `finished(form, carry)` its outputs. Folded, a
-    program one of whose rows' maximum passes `FOLD_REACH` walks again in the natural form (`unfolded`), its
-    outputs that form's (its maximum natural, as the fold's are once finished). Ordinary inputs take the one
-    walk, their bits and cost unchanged but for this check. A walk's sums are held at each row's scale in
-    the one walk where they could pass fp32's largest (`SCALED_WALK`), no guard."""
+    """A program's walk and its outputs under the fold's guard: `walk(form)` its walk in `form` (its carry a
+    `Partial` or a tuple led by one), `finished(form, carry)` its outputs, a row's along their leading axis.
+    Folded, a row whose maximum passes `FOLD_REACH` takes the natural form's walk's outputs (`unfolded`),
+    every other row its fold's, as a masked launch's rows (`walked_launches`; MSA's teacher reads them a row
+    at a time, train 1440's review). Ordinary inputs take the one walk, their bits and cost unchanged but
+    for this check. A walk's sums are held at each row's scale where they could pass fp32's largest
+    (`SCALED_WALK`), no guard."""
     carry = walk(spec)
     if not spec.reaches:
         return finished(spec, carry)
     state = carry if isinstance(carry, Partial) else carry[0]
-    reach = reach_of(state.m, unseen=spec.form == "spans")
+    rows = reached(state.m, unseen=spec.form == "spans") >= FOLD_REACH
     natural = unfolded(spec)
-    return jax.lax.cond(reach >= FOLD_REACH, lambda: finished(natural, walk(natural)),
-                        lambda: finished(spec, carry))
+
+    def rewalked():
+        def row_of(folded, rewalk):
+            return jnp.where(rows.reshape(rows.shape + (1,) * (folded.ndim - 1)), rewalk, folded)
+
+        return jax.tree.map(row_of, finished(spec, carry), finished(natural, walk(natural)))
+
+    return jax.lax.cond(jnp.any(rows), rewalked, lambda: finished(spec, carry))
 
 
 def reach_of(maxima: jax.Array, *, unseen: bool) -> jax.Array:
@@ -975,9 +982,7 @@ def logits_of(spec: Forward, s: jax.Array, coords: Coords, params: tuple[jax.Arr
     products, whose extreme the tile's maximum takes exactly (`peak`), so the logits' multiply feeds only
     the weights' subtraction, one FMA (`weights`); None under a hook or a zero factor."""
     factor = spec.factor
-    if spec.score_mod is None and factor != 0:
-        # The infinity the factor takes to -inf (a zero factor takes none, so it masks after scaling).
-        unseen = -jnp.inf if factor > 0 else jnp.inf
+    if spec.score_mod is None and (unseen := unseen_product(factor)) is not None:
         products = _chosen(masked, lambda: _masked(spec, s, coords, unseen), lambda: s)
         return (products if spec.raw else products * factor), products
     if (capped := _built_in_capped(spec.score_mod)) is not None and spec.base2:
@@ -990,6 +995,11 @@ def logits_of(spec: Forward, s: jax.Array, coords: Coords, params: tuple[jax.Arr
     if spec.score_mod is not None:
         logits = hooked(spec.score_mod, logits, coords.q_pos, coords.k_pos, params)
     return _chosen(masked, lambda: _masked(spec, logits, coords, -jnp.inf), lambda: logits), None
+
+
+def unseen_product(factor: float) -> float | None:
+    """The product `factor` takes to -inf, a hidden key's; None for 0, whose logits mask after scaling."""
+    return None if factor == 0 else -jnp.inf if factor > 0 else jnp.inf
 
 
 def _chosen(masked: bool | jax.Array, mask: Callable[[], jax.Array], whole: Callable[[], jax.Array]):

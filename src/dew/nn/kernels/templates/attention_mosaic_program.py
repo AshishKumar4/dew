@@ -1707,13 +1707,28 @@ class _Program[T: (Tiles, BackwardTiles)]:
                 (functools.partial(step, masked=False), start, end),
                 (functools.partial(step, masked=True), end, hi))
 
-    def whole_run(self, k_first, q_steps: int, spans: _Spans | None) -> tuple[jax.Array, jax.Array] | None:
+    def whole_run(self, k_first, q_steps: int, spans: _Spans | None
+                  ) -> tuple[jax.Array | None, jax.Array] | None:
         """The query tiles `[a, b)` that see the key block from `k_first` whole (`readers`' `whole`), one run
-        of them: a causal call's, from its diagonal to its first tile holding padding rows; None for a spans
-        call, whose whole tiles need not run unbroken, and for a full call, whose every tile but a padded
-        edge's is whole (ET-SEGS-h100: the run its own segment, 2% slower a full launch at width 64, 7%
-        faster a causal one at Qwen3-8B's)."""
-        return None if spans is not None or not self.causal else self._whole_run(k_first, q_steps)
+        of them: a causal call's, from its diagonal to its first tile holding padding rows, and a padded full
+        call's, before its first tile holding padding rows, none where the block holds padding keys; None
+        for a spans call, whose whole tiles need not run unbroken, and for a full call of whole tiles, every
+        tile whole (ET-SEGS-h100: the run its own segment, 2% slower a full launch at width 64, 7% faster a
+        causal one at Qwen3-8B's). A padded full call's edge tiles take their mask by its run's segments,
+        never chosen at run time: Mosaic GPU's layout inference found no layout for that choice in an RTX
+        5090's (sm120) one-warpgroup fused backward over 333 keys (row 14034); paired holders keep theirs
+        (`attention_mosaic_fused._walked_run`). A full call's whole tiles a prefix of its readers, `(None,
+        end)` (`segmented`'s two segments, its masked body traced once; `end` 0 where the block holds padding
+        keys)."""
+        if spans is not None or not (self.causal or self.padded_edges):
+            return None
+        start, end = self._whole_run(k_first, q_steps)
+        return (start, end) if self.causal else (None, end)
+
+    @property
+    def padded_edges(self) -> bool:
+        """Whether the call's last key or query tile holds padding (its keys or queries no whole tiles')."""
+        return self.keys % self.tiles.block_k != 0 or self.queries is not None
 
     def forward_whole_run(self, first, spans: _Spans | None) -> tuple[jax.Array | None, jax.Array] | None:
         """The key tiles `[0, whole_end)` a causal inference forward/dQ query block from `first` sees whole
@@ -1729,13 +1744,17 @@ class _Program[T: (Tiles, BackwardTiles)]:
         return first_reader(k_first, self.tiles.block_q, q_steps, self.keys, self.causal)
 
     def _whole_run(self, k_first, q_steps: int) -> tuple[jax.Array, jax.Array]:
-        """`whole_run`'s of a full or causal call: from past the block's diagonal (none if the block holds
-        padding keys) to the first query tile holding padding rows, which sees no block whole (`reach`)."""
+        """`whole_run`'s of a full or causal call: from past the block's diagonal (a full call's from 0) to
+        the first query tile holding padding rows, which sees no block whole (`reach`); none if the block
+        holds padding keys (`[q_steps, q_steps)` causal, `[0, 0)` full)."""
         block_q, block_k = self.tiles.block_q, self.tiles.block_k
-        lo = self._first_reader(k_first, q_steps)
-        start = jnp.minimum(pl.cdiv(k_first + block_k - 1, block_q), q_steps) if self.causal else lo
-        start = jnp.where(k_first + block_k > self.keys, q_steps, jnp.maximum(start, lo))
         end = jnp.int32(q_steps if self.queries is None else min(self.queries // block_q, q_steps))
+        padded = k_first + block_k > self.keys
+        if not self.causal:
+            return jnp.int32(0), jnp.where(padded, 0, end)
+        lo = self._first_reader(k_first, q_steps)
+        start = jnp.minimum(pl.cdiv(k_first + block_k - 1, block_q), q_steps)
+        start = jnp.where(padded, q_steps, jnp.maximum(start, lo))
         return start, jnp.maximum(end, start)
 
 

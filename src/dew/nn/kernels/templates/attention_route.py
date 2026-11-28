@@ -16,10 +16,11 @@ before it (`templates/attention.py`'s `gradients`). """
 import dataclasses
 import functools
 from collections.abc import Callable
-from typing import Literal, overload
+from typing import TYPE_CHECKING, Literal, overload
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from jax.custom_derivatives import zero_from_primal
 
 from dew.nn.derivatives import KernelGlue, contracted, with_gradients_formed
@@ -28,6 +29,7 @@ from dew.nn.kernels.templates.attention import (
     ACCURATE,
     BLOCK,
     NATURAL,
+    REFERENCE_PRECISION,
     Gradients,
     Hooks,
     Kept,
@@ -42,7 +44,10 @@ from dew.nn.kernels.templates.attention import (
     walked_initial,
 )
 from dew.nn.kernels.templates.hooks import Hook, Side
-from dew.nn.precision import configured_precision
+from dew.nn.precision import configured_precision, float32_einsum, two_product
+
+if TYPE_CHECKING:
+    from dew.nn.kernels.templates import attention_algebra as algebra
 
 
 def _plain():
@@ -97,6 +102,76 @@ def attend(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, 
                      None if operand_dtype is None else jnp.dtype(operand_dtype).name, in_key,
                      jax.config.jax_default_matmul_precision)
     return _attend(config, query, key, value, spans, hooks)
+
+
+def walked_logits(spec: "algebra.Forward", products: jax.Array, seen: jax.Array) -> jax.Array:
+    """The natural-unit logits `[..., K]` a walk of `spec` weighs each row's keys by, from their products
+    `[..., K]` (fp32, its prescaled query's, `algebra.Forward.prescale`) where `seen`, -inf elsewhere:
+    their softmax the walk's weights up to its exponentials' rounding. The raw form's differences of the
+    products scaled after (`algebra.Forward.raw`); the fold's exponents as its walk forms them, each
+    product times the factor less the row's largest folded logit in one multiply-add (`exp2(s f - m)`, its
+    product kept whole, `two_product`), then taken to natural units, so no logit rounds at its magnitude
+    (logits rounded there first read a gap of `2^-9` as one ulp of `2^15`, `2^-8`, where the walk's
+    multiply-add keeps it; train 1440's review); a row whose folded maximum reaches past
+    `algebra.FOLD_REACH` the natural rewalk's scaled logits (`algebra.reached`), a row at a time as a
+    portable program and a masked launch rewalk theirs (`algebra.walked`, `walked_launches`' `in_place`;
+    a whole launch walks every row again once one reaches, a row below the reach then natural where its
+    teacher folds, which differ by the fold's rounding alone, under `2^-8` in an exponent by `FOLD_REACH`'s
+    own bound: in contract, Main's ruling of 2026-11-28, row 14087); a natural form's scaled logits.
+    What a computation reading the weights the template gives reads (MSA's teacher,
+    `block_sparse.msa_scores`), the template's policy stated once (train 1440's review)."""
+    from dew.nn.kernels.templates import attention_algebra as algebra
+
+    if spec.raw:
+        # The raw form's scale is positive (`algebra.RAW_SCALES`): a hidden key's product -inf.
+        masked = jnp.where(seen, products, -jnp.inf)
+        largest = jax.lax.stop_gradient(jnp.max(masked, axis=-1, keepdims=True))
+        return (masked - jnp.where(jnp.isfinite(largest), largest, 0)) * np.float32(spec.scale)
+    # The walk's visibility, sign and zero-scale policy (`algebra.masked_logits`).
+    logits = _masked_logits(products, seen, spec.factor)
+    if spec.base2:
+        largest = jax.lax.stop_gradient(jnp.max(logits, axis=-1, keepdims=True))
+        # Split by its bits (`bit_split`), whose split overflows no finite product (a multiplier's split took
+        # `-2^124` to `-inf - -inf`, NaN in the loss's row, train 1440's re-review); a product past fp32
+        # its own infinity, no residual taken of it.
+        high, low = two_product(jnp.where(seen, products, 0), np.float32(spec.factor), bit_split=True)
+        shift = jnp.where(jnp.isfinite(largest), largest, 0)
+        exponents = jnp.where(jnp.isfinite(high), (high - shift) + low, high - shift)
+        natural = jnp.where(seen, exponents * np.float32(np.log(2.0)), -jnp.inf)
+    else:
+        natural = logits
+    if not spec.reaches:
+        return natural
+    rewalked = algebra.reached(jnp.max(logits, axis=-1, keepdims=True), unseen=True) >= algebra.FOLD_REACH
+    return jnp.where(rewalked, _masked_logits(products, seen, algebra.unfolded(spec).factor), natural)
+
+
+def _masked_logits(products: jax.Array, seen: jax.Array, factor: float) -> jax.Array:
+    """`products` times `factor` where `seen`, -inf elsewhere, as a walk's logits take them: the mask on the
+    products, at the infinity the factor takes to -inf, or after the scale under a zero factor
+    (`algebra.unseen_product`; NaN at a scale of 0, +inf at a negative one, train 1455's review)."""
+    from dew.nn.kernels.templates import attention_algebra as algebra
+
+    unseen = algebra.unseen_product(factor)
+    if unseen is None:
+        return jnp.where(seen, products * np.float32(factor), -jnp.inf)
+    return jnp.where(seen, products, unseen) * np.float32(factor)
+
+
+def softmax_logits(query: jax.Array, key: jax.Array, seen: jax.Array, subscripts: str, *,
+                   scale: float | None = None, natural: bool | None = None) -> jax.Array:
+    """The natural-unit logits a template call of `query` and `key` weighs each row's keys by, where `seen`,
+    in the run's form (`run_forms`): its query prescaled as every mainloop takes it (`prescaled`), its
+    products over `subscripts` in fp32, then the walk's policy (`walked_logits`): their
+    softmax the call's weights (MSA's teacher on the template's route, `block_sparse.msa_scores`)."""
+    from dew.nn.kernels.templates import attention_algebra as algebra
+
+    taken, left, power = prescaled(query, scale)
+    products = float32_einsum(subscripts, taken, key, precision=REFERENCE_PRECISION,
+                              preferred_element_type=jnp.promote_types(query.dtype, jnp.float32))
+    spec = algebra.Forward("spans", key.shape[-2], ids=False, scale=left, natural=run_forms(natural)[0],
+                           prescale=power)
+    return walked_logits(spec, products, seen)
 
 
 def run_forms(natural: bool | None = None, accurate: bool | None = None) -> tuple[bool, bool]:

@@ -2165,3 +2165,30 @@ def test_a_g4s_full_training_step_lowers_with_no_value_of_another_trace(without_
     with generation.assumed("sm120"), jax.sharding.use_abstract_mesh(mesh):
         jax.jit(step).trace(query, key, key).lower(lowering_platforms=("cuda",))
 
+
+@lowers("sm120")
+@pytest.mark.parametrize("call", ["full", "causal"])
+def test_a_g4s_fused_backward_over_padded_tiles_lowers(call, without_deterministic_ops):
+    """A G4's (sm120) training step over 333 queries and keys (12 heads 64 wide, bf16), its backward the fused
+    one-warpgroup launch (`BackwardTiles` pinned, 64 x 64 on mma.sync's fed rings): a full call's padded
+    edge tiles take their mask by its walk's segments (`_Program.whole_run`), as a causal call's do, where
+    their mask chosen at run time left Mosaic GPU's layout inference no layout ("Failed to infer a possible
+    set of layouts", row 14034: simple-mmdit-b's step on one device)."""
+    shape = jax.ShapeDtypeStruct((1, 333, 12, 64), jnp.bfloat16)
+    tiles = attention_mosaic.BackwardTiles(block_q=64, block_k=64, stages=3, consumers=1, fused=True,
+                                           family="mma.sync.fed", columns=1)
+
+    def step(q, k, v):
+        def loss(q, k, v):
+            out = scaled_dot_product_attention(q, k, v, causal=call == "causal", implementation="template")
+            return jnp.sum(out.astype(jnp.float32))
+        return jax.grad(loss, argnums=(0, 1, 2))(q, k, v)
+
+    mesh = generation.gpu_mesh(Mesh(np.array(jax.devices()[:1]), ("data",)), "sm120")
+    with (generation.assumed("sm120"), jax.sharding.use_abstract_mesh(mesh),
+          tuning.pinned({attention_mosaic.MosaicBackward: tiles}), tuning.seen() as found):
+        jax.jit(step).trace(shape, shape, shape).lower(lowering_platforms=("cuda",))
+    # The fused launch the pin names traced, the one-warpgroup walk row 14034's step took.
+    taken = [entry.config for entry in found if isinstance(entry.op, attention_mosaic.MosaicBackward)]
+    assert taken == [tiles], taken
+

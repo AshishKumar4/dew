@@ -76,27 +76,45 @@ def test_a_heads_sinks_hold_every_order(edge):
                           f"a head's sinks {edge}", plain_fn=plain)
 
 
-@pytest.mark.parametrize(("implementation", "edge"), list(itertools.product(("template", "tpu"), EDGES)))
-def test_a_fused_attention_kernel_holds_every_order(implementation, edge):
+def fused_kernel_cases() -> list:
+    """`test_a_fused_attention_kernel_holds_every_order`'s cases: splash's every order in one case an edge,
+    the template's an order set a case (`ORDER_SETS`): its every order in one case compiled each order's four
+    arms side by side, their portable walks' second orders at once, 93 to 197 s a case and its task's
+    resident peak past armada's 10 GiB (main's tests/test_durations.json at a6ee2ec53, 7.2 to 9.2 GB)."""
+    whole = [pytest.param("tpu", edge, None, id=f"tpu-{edge}") for edge in EDGES]
+    return whole + [pytest.param("template", edge, taken, id=f"template-{edge}-{taken}")
+                    for edge, taken in itertools.product(EDGES, ORDER_SETS)]
+
+
+@pytest.mark.parametrize(("implementation", "edge", "taken"), fused_kernel_cases())
+def test_a_fused_attention_kernel_holds_every_order(implementation, edge, taken):
     """The template's route (`attention_route._attend`) and splash (`splash._attention`, interpreted off a
     TPU), each differentiated at every order (`generation.linear_tangent`, row 2654): every order runs
     (forward mode, reverse mode, higher orders, remat, nested jit, scanned), finite wherever float64 is a
     normal float32 and the plain attention formula is, at queries, keys and values whose products near
-    float32's ends."""
+    float32's ends; the template's over an order set a case (`fused_kernel_cases`), its normal draws' check 1
+    over the fewest seeds (its mesh's program against the same order off it, one arithmetic placed twice)."""
     def fused(query, key, value):
         return attention.scaled_dot_product_attention(query, key, value, implementation=implementation)
 
     assert_drawn_contract(fused, attention_inputs(2657, (1, 128, 2, 64)), EDGES[edge],
                           f"{implementation} attention {edge}", truth_fn=plain_attention,
-                          plain_fn=plain_attention)
-    if implementation == "template" and edge == "near the largest":
-        # Prescaling Q by scale's power of two before the fp32 dot keeps value-only JVP finite at 2^64.
-        big = jnp.zeros((1, 2, 1, 64), jnp.float32).at[:, :, :, 0].set(jnp.float32(2.0 ** 64))
-        vals = jnp.zeros((1, 2, 1, 64), jnp.float32)
-        dvals = jnp.stack([jnp.ones((1, 1, 64), jnp.float32), jnp.full((1, 1, 64), 3.0, jnp.float32)], axis=1)
-        out, dout = jax.jvp(lambda v_in: fused(big, big, v_in), (vals,), (dvals,))
-        assert jnp.all(jnp.isfinite(out)) and jnp.all(jnp.isfinite(dout))
-        assert bool(jnp.array_equal(dout, jnp.full((1, 2, 1, 64), 2.0, jnp.float32)))
+                          plain_fn=plain_attention, taking=None if taken is None else ORDER_SETS[taken],
+                          seeds=None if taken is None else FEWEST_SEEDS)
+
+
+def test_a_template_calls_value_tangent_is_finite_past_its_raw_products():
+    """The template's route at keys and queries of 2^64 (their raw products 2^128, past fp32's largest),
+    differentiated along its values alone: its query prescaled by its scale's power of two before the fp32
+    products (`template.prescale`), the value and its tangent are finite, the tangent each row's mean of its
+    values' directions."""
+    big = jnp.zeros((1, 2, 1, 64), jnp.float32).at[:, :, :, 0].set(jnp.float32(2.0 ** 64))
+    values = jnp.zeros((1, 2, 1, 64), jnp.float32)
+    along = jnp.stack([jnp.ones((1, 1, 64), jnp.float32), jnp.full((1, 1, 64), 3.0, jnp.float32)], axis=1)
+    out, tangent = jax.jvp(lambda value: attention.scaled_dot_product_attention(
+        big, big, value, implementation="template"), (values,), (along,))
+    assert jnp.all(jnp.isfinite(out))
+    assert bool(jnp.array_equal(tangent, jnp.full((1, 2, 1, 64), 2.0, jnp.float32)))
 
 
 @pytest.mark.parametrize("edge", EDGES)
@@ -306,10 +324,15 @@ def test_a_giant_heads_clip_holds_every_order(taken):
     def plain(x):
         return x * jnp.minimum(8.0 / (jnp.sqrt(jnp.sum(jnp.square(x), axis=-1, keepdims=True)) + 1e-6), 1)
 
+    def clip(x):
+        # One function across the edges, so each order's programs compile once and every edge runs them
+        # (`contract_support._mesh_program`, held by function: a lambda an edge traced and compiled anew).
+        return clipped(x, 8.0, 1e-6)
+
     x, direction, cotangent = normal_draw(13137, (4, 8), (4, 8), (4, 8))
     for edge, scale in {**EDGES, "past the bound": 2.0 ** 64}.items():
-        assert_contract(lambda x: clipped(x, 8.0, 1e-6), (x * scale,), (direction * scale,), cotangent,
-                        f"a head's clip {edge}", plain_fn=plain, taking=ORDER_SETS[taken])
+        assert_contract(clip, (x * scale,), (direction * scale,), cotangent, f"a head's clip {edge}",
+                        plain_fn=plain, taking=ORDER_SETS[taken])
 
 
 def plain_parallax(query, second, key, second_key, value):
@@ -340,3 +363,30 @@ def test_parallax_holds_every_order(edge):
 
     assert_drawn_contract(parallax, inputs, EDGES[edge], f"parallax {edge}", truth_fn=plain_parallax,
                           plain_fn=plain_parallax)
+
+
+def plain_scores(query, key):
+    """jax.nn's form written plainly: the queries' products with the keys, then 1/sqrt(D)."""
+    return jnp.einsum("bqd,bkd->bqk", query, key) * query.shape[-1] ** -0.5
+
+
+@pytest.mark.parametrize("edge", EDGES)
+def test_jax_nns_range_safe_form_holds_every_order(edge):
+    """jax.nn's form range-safe as the template takes it (`attention.range_safe`, the reference path's and
+    MSA's teacher's logits: the query's power of two before its products, a declared tangent at the whole
+    scale): every order runs, finite wherever float64 is a normal float32 and the plain formula is, at
+    queries and keys whose products near float32's ends."""
+    from dew.nn.attention import reference_scores
+
+    shape = (1, 8, 16)
+
+    def inputs(seed: int, scale: float) -> tuple:
+        return (normal_draw([13731, seed], shape, shape, scale=scale),
+                normal_draw([13732, seed], shape, shape, scale=scale),
+                normal_draw([13733, seed], (1, 8, 8))[0])
+
+    def scores(query, key):
+        return reference_scores(query, key, "bqd,bkd->bqk", scale_logits=True)
+
+    assert_drawn_contract(scores, inputs, EDGES[edge], f"jax.nn's range-safe form {edge}",
+                          truth_fn=plain_scores, plain_fn=plain_scores)

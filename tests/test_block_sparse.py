@@ -25,6 +25,7 @@ from dew.batch import coordinates
 from dew.nn import block_sparse, sparse_selection
 from dew.nn.attention import scaled_dot_product_attention
 from dew.nn.inspection import INDEXER_COLLECTION
+from dew.nn.kernels import generation
 from dew.nn.kernels.generation import run_precision
 from dew.nn.mla import SELECTIONS, indexer_target
 from dew.nn.precision import ACCURATE
@@ -526,21 +527,22 @@ def test_infllm_v2s_selection_spends_no_pick_on_a_block_of_hidden_keys():
     assert int(picks[0, 0, -1, 0]) in (2, 3)
 
 
-@pytest.mark.parametrize(("dtype", "precision", "numerics", "keys", "scaled"), [
-    (jnp.bfloat16, "BF16_BF16_F32", None, (0.0, 1.0), float(
-        np.asarray(1.0, jnp.bfloat16) / np.asarray(np.sqrt(2.0), jnp.bfloat16))),
-    (jnp.float32, "highest", "BF16_BF16_F32", (4096.0, 4097.0), float(np.float32(2.0 ** -0.5))),
-    (jnp.float32, "BF16_BF16_F32", "accurate", (4096.0, 4097.0), float(np.float32(2.0 ** -0.5))),
+@pytest.mark.parametrize(("dtype", "precision", "numerics", "keys"), [
+    (jnp.bfloat16, "BF16_BF16_F32", None, (141.0, 142.0)),
+    (jnp.float32, "highest", "BF16_BF16_F32", (4096.0, 4097.0)),
+    (jnp.float32, "BF16_BF16_F32", "accurate", (4096.0, 4097.0)),
 ], ids=["bf16-preset", "layer-highest-under-ambient-bf16", "accurate-run-over-a-layers-bf16-preset"])
-def test_an_msa_layers_teacher_is_the_softmax_its_attention_forms(dtype, precision, numerics, keys, scaled):
-    """An MSA layer's sown indexer loss (`BlockSparseSelfAttention._msa`, `INDEXER_COLLECTION` open) over a
-    query `[1, 0]` and two keys at width 2, blocks of one key, both selected: the float64 KL from its index
-    branch's softmax (its sown scores) to the softmax of the logits its attention forms, written out here
-    (the query scaled by 1/sqrt(2) first in its dtype, its fp32 product with each key): at a bf16 preset the
-    scaled query bf16's 1/sqrt(2), 0.70703125; at a layer's `highest` under an ambient bf16 preset (row
-    13706), and under the run's accurate numerics over a layer's bf16 preset, fp32's, so keys of 4096 and
-    4097 stay a logit apart (train 1359's F1). A dropped handoff of the layer's precision or order to its
-    teacher moves its KL."""
+def test_an_msa_layers_teacher_is_the_softmax_its_attention_forms(dtype, precision, numerics, keys):
+    """An MSA layer (`BlockSparseSelfAttention._msa`, `INDEXER_COLLECTION` open) over a query `[1, 0]` and
+    two keys at width 2, blocks of one key, both selected: its attention's weights, its own output over
+    one-hot values, are the softmax of the logits jax.nn's form makes (`scale_logits`: each logit the fp32
+    product, then 1/sqrt(2) in fp32), written out here, and its sown indexer loss the float64 KL from its
+    index branch's softmax (its sown scores) to them. At a bf16 preset over keys of 141 and 142, logits of
+    99.70 and 100.41 weigh the second key bf16's 0.66796875, where a query scaled first (bf16's 0.70703125)
+    and its logits rounded to bf16 (99.5 and 100.5) weighed it 0.73046875 (train 1368's F1); at a layer's
+    `highest` under an ambient bf16 preset (row 13706), and under the run's accurate numerics over a
+    layer's bf16 preset, fp32's, so keys of 4096 and 4097 stay a logit apart (train 1359's F1). A dropped
+    handoff of the layer's precision or form to its attention or its teacher moves its weights or KL."""
     from types import SimpleNamespace
 
     from dew.nn.mixer_base import MixerContext
@@ -564,19 +566,70 @@ def test_an_msa_layers_teacher_is_the_softmax_its_attention_forms(dtype, precisi
     masking = SimpleNamespace(documents=None, valid=None)
     arguments = (query, key, key, masking, None, hidden)
     params = layer.init(jax.random.key(1), *arguments, method="msa")
-    ambient = (jax.default_matmul_precision(numerics) if numerics not in (None, "accurate")
-               else run_precision(ACCURATE) if numerics == "accurate" else contextlib.nullcontext())
-    with ambient:
+    def ambient():
+        return (jax.default_matmul_precision(numerics) if numerics not in (None, "accurate")
+                else run_precision(ACCURATE) if numerics == "accurate" else contextlib.nullcontext())
+
+    one_hot = jnp.eye(2, dtype=dtype)[None, :, None, :]
+    with ambient():
         _, sown = layer.apply(params, *arguments, method="msa", mutable=[INDEXER_COLLECTION, SELECTIONS])
+        attended, _ = layer.apply(params, query, key, one_hot, masking, None, hidden, method="msa",
+                                  mutable=[INDEXER_COLLECTION, SELECTIONS])
     found = float(np.asarray(jax.tree.leaves(sown[INDEXER_COLLECTION])[0])[0, 1])
     student = np.asarray(next(leaf for path, leaf in jax.tree_util.tree_flatten_with_path(sown[SELECTIONS])[0]
                               if "scores" in jax.tree_util.keystr(path)), np.float64)[0, 0, 1]
     student = np.exp(student - student.max()) / np.exp(student - student.max()).sum()
-    # Each logit the fp32 product its attention sums: the scaled query times the key, rounded once.
-    logits = np.asarray([np.float32(scaled) * np.float32(k) for k in keys], np.float64)
+    # Each logit the fp32 product its attention sums, then the fp32 scale, rounded once each.
+    logits = np.asarray([np.float32(np.float32(k) * np.float32(2.0 ** -0.5)) for k in keys], np.float64)
     teacher = np.exp(logits - logits.max()) / np.exp(logits - logits.max()).sum()
+    weights = np.asarray(attended.astype(jnp.float32), np.float64)[0, 1, 0]
+    if dtype == jnp.bfloat16:
+        # Rounded to bf16 once, as the weights are before their one-hot product.
+        np.testing.assert_array_equal(weights, np.asarray(jnp.asarray(teacher, jnp.bfloat16), np.float64))
+    else:
+        for found_weight, exact in zip(weights, teacher, strict=True):
+            assert_fp32_reduction_bound(found_weight, exact, exact, 8)
     expected = float(np.sum(teacher * (np.log(teacher) - np.log(student))))
     assert_fp32_reduction_bound(found, expected, float(np.sum(np.abs(teacher * np.log(student)))) + 1.0, 8)
+
+
+@pytest.mark.parametrize(("device", "wide"), [(None, False), ("sm90", True)], ids=["host", "h100-widened"])
+def test_an_msa_layers_attention_keeps_a_scaled_logit_whose_raw_product_overflows(device, wide):
+    """An MSA layer (`BlockSparseSelfAttention._msa`) at width 16, blocks of one key, both selected: a
+    first query of 2^127 against its one visible key of -4 has the finite logit -2^127, whose raw product
+    passes fp32's largest; its attention, on its range-safe route (`sparse_selection.selected_route`, never
+    jax.nn's own), reads that key's value whole, and its sown indexer loss is finite (train 1373's F2); on
+    an H100 with its logits widened (`wide_logits`), which the template does not take, the reference path,
+    where naming the template raised."""
+    from types import SimpleNamespace
+
+    from dew.nn.mixer_base import MixerContext
+
+    width = 16
+    context = MixerContext(emb_features=4, num_heads=1, num_kv_heads=1, head_dim=width, max_seq_len=2,
+                           qk_norm=False, dtype=jnp.float32, precision=None, wide_logits=wide)
+    built = mixers.build("block_sparse_attention", selection="msa", block=1, top_k=2, index_width=4).build(
+        context)
+
+    class Called(built.func):
+        """The layer's `_msa` as its own call, the index branch its submodule."""
+
+        @nn.compact
+        def msa(self, *arguments):
+            return self._msa(*arguments)
+
+    layer = Called(*built.args, **built.keywords)
+    assumed = generation.assumed(device) if device else contextlib.nullcontext()
+    query = jnp.zeros((1, 2, 1, width), jnp.float32).at[0, 0, 0, 0].set(2.0 ** 127)
+    key = jnp.zeros((1, 2, 1, width), jnp.float32).at[0, 0, 0, 0].set(-4.0)
+    value = jnp.asarray([[[[3.0] * width], [[5.0] * width]]], jnp.float32)
+    hidden = jax.random.normal(jax.random.key(0), (1, 2, 4), jnp.float32)
+    arguments = (query, key, value, SimpleNamespace(documents=None, valid=None), None, hidden)
+    with assumed:
+        params = layer.init(jax.random.key(1), *arguments, method="msa")
+        out, sown = layer.apply(params, *arguments, method="msa", mutable=[INDEXER_COLLECTION, SELECTIONS])
+    np.testing.assert_array_equal(np.asarray(out)[0, 0, 0], 3.0)
+    assert np.isfinite(np.asarray(jax.tree.leaves(sown[INDEXER_COLLECTION])[0])).all()
 
 
 def test_the_indexer_teacher_gives_a_hidden_key_no_share_of_a_heads_mass():
@@ -914,3 +967,215 @@ def test_a_cached_generation_selects_the_blocks_its_full_forward_selects():
     seven tokens, four blocks."""
     model = tiny(mixer=mixers.build("block_sparse_attention", block=2, top_k=2), dtype="float32")
     assert_generation_scores_as_full_forwards(model, "block-selected decoding", seeds=DECODED_SEEDS)
+
+
+def test_msas_template_teacher_reads_no_hidden_key():
+    """MSA's teacher on the template's route (`block_sparse.msa_scores`) at width 16 in fp32, its first
+    query against keys of raw products 0 and 1 and a hidden future key of `2^26`, or of NaN: its visible
+    logits, and the sown KL over the visible keys (`msa_query_kls`), those of a hidden key of 0, its anchor
+    the largest product over the keys the row weighs, as the template masks before it anchors (where the
+    hidden `2^26` rounded the visible gap away and a NaN poisoned the row, train 1368's review)."""
+    from dew.nn import block_sparse
+
+    width = 16
+    query = jnp.zeros((1, 3, 1, width), jnp.float32).at[..., 0].set(1.0)
+    selected = jnp.zeros((1, 1, 3, 1), jnp.int32)
+    index_scores = jnp.zeros((1, 1, 3, 3), jnp.float32)
+    teacher = block_sparse.msa_scores(jnp.float32, None, route="template")
+    allowed = jnp.asarray([[[True, True, False]]])
+
+    def keyed(hidden):
+        return jnp.zeros((1, 3, 1, width), jnp.float32).at[0, :, 0, 0].set(jnp.asarray([0.0, 1.0, hidden]))
+
+    def run(hidden):
+        key = keyed(hidden)
+        logits = teacher(query[:, :1, 0], key[:, :, 0], allowed)[0, 0, :2]
+        kls = block_sparse.msa_query_kls(index_scores, query, key, selected, block=4, scale=width ** -0.5,
+                                         teacher=teacher)
+        # The first two queries', to which the third key is a future one (causal).
+        return np.asarray(logits), np.asarray(kls)[:, :2]
+
+    plain = run(0.0)
+    for hidden in (2.0 ** 26, np.nan):
+        for found, expected in zip(run(hidden), plain, strict=True):
+            np.testing.assert_array_equal(found, expected)
+
+
+def test_msas_teacher_keeps_its_logits_fp32_sums():
+    """MSA's teacher (`block_sparse.msa_scores`) at width 64 in bf16 on a CPU: a query `(256, 8)` against
+    keys `(128, 0)` and `(128, 1)` at the scale 1/8 has the logits 4096 and 4097, its products' fp32 sums
+    scaled after (jax.nn's form, its attention route's), where its bf16 dot rounded both to 4096 before the
+    indexer's fp32 cast and a uniform student's indexer gradient read 0 (audit 2026-11-27, row 13992)."""
+    from dew.nn import block_sparse
+
+    width = 64
+    query = jnp.zeros((1, 1, width), jnp.bfloat16).at[0, 0, 0].set(256.0).at[0, 0, 1].set(8.0)
+    key = jnp.zeros((1, 2, width), jnp.bfloat16).at[0, :, 0].set(128.0).at[0, 1, 1].set(1.0)
+    logits = block_sparse.msa_scores(jnp.bfloat16, None)(query, key, jnp.ones((1, 1, 2), bool))
+    assert logits.dtype == jnp.float32
+    np.testing.assert_array_equal(np.asarray(logits)[0, 0], [4096.0, 4097.0])
+
+
+@pytest.mark.parametrize("natural", [False, True], ids=["fast", "accurate"])
+def test_msas_template_teacher_weighs_as_its_attention_does(natural):
+    """MSA's teacher on the template's route (`block_sparse.msa_scores`, the template's own policy,
+    `attention_route.softmax_logits`) at width 128 in fp32: a unit query against keys `2^26` and `2^26 + 8`:
+    in the fast form its fold past its reach walking again over rounded scaled logits, their gap 0.5, and
+    in the accurate one the raw difference scaled, `8 / sqrt(128)`, each exactly; and the template
+    attention's own weights, read as one-hot values (`attention_route.attend`), on that form's side of the
+    two gaps' weights, where the teacher's own accurate restatement read the accurate gap on the fast route
+    (train 1440's review)."""
+    from dew.nn.kernels.templates import attention as template, attention_route
+
+    width = 128
+    query = jnp.zeros((1, 1, 1, width), jnp.float32).at[0, 0, 0, 0].set(1.0)
+    key = jnp.zeros((1, 2, 1, width), jnp.float32).at[0, :, 0, 0].set(jnp.asarray([2.0 ** 26, 2.0 ** 26 + 8]))
+    value = jnp.eye(2, dtype=jnp.float32)[None, :, None, :]
+    weights = np.asarray(attention_route.attend(query, key, value, template.spans(1, 2, 1), natural=natural,
+                                                accurate=natural))[0, 0, 0]
+    seen = jnp.ones((1, 1, 2), bool)
+    logits = np.asarray(attention_route.softmax_logits(query[:, :, 0], key[:, :, 0], seen, "bsd,btd->bst",
+                                                       natural=natural))[0, 0]
+    _, left, power = template.prescaled(query, None)
+    accurate = np.float32(np.float32(8 * power) * np.float32(left))
+    np.testing.assert_array_equal(logits[1] - logits[0], accurate if natural else np.float32(0.5))
+    # The weight of the second key under the two gaps, apart: the attention's on its own form's side.
+    between = (1 / (1 + np.exp(-0.5)) + 1 / (1 + np.exp(-8 * width ** -0.5))) / 2
+    assert (weights[1] > between) if natural else (weights[1] < between)
+
+
+def test_msas_template_teacher_weighs_each_row_as_its_attention_does():
+    """Two fp32 queries of one tile, `4 e0` and `e0` at width 16, over keys `(2^17 - 2^-7) e0` and `2^17 e0`:
+    the first's folded maximum passes `FOLD_REACH`, so its row walks again natural (a row at a time,
+    `algebra.walked`), its teacher's gap the natural `2^-7`; the second's does not, its teacher's
+    exponents the fold's multiply-add, which keeps its gap of `2^-9` (`attention_route.walked_logits`);
+    the template attention's second row on its teacher's side of the weights of a gap rounded at its
+    logits' magnitude, one ulp of `2^15` (`2^-8 ln 2` natural), which its teacher read (train 1440's
+    review)."""
+    from dew.nn.kernels.templates import attention as template, attention_route
+
+    width = 16
+    query = jnp.zeros((1, 2, 1, width), jnp.float32).at[0, :, 0, 0].set(jnp.asarray([4.0, 1.0]))
+    key = jnp.zeros((1, 2, 1, width), jnp.float32).at[0, :, 0, 0].set(
+        jnp.asarray([2.0 ** 17 - 2.0 ** -7, 2.0 ** 17]))
+    value = jnp.eye(2, dtype=jnp.float32)[None, :, None, :]
+    weights = np.asarray(attention_route.attend(query, key, value, template.spans(2, 2, 1)))[0, :, 0]
+    seen = jnp.ones((1, 2, 2), bool)
+    logits = np.asarray(attention_route.softmax_logits(query[:, :, 0], key[:, :, 0], seen, "bsd,btd->bst"))[0]
+    gaps = logits[:, 1] - logits[:, 0]
+    natural = 2.0 ** -9
+    rounded = 2.0 ** -8 * np.log(2.0)
+    assert gaps[0] == 2.0 ** -7 and gaps[1] < (natural + rounded) / 2
+
+    def second(gap):
+        return 1 / (1 + np.exp(-np.float64(gap)))
+
+    between = (second(gaps[1]) + second(rounded)) / 2
+    assert weights[1, 1] < between
+
+
+def test_msas_teacher_reads_a_large_negative_products_weight_as_zero():
+    """A width-16 query `e0` over two keys, `-2^126 e0` and 0: its prescaled products `[-2^124, 0]`, the
+    folded peak 0, no rewalk; the teacher's softmax `[0, 1]` and every logit finite or -inf
+    (`attention_route.walked_logits`'s products split by their bits), where a multiplier's split took the
+    large product to `-inf - -inf` and the row's loss to NaN (train 1440's re-review)."""
+    from dew.nn.kernels.templates import attention_route
+
+    query = jnp.zeros((1, 1, 16), jnp.float32).at[0, 0, 0].set(1.0)
+    key = jnp.zeros((1, 2, 16), jnp.float32).at[0, 0, 0].set(-(2.0 ** 126))
+    logits = attention_route.softmax_logits(query, key, jnp.ones((1, 1, 2), bool), "bsd,btd->bst")
+    assert not np.isnan(np.asarray(logits)).any(), logits
+    np.testing.assert_array_equal(np.asarray(jax.nn.softmax(logits, axis=-1))[0, 0], [0.0, 1.0])
+
+
+def test_an_msa_draw_reports_no_route():
+    """MSA's route decided ahead of its dispatch (`sparse_selection.indexed_route`) and run as it is
+    (`indexed_attention`): reported where the call runs, and within a model's draw of its variables
+    (`generation.drawing`) nowhere, a draw's dispatch none of the run's (`generation.published`), where the
+    given route was reported past the selector's draw guard (train 1440's review)."""
+    from dew.nn.sparse_selection import indexed_attention, indexed_route
+
+    prepared, operands = _msa_call()
+
+    def run(query, key, value, selected):
+        call = prepared(query, key, value, selected)
+        return indexed_attention(call, route=indexed_route(call))
+
+    with generation.routes() as applied:
+        jax.make_jaxpr(run)(*operands)
+    with generation.drawing(), generation.routes() as drawn:
+        jax.make_jaxpr(run)(*operands)
+    assert [each.choice for each in applied] == ["attention"]
+    assert not drawn, drawn
+
+
+def _msa_call(length: int = 256, dtype=jnp.bfloat16):
+    """An MSA indexed call (`sparse_selection.indexed_call`) of `length` places, its query two heads over a
+    key head, range-safe in jax.nn's form as `_msa` makes it (`ShapeDtypeStruct`s traced)."""
+    from dew.nn.sparse_selection import block_runs, indexed_call
+
+    def prepared(query, key, value, selected, **options):
+        return indexed_call(query, key, value, selected, block_runs(length, 128), scale_logits=True,
+                            range_safe=True, **options)
+
+    query = jax.ShapeDtypeStruct((1, length, 2, 64), dtype)
+    key = jax.ShapeDtypeStruct((1, length, 1, 64), dtype)
+    selected = jax.ShapeDtypeStruct((1, 1, length, 2), jnp.int32)
+    return prepared, (query, key, key, selected)
+
+
+@pytest.mark.parametrize("case", ["a CPU", "a TPU", "a chosen template on a CPU", "an H100's sequence shards",
+                                  "an H100's wide logits"])
+def test_msas_decided_route_is_the_one_its_dispatch_runs_and_reports(case):
+    """MSA's route (`sparse_selection.indexed_route`, decided where its dispatch decides it,
+    `attention.dispatched_route`) is the one its call runs and reports, once and whole
+    (`indexed_attention`'s `route`): on a CPU the reference path (jax.nn's xla attention handing a range-safe
+    call on, `AttentionCase.range_safe`); on a TPU the template (where a GPU-only table took the reference
+    path, train 1440's review); under `generation.chosen(attention='template')` the template; over two
+    sequence shards on an H100 the template the exchange's instances take; and an H100 call of widened
+    logits the reference path, its refusal of the template kept and nothing forced, where a route named to
+    the dispatch re-reported it as forced (train 1430's review)."""
+    from jax.sharding import AbstractMesh, AxisType
+
+    from dew.mesh import DATA_AXIS, SEQUENCE_AXIS
+    from dew.nn.kernels import generation
+    from dew.nn.sparse_selection import indexed_attention, indexed_route
+
+    prepared, operands = _msa_call()
+    wide = case == "an H100's wide logits"
+    decided = []
+
+    def run(query, key, value, selected):
+        call = prepared(query, key, value, selected, wide_logits=wide)
+        decided.append(indexed_route(call))
+        return indexed_attention(call, route=decided[-1])
+
+    shards = 2 if case == "an H100's sequence shards" else 1
+    mesh = AbstractMesh((1, shards), (DATA_AXIS, SEQUENCE_AXIS), axis_types=(AxisType.Auto,) * 2)
+    context = {"a CPU": contextlib.nullcontext, "a TPU": lambda: generation.assumed("v5e"),
+               "a chosen template on a CPU": lambda: generation.chosen(attention="template")}.get(
+        case, lambda: generation.assumed("sm90"))
+    with context(), jax.sharding.use_abstract_mesh(mesh), generation.routes() as found:
+        jax.make_jaxpr(run)(*operands)
+    published = [each for each in found if each.choice == "attention"]
+    assert len(decided) == 1 and published == decided
+    expected = "reference" if case in ("a CPU", "an H100's wide logits") else "template"
+    assert decided[0].kernel == expected
+    if wide:
+        assert (decided[0].preferred, decided[0].forced) == ("template", None)
+        assert decided[0].refusal is not None
+
+
+@pytest.mark.parametrize(("scale", "expected"), [(0.0, [0.0, -np.inf]), (-1.0, [-4.0, -np.inf])])
+def test_msas_teacher_masks_a_hidden_key_at_any_scale(scale, expected):
+    """The template teacher's logits (`attention_route.softmax_logits`) of a query `e0` over keys `4 e0` and
+    a hidden one at width 16: a hidden key -inf at a scale of 0 and of -1, as the walk masks it
+    (`attention_algebra.unseen_product`), where its -inf product times 0 read NaN and times -1 read +inf
+    (train 1455's review)."""
+    from dew.nn.kernels.templates import attention_route
+
+    query = jnp.zeros((1, 1, 16), jnp.float32).at[0, 0, 0].set(1.0)
+    key = jnp.zeros((1, 2, 16), jnp.float32).at[0, :, 0].set(4.0)
+    seen = jnp.asarray([[[True, False]]])
+    logits = attention_route.softmax_logits(query, key, seen, "bsd,btd->bst", scale=scale)
+    np.testing.assert_array_equal(np.asarray(logits)[0, 0], np.asarray(expected, np.float32))

@@ -165,9 +165,10 @@ def indexer_log_target(query, key, keep, scale: float, *, dtype=None, precision=
     plain sums biased the KL upward, 1.67 times MaxText's error from float64), so a key whose every head
     weighs it below fp32's least normal keeps its mass in its logarithm (a mass of e^-110 rounded to 0
     before its product with a student's gap of 2^126, 1.44e-10, train 1345's F2). It sums in `dtype` where
-    given (at least fp32), its operands' otherwise. Each head's logits are `scores(q, k)` `[B, S, T]` of
-    its query and keys as given, where the attention it trains toward forms its own otherwise than
-    MaxText's (MSA's: `block_sparse.msa_scores`, the reference path's own); else MaxText's, the query
+    given (at least fp32), its operands' otherwise. Each head's logits are `scores(q, k, allowed)`
+    `[B, S, T]` of its query and keys as given (`allowed` the keys each row weighs, `[B, S, T]`, so a
+    teacher anchoring its logits reads none it hides), where the attention it trains toward forms its own
+    otherwise than MaxText's (MSA's: `block_sparse.msa_scores`, the route's own); else MaxText's, the query
     widened and scaled first, at `precision` (the layer's: under an ambient fp16 preset a layer's fp32
     logits 4096 and 4097 became 4096 and 4096 in the teacher, row 13706)."""
     wide = at_least_fp32(jnp.result_type(query, key) if dtype is None else dtype)
@@ -180,7 +181,7 @@ def indexer_log_target(query, key, keep, scale: float, *, dtype=None, precision=
 
     def products(q, k):
         if scores is not None:
-            return scores(q, k).astype(wide)
+            return scores(q, k, allowed).astype(wide)
         return float32_einsum('bsd,btd->bst', q.astype(wide) * scale, k.astype(wide), precision=precision)
 
     def masses(q, k):

@@ -26,10 +26,17 @@ from flax.linen.dtypes import promote_dtype
 from flax.typing import Dtype, PrecisionLike
 from jax.ad_checkpoint import checkpoint_name
 
-from dew.nn.attention import AttentionImpl, reference_scores, scaled_dot_product_attention, score_precision
+from dew.nn.attention import (
+    AttentionImpl,
+    attention_implementation,
+    reference_scores,
+    scaled_dot_product_attention,
+    score_precision,
+)
 from dew.nn.dense import Dense
 from dew.nn.documents import CrossDocuments, DocumentWindows, document_windows
 from dew.nn.inspection import INDEXER_COLLECTION, QK
+from dew.nn.kernels.templates import attention_route
 from dew.nn.kv_cache import cached_validity
 from dew.nn.mixer_base import MixerContext
 from dew.nn.mixers.attention import AttentionMixer, CausalSelfAttention
@@ -40,6 +47,9 @@ from dew.nn.sparse_selection import (
     SELECTING,
     block_maxima,
     block_runs,
+    indexed_attention,
+    indexed_call,
+    indexed_route,
     selected_attention,
     selection_mask,
     top_k_selection,
@@ -302,17 +312,25 @@ def _selected_tokens(selected: jax.Array, keys: int, block: int) -> jax.Array:
     return chosen & (jnp.arange(keys)[None, :] <= jnp.arange(queries)[:, None])
 
 
-def msa_scores(dtype, precision, *, wide_logits: bool = False) -> Callable:
-    """The logits MSA's attention forms of one head's query `[B, S, D]` and keys `[B, T, D]`, as its
-    selected attention's reference path forms them (`attention.reference_scores`: the query scaled first in
-    the call's `dtype`, or widened and scaled after under `wide_logits`, at the precision its logits take,
-    `attention.score_precision`): its teacher's (`msa_query_kls`), so the indexer trains toward the weights
-    the attention gives (a teacher scaling after its product where the attention scaled first saw 0.70710678
-    where the attention saw bf16's 0.70703125, train 1359's F1)."""
-    def scores(query: jax.Array, key: jax.Array) -> jax.Array:
+def msa_scores(dtype, precision, *, wide_logits: bool = False,
+               route: AttentionImpl = 'reference') -> Callable:
+    """The logits MSA's attention forms of one head's query `[B, S, D]` and keys `[B, T, D]` (`_msa`, its
+    selected attention in jax.nn's form, `scale_logits`: each logit the fp32 sum of its product, then the
+    scale) on the `route` its attention takes (`sparse_selection.indexed_route`): its teacher's
+    (`msa_query_kls`), so the indexer trains toward the weights the attention gives (a teacher scaling its
+    query first saw bf16's 0.70703125 where the attention scaled after, 0.70710677, train 1368's F1). On
+    the template's walk, as that walk weighs them, its policy the template's own
+    (`attention_route.softmax_logits`: the fast fold, its rewalk past its reach, or the accurate form's raw
+    differences, over the keys the row weighs, `allowed`; train 1440's review); on any other, as the
+    reference path forms them (`attention.reference_scores`, a logit at a time range-safe), at the call's
+    `dtype`, logit width and `score_precision` of its precision, its fp32 sums (a bf16 teacher's 4096 and
+    4097 kept apart, audit 2026-11-27 P01)."""
+    def scores(query: jax.Array, key: jax.Array, allowed: jax.Array) -> jax.Array:
         query, key = promote_dtype(query, key, dtype=dtype)
-        return reference_scores(query, key, 'bsd,btd->bst', precision=score_precision(precision),
-                                wide_logits=wide_logits)
+        if route != 'template':
+            return reference_scores(query, key, 'bsd,btd->bst', precision=score_precision(precision),
+                                    wide_logits=wide_logits, scale_logits=True)
+        return attention_route.softmax_logits(query, key, allowed, 'bsd,btd->bst')
 
     return scores
 
@@ -665,17 +683,30 @@ class BlockSparseSelfAttention(CausalSelfAttention):
         # Its selection as the gate reads every one (`selection_margins`): each query's blocks by their pooled
         # scores among those it takes by score, at the slots its forced own block leaves.
         sow_selection(self, pooled, None, taken, min(self.top_k, pooled.shape[-1]) - 1)
-        if not self.is_initializing() and self.is_mutable_collection(INDEXER_COLLECTION):
-            # Its indexer's loss per query, as an objective training an indexer reads it
-            # (`IndexerTraining`, `mla.indexer_kl`'s collection).
-            teacher = msa_scores(self.ctx.dtype, self.ctx.precision, wide_logits=self.ctx.wide_logits)
-            self.sow(INDEXER_COLLECTION, "kl", msa_query_kls(
-                scores, query, key, selected, block=self.block, scale=query.shape[-1] ** -0.5,
-                teacher=teacher))
-        return selected_attention(query, key, value, selected, block_runs(key.shape[1], self.block),
-                                  dtype=self.ctx.dtype, precision=self.ctx.precision,
-                                  force_fp32_for_softmax=self.ctx.force_fp32_for_softmax,
-                                  wide_logits=self.ctx.wide_logits, softcap=self.ctx.attn_logit_softcap)
+        # Its indexed call prepared once and its route decided once where its dispatch decides it (the
+        # selector's, at a sequence exchange's instance's geometry, the call range-safe so no route forming
+        # its raw products whole takes it, `AttentionCase.range_safe`), the call run on that decision and
+        # its teacher forming its logits as that route does (`msa_scores`), on any mesh.
+        bounds = block_runs(key.shape[1], self.block)
+        options = {"dtype": self.ctx.dtype, "precision": self.ctx.precision,
+                   "force_fp32_for_softmax": self.ctx.force_fp32_for_softmax,
+                   "wide_logits": self.ctx.wide_logits, "softcap": self.ctx.attn_logit_softcap,
+                   "scale_logits": True, "range_safe": True}
+        prepared = indexed_call(query, key, value, selected, bounds, **options)
+        if self.is_initializing() or not self.is_mutable_collection(INDEXER_COLLECTION):
+            # No teacher reads the route: the call decides it at its dispatch alone, never traced ahead
+            # (train 1461's review).
+            return indexed_attention(prepared)
+        route = indexed_route(prepared)
+        # Its indexer's loss per query, as an objective training an indexer reads it
+        # (`IndexerTraining`, `mla.indexer_kl`'s collection).
+        teacher = msa_scores(self.ctx.dtype, self.ctx.precision, wide_logits=self.ctx.wide_logits,
+                             route=attention_implementation(route.kernel))
+        self.sow(INDEXER_COLLECTION, "kl", msa_query_kls(
+            scores, query, key, selected, block=self.block, scale=query.shape[-1] ** -0.5,
+            teacher=teacher))
+        # jax.nn's form (`scale_logits`), the one every route forms its logits in, on its decided route.
+        return indexed_attention(prepared, route=route)
 
 
 @dataclasses.dataclass(frozen=True)
