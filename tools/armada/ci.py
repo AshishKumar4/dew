@@ -378,8 +378,8 @@ def lane_inputs(python: str) -> str:
     """The hash of what a GPU lane's file shares (`gpu_lane`): what every test file's run shares (`shared`),
     and this file and prepares.py, which set the environment (a user's process's, `VARIANTS`), share and
     deadline each file runs under on a GPU, where a CPU task's are the session's; and, under a tier's word
-    (`tier_wire.GPU_TIER`, its caller's), that its files run their gpu-marked tests alone, so a submitted job's
-    run of every test it names is never a tier's row of the same file, nor a tier's a job's."""
+    (`tier_wire.GPU_TIER`, its caller's), that its files run their gpu-marked tests alone, so a submitted
+    job's run of every test it names is never a tier's row of the same file, nor a tier's a job's."""
     locks = tuple(map(str, Path("locks").glob("*.txt")))
     own = code_of(__file__).hex() + code_of(str(HERE / "prepares.py")).hex()
     if os.environ.get(tier_wire().GPU_TIER) == "1":
