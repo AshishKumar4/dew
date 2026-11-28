@@ -447,19 +447,21 @@ def _gates(hooks, inputs, row, head, layout):
         return plgpu.load(ref, layout=layout, optimized=False).astype(jnp.float32)
 
     one = jnp.float32(1.0)
-    if hooks.gates is not None and hooks.decay == 'vector':
-        # Each key dimension's gate over the head's rate (`recurrence.gated`, its write gate a sigmoid's).
-        given = keyed(inputs['gate'].at[row, head]) + keyed(inputs['bias'].at[head])
-        rate = accurate_exp(headed('log_a'))
-        log_decay = (hooks.gates.bound * logistic_value(rate * given) if hooks.gates.bound is not None
-                     else -rate * softplus_series(given))
-        return accurate_exp(log_decay), logistic_value(scalar('beta'))
     if hooks.gates is not None:
-        rate = softplus_series(scalar('gate') + headed('bias'))
+        # The gates' law (`recurrence.gated`): a head's gate, or each key dimension's over the head's rate.
+        if hooks.decay == 'vector':
+            given = keyed(inputs['gate'].at[row, head]) + keyed(inputs['bias'].at[head])
+        else:
+            given = scalar('gate') + headed('bias')
+        rate = accurate_exp(headed('log_a'))
+        if hooks.gates.bound is not None:
+            bounded = hooks.gates.bound * logistic_value(rate * given)
+            return accurate_exp(bounded), logistic_value(scalar('beta'))
+        step = softplus_series(given)
         if hooks.gates.limit is not None:
-            rate = jnp.clip(rate, *hooks.gates.limit)
-        decay = accurate_exp(-accurate_exp(headed('log_a')) * rate)
-        return decay, rate if hooks.gates.write == 'step' else logistic_value(scalar('beta'))
+            step = jnp.clip(step, *hooks.gates.limit)
+        decay = accurate_exp(-rate * step)
+        return decay, step if hooks.gates.write == 'step' else logistic_value(scalar('beta'))
     if hooks.rated:
         write = scalar('beta')
         return jnp.exp(headed('rate') * write), write

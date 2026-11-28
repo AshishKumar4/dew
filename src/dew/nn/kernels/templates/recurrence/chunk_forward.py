@@ -217,7 +217,7 @@ def kept_forward(q, k, v, g, beta, h0=None, *, tiles: Tiles, starts=None, firsts
                      ranged: bool = False,
                  skip=None, forked: ForkedTable | None = None,
                  reads=None, normed: recurrence.OutputNorm | None = None, gate=None,
-                 weight=None) -> tuple[jax.Array, jax.Array, tuple]:
+                 weight=None) -> tuple:
     """`forward`'s `(o, final)` and what the fast backward takes rather than compute again
     (`mainloop_backward.gradients`' `inverse` and `kept`): each chunk's inverse under a decay a head
     (`_solved`'s, None otherwise or where the call `keeps` none, `forward`'s), as fla's backward keeps its

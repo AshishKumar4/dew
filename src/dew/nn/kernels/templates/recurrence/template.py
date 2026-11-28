@@ -248,14 +248,38 @@ def ranged(dtype, delta: bool, bound: float | None) -> bool:
     return delta and jnp.dtype(dtype) == jnp.float16 and bound is None
 
 
+_KEYED = ("starts", "firsts", "skip", "forked", "reads", "gate", "weight")
+"""`mosaic_rule`'s operands past its first six, as `chunk_forward.kept_forward` takes them by name."""
+
+
+def _named_read(read):
+    """The output a training forward's epilogue read before its norm, the recurrence's own, named as a remat
+    keeps it (`Residual.SCAN`, `Residual.CONTEXT`), as the other routes name theirs (`recurrence_chunk`)."""
+    return checkpoint_name(checkpoint_name(read, Residual.SCAN), Residual.CONTEXT)
+
+
+def _normed_pullback(normed: recurrence.OutputNorm | None, read, gate, weight, out_grad, dtype) -> tuple:
+    """The epilogue's gated norm's gradient at the output it `read` (`mosaic_rule`'s kept residual), `(the
+    output's, the gate's, the weight's)`: the layers' norm's own (`recurrence.output_normed`), the output's
+    the fast backward's cotangent; the cotangent as it came and none of the others without a norm or a
+    cotangent."""
+    if normed is None or out_grad is None:
+        return out_grad, None, None
+
+    def norm(out, gate, weight):
+        return recurrence.output_normed(normed, out, gate, weight, dtype)
+
+    _, pulled = jax.vjp(norm, read, gate, weight)
+    return pulled(out_grad.astype(dtype))
+
+
 def mosaic_rule(query, key, value, g, beta, state=None, *, tiles, starts=None,
                 max_segments: int | None = None, scale: float | None = None, delta: bool = True,
                 wide: bool = False, family=None, bound: float | None = None,
                 firsts=None, rounded: bool = False, apart: int = 0, values_gated: bool = False,
                 unit_pairs: bool = False,
                 decay_bound: float | None = None, skip=None, recomputed: bool = False,
-                forked: chunked_launch.Forked | None = None, reads=None,
-                normed: recurrence.OutputNorm | None = None, gate=None, weight=None):
+                forked: chunked_launch.Forked | None = None, reads=None, normed=None, gate=None, weight=None):
     """The chunked rule, a decay a head (`g` `[B, S, Hv]`) or a key dimension (`[B, S, Hv, Dk]`), with or
     without the `delta` rule, on the recurrence template's Mosaic GPU mainloop (`chunk_forward.forward`): the
     port's operands and results (`recurrence_chunk.fla_rule`'s), the operands in their common dtype and beta
@@ -278,11 +302,8 @@ def mosaic_rule(query, key, value, g, beta, state=None, *, tiles, starts=None,
     document's memory up from the table at its first chunk (`chunk_forward.ForkedTable`): a forked row costs
     its packed row at its documents' bound; the entry write is differentiated by JAX, the table's memories by
     the walks. The delta rule's keys erase along `reads` `[B, T, H, Dk]` where given
-    (`recurrence.Hooks.erase` 'read', `chunk_forward.forward`'s), which take their gradient. Where `normed`
-    (`recurrence.OutputNorm`) is given, the output leaves through its gated norm in the output launch's
-    epilogue, its gate `gate` `[B, T, HV, Dv]` and `weight` `[Dv]` (`chunk_forward.forward`'s); a training
-    forward keeps the output the norm read, whose gradient is the norm's own (`dew.nn.norms
-    .gated_rms_normalized`'s) before the fast backward's."""
+    (`recurrence.Hooks.erase` 'read', `chunk_forward.forward`'s), which take their gradient. A `normed`
+    call's output leaves through its gated norm in the output launch (`_normed_pullback`)."""
 
     dtype = jnp.result_type(query, key, value)
     device, interpret = mainloop.issued(dtype)
@@ -335,27 +356,17 @@ def mosaic_rule(query, key, value, g, beta, state=None, *, tiles, starts=None,
         # recomputes them (`recomputed`). Each is named as the port names its own, so a rung that saves names
         # keeps them rather than replaying the forward's launches for them (`residuals.DELTA_RESIDUALS`).
         out, final, (inverse, kept) = chunk_forward.kept_forward(
-            *operands[:6], starts=operands[6], firsts=operands[7], scale=scale, skip=operands[8],
-            forked=operands[9], reads=operands[10], normed=normed, gate=operands[11], weight=operands[12],
-            **forms, **run)
-        # The output the epilogue's norm read, the scan's own, as a remat names it (`Residual.SCAN`).
+            *operands[:6], scale=scale, normed=normed, **dict(zip(_KEYED, operands[6:])), **forms, **run)
         out, read = out if normed is not None else (out, None)
         kept = None if recomputed else checkpoint_name(kept, Residual.DELTA_MEMORY)
         return (out, final), (operands, (checkpoint_name(inverse, Residual.DELTA_INVERSE), kept,
-                                         None if read is None else checkpoint_name(read, Residual.SCAN)))
+                                         None if read is None else _named_read(read)))
 
     def backward(saved, grads):
         operands, (inverse, kept, read) = saved
         out_grad, final_grad = grads
         query, key, value, g, beta, state, starts, firsts, skip, table, reads, gate, weight = operands
-        gate_grad = weight_grad = None
-        if normed is not None and out_grad is not None:
-            # The norm's own gradient (the layers' norm, `recurrence.output_normed`) at the output it read.
-            def norm(out, gate, weight):
-                return recurrence.output_normed(normed, out, gate, weight, dtype)
-
-            _, pulled = jax.vjp(norm, read, gate, weight)
-            out_grad, gate_grad, weight_grad = pulled(out_grad.astype(dtype))
+        out_grad, *sides = _normed_pullback(normed, read, gate, weight, out_grad, dtype)
         if not fast:
             form = (f"{dtype.name}, {'the delta rule' if delta else 'no delta rule'}, a decay a "
                     f"{'head' if g.ndim == 3 else 'key dimension'}")
@@ -374,8 +385,7 @@ def mosaic_rule(query, key, value, g, beta, state=None, *, tiles, starts=None,
         # The skip's gradient formed in its dtype before the inputs' cotangents leave (row 6027).
         (grads, dh0, tabled_grads), dskip = derivatives.with_gradients_formed(
             (grads, dh0, tabled_grads), None if dskip is None else dskip.astype(skip.dtype))
-        return (*grads, None if state is None else dh0, None, None, dskip, tabled_grads, dreads, gate_grad,
-                weight_grad)
+        return (*grads, None if state is None else dh0, None, None, dskip, tabled_grads, dreads, *sides)
 
     rule = derivatives.contracted("test_the_template_rule_holds_its_orders")(
         derivatives.declared_derivative(derivatives.KernelGlue(), primal, forward, backward))

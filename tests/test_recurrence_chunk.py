@@ -91,25 +91,18 @@ FORMED = [
     recurrence.Hooks(decay='scalar', delta=False, write_gate=True, reads='apart'),
     recurrence.Hooks(decay='vector', delta=False, reads='apart'),
     recurrence.Hooks(decay='scalar', delta=True, reads='apart'),
-    recurrence.Hooks(decay='scalar', gates=recurrence.Gates(), scale=KEY_WIDTH ** -0.5,
-                     output=recurrence.OutputNorm(1e-6, read_in='bfloat16'), write_bound=1.0),
-    recurrence.Hooks(decay='vector', gates=recurrence.Gates(bound=-5.0), scale=KEY_WIDTH ** -0.5,
-                     output=recurrence.OutputNorm(1e-5, 'sigmoid'), write_bound=1.0, decay_bound=-5.0),
-    recurrence.Hooks(decay='vector', gates=recurrence.Gates(), l2norm=True),
 ]
-"""The prologue's and epilogue's hooks: the gated delta rule's gates and l2 norm, Mamba2's step gates clipped
-with the skip, the gated RMS norm after the l2 norm and after a plain scale, Mamba2's SSD as `chunk_ssd` hands
-it over (a rated decay, the step its write gate), with its gated norm, a rated decay under the delta rule and
-the l2 norm, the norm after the skip, a decay without any write gate, and the readout of the memory entering
-its token (`Hooks.reads`): RWKV6's, a decay a key dimension with its own write weighed (`Hooks.own_weight`),
-and the delta rule's; a write gate's own write weighed in a readout after it, its own weight added to the
-query's read of the write, as the decode step adds it; and the readout apart from its token's own write
-('apart', row 7402): Mamba-3's, a decay a head and a write gate, which the template forms, a decay a key
-dimension's, and the delta rule's, its corrected write apart from the read (the state after its decay), which
-the portable math alone does (row 7608: its corrected scan refused an apart read, a crash). The gated delta
-rule's layer's chunked call whole (`GatedDeltaNet._chunk_hooks`: its gates and its gated norm, its output read
-back in bf16 first), and Kimi delta attention's, its decay a key dimension's bounded below and its
-sigmoid-gated norm, and its decay unbounded (the softplus step's)."""
+"""The prologue's and epilogue's hooks: the gated delta rule's gates and l2 norm, Mamba2's step gates
+clipped with the skip, the gated RMS norm after the l2 norm and after a plain scale, Mamba2's SSD as
+`chunk_ssd` hands it over (a rated decay, the step its write gate), with its gated norm, a rated decay
+under the delta rule and the l2 norm, the norm after the skip, a decay without any write gate, and the
+readout of the memory entering its token (`Hooks.reads`): RWKV6's, a decay a key dimension with its own
+write weighed (`Hooks.own_weight`), and the delta rule's; a write gate's own write weighed in a readout
+after it, its own weight added to the query's read of the write, as the decode step adds it; and the
+readout apart from its token's own write ('apart', row 7402): Mamba-3's, a decay a head and a write gate,
+which the template forms, a decay a key dimension's, and the delta rule's, its corrected write apart from the
+read (the state after its decay), which the portable math alone does (row 7608: its corrected scan refused an
+apart read, a crash)."""
 
 PACKED = (False, True)
 
@@ -178,7 +171,7 @@ def chunk_on(kernel: str, hooks, *args, **kwargs):
 SEEDS = dict(zip(((hooks, packed) for hooks in HOOKS + FORMED for packed in PACKED), (
     8, 8, 8, 8, 8, 8, 8, 8, 16, 16, 64, 64, 16, 16, 16, 16, 8, 8, 64, 64, 8, 8, 8, 8, 8, 8,
     64, 64, 128, 128, 16, 8, 16, 16, 64, 64, 32, 32, 32, 32, 8, 8, 16, 16, 16, 16, 16, 16, 32, 16, 8, 8,
-    16, 16, 16, 16, 16, 16, 16, 16),
+    16, 16),
     strict=True))
 """Each site's declared seeds (hooks in `HOOKS` then `FORMED` order, one sequence then packed), sized
 independently by `seeds_for` on armada (2026-10-21; the readouts apart 2026-11-17), on the draw with a
@@ -280,13 +273,9 @@ def draw(hooks: recurrence.Hooks, packed: bool, seed: int, *, length: int = LENG
     state = (0.3 * normal((rows, value_heads, key_width, width)))[:, :, key_order][..., value_order]
     gates = {}
     if hooks.gates is not None:
-        # Pre-activations: the gate and beta raw, `log_a` a head's and `bias` a head's, or each key
-        # dimension's under a decay a key dimension (its gate too).
-        keyed = (key_width,) if vector else ()
-        gate, bias = normal((rows, length, value_heads) + keyed), normal((value_heads,) + keyed)
-        if vector:
-            gate, bias = gate[..., key_order], bias[..., key_order]
-        gates = {'gate': hosted(gate), 'log_a': hosted(0.5 * normal((value_heads,))), 'bias': hosted(bias)}
+        # Pre-activations: the gate and beta raw, `log_a` and `bias` a head's.
+        gates = {'gate': hosted(normal((rows, length, value_heads))),
+                 'log_a': hosted(0.5 * normal((value_heads,))), 'bias': hosted(normal((value_heads,)))}
         beta = written
     if hooks.rated:
         # The step through softplus is the write gate; the rate is `A = -exp(A_log)`, a head's.

@@ -572,8 +572,9 @@ def log_gates(hooks: Hooks, given: dict, work):
     or a write gate the hooks have not."""
     if hooks.gates is not None:
         beta = given['beta'].astype(work) if hooks.gates.write == 'sigmoid' else None
-        log_a = given['log_a'].astype(work)
-        # A head's rate over each of its key dimensions' gates.
+        # The rate exponentiated in its own dtype (at least fp32), as the layers take their `A_log`; a head's
+        # rate over each of its key dimensions' gates.
+        log_a = given['log_a'].astype(at_least_fp32(given['log_a'].dtype))
         log_a = log_a[..., None] if hooks.decay == 'vector' else log_a
         return gated(hooks.gates, given['gate'].astype(work), log_a, given['bias'].astype(work), beta)
     if hooks.rated:

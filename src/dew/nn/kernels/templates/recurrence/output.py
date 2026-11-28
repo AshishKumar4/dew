@@ -8,6 +8,7 @@ import functools
 import jax
 import jax.numpy as jnp
 from jax.experimental import pallas as pl
+from jax.experimental.pallas import mosaic_gpu as plgpu
 
 from dew.nn.kernels import recurrence_algebra as algebra
 from dew.nn.kernels.templates import mosaic, operands, product, resources, swizzling
@@ -214,8 +215,8 @@ def _output_held(call: Call, bv: int, swizzle: int | None = None, *, normed: boo
                         *_normed_phases(chunk, bv, normed)))
 
 
-def _normed_step(normed: Normed, family, out, index, sums, *, steps: int, bv: int, columns, gate_ref,
-                 weight_ref, out_ref, kept_ref, rows, landing):
+def _normed_step(normed: Normed, family, out, index, sums, *, steps: int, bv: int, columns, refs: tuple, rows,
+                 landing):
     """The epilogue's step (`Normed`): the value block's output `out` read back and its squares summed into
     each row's `sums`, held in the rows' own shared tile (`rows`, a head's whole value rows, staged apart from
     every store's landing) and, where the norm's residual is kept, stored as it is read (`kept_ref`); at the
@@ -223,7 +224,9 @@ def _normed_step(normed: Normed, family, out, index, sums, *, steps: int, bv: in
     (`precision.rms_statistics`' arithmetic, its mean the sum times the width's reciprocal) and every block
     of the row through it, the weight and the activated gate, in `precision.rms_weighted`'s order, stored to
     `out_ref`. `columns(c)` is block `c`'s columns of the outputs' `[R, HV * Dv]` rows, the gate's alike.
-    Returns the sums the next step carries."""
+    `refs` are the output's, the gate's, the weight's and the kept residual's (None unless kept,
+    `_output_refs`). Returns the sums the next step carries."""
+    out_ref, gate_ref, weight_ref, kept_ref = refs
     read = out.astype(normed.read)
     wide = read.astype(jnp.float32)
     sums = sums + jnp.sum(wide * wide, axis=1)
@@ -247,6 +250,38 @@ def _normed_step(normed: Normed, family, out, index, sums, *, steps: int, bv: in
     return sums
 
 
+def _columns(span, first: int, bv: int, block):
+    """Value block `block`'s columns of a head's `[R, HV * Dv]` rows from its first column `first`, over the
+    chunk's rows `span`."""
+    return span, pl.ds(first + block * bv, bv)
+
+
+def _output_refs(refs, normed: Normed | None) -> tuple:
+    """The output launch's refs past its write gate's, `(skip's, outputs)`: the skip's (none or one), then
+    the output's and, under an epilogue (`normed`), the gate's, the weight's and the kept residual's (None
+    unless kept), as `output_launch` passes and returns them (`_normed_step`'s `refs`)."""
+    if normed is None:
+        return refs[:-1], (refs[-1],)
+    taken = 3 + normed.kept
+    skip_ref, (gate_ref, weight_ref, out_ref, *kept_ref) = refs[:-taken], refs[-taken:]
+    return skip_ref, (out_ref, gate_ref, weight_ref, kept_ref[0] if kept_ref else None)
+
+
+def _normed_layout(normed: Normed | None, chunk: int, bv: int, value_width: int, staging: tuple,
+                   landing: dict, out_type) -> tuple:
+    """`output_launch`'s staging, landing and output type with its epilogue's (`normed`): the head's whole
+    value rows read back across the steps a staged tile of their own, and where its residual is kept, a
+    second output of the read-back rows, stored through a landing of its own."""
+    if normed is None:
+        return staging, landing, out_type
+    read = jnp.dtype(normed.read)
+    staging = (*staging, swizzling.plain((chunk, value_width), read))
+    if normed.kept:
+        out_type = (out_type, jax.ShapeDtypeStruct(out_type.shape, read))
+        landing = {**landing, "kept": ((chunk, bv), read)}
+    return staging, landing, out_type
+
+
 @building(lambda launch: ("recurrence_output",))
 def output_launch(q, k, h, corrected, prefix: tuple, taken, beta, call: Call, tiles: Tiles, *, scale: float,
                   out_dtype, scores=None, skip=None, normed: Normed | None = None, gate=None, weight=None):
@@ -256,10 +291,8 @@ def output_launch(q, k, h, corrected, prefix: tuple, taken, beta, call: Call, ti
     `chunk_output`), under one a key dimension the intra launch's (`scores`, `_intra`;
     `algebra.key_decayed_output`). Where the write gate takes the keys' side (`Call.gated_keys`) the scores'
     columns take `beta` `[HV, R]` before they are rounded, and a `skip` `[HV]` adds `D v` from the values the
-    step holds (there the corrected ones). Where `normed` (`Normed`) is given, each token's value row of the
-    head leaves through the epilogue's gated norm, its gate `gate` `[R, HV * Dv]` and `weight` `[Dv]` (fp32),
-    a program holding its chunk's whole rows across its steps (`_normed_step`): the output `(normalized,
-    read back)` where the norm's residual is kept (`Normed.kept`), else the normalized output."""
+    step holds (there the corrected ones). A `normed` call's rows leave through its gated norm, its
+    `gate` `[R, HV * Dv]` and `weight` `[Dv]` (`_normed_step`, `_normed_layout`)."""
     chunk = call.chunk
     assert skip is None or call.gated_keys, "a skip reads the values a call whose keys take the gate holds"
     width, value_width, bv = call.width, call.value_width, tiles.output_block
@@ -269,12 +302,9 @@ def output_launch(q, k, h, corrected, prefix: tuple, taken, beta, call: Call, ti
     # dimension's a key block at a time (`_gated_queries`).
     prefixes = prefix if call.per_key else (*prefix, *prefix)
 
-    sides = 0 if normed is None else 2
-
     def program(at, q_ref, k_ref, h_ref, v_ref, *refs, streams, staging, landing):
         prefix_refs, (_taken_ref, beta_ref, *refs) = refs[:len(prefixes)], refs[len(prefixes):]
-        skip_ref, refs = refs[:len(refs) - sides - 1 - kept], refs[len(refs) - sides - 1 - kept:]
-        (gate_ref, weight_ref), (o_ref, *kept_ref) = (refs[:sides] or (None, None)), refs[sides:]
+        skip_ref, outputs = _output_refs(refs, normed)
         n, h = at["chunks"], at["heads"]
         row, span = n * chunk, pl.ds(n * chunk, chunk)
         staged, *rows = staging
@@ -337,40 +367,26 @@ def output_launch(q, k, h, corrected, prefix: tuple, taken, beta, call: Call, ti
                                            Parts(staged, held.dtype), value, scale, Issuer(call))
             if skip_ref:
                 out = out + skip_ref[0][h] * value.value().astype(jnp.float32)
-
-            def columns(block):
-                return span, pl.ds(h * value_width + block * bv, bv)
-
-            if normed is not None:
-                carry = _normed_step(normed, family, out, index, carry, steps=steps, bv=bv, columns=columns,
-                                     gate_ref=gate_ref, weight_ref=weight_ref, out_ref=o_ref,
-                                     kept_ref=kept_ref[0] if kept_ref else None, rows=rows[0],
-                                     landing=landing)
+            columns = functools.partial(_columns, span, h * value_width, bv)
+            if normed is None:
+                family.stored([out.astype(outputs[0].dtype)], [outputs[0].at[columns(index)]],
+                              smem=landing["out"])
                 return carry, accumulators
-            family.stored([out.astype(o_ref.dtype)], [o_ref.at[columns(index)]], smem=landing["out"])
-            return carry, accumulators
+            return _normed_step(normed, family, out, index, carry, steps=steps, bv=bv, columns=columns,
+                                refs=outputs, rows=rows[0], landing=landing), accumulators
 
         # The epilogue's rows' sums of squares carried across the value blocks, zero as the chunk starts.
         carry = () if normed is None else family.as_row(family.zeros((chunk,)))
-        return mosaic.Walk(views, step, steps=steps, prologue=None if call.per_key else prologue,
-                           carry=carry)
+        return mosaic.Walk(views, step, steps=steps, prologue=None if call.per_key else prologue, carry=carry)
 
-    kept = int(normed is not None and normed.kept)
     blocks, staging = _output_streams(call, bv)
-    if normed is not None:
-        # The head's whole value rows read back across the steps, a tile of their own.
-        staging = (*staging, swizzling.plain((chunk, value_width), jnp.dtype(normed.read)))
     out_type = jax.ShapeDtypeStruct((call.rows, call.heads * value_width), out_dtype)
-    if kept:
-        out_type = (out_type, jax.ShapeDtypeStruct(out_type.shape, normed.read))
     # The chunk's scores once (the intra launch's under a decay a key dimension), then each value block's
     # memory and local products: the model's.
     scored = 0 if call.per_key else 2 * chunk * chunk * width
     model = scored + 2 * chunk * (width + chunk) * value_width
-    landing = {"out": ((chunk, bv), out_dtype)}
-    if kept:
-        # The norm's residual stored through its own landing.
-        landing["kept"] = ((chunk, bv), jnp.dtype(normed.read))
+    staging, landing, out_type = _normed_layout(normed, chunk, bv, value_width, staging,
+                                                {"out": ((chunk, bv), out_dtype)}, out_type)
     swizzle = None if call.per_key else _output_swizzle(call, bv, staging, landing, normed=normed is not None)
     keys = None if swizzle is None else {f"keys{p}": swizzle for p in range(call.given.parts)}
     # Its kernel named `recurrence_output` as the profiles and the gate know it (`launch_kernel` names a

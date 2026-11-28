@@ -253,7 +253,7 @@ class KimiDeltaAttention(nn.Module):
             loads, stores, table = (None, None, 0) if forked is None else forked
             sides = {'z': gate, 'weight': self.o_norm.variables['params']['weight']} if normed else {}
             return chunk(self._chunk_hooks(projected.dtype, normed), Chunk(
-                query, key, value, gate=pre_decay, log_a=self.A_log.astype(wide), bias=decay_bias,
+                query, key, value, gate=pre_decay, log_a=self.A_log, bias=decay_bias,
                 beta=pre_beta, state=held, starts=starts, firsts=tokens.firsts if forked is None else None,
                 loads=loads, stores=stores, held=table, valid=tokens.valid if forked is None else valid,
                 **sides), chunk_size=self.chunk_size, max_segments=tokens.max_segments,

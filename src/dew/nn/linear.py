@@ -151,7 +151,7 @@ def causal_conv1d(x, kernel, activation: bool = True, bias=None, *, valid=None, 
             out = out[0] if parts is None else out
         else:
             out = short_conv.xla_conv1d(x, kernel, activation, bias, valid=valid, segments=segments,
-                                        parts=parts, dtype=dtype, named=named)
+                                        parts=parts, dtype=dtype)
     # The conv's output, which a remat policy may keep (`dew.nn.residuals.RESIDUALS`).
     return jax.tree.map(lambda piece: checkpoint_name(piece, Residual.CONV), out)
 
@@ -454,7 +454,7 @@ def held_scan(module: nn.Module, mixed, taps, bias, scan, state_shape: tuple[int
         return _forked(mixed, taps, bias, scan, state_shape, coordinates=coordinates,
                        held=None if held is None or conv_state is None else (conv_state.value, held.value),
                        wide=jnp.promote_types(at_least_fp32(mixed.dtype), state_dtype or mixed.dtype),
-                       parts=parts, dtype=dtype)
+                       parts=parts, dtype=dtype, named=named)
     if decode:
         assert conv_state is not None and held is not None
         if token is not None:
