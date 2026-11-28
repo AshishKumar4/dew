@@ -679,17 +679,23 @@ def unscaled_scores(subscripts: str, query: jax.Array, key: jax.Array, *, precis
 
 
 def scored(subscripts: str, query: jax.Array, key: jax.Array, *, precision, dtype, wide_logits: bool = False,
-           scale_logits: bool = False, query_scale: float | None = None) -> jax.Array:
+           scale_logits: bool = False, query_scale: float | None = None, safe: bool = False) -> jax.Array:
     """The reference path's logits of `scaled_operands`' query and key (`reference_attention`), `dtype` the
     call's operands' own: their product (`unscaled_scores`), then under `wide_logits` or `scale_logits` the
-    call's scale, 1/sqrt(D) or `query_scale`, range-safe (`range_safe`: each logit jax.nn's own where its
-    raw product is finite, the prescaled one's where not)."""
+    call's scale, 1/sqrt(D) or `query_scale`: jax.nn's form as jax.nn writes it, or, for a call that asks its
+    logits range-safe (`safe`, `AttentionCase.range_safe`: MSA's), range-safe (`range_safe`: each logit
+    jax.nn's own where its raw product is finite, the prescaled one's where not). A call that does not ask
+    keeps jax.nn's arithmetic op for op, which a program's own attention written out is equal to
+    (`dew.algebra.recognize` proves it so, train 1473: a range-safe form for every call left no written
+    program equal to any call of Dew's)."""
     def product(query, key):
         return unscaled_scores(subscripts, query, key, precision=precision, dtype=dtype,
                                scale_logits=scale_logits)
 
     if not (wide_logits or scale_logits):
         return product(query, key)
+    if not safe:
+        return product(query, key) * template.logit_scale(query.shape[-1], query_scale)
     return range_safe(product, query, key, dtype, query_scale)
 
 
@@ -899,19 +905,20 @@ def _finite(arrays: Sequence[jax.Array]) -> jax.Array:
 
 def reference_scores(query: jax.Array, key: jax.Array, subscripts: str, *, precision=None,
                      wide_logits: bool = False, scale_logits: bool = False) -> jax.Array:
-    """The reference path's logits of `query` and `key` (`reference_attention`), formed as it forms them,
-    operand scaling, product and scale after: a computation that trains toward the attention's own weights
-    reads its logits here (MSA's teacher on the reference path, `block_sparse.msa_scores`)."""
+    """The reference path's logits of `query` and `key` (`reference_attention`) for a call that asks them
+    range-safe (`AttentionCase.range_safe`), formed as it forms them, operand scaling, product and scale
+    after: a computation that trains toward the attention's own weights reads its logits here (MSA's
+    teacher on the reference path, `block_sparse.msa_scores`, whose call is range-safe)."""
     dtype = query.dtype
     query, key = scaled_operands(query, key, wide_logits=wide_logits, scale_logits=scale_logits)
     return scored(subscripts, query, key, precision=precision, dtype=dtype, wide_logits=wide_logits,
-                  scale_logits=scale_logits)
+                  scale_logits=scale_logits, safe=True)
 
 
 def reference_attention(query, key, value, *, mask=None, bias=None, sinks=None, softcap=None, dtype=None,
                         precision=None, force_fp32_for_softmax=True, dropout_rate=0.0, dropout_seed=None,
                         dropout_places=None, wide_logits=False, scale_logits=False, mask_fill=None,
-                        query_scale=None, logit_floor=None, skipped=None, excluded=False):
+                        query_scale=None, logit_floor=None, skipped=None, excluded=False, range_safe=False):
     """Attend over [B, S, H, D] in plain XLA ops, every score policy on one pipeline.
 
     It is flax's reference attention, op for op: the query scaled by
@@ -949,6 +956,8 @@ def reference_attention(query, key, value, *, mask=None, bias=None, sinks=None, 
     (-inf) and a row of no mass (every logit -inf) zero, as the template and the kernels
     exclude it: a visible key whose own logit is its dtype's least is never
     tied by a masked one, and a visible score that is not a number stays one.
+    `range_safe` forms a scaled-after call's logits as the template takes them
+    where its raw products overflow (`scored`, `AttentionCase.range_safe`).
 
     A kernel's portable rule states its own walk (Splash's, `splash._splash_portable`, row 12848):
     `query_scale`, the scale its query takes in place of `D ** -0.5` (1 where the query comes scaled);
@@ -973,12 +982,13 @@ def reference_attention(query, key, value, *, mask=None, bias=None, sinks=None, 
             and query_scale is None and logit_floor is None and products.weighted is None):
         attend = functools.partial(reference_attention, softcap=softcap, precision=precision,
                                    force_fp32_for_softmax=force_fp32_for_softmax, wide_logits=wide_logits,
-                                   scale_logits=True, mask_fill=mask_fill, excluded=excluded)
+                                   scale_logits=True, mask_fill=mask_fill, excluded=excluded,
+                                   range_safe=range_safe)
         return _grouped_as_jax_nn(attend, query, key, value, mask, bias)
     scaled_query, scoring = scaled_operands(query, key, wide_logits=wide_logits, scale_logits=scale_logits,
                                             query_scale=query_scale)
     logits_of = functools.partial(scored, precision=products, dtype=dtype, wide_logits=wide_logits,
-                                  scale_logits=scale_logits, query_scale=query_scale)
+                                  scale_logits=scale_logits, query_scale=query_scale, safe=range_safe)
 
     if skipped is not None:
         value, logits = _skipped_logits(logits_of, scaled_query, scoring, value, skipped)
@@ -1629,7 +1639,8 @@ def attention_kernel(query, key, value, dtype=None, precision=None,
     call = functools.partial(
         _attention_kernel, dtype=dtype, precision=precision, force_fp32_for_softmax=force_fp32_for_softmax,
         causal=causal, sliding_window=sliding_window, softcap=softcap, max_segments=max_segments,
-        dropout_rate=dropout_rate, wide_logits=wide_logits, scale_logits=scale_logits, in_key=in_key)
+        dropout_rate=dropout_rate, wide_logits=wide_logits, scale_logits=scale_logits, in_key=in_key,
+        range_safe=range_safe)
     # Every array operand (masks, segment ids, lengths, spans, dropout) passes into `forward_differentiable`
     # as an argument, as the decode kernel passes its lengths and starts above: a closed-over integer or bool
     # tracer stays in a nested derivative's `custom_jvp` call as a constant (M-DD-13b, and a scanned
@@ -1797,7 +1808,8 @@ def _attention_kernel(query, key, value, *, bias, sinks, implementation, dtype, 
                       segment_ids, max_segments, lengths, starts, block_groups=None, image_groups=None,
                       key_valid=None, key_runs=None, places=None, query_slots=None, dropout_rate=0.0,
                       dropout_seed=None, dropout_places=None, wide_logits: bool = False,
-                      scale_logits: bool = False, mask_fill: float | None = None, in_key: bool = False):
+                      scale_logits: bool = False, mask_fill: float | None = None, in_key: bool = False,
+                      range_safe: bool = False):
     """Run one whole-sequence attention call on the kernel `attention_kernel` resolved.
 
     `masked` is `mask` with the key `lengths` and `starts` in it. Splash takes sinks, a
@@ -1880,7 +1892,7 @@ def _attention_kernel(query, key, value, *, bias, sinks, implementation, dtype, 
                                    force_fp32_for_softmax=force_fp32_for_softmax, wide_logits=wide_logits,
                                    scale_logits=scale_logits, mask_fill=mask_fill, dropout_rate=dropout_rate,
                                    dropout_seed=dropout_seed, dropout_places=dropout_places,
-                                   excluded=mask_fill is None)
+                                   excluded=mask_fill is None, range_safe=range_safe)
 
     # The decode kernel and the template read key starts as their own spans; elsewhere they are the mask.
     if implementation not in ('decode', 'template'):
