@@ -2226,23 +2226,13 @@ class Bound(ABC):
 
     def with_fields(self, **changed: Configured) -> Self:
         """This record with `changed` among the arguments it states, over those it stated."""
-        return self._rebound({**self.fields, **changed})
+        from dew._flags import rebound
+        return rebound(self, {**self.fields, **changed})
 
     def without_fields(self, *names: str) -> Self:
         """This record stating none of `names`, each then the member's default or the caller's."""
-        return self._rebound({name: value for name, value in self.fields.items() if name not in names})
-
-    def _rebound(self, fields: Mapping[str, Configured]) -> Self:
-        """This record stating `fields` as its arguments: a command line's subcommand (`record_flags`) as its
-        kind's own record so bound flags it (`flagged`), every flag and its `bound` taken from that, so an
-        argument a flag held is the one stated now, not the flag's earlier value merged over it (row
-        14127)."""
-        bound = functools.partial(self.member, **fields)
-        if "_alias" not in vars(type(self)):
-            return dataclasses.replace(self, bound=bound)
-        flagged = dataclasses.replace(self.recorded(), bound=bound).flagged()
-        return dataclasses.replace(self, **{field.name: vars(flagged)[field.name]
-                                            for field in dataclasses.fields(self)})
+        from dew._flags import rebound
+        return rebound(self, {name: value for name, value in self.fields.items() if name not in names})
 
     def recorded(self) -> Bound:
         """This record as its kind's own class holds it, where it is a command line's subcommand
@@ -2262,15 +2252,11 @@ class Bound(ABC):
         named = {} if aliases is None else {aliases.paths[alias]: alias for alias in reversed(list(aliases))}
         if self.name not in named or "_alias" in vars(type(self)):
             return self
-        from dew._flags import _fits, record_flags
+        from dew._flags import flag_held, record_flags
 
         made = record_flags(type(self), self.member, self.name, named[self.name])
         own = {each.name for each in dataclasses.fields(type(self))}
-        # An argument a flag can state, on its flag; one at the flag's default stays an argument, stated as
-        # the record states it, which a flag at its default would leave unstated.
-        defaults = {field.name: field.default for field in dataclasses.fields(made)}
-        held = {name: value for name, value in self.fields.items()
-                if name in made._flags and _fits(value, made._flags[name]) and value != defaults[name]}
+        held = flag_held(made, self.fields)
         settings = {name: vars(self)[name] for name in own if name != "bound"}
         rest = {name: value for name, value in self.fields.items() if name not in held}
         # Its flags and settings stated over the subcommand's defaults, `bound` the rest (its

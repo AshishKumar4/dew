@@ -9,7 +9,7 @@ import functools
 import operator
 import types
 import typing
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from typing import Annotated, Literal, Union
 
 import tyro
@@ -110,6 +110,28 @@ def record_flags[R: Bound](record: type[R], member: type | Callable[..., registr
     if not issubclass(made, record):
         raise TypeError(f"{made.__name__} is no {record.__name__}")
     return made
+
+
+def flag_held(made: type[Bound], fields: Mapping[str, registry.Configured]) -> dict[str, registry.Configured]:
+    """The arguments among `fields` a subcommand's record (`made`, `record_flags`'s) holds on its flags
+    (`Bound.flagged`): each a flag can state and set apart from the flag's default; one at the default stays
+    an argument, stated as the record states it, which a flag at its default would leave unstated."""
+    defaults = {field.name: field.default for field in dataclasses.fields(made)}
+    return {name: value for name, value in fields.items()
+            if name in made._flags and _fits(value, made._flags[name]) and value != defaults[name]}
+
+
+def rebound[R: Bound](record: R, fields: Mapping[str, registry.Configured]) -> R:
+    """`record` stating `fields` as its arguments (`Bound.with_fields`, `without_fields`): a command line's
+    subcommand (`record_flags`) as its kind's own record so bound flags it (`Bound.flagged`), every flag and
+    its `bound` taken from that, so an argument a flag held is the one stated now, not the flag's earlier
+    value merged over it (row 14127); any other record so bound."""
+    bound = functools.partial(record.member, **fields)
+    if "_alias" not in vars(type(record)):
+        return dataclasses.replace(record, bound=bound)
+    flagged = dataclasses.replace(record.recorded(), bound=bound).flagged()
+    return dataclasses.replace(record, **{field.name: vars(flagged)[field.name]
+                                          for field in dataclasses.fields(record)})
 
 
 def implied_subcommand(default: registry.Configured) -> str | None:
