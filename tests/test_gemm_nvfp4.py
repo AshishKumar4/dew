@@ -847,6 +847,33 @@ def test_an_nvfp4_products_gathered_gradient_keeps_far_routes_apart_and_routes_n
     np.testing.assert_array_equal(np.asarray(d_none), np.zeros((1, 512), np.float32))
 
 
+@pytest.mark.mesh(devices=3)
+def test_a_depth_split_nvfp4_projections_input_gradient_runs_on_an_explicit_mesh():
+    """A dense NVFP4 projection 768 deep whose matrix an Explicit 'tensor' axis splits three ways by its depth
+    (its words' and scales' last axis), over rows split by the same depth, jitted: its forward and its rows'
+    gradient are the product written plainly over its values (`packed_values`), exactly over small
+    integers. The exact rescue its pullback traces beside the plain one chunks the depth whole on every
+    device (`factored`'s `depth_chunk`; train 1455's review: 64 of a depth split three ways sliced no
+    device's share whole, its trace raised)."""
+    from jax.sharding import AxisType, PartitionSpec
+
+    matrix, values, rows, cotangent = _small_integer_projection(14551, depth=768)
+    mesh = jax.make_mesh((3,), ("tensor",), axis_types=(AxisType.Explicit,))
+
+    @jax.jit
+    def pulled(x, matrix, cotangent):
+        out, pull = jax.vjp(lambda x: gemm.nvfp4_product(x, matrix, out_dtype=jnp.float32), x)
+        return jax.reshard(out, PartitionSpec()), jax.reshard(pull(cotangent)[0], PartitionSpec())
+
+    with jax.set_mesh(mesh):
+        deep = PartitionSpec(None, "tensor")
+        placed = formats.NvFp4(jax.device_put(matrix.words, deep), jax.device_put(matrix.scales, deep),
+                               jax.device_put(matrix.scale, PartitionSpec()))
+        out, grad = pulled(jax.device_put(rows, deep), placed, jax.device_put(cotangent, PartitionSpec()))
+    np.testing.assert_array_equal(np.asarray(out, np.float64), rows.astype(np.float64) @ values)
+    np.testing.assert_array_equal(np.asarray(grad, np.float64), cotangent.astype(np.float64) @ values.T)
+
+
 @pytest.mark.mesh(devices=2)
 def test_a_column_split_nvfp4_projections_input_gradient_runs_on_an_explicit_mesh():
     """A dense NVFP4 projection whose matrix an Explicit 'tensor' axis splits by its columns (its words' and

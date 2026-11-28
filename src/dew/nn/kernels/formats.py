@@ -229,9 +229,27 @@ def _e2m1_values(codes: jax.Array) -> jax.Array:
 
 def _codes(words: jax.Array, dtype: DTypeLike = jnp.float32) -> jax.Array:
     """The codes' values of staged `words` (each its E2M1 value in `dtype`, `[depth, width]`) in the depths'
-    own order (`staged_rows` undone): `bits.nvfp4_codes`, the one word-to-code decode (row 8718)."""
+    own order (`staged_rows` undone): `bits.nvfp4_codes`, the one word-to-code decode (row 8718). The staged
+    order permutes the depths within each `packed.NVFP4_GROUP`-deep group alone (its 16 words' 8 codes, code
+    `j` of word `w` depth `16 j + w`), so it is undone within each group, a transpose of its words and codes,
+    the groups where they lie: a depth an Explicit axis splits by whole groups keeps its placement, where a
+    gather across the depth had none (row 14097)."""
+    from dew.nn.sharding import explicit_spec
+
     codes = bits.nvfp4_codes(words, dtype)
-    return codes[np.argsort(staged_rows(codes.shape[0]))]
+    depth, width = codes.shape
+    if depth % packed.NVFP4_GROUP:
+        raise ValueError(f"an NVFP4 matrix's depth is whole {packed.NVFP4_GROUP}-deep groups, not {depth}")
+    codes_a_word = 32 // bits.E2M1.width
+    grouped = (depth // packed.NVFP4_GROUP, packed.NVFP4_GROUP // codes_a_word, codes_a_word, width)
+    # A split depth's placement stated where its reshapes split and join it, by whole groups; any other
+    # placement JAX keeps through them itself.
+    placed = explicit_spec(codes)
+    deep = placed is not None and placed.spec[0] is not None
+    split = jax.sharding.NamedSharding(placed.mesh, jax.sharding.PartitionSpec(
+        placed.spec[0], None, None, placed.spec[1])) if deep else None
+    held = jnp.swapaxes(codes.reshape(grouped, out_sharding=split), 1, 2)
+    return held.reshape(depth, width, out_sharding=placed if deep else None)
 
 
 def _staged_words(codes, xp=jnp):
