@@ -89,7 +89,7 @@ def _packed_output_params(params: tuple[Side, ...], *, heads: int, kv_heads: int
 
 
 def serves(query: jax.Array, key: jax.Array, hooks: Hooks | None, *, natural: bool,
-           target: generation.GpuTarget, excluded: bool = True) -> bool:
+           target: generation.GpuTarget) -> bool:
     """Whether a call's inference runs as this work list (`attend`) rather than the template's forward: its
     hooks pack (`packable`), its key heads divide its query heads, its form the fold's (the work list folds,
     its natural rewalk its own), and its packed rows a key head too few for the device's products to bound
@@ -99,10 +99,6 @@ def serves(query: jax.Array, key: jax.Array, hooks: Hooks | None, *, natural: bo
     heads read the keys once a key head (ET-VERIFY-h100)."""
     heads, kv_heads = query.shape[2], key.shape[2]
     if natural or heads % kv_heads or not packable(hooks):
-        return False
-    if not excluded and hooks is not None and hooks.output.fn is not None:
-        # A merge's finish fuses the hook, a row of no mass zero before it (`_massless_read`): the
-        # template's forward reads the row NaN before its hook.
         return False
     batch, positions, _, width = query.shape
     rows = jax.ShapeDtypeStruct((batch, positions * (heads // kv_heads), kv_heads, width), query.dtype)
@@ -251,10 +247,7 @@ def plan(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, ho
     # No more slices than four programs a multiprocessor take: past them a slice's programs wait a wave.
     most = min(longest, max(2, 4 * processors // programs))
     counts = _slice_counts(processors, programs, most)
-    # Priced over every key a row holds (`spans.keys`): a call's own intervals (a cache's lengths, its
-    # documents) its launches count no work of, their extents its data's (a decode step's every launch
-    # priced none, its plan the heuristic's alone: M-NA-27-gh200 at fb6a6daa2).
-    every = spans if spans.form == "full" else key_spans(query.shape[1], spans.keys, query.shape[0])
+    every = priced_spans(query, spans)
     priced = None if chosen_by_caller else _priced_slices(
         query, key, value, every, walked, config, counts, scale=scale, target=target, table=table,
         sources=sources, scales=scales, chosen=chosen, in_key=in_key,
@@ -393,6 +386,17 @@ def _merge_seconds(query, value, spans: KeySpans, hooks: Hooks | None, config: a
     return 0.0 if seconds is None else seconds
 
 
+def priced_spans(query, spans: KeySpans) -> KeySpans:
+    """The spans a step's plan prices its launches over (`plan`'s): every key a row holds (`spans.keys`), a
+    call's own intervals (a cache's lengths, its documents) its launches count no work of, their extents
+    its data's (a decode step's every launch priced none, its plan the heuristic's alone: M-NA-27-gh200 at
+    fb6a6daa2); a row of no mass read as the call reads it (`excluded`: its merge's finish,
+    `merged.merge_launch`'s `massless`, row 14204's review)."""
+    if spans.form == "full":
+        return spans
+    return dataclasses.replace(key_spans(query.shape[1], spans.keys, query.shape[0]), excluded=spans.excluded)
+
+
 def merge_branch(slices: int, *, finished: bool, deferred: bool) -> str:
     """The merge a step of `slices` takes (`attend`'s `walked`): "none" where one slice finishes in its walk's
     own launch, "state" where one slice's rows merge with the initial state by the law
@@ -468,7 +472,7 @@ def _stream_op(query, key, value, spans: KeySpans, hooks: Hooks | None, *, scale
     masked = hooks is None or hooks.output.fn is None
     if out_dtype is not None:
         # A merge's slices (`Kept.OUTPUT`) keep each slice's state, a row of no mass the merge's to read
-        # (`_massless_read`): planned and launched as one op (`walked`'s pin).
+        # (`merged.merge_launch`'s `massless`): planned and launched as one op (`walked`'s pin).
         spans = dataclasses.replace(spans, excluded=True)
     op, args = attention_mosaic._forward_call(query, key, value, spans, hooks, scale=scale, natural=False,
                                               out_dtype=out_dtype, masked=masked, splits=splits, table=table,
@@ -497,20 +501,6 @@ def _certified_stream(op: attention_mosaic.MosaicForward, ba, target: generation
         return config
     found = op._certified(ba, first, offered=lambda: op.streaming(ba, config, target), decided=config)
     return found if isinstance(found, attention_mosaic.Tiles) else None
-
-
-def _massless_read(spec: algebra.Forward, out: jax.Array, stacked: jax.Array, initial: Initial | None, *,
-                   queries: int, heads: int, output: bool) -> jax.Array:
-    """A merge's finished `out` `[B, T, heads, Dv]` (`merged.merged_finished`), each row of no mass NaN where
-    the call reads it so (`algebra.Forward.massless_nan`, a call from no `initial` state): no slice's
-    denominator (`stacked[1]` `[B, KV, S, R]`), which the merge's own finish reads zero. Past an `output`
-    hook the merge fused, the row is as the hook read its zero (`serves` keeps such a call off the work
-    list; row 14204)."""
-    if not spec.massless_nan or initial is not None or output:
-        return out
-    empty = jnp.all(stacked[1][..., :queries] == 0, axis=2)
-    rows = ungrouped_rows(jnp.swapaxes(empty, 1, 2)[..., None], heads)
-    return jnp.where(rows, jnp.nan, out)
 
 
 def _spec(query: jax.Array, spans: KeySpans, hooks: Hooks, *, scale: float | None) -> algebra.Forward:
@@ -638,11 +628,11 @@ def _planned_step(query: jax.Array, key: jax.Array, value: jax.Array, spans: Key
             assert isinstance(walked_out, attention_mosaic.SplitOutput)
             padded, stacked = walked_out.padded, walked_out.stacked
         if branch == "finished":
-            out = merged.merged_finished(spec, padded, stacked, queries=queries, width=width,
-                                         out_dtype=query.dtype, out_heads=heads, initial=initial,
-                                         output=hooks.output)
-            return _massless_read(spec, out, stacked, initial, queries=queries, heads=heads,
-                                  output=hooks.output.fn is not None)
+            # A row of no mass NaN where the call reads it so, before the hook the merge fuses
+            # (`merged.merge_launch`'s `massless`, row 14204).
+            return merged.merged_finished(spec, padded, stacked, queries=queries, width=width,
+                                          out_dtype=query.dtype, out_heads=heads, initial=initial,
+                                          output=hooks.output)
         if branch == "state":
             state = algebra.merged_state(spec, padded, stacked[0], stacked[1], initial)
         else:

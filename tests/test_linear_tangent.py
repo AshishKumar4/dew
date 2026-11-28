@@ -198,3 +198,80 @@ def test_a_linear_maps_batched_pullback_sums_each_cotangent_in_its_own_type():
     assert ours.dtype == jnp.bfloat16
     assert np.asarray(ours).view(np.uint16) == np.asarray(theirs).view(np.uint16)
 
+
+@pytest.mark.mesh(devices=2)
+def test_a_linear_maps_replicated_operand_takes_its_split_residuals_summed_cotangent():
+    """A linear map `r · x` (`generation.linear_map`) of an `x` every device holds alike by residuals `r` a
+    checked `shard_map` splits by rows: its pullback, `Σ r · c` over each device's rows, is that device's
+    partial of `x`'s cotangent, which the map sums as `x` varies (none of the map's axes), so the gradient
+    through the map is the unsplit call's, its pullback summing nothing itself; unsummed, the map's
+    transpose handed the accumulator a cotangent varying over the axis (train 1511's K-F2)."""
+    from jax.sharding import AxisType, PartitionSpec as P
+
+    from dew.nn.kernels.generation import linear_map
+
+    mesh = jax.make_mesh((2,), ("data",), axis_types=(AxisType.Auto,), devices=jax.devices()[:2])
+    rows = jnp.arange(24, dtype=jnp.float32).reshape(6, 4)
+
+    def scaled(rows, x):
+        return linear_map(lambda rows, x: rows * x, lambda rows, cotangent: jnp.sum(rows * cotangent, axis=0),
+                          rows, x)
+
+    local = jax.shard_map(scaled, mesh=mesh, in_specs=(P("data"), P()), out_specs=P("data"))
+    out, pull = jax.vjp(lambda x: local(rows, x), jnp.ones((4,), jnp.float32))
+    (pulled,) = pull(jnp.ones_like(out))
+    np.testing.assert_array_equal(np.asarray(pulled), np.asarray(rows).sum(axis=0))
+
+
+@pytest.mark.mesh(devices=2)
+@pytest.mark.parametrize(("rows", "summed", "names"), [
+    ([2.0 ** 127, 2.0 ** 127, -(2.0 ** 127), -(2.0 ** 127)], 0.0, (None,)),
+    ([1.0, 2.0, 3.0, 4.0], 10.0, ("data",)),
+    ([1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0], 36.0, ("data", None))],
+    ids=["cancelling", "named as the mesh", "nested in one named as the mesh"])
+def test_a_batched_linear_maps_shared_operand_sums_each_lane_across_devices_first(rows, summed, names):
+    """A linear map `r · x` batched (`jax.vmap`, two lanes a device, a level of `names`, outermost first)
+    over residuals a checked `shard_map` splits, `x` shared by the lanes and every device: each lane's
+    cotangent of `x` summed across the devices before the lanes add (`generation._batched_pullback`), as the
+    map's unbatched transpose sums it, so a lane's partials `2^127` on one device and `-2^127` on the other
+    cancel to 0, where the lanes added first read `2^128` and `-2^128`, inf on each device, and their sum NaN
+    (train 1511's review); and under a batch named as the mesh's axis, or an anonymous one within it,
+    summed over the mesh's devices, not the batch's lanes, as the gradient of `Σ r` (train 1511's second
+    and third reviews)."""
+    from jax.sharding import AxisType, PartitionSpec as P
+
+    from dew.nn.kernels.generation import linear_map
+
+    mesh = jax.make_mesh((2,), ("data",), axis_types=(AxisType.Auto,), devices=jax.devices()[:2])
+    residuals = jnp.asarray(rows, jnp.float32)[:, None]
+
+    def lane(row, x):
+        return linear_map(lambda row, x: row * x, lambda row, cotangent: row * cotangent, row, x)
+
+    def scaled(rows, x):
+        mapped = lane
+        for name in reversed(names):
+            mapped = jax.vmap(mapped, in_axes=(0, None), axis_name=name)
+        return mapped(rows.reshape(*(2,) * len(names), 1), x).reshape(-1, 1)
+
+    local = jax.shard_map(scaled, mesh=mesh, in_specs=(P("data"), P()), out_specs=P("data"))
+    out, pull = jax.vjp(lambda x: local(residuals, x), jnp.ones((1,), jnp.float32))
+    (pulled,) = pull(jnp.ones_like(out))
+    np.testing.assert_array_equal(np.asarray(pulled), np.full((1,), summed, np.float32))
+
+
+def test_a_named_batchs_pullback_reads_its_lanes_name():
+    """A linear map `x (1 + i)` of each lane `i` of a batch named "lane" (`lax.axis_index` in its apply and
+    its pullback alike): the gradient of its sum over two lanes `[1, 2]`, the batch's name kept for its
+    pullback (`generation._batched_pullback`), where its lanes mapped unnamed read no such axis (train 1515's
+    review F2)."""
+    from dew.nn.kernels.generation import linear_map
+
+    def scaled(x):
+        return x * (1.0 + jax.lax.axis_index("lane"))
+
+    def lane(x):
+        return linear_map(lambda _, x: scaled(x), lambda _, cotangent: scaled(cotangent), x, x)
+
+    gradient = jax.grad(lambda x: jax.vmap(lane, axis_name="lane")(x).sum())(jnp.ones((2,), jnp.float32))
+    np.testing.assert_array_equal(np.asarray(gradient), [1.0, 2.0])

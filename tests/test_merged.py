@@ -341,7 +341,8 @@ def test_a_padded_merge_compiles_as_one_launch(name, cases):
     a generation unpinned (`_mosaic_served`), across: value widths 80, 96,
     100, 128 and 192 (predicated coalesced GMEM loads/stores); a `jax.vmap` batch of three splits (beside
     nothing but the one transpose that folds it, every launch typed by `assembled.launched_thunks`);
-    `merged_finished` with and without `Initial`; and long splits of 64 and 256 slices (row 8439)."""
+    `merged_finished` with and without `Initial`, and of a call that reads a row of no mass NaN (row 14204);
+    and long splits of 64 and 256 slices (row 8439)."""
     from fla_gdn_support import KernelCase
     from kernel_compile import compile_mosaic_kernels, mosaic_failures
 
@@ -358,6 +359,11 @@ def test_a_padded_merge_compiles_as_one_launch(name, cases):
     finished_padded = jax.ShapeDtypeStruct((1, 16, 16, 8, 128), jnp.float32)
     finished_stacked = jax.ShapeDtypeStruct((2, 1, 8, 16, 16), jnp.float32)
     finished = functools.partial(merged.merged_finished, SPECS["natural"], queries=4, width=128,
+                                 out_dtype=jnp.bfloat16, out_heads=32)
+    # A call that reads a row of no mass NaN (`algebra.Forward.massless_nan`): its launch marks the row before
+    # it stores (`algebra.merged_massless`, row 14204).
+    unexcluded = dataclasses.replace(SPECS["natural"], excluded=False)
+    massless = functools.partial(merged.merged_finished, unexcluded, queries=4, width=128,
                                  out_dtype=jnp.bfloat16, out_heads=32)
     init_m = jax.ShapeDtypeStruct((1, 8, 4), jnp.float32)
     init_t = jax.ShapeDtypeStruct((1, 8, 4), jnp.float32)
@@ -382,6 +388,7 @@ def test_a_padded_merge_compiles_as_one_launch(name, cases):
         "shapes-finished": [
             KernelCase("batched", lambda: (batched, (batched_padded, batched_stacked))),
             KernelCase("finished", lambda: (finished, (finished_padded, finished_stacked))),
+            KernelCase("finished-massless", lambda: (massless, (finished_padded, finished_stacked))),
             KernelCase("finished-initial",
                        lambda: (finished_with_initial(4, 128, jnp.bfloat16, 32),
                                 (finished_padded, finished_stacked, init_m, init_t, init_acc))),

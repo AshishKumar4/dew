@@ -887,6 +887,14 @@ class Issuer[Accumulator](abc.ABC):
         """The depth consumed by one instruction: the step's where its issuer does not split products."""
         return depth
 
+    def fed_columns(self, rows: int, columns: int) -> int:
+        """The columns of a right operand's fragments live at once in a product of `rows` rows where each load
+        takes one instruction's depth of `columns` and no later product reads it
+        (`resources.operand_fragments`): every one, unless each fragment feeds one instruction, whose loads
+        then feed them a few at a time."""
+        del rows
+        return columns
+
     def rhs_fragment_depth(self, depth: int, *, transposed: bool = False, swizzle: int | None = None) -> int:
         """The right operand's loaded depth at its storage orientation and swizzle (bytes). The model's
         `operand_live_depth` reads which slices of that granule stay live."""

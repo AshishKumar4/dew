@@ -343,7 +343,8 @@ class Tiles:
 class BackwardTiles:
     """A backward's config, one for its launches: the query block a dQ consumer takes and the key block a
     dK/dV consumer takes (`block_q`, `block_k`, so both launches' logits are one tile's), the tiles in
-    flight (`stages`), the consumers a program (`consumers`), whether the fast form runs as one launch
+    flight (`stages`: one where no config of two holds the block, `MosaicBackward.candidates`), the
+    consumers a program (`consumers`), whether the fast form runs as one launch
     (`fused`, `_launch_backward`), the instruction family whose bundle runs it (`family`) and the dK/dV
     programs a key block's head widths split among (`columns`: each its share of dK's and dV's columns, its
     logits and their cotangents its own, where a whole width's sums pass a consumer's registers) and the
@@ -399,8 +400,8 @@ class BackwardTiles:
         return self.fused and not self.dkv_apart
 
     def __post_init__(self):
-        if self.stages < 2:
-            raise ValueError(f"{self}: two stages or more")
+        if self.stages < 1:
+            raise ValueError(f"{self}: one stage or more")
 
 
 def _width(width: int, family: mosaic.Family, dtype) -> int:

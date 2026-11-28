@@ -311,6 +311,29 @@ def test_an_a100_backward_256_wide_compiles_on_32_row_tiles_within_its_block(acc
     assert not failed, "\n".join(failed)
 
 
+@COMPILES_ON_CPU
+@pytest.mark.parametrize("generation_name", ["sm86", "sm89", "sm120"])
+def test_a_99kb_blocks_backward_256_wide_walks_one_stage_spill_free(generation_name):
+    """Row 14113: the fast backward of heads 256 wide on a GPU of a 99 KB block (an A10's, an L4's, an RTX
+    PRO 6000's), where every config's two stages of queries and output cotangents beside its resident keys
+    and values pass the block (32 x 32 one launch 102,416 bytes on an A10 against its 101,376) and the step
+    fell to Pallas Triton, derives a Mosaic config of one stage (`MosaicBackward.candidates`,
+    FlashAttention 2's backward without double buffering), within the block as its model sizes it, its
+    launches spilling nothing, lowered and compiled for the GPU on this CPU."""
+    from fla_gdn_support import KernelCase
+    from kernel_compile import compile_mosaic_kernels, mosaic_failures
+
+    op, ba, derived = _gated_backward(generation_name, 256, accurate=False)
+    assert isinstance(derived, attention_mosaic.BackwardTiles), derived
+    with generation.assumed(generation_name):
+        target = generation.gpu_target()
+        assert op.staged_bytes(ba, derived, target) <= op.program_shared(derived, target)
+        found = compile_mosaic_kernels([KernelCase("backward", lambda: op.lowering(ba, derived))],
+                                       generation_name)
+    failed = mosaic_failures(found)
+    assert not failed, "\n".join(failed)
+
+
 def staged_widths(generation_name: str, dtype) -> tuple[int, ...]:
     """The head widths the mainloop stages for operands of `dtype` on a GPU of `generation_name`, every
     bundle of its taking them (`bundles.layouts`, `attention_mosaic_program.refused`): each power of two a
@@ -1544,6 +1567,42 @@ def test_sm90_d256_forward_fits_single_launch_without_spills(gen, label, residua
             assert main.shared is not None and 0 < main.shared <= record["limit"], main
             if isinstance(whole_cfg, attention_mosaic.Tiles):
                 assert main.threads == (whole_cfg.consumers + 1) * 128, main
+
+
+@COMPILES_ON_CPU
+@pytest.mark.parametrize("generation_name", ["sm120", "sm80", "sm86"])
+@pytest.mark.parametrize("causal", [False, True], ids=["full", "causal"])
+def test_an_inference_forward_256_wide_walks_its_keys_once_spill_free(generation_name, causal):
+    """Rows 14113 and 6216: a bf16 inference forward 256 wide (1 x 4096, 32 query heads over 8) on an RTX PRO
+    6000 (sm120), an A100 and an A10 derives one launch over every value column, no column launches each
+    walking the keys again (sm120 2.91 ms against FlashAttention 2's 1.56, M-NA-39b; an A100's causal 7.43
+    against 3.68, M-NA-37b), its values' fragments priced as its loads feed them (`Issuer.fed_columns`) and
+    its epilogue's settle over its quotient (`_epilogue_registers`), and compiles as one forward kernel,
+    spill-free (FS-14113-CENSUS2: ptxas 237 registers on sm120 where its values' fragments over every column
+    priced 260; probe oa6-epi: 255 and none spilled on an A100 and an A10 where their epilogue priced 284)."""
+    from fla_gdn_support import KernelCase
+    from kernel_compile import compile_mosaic_kernels, mosaic_failures, runs
+
+    spans = template.spans(4096, 4096, 1, causal=causal)
+    query = jax.ShapeDtypeStruct((1, 4096, 32, 256), jnp.bfloat16)
+    key = jax.ShapeDtypeStruct((1, 4096, 8, 256), jnp.bfloat16)
+
+    def forward(query, key, value):
+        return attention_mosaic.forward(query, key, value, spans, None)
+
+    with generation.assumed(generation_name):
+        found = compile_mosaic_kernels([KernelCase("d256", lambda: (forward, (query, key, key)))],
+                                       generation_name)
+    assert not mosaic_failures(found), "\n".join(mosaic_failures(found))
+    # Every build's run (`runs`) carries the plain walk's binary once, every value column its own (its
+    # rewalks', natural or scaled, launched apart where a row needs them), no column launch: its binaries a
+    # launch each (`assembled.carried`), a walk launched twice twice.
+    for run in runs(found):
+        carried = [binary["kernel"] for binary in run.get("binaries", ())]
+        walks = [name for name in carried
+                 if name == "attention_forward" or name.startswith("attention_forward_columns")]
+        assert walks == ["attention_forward"], (run["build"], carried)
+
 
 @COMPILES_ON_CPU
 @pytest.mark.parametrize("gen", ["sm80", "sm100"])

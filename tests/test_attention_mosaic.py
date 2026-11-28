@@ -904,6 +904,27 @@ def test_the_backward_at_a_width_of_256_is_on_par_under_bidirectional_blocks_int
                     spans=spans)
 
 
+ONE_STAGE = {"sm86": {"fused": True, "family": "mma.sync"},
+             "sm120": {"family": "mma.sync.produced", "columns": 2, "dkv_family": "mma.sync.fed",
+                       "dkv_consumers": 2}}
+"""The 32 x 32 backward 256 wide a 99 KB block's GPU derives at one stage (`MosaicBackward.candidates`): an
+A10's one launch on mma.sync, an RTX PRO 6000's two, its dK/dV launch's two consumers feeding their own
+ring."""
+
+
+@INTERPRETS
+@pytest.mark.parametrize("generation_name", list(ONE_STAGE))
+@pytest.mark.parametrize("call", ["causal", "full"])
+def test_a_backward_256_wide_of_one_stage_is_on_par_interpreted(call, generation_name):
+    """The fast backward 256 wide on a GPU of a 99 KB block at the one stage its derivation takes there,
+    each step's slot loaded once the step before has released it (`rings.Ring.load`, a cp.async walk's one
+    slot, `fed.Feed`'s refill), every gradient on par (check 1) with the reference's, under the interpreter
+    (row 14113)."""
+    _check_backward(call, SHAPES["interpreted"], form=None, interpret=True, width=256,
+                    target=generation.gpu_target(generation_name),
+                    config=attention_mosaic.BackwardTiles(32, 32, 1, 1, **ONE_STAGE[generation_name]))
+
+
 @ON_EACH_FAMILY
 @INTERPRETS
 @pytest.mark.parametrize(("width", "value_width"), HEAD_WIDTHS)

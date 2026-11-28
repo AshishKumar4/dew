@@ -349,8 +349,7 @@ def _forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans
                                                      in_key=config.in_key, **form)
         # A decode step's work list certifies the launches its plan derives (`attention_decode.plan`).
         decodes = kept is Kept.NONE and attention_decode.serves(query, key, hooks, natural=config.natural,
-                                                                target=generation.gpu_target(),
-                                                                excluded=spans.excluded)
+                                                                target=generation.gpu_target())
         uncertified = None if decodes else functools.partial(
             attention_mosaic.forward_declined, query, key, value, spans, hooks, residuals=kept,
             in_key=config.in_key, certified=True, **form)

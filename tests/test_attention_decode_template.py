@@ -198,18 +198,46 @@ def test_a_decode_steps_start_of_its_first_key_reads_as_no_start_interpreted():
                                   np.asarray(attend(None), np.float32))
 
 
-def test_a_route_keeps_a_hooked_step_that_reads_a_row_of_no_mass_nan_off_the_work_list():
-    """A decode step whose spans hide no key (`KeySpans.excluded` False: a row of no mass reads NaN) under an
-    output hook: the route declines the work list (`serves`), whose merge fuses the hook before such a row
-    is read, so the template's forward, which reads it NaN before its hook, takes it; the same step masked,
-    or hookless, the work list takes (row 14116)."""
-    query, key, _, _ = _drawn(1, 8, 2, jnp.bfloat16)(0)
+@INTERPRETS
+def test_a_split_steps_fused_output_hook_reads_a_row_of_no_mass_nan_interpreted():
+    """A decode step on an H100 of two rows over 4096 keys, its keys cut into slices (`plan`) whose merge
+    fuses its output hook (`merged.merged_finished`), the second row reading no key, under spans that hide
+    none (`KeySpans.excluded` False: a row of no mass reads NaN, as jax.nn's softmax reads it): the hook
+    reads the empty row's NaN as the reference path's does, where the merge's finish read it zero before the
+    hook (row 14204), and the route takes the step on the work list (`serves`)."""
+    keys = 4096
+    spans = dataclasses.replace(template.spans(1, keys, 2, lengths=jnp.asarray([keys, 0], jnp.int32)),
+                                excluded=False)
     hooks = template.Hooks(output=Hook(lambda o: jnp.where(jnp.isnan(o), 7.0, o)))
+    query, key, value = _operands((2, 1, 8, 64), keys)(0)
+    with generation.assumed("sm90"):
+        assert attention_decode.serves(query, key, hooks, natural=False, target=generation.gpu_target())
+        out = attention_decode.attend(query, key, value, spans, hooks, interpret=True)
+    expected = template.reference(query, key, value, spans, hooks)
+    np.testing.assert_array_equal(np.asarray(out[1], np.float32), np.asarray(expected[1], np.float32))
+
+
+def test_a_decode_plan_prices_a_row_of_no_mass_as_its_merge_reads_it():
+    """A hooked decode step on an H100 over a cache's lengths (two rows over 4096 keys, the second reading
+    none), its spans hiding no key (`KeySpans.excluded` False), split in two: the merge its plan prices over
+    every key a row holds (`priced_spans`) is the merge its step launches, reading a row of no mass NaN
+    before its hook, where the spans of every key priced its finish unmarked (row 14204's review)."""
+    keys, heads = 4096, 8
+    spans = dataclasses.replace(template.spans(1, keys, 2, lengths=jnp.asarray([keys, 0], jnp.int32)),
+                                excluded=False)
+    hooks = template.Hooks(output=Hook(lambda o: jnp.where(jnp.isnan(o), 7.0, o)))
+    query, key, value = _operands((2, 1, heads, 64), keys)(0)
+    tiles = attention_mosaic.Tiles(64, 64, 2, 1, family="wgmma")
     with generation.assumed("sm90"):
         target = generation.gpu_target()
-        assert not attention_decode.serves(query, key, hooks, natural=False, target=target, excluded=False)
-        assert attention_decode.serves(query, key, hooks, natural=False, target=target)
-        assert attention_decode.serves(query, key, None, natural=False, target=target, excluded=False)
+        _, rows, row_spans, whole = attention_decode.planned(query, key, value, spans, hooks)
+
+        def merge(spans):
+            return attention_decode.merge_launch_for(rows, key, spans, whole, tiles, 2, staged=rows.dtype,
+                                                     scale=None, target=target, initial=None,
+                                                     finished=(hooks.output, heads), deferred=False)
+
+        assert merge(attention_decode.priced_spans(rows, row_spans)) == merge(row_spans)
 
 
 @INTERPRETS

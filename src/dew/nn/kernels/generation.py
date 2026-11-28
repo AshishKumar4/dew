@@ -1870,7 +1870,6 @@ def linear_tangent(forward: Callable, backward: Callable, portable: Callable, *,
     from jax.custom_derivatives import SymbolicZero, zero_from_primal
 
     from dew.nn.derivatives import contracted, declared_tangent
-    from dew.nn.sharding import summed_to
 
     def produced_jvp(primals, tangents):
         output, saved = produced(*primals)
@@ -1923,9 +1922,8 @@ def linear_tangent(forward: Callable, backward: Callable, portable: Callable, *,
             operands, saved = residuals
             pulled_back = jax.tree.leaves(pulled(saved, operands, cotangent, tuple(live) if live_cotangents
                                                  else None))
-            cotangents = pulled_back if live_cotangents else [pulled_back[index] for index in live]
-            leaves = jax.tree.leaves(operands)
-            return [summed_to(each, leaves[index]) for each, index in zip(cotangents, live, strict=True)]
+            # Each typed as its operand varies at the map's boundary (`linear_map`'s transpose).
+            return pulled_back if live_cotangents else [pulled_back[index] for index in live]
 
         moving = [directions[index] for index in live]
         # The tangent typed as the output it perturbs, its sharding included: traced from `portable`'s
@@ -1958,9 +1956,13 @@ def linear_map(apply: Callable, pullback: Callable, residuals, moving, *, out_av
     (the cotangents of `moving`, a tree like it): one `jax.experimental.hijax.HiPrim`, so reverse mode
     runs `pullback` whether it reaches the map through a vjp or through a jvp that a shard_map, a scan
     or `jax.linear_transpose` transposes, and under `jax.vmap` too, where the map is one of `apply` and
-    `pullback` mapped over the batch. Its tangent is the map of the moving tangents plus `apply`'s own
-    derivative in `residuals` (a higher order's). `out_aval`, where given, is the output's type (a tree of
-    avals like it), which `apply` is then traced for only where forward mode runs it. With `zero_cotangents`,
+    `pullback` mapped over the batch. A pullback reading residuals that vary over a checked map's axes its
+    moving operand does not may return each device's partial of that operand's cotangent: the map sums it
+    to the operand's type as it accumulates it, once, a batch's each lane before its lanes add
+    (`_batched_pullback`).
+    Its tangent is the map of the moving tangents plus `apply`'s own derivative in `residuals` (a higher
+    order's). `out_aval`, where given, is the output's type (a tree of avals like it), which `apply` is then
+    traced for only where forward mode runs it. With `zero_cotangents`,
     a leaf of the cotangent that is a symbolic zero reaches `pullback` as None, not zeros. With
     `traced_tangent`, for an `apply` whose derivatives at every order are declared (an aligned sum's), its
     tangent is one jvp of `apply` in the residuals and moving leaves a tangent reaches, the others held as
@@ -2062,6 +2064,8 @@ def _linear_primitive() -> type:
             return self.apply(residuals, moving)
 
         def transpose(self, out_ct, *maybe_accums):
+            from dew.nn.sharding import summed_to
+
             residuals, moving = maybe_accums
             if all_zero(out_ct):
                 return
@@ -2069,9 +2073,13 @@ def _linear_primitive() -> type:
                     if self.zero_cotangents else instantiated(out_ct))
             pulled = self.pullback(residuals, held)
             accums = jax.tree.leaves(moving, is_leaf=lambda leaf: isinstance(leaf, hijax.GradAccum))
+            # Each cotangent summed to its accumulator's type, which JAX's own check reads, once, here: a
+            # pullback reading residuals a checked map splits gives each device its partial of a replicated
+            # operand's, which the accumulator refuses unsummed (train 1511's K-F2: Parallax's second
+            # products replicated beside split values).
             for accum, value in zip(accums, jax.tree.leaves(pulled), strict=True):
                 if isinstance(accum, hijax.GradAccum):
-                    accum.accum(value)
+                    accum.accum(summed_to(value, accum.aval))
 
         def jvp(self, primals, tangents):
             residuals, moving = primals
@@ -2104,21 +2112,46 @@ def _linear_primitive() -> type:
             def applied(residuals, moving):
                 return jax.vmap(self.apply, in_axes=(residual_axes, moving_axes), **mapped)(residuals, moving)
 
-            def pulled(residuals, cotangent):
-                if self.summed_first and _unmapped(residual_axes, moving_axes):
-                    return self.pullback(residuals, jax.tree.map(_batch_summed, cotangent))
-                back = jax.vmap(self.pullback, in_axes=(residual_axes, 0), **mapped)(residuals, cotangent)
-                leaves, tree = jax.tree.flatten(back)
-                axes = jax.tree.leaves(moving_axes, is_leaf=lambda axis: axis is None)
-                return jax.tree.unflatten(tree, [
-                    _batch_summed(leaf) if axis is None else jnp.moveaxis(leaf, 0, axis)
-                    for leaf, axis in zip(leaves, axes, strict=True)])
-
+            pulled = _batched_pullback(self.pullback, jax.tree.leaves(self.in_avals[1]), residual_axes,
+                                       moving_axes, mapped, summed_first=self.summed_first)
             return (linear_map(applied, pulled, *args, zero_cotangents=self.zero_cotangents,
                                traced_tangent=self.traced_tangent, summed_first=self.summed_first),
                     jax.tree.map(lambda _: 0, self.out_aval))
 
     return Linear
+
+
+def _batched_pullback(pullback: Callable, types: list, residual_axes, moving_axes, mapped: dict, *,
+                      summed_first: bool) -> Callable:
+    """A batched linear map's pullback (`linear_map`'s batch rule) of its lane's `pullback`, the moving
+    operands' types `types` and their batch axes (`moving_axes`, None where unbatched): each lane's
+    cotangents summed to their operand's type (`sharding.summed_to`) before a shared operand's lanes add, as
+    the map's transpose sums an unbatched pullback's, so each lane cancels across devices before the lanes
+    sum (a lane's partials `2^127` and `-2^127` read 0, not `inf - inf`). Its lanes mapped under the batch's
+    name (`mapped`'s `axis_name`), so a pullback reads its lane (`lax.axis_index`), but for a name a mesh
+    axis in scope holds, mapped unnamed: the mesh's sums of every level's pullback, an inner batch's within
+    it, read the mesh's axes, where a batch named as one of them took them for its own (train 1511's
+    reviews). With `summed_first`, a batch reaching the map through its cotangent alone pulled back once,
+    its cotangent summed (`linear_map`)."""
+    import jax
+    import jax.numpy as jnp
+
+    from dew.nn.sharding import summed_to
+
+    def pulled(residuals, cotangent):
+        if summed_first and _unmapped(residual_axes, moving_axes):
+            return pullback(residuals, jax.tree.map(_batch_summed, cotangent))
+        shadows = mapped.get("axis_name") in jax.sharding.get_abstract_mesh().axis_names
+        named = {key: value for key, value in mapped.items() if key != "axis_name" or not shadows}
+        back = jax.vmap(pullback, in_axes=(residual_axes, 0), **named)(residuals, cotangent)
+        leaves, tree = jax.tree.flatten(back)
+        axes = jax.tree.leaves(moving_axes, is_leaf=lambda axis: axis is None)
+        typed = [summed_to(leaf, aval) for leaf, aval in zip(leaves, types, strict=True)]
+        return jax.tree.unflatten(tree, [
+            _batch_summed(leaf) if axis is None else jnp.moveaxis(leaf, 0, axis)
+            for leaf, axis in zip(typed, axes, strict=True)])
+
+    return pulled
 
 
 def bf16_dot_runs() -> bool:
