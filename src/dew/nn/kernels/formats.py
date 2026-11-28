@@ -240,8 +240,9 @@ def _codes(words: jax.Array, dtype: DTypeLike = jnp.float32) -> jax.Array:
     depth, width = codes.shape
     if depth % packed.NVFP4_GROUP:
         raise ValueError(f"an NVFP4 matrix's depth is whole {packed.NVFP4_GROUP}-deep groups, not {depth}")
-    codes_a_word = 32 // bits.E2M1.width
-    grouped = (depth // packed.NVFP4_GROUP, packed.NVFP4_GROUP // codes_a_word, codes_a_word, width)
+    # A group's codes as the staged order lays them (`packed.nvfp4_staged_depth`): its words, a block's
+    # depth of them, by each word's codes.
+    grouped = (depth // packed.NVFP4_GROUP, formats_of.NVFP4.depth, 32 // bits.E2M1.width, width)
     # A split depth's placement stated where its reshapes split and join it, by whole groups; any other
     # placement JAX keeps through them itself.
     placed = explicit_spec(codes)
