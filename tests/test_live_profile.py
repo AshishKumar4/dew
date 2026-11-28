@@ -5,7 +5,7 @@ the fit ladder frees of it (`dew.training.planning.priced`)."""
 import jax
 import jax.numpy as jnp
 
-from dew.nn.protocols import COPIES_SCOPE, HEAD_SCOPE, WHOLE_LOGITS, RecomputeStatement
+from dew.nn.protocols import COPIES_SCOPE, HEAD_SCOPE, UPDATE_SCOPE, WHOLE_LOGITS, RecomputeStatement
 from dew.training.live_buffers import LiveInterval
 from dew.training.memory import Held, LiveProfile, LiveSet
 from dew.training.planning import FitSearch, Rung, priced
@@ -261,11 +261,13 @@ def test_a_searchs_places_hold_each_rungs_copy_free_form_beside_it():
     (`FitSearch.placed`): its copy-only release, then each rung of the ladder and its form without the
     copies beside it, so a plan the jump admits copy-free (a tiled head without its copies) is one the
     frontier lists lighter rungs below (train 1409: the frontier's order held the start's release alone, a
-    copy-free tile in none of it, its frontier then empty). A start reading none places its rungs alone."""
+    copy-free tile in none of it, its frontier then empty). A start reading none places its rungs alone, and
+    a step that reads no copies at all each rung once, as it stands (row 14129: each priced twice)."""
     tile = rung(tile=(16, 128))
     assert FitSearch.placed(START, [tile]) == [rung(narrow=False), tile, rung(tile=(16, 128), narrow=False)]
     copy_free = rung(tile=(16, 128), narrow=False)
     assert FitSearch.placed(rung(narrow=False), [copy_free]) == [copy_free]
+    assert FitSearch.placed(START, [tile], copies=False) == [tile]
 
 
 def test_a_custom_step_reads_no_narrow_copies():
@@ -284,4 +286,47 @@ def test_a_custom_step_reads_no_narrow_copies():
         custom = SimpleNamespace(**{**vars(built), "step": lambda objective, optimizer: None})
         assert not copies_narrow(custom, state)
         assert not copies_narrow(SimpleNamespace(**{**vars(built), "dynamic_scale": True}), state)
+
+
+def test_a_rungs_stacks_are_parted_at_once_only_where_its_peak_holds_the_update():
+    """A rung that missed by 47 within what its joined stacks hold by count (60) is asked parted at once only
+    where its peak holds as much of the update's own values (`LiveSet.updating`: neither its forward's nor
+    its backward's), the stacks' phase; a peak of its layers' residuals and their gradients holds none, so
+    its parting waits for the climb's end, as it does where the peak's largest value states no op (row
+    12463: a 4B cold start parted against a residual peak; its review)."""
+    from dew.training.planning import Parting, Rung
+
+    rung = Rung((), None, fused=False, xla_defaults=False, narrow=True)
+    residual = LiveSet(0, 0, ((40, FORWARD, ("mlp",)), (30, BACKWARD, ())))
+    updating = LiveSet(0, 0, ((20, BACKWARD, ()), (50, f"jit(step)/{UPDATE_SCOPE}/dot_general", ())))
+    # A value no op states is of no phase known, the update's none.
+    unknown = LiveSet(0, 0, ((80, "", ()), (10, f"jit(step)/{UPDATE_SCOPE}/dot_general", ())))
+    assert residual.updating() == 0 and updating.updating() == 50 and unknown.updating() == 10
+    assert Parting(60, lambda verdict: [verdict]).after(rung, 47, unknown.updating()) is None
+    assert Parting(60, lambda verdict: [verdict]).after(rung, 47, residual.updating()) is None
+    parted = Parting(60, lambda verdict: [verdict]).after(rung, 47, updating.updating())
+    assert parted is not None and parted.ns_group == 1
+
+
+def test_a_rungs_miss_and_its_update_bytes_are_read_in_a_devices_bytes():
+    """A search on an allocator whose temporaries count twice (factor 2) reads a rung's miss of 80 as a
+    device's 40 and its peak's update values as the live set states them, 60, unhalved: a joined rung its
+    stacks' 60 cover is parted at once (review: the update's bytes halved to 30 deferred it)."""
+    from types import SimpleNamespace
+
+    from test_miss_driven_rungs import scripted_search
+
+    from dew.training.memory import MemoryMiss
+    from dew.training.planning import Parting
+
+    search = scripted_search(lambda mine: [mine])
+    search.factor = 2
+    at = search.rung()
+    search.probes.append(SimpleNamespace(split=1, rung=search.current()))
+    search.misses[(at, 1)] = MemoryMiss(1, scaled=0, shortfall=80, factor=2)
+    search.live[(at, 1)] = LiveSet(0, 0, ((60, f"jit(step)/{UPDATE_SCOPE}/dot_general", ()),))
+    assert search.missed_with_update(at) == (40, 60)
+    parted = Parting(60, lambda verdict: [verdict]).after(
+        Rung((), None, fused=False, xla_defaults=False, narrow=True), *search.missed_with_update(at))
+    assert parted is not None and parted.ns_group == 1
 

@@ -38,7 +38,7 @@ from dew.nn.backbones.layer_names import StoredRow, group_layers, stored_layers
 from dew.nn.kernels.generation import backend, device_generation, gpu_target
 from dew.nn.kernels.options import Option, compiler_options
 from dew.nn.kernels.templates import report
-from dew.nn.protocols import OffloadsResiduals, Recomputing, TritonGemm
+from dew.nn.protocols import UPDATE_SCOPE, OffloadsResiduals, Recomputing, TritonGemm
 from dew.objectives.base import Objective, head_fused_of, head_tile_of
 from dew.state import TrainState
 from dew.telemetry.instrumentation import CompiledMemory, compiled_memory
@@ -918,6 +918,13 @@ class LiveSet:
         free."""
         return sum(size for size, op_name, names in self.made
                    if forward_made(op_name) and dropped(op_name, names))
+
+    def updating(self) -> int:
+        """The bytes its peak holds of values its optimizer's update made (`UPDATE_SCOPE` in their op),
+        where its working values (a Newton-Schulz iteration's joined stacks) lie: none of a peak within the
+        forward or the backward, and none of a value no op states (an unknown phase's, never counted as the
+        update's)."""
+        return sum(size for size, op_name, _ in self.made if UPDATE_SCOPE in op_name)
 
     def frees(self, dropped: Callable[[str, tuple[str, ...]], bool]) -> int:
         """What a rung that does not keep the forward's values `dropped` says it does not keep frees of the
