@@ -413,7 +413,7 @@ class CompiledTruths:
         return self.read[label]
 
 
-_LIBRARY_CALLS: "weakref.WeakKeyDictionary[Callable, str]" = weakref.WeakKeyDictionary()
+_LIBRARY_CALLS: weakref.WeakKeyDictionary[Callable, str] = weakref.WeakKeyDictionary()
 """Each library arm's call (`library_arm`), by its program."""
 
 
@@ -425,12 +425,9 @@ def library_arm[Fn: Callable](fn: Fn, call: str) -> Fn:
 
 
 def library_call(fn) -> str | None:
-    """The library call `fn`'s executable makes, where it is a library arm (`library_arm`); None otherwise."""
-    try:
-        return _LIBRARY_CALLS.get(fn)
-    except TypeError:
-        # A callable no weak reference holds is no library arm.
-        return None
+    """The library call `fn`'s executable makes, where it is a library arm (`library_arm`); None otherwise,
+    a value no weak reference holds (a partial, a builtin) among them, which no arm marks."""
+    return next((call for arm, call in _LIBRARY_CALLS.items() if arm is fn), None)
 
 
 def library_checked(executable: jax.stages.Compiled, call: str, label: str) -> None:
