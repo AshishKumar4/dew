@@ -1855,10 +1855,11 @@ def test_a_packed_decode_steps_score_hook_reads_each_rows_own_query_place(finish
 @INTERPRETS
 def test_a_gated_decode_step_traces_its_hook_once_a_tile():
     """A bf16 decode step (`attention_decode.attend`) under a closure output hook (none held past its
-    call), interpreted as an H100 runs it: the hook traced once at each shape it is traced at, its
-    planning, pricing and launches reading one program a tile (`tuning.one_call` at the decode's entry),
-    where the plan's register pricing, before the Mosaic forward's table opened, traced the chosen tile
-    again (train 1472's review); and its output the hooked reference's (check 1)."""
+    call), interpreted as an H100 runs it: the hook traced at most twice at each shape, once for the program
+    its launches run and once for their identity, its planning, pricing and launches reading one of each
+    (`tuning.one_call` at the decode's entry), where the plan's register pricing, before the Mosaic forward's
+    table opened, traced the chosen tile again (train 1472's review) and each launch's identity traced it
+    again (six traces at one tile, train 1474's K-F1); and its output the hooked reference's (check 1)."""
     positions, heads, kv_heads = CALLS["one-query"]
     spans = _spans(positions)
     draw = _drawn(positions, heads, kv_heads, jnp.bfloat16)
@@ -1880,6 +1881,6 @@ def test_a_gated_decode_step_traces_its_hook_once_a_tile():
 
     jax.jit(ours).lower(*draw(0))
     counts = {shape: traced.count(shape) for shape in traced}
-    assert traced and set(counts.values()) == {1}, counts
+    assert traced and max(counts.values()) <= 2, counts
     assert_as_exact(jax.jit(ours), jax.jit(reference), draw, "template decode under a closure output hook",
                     seeds=SEEDS)

@@ -35,7 +35,6 @@ from typing import ClassVar, Literal, NamedTuple, overload
 import jax
 import jax.numpy as jnp
 import numpy as np
-from jax._src import config as jax_config
 from jax.typing import DTypeLike
 from numpy.lib.array_utils import normalize_axis_tuple
 
@@ -1956,14 +1955,18 @@ def hook_program(name: str, hook, kinds: tuple[Kind, ...], dtypes: tuple[str, ..
     pullback too, so a hook whose derivative is its own rule (`jax.custom_vjp`) keys by that rule (a
     prologue's pullback runs past the kernels, `jax.vjp` of `prologued`). None or an already traced key as
     it is. Within a kernel call's making (`tuning.one_call`), traced once for each hook at these arguments,
-    whichever of the call's launches reads it: a decode step's slices and merge, each an op of its own, keyed
-    a closure hook five times, its program the same at each (train 1474's K-F1)."""
+    whichever of the call's launches reads it and under whichever context: a decode step's planning, pricing
+    and launches, each an op of its own under a context of its own, keyed a closure hook five times, its
+    program the same at each (train 1474's K-F1)."""
     if hook is None or isinstance(hook, str):
         return hook
     if (call := tuning.call_scoped()) is not None:
         source = hook.source if isinstance(hook, tuning.Prepared) else hook
+        # Keyed as `output_program` keys a call's programs, by the hook and its arguments: a call's planning,
+        # pricing and launches trace under contexts of their own (a target assumed, a launch's refusals), the
+        # one call's alike.
         place = ("hook_program", name, id(source), kinds, tuple(map(str, dtypes)), differentiated, width,
-                 str(operand), jax_config.trace_context())
+                 str(operand))
         if place not in call:
             # The hook kept beside its key, so its identity names no other hook while the call lasts.
             call[place] = (hook, _hook_program(name, hook, kinds, dtypes, differentiated=differentiated,
