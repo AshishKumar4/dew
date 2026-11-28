@@ -24,7 +24,7 @@ import jax
 import jax.numpy as jnp
 
 from dew.nn.aligned import aligned_sum
-from dew.nn.kernels.titans import mini_batches, prepared_operands, read_out, real_gradients
+from dew.nn.kernels.titans import assembled, mini_batches, prepared_operands, read_out, real_gradients
 from dew.nn.residuals import memory_chunks
 
 
@@ -65,8 +65,8 @@ def ttt_linear(query, key, value, weight, bias, eta, state=None, *, chunk: int =
         # overflowed its variance, NaN through the absent output's zero cotangent).
         readout = jnp.einsum('bhck,bhckv->bhcv', q, states[0]) + states[1][:, :, :, 0]
         reads = jnp.where(real[..., None], readout, jnp.zeros((), readout.dtype))
-        return tuple(state[:, :, -1] for state in states), jnp.moveaxis(reads, 2, 0)
+        return tuple(state[:, :, -1] for state in states), read_out(reads, q, weight, bias, eps)
 
     keys, *rest = mini_batches(chunk, k, q, v, eta, valid=valid)
     final, out = memory_chunks(mini_batch, states, (rest[0], keys, *rest[1:]))
-    return read_out(out, q, weight, bias, eps, dtype), final
+    return assembled(out, q.shape[2], dtype), final

@@ -128,6 +128,37 @@ def test_the_chunk_parallel_memory_is_the_token_by_token_one(name):
                     truth_fn=written(module, dtype=jnp.float64))
 
 
+def test_a_one_document_ttt_memory_alone_runs_the_mini_batched_kernel(monkeypatch):
+    """A TTT-Linear memory's call of rows of one document runs its mini-batched kernel
+    (`dew.nn.kernels.ttt.ttt_linear`) once, and a packed call, a call under a method interceptor and a Titans
+    memory's call take the general path, never it (train 1495's review: the route's tests held its numbers,
+    which the general path meets too)."""
+    from dew.nn.kernels import ttt
+
+    calls = []
+    kernel = ttt.ttt_linear
+
+    def counted(*args, **kwargs):
+        calls.append(args[0].shape)
+        return kernel(*args, **kwargs)
+
+    monkeypatch.setattr(ttt, "ttt_linear", counted)
+    module = layer("ttt_linear")
+    x, params = drawn(module)(0)
+    module.apply(params, x)
+    assert len(calls) == 1
+
+    def passing(next_fun, args, kwargs, context):
+        return next_fun(*args, **kwargs)
+
+    module.apply(params, x, packed(np.ones((ROWS, LENGTH), np.int32)))
+    with nn.intercept_methods(passing):
+        module.apply(params, x)
+    titans = layer("titans_linear")
+    titans.apply(drawn(titans)(0)[1], drawn(titans)(0)[0])
+    assert len(calls) == 1
+
+
 @pytest.mark.parametrize("name", ["ttt_linear"])
 def test_a_mini_batched_memory_under_a_method_interceptor_reads_the_intercepted_call(name):
     """A Flax method interceptor that stands in for its heads' calls (`nn.intercept_methods`) is honoured by
