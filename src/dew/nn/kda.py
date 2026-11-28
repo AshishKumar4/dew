@@ -228,9 +228,9 @@ class KimiDeltaAttention(nn.Module):
         # no kernel takes it in an epilogue then (train 1484's K-F3).
         fusing = not self.is_initializing() and not watched_or_owned(self.o_norm)
         # An initialization runs the general path, where the layer makes its parameters.
-        if decode and S == 1 and not forked and fusing and decode_kernel(
+        if decode and S == 1 and not forked and not self.is_initializing() and decode_kernel(
                 jax.ShapeDtypeStruct((B, self.num_heads, self.head_dim, self.head_dim), wide),
-                groups=self.num_heads, fuses=True) == 'fused':
+                groups=self.num_heads, fuses=fusing) == 'fused':
             token = self._fused_token(taps, g, beta, gate, valid, tokens.starts, projected.dtype)
 
         def split(part):

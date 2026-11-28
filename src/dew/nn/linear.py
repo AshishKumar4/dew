@@ -1307,13 +1307,13 @@ class GatedDeltaNet(nn.Module):
         return scan_cache(rows, self.conv_kernel, self.conv_features, 'recurrent_state',
                           (self.num_v_heads, self.head_k_dim, self.head_v_dim), stored, conv)
 
-    def _decode_kernel(self, x, operand) -> str:
+    def _decode_kernel(self, x, operand, *, fuses: bool) -> str:
         """The kernel a decode token runs (`decode_kernel`): the fused step with the layer's conv,
-        gates and norm (`_fused_token`), the step alone between them (`decode_gated_delta_rule`), or
-        the portable recurrence ('xla')."""
+        gates and norm (`_fused_token`) where it `fuses` them, the step alone between them
+        (`decode_gated_delta_rule`), or the portable recurrence ('xla')."""
         state = jax.ShapeDtypeStruct((x.shape[0], self.num_v_heads, self.head_k_dim, self.head_v_dim),
                                      self._stored(operand)[0])
-        return decode_kernel(state, groups=self.num_k_heads, fuses=True)
+        return decode_kernel(state, groups=self.num_k_heads, fuses=fuses)
 
     @property
     def _gates(self) -> recurrence.Gates:
@@ -1367,8 +1367,8 @@ class GatedDeltaNet(nn.Module):
         fusing = not self.is_initializing() and not watched_or_owned(self.norm)
         # An initialization runs the general path, where the layer makes its parameters.
         if decode and S == 1 and not forked and not self.is_initializing():
-            kernel = self._decode_kernel(x, operand)
-            token = self._fused_token(z, b, a, valid, operand) if kernel == 'fused' and fusing else None
+            kernel = self._decode_kernel(x, operand, fuses=fusing)
+            token = self._fused_token(z, b, a, valid, operand) if kernel == 'fused' else None
             stepped = kernel == 'step'
 
         # fp32 on purpose, as the reference notes: an fp16 A can make exp
@@ -1395,6 +1395,11 @@ class GatedDeltaNet(nn.Module):
         ported = S > 1 and kernel_routed(rows, keys, values, g, beta, **self.declared)
 
         gate = z.reshape(B, S, -1, self.head_v_dim)
+        if valid is not None:
+            # A padded token's output gate zero, as the chunked op's epilogue zeroes it (`Chunk.valid`): the
+            # norm the module runs where a caller watches it met an infinite one beside its zero cotangent as
+            # NaN in the shared weight's gradient (head review of train 1484's K-F3).
+            gate = jnp.where(valid[:, :, None, None], gate, jnp.zeros((), gate.dtype))
         # The chunked op forms the gates from their pre-activations and, where the layer has made its
         # parameters, gates and norms its output in its epilogue (`_chunk_hooks`), as the decode token does:
         # its gate, weight and output dtype, the sequence's either path's.

@@ -15,11 +15,11 @@ from reference_error import assert_as_exact
 from test_recurrence_chunk import CHUNK, KEY_WIDTH, PACKED, chunk_on, draw, hosted, token_by_token
 
 from dew.nn import norms
+from dew.nn.kda import KimiDeltaAttention
 from dew.nn.kernels import generation, norm_swiglu, recurrence
 from dew.nn.kernels.recurrence_chunk import Chunk, chunk
 from dew.nn.kernels.templates.hooks import RowHook, Side
 from dew.nn.kernels.templates.recurrence import mainloop, template
-from dew.nn.kda import KimiDeltaAttention
 from dew.nn.linear import GatedDeltaNet
 from dew.nn.mixers.mamba2 import MambaRMSNormGated
 
@@ -488,3 +488,30 @@ def test_a_captured_norm_runs_as_its_module(name):
     (normed,) = captured['intermediates'][norm]['__call__']
     assert normed.shape[:2] == x.shape[:2]
     np.testing.assert_allclose(np.asarray(out), np.asarray(module.apply(variables, x)), rtol=1e-5, atol=1e-6)
+
+
+def test_a_captured_norms_padded_gate_leaves_its_weights_gradient_finite():
+    """A gated delta net whose caller captures its calls, so its gated norm runs as its module
+    (`dense.watched_or_owned`), over a row whose last two tokens are padded and infinite: the gradient of
+    its live tokens' output by the norm's weight finite, the padded tokens' output gate zeroed before the
+    norm as the chunked op's epilogue zeroes it, where their infinite or undefined gate met their zero
+    cotangent as NaN (head review of train 1484's K-F3)."""
+    from dew.batch import coordinates
+    from dew.nn.inputs import AttentionMetadata, MixerCall
+
+    module = GatedDeltaNet(emb_features=32, num_k_heads=1, num_v_heads=2, head_k_dim=8, head_v_dim=8,
+                           chunk_size=4, dtype=jnp.float32)
+    x = np.random.default_rng(1484).standard_normal((1, 12, 32)).astype(np.float32)
+    x[:, 10:] = np.inf
+    valid = jnp.asarray(np.arange(12) < 10)[None]
+    variables = module.init(jax.random.key(3), jnp.zeros((1, 12, 32), jnp.float32))
+    call = MixerCall(AttentionMetadata(coordinates=coordinates(valid=valid)))
+
+    def live(weight):
+        params = {**variables['params'], 'norm': {**variables['params']['norm'], 'weight': weight}}
+        out, _ = module.apply({'params': params}, jnp.asarray(x), call, capture_intermediates=True,
+                              mutable=['intermediates'])
+        return jnp.sum(out[:, :10])
+
+    found = jax.jit(jax.grad(live))(variables['params']['norm']['weight'])
+    assert np.all(np.isfinite(np.asarray(found)))
