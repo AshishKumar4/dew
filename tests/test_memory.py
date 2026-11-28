@@ -194,6 +194,26 @@ def test_titans_linear_rate_takes_its_gradient_at_the_scale_the_token_path_does(
         assert all(np.isfinite(np.asarray(leaf)).all() for leaf in jax.tree.leaves(pullback(cotangent)))
 
 
+@pytest.mark.parametrize("bias", [True, False])
+def test_a_mini_batched_memorys_error_takes_its_residual_first(bias):
+    """A linear residual memory's inner error is `(k + LN(k W + b) w + c) - v`, its residual first, on its
+    mini-batched kernel as on the token path (a head review): one token, the memory at zero, its layer norm's
+    bias `[-2^100, 0]` and epsilon one, `k = [2^100, 1]`, `v = [1, 1]`, `q = [1, 0]` and a rate of `2^-100`
+    err by `[-1, 0]`, which writes the memory's first row and reads a second coordinate below zero; taken
+    against `v - k`, which rounds to `[-2^100, 0]`, the error and the update were zero."""
+    module = InContextMemory(network=ResidualMemory(hidden=None, norm=True, bias=bias, epsilon=1.0),
+                             slow=("norm",), project_key=False, output=False, chunk=1,
+                             learning_rate=Gate(value=2.0**-100))
+    x = jnp.asarray([[[2.0**100, 1.0]]], jnp.float32)
+    params = jax.tree.map(jnp.zeros_like, module.init(jax.random.key(0), x))
+    params["params"]["q_proj"]["kernel"] = jnp.asarray([[0.0, 0.0], [1.0, 0.0]], jnp.float32)
+    params["params"]["v_proj"]["kernel"] = jnp.asarray([[0.0, 0.0], [1.0, 1.0]], jnp.float32)
+    params["params"]["head_0"]["norm"]["scale"] = jnp.ones((2,), jnp.float32)
+    params["params"]["head_0"]["norm"]["bias"] = jnp.asarray([-(2.0**100), 0.0], jnp.float32)
+    for call in (PLAIN_CALL, packed(np.ones((1, 1), np.int32))):
+        assert np.asarray(module.apply(params, x, call))[0, 0, 1] < 0
+
+
 def test_packed_documents_read_as_each_alone():
     """Two documents packed in a row each start from the initial network, their chunks counted from
     their own first token: each reads, bit for bit, as the document alone."""
