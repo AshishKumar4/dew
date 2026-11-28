@@ -696,11 +696,9 @@ class _Mosaic(tiling.TilesTemplate, _GroupedLaunch[tiling.Tiles]):
     def _stores_group_rows(self, ba, family: mosaic.Family) -> bool:
         """Whether the call's tile stores each group's rows by TMA from its group's first, a row known only
         as it runs (`mosaic_gpu._stored_rows`): a grouped product's on a family staging its outputs in chunks
-        it stores by TMA (`ring_family.RingFamily`, `stores.staged_chunks`), not a dense one's (from row 0),
+        it stores by TMA (`Transport.stores_chunks`, `stores.staged_chunks`), not a dense one's (from row 0),
         nor a scattered one's (its rows landing a lane at a time), nor one through registers (`CpAsync`)."""
-        from .templates.ring_family import RingFamily
-
-        return (isinstance(family, RingFamily) and not ba.arguments.get('dense')
+        return (family.stores_chunks and not ba.arguments.get('dense')
                 and ba.arguments.get('scatter') is None)
 
     def _pingpong_refuses(self, config: tiling.Tiles, family: mosaic.Family) -> bool:
