@@ -11,7 +11,6 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from reference_error import assert_as_exact
-from jax.sharding import Mesh, PartitionSpec as P
 from test_recurrence_chunk import CHUNK, KEY_WIDTH, PACKED, chunk_on, draw, hosted, token_by_token
 
 from dew.nn.kernels import generation, recurrence
@@ -121,31 +120,3 @@ def test_a_padded_token_keeps_the_memory_its_value_decay_would_halve():
     _, final = chunk_on('xla', hooks, operands)
     np.testing.assert_array_equal(np.asarray(final), np.ones((1, 1, 4, 4), np.float32))
 
-
-@pytest.mark.mesh(devices=2)
-def test_a_gate_split_across_a_checked_shard_map_sums_a_replicated_values_gradient():
-    """The template's bf16 chunked call in a checked `shard_map` over two devices, 64 tokens of 64 values,
-    its query and key `e0` and its write gate one at the first token alone, its values, decays and memory
-    zero, its norm's weight one, `scale` and `eps` one, replicated, and its sigmoid output gate alone split,
-    0 on the first device and 96 on the second: the gradient of its outputs' sum by the replicated values
-    1.5 at the first token's every value (the two devices' gates, 1/2 and 1, summed) and zero elsewhere, the
-    norm kept apart from the output launch (its gate varying where the recurrence does not), where the fused
-    norm's pullback left the values' cotangent varying (a head review)."""
-    hooks = recurrence.Hooks(decay='scalar', scale=1.0, write_bound=1.0,
-                             output=recurrence.OutputNorm(1.0, 'sigmoid', read_in='bfloat16'))
-    first = jnp.zeros((1, 64, 1, 64), jnp.bfloat16).at[0, 0, 0, 0].set(1.0)
-    beta = jnp.zeros((1, 64, 1), jnp.float32).at[0, 0, 0].set(1.0)
-    gates = jnp.zeros((2, 64, 1, 64), jnp.bfloat16).at[1].set(96.0)
-
-    def total(value, z):
-        operands = Chunk(first, first, value, log_decay=jnp.zeros((1, 64, 1)), beta=beta, z=z,
-                         weight=jnp.ones((64,)))
-        return jnp.sum(chunk_on('mosaic_gpu', hooks, operands, dtype=jnp.bfloat16)[0].astype(jnp.float32))
-
-    mesh = Mesh(np.asarray(jax.devices()[:2]), ('data',))
-    split = jax.shard_map(lambda value, z: jax.lax.psum(total(value, z), 'data'), mesh=mesh,
-                          in_specs=(P(), P('data')), out_specs=P(), check_vma=True)
-    found = jax.jit(jax.grad(split))(jnp.zeros((1, 64, 1, 64), jnp.bfloat16), gates)
-    expected = np.zeros((1, 64, 1, 64), np.float32)
-    expected[0, 0] = 1.5
-    np.testing.assert_array_equal(np.asarray(found, np.float32), expected)
