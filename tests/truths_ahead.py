@@ -407,50 +407,61 @@ class CompiledTruths:
             held = pickle.loads((site / HELD).read_bytes())
             for name, record in held.items():
                 # A library arm's executable, the one this run loads, held to its library's call where it runs
-                # on the backend that makes it (row 14096).
-                marked = record.get("library_call")
-                if marked is not None and marked[1] == jax.default_backend():
-                    library_checked(programs[name], marked[0], f"{label}: {name}")
+                # on the platform that makes it (row 14096).
+                if (mark := record.get("library_call")) is not None:
+                    library_checked(programs[name], mark, f"{label}: {name}")
             self.read[label] = (programs, held)
         return self.read[label]
 
 
 _LIBRARY_CALLS: weakref.WeakKeyDictionary[Callable, tuple[str, str]] = weakref.WeakKeyDictionary()
-"""Each library arm's call and the backend it makes it on (`library_arm`), by its program."""
+"""Each library arm's call and the platform it makes it on (`library_arm`), by its program."""
 
 
-def library_arm[Fn: Callable](fn: Fn, call: str, backend: str = "gpu") -> Fn:
+def library_arm[Fn: Callable](fn: Fn, call: str, platform: str = "gpu") -> Fn:
     """`fn`, a library arm's program (`generation_support.cublas_compiled`), marked as one whose executable
-    calls the library's `call` where it runs on `backend` (a GPU's cuBLAS; elsewhere its dots are XLA's own),
-    which the gate checks it by where it runs there (`library_checked`): a prepared executable as its run
-    loads it (`CompiledTruths._site`), else the run's own compile (`arm_store._library_checked`)."""
-    _LIBRARY_CALLS[fn] = (call, backend)
+    calls the library's `call` where it runs on `platform` (a GPU's cuBLAS; elsewhere its dots are XLA's
+    own), which the gate checks it by where it runs there (`library_checked`): a prepared executable as its
+    run loads it (`CompiledTruths._site`), else the run's own compile (`arm_forms._LibraryChecked`)."""
+    _LIBRARY_CALLS[fn] = (call, platform)
     return fn
 
 
 def library_call(fn) -> tuple[str, str] | None:
-    """The library call `fn`'s executable makes and the backend it makes it on, where it is a library arm
+    """The library call `fn`'s executable makes and the platform it makes it on, where it is a library arm
     (`library_arm`); None otherwise, a value no weak reference holds (a partial, a builtin) among them, which
-    no arm marks. Read where an arm is prepared, whatever the host, and checked where it runs on that
-    backend (`library_checked`)."""
+    no arm marks. Read where an arm is prepared, whatever the host, and checked where its executable runs on
+    that platform (`library_checked`)."""
     return next((marked for arm, marked in _LIBRARY_CALLS.items() if arm is fn), None)
 
 
-def library_checked(executable: jax.stages.Compiled, call: str, label: str) -> None:
-    """`executable`, a library arm's (`generation_support.cublas_compiled`) as it runs, read by its
-    instructions as XLA's own schema reads them (`dew.telemetry.instrumentation.hlo_instructions`): it calls
-    the library's `call` (cuBLASLt's `__cublas$lt$matmul`) and runs no dot of XLA's own, fused or not, so no
-    lane flag or fusion choice gives it another GEMM; refused otherwise, naming what it calls. Checked on
-    the executable that runs, a prepared one as its run loads it (`CompiledTruths._site`), never on a
-    compile of its own beside it (row 14096)."""
+def library_checked(executable: jax.stages.Compiled, mark: tuple[str, str], label: str) -> None:
+    """`executable`, a library arm's (`library_arm`'s `mark`, its call and the platform that makes it) as it
+    runs, read by its instructions as XLA's own schema reads them
+    (`dew.telemetry.instrumentation.hlo_instructions`) where it runs on that platform (its outputs'
+    devices', not the process's default: a GPU host's CPU-placed call runs on its CPU): it calls the
+    library's call (cuBLASLt's `__cublas$lt$matmul`) and runs no dot of XLA's own, fused or not, so no lane
+    flag or fusion choice gives it another GEMM; refused otherwise, naming what it calls. Checked on the
+    executable that runs, a prepared one as its run loads it (`CompiledTruths._site`) or the run's own
+    (`arm_forms._LibraryChecked`), never on a compile of its own beside it (row 14096)."""
     from dew.telemetry.instrumentation import hlo_instructions
 
+    call, platform = mark
+    if _platform(executable) != platform:
+        return
     instructions = hlo_instructions(executable).values()
     targets = {each.target for each in instructions} - {""}
     if call not in targets:
         raise AssertionError(f"{label}: the library arm calls {sorted(targets)}, no {call}")
     if any(each.op == "dot" or "dot" in each.fused for each in instructions):
         raise AssertionError(f"{label}: the library arm runs a dot of XLA's own")
+
+
+def _platform(executable: jax.stages.Compiled) -> str:
+    """The platform `executable` runs on, its outputs' devices' ('gpu' for CUDA's and ROCm's)."""
+    sharding = jax.tree.leaves(executable.output_shardings)[0]
+    platform = next(iter(sharding.device_set)).platform
+    return "gpu" if platform in ("cuda", "rocm") else platform
 
 
 def compiled_memory(directory: Path, *, arms: bool = False) -> list[dict[str, int | str]]:

@@ -1,5 +1,5 @@
 """A check-1 site's arms compiled ahead into a store of programs (`truths_ahead.CompiledTruths`, a GPU tier's
-prepare) and run from it (`_stored_arms`): each arm's program traced as its run traces it and compiled as the
+prepare) and run from it (`_routed_arms`): each arm's program traced as its run traces it and compiled as the
 gate compiles it (`arm_forms._compiled`), its references' twins as written (`arm_forms._written_twin`) held
 apart."""
 
@@ -19,6 +19,7 @@ from arm_forms import (
     _declared,
     _given,
     _holds_program,
+    _LibraryChecked,
     _own_function,
     _refuse_numpy_arms,
     _RunToRun,
@@ -34,7 +35,7 @@ from float64_terms import POWER, evaluated, evaluated_on, static, traced
 from reference_error import _of_float64, _site, _SiteTerms, _sizing_seeds, _truth_program
 from store_wire import COMPILED
 from tier_wire import stop_past_cap
-from truths_ahead import AT_RUN, CompiledTruths, arm_role, library_call, library_checked, named
+from truths_ahead import AT_RUN, CompiledTruths, arm_role, library_call, named
 
 from dew.parity_stages import staged_units
 
@@ -315,15 +316,25 @@ def _hold(programs: dict, held: dict, name: str, closed, tree, inputs, again: Ca
     held[name] = {"constants": [*map(np.asarray, closed.consts)], "tree": tree}
 
 
-def _stored_arms(store: CompiledTruths, label: str, dew_fn, reference_fn, also: Mapping, compiled: tuple):
-    """A site's arms as compiled (`arm_forms._arms_with`'s `compiled`) whose every call is its draw's program
-    its prepare compiled into `store` (`_ahead_arm`), each named as its prepare named it, before any call of
-    it (`_compile_arms`); one no statement holds runs unprepared, named, and one that holds no program as it
-    is: the run's verdict's and a qualification run's sizing's (`reference_error._qualified`) alike."""
-    return (_stored_arm(store, label, dew_fn, compiled[0], "dew"),
-            _stored_arm(store, label, reference_fn, compiled[1], "reference"),
-            [_stored_arm(store, label, fn, arm, f"further {name}")
+def _routed_arms(store: CompiledTruths | None, label: str, dew_fn, reference_fn, also: Mapping,
+                 compiled: tuple):
+    """A site's arms as compiled (`arm_forms._arms_with`'s `compiled`), each as its run calls it
+    (`_routed_arm`): the run's verdict's and a qualification run's sizing's (`reference_error._qualified`)
+    alike."""
+    return (_routed_arm(store, label, dew_fn, compiled[0], "dew"),
+            _routed_arm(store, label, reference_fn, compiled[1], "reference"),
+            [_routed_arm(store, label, fn, arm, f"further {name}")
              for (name, fn), arm in zip(also.items(), compiled[2], strict=True)])
+
+
+def _routed_arm(store: CompiledTruths | None, label: str, given_fn, arm, role: str, *, written: bool = False):
+    """A site's arm `role` as its run calls it, the one route of every arm of a site's (Dew's, its
+    references', their twins as written, a library's): with `store`, a store its prepare reached the site in,
+    each call its draw's program its prepare compiled (`_stored_arm`); with none (no store, or a prepare that
+    did not reach the site), its run's own compile, a library arm held to its call (`_library_checked`)."""
+    if store is None:
+        return _library_checked(arm, given_fn, f"{label}: its {role} arm")
+    return _stored_arm(store, label, given_fn, arm, role, written=written)
 
 
 def _stored_arm(store: CompiledTruths, label: str, given_fn, arm, role: str, *, written: bool = False):
@@ -331,7 +342,7 @@ def _stored_arm(store: CompiledTruths, label: str, given_fn, arm, role: str, *, 
     draw's program its prepare compiled into `store` (`_ahead_arm`), named as its prepare named it; one no
     statement holds, or whose site's arms its prepare did not finish (its truths written, a failure before
     its arms': a flow's cell its prepare deferred, `gpu_flow.run_cells`), runs unprepared, named, and one
-    that holds no program as it is (`_stored_arms`). One of a site its prepare wrote at run (`at_run`, before
+    that holds no program as it is (`_routed_arms`). One of a site its prepare wrote at run (`at_run`, before
     `holds`) runs as given, compiled on its GPU, named (`truths_ahead.AT_RUN`), nothing unprepared. A twin
     compiled as written (`written`) is held apart from the arms compiled alike (`armed`)."""
     if not _holds_program(given_fn):
@@ -356,37 +367,14 @@ def _stored_arm(store: CompiledTruths, label: str, given_fn, arm, role: str, *, 
 def _library_checked(arm, given_fn, label: str):
     """`arm`, a site's arm its run compiles (none prepared: no store, a site its prepare did not reach, an
     unnamed or at-run arm), held to its library's call where `given_fn`'s program (`_adapted`) is a library
-    arm (`truths_ahead.library_arm`) and it runs on the backend that makes the call
-    (`truths_ahead.library_checked`), checked on the executable it runs (row 14096, train 1472's review);
-    `arm` as it is otherwise."""
+    arm (`truths_ahead.library_arm`): checked on the executable it runs (`arm_forms._LibraryChecked`) where
+    that runs on the platform that makes the call (row 14096, train 1472's review); `arm` as it is
+    otherwise."""
     def checked(given, compiled):
-        marked = library_call(given)
-        if marked is None or marked[1] != jax.default_backend():
-            return compiled
-        return _LibraryChecked(compiled, marked[0], label)
+        mark = library_call(given)
+        return compiled if mark is None else _LibraryChecked(compiled, mark, label)
 
     return _adapted(given_fn, arm, checked)
-
-
-class _LibraryChecked:
-    """A library arm (`arm`, as the gate runs it) whose program at each call's signature
-    (`arm_forms._signature`), the one it runs (its `lower`, under its switches: `Unrewritten`'s, a twin's as
-    written, a pair's selected), is compiled, checked to call `call` and run, once a signature
-    (`_library_checked`), its other attributes the arm's."""
-
-    def __init__(self, arm, call: str, label: str):
-        self.arm, self.call, self.label, self.executables = arm, call, label, {}
-
-    def __call__(self, *inputs):
-        key = _signature(inputs)
-        if key not in self.executables:
-            executable = self.arm.lower(*inputs).compile()
-            library_checked(executable, self.call, self.label)
-            self.executables[key] = executable
-        return self.executables[key](*inputs)
-
-    def __getattr__(self, name):
-        return getattr(self.arm, name)
 
 
 def _adapted(given, compiled, leaf: Callable):

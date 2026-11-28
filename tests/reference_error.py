@@ -1509,7 +1509,7 @@ def _qualified(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth_fn, 
     store of programs compiled ahead (`truths_ahead.compiled_truths`: a GPU flow's) sizes in its run, its
     sizing draws' truths computed here from its own `truth_fn`, on the host as a sizing's are; none sizes in
     a prepare, a map task or its judge, its arms the programs its prepare compiled at its sizing draws'
-    shapes (`_stored_arms`), never compiled in the run."""
+    shapes (`_routed_arms`), never compiled in the run."""
 
     record = {"site": os.environ.get("PYTEST_CURRENT_TEST", "").rsplit(" (", 1)[0], "label": label,
               "declared": seeds}
@@ -1527,11 +1527,11 @@ def _qualified(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth_fn, 
             truth_fn = _truth_program(truth_fn if truth_fn is not None else reference_fn,
                                       jax.local_devices(backend="cpu")[0])
             if store.holds(label):
-                from arm_store import _stored_arms
+                from arm_store import _routed_arms
 
                 # Its arms the programs its prepare compiled at the sizing draws' shapes too
                 # (`_compile_arms`'s `sizing`), never compiled here.
-                arms = _stored_arms(store, label, dew_fn, reference_fn, {},
+                arms = _routed_arms(store, label, dew_fn, reference_fn, {},
                                     _arms_with(dew_fn, reference_fn, [], label))[:2]
             else:
                 # A site its prepare did not reach sizes and runs unprepared, recorded before its sizing
@@ -1561,15 +1561,15 @@ def _qualified(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth_fn, 
 
 def _written_pair(store, label: str, dew_fn, reference_fn, draw, arms):
     """A qualification run's pair of Dew and its reference as written (`_qualified`), and beside it the pair
-    compiled alike: a store's prepared arms and twin where `arms` are its (`_stored_arm`), else both compiled
+    compiled alike: a store's prepared arms and twin where `arms` are its (`_routed_arm`), else both compiled
     here, their CPU mode decided once over all three arms (`_ynn_decided`) on a sizing draw, as the verdict
     decides it over all of them, so neither sizing takes another arithmetic than its verdict's.
     `(dew, twin, (dew, reference))`."""
     twin = _written_twin(dew_fn, reference_fn)
     if arms is not None:
-        from arm_store import _stored_arm
+        from arm_store import _routed_arm
 
-        return arms[0], _stored_arm(store, label, reference_fn, twin, _written_role(None), written=True), arms
+        return arms[0], _routed_arm(store, label, reference_fn, twin, _written_role(None), written=True), arms
     _refuse_numpy_arms(draw, dew_fn, reference_fn)
     alike = _arms_with(dew_fn, reference_fn, [], label)[:2]
     with summed_as_run():
@@ -1610,38 +1610,23 @@ def _site_judged(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth_fn
     # programs take the arms' place: a reference arm read from the store is its own program at its own
     # inputs alone, which a truth its run computes (its truths at run, `truths_ahead.running`) never is.
     truth_program = truth_program if truth_program is not None else compiled[1]
-    # The arms read from the store wherever its prepare reached the site, its truths' at run or not.
-    if (ahead := reading()) is None:
+    # The arms read from the store wherever its prepare reached the site, its truths' at run or not; else each
+    # its run's own compile, a library arm held to its call on it (`arm_store._routed_arm`, row 14096).
+    store = None if (ahead := reading()) is None else ahead[0]
+    if store is None:
         _refuse_numpy_arms(draw, dew_fn, reference_fn, *([] if library_fn is None else [library_fn]),
                            *also.values())
-        from arm_store import _library_checked
+    from arm_store import _routed_arm, _routed_arms
 
-        # Each arm its run compiles, no prepare having reached the site (no store, or a prepare past its cap),
-        # a library arm held to its call on the executable it runs (row 14096, train 1472's review).
-        compiled = (_library_checked(compiled[0], dew_fn, f"{label}: its Dew arm"),
-                    _library_checked(compiled[1], reference_fn, f"{label}: its reference arm"),
-                    [_library_checked(arm, fn, f"{label}: its {name} arm")
-                     for arm, (name, fn) in zip(compiled[2], also.items(), strict=True)])
-        twins = [_library_checked(twin, reference_fn if name is None else fn, f"{label}: its written twin")
-                 for (name, fn), twin in zip(written, twins, strict=True)]
-    else:
-        from arm_store import _stored_arm, _stored_arms
-
-        # Each arm's draws run by the programs its prepare compiled (`_compile_arms`), whose trace refused an
-        # arm computing in NumPy.
-        compiled = _stored_arms(ahead[0], label, dew_fn, reference_fn, also, compiled)
-        twins = [_stored_arm(ahead[0], label, fn, twin, _written_role(name), written=True)
-                 for (name, fn), twin in zip(written, twins, strict=True)]
-    dew_fn, reference_fn, further = compiled
+    # Each arm's draws run by the programs its prepare compiled (`_compile_arms`), whose trace refused an arm
+    # computing in NumPy; every role routed once.
+    dew_fn, reference_fn, further = _routed_arms(store, label, dew_fn, reference_fn, also, compiled)
+    twins = [_routed_arm(store, label, fn, twin, _written_role(name), written=True)
+             for (name, fn), twin in zip(written, twins, strict=True)]
     further = [*further, *twins]
-    library = None if library_fn is None else _arms(library_fn, library_fn)[1]
-    # A library arm's draws run by the program its prepare compiled, as the other arms' are (row 8468); with
-    # none prepared, by its run's own compile, held to its call (row 14096).
-    if library is not None:
-        from arm_store import _library_checked
-
-        library_fn = (_library_checked(library, library_fn, f"{label}: its library arm") if ahead is None
-                      else _stored_arm(ahead[0], label, library_fn, library, "library"))
+    # A library arm's draws run as the other arms' are (row 8468).
+    library_fn = (None if library_fn is None
+                  else _routed_arm(store, label, library_fn, _arms(library_fn, library_fn)[1], "library"))
     truth_fn = truth_program
     # Each range's draws, every reference's, computed once for the stages of them all.
     ranges: dict[tuple[int, int], list[_Draws]] = {}
@@ -1782,7 +1767,7 @@ def seeds_for(reference_fn, draw, label: str, *, start: int = FEWEST_SEEDS, most
     against its second), and the reference on the same inputs runs once. `orders` sizes a site whose
     verdict sweeps them (`assert_as_exact`'s `orders`): each seed's evidence is its draw's over every
     order, as the verdict reads it. `examples` sizes a site that stacks them as its verdict judges it.
-    `arms`, where given, are the pair as compiled (Dew's and the reference's, a store's, `_stored_arms`; with
+    `arms`, where given, are the pair as compiled (Dew's and the reference's, a store's, `_routed_arms`; with
     `written` the reference's twin as written), taken in place of compiling them here, an arm computing in
     NumPy refused where they were made. `progress`, where given, is told each count before its draws are
     drawn (`parity.Sized`)."""

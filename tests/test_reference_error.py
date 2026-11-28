@@ -119,6 +119,25 @@ def written_attention(query, key, value):
 
 @pytest.mark.skipif(jax.default_backend() != "cpu", reason="WITHOUT_YNN is XLA:CPU's")
 @pytest.mark.usefixtures("switched")
+def test_a_library_arm_compiled_only_with_ynnpacks_fusions_switches_its_site_before_it_is_checked():
+    """A library arm (`truths_ahead.library_arm`, marked for a CPU) whose program XLA:CPU compiles only with
+    YNNPACK's fusions (jax.nn's XLA attention's backward over a single key) switches its site's arms onto
+    them before any draw (`_ynn_decided`, reported in `SWITCHED`), as the bare arm does, and its check reads
+    the executable it then runs, the fused one, which makes no call of the mark's and is refused for that
+    (train 1472's review: the check hid the arm's pairing and lowered the variant XLA refuses)."""
+    from check1_judge import SWITCHED
+    from truths_ahead import library_arm
+
+    marked = library_arm(pulled_by_itself(xla_attention), "__a_library_call", platform="cpu")
+    with pytest.raises(AssertionError, match="no __a_library_call"):
+        assert_as_exact(marked, pulled_by_itself(written_attention), one_key_draw,
+                        "a library arm over one key", seeds=16)
+    assert [entry["label"] for entry in SWITCHED] == ["a library arm over one key"]
+    SWITCHED.clear()
+
+
+@pytest.mark.skipif(jax.default_backend() != "cpu", reason="WITHOUT_YNN is XLA:CPU's")
+@pytest.mark.usefixtures("switched")
 def test_a_check_whose_program_xla_cpu_compiles_only_with_ynnpacks_fusions_runs_both_arms_with_them(
         tmp_path, monkeypatch):
     """XLA:CPU refuses jax.nn's XLA attention's backward over a single key without YNNPACK's fusions, at

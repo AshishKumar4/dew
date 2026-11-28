@@ -94,11 +94,14 @@ class _RunToRun:
 
 def _layers(fn):
     """`fn` and every arm it adapts, outermost first: through a declaration (`_RunToRun`), a window loop
-    (`_Windowed`) and a reference's unrewritten scope (`Unrewritten`)."""
+    (`_Windowed`), a library arm's check (`_LibraryChecked`) and a reference's unrewritten scope
+    (`Unrewritten`)."""
     while True:
         yield fn
         if isinstance(fn, _RunToRun | _Windowed):
             fn = fn.fn
+        elif isinstance(fn, _LibraryChecked):
+            fn = fn.arm
         elif isinstance(fn, Unrewritten):
             fn = fn.wrapped
         else:
@@ -471,6 +474,12 @@ class _Paired:
         are its own."""
         return self.plain if self.pairing.with_ynn else self.without
 
+    def executable(self, inputs) -> jax.stages.Compiled:
+        """The executable the arm runs at `inputs`: its compile ahead where its pairing holds one
+        (`ahead`, `_ynn_decided`), else its selected program's (`selected`)."""
+        held = None if self.pairing.with_ynn else self.ahead.get(_signature(inputs))
+        return held if held is not None else self.selected.lower(*inputs).compile()
+
     @property
     def trace(self):
         """The trace of the arm the site runs (JAX's `jit(...).trace`), where it is a compiled program's:
@@ -497,6 +506,35 @@ def _signature(inputs) -> tuple:
         return type(leaf), getattr(leaf, "shape", ()), getattr(leaf, "dtype", None)
 
     return jax.dtypes.canonicalize_dtype(np.float64), tree, tuple(taken(leaf) for leaf in leaves)
+
+
+class _LibraryChecked:
+    """A library arm (`arm`, as the gate runs it; its `mark`, `truths_ahead.library_arm`'s) whose executable
+    at each call's signature (`_signature`) is checked to make its library's call where it runs on the
+    platform that makes it (`truths_ahead.library_checked`), then run: the executable the arm runs, a pair's
+    compile ahead where it holds one (`_Paired.executable`), else its program's (its `lower`, under its
+    switches: `Unrewritten`'s, a twin's as written), once a signature; the gate's layers see through it
+    (`_layers`), so its pairing is decided as the bare arm's (`_ynn_decided`). Its other attributes are the
+    arm's (row 14096, train 1472's review)."""
+
+    def __init__(self, arm, mark: tuple[str, str], label: str):
+        self.arm, self.mark, self.label, self.executables = arm, mark, label, {}
+
+    def __call__(self, *inputs):
+        from truths_ahead import library_checked
+
+        key = _signature(inputs)
+        if key not in self.executables:
+            executable = (self.arm.executable(inputs) if isinstance(self.arm, _Paired)
+                          else self.arm.lower(*inputs).compile())
+            library_checked(executable, self.mark, self.label)
+            self.executables[key] = executable
+        return self.executables[key](*inputs)
+
+    def __getattr__(self, name):
+        if name == "arm" or name.startswith("__"):
+            raise AttributeError(name)
+        return getattr(self.arm, name)
 
 
 def _paired_arms(arms) -> list[_Paired]:
@@ -543,8 +581,10 @@ def _ynn_decided(label: str, arms, inputs) -> None:
     _ynn_option_held()
     refused = None
     for arm in arms:
-        # Through a declaration alone: a window loop's arm takes each window's slices, which the draw is not.
+        # Through a declaration and a library arm's check alone: a window loop's arm takes each window's
+        # slices, which the draw is not.
         arm = arm.fn if isinstance(arm, _RunToRun) else arm
+        arm = arm.arm if isinstance(arm, _LibraryChecked) else arm
         if not isinstance(arm, _Paired) or not hasattr(arm.without, "lower"):
             continue
         try:

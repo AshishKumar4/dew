@@ -271,8 +271,8 @@ named by jaxlib for float32) and its truth: one whose executable makes the call,
 @pytest.mark.parametrize("case", LIBRARY_ARMS)
 def test_a_library_arm_is_held_to_its_call_on_the_executable_its_run_runs(tmp_path, monkeypatch, case,
                                                                           reached):
-    """A library arm marked for the backend this process runs (`truths_ahead.library_arm`, a CPU's) is held
-    to its call on the executable its run runs: the prepared one as its run loads it (`reached`,
+    """A library arm marked for a CPU (`truths_ahead.library_arm`), run on this process's CPU, is held to its
+    call on the executable its run runs: the prepared one as its run loads it (`reached`,
     `CompiledTruths._site`), or, where its prepare stopped past its cap before the site, its run's own
     compile (`arm_store._library_checked`). An arm whose executable makes its call (LAPACK's Cholesky) runs;
     one whose does not (XLA's own dot marked as cuBLAS's) is refused (train 1472's review: an arm at a site
@@ -285,19 +285,20 @@ def test_a_library_arm_is_held_to_its_call_on_the_executable_its_run_runs(tmp_pa
 
     fn, draw, call, truth = LIBRARY_ARMS[case]
     call = build_lapack_fn_target(f"{call}_ffi", np.float32) if call == "potrf" else call
-    reference = library_arm(jax.jit(fn), call, backend=jax.default_backend())
+    reference = library_arm(jax.jit(fn), call, platform="cpu")
     label = f"a library arm, {case}"
-    with monkeypatch.context() as capped:
-        if not reached:
-            capped.setenv(tier_wire.PREPARE_BY, repr(time.monotonic() - 1.0))
-        with compiled_truths(tmp_path, prepare=True, stamp="here"):
-            assert_as_exact(jax.jit(fn), reference, draw, label, seeds=8, truth_fn=truth)
-    with compiled_truths(tmp_path, prepare=False, stamp="here"):
-        if case == "its call made":
-            assert_as_exact(jax.jit(fn), reference, draw, label, seeds=8, truth_fn=truth)
-        else:
-            with pytest.raises(AssertionError, match=f"no {re.escape(call)}"):
+    with jax.default_device(jax.devices("cpu")[0]):
+        with monkeypatch.context() as capped:
+            if not reached:
+                capped.setenv(tier_wire.PREPARE_BY, repr(time.monotonic() - 1.0))
+            with compiled_truths(tmp_path, prepare=True, stamp="here"):
                 assert_as_exact(jax.jit(fn), reference, draw, label, seeds=8, truth_fn=truth)
+        with compiled_truths(tmp_path, prepare=False, stamp="here"):
+            if case == "its call made":
+                assert_as_exact(jax.jit(fn), reference, draw, label, seeds=8, truth_fn=truth)
+            else:
+                with pytest.raises(AssertionError, match=f"no {re.escape(call)}"):
+                    assert_as_exact(jax.jit(fn), reference, draw, label, seeds=8, truth_fn=truth)
 
 
 def test_a_written_twin_of_a_cublas_reference_keeps_its_compiler_options():
