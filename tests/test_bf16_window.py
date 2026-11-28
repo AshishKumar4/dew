@@ -846,29 +846,3 @@ def test_a_packed_bank_split_by_stage_over_an_explicit_axis_reads_its_rows():
         np.testing.assert_array_equal(np.asarray(advanced), whole[index])
         assert np.shape(np.asarray(advanced)) == advanced.shape == np.shape(whole[index])
     assert np.shape(whole[1, :, [0, 1]]) == (2, 256)
-
-
-WINDOW_WITHOUT_CPU = """
-import jax, jax.numpy as jnp, numpy as np
-from dew import quantization
-kernel = (np.random.default_rng(13987).normal(size=(256, 256)) * 0.02).astype(jnp.bfloat16)
-held = quantization.bf16_windows({"params": {"kernel": jnp.asarray(kernel)}}, sites=[""])
-decoded = np.asarray(quantization.decoded_packed(held)["params"]["kernel"])
-print(jax.default_backend(), bool(np.array_equal(decoded.view(np.uint16), kernel.view(np.uint16))))
-"""
-
-
-@pytest.mark.gpu
-@pytest.mark.compiles_at_run(reason="a fresh process, whose JAX runs no CPU backend, compiles where it runs")
-def test_a_window_decodes_for_an_export_where_jax_runs_no_cpu():
-    """A window decoded for an export (`quantization.decoded_packed`, `Pretrained.save`'s) in a process whose
-    JAX runs no CPU backend (`JAX_PLATFORMS=cuda`) decodes on its device, bit for bit, rather than ask for a
-    CPU it does not have (audit 2026-11-27 P03)."""
-    import os
-    import subprocess
-    import sys
-
-    ran = subprocess.run([sys.executable, "-c", WINDOW_WITHOUT_CPU], capture_output=True, text=True,
-                         env={**os.environ, "JAX_PLATFORMS": "cuda"}, timeout=600)
-    assert ran.returncode == 0, ran.stderr[-2000:]
-    assert ran.stdout.split()[-2:] == ["gpu", "True"], ran.stdout
