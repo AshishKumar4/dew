@@ -1,7 +1,8 @@
-"""Titans' linear memory (`dew.nn.kernels.titans`, fla's chunk_titans_linear_ref) and TTT-Linear
-(`dew.nn.kernels.ttt`, fla's chunk_ttt_linear_ref) a mini-batch at a time: each one's output, final states
-and every operand's gradient on par with a token recurrence from float64 (check 1), the recurrence this
-file's own (its inner gradient the inner loss's by autodiff, no part of either module's)."""
+"""Titans' linear memory (`dew.nn.kernels.titans`) and TTT-Linear (`dew.nn.kernels.ttt`) a mini-batch at a
+time, as Dew's in-context memory computes them (each token stepping by its own rate, the residual around its
+query): each one's output, final states and every operand's gradient on par with a token recurrence from
+float64 (check 1), the recurrence this file's own (its inner gradient the inner loss's by autodiff, no part
+of either module's)."""
 
 import functools
 
@@ -35,8 +36,9 @@ def _half_gradient(k, v, readout, weight, bias, eps: float):
     return jax.grad(loss)(readout)
 
 
-def _read_out(out, weight, bias, eps: float):
-    return out + _layer_normed(out, eps) * weight + bias
+def _read_out(q, out, weight, bias, eps: float):
+    """Each query plus its readout's LayerNorm under the affine: the memory's residual around its input."""
+    return q + _layer_normed(out, eps) * weight + bias
 
 
 def _tokens_first(work, *xs):
@@ -68,14 +70,15 @@ def titans_by_token(query, key, value, weight, bias, theta, alpha, eta, state=No
 
     steps = (jnp.arange(tokens[0].shape[0]), *tokens)
     (memory, momentum, _), outs = jax.lax.scan(step, (memory, momentum, memory), steps)
-    return _read_out(jnp.moveaxis(outs, 0, 1), weight, bias, eps).astype(dtype), (memory, momentum)
+    queries = jnp.moveaxis(tokens[0], 0, 1)
+    return _read_out(queries, jnp.moveaxis(outs, 0, 1), weight, bias, eps).astype(dtype), (memory, momentum)
 
 
 def ttt_by_token(query, key, value, weight, bias, eta, state=None, *, chunk: int, scale=None,
                  eps: float = 1e-6):
-    """TTT-Linear a token at a time: each mini-batch's entering memory and bias held, each token's gradient at
-    them (`_half_gradient`), its update sums running, its output read at its own rate, the state leaving
-    at the mini-batch's last token's, in at least fp32 of its operands."""
+    """TTT-Linear a token at a time as Dew's in-context memory steps it: each mini-batch's entering memory and
+    bias held, each token's gradient at them (`_half_gradient`), each token stepping the state by its own
+    rate times its own gradient and reading the state it leaves, in at least fp32 of its operands."""
     dtype = jnp.result_type(query, key, value)
     work = jnp.promote_types(dtype, jnp.float32)
     q, k, v, eta = _tokens_first(work, query, key, value, eta)
@@ -86,25 +89,23 @@ def ttt_by_token(query, key, value, weight, bias, eta, state=None, *, chunk: int
                       if state is None else (jnp.asarray(s, work) for s in state))
 
     def step(carried, at):
-        memory, offset, entering, entering_offset, keys, values = carried
+        memory, offset, entering, entering_offset = carried
         t, q, k, v, eta = at
         start = t % chunk == 0
         entering = jnp.where(start, memory, entering)
         entering_offset = jnp.where(start, offset, entering_offset)
-        keys, values = jnp.where(start, 0.0, keys), jnp.where(start, 0.0, values)
         readout = jnp.einsum('bhk,bhkv->bhv', k, entering) + entering_offset[:, :, 0]
         u = _half_gradient(k, v, readout, weight, bias, eps)
-        keys = keys + k[..., :, None] * u[..., None, :]
-        values = values + u[..., None, :]
         rate = eta[..., None, None]
-        # The state as this token leaves it: the next mini-batch's entering one at its last token.
-        memory, offset = entering - rate * keys, entering_offset - rate * values
+        memory = memory - rate * k[..., :, None] * u[..., None, :]
+        offset = offset - rate * u[..., None, :]
         out = jnp.einsum('bhk,bhkv->bhv', q, memory) + offset[:, :, 0]
-        return (memory, offset, entering, entering_offset, keys, values), out
+        return (memory, offset, entering, entering_offset), out
 
-    carried = (memory, offset, memory, offset, jnp.zeros_like(memory), jnp.zeros_like(offset))
+    carried = (memory, offset, memory, offset)
     (memory, offset, *_), outs = jax.lax.scan(step, carried, (jnp.arange(q.shape[0]), q, k, v, eta))
-    return _read_out(jnp.moveaxis(outs, 0, 1), weight, bias, eps).astype(dtype), (memory, offset)
+    return _read_out(jnp.moveaxis(q, 0, 1), jnp.moveaxis(outs, 0, 1), weight, bias,
+                     eps).astype(dtype), (memory, offset)
 
 
 def operands(form: str, dtype):
@@ -336,9 +337,9 @@ def test_ttts_rate_meets_its_keys_before_their_updates_sum():
 def test_a_later_tokens_overflowing_update_leaves_an_earlier_read_as_it_is():
     """TTT-Linear over two fp32 tokens of one mini-batch, width 2, a zero query, key and entering state, the
     second token's value `(2^127, 0)`, unit rates, an affine weight of 4 and zero bias, `eps` 1: the first
-    token's output zero, the second token's non-finite update (its LayerNorm pullback's seed `-2^127 4`)
-    selected out of the first's prefix before any product, where a zero factor times it was NaN (a head
-    review)."""
+    token's output zero, read from the state its own step leaves, the second token's non-finite update (its
+    LayerNorm pullback's seed `-2^127 4`) none of it, where a prefix holding it behind a zero factor was NaN
+    (a head review)."""
     zeros = _pair((0.0, 0.0), (0.0, 0.0))
     affine = (jnp.full((1, 2), 4.0, jnp.float32), jnp.zeros((1, 2), jnp.float32))
     out, _ = ttt_linear(zeros, zeros, _pair((0.0, 0.0), (2.0 ** 127, 0.0)), *affine, jnp.ones((1, 2, 1)),

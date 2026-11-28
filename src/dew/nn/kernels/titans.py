@@ -2,9 +2,11 @@
 kernel): a memory `M` learned at test time by gradient descent with momentum `S`, each head's `[D, D]`,
 
     S_t = eta_t S_{t-1} - 2 theta_t k_t^T u_t,    M_t = (1 - alpha_t) M_{t-1} + S_t,
-    o_t = q_t M_t + LN(q_t M_t) w + b,
+    o_t = q_t + LN(q_t M_t) w + b,
 
-`2 k_t^T u_t` the gradient at `M` of the inner loss `|LN(k_t M) w + b - (v_t - k_t)|^2`, `u_t` taken
+the memory's residual around its query, as Dew's in-context memory reads it (`dew.nn.memory`'s
+`ResidualMemory`; fla's reference reads `q M + LN(q M)`), `2 k_t^T u_t` the gradient at `M` of the inner
+loss `|LN(k_t M) w + b - (v_t - k_t)|^2`, `u_t` taken
 through the LayerNorm's backward (`inner_gradient`) at the memory entering the token's mini-batch: `chunk`
 tokens from the sequence's start share one memory their gradients are taken at, as fla's reference anchors
 them (its `M_prev_nabla`). The LayerNorm's backward is TTT's (fla/ops/ttt/naive.py), `(D g - sum g -
@@ -84,11 +86,13 @@ def real_gradients(k, v, readout, real, weight, bias, eps: float):
     return jnp.where(live, inner_gradient(k, v, jnp.where(live, readout, zeros), weight, bias, eps), zeros)
 
 
-def read_out(walked, length: int, weight, bias, eps: float, dtype):
+def read_out(walked, queries, weight, bias, eps: float, dtype):
     """A walk's readouts `[N, C, B, H, D]` as the call's output `[B, T, H, D]` in `dtype`, the padding
-    dropped: each readout plus its LayerNorm under the inner loss's affine."""
-    out = jnp.moveaxis(walked.reshape(-1, *walked.shape[2:]), 0, 2)[:, :, :length]
-    return jnp.moveaxis(out + layer_normed(out, eps) * weight + bias, 1, 2).astype(dtype)
+    dropped: each query (`[B, H, T, D]`, as the walk read it) plus its readout's LayerNorm under the inner
+    loss's affine, the memory's residual around its input (Dew's `ResidualMemory`, the TTT paper's Sec
+    2.7)."""
+    out = jnp.moveaxis(walked.reshape(-1, *walked.shape[2:]), 0, 2)[:, :, :queries.shape[2]]
+    return jnp.moveaxis(queries + layer_normed(out, eps) * weight + bias, 1, 2).astype(dtype)
 
 
 def placed_alike(affine, *operands):
@@ -189,4 +193,4 @@ def titans(query, key, value, weight, bias, theta, alpha, eta, state=None, *, ch
 
     keys, *rest = mini_batches(chunk, k, q, v, theta, alpha, eta, valid=valid)
     final, out = jax.lax.scan(mini_batch, states, (rest[0], keys, *rest[1:]))
-    return read_out(out, k.shape[2], weight, bias, eps, dtype), final
+    return read_out(out, q, weight, bias, eps, dtype), final
