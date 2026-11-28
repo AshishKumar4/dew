@@ -377,9 +377,13 @@ def shared(python: str, locks: tuple[str, ...] = ()) -> str:
 def lane_inputs(python: str) -> str:
     """The hash of what a GPU lane's file shares (`gpu_lane`): what every test file's run shares (`shared`),
     and this file and prepares.py, which set the environment (a user's process's, `VARIANTS`), share and
-    deadline each file runs under on a GPU, where a CPU task's are the session's."""
+    deadline each file runs under on a GPU, where a CPU task's are the session's; and, under a tier's word
+    (`tier_wire.GPU_TIER`, its caller's), that its files run their gpu-marked tests alone, so a submitted job's
+    run of every test it names is never a tier's row of the same file, nor a tier's a job's."""
     locks = tuple(map(str, Path("locks").glob("*.txt")))
     own = code_of(__file__).hex() + code_of(str(HERE / "prepares.py")).hex()
+    if os.environ.get(tier_wire().GPU_TIER) == "1":
+        own += "\0gpu-marked"
     return hashlib.sha256((shared(python, locks) + own).encode()).hexdigest()
 
 
@@ -2070,11 +2074,7 @@ def gpu_lane(python: str, tests: list[str], out: Path, *, cache: str, processes:
     shares = {name: share for name, (share, _) in needed.items()}
     holds = {name: held for name, (_, held) in needed.items()}
     short = gpu_measures.measured_short({name: measures[name] for name in tests}, budget)
-    # Before any test writes under tests/, the inputs every file's key hashes; and whether it runs a tier's
-    # gpu-marked tests alone (`tier_wire.GPU_TIER`, its caller's word), so a submitted job's run of every test it
-    # names is never a tier's row of the same file, nor a tier's a job's.
-    marked = os.environ.get(tier_wire().GPU_TIER) == "1"
-    common = hashlib.sha256((lane_inputs(python) + ("\0gpu-marked" if marked else "")).encode()).hexdigest()
+    common = lane_inputs(python)  # Before any test writes under tests/, the inputs every file's key hashes.
     verdicts = {name: out.with_name(f"{out.name}.{index}") for index, name in enumerate(tests)}
 
     waiting = sorted(tests, key=lambda name: -holds[name])
