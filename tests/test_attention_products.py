@@ -266,6 +266,112 @@ def test_a_banded_calls_16_bit_key_bias_sums_its_copies_gradients_before_it_roun
     assert np.isfinite(np.asarray(pull(dout)[0], np.float32)).all()
 
 
+def test_a_wide_banded_call_weighs_its_values_at_their_own_dtype():
+    """An fp64 query and key over fp16 values `[0, 1]`, logits `[0, -18]` (`_widely`, the call wide): the
+    far key's weight, 1.52e-8, rounds to fp16's 0 before its product, as every other path takes it, so the
+    output is 0, and the far value's gradient under a cotangent of `2^20` 0 (its weight's, rounded the
+    same, `_scaled_mean`), where weighed at the widened values' fp32 they read 1.52e-8 and 0.016 (train
+    1444's reviews)."""
+    with jax.enable_x64(new_val=True):
+        spans = template.spans(1, 2, 1)
+        query = jnp.zeros((1, 1, 1, 8), jnp.float64).at[..., 0].set(1.0)
+        key = jnp.zeros((1, 2, 1, 8), jnp.float64).at[0, 1, 0, 0].set(-18.0)
+        value = jnp.broadcast_to(jnp.asarray([0.0, 1.0], jnp.float16)[None, :, None, None], (1, 2, 1, 8))
+
+        def attended(value):
+            return attention_products.attend((query, query), (key, key), value, spans,
+                                             attention_products.Banded((0,)), scale=1.0)
+
+        out, pull = jax.vjp(attended, value)
+        (dvalue,) = pull(jnp.full(out.shape, 2.0 ** 20, out.dtype))
+        np.testing.assert_array_equal(np.asarray(out), np.zeros((1, 1, 1, 8)))
+        np.testing.assert_array_equal(np.asarray(dvalue, np.float32)[0, 1], np.zeros((1, 8), np.float32))
+
+
+def test_a_wide_banded_dropping_calls_kept_weight_stays_in_range():
+    """An fp64 query and key, one key, fp16 values of `2^-16`, dropout at a rate of `1 - 2^-16` over 2^20
+    queries: each kept weight 1 times its multiplier `2^16` held at its row's power before it narrows
+    (`template._narrowed_held`, as the kernels' scaled parts hold it), so a kept query reads 1 and a dropped
+    one 0, where narrowed to fp16 the multiplier read inf (train 1444's re-review)."""
+    queries = 2 ** 20
+    with jax.enable_x64(new_val=True):
+        spans = template.spans(queries, 1, 1)
+        query = jnp.zeros((1, queries, 1, 8), jnp.float64)
+        key = jnp.zeros((1, 1, 1, 8), jnp.float64)
+        value = jnp.full((1, 1, 1, 8), 2.0 ** -16, jnp.float16)
+        drop = template.Dropout(jnp.asarray([7, 11], jnp.uint32), jnp.arange(1, dtype=jnp.int32),
+                                jnp.arange(1, dtype=jnp.int32), 1.0 - 2.0 ** -16)
+        out = attention_products.attend((query, query), (key, key), value, spans,
+                                        attention_products.Banded((0,)), template.Hooks(drop=drop), scale=1.0)
+        kept = np.asarray(drop.draw(0, 0).keep(jnp.arange(queries)[:, None], jnp.arange(1)[None, :]))[:, 0]
+    assert kept.any()
+    np.testing.assert_array_equal(np.asarray(out)[0, :, 0, 0], np.where(kept, 1.0, 0.0))
+
+
+def test_a_wide_banded_calls_value_copies_sum_where_the_call_computes():
+    """fp64 queries at places 0 and 1 over one key, an fp16 value of 1, `Banded((0,))` (each query's own
+    product copy of the value), a resumed state of `m = 0, total = 1, acc = 0` (each weight 1/2), output
+    cotangents `2^130` and `-2^130`: the value's cotangent 0, its copies widened to the call's fp64 before
+    they are made (`attention_products.attend`), where widened to fp32 their cotangents `±2^129` each read
+    infinite and summed to NaN (train 1461's review)."""
+    with jax.enable_x64(new_val=True):
+        query = jnp.zeros((1, 2, 1, 8), jnp.float64)
+        key = jnp.zeros((1, 1, 1, 8), jnp.float64)
+        value = jnp.ones((1, 1, 1, 8), jnp.float16)
+        initial = template.Initial(jnp.zeros((1, 1, 2), jnp.float64), jnp.ones((1, 1, 2), jnp.float64),
+                                   jnp.zeros((1, 1, 2, 8), jnp.float64))
+
+        def attended(value):
+            return attention_products.attend((query, query), (key, key), value, template.spans(2, 1, 1),
+                                             attention_products.Banded((0,)), template.Hooks(initial=initial),
+                                             places=jnp.arange(2), scale=1.0)
+
+        out, pull = jax.vjp(attended, value)
+        cotangent = jnp.broadcast_to(jnp.asarray([2.0 ** 130, -(2.0 ** 130)])[None, :, None, None], out.shape)
+        (dvalue,) = pull(cotangent.astype(out.dtype))
+    np.testing.assert_array_equal(np.asarray(dvalue, np.float32), np.zeros((1, 1, 1, 8), np.float32))
+
+
+def test_a_wide_banded_dropping_call_of_no_keys_reads_zero():
+    """The same call over no keys (`template.spans(4, 0, 1)`), dropout at a rate of `1 - 2^-16`: zeros, a
+    row's weights of none held at its power with no maximum to take (`template._narrowed_held`)."""
+    with jax.enable_x64(new_val=True):
+        query = jnp.zeros((1, 4, 1, 8), jnp.float64)
+        key = jnp.zeros((1, 0, 1, 8), jnp.float64)
+        value = jnp.zeros((1, 0, 1, 8), jnp.float16)
+        drop = template.Dropout(jnp.asarray([7, 11], jnp.uint32), jnp.arange(1, dtype=jnp.int32),
+                                jnp.arange(1, dtype=jnp.int32), 1.0 - 2.0 ** -16)
+        out = attention_products.attend((query, query), (key, key), value, template.spans(4, 0, 1),
+                                        attention_products.Banded((0,)), template.Hooks(drop=drop), scale=1.0)
+    np.testing.assert_array_equal(np.asarray(out), np.zeros((1, 4, 1, 8)))
+
+
+def test_a_wide_banded_calls_key_bias_copies_sum_where_the_call_computes():
+    """fp64 queries at places 0 and 1 over one key of value 1, a zero fp32 key bias on the logits (a KEY
+    side), `Banded((0,))`, a resumed state of `m = 0, total = 1, acc = 0`, output cotangents `2^132` and
+    `-2^132`: the bias's cotangent 0, its copies widened to the call's fp64 (`attention_products`'s
+    `_copied_hooks`), where widened to fp32 their cotangents `±2^130` each read infinite and summed to NaN
+    (train 1472's review)."""
+    with jax.enable_x64(new_val=True):
+        query = jnp.zeros((1, 2, 1, 8), jnp.float64)
+        key = jnp.zeros((1, 1, 1, 8), jnp.float64)
+        value = jnp.ones((1, 1, 1, 8), jnp.float64)
+        initial = template.Initial(jnp.zeros((1, 1, 2), jnp.float64), jnp.ones((1, 1, 2), jnp.float64),
+                                   jnp.zeros((1, 1, 2, 8), jnp.float64))
+
+        def attended(bias):
+            hooks = template.Hooks(score=Hook(lambda s, q, k, b: s + b, (Side(bias, template.Kind.KEY),)),
+                                   initial=initial)
+            return attention_products.attend((query, query), (key, key), value, template.spans(2, 1, 1),
+                                             attention_products.Banded((0,)), hooks, places=jnp.arange(2),
+                                             scale=1.0)
+
+        out, pull = jax.vjp(attended, jnp.zeros((1, 1, 1), jnp.float32))
+        cotangent = jnp.broadcast_to(jnp.asarray([2.0 ** 132, -(2.0 ** 132)])[None, :, None, None], out.shape)
+        (dbias,) = pull(cotangent.astype(out.dtype))
+    np.testing.assert_array_equal(np.asarray(dbias), np.zeros((1, 1, 1), np.float32))
+
+
 def test_a_banded_call_takes_an_unsigned_place_without_x64():
     """A uint32 place of 0 over two keys, x64 off: the near product's key 0, the far's key 1 (band 0), its
     keys' end held unsigned beside it."""

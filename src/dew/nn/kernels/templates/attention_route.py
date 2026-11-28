@@ -23,7 +23,7 @@ import jax.numpy as jnp
 from jax.custom_derivatives import zero_from_primal
 
 from dew.nn.derivatives import KernelGlue, contracted, with_gradients_formed
-from dew.nn.kernels import generation, selection
+from dew.nn.kernels import generation, selection, tuning
 from dew.nn.kernels.templates.attention import (
     ACCURATE,
     BLOCK,
@@ -69,6 +69,7 @@ the accurate products), which a run's numerics name for every template call in t
 (`generation.run_precision`, `Numerics.forms`)."""
 
 
+@tuning.one_call
 def attend(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks | None = None,
            *, scale: float | None = None, natural: bool | None = None, accurate: bool | None = None,
            operand_dtypes: tuple | None = None, in_key: bool = False) -> jax.Array:

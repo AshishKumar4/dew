@@ -11,6 +11,7 @@ import dataclasses
 import functools
 import itertools
 import math
+import traceback
 
 import jax
 import jax.numpy as jnp
@@ -1850,3 +1851,30 @@ def test_a_packed_decode_steps_score_hook_reads_each_rows_own_query_place(finish
     read = (np.asarray(out, np.float32)[0, 0, :, 0] if finished
             else np.asarray(out.acc, np.float32)[0, :, 0, 0])
     np.testing.assert_array_equal(read, [0.5, 0.5])
+
+
+@INTERPRETS
+def test_a_gated_decode_step_traces_its_hook_once_a_tile():
+    """A bf16 decode step (`attention_decode.attend`) under a closure output hook (none held past its
+    call), interpreted as an H100 runs it: each tile's program its planning and launch read
+    (`attention_mosaic_program.output_program`) traced once (`tuning.one_call` at the decode's entry),
+    where the plan's register pricing, before the Mosaic forward's table opened, traced the chosen tile
+    again (train 1472's review)."""
+    positions, heads, kv_heads = CALLS["one-query"]
+    spans = _spans(positions)
+    query, key, value, _ = _drawn(positions, heads, kv_heads, jnp.bfloat16)(0)
+    traced = []
+
+    def doubled(out):
+        if any(frame.name == "output_program" for frame in traceback.extract_stack()):
+            traced.append(out.shape)
+        return out * 2.0
+
+    def ours(query, key, value):
+        with generation.assumed("sm90", interpreted=True):
+            return attention_decode.attend(query, key, value, spans, template.Hooks(output=Hook(doubled, ())),
+                                           interpret=True)
+
+    jax.jit(ours).lower(query, key, value)
+    counts = {shape: traced.count(shape) for shape in traced}
+    assert traced and set(counts.values()) == {1}, counts

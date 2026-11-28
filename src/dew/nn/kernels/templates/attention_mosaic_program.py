@@ -1942,13 +1942,16 @@ class BlockPlan(NamedTuple):
     allocation and emission read alike: the hook split past the launch, the block's `out_dtype`, the hook
     held in the kernel, and that hook's program at its launch's `tile` where it acts one entry at a time
     (`entrywise_hook`), with the dtypes of the tiles it makes (`tile_dtypes`), which its epilogue
-    replays a chunk of columns at a time (`sliced`)."""
+    replays a chunk of columns at a time (`sliced`). `traced` the held hook's program as its launch traced
+    it once at `tile` (`output_program`), entrywise or not, which a whole-width epilogue replays (`whole`)
+    rather than trace the hook again (train 1444's review)."""
     split: bool
     out_dtype: Any
     output_hook: bool
     program: Any = None
     tile: tuple[int, int] | None = None
     tile_dtypes: tuple[str, ...] = ()
+    traced: Any = None
 
     @property
     def pointwise(self) -> bool:
@@ -1962,6 +1965,19 @@ class BlockPlan(NamedTuple):
         if self.program is None or self.tile is None:
             return None
         return _replaying(self.program, self.tile)
+
+    def whole(self, hook: Callable) -> Callable:
+        """Its held `hook` as its launch traced it, its program replayed on an output of its whole tile; the
+        hook itself on any other, or where it holds no program."""
+        if self.traced is None or self.tile is None:
+            return hook
+        program = jax_core.jaxpr_as_fun(self.traced)
+
+        def held(out, *params):
+            # Evaluated as it was traced, its nested programs as they are (`on_tile` retraced them).
+            return program(out, *params)[0] if tuple(out.shape) == self.tile else hook(out, *params)
+
+        return held
 
     def epilogue_chunk(self, family: mosaic.Family, value_width: int, dtype, *,
                        training: bool = False, masked: bool = False, kept: bool | None = None) -> int:
@@ -2002,11 +2018,13 @@ def forward_block_plan(total_v: int, columns: int | None, out_dtype, *, has_outp
         return plan
     hook, kinds, dtypes = output
     tile = (rows, value_columns(total_v, columns))
-    closed = (entrywise_hook(hook, kinds, dtypes, tile) if program is None
-              else program if _acts_by_entry(program.jaxpr, tile) else None)
-    if closed is None:
+    traced = output_program(hook, kinds, dtypes, tile) if program is None else program
+    if traced is None:
         return plan
-    return plan._replace(program=closed, tile=tile, tile_dtypes=_tile_dtypes(closed, tile))
+    plan = plan._replace(tile=tile, traced=traced)
+    if not _acts_by_entry(traced.jaxpr, tile):
+        return plan
+    return plan._replace(program=traced, tile_dtypes=_tile_dtypes(traced, tile))
 
 
 def _tile_dtypes(closed, tile: tuple[int, int]) -> tuple[str, ...]:
@@ -2034,12 +2052,29 @@ def output_program(hook: Callable | None, kinds: tuple[Kind, ...], dtypes: tuple
     traces at none of this tile. A hook a cache may hold (`tuning.holdable`) held by its identity
     (`_Identity`), tile and the context a kernel is chosen in (`fusion.choice_context`: its numerics
     among it), so a hook traced under one run's numerics is never replayed under another's (train 1375's
-    F4); a program that captures a tracer of its caller's trace (a value an ordinary default object holds,
-    `Box(bias)`) never held (train 1427's review); any other traced each call."""
-    from dew.algebra import fusion
-
+    F4); a program that captures an array of JAX's (a tracer of its caller's trace or a device array, a
+    value an ordinary default object holds, `Box(bias)`) never held (`_captures_array`, trains 1427's and
+    1444's reviews); any other traced each call."""
     if hook is None or not callable(hook):
         return None
+    launch = tuning.call_scoped()
+    if launch is None:
+        return _held_program(hook, kinds, dtypes, tile)
+    # Within a call (`tuning.one_call`), one program a hook's source and tile: its pricing and its emission
+    # take a prepared hook (`tuning.Prepared`) apart, one wrapper each, its dtypes each as it names them.
+    source = hook.source if isinstance(hook, tuning.Prepared) else hook
+    key = (id(source), kinds, tuple(jnp.dtype(dtype).name for dtype in dtypes), tile)
+    if key not in launch:
+        # The hook kept beside its program, so its identity names no other hook while the launch lasts.
+        launch[key] = (hook, _held_program(hook, kinds, dtypes, tile))
+    return launch[key][1]
+
+
+def _held_program(hook: Callable, kinds: tuple[Kind, ...], dtypes: tuple[str, ...], tile: tuple[int, int]):
+    """`output_program`'s program of `hook` apart from a launch: held by its identity where a cache may hold
+    it, else traced each call."""
+    from dew.algebra import fusion
+
     if not tuning.holdable(hook):
         # A closure or callable object may reach an array its caller's trace made: traced here, held by none.
         return _traced_output(hook, kinds, dtypes, tile)
@@ -2050,7 +2085,7 @@ def output_program(hook: Callable | None, kinds: tuple[Kind, ...], dtypes: tuple
 
     def made():
         program = _traced_output(hook, kinds, dtypes, tile)
-        if program is not None and _captures_tracer(program.jaxpr, program.consts):
+        if program is not None and _captures_array(program.jaxpr, program.consts):
             raise _Captured(program)
         return program
 
@@ -2061,27 +2096,43 @@ def output_program(hook: Callable | None, kinds: tuple[Kind, ...], dtypes: tuple
         return captured.program
 
 
+def _deferred(eqn) -> bool:
+    """Whether an equation holds a rule its program does not materialize: a custom derivative's (a callable
+    parameter, `custom_vjp`'s `bwd` and `fwd_jaxpr_thunk`, `custom_jvp`'s `jvp_jaxpr_fun`)."""
+    return "custom" in eqn.primitive.name and any(callable(value) for value in eqn.params.values())
+
+
 class _Captured(Exception):
-    """An output hook's program closing over a tracer of its caller's trace (`output_program`): run, never
-    held."""
+    """An output hook's program closing over an array of JAX's (`output_program`, `_captures_array`): run,
+    never held."""
 
     def __init__(self, program):
-        super().__init__("an output hook's program captured a tracer")
+        super().__init__("an output hook's program captured an array")
         self.program = program
 
 
-def _captures_tracer(jaxpr: jax_core.Jaxpr, consts) -> bool:
-    """Whether a program's constants, or a literal it or a program it nests reads, hold a tracer."""
-    if any(isinstance(const, Tracer) for const in consts):
+def _captures_array(jaxpr: jax_core.Jaxpr, consts) -> bool:
+    """Whether a program's constants, or a literal it or a program it nests reads or returns, hold an array
+    of JAX's (a tracer of its caller's trace, or a concrete device array, `Box(bias)`'s), or a rule it
+    defers may (`_deferred`): a held program so would keep it resident, or alive past its trace, until
+    evicted (train 1444's reviews)."""
+    def held(value) -> bool:
+        return isinstance(value, jax.Array | Tracer)
+
+    if any(held(const) for const in consts):
         return True
     for eqn in jaxpr.eqns:
-        if any(isinstance(atom, jax_core.Literal) and isinstance(atom.val, Tracer)
-               for atom in eqn.invars):
+        if any(isinstance(atom, jax_core.Literal) and held(atom.val) for atom in eqn.invars):
+            return True
+        if _deferred(eqn):
+            # A custom derivative's rules traced only when differentiated (`custom_vjp`'s `bwd`, its
+            # forward's thunk) may close over an array no materialized program shows: never held (train
+            # 1444's re-review).
             return True
         for nested in jax_core.jaxprs_in_params(eqn.params):
-            if _captures_tracer(nested, nested.consts):
+            if _captures_array(nested, nested.consts):
                 return True
-    return False
+    return any(isinstance(atom, jax_core.Literal) and held(atom.val) for atom in jaxpr.outvars)
 
 
 class _Identity:

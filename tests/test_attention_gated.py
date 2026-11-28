@@ -3,6 +3,9 @@ forward 256 wide finishes a chunk of columns at a time in one launch of every va
 its own bytes; a hook laid at the whole width keeps the whole-width finish; each on par with the reference
 (check 1)."""
 
+import dataclasses
+import traceback
+
 import jax
 import jax.extend.core
 import jax.numpy as jnp
@@ -108,6 +111,18 @@ SPLIT = {"sm90": attention_mosaic.Tiles(64, 64, 2, 2, family="wgmma", columns=12
 past their joined columns in XLA (`attention_mosaic_program.forward_block_plan`'s split)."""
 
 
+def _pinned(hook, tiles, spans):
+    """A Mosaic forward of `(query, key, value, gate)` under the output hook `hook(out, gate)` on an H100's
+    family under the interpreter, pinned to `tiles`."""
+    def ours(query, key, value, gate):
+        hooks = template.Hooks(output=Hook(hook, (Side(gate, template.Kind.OUTPUT),)))
+        with generation.assumed("sm90", interpreted=True), tuning.pinned({attention_mosaic.MosaicForward:
+                                                                            tiles}):
+            return attention_mosaic.forward(query, key, value, spans, hooks, interpret=True)
+
+    return ours
+
+
 @INTERPRETS
 def test_a_gate_held_to_its_whole_width_runs_past_launches_of_a_block_of_its_columns():
     """A bf16 gate over a forward 256 wide whose hook holds to that width (it asserts its output's), the
@@ -121,16 +136,10 @@ def test_a_gate_held_to_its_whole_width_runs_past_launches_of_a_block_of_its_col
         assert out.shape[-1] == width, out.shape
         return _gate(out, gate)
 
-    def ours(query, key, value, gate):
-        hooks = template.Hooks(output=Hook(whole, (Side(gate, template.Kind.OUTPUT),)))
-        with generation.assumed("sm90", interpreted=True), tuning.pinned({attention_mosaic.MosaicForward:
-                                                                            SPLIT["sm90"]}):
-            return attention_mosaic.forward(query, key, value, spans, hooks, interpret=True)
-
     def reference(query, key, value, gate):
         return template.reference(query, key, value, spans, _gated(gate))
 
-    assert_as_exact(jax.jit(ours), jax.jit(reference), _wide(queries, width),
+    assert_as_exact(jax.jit(_pinned(whole, SPLIT["sm90"], spans)), jax.jit(reference), _wide(queries, width),
                     "mosaic forward, a whole-width bf16 gate over 128-column launches", seeds=SEEDS)
 
 
@@ -161,8 +170,6 @@ def test_two_output_hooks_equal_by_their_fields_keep_their_own_epilogue_programs
     and of one hash: each one's epilogue program (`attention_mosaic_program.entrywise_hook`) is its own, held
     by its identity, where a cache keyed by equality replayed the first's for the second (train 1379's
     K-F5)."""
-    import dataclasses
-
     from dew.nn.kernels.templates import attention_mosaic_program
 
     @dataclasses.dataclass(frozen=True)
@@ -218,6 +225,125 @@ def test_an_epilogue_program_holds_no_tracer_of_its_callers_trace(held):
         program = held[0]
         constants = () if program is None else program.consts
         assert not any(isinstance(constant, Tracer) for constant in constants)
+
+
+def test_an_epilogue_program_holds_no_device_array_its_hook_captured():
+    """An output hook of an ordinary object holding a concrete device array (`box=_Box(bias)`, traced
+    outside any jit, which `tuning.holdable` holds): its program, which closes over the array, is never
+    held (`_ENTRYWISE`), where held it kept the array resident until evicted (train 1444's review)."""
+    from dew.nn.kernels.templates import attention_mosaic_program
+
+    tile = (64, 128)
+    holder = _Box(jnp.full((), 3.0, jnp.float32))
+
+    def gate(out, *, box=holder):
+        return out + box.bias
+
+    program = attention_mosaic_program.entrywise_hook(gate, (), (), tile)
+    assert program is not None
+    for held in attention_mosaic_program._ENTRYWISE.values():
+        kept = held[0]
+        if kept is None:
+            continue
+        literals = [atom.val for eqn in kept.jaxpr.eqns for atom in eqn.invars
+                    if isinstance(atom, jax.extend.core.Literal)]
+        assert not any(isinstance(value, jax.Array) for value in (*kept.consts, *literals))
+
+
+def _centred(traced: list[tuple[tuple[int, ...], bool]]):
+    """A gate less its row's mean (`out - mean(out)`, no entrywise program), each trace recording in
+    `traced` the shape it traced at and whether its program's tracing
+    (`attention_mosaic_program.output_program`) made it."""
+    def centred(out, gate):
+        traced.append((out.shape, any(frame.name == "output_program" for frame in traceback.extract_stack())))
+        return _gate(out, gate) - jnp.mean(out, axis=-1, keepdims=True)
+
+    return centred
+
+
+@dataclasses.dataclass(frozen=True)
+class _Derived:
+    """An output hook doubling its output through a custom derivative whose backward reads its box's array
+    (`box.bias`), its primal array-free: the rule deferred, no materialized program showing the array."""
+
+    box: _Box
+
+    def __call__(self, out):
+        @jax.custom_vjp
+        def doubled(x):
+            return x * 2.0
+
+        doubled.defvjp(lambda x: (x * 2.0, None), lambda _, g: (g * self.box.bias,))
+        return doubled(out)
+
+
+def test_an_epilogue_program_with_a_deferred_rule_is_never_held():
+    """A held hook (`_Derived`, a dataclass over a box) whose custom derivative's backward closes over a
+    device array its primal does not read: its program, whose deferred rule no capture check sees, is
+    never held (`attention_mosaic_program._deferred`), where it was, keeping the array resident (train
+    1444's re-review)."""
+    from dew.nn.kernels.templates import attention_mosaic_program
+
+    before = len(list(attention_mosaic_program._ENTRYWISE.values()))
+    program = attention_mosaic_program.entrywise_hook(_Derived(_Box(jnp.full((), 3.0, jnp.float32))), (), (),
+                                                      (64, 128))
+    assert program is not None
+    assert len(list(attention_mosaic_program._ENTRYWISE.values())) == before
+
+
+def test_a_launchs_hook_programs_key_no_trace():
+    """A call's programs of its hooks (`tuning.one_call`), read while it makes them, leave the key a trace
+    kept past the call is held by unchanged (`options.trace_context`), so no such key holds a hook or its
+    program past the call (train 1452's re-review)."""
+    from dew.nn.kernels import options
+    from dew.nn.kernels.templates import attention_mosaic_program
+
+    before = options.trace_context()
+
+    @tuning.one_call
+    def launch():
+        attention_mosaic_program.output_program(lambda out: out * 2.0, (), (), (64, 128))
+        return options.trace_context()
+
+    assert launch() == before
+
+
+@INTERPRETS
+def test_a_calls_pricing_and_launch_trace_its_hook_once():
+    """A closure hook (none held past its call) on an H100's Mosaic forward interpreted, 64 wide: traced at
+    its launch's tile once across the call (`tuning.one_call`), its config's pricing and its launch's
+    emission reading one trace, where the pricing, outside the launch's table, traced it again (train
+    1461's review)."""
+    queries, width = 128, 64
+    traced = []
+
+    def gated(out, gate):
+        traced.append(out.shape)
+        return _gate(out, gate) - jnp.mean(out, axis=-1, keepdims=True)
+
+    spans = template.spans(queries, queries, 1, causal=True)
+
+    def ours(query, key, value, gate):
+        hooks = template.Hooks(output=Hook(gated, (Side(gate, template.Kind.OUTPUT),)))
+        with generation.assumed("sm90", interpreted=True), tuning.pinned(
+                {attention_mosaic.MosaicForward: UNSPLIT["sm90"]}):
+            return attention_mosaic.forward(query, key, value, spans, hooks, interpret=True)
+
+    jax.jit(ours).lower(*_wide(queries, width)(0))
+    assert traced.count((64, width)) == 1, traced
+
+
+@INTERPRETS
+def test_a_whole_width_epilogue_replays_its_hooks_one_program():
+    """A hook that reads its row whole (`_centred`) in a pinned H100 launch 64 wide, finished whole: traced
+    at its launch's tile by its program's tracing alone (`output_program`), its epilogue replaying that
+    program (`BlockPlan.whole`), where the epilogue traced the hook again (train 1444's review)."""
+    queries, width = 128, 64
+    traced = []
+    spans = template.spans(queries, queries, 1, causal=True)
+    jax.jit(_pinned(_centred(traced), UNSPLIT["sm90"], spans)).lower(*_wide(queries, width)(0))
+    at_tile = [made for shape, made in traced if shape == (64, width)]
+    assert at_tile and all(at_tile), traced
 
 
 def test_an_output_hooks_literal_array_is_no_entrywise_program():

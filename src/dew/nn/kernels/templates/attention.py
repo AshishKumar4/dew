@@ -41,6 +41,7 @@ from numpy.lib.array_utils import normalize_axis_tuple
 from dew._hashing import fmix32
 from dew.nn.aligned import aligned_sum
 from dew.nn.derivatives import Protected, contracted, surrogate
+from dew.nn.fake_quant import straight_through
 from dew.nn.float_bits import binade_of, lowered_rounded, raised_exactly
 from dew.nn.kernels import generation, tuning
 from dew.nn.kernels.templates import band, scaled_contraction
@@ -1362,19 +1363,19 @@ def score_modded(products: jax.Array, hooks: Hooks) -> jax.Array:
 
 @overload
 def reference(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks | None = None,
-              *, scale: float | None = None, residuals: Literal[False] = False) -> jax.Array:
+              *, scale: float | None = None, residuals: Literal[False] = False, rounded_to=None) -> jax.Array:
     ...
 
 
 @overload
 def reference(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks | None = None,
-              *, scale: float | None = None, residuals: Literal[True]
+              *, scale: float | None = None, residuals: Literal[True], rounded_to=None
               ) -> tuple[jax.Array, jax.Array, jax.Array]:
     ...
 
 
 def reference(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks | None = None,
-              *, scale: float | None = None, residuals: bool = False):
+              *, scale: float | None = None, residuals: bool = False, rounded_to=None):
     """The template's arithmetic in XLA ops: `query` `[B, Q, H, D]` over `key` and `value` `[B, K, Hk, D]` and
     `[B, K, Hk, Dv]`, a query head reading the key head it shares with `H // Hk` others, the keys `spans`
     leaves it. As the kernels compute it: products of the inputs accumulated in fp32 (fp64 for fp64
@@ -1386,8 +1387,11 @@ def reference(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpan
     no state gives zeros. With `residuals`, also each query's running maximum `m` and denominator `total`
     `[B, H, Q]` (natural log, unnormalized), in the softmax's dtype, a query that sees no key and starts
     from no state holding 0 for both, so every residual is finite; a softmax resumed from them (`Initial`)
-    starts such a query from `m = -inf`. No hooks where `hooks` is None."""
+    starts such a query from `m = -inf`. No hooks where `hooks` is None. `rounded_to`, where given, is the
+    dtype the probabilities round to in the values' stead: values a caller widened (its copies' gradients
+    summed wide) weighed as their own dtype's (`attention_products._widely`)."""
     hooks = Hooks() if hooks is None else hooks
+    rounded_to = value.dtype if rounded_to is None else jnp.dtype(rounded_to)
     walked_initial(hooks.initial)
     batch, queries, heads, _ = query.shape
     kv_heads = key.shape[2]
@@ -1412,25 +1416,27 @@ def reference(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpan
     carried = jnp.where(jnp.isfinite(m0), jnp.exp(m0 - safe), 0)
     total = total0 * carried + jnp.sum(p, axis=-1)
 
-    def valued(weights: jax.Array, *, cotangent_wide: bool = False) -> jax.Array:
-        # The weights narrowed to the values' dtype times the values, a query group's over its key head. With
-        # `cotangent_wide` the weights' cotangent dO·Vᵀ fp32, the product's value and the values' cotangent
-        # the narrowed one's as they are: an fp16 dropping call's reached 8 x 2^15 before the small weight
-        # that takes it finite, inf in fp16 (row 9506's gradients).
+    def valued(weights: jax.Array, *, bound: float | None = None) -> jax.Array:
+        # The weights narrowed to the values' dtype times the values, a query group's over its key head.
+        # Values a caller widened (`rounded_to`), and an fp16 dropping call's, take their weights rounded
+        # straight through, held wide, so the weights' and the values' cotangents are the wide product's
+        # (an fp16 dropping call's reached 8 x 2^15 before the small weight that takes it finite, inf in
+        # fp16, row 9506's gradients); where a dropping call's multiplier `bound` can take a weight past
+        # fp16's largest, at each row's power of two, as the kernels' scaled parts hold them
+        # (`attention_algebra.weights_parts`): a kept weight of 1 times a multiplier of 2^16 (train 1452's
+        # review).
         def product(grouped, operand):
             return float32_einsum("bhgqk,bkhd->bhgqd", grouped, operand, precision=REFERENCE_PRECISION,
                                   preferred_element_type=wide).reshape(batch, heads, queries, value.shape[-1])
 
         grouped = weights.reshape(batch, kv_heads, heads // kv_heads, queries, spans.keys)
-        narrowed = product(grouped.astype(value.dtype), value)
-        if not cotangent_wide:
-            return narrowed
-        # Its value the narrowed product's; its derivatives at every order the same bilinear product's in
-        # fp32, the narrowing straight through, both operands live (`derivative_of`).
-        rounded = grouped.astype(value.dtype).astype(grouped.dtype)
-        wide_product = product(grouped + jax.lax.stop_gradient(rounded - grouped),
-                               value.astype(grouped.dtype))
-        return jax.lax.stop_gradient(narrowed) + derivative_of(wide_product)
+        sixteen = bound is not None and jnp.dtype(rounded_to) == jnp.float16
+        if rounded_to == value.dtype and not sixteen:
+            return product(grouped.astype(rounded_to), value)
+        past = bound is not None and sixteen and bound > float(jnp.finfo(jnp.float16).max)
+        rounded = (_narrowed_held(grouped, rounded_to) if past
+                   else grouped.astype(rounded_to).astype(grouped.dtype))
+        return product(straight_through(grouped, rounded), value.astype(grouped.dtype))
 
     drop = hooks.drop
     if hooks.rounds is not None:
@@ -1441,8 +1447,8 @@ def reference(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpan
         acc = acc0 * carried[..., None] + valued(p)
         normalized = jnp.where(total[..., None] > 0, acc / jnp.where(total > 0, total, 1)[..., None], 0)
         if hooks.initial is None or hooks.initial.valueless:
-            normalized = held_mean(acc, total, value.dtype, functools.partial(
-                _scaled_mean, logits, value, m0, total0, acc0))
+            normalized = held_mean(acc, total, rounded_to, functools.partial(
+                _scaled_mean, logits, value, m0, total0, acc0, rounded_to))
         if hooks.output.fn is None and jnp.dtype(query.dtype).itemsize == 2:
             # Rounded to odd for its narrowing, as the kernels' quotients outside a register epilogue are.
             normalized = narrowing_settled(normalized, acc, total, query.dtype)
@@ -1461,11 +1467,23 @@ def reference(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpan
         drawn = jax.vmap(jax.vmap(multiplier, in_axes=(None, 0)), in_axes=(0, None))(jnp.arange(batch),
                                                                                     jnp.arange(heads))
         normalized = acc0 * (carried * inverse)[..., None] + valued((p * inverse[..., None]) * drawn,
-                                                                   cotangent_wide=value.dtype == jnp.float16)
+                                                                   bound=drop.bound)
 
     out = output_hooked(normalized, hooks.output.fn, hooks.output.sides)
     out = jnp.swapaxes(out.astype(query.dtype), 1, 2)
     return (out, safe, total) if residuals else out
+
+
+def _narrowed_held(x: jax.Array, dtype) -> jax.Array:
+    """`x` rounded to `dtype`, held in `x`'s own dtype; an entry past `dtype`'s range rounded at its row's
+    power of two (its last axis', the row's largest at `2^13`) instead, as the kernels' scaled parts hold a
+    dropping call's weights (`attention_algebra.weights_parts`), every other entry as it narrows."""
+    largest = jnp.max(jnp.abs(x), axis=-1, keepdims=True, initial=0)
+    _, exponent = jnp.frexp(jnp.where(largest > 0, largest, 1))
+    shift = 14 - exponent
+    scaled = power2(power2(x, shift).astype(dtype).astype(x.dtype), -shift)
+    past = jnp.abs(x) > float(jnp.finfo(dtype).max)
+    return jnp.where(past, scaled, x.astype(dtype).astype(x.dtype))
 
 
 def saturated(x: jax.Array, finite_operands: jax.Array, dtype=None) -> jax.Array:
@@ -1589,7 +1607,7 @@ def held_mean(acc: jax.Array, total: jax.Array, dtype, law) -> jax.Array:
 
 
 def _scaled_mean(logits: jax.Array, value: jax.Array, m0: jax.Array, total0: jax.Array,
-                 acc0: jax.Array) -> jax.Array:
+                 acc0: jax.Array, rounded_to=None) -> jax.Array:
     """The mean of the values `[B, K, Hk, Dv]` at the logits `[B, H, Q, K]` beside a state (its maximum `m0`
     and mass `total0`, `[B, H, Q]`, and its sums `acc0`, `[B, H, Q, Dv]`, a valueless state's zero), `[B, H,
     Q, Dv]`, as the reference forms it (`valued`): each key's mass at the row's maximum, held out of the graph
@@ -1606,7 +1624,10 @@ def _scaled_mean(logits: jax.Array, value: jax.Array, m0: jax.Array, total0: jax
     reached = jnp.maximum(m0, jnp.max(logits, axis=-1, initial=-jnp.inf))
     shift = jax.lax.stop_gradient(jnp.where(jnp.isfinite(reached), reached, 0))
     masses = jnp.where(jnp.isfinite(logits), jnp.exp(logits - shift[..., None]), 0)
-    narrowing = jax.lax.stop_gradient(masses.astype(value.dtype).astype(masses.dtype) - masses)
+    # The masses rounded where the values' own dtype rounds them (`rounded_to`: values a caller widened
+    # weigh at their own, `reference`), their cotangents wide.
+    rounded_to = value.dtype if rounded_to is None else rounded_to
+    narrowing = jax.lax.stop_gradient(masses.astype(rounded_to).astype(masses.dtype) - masses)
     carried = jnp.where(jnp.isfinite(m0), jnp.exp(m0 - shift), 0)
     seen = jax.lax.stop_gradient(jnp.sum(masses, axis=-1) + total0 * carried) > 0
     form = scaled_contraction.Form(

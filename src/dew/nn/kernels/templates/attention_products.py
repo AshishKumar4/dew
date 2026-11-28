@@ -122,15 +122,21 @@ def attend(queries: Sequence[jax.Array], keys: Sequence[jax.Array], value: jax.A
     # computed in its own dtype (`attention_route.attend`'s `operand_dtypes`), so each sums its copies' and
     # rounds once; the queries as they come.
     dtypes = (jnp.result_type(*keys), value.dtype)
-    # Widened, never narrowed: an fp64 operand stays fp64 (`promote_types`), its hook's sides too where the
-    # call is wide (`selected`).
-    query, key, value, spans, hooks = selected(
-        queries, [key.astype(jnp.promote_types(key.dtype, jnp.float32)) for key in keys],
-        value.astype(jnp.promote_types(value.dtype, jnp.float32)), spans, combine, hooks, places)
+    # Widened, never narrowed, to the call's accumulation before their copies are made: fp32 at least, the
+    # call's widest where it is wide (an fp64 query's call takes fp16 values to fp64), so two copies'
+    # cotangents past fp32 (`±2^129`) sum where the call computes before any rounds (train 1461's review);
+    # its hook's sides too where the call is wide (`selected`).
+    widest = _wide(*queries, *keys, value, hooks=hooks) or jnp.dtype(jnp.float32)
+
+    def widened(operand):
+        return operand.astype(jnp.promote_types(operand.dtype, widest))
+
+    query, key, value, spans, hooks = selected(queries, [widened(key) for key in keys], widened(value), spans,
+                                               combine, hooks, places)
     scale = queries[0].shape[-1] ** -0.5 if scale is None else scale
     wide = _wide(query, key, value, hooks=hooks)
     if wide is not None:
-        return _widely(query, key, value, spans, hooks, scale, wide)
+        return _widely(query, key, value, spans, hooks, scale, wide, rounded_to=dtypes[1])
     return attention_route.attend(query, key, value, spans, hooks, scale=scale, natural=natural,
                                   accurate=accurate, operand_dtypes=dtypes)
 
@@ -147,14 +153,17 @@ def _wide(*operands, hooks: Hooks | None = None) -> jnp.dtype | None:
 
 
 def _widely(query, key, value, spans: KeySpans, hooks: Hooks | None, scale: float | None,
-            wide: jnp.dtype) -> jax.Array:
+            wide: jnp.dtype, *, rounded_to=None) -> jax.Array:
     """A wide call on the template's arithmetic in XLA ops at its dtype `wide` (`_wide`), forward and
     backward (`reference`): its query and key under their prologues at their own dtypes first
     (`prologues_taken`: a prologue sees its operand's dtype), then the query taken to `wide`, so the
     softmax's dtype is the call's, not the query's alone (an fp32 query over fp64 keys tied the logits
-    `2^24` and `2^24 + 1`); its output in the query's own dtype."""
+    `2^24` and `2^24 + 1`); its output in the query's own dtype. Values a Banded call widened for its copies'
+    gradients weigh at their own dtype, `rounded_to` (the route's `operand_dtypes`): fp16 values under fp64
+    logits `[0, -18]` read 0, where weighed at fp32 they read 1.52e-8 (train 1444's review)."""
     taken, key, hooks = prologues_taken(query, key, hooks)
-    return reference(taken.astype(wide), key, value, spans, hooks, scale=scale).astype(query.dtype)
+    return reference(taken.astype(wide), key, value, spans, hooks, scale=scale,
+                     rounded_to=rounded_to).astype(query.dtype)
 
 
 def _paired(queries: Sequence[jax.Array], keys: Sequence[jax.Array]) -> int:
@@ -238,10 +247,12 @@ def _copied_hooks(hooks: Hooks, products: int, count: int, *, wide: jnp.dtype | 
 
     # A side along the keys once a copy, at the dtype the kernels compute it in (`kept_value`), so its
     # copies' gradients sum before they round to its own (a 16-bit bias's near and far terms each past its
-    # largest, summing to 0); a wide call's at its own, at least fp32 (an fp64 bias of `-(2^24 + 1)` kept).
+    # largest, summing to 0); a wide call's at the call's accumulation, `wide` (an fp64 bias of
+    # `-(2^24 + 1)` kept, an fp32 one's copies' cotangents past fp32 summed before they round, train
+    # 1472's review).
     def kept(value):
         if wide is not None and jnp.issubdtype(value.dtype, jnp.floating):
-            return value.astype(jnp.promote_types(value.dtype, jnp.float32))
+            return value.astype(jnp.promote_types(value.dtype, wide))
         return kept_value(value)
 
     sides = tuple(Side(jnp.concatenate([kept(side.value)] * products, axis=side.axes.index("keys")),

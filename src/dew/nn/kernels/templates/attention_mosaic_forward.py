@@ -1635,8 +1635,12 @@ def _stored_walk(program: _Program, spec: algebra.Forward, state: algebra.Partia
                       else write_chunks(stage) if stage.shape[-1] == chunk
                       else family.stored((mosaic.StagedWriter(write_chunks),), (out_view,), smem=stage))
         else:
+            # The hook as the launch traced it once (`BlockPlan.whole`), not traced a second time here.
+            hook = hooks.output.fn
+            if hook is not None and program.block_plan is not None:
+                hook = program.block_plan.whole(hook)
             output, maximum, denominator = algebra.finish(spec, state, initial=hooked.initial is not None,
-                                                          output_mod=hooks.output.fn,
+                                                          output_mod=hook,
                                                           output_params=out_params(state.acc),
                                                           held=program.parts > 1)
             out_stage(lambda stage: family.stored((_kept_rows(family, keep, output, out_view),), (out_view,),
@@ -1920,6 +1924,7 @@ def _paged_views(refs: dict, table, row, head, page: int, block_k: int) -> dict:
     return {name: (ref.at[head], tile) for name, ref in refs.items()}
 
 
+@tuning.one_call
 def _launch(query, key, value, spans: _Spans | None, hooked: _Hooked, *,
             spec: algebra.Forward, hooks: Hooks, tiles: Tiles, family: mosaic.Family, training: bool,
             interpret: bool, columns: int | None = None, peaks: bool = False,

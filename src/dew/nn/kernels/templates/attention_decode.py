@@ -720,6 +720,7 @@ def attend(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, 
            bounds: jax.Array | None = None, finished: Literal[False], in_key: bool = False) -> Initial: ...
 
 
+@tuning.one_call
 def attend(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks | None = None, *,
            scale: float | None = None, interpret: bool = False, table: jax.Array | None = None,
            sources: jax.Array | None = None, scales: tuple[jax.Array, jax.Array] | None = None,
