@@ -719,15 +719,18 @@ def test_a_gh200s_triton_merge_prices_its_slots_at_its_own_step():
     def waited(slices: int) -> float:
         padded = jax.ShapeDtypeStruct((1, slices, 1, 1, 64), jnp.float32)
         stacked = jax.ShapeDtypeStruct((2, 1, 1, slices, 1), jnp.float32)
-        return cost.chained(merged.launch_work(SPECS["fold"], padded, stacked, 1, 64, target), target)
+        # The Pallas Triton merge, whose launches the receipt timed, whatever the selector takes.
+        with generation.chosen(merge="triton"):
+            return cost.chained(merged.launch_work(SPECS["fold"], padded, stacked, 1, 64, target), target)
 
     # Eight slots more, each a step of each of its three passes (`means.merged_state_chunked`'s joining,
     # placing and summing), each step the GH200's.
     eight = np.float64(8 * 3 * target.kernel_step_seconds)
     assert_computes_the_oracle(np.float64(waited(16) - waited(8)), eight, "eight slots' steps", roundings=8)
-    # Nine slices take a chunk of sixteen slots (`windows.chunk_width`), padded slots priced alike: the same
-    # slot-bound wait as sixteen.
-    assert waited(9) == waited(16)
+    # Nine slices fill whole chunks (`windows.chunk_width`'s), their padded slots priced as the others: the
+    # same slot-bound wait as the slots those chunks hold.
+    width = windows.chunk_width(9)
+    assert waited(9) == waited(-(-9 // width) * width)
 
 
 def test_a_padded_merges_launch_work_counts_common_passes_unmasked_bytes_and_span():
