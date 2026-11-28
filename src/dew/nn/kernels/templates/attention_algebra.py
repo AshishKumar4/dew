@@ -528,10 +528,28 @@ def nan_massless(spec: Forward, state: Partial) -> Partial:
     weight its backward recomputes over that denominator are NaN as jax.nn's are (`inverse`, `output_of`,
     `attention_gradient.dq_finish`); a padding row's sliced off with the call's. Its walk's rewalk test reads
     the walk's state before it (`reached`). A split walk's slices are no whole walk: their merge finishes the
-    row."""
+    row (`merged_massless`)."""
     if not spec.massless_nan:
         return state
+    return _massless_marked(state)
+
+
+def _massless_marked(state: Partial) -> Partial:
+    """`state` with each row of no mass (`no_keys`) its total NaN: the one mark of a row its call reads NaN,
+    a whole walk's (`nan_massless`) and a finished merge's (`merged_massless`)."""
     return state._replace(total=jnp.where(no_keys(state.total), jnp.nan, state.total))
+
+
+def merged_massless(state: Partial) -> Partial:
+    """A merge's finished `state` (`finished_merged`'s, its output its sums) where its call reads a row of no
+    mass NaN (`Forward.massless_nan`, a merge's `massless`): each such row's total NaN (`_massless_marked`)
+    and its output NaN with it, as a whole walk's finish reads it (`inverse`), before an output hook the
+    merge fuses reads the row (kernel-templates.md's Partial: the hooks run once, after the final merge, on
+    what it finished). The merge's slices exclude the row, each slice's state kept as its launch wrote it,
+    so the row is read here, once, on the law's path and in each launch alike (row 14204)."""
+    marked = _massless_marked(state)
+    unread = expand(marked.total != marked.total, marked.acc)
+    return marked._replace(acc=jnp.where(unread, jnp.nan, marked.acc))
 
 
 def empty(rows: int, width: int, *, scaled: bool = False) -> Partial:
@@ -1918,7 +1936,7 @@ def finish(spec: Forward, state: Partial, *, initial: bool, output_mod: Callable
            ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """The block's output `[bq, Dv]` fp32 (its weighted values over its denominator, zero for a query
     that saw nothing and started from no state, then the output hook) and its residual rows
-    (`finished_rows`); the output is the derived forms' ratio (`_derived_output`), which a scaled walk's
+    rows (`finished_rows`); the output is the derived forms' ratio (`_derived_output`), which a scaled walk's
     rows' scale leaves (both its sums are at it). A `normalized` state's sums are its output already (a
     merge of finished states, `finished_merged`): zero where it holds no mass. Where its arithmetic flushes
     a subnormal result (XLA's CPU, `bodies.subnormals`), its ratio is `quotient`'s, held at the values'

@@ -199,7 +199,8 @@ class OperandRead(NamedTuple):
     an fp32 value is split into (none where it is already held), its stage's `swizzle` (bytes; the
     family's default where None), whether it stays live across products (`retained`: its whole loaded
     granule) or is staged for this product from registers (`staged`: dead before the product reloads its
-    fragments), and, a right operand's, whether its storage is transposed."""
+    fragments), and, a right operand's, whether its storage is transposed and whether this product alone
+    reads it (`alone`: no later product reads its fragments, `product_phases`' single readers)."""
 
     dtype: jnp.dtype
     parts: int = 1
@@ -207,6 +208,7 @@ class OperandRead(NamedTuple):
     retained: bool = False
     staged: bool = False
     transposed: bool = False
+    alone: bool = False
 
     @classmethod
     def of(cls, operand: Stored, **read) -> "OperandRead":
@@ -218,10 +220,11 @@ def operand_fragments(family: "Family", rows: int, depth: int, columns: int, lhs
                       rhs: OperandRead) -> list:
     """The register live set of a product `[rows, depth] @ [depth, columns]`'s operands, each read as `lhs`
     and `rhs` state: their issuer at the operand's dtype, the slices consumed and loaded ahead within a
-    stage's granule (`Family.operand_live_depth`), each operand's replicating warps and parts. An operand
-    retained across products keeps its whole loaded granule. A value staged for its product dies before the
-    product reloads its fragments: those are separate phases, whose larger set is returned. Where products
-    read shared memory, only that staging phase holds registers."""
+    stage's granule (`Family.operand_live_depth`), the right one's columns its loads feed at once where it
+    loads an instruction's depth for this product alone (`Issuer.fed_columns`), each operand's replicating
+    warps and parts. An operand retained across products keeps its whole loaded granule. A value staged for
+    its product dies before the product reloads its fragments: those are separate phases, whose larger set
+    is returned. Where products read shared memory, only that staging phase holds registers."""
     staged = ([(rows, depth, lhs.dtype)] * lhs.parts if lhs.staged else [])
     staged += ([(depth, columns, rhs.dtype)] * rhs.parts if rhs.staged else [])
     if not family.operands_in_registers:
@@ -229,11 +232,18 @@ def operand_fragments(family: "Family", rows: int, depth: int, columns: int, lhs
     left_issuer, right_issuer = family.for_dtype(lhs.dtype), family.for_dtype(rhs.dtype)
     left_depth = left_issuer.operand_live_depth(
         depth, left_issuer.lhs_fragment_depth(depth, swizzle=lhs.swizzle), retained=lhs.retained)
-    right_depth = right_issuer.operand_live_depth(
-        depth, right_issuer.rhs_fragment_depth(depth, transposed=rhs.transposed, swizzle=rhs.swizzle),
-        retained=rhs.retained, transposed=rhs.transposed)
+    right_loaded = right_issuer.rhs_fragment_depth(depth, transposed=rhs.transposed, swizzle=rhs.swizzle)
+    right_depth = right_issuer.operand_live_depth(depth, right_loaded, retained=rhs.retained,
+                                                  transposed=rhs.transposed)
+    # A right operand loaded an instruction's depth at a time that this product alone reads (`alone`) feeds
+    # its instructions a few columns at once (`Issuer.fed_columns`); one another product reads, or loaded
+    # deeper than an instruction (a granule the next instructions read too), is live over every column
+    # (ET-CENSUS80: a 64 x 192 forward's keys at the widest swizzle held 162 of its 291 registers).
+    fed = (right_issuer.fed_columns(rows, columns)
+           if rhs.alone and not rhs.retained and right_loaded <= right_issuer.fragment_depth(depth)
+           else columns)
     fragments = ([(rows * family.lhs_copies, left_depth, lhs.dtype)] * lhs.parts
-                 + [(right_depth, columns * family.rhs_copies, rhs.dtype)] * rhs.parts)
+                 + [(right_depth, fed * family.rhs_copies, rhs.dtype)] * rhs.parts)
     # A value staged into shared memory dies before its product loads the fragments back.
     return largest_live_set(staged, fragments) if staged else fragments
 
@@ -241,8 +251,12 @@ def operand_fragments(family: "Family", rows: int, depth: int, columns: int, lhs
 class Product(NamedTuple):
     """One product a launch issues (`product_phases`): `[rows, depth] @ [depth, columns]`, the register
     tiles live `beside` it, whether its left value is already `held` in registers (no fragments of its
-    own), whether its right operand's storage is `transposed`, and the right operand's `source`: products
-    naming one source read one staged value, live from its first reader through its last."""
+    own), whether its right operand's storage is `transposed`, the right operand's `source`: products
+    naming one source read one staged value, live from its first reader through its last; and whether a
+    step issues this product alone against its right operand (`alone`: one left operand, no parts of it each
+    issued against the same fragments, as an fp32 call's weights' parts, fp16's dropped weights' two and a
+    scaled walk's small weights are), whose loads then feed its instructions a few columns at once
+    (`OperandRead.alone`)."""
 
     rows: int
     depth: int
@@ -251,6 +265,7 @@ class Product(NamedTuple):
     held: bool = False
     transposed: bool = False
     source: Hashable | None = None
+    alone: bool = False
 
 
 def product_phases(family: "Family", dtype, *products: Product, lhs_swizzle: int | None = None,
@@ -274,8 +289,9 @@ def product_phases(family: "Family", dtype, *products: Product, lhs_swizzle: int
     phases = []
     for i, product in enumerate(products):
         left = OperandRead(dtype, parts=0 if product.held else 1, swizzle=lhs_swizzle)
+        alone = product.alone and product.source not in retained
         right = OperandRead(dtype, parts=0 if product.source in retained else 1, swizzle=rhs_swizzle,
-                            transposed=product.transposed)
+                            transposed=product.transposed, alone=alone)
         fragments = operand_fragments(family, product.rows, product.depth, product.columns, left, right)
         live = [tile for first, last, tiles in retained.values() if first <= i <= last for tile in tiles]
         phases.append([*product.beside, *fragments, *live])

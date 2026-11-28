@@ -98,7 +98,7 @@ from .precision import (
     float32_einsum,
     sums_in_float64,
 )
-from .sharding import SCORES, sequence_shards, summed_to, varied_alike, varying_like
+from .sharding import SCORES, sequence_shards, varied_alike, varying_like
 from .visibility import window_sides
 
 AttentionImpl = Literal["auto", "reference", "xla", "cudnn", "triton", "flash", "tpu", "template",
@@ -796,13 +796,13 @@ def range_safe(product: Callable[[jax.Array, jax.Array], jax.Array], query: jax.
 
     def backward(saved, operands, cotangent):
         # The operands and cotangent varying alike over a checked map's axes (`varied_alike`), so each
-        # conditional's branches are each device's own partials, typed alike, and each operand's placement
-        # restored once after them (`summed_to`): a replicated query's raw partial was summed over the map
-        # where the recovered one's varied with each device's keys (train 1440's review).
+        # conditional's branches are each device's own partials, typed alike (a replicated query's raw
+        # partial was summed over the map where the recovered one's varied with each device's keys, train
+        # 1440's review); each summed to its operand's type where the linear map's transpose accumulates it
+        # (`generation.linear_map`), as both of this rule's maps are.
         query, key, cotangent = varied_alike((*operands, cotangent))
-        pulled = _range_safe_pullback(product, query, key, cotangent * jnp.asarray(scale, cotangent.dtype),
-                                      power)
-        return tuple(summed_to(each, operand) for each, operand in zip(pulled, operands, strict=True))
+        taken = cotangent * jnp.asarray(scale, cotangent.dtype)
+        return tuple(_range_safe_pullback(product, query, key, taken, power))
 
     rule = contracted("test_jax_nns_range_safe_form_holds_every_order")(
         generation.linear_tangent(forward, backward, portable, kind=Protected(), primal=safe, traced=True))

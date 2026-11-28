@@ -271,6 +271,15 @@ def mosaic_cells() -> list[Cell]:
         *cells_of(_flash_inference_forward_is_on_par_on_an_a100, "sm80",
                   fault=lambda: "rows 13288 / 13319: FlashAttention-2's forward, flash_inference's "
                                 "undifferentiated arm, native at the A100 cell's shape"),
+        # New cells go last (`parted`: a cell's part is its place's).
+        *(cell for generation_name in ("sm80", "sm86", "sm89", "sm120")
+          for cell in cells_of(_an_inference_forward_256_wide_walks_once_on_par, generation_name,
+                               fault=lambda: "rows 14113 / 6216: the inference forward 256 wide in one "
+                                             "launch over every value column, native")),
+        *(cell for generation_name in ("sm86", "sm89", "sm120")
+          for cell in cells_of(_a_backward_256_wide_of_one_stage_on_par, generation_name,
+                               fault=lambda: "row 14113: the backward 256 wide at one stage on a 99 KB "
+                                             "block, native")),
     ]
 
 
@@ -281,6 +290,21 @@ def _mma_sync_fused_32x32_backward_is_on_par_on_an_a100():
 
     pin = attention_mosaic.BackwardTiles(32, 32, 2, 1, fused=True, family="mma.sync")
     mosaic._check_backward("causal", (1, 128, 4, 2), width=128, form=None, config=pin, interpret=False)
+
+
+def _an_inference_forward_256_wide_walks_once_on_par():
+    """Rows 14113, 6216: native check 1 of the bf16 causal inference forward 256 wide at its derived config,
+    one launch over every value column on mma.sync (`Issuer.fed_columns`, the epilogue's settle over its
+    quotient), on par with the reference path from float64."""
+    mosaic._check_forward("causal", jnp.bfloat16, (1, 512, 4, 2), natural=False, interpret=False, width=256,
+                          value_width=256)
+
+
+def _a_backward_256_wide_of_one_stage_on_par():
+    """Row 14113: native check 1 of the fast causal backward 256 wide on a 99 KB block's GPU at its derived
+    config, one stage (`MosaicBackward.candidates`), each step's slot loaded once the step before released
+    it, on par with the reference path from float64."""
+    mosaic._check_backward("causal", (1, 512, 4, 2), width=256, form=None, interpret=False)
 
 
 def _flash_inference_forward_is_on_par_on_an_a100():

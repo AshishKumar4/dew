@@ -63,6 +63,7 @@ from dew.nn.kernels.templates.attention_mosaic_derivation import (
     WARPGROUP_WARPS,
     _choice_key,
     _column_blocks_of,
+    _columns_legal,
     _derived,
     _fewer_hooked,
     _least_keys,
@@ -1639,36 +1640,6 @@ def producer_raised(family: mosaic.Family, target: generation.GpuTarget) -> bool
         return family.registers(family.consumers) > resources.entry_registers(held)
 
 
-def _columns_legal(ba: tokamax.BoundArguments, config: BackwardTiles, family: mosaic.Family, dtype) -> bool:
-    """Whether a backward config's consumers and programs split the call's widths as `family` stages them
-    (`MosaicBackward.legal`'s last part): a shared key block's consumers each their share of the columns, a
-    width split among programs its shares."""
-    if config.shared_keys:
-        # Every consumer's share of the keys whole rows of a swizzle the exchange stages them at
-        # (`swizzling.swizzle_for`), its share of the columns whole swizzled rows
-        # (`attention_mosaic_coop`).
-        share = _width(ba.arguments["query"].shape[-1], family, dtype) // config.consumers
-        narrowest = family.narrowest_columns(dtype)
-        return (config.fused and config.queries_first and config.consumers > 1 and config.columns == 1
-                and (config.block_k // config.consumers) % narrowest == 0
-                and share % family.column_unit(dtype) == 0)
-    # A width split among programs adds its dQ once, in no fused launch, each share whole swizzled rows
-    # and, where its family's products read their right operand's columns from a block staged at its
-    # whole width (`Family.operands_in_registers`), whole swizzle tiles of that block: an A100's accurate
-    # dQ under a score hook split 64 columns in two, its keys' 64-column tile sliced at 32, and failed to
-    # lower ("slice size (32) divisible by the tile size (64)", FS-A100CHECK1d, acchook3).
-    widths = [_width(ba.arguments[name].shape[-1], family, dtype) for name in ("query", "value")]
-    def unit(width: int) -> int:
-        if not family.operands_in_registers:
-            return family.column_unit(dtype)
-        tile = swizzling.swizzle_columns(dtype, swizzling.swizzle_for(dtype, width))
-        return max(family.column_unit(dtype), tile)
-
-    units = [unit(width) for width in widths]
-    return config.columns == 1 or (not config.fused and all(
-        (width / config.columns) % unit == 0 for width, unit in zip(widths, units, strict=True)))
-
-
 @dataclasses.dataclass(frozen=True)
 class MosaicBackward(_Mainloop[BackwardTiles]):
     """The template's backward on this mainloop (`gradients`) over the call's own arrays (`backward` gives
@@ -1828,6 +1799,15 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
         # A placement takes the launch it is written for (`placed.walked_launch`): keys first the dK/dV
         # launch's, queries first the dQ launch's; the one launch's keys first apart from its config's own.
         dq_named = found.get(config.family)
+        # A ring of one stage takes products that complete in their step on their registers (mma.sync's),
+        # each load waiting on the release before it (`Ring.load`): a slot an asynchronous product still
+        # reads past its step (`Family.in_flight`) or a placed issuer scoring a step ahead
+        # (`places_on_role`, tcgen05's) is no slot to load the next step into, its release after the load
+        # it waits on (train 1515's F1).
+        if config.stages < 2 and not all(
+                layout is None or (layout.operands_in_registers and not layout.in_flight
+                                   and not layout.places_on_role) for layout in (dkv_family, dq_named)):
+            return False
         walked_dkv = placed.walked_launch(dkv_family) == "dkv" if dkv_family.places_on_role else None
         if walked_dkv is False or (walked_dkv and not self._walked_legal(ba, config, dkv_family, config.dkv,
                                                                           target)):
@@ -1993,7 +1973,12 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
 
     def candidates(self, ba: tokamax.BoundArguments, target: generation.GpuTarget) -> list[BackwardTiles]:
         """The legal one launch and two launches `derived` prices (`_one_launch`, `_two_launches`), each
-        deepened (`_deepened`), in that order; none on a target of no family."""
+        deepened (`_deepened`), in that order, at two stages, a slot loading while one is read; where no
+        config of two holds the block, at one, each step's slots loaded once the step before read them:
+        FlashAttention 2's backward at width 256 on a 99 KB block, no double buffering (every 32-row tile's
+        two stages of queries and output cotangents beside its resident keys and values passed an sm86's and
+        an sm89's block by 1,040 bytes and an sm120's by more, and the step fell to Pallas Triton: 1.75 times
+        FlashAttention 2's on an RTX PRO 6000, row 14113). None on a target of no family."""
         family = self._family(ba, target)
         if family is None:
             return []
@@ -2004,9 +1989,13 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
         # The dK/dV launch's consumers a backward's at most (`BACKWARD_CONSUMERS`), whatever its layout's.
         dkv = ({"dkv_family": fed[0].name, "dkv_consumers": min(fed[0].consumers, BACKWARD_CONSUMERS)}
                if fed else {})
-        return [self._deepened(ba, config, target) for config in (
-            self._one_launch(ba, target, family, fed, dkv), self._two_launches(ba, target, family, dkv))
-            if config is not None]
+        for stages in (2, 1):
+            found = [self._deepened(ba, config, target) for config in (
+                self._one_launch(ba, target, family, fed, dkv, stages=stages),
+                self._two_launches(ba, target, family, dkv, stages=stages)) if config is not None]
+            if found:
+                return found
+        return []
 
     def _cheaper(self, ba: tokamax.BoundArguments, candidates: list[BackwardTiles],
                  target: generation.GpuTarget) -> BackwardTiles:
@@ -2174,9 +2163,9 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
                 or self.resident(ba, config, target) > self.resident(ba, unstaged, target))
 
     def _one_launch(self, ba: tokamax.BoundArguments, target: generation.GpuTarget, family: mosaic.Family,
-                    fed: list, dkv: dict) -> BackwardTiles | None:
-        """`derived`'s one launch: on the fed layout with its consumers (FlashAttention 3's CTA), keys first
-        on the dQ launch's layout, or a key block its consumers share; None where none holds."""
+                    fed: list, dkv: dict, *, stages: int) -> BackwardTiles | None:
+        """`derived`'s one launch at `stages`: on the fed layout with its consumers (FlashAttention 3's CTA),
+        keys first on the dQ launch's layout, or a key block its consumers share; None where none holds."""
         query, key = ba.arguments["query"], ba.arguments["key"]
 
         def fits(config: BackwardTiles) -> bool:
@@ -2198,7 +2187,7 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
         producer = [family] if fed and producer_raised(family, target) else []
         for layout in (*producer, *(layout for layout in fed if layout.name != family.name)):
             def fed_fused(rows: int, walked: int, consumers: int, layout=layout) -> BackwardTiles:
-                return BackwardTiles(walked, rows, 2, consumers, fused=True, family=layout.name)
+                return BackwardTiles(walked, rows, stages, consumers, fused=True, family=layout.name)
 
             config = derive(layout, query.dtype, key.shape[1], query.shape[1], fed_fused, fits,
                             overlapped=True)
@@ -2212,7 +2201,8 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
         if dq_summed(family, family.shared_consumers) and family.shared_consumers > family.consumers:
             def paired(rows: int, walked: int, consumers: int) -> BackwardTiles:
                 del consumers  # the launch names its family's paired consumers
-                return BackwardTiles(walked, rows, 2, family.shared_consumers, fused=True, family=family.name)
+                return BackwardTiles(walked, rows, stages, family.shared_consumers, fused=True,
+                                     family=family.name)
 
             if config := derive(family, query.dtype, key.shape[1], query.shape[1], paired, fits,
                                 overlapped=False):
@@ -2221,7 +2211,8 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
         # queries a stream of their own, then staged a step, then on the dQ launch's layout alone.
         for shared in [*({**dkv, "staged_logits": staged} for staged in (False, True) if dkv), {}]:
             def fused(rows: int, walked: int, consumers: int, shared=shared) -> BackwardTiles:
-                return BackwardTiles(walked, rows, 2, consumers, fused=True, family=family.name, **shared)
+                return BackwardTiles(walked, rows, stages, consumers, fused=True, family=family.name,
+                                     **shared)
 
             for rows in (None, *fewer_rows(family)):
                 if config := derive(family, query.dtype, key.shape[1], query.shape[1], fused, fits,
@@ -2233,7 +2224,7 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
         # fit, sharing cost 9% at width 128 and 46% at 64, ET-COOP2-h100).
         for layout in fed:
             def sharing(rows: int, walked: int, consumers: int, layout=layout) -> BackwardTiles:
-                return BackwardTiles(walked, rows, 2, consumers, fused=True, family=layout.name,
+                return BackwardTiles(walked, rows, stages, consumers, fused=True, family=layout.name,
                                      shared_keys=True)
 
             if config := derive(layout, query.dtype, key.shape[1], query.shape[1], sharing, fits,
@@ -2242,8 +2233,9 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
         return None
 
     def _two_launches(self, ba: tokamax.BoundArguments, target: generation.GpuTarget, family: mosaic.Family,
-                      dkv: dict) -> BackwardTiles | None:
-        """`derived`'s two launches, the dQ launch then the keys-first dK/dV one; None where none holds."""
+                      dkv: dict, *, stages: int) -> BackwardTiles | None:
+        """`derived`'s two launches at `stages`, the dQ launch then the keys-first dK/dV one; None where none
+        holds."""
         query, key = ba.arguments["query"], ba.arguments["key"]
 
         def fits(config: BackwardTiles) -> bool:
@@ -2287,7 +2279,7 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
                     for staged in (False, True):
                         def tiles(rows: int, walked: int, consumers: int, columns=columns, staged=staged
                                   ) -> BackwardTiles:
-                            return BackwardTiles(walked, rows, 2, consumers, family=dq.name,
+                            return BackwardTiles(walked, rows, stages, consumers, family=dq.name,
                                                  columns=columns, staged_logits=staged, **dkv)
 
                         if config := derive(dq, query.dtype, key.shape[1], query.shape[1], tiles, wanted,

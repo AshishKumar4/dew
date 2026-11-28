@@ -626,6 +626,22 @@ class MmaIssuer(mosaic.Issuer[jax.Array]):
         # 8-row tiles allow (a swizzled row takes no slice narrower than its tile).
         return min(depth, 8 * max(32 // (jnp.dtype(self.dtype).itemsize * 8), 1))
 
+    def fed_columns(self, rows: int, columns: int) -> int:
+        # Where a warp's rows are one instruction's (`m_warps` warps of 16 along the product's rows), each
+        # right fragment, an n8 tile's, feeds one instruction: each column warp's load feeds two of its
+        # (`ldmatrix`'s four 8 x 8 matrices of 16-bit rows; a 32-bit operand's own loads one), beside the
+        # loads ahead of it (`operand_steps_ahead`), and ptxas sinks each load to its instruction, so a
+        # k-step's loads over many columns are never live at once: the column warps' atom
+        # (`atom_columns`, an n8 tile each) that many times. An sm120 forward 256 wide at 64 x 32 held 237
+        # registers, 9 past its accumulator's growth from width 128, where its values' fragments over every
+        # column priced 260 and refused its one launch (FS-14113-CENSUS2, row 14113). A warp of more rows
+        # reads each fragment once a row tile and holds them over every column: a grouped GEMM 2880 wide so
+        # priced took 64 x 320 tiles (one row warp) that spilled 112 to 3,732 bytes.
+        if rows > self.m_warps * self.rows:
+            return columns
+        per_load = 2 if self._matrix_loads else 1
+        return min(columns, self.atom_columns * per_load * (1 + self.operand_steps_ahead))
+
     def rhs_fragment_depth(self, depth: int, *, transposed: bool = False, swizzle: int | None = None) -> int:
         # A transposed stage's rows are its depth: a load takes a whole swizzle tile of it (`products`), one
         # instruction's at the narrowest swizzle (a stream staged so by `streams`' `swizzles`: D64's K in

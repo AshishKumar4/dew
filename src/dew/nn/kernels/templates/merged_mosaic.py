@@ -348,11 +348,11 @@ def _mgpu_load_output_param(param_ref, b, out_t, out_h, c_start, *, kind: Kind, 
 def launch(padded, stacked, *extra, units: windows.Units, queries: int, width: int, block: int,
                    raw_scale: float | None = None, out_dtype=None, out_heads: int | None = None,
                    output_mod: Callable | None = None, output_kinds: tuple[Kind, ...] = (),
-                   family: str = "mma.sync", normalized: bool = False):
+                   family: str = "mma.sync", normalized: bool = False, massless: bool = False):
     """`_value` as one Mosaic GPU launch on NVIDIA sm80+ GPUs (row 9795): zero SMEM, zero warp shuffles,
     predicated coalesced GMEM loads/stores over arbitrary `width`/`slices`, executing the exact same
-    `algebra.finished_merged_chunked` body as `_launch`, with optional fused `output_mod` epilogue
-    (row 5385)."""
+    `algebra.finished_merged_chunked` body as `_launch`, a row of no mass NaN where `massless`
+    (`algebra.merged_massless`), with optional fused `output_mod` epilogue (row 5385)."""
     batch, slices, _, heads, read_width = padded.shape
     init_args, _ = split_extra(extra, output_kinds)
     has_initial = bool(init_args)
@@ -406,6 +406,8 @@ def launch(padded, stacked, *extra, units: windows.Units, queries: int, width: i
             return (*read(start), valid)
 
         state = algebra.finished_merged_chunked(units, load, -(-total_slices // chunk))
+        if massless:
+            state = algebra.merged_massless(state)
         if out_dtype is not None:
             assert out_heads is not None
             group = out_heads // heads

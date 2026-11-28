@@ -624,6 +624,30 @@ FlashAttention 4's: each step's `dS K` over its freed turns, added into dQ), or 
 on tcgen05 too (`walked dq`, `placed.QUERIES`: 128 queries a step of 64 keys, dQ kept in tensor memory)."""
 
 
+def test_a_placed_backward_of_one_stage_is_refused():
+    """A B200's backward pinned keys first on tcgen05 with its dQ queries first (`KEYS_TILES["walked dq"]`)
+    over 256 tokens: legal at its two stages, refused at one (`MosaicBackward.legal`), never launched: its
+    issuer warp scores a step ahead before the step behind it releases its slots, so one slot deadlocks,
+    where a one-stage ring, mma.sync's alone, was admitted (train 1515's review F1)."""
+    query = jax.ShapeDtypeStruct((1, 256, 2, 64), jnp.bfloat16)
+    key = jax.ShapeDtypeStruct((1, 256, 1, 64), jnp.bfloat16)
+    spans = template.spans(256, 256, 1)
+
+    def residuals_of(query, key, value):
+        return attention_mosaic.forward(query, key, value, spans, None, residuals=template.Kept.SPLIT)[1:]
+
+    with generation.assumed("sm100"):
+        target = generation.gpu_target()
+        residuals = jax.eval_shape(residuals_of, query, key, key)
+        op, args = attention_mosaic._backward_call(query, key, key, spans, None, query, residuals,
+                                                   scale=None, natural=attention_mosaic.NATURAL,
+                                                   accurate=attention_mosaic.ACCURATE)
+        ba = op.bind(*args, interpret=False)
+        pinned = KEYS_TILES["walked dq"]
+        assert op.legal(ba, pinned, target)
+        assert not op.legal(ba, dataclasses.replace(pinned, stages=1), target)
+
+
 @INTERPRETS
 @pytest.mark.parametrize("width", [64, 128])
 @pytest.mark.parametrize("call", ["full", "causal"])

@@ -991,10 +991,11 @@ def varied_alike(operands: Sequence) -> list:
     return [None if operand is None else _varying_over(operand, axes) for operand in operands]
 
 
-def excess_axes(value: jax.Array, of: jax.Array) -> tuple[str, ...]:
+def excess_axes(value: jax.Array, of: jax.Array | ShapedArray) -> tuple[str, ...]:
     """The manual axes `value` varies over that `of` does not (a checked `shard_map`'s), sorted: the axes a
-    partial computed per device from operands that vary over them sums over to be typed as `of`."""
-    return tuple(sorted(jax.typeof(value).mat.varying - jax.typeof(of).mat.varying))
+    partial computed per device from operands that vary over them sums over to be typed as `of`, an array or
+    its type (`varying`'s reading: a recorded input's, `generation.linear_map`'s moving operand)."""
+    return tuple(sorted(varying(value) - varying(of)))
 
 
 def broadcast_axes(shape: tuple[int, ...], broadcast: tuple[int, ...]) -> tuple[int, ...]:
@@ -1025,8 +1026,8 @@ def summed_to(cotangent, operand):
     (`dew.nn.kernels.launches._typed`, row 9808), so its gradient of an operand every device holds the same
     of is each device's partial, which sums to the operand's, as JAX's own transposes give a replicated
     operand's (row 10526: a GEMM template's kernel gradient for a replicated matrix reached `ad.ct_check`
-    varying over the map's axis). `cotangent` as it is (None included) where no axis is in excess, outside a
-    checked map among them."""
+    varying over the map's axis). `operand` an array or its type (`excess_axes`). `cotangent` as it is (None
+    included) where no axis is in excess, outside a checked map among them."""
     if cotangent is None or operand is None:
         return cotangent
     axes = excess_axes(cotangent, operand)

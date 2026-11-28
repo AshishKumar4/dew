@@ -137,9 +137,13 @@ def _converted(block_k: int, *widths: int) -> list[list[tuple]]:
 
 def _epilogue_registers(family: mosaic.Family, carried: list, block_q: int, value_width: int, dtype, *,
                         residuals: bool, plan: BlockPlan | None = None, masked: bool = False) -> int:
-    """Wide (>128) inference epilogue's live registers (chunked, or whole-width finish + masked preserve),
-    a pointwise output hook's tiles past its input at its chunk (the plan's `tile_dtypes`) beside the
-    chunk's finish."""
+    """Wide (>128) inference epilogue's live registers (chunked, or whole-width finish + masked preserve):
+    beside the sums carried, a chunk's quotient fp32 and, where its 16-bit output settles its overflow
+    midpoint in registers unhooked (`algebra.settled_store`, `midpoint_settled`), the settle's compared
+    operand, its select written over the quotient; the chunk in its output's dtype; and a pointwise output
+    hook's tiles past its input at its chunk (the plan's `tile_dtypes`). A third fp32 tile priced an A100's
+    and an A10's one launch 256 wide 284 where ptxas held it spill-free at 255 under no hook, a causal mask
+    and a softcap alike, at 64 x 16 to 64 x 64 on an A100 and 64 x 32 on an A10 (probe oa6-epi, row 6216)."""
     if residuals or not family.budgets_registers or family.places_on_role or value_width <= 128:
         return 0
     block = plan or BlockPlan(split=False, out_dtype=None, output_hook=False)
@@ -147,7 +151,9 @@ def _epilogue_registers(family: mosaic.Family, carried: list, block_q: int, valu
     w = block.epilogue_chunk(family, value_width, dtype, training=residuals, masked=masked) or value_width
     r, live = family.row_registers(block_q, jnp.float32), resources.live_registers
     hooked = [(block_q, w, jnp.dtype(kept)) for kept in block.tile_dtypes] if block.pointwise else []
-    fin = live(family, carried, [(block_q, w, jnp.float32)] * 3 + [(block_q, w, ed)] + hooked) + 2 * r
+    settles = jnp.dtype(ed).itemsize == 2 and not block.output_hook
+    finished = [(block_q, w, jnp.float32)] * (2 if settles else 1) + [(block_q, w, ed)]
+    fin = live(family, carried, finished + hooked) + 2 * r
     return max(fin, live(family, [], [(block_q, value_width, ed)] * 2) + r) if masked else fin
 
 
@@ -272,7 +278,8 @@ def forward_registers(family: mosaic.Family, tiles: Tiles, value_width: int, dty
     products = _products(
         family, dtype,
         resources.Product(block_q, depth, block_k, beside=[logits], transposed=True),
-        resources.Product(block_q, block_k, value_width, beside=[weights], held=True),
+        resources.Product(block_q, block_k, value_width, beside=[weights], held=True,
+                          alone=parts == weight_parts == 1 and not (scaled or scaled_products)),
         narrow=tiles.narrow, lhs_swizzle=query_swizzle(family))
     carried = [] if kept else [(block_q, value_width, jnp.float32)]
     scored = resources.live_registers(family, carried, [logits, *hooked]) + vectors
