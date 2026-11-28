@@ -266,7 +266,7 @@ def blocks_quantized(w: jax.Array, *, k_major: bool = False) -> tuple[jax.Array,
     block's 128 rows), apart from the codes, each value over its block's scale spread back over the block,
     so no pass reads the matrix transposed but a K-major one's codes, written transposed as they are formed
     (row 4518: one reduction over a block's both axes shared the codes' fp32 matrix, which XLA then wrote
-    through a 6.7 ms transposing fusion of a 8.8 ms quantization on a GH200, M-NG-67f)."""
+    through a 6.7 ms transposing fusion of an 8.8 ms quantization on a GH200, M-NG-67f)."""
     from dew.nn import fake_quant
     from dew.nn.float_bits import largest_magnitude
 
@@ -280,7 +280,6 @@ def blocks_quantized(w: jax.Array, *, k_major: bool = False) -> tuple[jax.Array,
     if k_major:
         wide, spread = jnp.swapaxes(wide, 1, 2), jnp.swapaxes(spread, 1, 2)
     return fake_quant.fp8_codes(wide / spread).astype(jnp.float8_e4m3fn), scale
-
 
 
 def _quantized_rows_product(rows, rows_scales, w, sizes, out_dtype, interpret) -> jax.Array:

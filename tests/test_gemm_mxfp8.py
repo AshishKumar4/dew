@@ -352,7 +352,8 @@ def test_a_largest_magnitude_is_ieees_maximum_of_magnitudes_at_every_width(dtype
     """`float_bits.largest_magnitude` of each row, eager and jitted, bit for bit, at each width a quantizer
     reads: a NaN among normal draws NaN; an infinity (E4M3FN's largest finite, as it holds none) among them
     that; a negative largest its magnitude; a least subnormal among zeros of both signs that subnormal, which
-    a flushing maximum reads as zero; zeros of both signs +0 (row 14083's train 1477)."""
+    a flushing maximum reads as zero; zeros of both signs +0 (row 14083's train 1477). A float64 array made in
+    x64 and reduced eagerly outside it reads its own width (its review)."""
     from dew.nn.float_bits import largest_magnitude
 
     with jax.enable_x64(new_val=True) if dtype == jnp.float64 else contextlib.nullcontext():
@@ -365,12 +366,13 @@ def test_a_largest_magnitude_is_ieees_maximum_of_magnitudes_at_every_width(dtype
         rows[3:, ::2] = -0.0
         rows[3, 5] = least
         x = jnp.asarray(rows, dtype)
-        word = np.dtype(f"uint{limits.bits}")
-        want = np.asarray([top, 8.0, least, 0.0]).astype(dtype).view(word)
-        for got in (largest_magnitude(x, -1), jax.jit(lambda x: largest_magnitude(x, -1))(x)):
-            got = np.asarray(got)
-            assert got.dtype == np.dtype(dtype) and np.isnan(got[0].astype(np.float32))
-            np.testing.assert_array_equal(got[1:].view(word), want)
+        jitted = jax.jit(lambda x: largest_magnitude(x, -1))(x)
+    word = np.dtype(f"uint{limits.bits}")
+    want = np.asarray([top, 8.0, least, 0.0]).astype(dtype).view(word)
+    for got in (largest_magnitude(x, -1), jitted):
+        got = np.asarray(got)
+        assert got.dtype == np.dtype(dtype) and np.isnan(got[0].astype(np.float32))
+        np.testing.assert_array_equal(got[1:].view(word), want)
 
 
 @pytest.mark.mesh(devices=2)
