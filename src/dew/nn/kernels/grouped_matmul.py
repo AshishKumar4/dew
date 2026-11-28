@@ -361,8 +361,14 @@ class _Mosaic(tiling.TilesTemplate, _GroupedLaunch[tiling.Tiles]):
         """Each issuer's bundles that take the call (`_takes`), in `bundles.groups`' preference order, a group
         whose issuer's bundle takes it: the derivation's, each group's tiles tried before the next's, so a
         call the most capable issuer takes but derives no tile of (a B200's paired product of three outputs,
-        whose register model holds none on tcgen05) runs on the next issuer's (mma.sync's)."""
+        whose register model holds none on tcgen05) runs on the next issuer's (mma.sync's); none on a GPU
+        where a side operand's axes are out of the launch's order (`hooks.sides_in_order`, row 14207), before
+        any tile is searched."""
         from .templates import bundles
+        from .templates.gemm.hooks import sides_in_order
+
+        if not generation.tpu(target) and not sides_in_order(ba.arguments['hooks']):
+            return ()
 
         found = bundles.groups(target.generation, ba.arguments['tokens'].dtype, stated=True,
                                tpu=generation.tpu(target))
@@ -645,16 +651,12 @@ class _Mosaic(tiling.TilesTemplate, _GroupedLaunch[tiling.Tiles]):
         stages at least (a walk keeping one step's products in flight holds its slot while the next step's
         loads fill another), its blocks dividing the call's extents, its cluster at most the family's
         (`mosaic.Family.cluster`), and a one-dimensional side operand's block, copied untiled, at most one
-        copy's extent along its axis (`mosaic.Family.copy_extent`), and on a GPU each side operand's axes in
-        the launch's order (`hooks.sides_in_order`); none a compile of this process found spilling
-        (`report.refused`), so the derivation takes the next tile by its own rule."""
+        copy's extent along its axis (`mosaic.Family.copy_extent`); none a compile of this process found
+        spilling (`report.refused`), so the derivation takes the next tile by its own rule."""
         from .templates.axes import held as held_axes
         from .templates.gemm import mosaic_gpu, pricing, quantized
-        from .templates.gemm.hooks import sides_in_order
         family = next((bundle for group in self._groups(ba, target) for bundle in group
                        if bundle.name == config.family), None)
-        if not generation.tpu(target) and not sides_in_order(ba.arguments['hooks']):
-            return False
         if (family is None or config.cluster > family.cluster or not mosaic_gpu.pair_takes(config, family)
                 or (family.pairs_product and ba.arguments['interpret'])
                 or self._pair_refuses(ba, config, family) or self._pingpong_refuses(config, family)

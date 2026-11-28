@@ -15,7 +15,7 @@ import jax.numpy as jnp
 from dew.nn.derivatives import KernelGlue, contracted
 from dew.nn.kernels import gemm, generation, grouped_quantized, selection, xla_products
 from dew.nn.kernels.formats import Bf16Window
-from dew.nn.kernels.templates.gemm import launched_whole
+from dew.nn.kernels.templates.gemm import as_groups, launched_whole
 
 WINDOW_ROW = "ledger 5387"
 
@@ -30,6 +30,14 @@ class MosaicWindowPackedGmm(grouped_quantized.MosaicWordPackedGmm):
 WINDOW = gemm.word_packed_op("window", WINDOW_ROW, "M-NG-49")
 
 
+@jax.checkpoint
+def _decoded_dot(rows: jax.Array, window: Bf16Window, group_sizes: jax.Array | None) -> jax.Array:
+    """The window's decoded matrix's XLA dot (`xla_products.decoded_dot`), decoded here and again in its
+    derivative (`jax.checkpoint`): what the derivative holds is the window, packed, which a scan over layers
+    forwards, where it stacked each step's decoded copy in bfloat16 (row 14220)."""
+    return xla_products.decoded_dot(rows, window.decoded(), group_sizes)
+
+
 def window_product(lhs: jax.Array, window: Bf16Window, group_sizes: jax.Array | None = None, *,
                    out_dtype=None, interpret_on_cpu: bool = False) -> jax.Array:
     """`lhs @ window` for a lossless bfloat16 window (`formats.Bf16Window`, row 5387: `[depth, width]`
@@ -42,16 +50,19 @@ def window_product(lhs: jax.Array, window: Bf16Window, group_sizes: jax.Array | 
     if (dense and len(window.shape) != 2) or (not dense and len(window.shape) != 3):
         raise ValueError(f"window_product weight rank mismatch for dense={dense}: {window.shape}")
     rows = lhs.astype(jnp.bfloat16)
-    # The launch's bank is grouped: a dense window its one group.
-    words, meta = (jnp.asarray(plane)[None] if dense else jnp.asarray(plane)
-                   for plane in (window.words, window.meta))
+    # The launch's bank is grouped (a dense window its one group), by the launch alone (`as_groups`): its
+    # planes held as given across the product's derivative, which a scan over layers forwards (row 14220).
+    words, meta = jnp.asarray(window.words), jnp.asarray(window.meta)
     sizes = jnp.asarray([lhs.shape[0]], jnp.int32) if dense else group_sizes.astype(jnp.int32)
     launch = MosaicWindowPackedGmm()
 
     def _spec(operand):
         return jax.ShapeDtypeStruct(jnp.shape(operand), jnp.result_type(operand))
 
-    bank_spec = jax.tree.map(_spec, Bf16Window(words, meta, window.form))
+    def banked(words, meta):
+        return Bf16Window(as_groups(words), as_groups(meta), window.form)
+
+    bank_spec = jax.eval_shape(banked, words, meta)
     bound = launch.bind(_spec(rows), bank_spec, _spec(sizes), (), (), None, None, None, out_dtype="float32",
                         trans_rhs=False, interpret=interpret_on_cpu, dense=dense, exact_sums=False)
     with xla_products.interpreted_context(interpret_on_cpu):
@@ -65,7 +76,7 @@ def window_product(lhs: jax.Array, window: Bf16Window, group_sizes: jax.Array | 
             generation.linear_tangent(*rules, live_cotangents=True, kind=KernelGlue()))
         operands = (words, sizes, meta)
     else:
-        product = xla_products.decoded_dot
-        operands = (window.decoded(), group_sizes)
+        product = _decoded_dot
+        operands = (window, group_sizes)
     summed = gemm._interpreted(product, interpret_on_cpu, rows, *operands)
     return summed.astype(lhs.dtype if out_dtype is None else out_dtype)
