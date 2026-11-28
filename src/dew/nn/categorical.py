@@ -32,7 +32,7 @@ from dew.nn.precision import at_least_fp32
 __all__ = ["brier", "cross_entropy", "entropy", "group_divergence", "kl_divergence", "label_derivative",
            "label_entry", "label_logit", "label_terms", "log_probs", "partition", "probabilities",
            "ranked_probability", "rescaled", "segment_log_partition", "smoothed", "soft_cross_entropy",
-           "spherical", "target_loss", "token_log_probs"]
+           "softmax_tangent", "spherical", "target_loss", "token_log_probs"]
 
 
 def widened(logits: jax.Array, where: jax.Array | None = None) -> jax.Array:
@@ -62,13 +62,169 @@ def _softmax(logits: jax.Array) -> jax.Array:
     return jax.nn.softmax(logits, axis=-1)
 
 
+def softmax_tangent(probability: jax.Array, d_logits: jax.Array) -> jax.Array:
+    """A softmax's tangent over the last axis at its `probability` along `d_logits`: `p (dz - sum p dz)`
+    taken from each entry's difference to the most probable class's (the pivot), so a constant direction,
+    whatever the probabilities' rounded sum, maps to zero exactly, and the pivot's entry the others' summed
+    and negated, so a row's derivative sums to zero (`probabilities`): the one statement of it, every softmax
+    of Dew's differentiated by it (`dew.nn.moe.expert_softmax` among them). The map is `diag(p) - p p^T`,
+    symmetric, so reverse mode runs this same expression on the cotangent (`generation.linear_map`),
+    PyTorch's softmax backward, no division among it; a constant cotangent pulls back to zero as a constant
+    direction maps there (train 1455's review: centering on `sum p dz` gave `[0, -17]`'s constant cotangent
+    near float32's end a gradient of 2^79), each entry centered on its own value at its own scale
+    (`_softmax_moved`). The direction is typed as the probabilities vary and placed, so its cotangent is
+    summed back to its own (theme 76's review: a replicated direction beside split probabilities took a
+    split cotangent)."""
+    from dew.nn import sharding
+    from dew.nn.kernels.generation import linear_map
+
+    moving = sharding.varying_like(d_logits, probability)
+    placed = sharding.explicit_placement(jax.typeof(probability))
+    moving = moving if placed is None else jax.sharding.reshard(moving, placed)
+    return linear_map(_softmax_moved, _softmax_moved, probability, moving)
+
+
+def _softmax_moved(probability: jax.Array, moving: jax.Array) -> jax.Array:
+    """`softmax_tangent`'s map of `moving` at `probability`, its own transpose: `p (m - mean)`, the most
+    probable class's entry (the pivot) the others' summed and negated, every value at its own scale.
+
+    Its mean is the probabilities' weighted mean over the mass they hold, `sum p m / sum p`, which a rounded
+    softmax's needs not be one (`[0, 0, 0]`'s thirds sum to `1 + 2^-25`): the pivot plus each entry's exact
+    difference to it (`precision.two_sum`) weighed (`precision.two_product`), summed as a double float
+    (`precision.summed_pairs`) and divided by the mass (`_over`), its differences' low limbs apart. So a
+    constant row's mean is that constant and a row whose weighted sum cancels has the mean that cancels,
+    whatever the probabilities sum to (train 1455's review, train 1468's: `[2^100, -2^100, 0]` at three
+    equal logits), and small entries beside a large pivot keep their share. Where a difference of an entry
+    some probability reaches leaves the range, the row is no constant and the same mean is taken from a zero
+    pivot. Each entry is centered on its difference to the pivot less the mean's, every limb of both summed
+    exactly and rounded once (`direct`, `aligned_sum`), the pivot never rounded into the mean (a tied class
+    beside a pivot of one kept its share, train 1474's review). The
+    weighted sum, where it alone passes the range, is held 2^-4 times smaller with the mean's large part,
+    never joined (`large`), so a mean past the range whose entries' results are in it is still read, each
+    entry centered on its own value at its own scale where that is in range, else 2^-4 times smaller and
+    its product scaled back. Every operand of a value not taken is held at zero before arithmetic
+    reads it, so no derivative past the range meets a zero cotangent (train 1455's review)."""
+    from dew.nn import precision
+    from dew.nn.aligned import aligned_sum
+
+    axis = (probability.ndim - 1,)
+    top = jax.nn.one_hot(jnp.argmax(probability, axis=-1), probability.shape[-1], dtype=bool)
+    pivot = jnp.sum(jnp.where(top, moving, 0), axis=-1, keepdims=True)
+    high, low = precision.two_sum(moving, -pivot)
+    reached = probability != 0
+    pivoted = jnp.all((jnp.isfinite(high) & jnp.isfinite(low)) | ~reached, axis=-1, keepdims=True)
+    # From the pivot where every difference to it is in range, else from zero: each entry's own value.
+    pivot = jnp.where(pivoted, pivot, 0)
+    high = jnp.where(reached & (~top | ~pivoted), jnp.where(pivoted, high, moving), 0)
+    low = jnp.where(pivoted & reached & ~top, low, 0)
+    mass = _pair_sum(probability, jnp.zeros_like(probability), axis)
+    weighed_high, weighed_low = _weighed(probability, high, axis)
+    held = jnp.isfinite(weighed_high)
+    # A weighted sum past the range taken 2^-4 times smaller; one in range at its own scale.
+    shrunk_high, shrunk_low = _weighed(probability, jnp.where(held, 0, high) * 2.0**-4, axis)
+    native = _over((jnp.where(held, weighed_high, 0), jnp.where(held, weighed_low, 0)), mass)
+    scaled = _over((jnp.where(held, 0, shrunk_high), jnp.where(held, 0, shrunk_low)), mass)
+    lows = _over(_weighed(probability, low, axis), mass)
+    large = jnp.where(held, 0, _added(jnp.where(held, 0, pivot) * 2.0**-4, *scaled))
+    small = jnp.where(held, _added(pivot, *native), 0) + (lows[0] + lows[1])
+    mean = large * 2.0**4 + small
+    # Where the weighted sum is in range, each entry's difference to the pivot less the mean's, no pivot
+    # rounded into the mean first: `1 - 1.03e-9` rounds to one, and a tied class's `p (1 - mean)` lost its
+    # whole share to the pivot (train 1474's review: logits `[0, 0, -20]` along `[1, 1, 0]`). Else the entry
+    # less the mean, at its own scale; neither reads the other's operands.
+    # The entry's limbs less the mean's summed exactly and rounded once (`aligned_sum`, at least float32), in
+    # the direction's dtype as the rest of the map is: no limb meets another rounded first (head reviews:
+    # `256 - 2^34 + 2^34` lost the 256, and `B + 2^11` rounded to `B` lost -256).
+    limbs = [[jnp.where(held, high, 0)], [jnp.where(held, low, 0)],
+             *([jnp.broadcast_to(-limb, high.shape)] for limb in (*native, *lows))]
+    direct = aligned_sum(limbs).astype(moving.dtype)
+    whole = jnp.where(held, 0, moving) - jnp.where(held, 0, mean)
+    centered = jnp.where(held, direct, whole)
+    fits = jnp.isfinite(centered) & (held | jnp.isfinite(mean))
+    apart = (jnp.where(fits, 0, moving) * 2.0**-4 - small * 2.0**-4) - large
+    taken, weighed_apart = fits & ~top, ~fits & ~top
+    tangent = jnp.where(fits, probability * jnp.where(taken, centered, 0),
+                        (probability * jnp.where(weighed_apart, apart, 0)) * 2.0**4)
+    rest = _joined(*_ranged(jnp.where(top, 0, tangent)))
+    return jnp.where(top, -rest, tangent)
+
+
+def _weighed(probability: jax.Array, values: jax.Array, axes: tuple[int, ...]) -> tuple[jax.Array, jax.Array]:
+    """`values` weighed by `probability`, each product exact (`precision.two_product`), summed over `axes` as
+    a double float (`_pair_sum`)."""
+    from dew.nn import precision
+
+    product, error = precision.two_product(probability, values, bit_split=True)
+    return _pair_sum(product, error, axes)
+
+
+def _pair_sum(high: jax.Array, low: jax.Array, axes: tuple[int, ...]) -> tuple[jax.Array, jax.Array]:
+    """Double floats `(high, low)` summed over `axes` (`precision.summed_pairs`), kept along them."""
+    from dew.nn import precision
+
+    summed, residual = precision.summed_pairs((high, low), axes)
+    return summed[..., None], residual[..., None]
+
+
+def _over(pair: tuple[jax.Array, jax.Array],
+          mass: tuple[jax.Array, jax.Array]) -> tuple[jax.Array, jax.Array]:
+    """A double float `pair` over the double float `mass`, a double float: its quotient's rounded first
+    part and what that left, each step's residual exact (`precision.two_product`) where nothing
+    overflows."""
+    from dew.nn import precision
+
+    (high, low), (whole, part) = pair, mass
+    first = high / whole
+    product, error = precision.two_product(first, whole, bit_split=True)
+    return first, ((((high - product) - error) + low) - first * part) / whole
+
+
+def _added(base: jax.Array, first: jax.Array, rest: jax.Array) -> jax.Array:
+    """`base + first + rest`, `base` and `first` added exactly (`precision.two_sum`), so a quotient that
+    cancels the base leaves its remainder whole."""
+    from dew.nn import precision
+
+    rounded, error = precision.two_sum(base, first)
+    return rounded + (error + rest)
+
+
+def _bound(count: int, dtype: jnp.dtype) -> float:
+    """The size from which one of `count` terms in `dtype` could carry a sum of them all past the range,
+    `2^(maxexp - 2) / count` (`_ranged`)."""
+    return 2.0 ** (int(jnp.finfo(dtype).maxexp) - 2 - count.bit_length())
+
+
+def _ranged(*parts: jax.Array) -> tuple[jax.Array, jax.Array]:
+    """The sum over their last axis of `parts`, arrays alike in shape and layout, as a pair whose value is
+    `large 2^4 + small`: their one compensated sum (`precision.compensated_sum`), its cancellations kept
+    whole, as `(0, sum)` wherever it is in range; where it is not (a sum within rounding of the range's end,
+    whose terms' cancellations no small term outweighs), the terms whose size could carry a sum past the
+    range (`_bound`) summed 2^-4 times smaller, where none flushes, and the rest at their own scale, where
+    none can carry a sum past it, so neither part overflows where the terms are finite (`_softmax_moved`).
+    The parts are stacked on an axis of their own, never joined along the last, which a layout may split."""
+    from dew.nn import precision
+
+    terms = jnp.stack(parts, axis=-2)
+    axes = (terms.ndim - 2, terms.ndim - 1)
+    whole = precision.compensated_sum(terms, axes)[..., None]
+    held = jnp.isfinite(whole)[..., None]
+    large = jnp.abs(terms) >= _bound(terms.shape[-2] * terms.shape[-1], terms.dtype)
+    scaled = precision.compensated_sum(jnp.where(large & ~held, terms * 2.0**-4, 0), axes)[..., None]
+    small = precision.compensated_sum(jnp.where(large | held, 0, terms), axes)[..., None]
+    return jnp.where(held[..., 0], 0, scaled), jnp.where(held[..., 0], whole, small)
+
+
+def _joined(large: jax.Array, small: jax.Array) -> jax.Array:
+    """A `_ranged` pair's value, finite wherever it is in range: joined at the large part's scale where it
+    is near the range's end, else at the small part's."""
+    near = jnp.abs(large) >= 2.0 ** (jnp.finfo(large.dtype).maxexp - 6)
+    return jnp.where(near, (large + small * 2.0**-4) * 2.0**4, large * 2.0**4 + small)
+
+
 def _probabilities_tangent(primals, tangents):
     (logits,), (d_logits,) = primals, tangents
     probability = _probabilities(logits)
-    tangent = probability * (d_logits - jnp.sum(probability * d_logits, axis=-1, keepdims=True))
-    top = jax.nn.one_hot(jnp.argmax(probability, axis=-1), logits.shape[-1], dtype=bool)
-    rest = jnp.sum(jnp.where(top, 0.0, tangent), axis=-1, keepdims=True)
-    return probability, jnp.where(top, -rest, tangent)
+    return probability, softmax_tangent(probability, d_logits)
 
 
 _probabilities = contracted("test_the_categorical_losses_hold_every_order")(

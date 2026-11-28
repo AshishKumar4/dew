@@ -1120,8 +1120,23 @@ def _attention_candidates(q: jcore.Var, k: jcore.Var, v: jcore.Var, output: jcor
 
         operands = (q, k, v, *([extra] if extra is not None else []))
         options = (causal, softcap, wide, after, fill, window, boolean, dtype)
+        # The declaration the proof compares is the reference path's: a call is taken where its kernel reads
+        # each row as that does (`_attention_taken`), a row of no mass NaN whatever kernel then takes it.
+        # A row's hidden keys count where it can have no mass: a mask hides it wholly, a window passes every
+        # key a later row's than the keys hold, or a bias puts -inf on every key a causal or windowed row
+        # sees (a finite floor weighing the hidden keys there, where the reference excludes the row). An
+        # unbiased causal or windowed walk of no more queries than keys hides no row wholly (its first key
+        # each row's own), each key it sees a finite logit, as an unmasked call's are
+        # (`keeps_reference_rows`' contract: a product overflowing to -inf is no row of no mass any kernel
+        # answers for). A fill reaches a row only where one can have no mass. Plain programs' attention
+        # holds no sinks.
+        biased = extra is not None and not boolean
+        masked = boolean or (window is not None and aval(q).shape[-3] > aval(k).shape[-3]) or (
+            biased and (causal or window is not None))
+        rows = {"masked": masked, "filled": fill is not None and (masked or biased), "sunk": False,
+                "biased": biased}
         yield Candidate(operands, (output,), attend, functools.partial(attend, implementation='reference'),
-                        functools.partial(_attention_taken, attend, operands, options))
+                        functools.partial(_attention_taken, attend, operands, options, rows))
 
 
 def _selections(index: fusion.Index, operands: Sequence[jcore.Var], places: Sequence[int],
@@ -1186,13 +1201,16 @@ def _band(mask: np.ndarray) -> int | None:
 KEPT = frozenset({"xla", "reference"})
 """The attention routes that are no kernel of Dew's."""
 
-
-def _attention_taken(attend: Callable, operands: Sequence[jcore.Var], options: Hashable) -> bool:
+def _attention_taken(attend: Callable, operands: Sequence[jcore.Var], options: Hashable,
+                     rows: Mapping[str, bool]) -> bool:
     """Whether Dew's selector gives the call a kernel of its own (the template, FlashAttention, cuDNN; none
-    of `KEPT`), asked once by what it reads (`_TAKEN`): its operands' shapes and dtypes, the call's
-    `options` and the context its kernels are chosen in (`fusion.choice_context`)."""
+    of `KEPT`) that reads each row as the program's softmax does, the call's reference path
+    (`attention_kernels.keeps_reference_rows` of the call's `rows`: whether it hides keys, fills a wholly
+    hidden row, or adds a bias; a row of no mass NaN, row 14116), asked once by what it reads (`_TAKEN`): its
+    operands' shapes and dtypes, the call's `options` and the context its kernels are chosen in
+    (`fusion.choice_context`)."""
     key = (tuple((aval(var).shape, aval(var).dtype) for var in operands), options, fusion.choice_context())
-    return _cache.holding(_TAKEN, key, lambda: _traced_taken(attend, operands), fusion.DECISIONS_HELD)
+    return _cache.holding(_TAKEN, key, lambda: _traced_taken(attend, operands, rows), fusion.DECISIONS_HELD)
 
 
 _TAKEN: collections.OrderedDict[Hashable, Held[bool]] = collections.OrderedDict()
@@ -1203,10 +1221,16 @@ each shape and option asked of the selector once, however many regions and progr
 recognition traced the call 832 times for 113 regions, 37 of its 46 s, row 6799)."""
 
 
-def _traced_taken(attend: Callable, operands: Sequence[jcore.Var]) -> bool:
+def _traced_taken(attend: Callable, operands: Sequence[jcore.Var], rows: Mapping[str, bool]) -> bool:
     """`_attention_taken`'s answer: the call traced over its operands' shapes, its attention route read
-    (`generation.routes`); not where a kernel a call names refuses it (`KernelRefused`)."""
-    from dew.nn.kernels.selection import KernelRefused
+    (`generation.routes`), a kernel of Dew's that keeps the reference's rows; not where a kernel a call names
+    refuses it (`KernelRefused`); where this host cannot lower the GPU's kernel (`Unlowerable`), as the GPU
+    takes it."""
+    from dew.nn.attention_kernels import keeps_reference_rows
+    from dew.nn.kernels.selection import KernelRefused, Unlowerable
+
+    def keeps(kernel: str) -> bool:
+        return keeps_reference_rows(kernel, **rows)
 
     with generation.routes(alone=True) as found:
         try:
@@ -1214,7 +1238,13 @@ def _traced_taken(attend: Callable, operands: Sequence[jcore.Var]) -> bool:
         except KernelRefused:
             # A kernel a call names that does not take the call: the program's own math runs it.
             return False
-    return any(route.choice == Choice.ATTENTION and route.kernel not in KEPT for route in found)
+        except Unlowerable as unlowered:
+            # A kernel the GPU runs and this host cannot lower: the GPU's selector takes it, so a region its
+            # proof finds equal is the GPU's call, whose writing refuses the compile here (row 4616); one that
+            # reads a row otherwise the GPU does not take, the program as written there and here alike.
+            return keeps(unlowered.kernel)
+    return any(route.choice == Choice.ATTENTION and route.kernel not in KEPT and keeps(route.kernel)
+               for route in found)
 
 
 _QUERY_PASSTHROUGH = frozenset({

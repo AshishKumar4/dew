@@ -640,7 +640,9 @@ def test_a_provisional_plans_search_is_released_where_the_placed_search_after_it
     keeping the programs it compiled; where the devices, once the state is placed, hold no plan and the
     placed search refuses, every program the provisional search kept is dropped with it, none outliving the
     refused compile (review of row 12131's P0: the plan taken out of the compiler before the placed search
-    leaked its programs where that search raised)."""
+    leaked its programs where that search raised). The run states its split and its remat, so the placed
+    search refuses past its head's rungs alone (row 14114: the whole ladder at every split, 48 compiles,
+    took 148 s)."""
     from affine_run import Replaying
 
     from dew.data.dataset import Loader
@@ -658,7 +660,7 @@ def test_a_provisional_plans_search_is_released_where_the_placed_search_after_it
     monkeypatch.setattr(jax.Device, "memory_stats", lambda device: {
         "bytes_limit": LIMIT, "bytes_in_use": 0 if held(device) <= before[device] else LIMIT - (1 << 10)})
     rows = Replaying(lambda position: {"text": np.asarray(BATCH["text"])})
-    trainer = lm()
+    trainer = lm(split=1, policy="full")
     with pytest.raises(PlanRefused):
         trainer.fit(Loader(lambda partition: rows, None, None, ROWS), steps=1)
     gc.collect()

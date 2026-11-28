@@ -15,6 +15,7 @@ taken on.
 """
 
 
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -28,6 +29,7 @@ from jax.sharding import NamedSharding, PartitionSpec
 from model_support import TINY_DECODER, attending, scanning, stacked, unrolled
 from process_support import READ_ONLY, fresh, keeping_picks
 from reference_error import as_given, assert_as_exact, widened, with_gradients
+from test_stage_local import LORA_OPTIMIZER, SEEDS, draw, initials, lora, stepped
 
 from dew.batch import FROZEN
 from dew.data.dataset import Loader
@@ -130,6 +132,37 @@ def test_a_one_stage_scan_reads_a_frozen_fp8_base_where_it_lies():
                 run.compile(state, rows)
                 held[scan] = run.executable.memory_analysis().temp_size_in_bytes
         assert held[True] <= held[False], (remat, held)
+
+
+def trained(run):
+    """`run`'s steps (`stepped`, `per_step`) as what they train: each step's loss and optimizer state, whose
+    first moment holds that step's gradient of the adapter's factors, and the factors they leave."""
+    def factors(tokens, seed):
+        held = run(tokens, seed)
+        return {"params": held["variables"]["params"], "losses": held["losses"], "moments": held["moments"]}
+    return as_given(factors)
+
+
+@pytest.mark.usefixtures("scanned_stacks")
+@pytest.mark.mesh(devices=1)
+def test_a_one_stage_scan_over_an_fp8_base_trains_its_adapter_as_one_holding_no_stage_state():
+    """A LoRA run over an FP8 base, its layers scanned on one stage and stage-local, reading its packed frozen
+    kernels a row an iteration where they lie (`QUANTIZATION` among its `LAYER_ROWS`), trains its factors
+    two steps on par with the same run holding no stage-local state, against that whole run's float64, the
+    FP8 cast of its own values its one rounding (`quantization._fp8_rows_exactly`, check 1, row 14107; a
+    cast of float64 values may decide a block apart from a bfloat16 arm's, which the check's budget then
+    holds), reading no row the way the stage-local arm does: each iteration reads its own layer's packed
+    rows, each layer drawn apart (row 14082: the memory bound alone holds a wrong row read), each step's
+    loss and gradient held, not the run's end alone (train 1455's review)."""
+    model = decoder(num_layers=4)
+    adapted, given = lora(0, model, record)
+    # No EMA: what the check holds is the factors' training (an FP8 base's average is its own test's).
+    initial = initials(adapted, LORA_OPTIMIZER, lambda seed: lora(seed, model, record)[1], ema=None)
+    local, whole = (trained(stepped(adapted, LORA_OPTIMIZER, MeshSpec(), 1, initial, variables=given,
+                                    stage_local=held, ema=None, per_step=True)) for held in (True, False))
+    truth = trained(stepped(adapted, LORA_OPTIMIZER, MeshSpec(), 1, initial, variables=given, exact=True,
+                            stage_local=False, ema=None, per_step=True))
+    assert_as_exact(local, whole, draw, "an FP8 base's rows read where they lie", seeds=SEEDS, truth_fn=truth)
 
 
 ELSEWHERE = "sm90" if device_generation() == "sm80" else "sm80"
@@ -370,6 +403,59 @@ def test_split_over_fsdp_the_frozen_product_is_one_devices():
     assert_products_exact(placed, "the frozen FP8 product split over fsdp")
 
 
+def explicit_tensor_split():
+    """A float64 frozen product's case split over an Explicit `tensor` axis of two devices along its
+    contracted width (`P(None, 'tensor')`), as a tensor-parallel run lays it: the mesh, the split, float64
+    activations whose every row's largest is 1.75 (E4M3's 448 at a scale of 2^-8) and every other a power of
+    two, and a kernel packed alike, so every code, scale, product and partial sum is exact whatever the
+    split. Built under x64."""
+    from jax.sharding import AxisType
+
+    mesh = jax.make_mesh((2,), ("tensor",), axis_types=(AxisType.Explicit,), devices=jax.devices()[:2])
+    x = np.full((4, 8), 0.5, np.float64)
+    x[:, 0] = 1.75
+    kernel = np.full((8, 6), 0.25, np.float32)
+    kernel[0] = 1.75
+    leaves = [jnp.asarray(value) for value in frozen_fp8_leaves(kernel).values()]
+    return mesh, NamedSharding(mesh, PartitionSpec(None, "tensor")), jnp.asarray(x), leaves
+
+
+@pytest.mark.mesh(devices=2)
+def test_a_float64_frozen_product_split_over_an_explicit_tensor_axis_is_its_unsplit_one():
+    """Float64 activations and packed rows each split over an Explicit `tensor` axis along their contracted
+    width (`explicit_tensor_split`) take the frozen product's float64 truth
+    (`quantization._fp8_rows_exactly`) as they take it whole, exactly (train 1478's review: a bare `jnp.dot`
+    refused the split contraction, which the float32 product's portable route places)."""
+    with jax.enable_x64(new_val=True):
+        mesh, split, x, leaves = explicit_tensor_split()
+        whole = jax.jit(frozen_fp8_product)(x, *leaves)
+        with jax.set_mesh(mesh):
+            placed = jax.jit(frozen_fp8_product)(jax.device_put(x, split), jax.device_put(leaves[0], split),
+                                                 *leaves[1:])
+        assert placed.dtype == whole.dtype == jnp.float64
+        np.testing.assert_array_equal(np.asarray(placed), np.asarray(whole))
+
+
+@pytest.mark.mesh(devices=2)
+def test_a_float64_frozen_products_tangent_split_over_an_explicit_tensor_axis_is_its_unsplit_one():
+    """Forward mode (`jax.jvp`, MeanFlow's target) over the split of `explicit_tensor_split`, a dyadic
+    direction split as its activations are: the tangent, the direction times the decoded rows in float64,
+    is its unsplit one, exactly (train 1484's review P-F6: a bare dot refused the split tangent where the
+    value took it)."""
+    with jax.enable_x64(new_val=True):
+        mesh, split, x, leaves = explicit_tensor_split()
+        direction = jnp.asarray(np.where(np.arange(8) % 2 == 0, 0.5, -0.25) * np.ones((4, 1)), jnp.float64)
+
+        def tangent(x, direction, forward):
+            return jax.jvp(lambda x: frozen_fp8_product(x, forward, *leaves[1:]), (x,), (direction,))[1]
+
+        whole = jax.jit(tangent)(x, direction, leaves[0])
+        with jax.set_mesh(mesh):
+            placed = jax.jit(tangent)(*jax.device_put((x, direction, leaves[0]), split))
+        assert placed.dtype == whole.dtype == jnp.float64
+        np.testing.assert_array_equal(np.asarray(placed), np.asarray(whole))
+
+
 @pytest.mark.parametrize("measured_on", [None, ELSEWHERE], ids=["here", "elsewhere"])
 def test_every_named_site_computes_from_its_packed_kernel_inside_the_branch(measured_on):
     """A fresh adapter's branch adds zero (B starts at 0), so each named
@@ -396,8 +482,8 @@ def test_every_named_site_computes_from_its_packed_kernel_inside_the_branch(meas
     assert set(base) == set(seen)
 
 
-def fit(adapter, steps, directory=None):
-    objective = LMObjective(adapter.model, SEQ, variables=adapter.variables)
+def fit(adapter, steps, directory=None, ema=None):
+    objective = LMObjective(adapter.model, SEQ, variables=adapter.variables, ema_decay=ema)
     batches = np.random.default_rng(2).integers(0, VOCAB, (8, BATCH, SEQ + 1)).astype(np.int32)
 
     mesh = MeshSpec()
@@ -436,6 +522,23 @@ def test_lora_packs_the_frozen_base_once_in_place_of_its_kernels_and_training_mo
         for path, value in flatten_dict(tree, sep="/").items():
             np.testing.assert_array_equal(np.asarray(value).view(np.uint8),
                                           np.asarray(before[path]).view(np.uint8))
+
+
+def test_an_fp8_base_runs_average_follows_its_factors_and_holds_no_packed_base():
+    """A LoRA run over an FP8 base keeping an EMA (`LMObjective(ema_decay=...)`, `EMASpec.constant`) fits,
+    its average holding the factors alone, never the frozen base nor its packed codes (`UNFOLLOWED`): after
+    one step at decay one half each factor's average is the mean of its start and its step, bit for bit
+    (row 14086: the average took the packed FP8 codes, which no step compiled)."""
+    _, fp8 = adapters()
+    state = fit(fp8, 1, ema=0.5)
+    assert set(state.ema) == {"params"}
+    start, moved = (flatten_dict(tree) for tree in (fp8.variables["params"], state.variables["params"]))
+    for path, leaf in flatten_dict(state.ema["params"]).items():
+        average = np.asarray(leaf)
+        held, live = np.asarray(start[path], np.float32), np.asarray(moved[path], np.float32)
+        # Averaged in float32 and stored in the factor's own type (`averaging.ema_update`).
+        mean = (np.float32(0.5) * held + np.float32(0.5) * live).astype(average.dtype)
+        np.testing.assert_array_equal(average, mean)
 
 
 def test_a_merged_fp8_base_computes_the_kernels_its_training_moved():

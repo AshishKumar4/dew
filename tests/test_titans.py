@@ -146,6 +146,26 @@ def test_the_mini_batches_are_as_exact_as_the_recurrence_a_token_at_a_time(form,
     assert_as_exact(chunked, stepped, operands(form, dtype), f'{form}, {jnp.dtype(dtype).name}', seeds=SEEDS)
 
 
+@pytest.mark.parametrize("form", ["titans", "ttt"])
+def test_a_small_weight_over_a_large_root_reads_its_normal_output(form):
+    """One token whose memory reads `[-2^32, 2^32]` under an epsilon of `2^100` and a norm weight of `2^-101`
+    normalizes to `[-2^-18, 2^-18]` and reads `2^-119`, a normal float32, on either kernel: the weight is
+    taken into the inverse root only where it and the root both pass one, so `2^-101 / 2^50` never rounds to
+    zero first (79g's review)."""
+    query = jnp.asarray([[[[1.0, 0.0]]]], jnp.float32)
+    zeros = jnp.zeros_like(query)
+    weight, bias = jnp.full((1, 2), 2.0**-101, jnp.float32), jnp.zeros((1, 2), jnp.float32)
+    rate = jnp.zeros((1, 1, 1), jnp.float32)
+    memory = jnp.asarray([[[[-(2.0**32), 2.0**32], [0.0, 0.0]]]], jnp.float32)
+    if form == "titans":
+        out, _ = titans(query, zeros, zeros, weight, bias, rate, rate, rate, (memory, jnp.zeros_like(memory)),
+                        chunk=1, eps=2.0**100)
+    else:
+        out, _ = ttt_linear(query, zeros, zeros, weight, bias, rate, (memory, jnp.zeros((1, 1, 1, 2))),
+                            chunk=1, scale=1.0, eps=2.0**100)
+    assert np.asarray(out)[0, 0, 0, 1] == np.float32(2.0**-119)
+
+
 def _pair(*rows):
     """`[1, len(rows), 1, len(rows[0])]` fp32 from `rows`."""
     return jnp.asarray(rows, jnp.float32).reshape(1, len(rows), 1, len(rows[0]))
@@ -418,6 +438,29 @@ def test_a_memorys_mini_batches_are_recomputed_where_the_rung_recomputes_the_chu
     with recomputing((MEMORY_RESIDUALS[1],)):
         recomputed_bytes = saved()
     assert recomputed_bytes < stored_bytes, (recomputed_bytes, stored_bytes)
+
+
+@pytest.mark.parametrize('form', sorted(FORMS))
+def test_a_memorys_readout_is_recomputed_with_its_chunks(form):
+    """Where the run's rung recomputes the memory's chunks (`residuals.memory_chunks`), the residuals its
+    gradient saves past its arguments (`jax.ad_checkpoint.saved_residuals`) hold none of its readout's
+    LayerNorm over the call's own tokens: the readout is formed in each mini-batch's step, recomputed with
+    it, every value of it laid on the mini-batches' padded tokens (train 1498's review: formed after the walk,
+    its normalized readouts and roots over the call's tokens were kept for the backward)."""
+    from jax._src.ad_checkpoint import saved_residuals
+
+    from dew.nn.residuals import MEMORY_RESIDUALS, recomputing
+
+    *given, states, _ = operands(form, jnp.float32)(1)
+    memory = functools.partial(FORMS[form][0], chunk=CHUNK)
+
+    def total(*arguments):
+        return sum(jnp.sum(x) for x in jax.tree.leaves(memory(*arguments)))
+
+    with recomputing((MEMORY_RESIDUALS[1],)):
+        kept = [jnp.shape(aval) for aval, source in saved_residuals(total, *given, states)
+                if not source.startswith("from the argument")]
+    assert LENGTH % CHUNK and not [shape for shape in kept if LENGTH in shape], kept
 
 
 def test_a_memorys_residual_survives_an_affine_its_bias_cancels():

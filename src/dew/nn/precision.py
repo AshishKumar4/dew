@@ -40,6 +40,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from flax.typing import Dtype, PrecisionLike
+from jax.core import ShapedArray
 from jax.extend import core
 from jax.typing import DTypeLike
 from numpy.lib.array_utils import normalize_axis_tuple
@@ -130,6 +131,7 @@ __all__ = [
     "precision_names",
     "products_dtype",
     "projection_role",
+    "ragged",
     "recipe_role",
     "refuse_recipe",
     "rms_statistics",
@@ -195,8 +197,17 @@ def rms_statistics(x: jax.Array, epsilon: float, *, axis=-1, keepdims: bool = Tr
     learned scale round. The count's reciprocal is a Python float, where `jnp.reciprocal` of the count's
     array is an integer power, which a Pallas Triton kernel cannot lower on a folded constant."""
     square = jnp.square(x.astype(at_least_fp32(x.dtype)))
-    mean = (jnp.mean(square, axis=axis, keepdims=keepdims) if count is None
-            else jnp.sum(square, axis=axis, keepdims=keepdims) * (1.0 / count))
+    if count is None:
+        mean = jnp.mean(square, axis=axis, keepdims=keepdims)
+        return mean, jax.lax.rsqrt(mean + epsilon)
+    return rms_of_total(jnp.sum(square, axis=axis, keepdims=keepdims), count, epsilon)
+
+
+def rms_of_total(total: jax.Array, count: int, epsilon: float) -> tuple[jax.Array, jax.Array]:
+    """`rms_statistics`' mean square and inverse RMS from its squares' `total` over `count` entries: the
+    total times the count's reciprocal (a Python float), as a kernel summing its rows' squares across its
+    steps or lanes takes them (the recurrence's output launch, its decode step)."""
+    mean = total * (1.0 / count)
     return mean, jax.lax.rsqrt(mean + epsilon)
 
 
@@ -888,17 +899,68 @@ def accumulated(product: Callable[..., jax.Array], *operands,
     on a CPU, states its fp32 sums with JAX's dot algorithm for them, `with
     jax.default_matmul_precision(FP32_SUMS)`, which jit's cache keys as it keys every precision."""
     if _ragged(product):
-        # A ragged dot's group sizes count its rows and multiply nothing (`counts`): its product is of the two
-        # others, the sizes passed through as they are.
-        *multiplied, _ = operands
-        if _sums_in_float64(*multiplied):
-            return _summed_wide(product, preferred_element_type, *operands, counts=1)
-        return product(*operands, preferred_element_type=preferred_element_type)
+        return ragged(product, *operands, preferred_element_type=preferred_element_type, summed_wide=True)
     if not _sums_in_float64(*operands):
         return product(*operands, preferred_element_type=preferred_element_type)
     if (key := _contraction(product, preferred_element_type)) is not None:
         return _traced_once(key, _summed_wide)(*operands)
     return _summed_wide(product, preferred_element_type, *operands)
+
+
+def ragged(product: Callable[..., jax.Array], *operands, preferred_element_type: DTypeLike | None = None,
+           summed_wide: bool = False) -> jax.Array:
+    """`product(*operands, preferred_element_type=...)`, a ragged dot (`jax.lax.ragged_dot_general` bound,
+    `_ragged`; its last operand its group sizes, which count its rows and multiply nothing): where its groups
+    are statically none (the sizes' last axis empty) and count its rows (`_counts_groups`) its zeros
+    (`_no_groups`), as it multiplies no row; else, `summed_wide` (`accumulated`'s), its products summed as a
+    wide CPU process sums them (`_summed_wide`, over the program traced here, none traced twice), or as
+    written. XLA's CUDA backend refuses a ragged dot of no
+    groups (row 14112: a forward's legalization left its result unmaterialized, a kernel gradient's
+    contraction aborted the process; a bank of no experts on a GH200). Every ragged product Dew forms passes
+    here (`accumulated`'s, `xla_products.placed_ragged_dot`'s, the fuser's dot as written)."""
+    *multiplied, sizes = operands
+    traced = None
+    if not jnp.shape(sizes)[-1]:
+        traced = jax.make_jaxpr(functools.partial(product, preferred_element_type=preferred_element_type))(
+            *operands)
+        if _counts_groups(traced, product):
+            return _no_groups(traced, operands)
+    if summed_wide and _sums_in_float64(*multiplied):
+        return _summed_wide(product, preferred_element_type, *operands, counts=1, traced=traced)
+    return product(*operands, preferred_element_type=preferred_element_type)
+
+
+def _counts_groups(traced: core.Jaxpr, product: Callable) -> bool:
+    """Whether the ragged dot `traced` (`product`'s program) has its group sizes count its rows: its rows'
+    ragged axis one it keeps or contracts (JAX's ragged non-contracting and contracting modes), not a batch
+    axis (its ragged-batch mode, a batched dot whatever its sizes, which it reads not at all:
+    `jax.lax.ragged_dot_general`; train 1478's review of row 14112: two [2, 1, 1] operands of 2s and 3s
+    batched on their ragged axis are two 6s at sizes of no groups, not zeros). Its dimension numbers read
+    at any depth of the program (`programs.equations`: a product jitted or wrapped); a product that binds
+    no ragged dot is refused."""
+    numbers = next((equation.params["ragged_dot_dimension_numbers"] for equation in equations(traced)
+                    if "ragged_dot_dimension_numbers" in equation.params), None)
+    if numbers is None:
+        raise ValueError(f"precision.ragged multiplies a ragged dot, and {product!r} binds none")
+    (ragged_axis,) = numbers.lhs_ragged_dimensions
+    _, (batch_axes, _) = numbers.dot_dimension_numbers
+    return ragged_axis not in batch_axes
+
+
+def _no_groups(traced: core.Jaxpr, operands: tuple) -> jax.Array:
+    """A ragged dot of no groups' zeros (`traced`, its program), typed as the product is: its traced aval's
+    dtype (a float64 one's outside x64 too), weakness and Explicit placement, made where a product of its
+    operands would be (`sharding.placed_zeros`: traced, at that placement; eagerly, on its operands' mesh of
+    devices or the one device they are committed to), varying as its operands vary. A constant, its derivative
+    zero at every order (row 14112's reviews; train 1490's K-F1: a mesh entered while a jit traced a closure's
+    concrete bank)."""
+    from dew.nn.sharding import placed_zeros, varying_like
+
+    # The one array a ragged dot returns.
+    typed = next(aval for aval in traced.out_avals if isinstance(aval, ShapedArray))
+    placement = typed.sharding if isinstance(typed.sharding, jax.sharding.NamedSharding) else None
+    zeros = placed_zeros(typed.shape, typed.dtype, placement, *operands, weak_type=typed.weak_type)
+    return varying_like(zeros, *operands)
 
 
 def _ragged(product: Callable) -> bool:
@@ -969,15 +1031,17 @@ def _traced_once(key: tuple, summed: Callable) -> Callable:
     return nested(functools.partial(summed, product, preferred_element_type))
 
 
-def _summed_wide(product: Callable, preferred_element_type, *operands, counts: int = 0) -> jax.Array:
+def _summed_wide(product: Callable, preferred_element_type, *operands, counts: int = 0,
+                 traced: core.Jaxpr | None = None) -> jax.Array:
     """`accumulated`'s product under Dew's wide CPU arithmetic: its float64 sum where it takes the
     platform's choice (`platform_dependent`), the plain product where its result is wider than float32 or
-    its library states its derivative; its last `counts` operands multiply nothing (`float64_sum`)."""
+    its library states its derivative; its last `counts` operands multiply nothing (`float64_sum`).
+    `traced`, the product's program where its caller traced it (`ragged`'s), else traced here."""
     from dew.nn.kernels.generation import linear_tangent
 
     narrow = functools.partial(product, preferred_element_type=preferred_element_type)
-    traced, shape = jax.make_jaxpr(narrow, return_shape=True)(*operands)
-    dtype = shape.dtype
+    traced = jax.make_jaxpr(narrow)(*operands) if traced is None else traced
+    dtype = next(aval for aval in traced.out_avals if isinstance(aval, ShapedArray)).dtype
     if jnp.promote_types(dtype, jnp.float32) != jnp.float32 or _own_backward(traced.jaxpr):
         # A wider result converts the operands to it, so the products are not float32's; a product
         # with a backward of its own is its library's.
@@ -1602,6 +1666,25 @@ def rounding_alone():
     held = _MARKING.set(True)
     try:
         with set_xla_metadata(**{name: True}):
+            yield
+    finally:
+        _MARKING.reset(held)
+
+
+@contextlib.contextmanager
+def rounding_as_compiled():
+    """Inside a `rounding_alone` block, a block traced as outside any (`uncontracted`), unmarked: code the
+    marked arithmetic calls that is not its own (a model a solver's step calls; review of train 1492's
+    fold). Outside a marked block, nothing changes."""
+    name = no_contract()
+    if name is None or not _MARKING.get():
+        yield
+        return
+    from jax.experimental.xla_metadata import set_xla_metadata
+
+    held = _MARKING.set(False)
+    try:
+        with set_xla_metadata(**{name: None}):  # a None value lifts the mark for the block
             yield
     finally:
         _MARKING.reset(held)

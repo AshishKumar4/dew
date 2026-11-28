@@ -190,7 +190,8 @@ def test_a_run_started_from_a_saved_run_resumes_and_serves_on_hosts_whose_caches
     where it trained: the pin they share writes this host's release of the same saved run
     (`SavedRun.pinned`, `releases_here`), where the record's paths raised Hugging Face's repo-id error. On a
     host that lacks the saved run too, a reader of the weights alone (`dew.checkpoints.averaged`) reads them,
-    and a reader that opens the record's paths is refused, naming the saved run."""
+    and a reader that opens the record's paths is refused, naming the saved run. An export of it to a store
+    is refused before its pin writes any release (train 1478's review, P-F3)."""
     from dew.checkpoints import averaged
     from dew.decision import Choice, Decide
     from dew.inference.loading import pipeline
@@ -228,6 +229,16 @@ def test_a_run_started_from_a_saved_run_resumes_and_serves_on_hosts_whose_caches
     cache("serving_host")
     np.testing.assert_array_equal(answered(Decide.from_run(second, step=1)), served)
     np.testing.assert_array_equal(answered(pipeline(second, step=2)), stepped)
+    # A fourth host, lacking both releases (the resuming host's cache gone too), exporting the run to a store:
+    # refused before the run is pinned, whose pin would write its release of the saved run into this host's
+    # cache (train 1478's review, P-F3).
+    from dew._cli.main import main
+
+    shutil.move(resumed_on.parent.parent, tmp_path / "kept resumed")
+    exporting = cache("exporting_host")
+    with pytest.raises(ValueError):
+        main(["export", second, "memory://refused-export"])
+    assert not exporting.exists() or not any(exporting.iterdir())
     # A host lacking the saved run too: a reader of the weights alone reads them, and one that opens the
     # record's paths is refused, naming the saved run.
     shutil.move(source, tmp_path / "moved")

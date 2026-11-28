@@ -829,9 +829,10 @@ PLANNED: contextvars.ContextVar[list | None] = contextvars.ContextVar("planned",
 """Where `template.planned` collects its launches; None where they run."""
 
 
-STATIC = ("call", "tiles", "scale", "keeps", "applies", "out_dtype", "solves")
+STATIC = ("call", "tiles", "scale", "keeps", "applies", "out_dtype", "solves", "normed")
 """A launch's static arguments, by name (`lowered_once`): its call's geometry, bundle and target, its tiles
-and its constants; its every other argument an array or None."""
+and its constants (an output launch's epilogue among them, `output.Normed`); its every other argument an
+array or None."""
 
 
 _ALONE = "recurrence_alone"

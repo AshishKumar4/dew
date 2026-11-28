@@ -559,8 +559,8 @@ def test_an_owed_power_past_float32s_is_owed_exactly_natively_and_in_software():
 
 
 def an_owed_products_native_fold_rounds_once_below_the_normals():
-    """On a GPU, whose float32 keeps subnormals (`factored.flushing`'s native platform),
-    `factored.owed_native` and `owed_exactly` owe 2^127 on a subnormal product past a factor whose folded
+    """On a GPU, `factored.owed_native` (a packed launch's epilogue's) and `owed_exactly` owe 2^127 on a
+    subnormal product past a factor whose folded
     multiplier overflows, rounding once: 2^-149 times 2.5 owed 2^127 is 5 2^-23, the product raised by the
     power before the factor's one rounding, where its product with the factor first, rounded on the
     subnormal grid, gave 2^-21 (train 1450's review). Run by tests/test_gpu_gemm.py's cells: this CPU
@@ -977,6 +977,39 @@ def a_packed_nvfp4_call_placed_on_its_hosts_cpu_keeps_a_subnormal_scale():
     np.testing.assert_array_equal(np.asarray(out), np.full((256, 128), 2.0 ** -119, np.float32))
 
 
+def a_packed_nvfp4_prefills_finish_is_its_products_finished_apart():
+    """On a GPU, a packed NVFP4 prefill (named packed, 256 rows of two experts' groups) whose tensor scale is
+    one a column, the columns' scales 1, 2^-127 (subnormal, the 2^8 it owes taking it to a normal 2^-119)
+    and 2^121 (finite, its product by 2^8 past float32's largest) by turns and each expert's its own: its
+    launch's finish (`gemm._packed_finish`, the scale and the owed 2^8 in the epilogue) is bitwise its
+    products finished apart (XLA's decoded product, `factored`'s one rounding after it) and the float64
+    truth, over small integer codes and rows (train 1474's review: the finish was lowered and run on the
+    host, never natively against the finish apart). Run by tests/test_gpu_gemm.py's cells."""
+    rng = np.random.default_rng(13743)
+    # Codes of E2M1's half steps and rows of units: every sum small, so 2^121 times it stays finite.
+    codes = rng.integers(-2, 3, (2, 256, 128)).astype(np.float32) / 2
+    scales = np.tile(np.asarray([1.0, 2.0 ** -127, 2.0 ** 121], np.float32), 43)[:128]
+    scale = np.stack([scales, np.roll(scales, 1)])
+    bank = formats.NvFp4.of(jnp.asarray(codes), jnp.ones((2, 16, 128), jnp.float8_e4m3fn), jnp.asarray(scale))
+    rows = rng.integers(-1, 2, (256, 256)).astype(np.float32)
+    sizes = jnp.asarray([128, 128], jnp.int32)
+
+    def product(route):
+        with generation.chosen(nvfp4=route), tuning.seen() as launched:
+            out = np.asarray(jax.jit(lambda x: gemm.nvfp4_product(x, bank, sizes, out_dtype=jnp.float32))(
+                jnp.asarray(rows, jnp.bfloat16)))
+        return out, _packed_epilogues(launched)
+
+    truth = np.concatenate([rows[group * 128:(group + 1) * 128].astype(np.float64) @ codes[group]
+                            * scale[group].astype(np.float64) for group in range(2)]).astype(np.float32)
+    (finished, hooked), (apart, _) = product("packed"), product("xla")
+    # The packed call's launch took the finish in its epilogue (its review: else the finish was XLA's).
+    assert hooked and all(epilogue is not None for epilogue in hooked), hooked
+    assert np.isfinite(truth).all()
+    np.testing.assert_array_equal(apart.view(np.uint32), truth.view(np.uint32))
+    np.testing.assert_array_equal(finished.view(np.uint32), apart.view(np.uint32))
+
+
 def _packed_epilogues(launched) -> list:
     """The epilogue of each packed NVFP4 launch a trace took (`tuning.seen`)."""
     return [observed.keyed.arguments["hooks"].epilogue for observed in launched
@@ -984,12 +1017,13 @@ def _packed_epilogues(launched) -> list:
 
 
 @pytest.mark.parametrize("grouped", [False, True], ids=["matrix", "bank"])
-def test_a_packed_nvfp4_call_finishes_its_scale_in_its_launch_where_it_runs_unswapped(grouped):
-    """An NVFP4 product named packed on an H100 whose tensor scale is one a column, as a matrix and as a bank
-    of two experts: a prefill's launch takes the scale and the decode's owed 2^8 in its epilogue
-    (`gemm._packed_finish`, row 13743), no factor's rows formed; a decode's 16 rows (swapped or not) take
-    none, the factor XLA's after it, as its receipts timed it; interpreted on this CPU (whose float32 flushes
-    the subnormals `factored`'s own rounding keeps) no launch takes it either."""
+def test_a_packed_nvfp4_call_finishes_its_scale_in_its_launch_where_it_varies_by_group(grouped):
+    """An NVFP4 product named packed on an H100 whose tensor scale is one a column, as a bank of two experts
+    and as a matrix: a bank's prefill launch takes the scale and the decode's owed 2^8 in its epilogue
+    (`gemm._packed_finish`, row 13743), no row's expert's scales gathered after it; a matrix's takes none,
+    its one scale XLA's in the output's conversion, which the epilogue's finish only slowed (M-NG-68t4,
+    GH200); a decode's 16 rows (swapped or not) take none, as its receipts timed it; interpreted on this CPU
+    (whose float32 flushes the subnormals `factored`'s own rounding keeps) no launch takes it either."""
 
     def epilogues(rows, *, interpret):
         spec, matrix, sizes = _columned_case(rows, grouped=grouped)
@@ -1000,7 +1034,7 @@ def test_a_packed_nvfp4_call_finishes_its_scale_in_its_launch_where_it_runs_unsw
         assert found, rows
         return found
 
-    assert all(epilogue is not None for epilogue in epilogues(256, interpret=False))
+    assert all((epilogue is not None) == grouped for epilogue in epilogues(256, interpret=False))
     assert all(epilogue is None for epilogue in epilogues(256, interpret=True))
     # A decode's rows (the receipts' decode cells, `NVFP4_DECODE_ROWS`) keep the factor after the launch.
     assert all(epilogue is None for epilogue in epilogues(16, interpret=False))
@@ -1015,13 +1049,13 @@ def test_a_packed_nvfp4_pin_its_finish_cannot_take_keeps_the_plain_launch(interp
     raised (`gemm._packed_finish`: the optional finish bound as its native launch is, row 13743's review)."""
     from dew.nn.kernels.templates import report
 
-    spec, matrix, _ = _columned_case(256, grouped=False)
+    spec, matrix, sizes = _columned_case(256, grouped=True)
     launch = grouped_quantized.MosaicPackedGmm()
     mesh = generation.gpu_mesh(Mesh(np.array(jax.devices()[:1]), ("data",)), "sm90")
 
     def packed(pins):
         with generation.chosen(nvfp4="packed"), tuning.pinned(pins), tuning.seen() as launched:
-            jax.jit(lambda x: gemm.nvfp4_product(x, matrix, out_dtype=jnp.float32,
+            jax.jit(lambda x: gemm.nvfp4_product(x, matrix, sizes, out_dtype=jnp.float32,
                                                  interpret_on_cpu=interpret)).trace(spec)
         return [(observed.config, observed.arguments) for observed in launched.held()
                 if isinstance(observed.arguments.op, grouped_quantized.MosaicPackedGmm)]
@@ -1041,14 +1075,13 @@ def test_a_packed_nvfp4_pin_its_finish_cannot_take_keeps_the_plain_launch(interp
     assert all(taken == launch.completed(plain, config) for taken, _ in after), after
 
 
-@pytest.mark.parametrize("grouped", [False, True], ids=["matrix", "bank"])
 @pytest.mark.parametrize("gpu", [pytest.param("sm80", marks=lowers("sm80")),
                                  pytest.param("sm90", marks=lowers("sm90"))])
-def test_a_packed_nvfp4_prefill_finishing_its_scale_lowers_for_cuda(gpu, grouped):
-    """A prefill-sized NVFP4 product named packed whose tensor scale is one a column (a matrix's, a bank's
-    of two experts) lowers for CUDA on an A100 and an H100 with its launch's epilogue taking the scale, a
-    side each tile reads where it lands (row 13743)."""
-    spec, matrix, sizes = _columned_case(256, grouped=grouped)
+def test_a_packed_nvfp4_prefill_finishing_its_scale_lowers_for_cuda(gpu):
+    """A prefill-sized NVFP4 product named packed whose tensor scale is one a column of each of a bank's
+    two experts lowers for CUDA on an A100 and an H100 with its launch's epilogue taking the scale, a side
+    each tile reads where it lands (row 13743)."""
+    spec, matrix, sizes = _columned_case(256, grouped=True)
     mesh = generation.gpu_mesh(Mesh(np.array(jax.devices()[:1]), ("data",)), gpu)
     with (generation.assumed(gpu), jax.sharding.use_abstract_mesh(mesh), generation.chosen(nvfp4="packed"),
           tuning.seen() as launched):
@@ -1136,6 +1169,84 @@ def test_gemm_quantized_nvfp4_block_matches_bits_nvfp4_coded_and_lowers(gpu: str
           generation.chosen(grouped_matmul="mosaic")):
         jax.jit(lambda a, b, s: quantized.gemm_quantized(a, b, minifloat=bits.E2M1, tensor_scale=s)).trace(
             x_s, w_s, s_s).lower(lowering_platforms=("cuda",))
+
+
+def test_a_block_whose_ratio_is_subnormal_takes_the_least_scale_in_both_routes():
+    """A block of values at fp32's least normal under a tensor scale of 1, its ratio over 6 below the
+    normals, takes e4m3's least subnormal scale (0x01), the least at or above its ratio, its codes zero, in
+    `formats.NvFp4Block.quantized` and the GEMM epilogue (`quantized.gemm_quantized`) alike on this CPU, whose
+    flushing comparison read the ratio as zero and gave the block a scale of zero (row 14083's review:
+    `bits.scales_rounded_up` compares words)."""
+    x = jnp.eye(64, dtype=jnp.bfloat16)
+    w = np.ones((64, 64), np.float32)
+    w[0, :16] = 2.0 ** -126
+    w = jnp.asarray(w, jnp.bfloat16)
+    one = jnp.float32(1)
+    ref = formats.NvFp4Block.quantized(jax.lax.dot(x, w, preferred_element_type=jnp.float32), one)
+    got = jax.jit(lambda a, b, s: quantized.gemm_quantized(a, b, minifloat=formats.NvFp4Block,
+                                                           tensor_scale=s))(x, w, one)
+    for block in (ref, got):
+        assert np.asarray(block.scales).view(np.uint8)[0, 0] == 0x01
+        assert not np.asarray(block.codes).view(np.uint8)[0, :16].any()
+    for found, expected in ((got.scales, ref.scales), (got.codes, ref.codes)):
+        np.testing.assert_array_equal(np.asarray(found).view(np.uint8), np.asarray(expected).view(np.uint8))
+
+
+def test_every_route_codes_a_blocks_scale_alike_at_its_edges():
+    """Each route quantizing an NVFP4 operand codes the same block scales on this CPU, whose float32
+    arithmetic flushes subnormals (row 14083's review): a block whose largest accumulator is subnormal
+    (2^-140) at a tensor scale of 1, through the GEMM epilogue outside a kernel and `NvFp4Block.quantized`,
+    both its least subnormal scale 0x01, and at a negative, negative-zero or NaN scale every block's scale
+    e4m3's NaN, 0x7F (`bits.scales_rounded_up`); at float32 width and a float64
+    truth's, a block of fp32's least normal at a scale of 3 (0x01) and one of 2^-124 at a subnormal scale
+    of 2^-127 (8 over 6, 0x3B: 1.375), a zero scale's NaN lanes coded alike at both widths and in the
+    epilogue, and the tensor scale's derivative in the block's largest, 1/2688."""
+    acc = np.zeros((4, 32), np.float32)
+    acc[0, 0] = 2.0 ** -140
+    acc[1:, :] = 1.0
+
+    def epilogue(acc, scale):
+        codes, scales = quantized._nvfp4_quantize_epilogue(acc, jnp.broadcast_to(scale, (acc.shape[0],)))
+        return formats.NvFp4Block.encoded(codes, scales[..., ::16], scale)
+
+    def coded(acc, scale):
+        return formats.NvFp4Block.quantized(acc, scale)
+
+    for scale in (np.float32(1), np.float32(-1), np.float32(-0.0), np.float32(np.nan)):
+        found = [jax.jit(route)(acc, jnp.float32(scale)) for route in (epilogue, coded)]
+        for operand in found:
+            scales, codes = (np.asarray(each).view(np.uint8) for each in (operand.scales, operand.codes))
+            if scale > 0:
+                assert scales[0, 0] == 0x01, scales
+            else:
+                # A negative, negative-zero or NaN scale codes every block's scale NaN, its codes zero.
+                assert (scales == bits.E4M3.nan).all() and not codes.any(), (scale, scales, codes)
+        for each in ("scales", "codes"):
+            np.testing.assert_array_equal(*(np.asarray(getattr(operand, each)).view(np.uint8)
+                                            for operand in found))
+    with jax.enable_x64(new_val=True):
+        # A zero scale: a block of a value beside zeros at 448, its zeros' quotients NaN, one code at either
+        # width and in the epilogue, whatever sign the platform's 0/0 takes.
+        found = [jax.jit(route)(acc.astype(dtype), jnp.float32(0)) for route, dtype in
+                 ((epilogue, np.float32), (coded, np.float32), (coded, np.float64))]
+        for each in ("scales", "codes"):
+            first, *others = (np.asarray(getattr(operand, each)).view(np.uint8) for operand in found)
+            for other in others:
+                np.testing.assert_array_equal(other, first)
+        for value, scale, code in ((2.0 ** -126, 3.0, 0x01), (2.0 ** -124, 2.0 ** -127, 0x3B)):
+            for dtype in (jnp.float32, jnp.float64):
+                block = jnp.full((4, 32), value, dtype)
+                assert block.dtype == dtype
+                operand = jax.jit(coded)(block, jnp.float32(scale))
+                assert (np.asarray(operand.scales).view(np.uint8) == code).all(), (value, dtype)
+        largest = np.zeros((16, 2), np.float64)
+        largest[3, 1] = 2688.0
+        for dtype in (jnp.float32, jnp.float64):
+            moved = np.zeros_like(largest)
+            moved[3, 1] = 1.0
+            _, slope = jax.jvp(lambda x: bits.nvfp4_coded(x)[2], (jnp.asarray(largest, dtype),),
+                               (jnp.asarray(moved, dtype),))
+            assert np.asarray(slope, np.float32) == np.float32(1 / 2688), (dtype, slope)
 
 
 def test_ternary_weights_checkpoint_restore_verifies_form_and_scale(tmp_path):
@@ -2026,3 +2137,50 @@ def test_a_grouped_nvfp4_product_of_no_depth_is_zero(generation_name):
         out = gemm.nvfp4_product(jnp.zeros((8, 0), jnp.float32), matrix, jnp.asarray([8], jnp.int32),
                                  out_dtype=jnp.float32, interpret_on_cpu=True)
     np.testing.assert_array_equal(np.asarray(out), np.zeros((8, 64), np.float32))
+
+
+def test_a_packed_steps_price_counts_its_decodes_integer_pipes():
+    """A step whose NVFP4 operand its consumers decode (`pricing.step_seconds`, the form's work in its
+    `Decoded`, row 14106): on the tile an H100's planner takes for an 8-token call (its forms the launch's
+    own, `_operand_bytes`; theme 21's review K-F7) the shared bytes outlast the decode, so its price
+    stands, and a decode of sixty-four times its work outlasts them, the step priced past them; and two
+    operands' decodes on one pipe add, not overlap, each pipe's work summed before the busiest is read (its
+    review: a 64x64x256 step's two decodes 384 clocks, not 192)."""
+    from dew.nn.kernels.templates import cost
+    from dew.nn.kernels.templates.gemm import pricing
+
+    # The forms the packed launch itself prices a decode call's step by (`_operand_bytes`, its review's
+    # K-F7: not built by hand beside it), of an 8-token call through it.
+    spec, matrix, _ = _columned_case(8, grouped=False)
+    launch = grouped_quantized.MosaicPackedGmm()
+    with generation.assumed("sm90"), generation.chosen(nvfp4="packed"), tuning.seen() as launched:
+        jax.jit(lambda x: gemm.nvfp4_product(x, matrix, None, out_dtype=jnp.float32,
+                                             interpret_on_cpu=True)).trace(spec)
+    taken = [(observed.config, observed.arguments) for observed in launched.held()
+             if isinstance(observed.arguments.op, grouped_quantized.MosaicPackedGmm)]
+    assert taken, "the call took no packed launch"
+    # The tile the planner took for it and the operand whose stage its consumers decode there.
+    (tile, bound), h100 = taken[0], generation.gpu_target("sm90")
+    itemsizes, forms = launch._operand_bytes(bound, tile)
+    [(slot, form)] = [(slot, each) for slot, each in enumerate(forms) if each is not None]
+    assert form.work is not None
+
+    def held(work):
+        each = list(forms)
+        each[slot] = form._replace(work=work)
+        return tuple(each)
+
+    def priced(work):
+        return pricing.step_seconds(tile, h100, itemsizes, held(work), issued=jnp.bfloat16)
+
+    rates = cost.rates(h100, device=False)
+    assert priced(form.work) == priced(None)
+    # A decode of sixty-four times its work outlasts the shared bytes, and the step is priced at it.
+    heavy = cost.repeated(form.work, 64)
+    decoding = pricing.decode_seconds(tile, held(heavy), rates)
+    assert decoding > priced(None) and priced(heavy) == decoding
+    square = tiling.Tiles(64, 64, 256, 2, 1, family="wgmma")
+    one = pricing.Decoded(2, 1, form.work)
+    # The square tile's two operands alike, each decode's seconds the other's; doubled exactly.
+    left, right = (pricing.decode_seconds(square, forms, rates) for forms in ((one, None), (None, one)))
+    assert left == right and pricing.decode_seconds(square, (one, one), rates) == 2 * left

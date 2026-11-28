@@ -979,8 +979,10 @@ def test_a_checkpoint_declaring_block_attention_trains_and_serves_a_fresh_heads_
         prepared = dataclasses.replace(default, pretrained=str(source), trainer=trainer).prepare()
         objective, _ = prepared.train("x")
         assert objective.layout.blocks
+    # Read with no held-out split, whose scoring compiles a program of its own for none of this (row 14115:
+    # 122 s with it).
     run = dataclasses.replace(decision(tmp_path, drawn=False), pretrained=str(sources["text_config"]),
-                              source=SourceOptions(text_only=True))
+                              source=SourceOptions(text_only=True), validation=None)
     assert answered(trained_by_cli(run, tmp_path, "declared", {})).layout.blocks
 
 

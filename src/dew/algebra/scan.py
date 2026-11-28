@@ -57,6 +57,7 @@ from dew.algebra import carry, cost, derive, linear_scan, program, ratios, scale
 from dew.algebra.forms import Derived, Refused, aval, environment, evaluate, scalar_case_batch
 from dew.nn import float_bits
 from dew.nn.derivatives import Protected, contracted, declared_tangent
+from dew.nn.kernels.generation import symbolic_tangent
 from dew.nn.kernels.templates.axes import laid
 from dew.nn.nested import nested
 from dew.nn.precision import (
@@ -69,7 +70,7 @@ from dew.nn.precision import (
     uncontracted,
     vanishing,
 )
-from dew.nn.programs import holes, read_by
+from dew.nn.programs import read_by
 
 Axes = tuple[str, ...]
 
@@ -1258,36 +1259,66 @@ def _pair_factors(left, right, decay, after):
     return left[..., :, None], right[..., None, :], *factors, active.astype(left.dtype)
 
 
-def _portable_pair_jvp(primals, tangents):
-    live = tuple(t is not None and not isinstance(t, SymbolicZero) for t in tangents)
-    value = _portable_pairs(*primals)
-    if not any(live):
-        return value, SymbolicZero(jax.typeof(value).to_tangent_aval())
-    operands, fill = holes(primals, live, is_leaf=lambda arg: arg is None)
-
-    def exact(*active):
-        return _pair_sum(_pair_factors(*fill(active)))
-
-    directions = tuple(t for t, take in zip(tangents, live, strict=True) if take)
-    return value, jax.jvp(exact, tuple(operands), directions)[1]
+def _laid_factors(left, right, decay, after):
+    """One group's factors (`_pair_factors`) laid as every group's of a call of several (`_exact_pairs`):
+    its first decay whole `[K, ..., i, j]` and its second `[K, ..., 1, j]`, one where the group's pairs
+    decay by one factor alone (exactly: the sum holds every factor's product until it lands). A value's
+    layout alone: a derivative takes each group's own factors (`_portable_pair_jvp`), whose broadcast axes
+    the ratio's transpose reduces before landing."""
+    left, right, *factors, active = _pair_factors(left, right, decay, after)
+    second = factors[1] if after is not None else jnp.ones_like(right)
+    return left, right, jnp.broadcast_to(factors[0], active.shape), second, active
 
 
-@custom_vmap
-def _pair_dispatch(left, right, decay, after):
+def _exact_pairs(groups: tuple[tuple, ...]) -> tuple[jax.Array, ...]:
+    """Each group's pairs by the portable contraction that holds every factor until the sum lands
+    (`_pair_sum`), several groups' blocks joined along their blocks' axis in one sum: its lowering is most
+    of a portable walk's program (row 14108: 13k to 15k StableHLO ops each, 56k of a GLM-5 tiny walk's 65k
+    in four of them, two a `_factored`)."""
+    if len(groups) == 1:
+        return (_exact_group(*groups[0]),)
+    laid = [_laid_factors(*group) for group in groups]
+    summed = _pair_sum(tuple(jnp.concatenate(parts, axis=-3) for parts in zip(*laid, strict=True)))
+    edges = np.cumsum([factors[-1].shape[-3] for factors in laid])[:-1]
+    return tuple(jnp.split(summed, edges, axis=-3))
+
+
+def _ordinary_pairs(left, right, decay, after) -> tuple[jax.Array, jax.Array]:
+    """One group's pairs by a dot of its decayed factors, and whether a decayed factor flushed
+    (`_tiny_factor`), which the exact sum then decides (`_pair_dispatch`)."""
     if after is None:
         decayed = right[..., None, :, :] * decay
         tiny = jnp.any(_tiny_factor(right[..., None, :, :], decay, decayed))
+        return _portable_einsum("...ik,...ijk->...ij", left, decayed), tiny
+    leading, trailing = left * decay, right * after
+    tiny = jnp.any(_tiny_factor(left, decay, leading)) | jnp.any(_tiny_factor(right, after, trailing))
+    return _portable_einsum("...ik,...jk->...ij", leading, trailing), tiny
 
-        ordinary = _portable_einsum("...ik,...ijk->...ij", left, decayed)
-    else:
-        leading, trailing = left * decay, right * after
-        tiny = jnp.any(_tiny_factor(left, decay, leading)) | jnp.any(_tiny_factor(right, after, trailing))
-        ordinary = _portable_einsum("...ik,...jk->...ij", leading, trailing)
 
-    # A dot can overflow one channel before another cancels it. Keep the ordinary finite path,
-    # but let the existing scaled sum decide any nonfinite result or flushed pre-product.
-    repair = tiny | jnp.any(~jnp.isfinite(ordinary))
-    return lax.cond(repair, lambda: _pair_sum(_pair_factors(left, right, decay, after)), lambda: ordinary)
+def _portable_pair_jvp(primals, tangents):
+    """Each group's tangent its own exact sum's at its own factors (`_pair_factors`), whose transpose sums the
+    earlier blocks' row decay's cotangents over the key positions before they land, a group none of whose
+    operands moves a symbolic zero (`generation.symbolic_tangent`): laid with the others' (`_laid_factors`),
+    that row-side decay landed a cotangent a key in fp32 first (two cancelling 2^130 landed as two
+    infinities), and a held group's zero tangent met an infinite factor as NaN (head review of row 14108)."""
+    value = _portable_pairs(*primals)
+    return value, tuple(symbolic_tangent(_exact_group, group, directions, pairs)
+                        for group, directions, pairs in zip(primals, tangents, value, strict=True))
+
+
+def _exact_group(left, right, decay, after):
+    """One group's exact sum at its own factors (`_pair_factors`)."""
+    return _pair_sum(_pair_factors(left, right, decay, after))
+
+
+@custom_vmap
+def _pair_dispatch(*groups):
+    ordinary, flushed = zip(*(_ordinary_pairs(*group) for group in groups), strict=True)
+    # A dot can overflow one channel before another cancels it. Keep the ordinary finite path, but let the
+    # existing scaled sum decide any group's nonfinite result or flushed pre-product, every group's at once.
+    repair = functools.reduce(jnp.logical_or, (tiny | jnp.any(~jnp.isfinite(pairs))
+                                               for pairs, tiny in zip(ordinary, flushed, strict=True)))
+    return lax.cond(repair, lambda: _exact_pairs(groups), lambda: tuple(ordinary))
 
 
 _pair_dispatch.def_vmap(functools.partial(scalar_case_batch, _pair_dispatch))
@@ -1295,6 +1326,10 @@ _pair_dispatch.def_vmap(functools.partial(scalar_case_batch, _pair_dispatch))
 
 _portable_pairs = contracted("test_a_decayed_pair_holds_its_derivatives")(
     declared_tangent(Protected(), _pair_dispatch, _portable_pair_jvp, symbolic_zeros=True))
+"""Pairs `sum_k left_ik right_jk decay_ijk` (or `left_ik decay_ik right_jk after_jk` where `after` is
+given) of each of its groups `(left, right, decay, after)`, a tuple of each group's: a dot of the decayed
+factors, or where any group's flushes a decayed factor or ends nonfinite, every group's exact sum in one
+(`_exact_pairs`); each group's tangent its own exact sum's (`_portable_pair_jvp`)."""
 
 
 def _factored(left, right, between, joined, issue: Callable, role: str, *, back: bool = False):
@@ -1308,9 +1343,10 @@ def _factored(left, right, between, joined, issue: Callable, role: str, *, back:
     factor read at the reference's next row, its own sub-chunk's first: `between_back_pj` is a token short of
     `p`, which the pair's whole decay spans (`exp(G_{i-1} - G_p) exp(G_p - G_j)`). The sub-chunks' blocks are
     taken by static slices (the chunk padded to whole sub-chunks with crossed keys, which pair nothing) and
-    the portable pairs taken in two batched calls, the diagonal blocks' and every earlier sub-chunk's, one
-    repair decision each: a call a block traced the pairs' arithmetic again for each of a chunk's `S (S + 1) /
-    2`, 84% of a GLM-5 tiny forward's 85k StableHLO ops (two walks of 36k ops, 71k of them these calls)."""
+    the portable pairs taken in one batched call, the diagonal blocks' and every earlier sub-chunk's, one
+    repair decision and one exact sum: a call a block traced the pairs' arithmetic again for each of a chunk's
+    `S (S + 1) / 2`, 84% of a GLM-5 tiny forward's 85k StableHLO ops (two walks of 36k ops, 71k of them these
+    calls); a call a kind, each exact sum's 13k to 15k ops (row 14108)."""
     from dew.nn.kernels import recurrence_algebra
 
     count = left.shape[0]
@@ -1333,11 +1369,8 @@ def _factored(left, right, between, joined, issue: Callable, role: str, *, back:
     # The diagonal blocks' rows and keys are contiguous: reshaped (a reshape's transpose).
     own_left, own_right = (x.reshape(blocks, sub, x.shape[-1]) for x in (left, right))
     decay = jnp.stack([block(joined, first, first) for first in range(blocks)])
-    if issue is _issued:
-        diagonal = _portable_pairs(own_left.astype(work), own_right.astype(work), decay.astype(work), None)
-    else:
-        diagonal = _portable_einsum("...ik,...ijk->...ij", own_left, own_right[:, None] * decay)
-    off = []
+    groups: list[tuple[jax.Array, jax.Array, jax.Array, jax.Array | None]] = [
+        (own_left, own_right, decay, None)]
     if earlier:
         rows = jnp.stack([own_left[first] for first, _ in earlier])
         keys = jnp.stack([own_right[start] for _, start in earlier])
@@ -1345,10 +1378,17 @@ def _factored(left, right, between, joined, issue: Callable, role: str, *, back:
         # next row a token back, `back`).
         before = jnp.stack([block(between, first)[:, first * sub - 1] for first, _ in earlier])
         after = jnp.stack([block(between[first * sub - 1 + back], start) for first, start in earlier])
-        off = (_portable_pairs(rows.astype(work), keys.astype(work), before.astype(work), after.astype(work))
-               if issue is _issued else
-               [issue(role, rows[place] * before[place], (keys[place] * after[place]).T)
-                for place in range(len(earlier))])
+        groups.append((rows, keys, before, after))
+    if issue is _issued:
+        # The own blocks and the earlier ones in one call: one repair decision and one exact sum (row 14108).
+        diagonal, *off = _portable_pairs(*(tuple(None if x is None else x.astype(work) for x in group)
+                                           for group in groups))
+        off = off[0] if earlier else []
+    else:
+        diagonal = _portable_einsum("...ik,...ijk->...ij", own_left, own_right[:, None] * decay)
+        off = [issue(role, rows[place] * before[place], (keys[place] * after[place]).T)
+               for rows, keys, before, after in groups[1:] if after is not None
+               for place in range(len(earlier))]
     placed = {pair: place for place, pair in enumerate(earlier)}
     zeros = jnp.zeros((sub, sub), work)
     rows = [jnp.concatenate([off[placed[first, start]] if start < first else

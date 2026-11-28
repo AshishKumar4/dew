@@ -38,7 +38,7 @@ from dew.nn.backbones.layer_names import StoredRow, group_layers, stored_layers
 from dew.nn.kernels.generation import backend, device_generation, gpu_target
 from dew.nn.kernels.options import Option, compiler_options
 from dew.nn.kernels.templates import report
-from dew.nn.protocols import OffloadsResiduals, Recomputing, TritonGemm
+from dew.nn.protocols import UPDATE_SCOPE, OffloadsResiduals, Recomputing, TritonGemm
 from dew.objectives.base import Objective, head_fused_of, head_tile_of
 from dew.state import TrainState
 from dew.telemetry.instrumentation import CompiledMemory, compiled_memory
@@ -919,6 +919,13 @@ class LiveSet:
         return sum(size for size, op_name, names in self.made
                    if forward_made(op_name) and dropped(op_name, names))
 
+    def updating(self) -> int:
+        """The bytes its peak holds of values its optimizer's update made (`UPDATE_SCOPE` in their op),
+        where its working values (a Newton-Schulz iteration's joined stacks) lie: none of a peak within the
+        forward or the backward, and none of a value no op states (an unknown phase's, never counted as the
+        update's)."""
+        return sum(size for size, op_name, _ in self.made if UPDATE_SCOPE in op_name)
+
     def frees(self, dropped: Callable[[str, tuple[str, ...]], bool]) -> int:
         """What a rung that does not keep the forward's values `dropped` says it does not keep frees of the
         step's peak: priced over its whole schedule where its compile states it (`LiveProfile.frees`: the
@@ -953,6 +960,14 @@ class Held:
     """For a residual, the position past the last at which the forward reads it (`LiveInterval.uses`):
     where a rung recomputing it holds it until (`LiveProfile.peak`); its start's next where the forward
     reads it nowhere."""
+    stack: tuple[int, int] | None = None
+    """The scan's stack it is a buffer of (`LiveInterval.stack`), where the backward alone reads it past its
+    loop (`LiveProfile.of`): the zeros its loop fills, its state, each step's write and the loop's output
+    are one stack, which a rung recomputing every buffer of it the backward reads builds none of
+    (`LiveProfile.peak`)."""
+    filling: bool = False
+    """Whether it is one of the values its loop fills its stack through (`LiveInterval.filling`), which
+    neither asks for the stack nor drops it."""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1012,11 +1027,26 @@ class LiveProfile:
             read = [position for position, op_name in uses if forward_made(op_name) and position < ends]
             return max(read, default=interval.start) + 1
 
+        def read_by(interval: LiveInterval, backward: bool) -> bool:
+            # Read while it holds the value by the backward's ops (each read placed and named), or by any
+            # other: the forward's, the update's, an op no phase is told of or a read placed nowhere.
+            return any((position != UNPLACED and backward_made(op_name)) == backward
+                       for position, op_name in within(interval))
+
+        # A stack its loop writes alone (`LiveInterval.stack`) is one a rung recomputing it builds none of
+        # only where the backward reads it past its loop and nothing else does: its values the loop fills
+        # it through read by nothing but the loop (`LiveInterval.filling`), the loop's output read by the
+        # backward alone. A read by the forward past the backward's start, by the update or by an op no
+        # phase is told of keeps it built (review of row 12463).
+        read = [interval for interval in whole if interval.stack is not None and not interval.filling]
+        unbuilt = ({interval.stack for interval in read if read_by(interval, backward=True)}
+                   - {interval.stack for interval in read if read_by(interval, backward=False)})
         return LiveProfile(tuple(
             Held(interval.bytes, interval.op_name, tuple(interval.names),
                  any(dimension is not None and dimension & rows for dimension in interval.dims),
                  residual(interval), interval.trace, interval.start, interval.end, interval.buffer,
-                 interval.storage, interval.shape, until(interval))
+                 interval.storage, interval.shape, until(interval),
+                 interval.stack if interval.stack in unbuilt else None, interval.filling)
             for interval in whole))
 
     @functools.cached_property
@@ -1040,11 +1070,26 @@ class LiveProfile:
         (a storage reused after it was freed held again where a buffer reusing it is live). A buffer it does
         not keep and `recomputed` says a rung recomputes is held through its forward's last read of it
         (`Held.until`): the rung frees its span past that alone, its forward making and reading it all the
-        same; one it does not keep otherwise (a tiled head's whole logits, the copies' casts) is made none."""
+        same; one it does not keep otherwise (a tiled head's whole logits, the copies' casts) is made none.
+        A scan's stack the backward alone reads past its loop (`Held.stack`), whose every buffer the backward
+        reads a rung recomputes, is never built: every buffer of it, the zeros its loop fills and each
+        step's write among them, is made none; one its loop fills it through neither asks for it nor drops
+        it (`Held.filling`)."""
         held = self.held + tuple(added)
-        keeps = [kept(buffer) for buffer in self.held] + [True] * len(added)
+        # A value its loop fills a stack through is no residual a rung recomputes: held whole while its stack
+        # is built, made none with it where it is not (review of row 12463).
+        keeps = [buffer.filling or kept(buffer) for buffer in self.held] + [True] * len(added)
         # A residual not kept ends where its forward last reads it, ahead of any end at that position.
         remade = [not keeps[index] and recomputed(buffer) for index, buffer in enumerate(self.held)]
+        # A stack held for the backward alone, a row a step, is built by no rung that recomputes it (row
+        # 12463: a cold 4B start's forward held 167 GiB of its stacks' in-loop values, none a residual, and
+        # no remat was priced to free them).
+        unbuilt = ({buffer.stack for buffer in self.held if buffer.stack is not None}
+                   - {buffer.stack for index, buffer in enumerate(self.held)
+                      if buffer.stack is not None and not buffer.filling and not remade[index]})
+        for index, buffer in enumerate(self.held):
+            if buffer.stack is not None and buffer.stack in unbuilt:
+                keeps[index] = remade[index] = False
         cut = sorted((buffer.start + 1 if buffer.until is None else buffer.until, -1, index)
                      for index, buffer in enumerate(self.held) if remade[index])
         extra = sorted(event for at, buffer in enumerate(added, len(self.held))

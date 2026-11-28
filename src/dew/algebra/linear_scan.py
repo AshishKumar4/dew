@@ -922,18 +922,13 @@ and a token loop's, which walks it."""
 @functools.cache
 def _stateful():
     """Which values read the entering state (`stateful`): a constructor of `READING`'s, and any value of the
-    language (`CONSTRUCTORS`, each by its declared signature, `terms.pattern_of`) any of whose operands reads
+    language (`CONSTRUCTORS`, each by its declared signature, `terms.propagated`) any of whose operands reads
     it. Run after saturation, so it adds no fact a saturation's limits count, for extraction alone
     (`derive`)."""
     t = var("t", Chunk)
-    marked = []
-    for index, constructor in enumerate(CONSTRUCTORS):
-        made, operands = terms.pattern_of(Chunk, constructor, f"s{index}")
-        if constructor in READING:
-            marked.append(rule(eq(t).to(made)).then(set_(stateful(t)).to(i64(1))))
-        marked += [rule(eq(t).to(made), eq(stateful(operand)).to(i64(1))).then(set_(stateful(t)).to(i64(1)))
-                   for operand in operands]
-    return ruleset(*marked, name="chunk_stateful")
+    seeds = [rule(eq(t).to(terms.pattern_of(Chunk, constructor, f"r{index}")[0]))
+             .then(set_(stateful(t)).to(i64(1))) for index, constructor in enumerate(READING)]
+    return ruleset(*seeds, *terms.propagated(Chunk, CONSTRUCTORS, stateful, "s"), name="chunk_stateful")
 
 
 def _shapes(token_count: int, key_count: int, value_count: int, apart: int, values_read: bool):

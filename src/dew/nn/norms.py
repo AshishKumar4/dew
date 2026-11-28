@@ -1,10 +1,13 @@
 """The normalizations Dew's modules share: RMS (`rms_normalized`, a residual stream's
 `stream_rms_normalized`, a gated one), group, L2 and unweighted RMS forms, and their modules (`RMSNorm`,
-`LayerNorm`, `GroupNorm`). The RMS and group forms take their statistics in at least float32 by default
-(`normalized_in_fp32`), the RMS ones in the input's dtype where a caller asks; L2 computes in its
+`LayerNorm`, `GroupNorm`); a gated RMS norm's forms (`OutputNorm`), their arithmetic (`gated_norm_rows`),
+a launch's row epilogue of them (`norm_row_hook`) and their portable application (`output_normed`), the
+recurrences' and the layers' alike. The RMS and group forms take their statistics in at least float32 by
+default (`normalized_in_fp32`), the RMS ones in the input's dtype where a caller asks; L2 computes in its
 input's.
 """
 
+import dataclasses
 import enum
 import functools
 import math
@@ -20,7 +23,15 @@ from jax.ad_checkpoint import checkpoint_name
 from .activations import GATE_ACTIVATIONS, logistic, silu
 from .dense import Dense
 from .derivatives import portable_formed
-from .precision import at_least_fp32, float32_dot_general, rms_statistics, rms_weighted, rounded_to
+from .precision import (
+    activation_and_slope,
+    at_least_fp32,
+    float32_dot_general,
+    rms_of_total,
+    rms_statistics,
+    rms_weighted,
+    rounded_to,
+)
 from .sharding import LogicalAxes, declared
 
 
@@ -412,6 +423,16 @@ SHIFT = "layer_norm_shift"
 (`LayerNorm`)."""
 
 
+def row_shift(x: jax.Array, axes, *, mask: jax.Array | None = None) -> jax.Array:
+    """Each row's mean over `axes`, kept, in at least float32 and constant to the gradient: what a layer norm
+    takes from its rows before their statistics (`_Shifted`), which a layer norm does not change, so a row
+    whose mean dwarfs its spread rounds as a row near zero does (`[2^24, 2^24 + 2]` is `[-1, 1]` over the
+    root of its variance and epsilon; its statistics read unshifted, `[0, 2]` over another). The one shift
+    of Dew's layer norm and of the kernels that compute one (`dew.nn.kernels.titans.layer_normed`)."""
+    wide = jnp.promote_types(x.dtype, jnp.float32)
+    return jax.lax.stop_gradient(jnp.mean(x, axis=axes, keepdims=True, dtype=wide, where=mask))
+
+
 class _Shifted(nn.LayerNorm):
     """flax's `nn.LayerNorm` over its input less each row's mean, which a layer norm does not change: its
     statistics read rows centered near zero, so a row whose mean dwarfs its spread rounds as a row near
@@ -423,12 +444,11 @@ class _Shifted(nn.LayerNorm):
     @nn.compact
     def __call__(self, x, *, mask=None):
         axes = (self.reduction_axes,) if isinstance(self.reduction_axes, int) else tuple(self.reduction_axes)
-        wide = jnp.promote_types(x.dtype, jnp.float32)
-        shift = jnp.mean(x, axis=axes, keepdims=True, dtype=wide, where=mask)
+        shift = row_shift(x, axes, mask=mask)
         if self.axis_name is not None:
             shift = jax.lax.pmean(shift, self.axis_name, axis_index_groups=self.axis_index_groups)
-        shift = checkpoint_name(jax.lax.stop_gradient(shift), SHIFT)
-        normed = super().__call__(x.astype(wide) - shift, mask=mask)
+        shift = checkpoint_name(shift, SHIFT)
+        normed = super().__call__(x.astype(shift.dtype) - shift, mask=mask)
         # The parameters' values, out of the partitioning box a norm declaring its axes stores them in.
         held = [nn.unbox(self.get_variable("params", name)) for name in ("scale", "bias")
                 if self.has_variable("params", name)]
@@ -531,3 +551,126 @@ class GroupNorm(nn.Module):
         bias = self.param('bias', nn.initializers.zeros, width, self.param_dtype)
         return group_normalized(x, scale, bias, self.num_groups, self.epsilon, self.activation, self.dtype,
                                 canonicalize_dtype(x, scale, bias, dtype=self.dtype))
+
+
+@dataclasses.dataclass(frozen=True)
+class OutputNorm:
+    """A gated RMS norm's form, a recurrence's output's (`kernels.recurrence.Hooks.output`, the template's
+    epilogue's and the layers' norm after it alike): `rms_norm(o) weight act(z)`, the norm in fp32 with
+    `epsilon`, `activation` the gate's ('silu' or 'sigmoid'), the output first read back in `read_in` where it
+    names a dtype: the one the layer's input projection computes in, the projections' dtype, where its
+    reference casts the scan's output before its norm (transformers' Qwen3-Next and Kimi `.to(query.dtype)`),
+    as the layer's unfused token does. Normalized unrounded, a fused bf16 token sat nearer float64 than its
+    reference and apart from the layer's own unfused token (row 6963). Its form (`gated_rows`,
+    `gated_norm_rows`): the gate after the weighted norm (Qwen3-Next's, Kimi's, Falcon-H1's
+    `norm_before_gate`), or with `gate_first` before the norm (Mamba-2's `MambaRMSNormGated`); with `rounded`,
+    the normalized rows rounded to the output's dtype before the weight, in that dtype, multiplies them
+    (Mamba-2's weight not `scale_wide`)."""
+    epsilon: float
+    activation: str = 'silu'
+    read_in: str | None = None
+    gate_first: bool = False
+    rounded: bool = False
+
+    @property
+    def form(self) -> str:
+        """Its form as the norm's selector names it (`norm_swiglu.GATED_FORMS`)."""
+        return f"gate {'first' if self.gate_first else 'after'}{', rounded' if self.rounded else ''}"
+
+
+def gated_rows(norm: OutputNorm, rows, gate, *, activate):
+    """The rows `norm` normalizes: `rows` (wide) times `activate(gate)` (its gate's activation) where the gate
+    comes first (`OutputNorm.gate_first`), else as they are."""
+    return rows * activate(gate) if norm.gate_first else rows
+
+
+def weighted_rows(norm: OutputNorm, rows, inverse, weight, dtype):
+    """`norm`'s gated rows (`gated_rows`) times their `inverse` RMS and the `weight`
+    (`precision.rms_weighted`), in the rows' dtype, or where `rounded` the normalized rows rounded to `dtype`
+    first and the weight taken in it."""
+    if norm.rounded:
+        return rms_weighted(rows, inverse, weight=weight.astype(dtype), rounded=lambda x: x.astype(dtype))
+    return rms_weighted(rows, inverse, weight=weight.astype(rows.dtype))
+
+
+def gated_norm_rows(norm: OutputNorm, rows, inverse, gate, weight, dtype, *, activate):
+    """`norm`'s arithmetic past its statistics, in `dtype`: its weighted rows (`weighted_rows`), then where
+    the gate comes after, times `activate(gate)` in the rows' dtype, rounded once to `dtype`. The one form
+    the recurrence's norm after its launches, its output launch's epilogue (`norm_row_hook`) and its decode
+    step's take; `MambaRMSNormGated` takes its `weighted_rows` over its groups, its gate broadcast after."""
+    normed = weighted_rows(norm, rows, inverse, weight, dtype)
+    if not norm.gate_first:
+        normed = normed.astype(rows.dtype) * activate(gate)
+    return normed.astype(dtype)
+
+
+@dataclasses.dataclass(frozen=True)
+class _NormStatistic:
+    """An output norm's row statistic (`templates.hooks.RowHook.statistic`): a block's gated rows' sums of
+    squares, its gate activated as a kernel's body activates it (`activation_and_slope`)."""
+    norm: OutputNorm
+
+    def __call__(self, block, *sides):
+        # The gate read where it comes first alone (`norm_row_hook`'s `reads`).
+        rows = block * self._activate(sides[0].astype(block.dtype)) if self.norm.gate_first else block
+        return jnp.sum(rows * rows, axis=-1)
+
+    def _activate(self, gate):
+        return activation_and_slope(gate, self.norm.activation)[0]
+
+
+@dataclasses.dataclass(frozen=True)
+class _NormApplied(_NormStatistic):
+    """An output norm applied to a block past the walk (`templates.hooks.RowHook.fn`): its inverse RMS over
+    the head's `width` values from the rows' `total` (`precision.rms_of_total`), then `gated_norm_rows` in
+    `dtype`."""
+    width: int = 0
+    dtype: str = 'float32'
+
+    def __call__(self, block, *sides):
+        total, gate, weight = sides
+        gate = gate.astype(block.dtype)
+        rows = gated_rows(self.norm, block, gate, activate=self._activate)
+        _, inverse = rms_of_total(total, self.width, self.norm.epsilon)
+        return gated_norm_rows(self.norm, rows, inverse[:, None], gate, weight[None, :].astype(block.dtype),
+                               jnp.dtype(self.dtype), activate=self._activate)
+
+
+def norm_row_hook(norm: OutputNorm, width: int, dtype, gate, weight):
+    """`norm` as a launch's row epilogue (`templates.hooks.RowHook`): its statistic and its application to the
+    head's `width` values in `dtype`, its gate `[rows, heads, columns]` and weight `[columns]` (every head's)
+    its sides, the statistic reading the gate where it comes first alone."""
+    from .kernels.templates.hooks import RowHook, Side
+
+    sides = (Side(gate, ('rows', 'heads', 'columns')), Side(weight, ('columns',)))
+    return RowHook(_NormStatistic(norm), _NormApplied(norm, width, jnp.dtype(dtype).name), sides,
+                   reads=(0,) if norm.gate_first else ())
+
+
+def output_normed(norm: OutputNorm, out, z, weight, dtype, work, *, axes=None):
+    """An output `[..., Hv, Dv]` through the epilogue's gated RMS norm `norm`, in `dtype`: the layers' one
+    gated norm (`gated_rms_normalized`, its fused kernel where its selector gives it, else its arithmetic in
+    XLA), the output first read back in `OutputNorm.read_in`, `axes` its logical axes where a mesh places the
+    kernel's rows (a chunked call's `[B, S, Hv, Dv]`, `dew.nn.sharding.HEADS`). The recurrence template's
+    output launch computes it in its epilogue, and takes its gradient here
+    (`kernels.templates.recurrence.template.mosaic_rule`). Its statistics and gate at least in the
+    recurrence's `work`: a read-back narrower than it (a float64 recurrence's fp32 `read_in`) is the
+    read-back's rounding alone, widened again before the norm, where the norm's own working dtype from it took
+    a sigmoid gate of -100 to zero (train 1461's review)."""
+    from .kernels import norm_swiglu
+
+    if norm.read_in is not None:
+        out = out.astype(norm.read_in)
+        out = out if at_least_fp32(out.dtype) == jnp.dtype(work) else out.astype(work)
+    if not (norm.gate_first or norm.rounded):
+        return gated_rms_normalized(out, z, weight, norm.epsilon, dtype, norm.activation, axes=axes)
+    # The other forms XLA's alone: the norm's selector refuses its kernel their form (`norm_swiglu.NORM`'s
+    # 'form'), a call naming it refused, the route reported (train 1473's head review).
+    chosen = norm_swiglu.gated_rms_kernel('auto', out, z, weight, dtype, norm.activation, axes=axes,
+                                          form=norm.form)
+    assert chosen == 'xla', f"the norm's kernel takes no {norm.form!r} form"
+    wide = at_least_fp32(out.dtype)
+    activate = GATE_ACTIVATIONS[norm.activation]
+    rows = gated_rows(norm, out.astype(wide), z.astype(wide), activate=activate)
+    return gated_norm_rows(norm, rows, rms_statistics(rows, norm.epsilon)[1], z.astype(wide), weight, dtype,
+                           activate=activate)

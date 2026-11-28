@@ -65,6 +65,14 @@ readout adds P_t W_0^T q (P_t one for the delta rule). That readout is computed 
 rounded once to the layer's dtype. Its decode cache holds the recurrence's state whichever route a call
 takes, as a call's wrappers may take it off the recurrence (an adapter's dropout on a training
 forward), whose general path steps the weights that state makes (`_stepped_from_recurrence`).
+
+TTT-Linear's memory (a linear residual memory with its layer norm and its bias, `ResidualMemory`, the norm
+slow, on the l2 objective, each token reading its own step, no momentum or retention) runs a call of rows of
+one document on its mini-batched kernel (`dew.nn.kernels.ttt`, `_mini_batch`): the rows compacted as the
+chunked path compacts them, each mini-batch its chunk, the kernel its whole computation in at least float32,
+a mini-batch's steps held apart from the state it entered as the chunked path holds a chunk's. A packed row,
+a cached call, a call over forks, a head a wrapper computes otherwise and Titans' form (row 14199) take the
+general path.
 """
 
 from __future__ import annotations
@@ -82,7 +90,6 @@ from flax import linen as nn, traverse_util
 from flax.core import lift
 from flax.linen.transforms import lift_direct_transform
 from flax.typing import Dtype, PrecisionLike
-from jax.ad_checkpoint import checkpoint_name
 
 from dew.batch import Coordinates, prefix_sum, valid_order
 from dew.newton_schulz import NEWTON_SCHULZ, newton_schulz
@@ -93,7 +100,7 @@ from dew.nn.documents import within_documents
 from dew.nn.kernels import recurrence, recurrence_chunk
 from dew.nn.kv_cache import ROUNDING_KEYS, Opened, cache_variables, kept, stated
 from dew.nn.precision import softplus
-from dew.nn.residuals import DELTA_RESIDUALS, MEMORY_RESIDUALS, RECOMPUTED
+from dew.nn.residuals import DELTA_RESIDUALS, MEMORY_RESIDUALS, memory_chunks
 from dew.nn.scatter import gather_positions
 from dew.nn.sharding import LOW_RANK_FACTORS, rows_like
 from dew.quantization import (
@@ -115,6 +122,9 @@ CHUNK = MEMORY_RESIDUALS[1]
 (`dew.nn.residuals.RESIDUALS`), and of a chunk's own values, which a rung naming it recomputes from that
 state (`residuals.RECOMPUTED`: the heaviest rung's, `decoder_block.recomputed_inside`)."""
 
+MINI_BATCHED = "memory_mini_batched"
+"""The scope a call's mini-batched kernel runs under (`jax.named_scope`, `InContextMemory._mini_batch`): the
+route a call of rows of one document takes, told apart from the general path by a program's reader."""
 STATE, MOMENTUM, START, COUNT = "memory_state", "memory_momentum", "memory_start", "memory_count"
 """The decode cache's variables: the network's fast parameters now, the momentum, the parameters at the
 chunk's start, and the real tokens of each row's current document seen, rows first. A row that has
@@ -195,27 +205,33 @@ class LinearMemory(nn.Module):
 
 class ResidualMemory(nn.Module):
     """`x + N(f_res(x))`: f_res linear (`hidden` None) or `Dense(D) . activation . Dense(hidden)`, the
-    ungated `GatedMLP` (`up`, `down`), N a layer norm or none. TTT's f (Sec 2.7: LN and residual, f_lin
-    or a 4x GELU MLP), Nested Learning's memories (Eq 89, no norm) and Miras' (Sec 5.3). `activation`
-    names one of `dew.nn.activations.UNGATED`."""
+    ungated `GatedMLP` (`up`, `down`), N a layer norm of `epsilon` or none. TTT's f (Sec 2.7: LN and
+    residual, f_lin or a 4x GELU MLP), Titans' linear memory with its layer norm (a linear f_res without
+    its `bias`, fla's `chunk_titans_linear_ref`), Nested Learning's memories (Eq 89, no norm) and Miras'
+    (Sec 5.3). `activation` names one of `dew.nn.activations.UNGATED`; `bias` is the linear f_res's."""
 
     hidden: int | None = None
     activation: Literal["gelu", "silu", "relu"] = "gelu"
     norm: bool = True
     dtype: Dtype | None = None
     precision: PrecisionLike = None
+    # After every field a caller may give by position, so `ResidualMemory(None, "gelu", True, None)` reads its
+    # fourth as its dtype (train 1484's review: a bias ahead of it read the dtype's None).
+    bias: bool = True
+    epsilon: float = 1e-6
 
     @nn.compact
     def __call__(self, x: jax.Array) -> jax.Array:
         if self.hidden is None:
-            branch = Dense(x.shape[-1], dtype=self.dtype, precision=self.precision, name="down")(x)
+            branch = Dense(x.shape[-1], use_bias=self.bias, dtype=self.dtype, precision=self.precision,
+                           name="down")(x)
         else:
             mlp = GatedMLP(self.hidden, x.shape[-1], self.activation, use_bias=True, linear=Dense,
                            names=("up", "down"), dtype=self.dtype, precision=self.precision)
             nn.share_scope(self, mlp)
             branch = mlp(x)
         if self.norm:
-            branch = LayerNorm(epsilon=1e-6, dtype=self.dtype, name="norm")(branch)
+            branch = LayerNorm(epsilon=self.epsilon, dtype=self.dtype, name="norm")(branch)
         return x + branch
 
 
@@ -445,7 +461,7 @@ class InContextMemory(LinearProducts):
         elif tokens.max_segments > 1:
             read = self._stepped(heads, steps)[0]
         else:
-            read = self._chunked(heads, steps)
+            read = self._one_document(heads, steps, features)
         # A call over forks leaves the cache as it was, its count too (`_recurrent`).
         if counted is not None and tokens.forks is None:
             counted()
@@ -634,7 +650,7 @@ class InContextMemory(LinearProducts):
         laid = jax.tree.map(unfolded, steps._replace(places=places))._replace(
             real=real.reshape(batch * count, -1))
         if not decoded:
-            reads = self._chunked(heads, laid)
+            reads = self._one_document(heads, laid)
         elif self._recurrence() is not None:
             # The recurrence's state and kept share the cache holds, the chain its row's document continued
             # (`_stepped_from_recurrence`, as `_recurrent_decoded` reads it).
@@ -677,6 +693,70 @@ class InContextMemory(LinearProducts):
         after = jnp.stack([_kernel(state[index]) - _lead(last[:, index], _kernel(head.initial)[None])
                            * _kernel(head.initial)[None] for index, head in enumerate(heads)], axis=1)
         return reads, jnp.where(_lead(jnp.any(real, axis=1), held), after, held), share
+
+    # TTT-Linear's linear memory on its mini-batched kernel.
+
+    MINI_BATCHED: ClassVar[frozenset[tuple[str, ...]]] = frozenset({("down", "kernel"), ("down", "bias")})
+    """The moving weights a head steps on the mini-batched kernel (`_mini_batched`): TTT-Linear's memory and
+    bias (`dew.nn.kernels.ttt`)."""
+
+    def _mini_batched(self, heads: tuple[_Head, ...], features: int) -> bool:
+        """Whether this call of rows of one document runs on TTT-Linear's mini-batched kernel (`_mini_batch`):
+        Dew's own linear residual memory with its layer norm and its bias (`ResidualMemory(hidden=None,
+        norm=True)`, no subclass, whose function the kernel states) on Dew's own l2 objective (no subclass)
+        and its given target, its layer norm slow and its linear map fast, each token reading its own step,
+        no orthogonalized step, no momentum or retention. The kernel computes in at least float32, so the
+        layer's readout must too (its `dtype` None or that wide: a narrower one reads the state rounded to
+        it), its linear map at the run's precision and in no projection recipe (`recipe_takes`). Each head
+        computes the plain network: its weights its network's own (no adapter, no other collection) and its
+        product the linear map of its input by the kernel its state moves (`linear_product`), which draws
+        from no RNG stream a call may carry. Titans' form (no bias) takes the general path: its kernel
+        (`dew.nn.kernels.titans`) rounds each step into the memory, where the general path holds a chunk's
+        steps apart from the state it entered (79g's review; row 14199)."""
+        from dew.nn.kernels import projections
+
+        network = self.network
+        own = (type(network) is ResidualMemory and network.hidden is None and network.norm and network.bias
+               and network.precision is None and type(self.objective) is Objective)
+        if not (own and self.objective.kind == "l2" and self.target == "given" and self.commit == "token"
+                and not self.orthogonalize and tuple(self.slow) == ("norm",)
+                and self.momentum is None and self.retention is None
+                and (self.dtype is None or jnp.dtype(self.dtype) == at_least_fp32(self.dtype))
+                and not projections.recipe_takes(features, features)):
+            return False
+        from dew.nn.dense import watched_or_owned
+
+        # No call of a head a wrapper must see (`dense.watched_or_owned`, as a joined projection asks): a
+        # Flax method interceptor that may intercept it, a capture of its outputs, a quantization scope of
+        # Dew's or a direct Qwix provider, whose rules may name its `down` (`head_0/down`): the kernel reads
+        # its weights, never its call (train 1478's review: an interceptor zeroing `head_0`'s call, the
+        # general path read zeros and the kernel the weights; train 1484's: a direct Qwix rule on
+        # `head_0/down` left unused).
+        return all(set(traverse_util.flatten_dict(head.initial)) == self.MINI_BATCHED
+                   and set(traverse_util.flatten_dict(head.held)) == {("norm", "scale"), ("norm", "bias")}
+                   and not head.collections and self.linear_product(f"head_{index}")
+                   and not watched_or_owned(getattr(self, f"head_{index}"))
+                   for index, head in enumerate(heads))
+
+    def _mini_batch(self, heads: tuple[_Head, ...], steps: _Steps) -> jax.Array:
+        """The readouts `[B, S', H, F]` of compacted rows of one document (`_compacted`) on TTT-Linear's
+        kernel (`_mini_batched`): its mini-batches its chunks, counted from its first real token, the
+        compacted tail absent (`valid`), each head's W_0 and bias the state it enters, its layer norm's affine
+        the inner loss's. The kernel takes each gradient at its mini-batch's start and steps it at its own
+        token's rate, as the general path does, and names and recomputes its mini-batches as `_chunk`'s
+        (`CARRY`, `CHUNK`)."""
+        from dew.nn.kernels import ttt
+
+        network = self.network
+        assert isinstance(network, ResidualMemory)
+        rows = [_rows(head.initial, steps.real)["down"] for head in heads]
+        weight, bias = (jnp.stack([head.held["norm"][name] for head in heads]) for name in ("scale", "bias"))
+        memory = jnp.stack([row["kernel"] for row in rows], axis=1)
+        offset = jnp.stack([row["bias"] for row in rows], axis=1)[:, :, None]
+        with jax.named_scope(MINI_BATCHED):
+            return ttt.ttt_linear(steps.query, steps.key, steps.value, weight, bias, steps.theta,
+                                  state=(memory, offset), chunk=self.chunk, scale=1.0, eps=network.epsilon,
+                                  valid=steps.real)[0]
 
     # The function, token by token and chunk by chunk.
 
@@ -781,32 +861,40 @@ class InContextMemory(LinearProducts):
         carry, reads = jax.lax.scan(lambda held, step: self._token(held, step, heads), carry, sequence)
         return jnp.moveaxis(reads, 0, 1), carry
 
-    def _chunked(self, heads: tuple[_Head, ...], steps: _Steps) -> jax.Array:
-        """The readouts `[B, S, H, F]` of rows of one document, chunk by chunk (the module docstring)."""
-        batch, length = steps.real.shape
+    def _one_document(self, heads: tuple[_Head, ...], steps: _Steps,
+                      features: int | None = None) -> jax.Array:
+        """The readouts `[B, S, H, F]` of rows of one document: their real tokens compacted to the front
+        (`valid_order`), so a chunk counts from its row's first real token, run on TTT-Linear's mini-batched
+        kernel where the memory is its form (`_mini_batched`, the views' width `features` given: a call's own
+        rows, not a fork's) and chunk by chunk otherwise (`_chunked`), each readout read back at its token."""
         order, _ = valid_order(steps.real)
-        gathered = jax.tree.map(lambda field: gather_positions(field, order), steps)
-        laid = jax.tree.map(lambda field: sequence_blocks(field, self.chunk, leading=True), gathered)
+        compacted = jax.tree.map(lambda field: gather_positions(field, order), steps)
+        kernel = features is not None and self._mini_batched(heads, features)
+        reads = self._mini_batch(heads, compacted) if kernel else self._chunked(heads, compacted)
+        inverse = jnp.argsort(order, axis=1)
+        return jnp.take_along_axis(reads, inverse.reshape(*inverse.shape, 1, 1), axis=1)
+
+    def _chunked(self, heads: tuple[_Head, ...], steps: _Steps) -> jax.Array:
+        """The readouts `[B, S, H, F]` of compacted rows of one document (`_one_document`), chunk by chunk
+        (the module docstring)."""
+        batch, length = steps.real.shape
+        laid = jax.tree.map(lambda field: sequence_blocks(field, self.chunk, leading=True), steps)
         count = laid.real.shape[0]
         rows = tuple(_rows(head.initial, steps.real) for head in heads)
         carry = (rows, jax.tree.map(jnp.zeros_like, rows))
         # Where the run's remat recomputes the chunks (`CHUNK`), each chunk's work is recomputed from the
         # carry it entered with, the scan stacking that carry alone; elsewhere it stacks every value of a
         # chunk's gradients and steps, as fast as the step that fits them runs (row 6577: recomputed always, a
-        # Titans step that fit ran 31-41% slower).
-        chunk = functools.partial(self._chunk, heads=heads)
-        if CHUNK in RECOMPUTED.get():
-            chunk = jax.checkpoint(chunk, prevent_cse=False)
-        _, reads = jax.lax.scan(chunk, carry, laid)
-        reads = jnp.moveaxis(reads, 0, 1).reshape(batch, count * self.chunk, *reads.shape[3:])[:, :length]
-        inverse = jnp.argsort(order, axis=1)
-        return jnp.take_along_axis(reads, inverse.reshape(*inverse.shape, 1, 1), axis=1)
+        # Titans step that fit ran 31-41% slower): the one driver of every memory's chunks
+        # (`residuals.memory_chunks`), the mini-batched kernel's too.
+        _, reads = memory_chunks(functools.partial(self._chunk, heads=heads), carry, laid)
+        return jnp.moveaxis(reads, 0, 1).reshape(batch, count * self.chunk, *reads.shape[3:])[:, :length]
 
     def _chunk(self, carry: tuple, step: _Steps, *, heads: tuple[_Head, ...]) -> tuple:
         """One chunk of every row: its gradients at its start, its states, its readouts `[B, C, H, F]`.
-        The carry holds each head's state and momentum, rows first."""
+        The carry holds each head's state and momentum, rows first; its names are its driver's
+        (`residuals.memory_chunks`)."""
         state, momentum = carry
-        state, momentum = checkpoint_name((state, momentum), CARRY)
         real = step.real[..., None]
         theta, mu, a = (jnp.where(real, field, fill) for field, fill in
                         ((step.theta, 0.0), (step.mu, 1.0), (step.a, 1.0)))
@@ -817,9 +905,7 @@ class InContextMemory(LinearProducts):
         laid = [self._chunk_head(head, state[index], momentum[index], step, theta[:, :, index],
                                  matrices[:, :, index], index) for index, head in enumerate(heads)]
         lasts, moments, reads = zip(*laid, strict=True)
-        # The chunk's readouts and next carry named (`CHUNK`): what a rung keeping the chunks' own values
-        # saves (a policy saving them, `RematPolicy.save`), the rest of the chunk's values recomputed beside.
-        return checkpoint_name(((lasts, moments), jnp.stack(reads, axis=2)), CHUNK)
+        return (lasts, moments), jnp.stack(reads, axis=2)
 
     def _chunk_head(self, head: _Head, state: dict, momentum: dict, step: _Steps, theta: jax.Array,
                     matrices: jax.Array, index: int) -> tuple[dict, dict, jax.Array]:

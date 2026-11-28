@@ -323,19 +323,34 @@ causality, -inf's mask) and wholly masked (jax.nn's mask, uniform rows under its
 masks wholly is NaN, as written, which check 1 does not compare."""
 
 
+FORM_ROWS = {
+    "a mask of its inputs": {"masked": True, "filled": True, "sunk": False, "biased": False},
+    "a mask of its inputs filled with -inf": {"masked": True, "filled": True, "sunk": False, "biased": False},
+    "a bias of its inputs": {"masked": False, "filled": False, "sunk": False, "biased": True},
+    "twice the default scale": {"masked": False, "filled": False, "sunk": False, "biased": False},
+    "a causal window": {"masked": False, "filled": False, "sunk": False, "biased": False},
+    "a softcap": {"masked": False, "filled": False, "sunk": False, "biased": False},
+}
+"""How each form's call can reach a row of no mass (`attention_kernels.keeps_reference_rows`): a mask can
+hide a row wholly, its fill reaching it; a causal walk or window of as many queries as keys hides none; a
+bias can put -inf on a row's every key."""
+
+
 @pytest.mark.parametrize("form", list(FORMS))
 def test_a_plain_programs_attention_under_each_form_runs_the_kernel_dews_own_call_takes(form):
     """A plain program's attention under a mask (filled as jax.nn fills it, or with -inf) or a bias it draws
     from its inputs, a causal window or a softcap, compiled through `dew.jit` on an H100, runs the kernel
-    Dew's own attention call under those arguments routes to (none where that is XLA's), and under a scale
-    no call of Dew's takes runs as written, XLA's; on this host, under the template, its output and
-    gradients on par with the program as written (check 1)."""
+    Dew's own attention call under those arguments routes to where that reads each row as the program does
+    (`FORM_ROWS`; none where it is XLA's or reads a row of no mass otherwise), and under a scale no call of
+    Dew's takes runs as written, XLA's; on this host, under the template, its output and gradients on par
+    with the program as written (check 1)."""
     from attention_oracle import attention_on_par, kept
     from contract_support import normal_drawn
 
     import dew
     from dew.algebra.recognize import KEPT
     from dew.nn.attention import scaled_dot_product_attention
+    from dew.nn.attention_kernels import keeps_reference_rows
 
     attend, arguments, exact = FORMS[form]
     shapes = (jax.ShapeDtypeStruct((2, 128, 4, 64), jnp.bfloat16),) * 3
@@ -346,7 +361,8 @@ def test_a_plain_programs_attention_under_each_form_runs_the_kernel_dews_own_cal
     with generation.assumed("sm90"):
         assert not _routes("attention", lambda: jax.jit(attend).trace(*shapes))
         expected = [] if arguments is None else [kernel for kernel in _routes(
-            "attention", lambda: jax.jit(own).trace(*shapes)) if kernel not in KEPT]
+            "attention", lambda: jax.jit(own).trace(*shapes))
+            if kernel not in KEPT and keeps_reference_rows(kernel, **FORM_ROWS[form])]
         assert set(_routes("attention", lambda: dew.jit(attend).trace(*shapes))) == set(expected)
     drawn = (2, 64, 4, 32)
     draw = normal_drawn(41, *(drawn,) * 4, dtype=jnp.bfloat16)
@@ -364,6 +380,81 @@ def test_a_plain_programs_attention_under_each_form_runs_the_kernel_dews_own_cal
         oracle = {"truth": lambda *x: exact(*(a.astype(jnp.float64) for a in x))}
     with generation.chosen(attention="template"):
         attention_on_par(dew.jit(attend), attend, draw, f"dew.jit {form}", **oracle)
+
+def massless_bias(q, k):
+    """`input_bias` with its first query's row -inf at every key: an unmasked row of no mass."""
+    return input_bias(q, k).at[:, :, 0, :].set(-jnp.inf)
+
+
+def biased_without_mass(q, k, v):
+    """jax.nn's attention under `massless_bias`, unmasked: its first query's rows read NaN, as written."""
+    return jax.nn.dot_product_attention(q, k, v, bias=massless_bias(q, k), implementation="xla")
+
+
+def test_a_plain_programs_row_of_no_mass_reads_as_written_under_the_pass():
+    """A plain program's attention whose bias is -inf on every key of a row, unmasked (`biased_without_mass`):
+    on an H100 whose call names the template, which reads such a row NaN as the program does (row 14116),
+    `dew.jit` writes it as Dew's call, and on this host computes NaN exactly where the program does."""
+    from contract_support import normal_drawn
+
+    import dew
+
+    shapes = (jax.ShapeDtypeStruct((2, 128, 4, 64), jnp.bfloat16),) * 3
+    with generation.assumed("sm90"), generation.chosen(attention="template"):
+        assert "template" in _routes("attention", lambda: dew.jit(biased_without_mass).trace(*shapes))
+    q, k, v = normal_drawn(43, *((2, 64, 4, 32),) * 3, dtype=jnp.bfloat16)(0)
+    written = np.isnan(np.asarray(biased_without_mass(q, k, v), np.float32))
+    with generation.chosen(attention="template"):
+        rewritten = np.isnan(np.asarray(dew.jit(biased_without_mass)(q, k, v), np.float32))
+    assert written[:, 0].all() and not written[:, 1:].any()
+    np.testing.assert_array_equal(rewritten, written)
+
+
+def unbiased(q, k, v):
+    """jax.nn's attention, unmasked and unbiased: no row of no mass on any route."""
+    return jax.nn.dot_product_attention(q, k, v, implementation="xla")
+
+
+def test_a_plain_programs_attention_compiled_for_cudnn_is_written_where_cudnn_keeps_its_rows():
+    """Plain programs traced for any H100 whose call names cuDNN (`generation.assumed`'s portable target, on
+    which cuDNN does not lower, whatever library this host holds), on this host: `biased_without_mass`, whose
+    row of no mass cuDNN reads 0 where the program reads NaN, is left as written, XLA's
+    (`attention_kernels.keeps_reference_rows`), where probing its kernel refused the whole compile; and
+    `unbiased`, whose rows cuDNN reads as the program does, is written as Dew's call, whose compile here
+    refuses as the GPU's own cuDNN program (`Unlowerable`, row 4616)."""
+    import dew
+    from dew.nn.kernels.selection import Unlowerable
+
+    shapes = (jax.ShapeDtypeStruct((2, 128, 4, 64), jnp.bfloat16),) * 3
+    with generation.assumed("sm90", portable=True), generation.chosen(attention="cudnn"):
+        assert not _routes("attention", lambda: dew.jit(biased_without_mass).trace(*shapes))
+        with pytest.raises(Unlowerable):
+            dew.jit(unbiased).trace(*shapes)
+
+
+def a_plain_programs_row_of_no_mass_is_left_off_cudnn() -> None:
+    """On this GPU, `biased_without_mass` under a call naming cuDNN: Dew's own biased call takes cuDNN, whose
+    row of no mass reads a number where the program reads NaN, and `dew.jit` leaves the program as written
+    (`attention_kernels.keeps_reference_rows`), NaN exactly where it is (row 14116;
+    tests/test_gpu_attention.py's fused routes' cell, cuDNN loading on no CPU host)."""
+    from contract_support import normal_drawn
+
+    import dew
+    from dew.nn.attention import scaled_dot_product_attention
+
+    def own(q, k, v):
+        return scaled_dot_product_attention(q, k, v, scale_logits=True, bias=massless_bias(q, k))
+
+    q, k, v = normal_drawn(43, *((2, 64, 4, 32),) * 3, dtype=jnp.bfloat16)(0)
+    written = np.isnan(np.asarray(biased_without_mass(q, k, v), np.float32))
+    with generation.chosen(attention="cudnn"):
+        assert "cudnn" in _routes("attention", lambda: jax.jit(own).trace(q, k, v))
+        on_cudnn = np.asarray(jax.jit(own)(q, k, v), np.float32)
+        assert not _routes("attention", lambda: dew.jit(biased_without_mass).trace(q, k, v))
+        kept = np.isnan(np.asarray(dew.jit(biased_without_mass)(q, k, v), np.float32))
+    assert np.isfinite(on_cudnn[:, 0]).all() and written[:, 0].all()
+    np.testing.assert_array_equal(kept, written)
+
 
 def written_out(*, fill=-jnp.inf, logits_cast=None, initial=-jnp.inf, other_rows=False, sum_cast=None,
                 root=None):

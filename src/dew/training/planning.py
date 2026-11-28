@@ -947,15 +947,19 @@ class Parting:
     futile: bool = False
     """Whether a parted rung's miss measured parting to free nothing on some process (`measured`)."""
 
-    def after(self, rung: Rung, shortfall: int | None) -> Rung | None:
+    def after(self, rung: Rung, shortfall: int | None, updating: int | None = None) -> Rung | None:
         """`rung`, asked joined and missed by `shortfall` (None where it measured no miss), parted, where it
         is asked at once: every process's miss measured and within what parting frees, which no parted rung
-        measured to free nothing; None where its parted variant is deferred, or where the step joins no
-        stacks or its rung parts them already."""
+        measured to free nothing, and which is no more than the miss's peak holds of the update's own values
+        (`updating`, `LiveSet.updating`: the stacks are the update's, so a peak in the forward or the backward
+        holds none of them, and parting lowers no such peak; row 12463: a 4B cold start parted its stacks
+        against a 47 GiB miss its layers' residuals made); None where its parted variant is deferred, or
+        where the step joins no stacks or its rung parts them already."""
         if not self.estimate or rung.ns_group is not None:
             return None
         parted = dataclasses.replace(rung, ns_group=1)
-        if self.futile or any(self.gather(shortfall is None or shortfall > self.estimate)):
+        frees = self.estimate if updating is None else min(self.estimate, updating)
+        if self.futile or any(self.gather(shortfall is None or shortfall > frees)):
             self.deferred.append(parted)
             return None
         return parted
@@ -972,6 +976,18 @@ class Parting:
             self.futile = True
         else:
             self.estimate = min(freed)
+
+
+class Jump(NamedTuple):
+    """The place a start's schedule reads as fitting (`FitSearch.jumped`): its rung, the index among the
+    candidate splits of the split it reads it at (where its walk begins, `walked`'s `first`), what the
+    schedule prices it to free and what the start fell short by there, which a miss at it is read against
+    (`FitSearch.moved`)."""
+
+    rung: Rung
+    first: int
+    freed: int
+    short: int
 
 
 class Lower(Protocol):
@@ -1578,8 +1594,7 @@ class FitSearch[LossT, EffectsT]:
             # so; a miss of it measures what parting freed against the joined rung's at the same split
             # (`Parting.measured`), none where either measured nothing there.
             at = named[self.asked.index(rung)]
-            joined = self.last_shortfall(at)
-            variant = parting.after(rung, None if joined is None else joined[1])
+            variant = parting.after(rung, *self.missed_with_update(at))
             if variant is None or variant in self.asked:
                 return None
             split = ask(variant, "the step does not fit the devices with its Newton-Schulz stacks joined; "
@@ -1594,12 +1609,11 @@ class FitSearch[LossT, EffectsT]:
         # asked at the search's end (`untried`), and the start's finer splits its first miss left.
         jumped: list[Rung] = []
         if (jump := self.jumped(start, narrow, group, candidates, named[0])) is not None:
-            split = ask(jump[0], "the step does not fit the devices; compiling it again at the place its "
-                        "schedule reads as fitting, %s", jump[1]) or parted(jump[0])
+            split = self.asked_jump(jump, candidates, named, ask) or parted(jump.rung)
             if split is not None:
                 self.said(named)
                 return split
-            jumped.append(jump[0])
+            jumped.append(jump.rung)
         if resumed is not None:
             # On from where the start's walk stopped: its next split, down past a fit to the one after its
             # miss, as its walk would have gone on.
@@ -1617,8 +1631,8 @@ class FitSearch[LossT, EffectsT]:
             if rung in self.asked:
                 continue
             split = ask(rung, "the step does not fit the devices; compiling it again recomputing more at %s")
-            if split is None and rung == read:
-                self.moved(rung, missed)
+            if split is None and rung == read and missed is not None and (said := _stated(rung)) is not None:
+                self.moved(named[-1], None, missed[1].frees(said.drops), missed[0])
             if split is None:
                 split = parted(rung)
             if split is not None:
@@ -1648,6 +1662,19 @@ class FitSearch[LossT, EffectsT]:
                 return split
         split = self.untried(candidates, jumped, self.fits_here)
         self.said(named)
+        return split
+
+    def asked_jump(self, jump: Jump, candidates: Sequence[int], named: list[str],
+                   ask: Callable[[Rung, str, int], int | None]) -> int | None:
+        """The split `jump`'s place fits at, asked from the split it was read at (`ask`, `named` naming
+        each rung asked), None where it fits at none; where its own split misses, what its assumption
+        moved, recorded beside it (`moved`, `jump`'s `missed_by`), whatever compile follows."""
+        split = ask(jump.rung, "the step does not fit the devices; compiling it again at the place its "
+                    "schedule reads as fitting, %s", jump.first)
+        at = named[self.asked.index(jump.rung)]
+        if (missed := self.shortfall_at(at, candidates[jump.first])) is not None:
+            self.jump["missed_by"] = missed
+            self.moved(at, candidates[jump.first], jump.freed, jump.short)
         return split
 
     def start_walked(self, candidates: Sequence[int], first: int
@@ -1732,11 +1759,15 @@ class FitSearch[LossT, EffectsT]:
                      if (split := tried(rung)) is not None), None)
 
     @staticmethod
-    def placed(start: Rung, rungs: Sequence[Rung]) -> list[Rung]:
+    def placed(start: Rung, rungs: Sequence[Rung], copies: bool = True) -> list[Rung]:
         """The places past `start` in the order a search reads them, the jump's (`jumped`) and the frontier's
         (`below`) alike: the start's copy-only release where it reads narrow copies, then each of `rungs`
         and, where it reads them, its form without them (train 1409: a frontier ordering fewer places than
-        the jump admits read a copy-free plan as none of its own)."""
+        the jump admits read a copy-free plan as none of its own). Where the step reads no copies
+        (`copies`, `FitSearch.copies`), a rung and its copy-free form lower one program: each is read once,
+        as it stands, and no release of copies none holds (row 14129: priced twice at a cold start)."""
+        if not copies:
+            return list(rungs)
         return [*([dataclasses.replace(start, narrow=False)] if start.narrow else []),
                 *(place for rung in rungs for place in
                   ((rung, dataclasses.replace(rung, narrow=False)) if rung.narrow else (rung,)))]
@@ -1826,6 +1857,17 @@ class FitSearch[LossT, EffectsT]:
                       if json.dumps(probe.rung, sort_keys=True) == rung), None)
         return None if split is None else (split, self.shortfall_at(rung, split))
 
+    def missed_with_update(self, rung: str) -> tuple[int | None, int | None]:
+        """The last miss `rung` measured (`last_shortfall`), and what its miss's peak held of the update's own
+        values (`LiveSet.updating`), each None where it measured none: what a rung's parting is read
+        against (`Parting.after`)."""
+        joined = self.last_shortfall(rung)
+        if joined is None:
+            return None, None
+        live = self.live.get((rung, joined[0]))
+        # Both a device's bytes: the miss is read per device already (`shortfall_at`), as a live set is.
+        return joined[1], None if live is None else live.updating()
+
     def shortfall_at(self, rung: str, split: int) -> int | None:
         """What the search fell short by at `rung` at `split`, None where it measured no miss there."""
         miss = self.misses.get((rung, split))
@@ -1845,7 +1887,7 @@ class FitSearch[LossT, EffectsT]:
         return min(found, key=lambda pair: pair[0]) if found else None
 
     def jumped(self, start: Rung, narrow: bool, ns_group: int | None, candidates: Sequence[int],
-               begun: str) -> tuple[Rung, int] | None:
+               begun: str) -> Jump | None:
         """The first place of the ladder past `start`, and the split, that every process reads as fitting
         off the start's whole schedules: each split the start (named `begun`) missed at whose compile states
         its schedule (`LiveSet.profile`, read for the start's misses alone: `fits_here`) prices each place
@@ -1861,7 +1903,8 @@ class FitSearch[LossT, EffectsT]:
         common one was asked; why is recorded (`jump`). Its compile is the judge (XLA schedules each place
         anew and recomputes what it drops), the climb going on past a miss."""
         ladder = self.ladder(start, narrow, ns_group, remat_set=self.remat_set, defaults=self.own_defaults())
-        places = self.placed(start, [rung for places in ladder for rung in places])
+        # Each place once where the step reads no copies (`placed`, row 14129).
+        places = self.placed(start, [rung for places in ladder for rung in places], self.copies)
         profiles = {split: live.profile for (rung, split), live in self.live.items()
                     if rung == begun and live.profile is not None}
         tiled = self.objective.tiled_logits if isinstance(self.objective, HeadedObjective) else None
@@ -1907,7 +1950,7 @@ class FitSearch[LossT, EffectsT]:
                   "narrow copies, at %d microbatches: %s", _stated(jump), jump.tile,
                   "with" if jump.narrow else "without", candidates[index],
                   json.dumps(self.jump, sort_keys=True))
-        return jump, index
+        return Jump(jump, index, frees, short)
 
     def by_shortfall(self, rungs: list[Rung], missed: tuple[int, LiveSet] | None
                      ) -> tuple[list[Rung], Rung | None]:
@@ -1939,19 +1982,25 @@ class FitSearch[LossT, EffectsT]:
                   "over its schedule" if missed[1].profile is not None else "at it", missed[0])
         return [*rungs[first:], *rungs[:first]], rungs[first]
 
-    def moved(self, rung: Rung, missed: tuple[int, LiveSet] | None) -> None:
-        """Say what the miss at `rung`, which the start's miss read as fitting (`by_shortfall`), moved: the
-        bytes it predicted the rung drops, and what the rung's own peak holds by checkpoint name."""
-        said = _stated(rung)
-        now = self.short(self.rung())
-        if missed is None or said is None or now is None:
+    def moved(self, rung: str, split: int | None, predicted: int, short: int) -> None:
+        """Say what the miss at `rung` (as `rung` names it), a place the start's miss read as fitting (the
+        jump's at its `split`, `jumped`, or the remat read first at its least miss, `by_shortfall`), moved,
+        a third compile following it: the bytes the start's schedule priced the place to free, what the
+        start fell short by, what the place fell short by and what its own peak holds by checkpoint name
+        where its compile states its live set (owner, 2026-11-15: which buffer assumption moved whenever a
+        third attempt is needed)."""
+        if split is None:
+            least = self.short(rung)
+            missed, live = (None, None) if least is None else least
+        else:
+            missed, live = self.shortfall_at(rung, split), self.live.get((rung, split))
+        if missed is None:
             return
-        predicted = missed[1].frees(said.drops)
         held: dict[str, int] = {}
-        for size, _, names in now[1].made:
+        for size, _, names in () if live is None else live.made:
             held[",".join(names) or "-"] = held.get(",".join(names) or "-", 0) + size
-        _log.warning("the rung predicted to drop %d of the %d bytes the start missed by missed by %d: XLA "
-                     "scheduled its peak otherwise, which holds by name %s", predicted, missed[0], now[0],
+        _log.warning("the place priced to free %d of the %d bytes the start missed by missed by %d: XLA "
+                     "scheduled its peak otherwise, which holds by name %s", predicted, short, missed,
                      json.dumps(dict(sorted(held.items(), key=lambda named: -named[1])[:8])))
 
     def recomputing(self, start: Rung, narrow: bool, ns_group: int | None) -> list[Rung]:

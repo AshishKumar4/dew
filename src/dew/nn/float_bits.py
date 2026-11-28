@@ -105,6 +105,47 @@ def raw_fields(x: jax.Array) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array
             bits & word.type((1 << limits.nmant) - 1))
 
 
+def largest_magnitude(x: jax.Array, axis: int | tuple[int, ...] | None = None, *,
+                      keepdims: bool = False) -> jax.Array:
+    """`x`'s largest magnitude along `axis`, in `x`'s type and placement, as IEEE's maximum of `abs(x)` takes
+    it, reduced on its words (`raw_fields`' bits, the sign cleared), which order as their magnitudes do: a
+    NaN's above infinity's above every finite one's, -0's +0's. So it is exact at every width on every
+    platform, where a float maximum is not: a flushing platform's (XLA's CPU) reads a subnormal as zero, and
+    XLA:CPU's YNNPACK reduction drops a NaN as its neighbours' values fall (row 14083's train 1477: a NaN
+    among normal draws read 2.53, among ones NaN). The one block maximum a quantizer
+    (`fake_quant.fp8_scaled_blocks`, `projections.blocks_quantized`, `formats.MxFp8.quantized`,
+    `bits.nvfp4_coded`'s tensor) and the GEMM's
+    quantizing epilogue (`quantized._block_max`) read. Its derivative is a word's, zero: each reader takes it
+    into a scale read from its bits (`fake_quant.fp8_block_scale`'s power of two, `formats.mxfp8_scale_bytes`'
+    exponent), whose derivative is zero as the float maximum's was there, and `bits.nvfp4_coded`'s tensor
+    scale, a quotient of it, declares the maximum's own (`bits._nvfp4_amax`). A float64 one's words read in
+    x64 whatever x64 scope it is called in (outside one, a 64-bit word is two 32-bit ones)."""
+    with jax.enable_x64(new_val=True) if x.dtype == np.dtype(np.float64) else contextlib.nullcontext():
+        peak = jnp.max(magnitude_words(x), axis=axis, keepdims=keepdims)
+        return jax.lax.bitcast_convert_type(peak, x.dtype)
+
+
+def magnitude_words(x: jax.Array) -> jax.Array:
+    """Each of `x`'s magnitudes as an unsigned word of its width that orders as the magnitude does
+    (`raw_fields`' bits, the sign cleared): a NaN's above infinity's above every finite one's, -0's +0's; an
+    FNUZ format's NaN, its sign bit alone, kept whole, above every magnitude's. Any reduction of them by
+    integer maximum (`largest_magnitude`'s, a kernel's row reduction, `quantized._block_max`) bitcast back is
+    the largest magnitude; a float64 `x`'s read in x64 (its caller's scope)."""
+    words, sign, _, _ = raw_fields(x)
+    magnitude = words ^ sign
+    if _sign_bit_nan(x.dtype):
+        nan = words.dtype.type(1 << (jnp.finfo(x.dtype).bits - 1))
+        magnitude = jnp.where(words == nan, words, magnitude)
+    return magnitude
+
+
+def _sign_bit_nan(dtype) -> bool:
+    """Whether a float format's word of its sign bit alone is a NaN (the FNUZ formats', which hold no -0),
+    read off its own encoding."""
+    bits = jnp.finfo(dtype).bits
+    return bool(np.isnan(np.asarray(1 << (bits - 1), f"uint{bits}").view(dtype).astype(np.float32)))
+
+
 def split_bits(dtype) -> tuple[type, int, int]:
     """A float's significand split for `precision.two_product`'s `bit_split` and `aligned_sum`'s digits: its
     unsigned bits' type, the mask keeping its high part and the low bits masked, `p - floor(p / 2)` of its
@@ -281,6 +322,55 @@ def rounded_binary(sign: jax.Array, significand: jax.Array, exponent: jax.Array,
     return jax.lax.bitcast_convert_type(bits.astype(f"uint{limits.bits}"), dtype)
 
 
+def narrowed_float32(x: jax.Array) -> jax.Array:
+    """A float64 `x` rounded once to the nearest float32, ties to even, below the least normal on the
+    subnormal grid (`rounded_binary` on its bits), where a flushing platform's convert (XLA's CPU) drops a
+    subnormal to zero; past the largest finite an infinity, an infinity its own, a NaN a quiet one. The
+    narrowing is a linear map (`generation.linear_map`), as `widened_exactly`'s widening is: its tangent
+    the tangent narrowed alike, a cast's derivative (an NVFP4 tensor scale's at a float64 truth's width:
+    row 14083's review), its transpose the cotangent widened exactly (`widened_exactly`, whose transpose from
+    float64 to float32 is this narrowing), so every order of reverse mode rounds on the bits. It reads `x`
+    in x64 whatever x64 scope it is called in."""
+    from dew.nn.kernels.generation import linear_map
+
+    def apply(_, moving):
+        # Traced where JAX evaluates the map, which may lie outside its caller's x64 scope; a reduced or
+        # unreduced placement's each device's part (train 1455's review: no bit operation has its rule).
+        return _bitwise(_narrowed_bits, moving, wide=True)
+
+    def pullback(_, cotangent):
+        # The cotangent widened from its bits, a subnormal float32 one kept, which a flushing convert zeroes
+        # (train 1455's review), placed as it is, into float64 whatever scope a pullback runs in. A batch's
+        # cotangents each widened before they are summed, in float64 (no `summed_first`: two of 2^127 summed
+        # in float32 first were an infinity, not 2^128; train 1468's review).
+        with jax.enable_x64(new_val=True):
+            return widened_exactly(cotangent, jnp.float64)
+
+    # Outside x64 a float64 array asked for as float64 is converted to float32 first, whose bits the
+    # narrowing then reads as a float64's (train 1461's review: 1.0 made in x64 and narrowed after it, 0).
+    with jax.enable_x64(new_val=True):
+        x = jnp.asarray(x, jnp.float64)
+        narrowed = jax.typeof(x).update(dtype=jnp.dtype(jnp.float32), weak_type=False)
+        return linear_map(apply, pullback, (), x, out_aval=narrowed)
+
+
+def _narrowed_bits(x: jax.Array) -> jax.Array:
+    """`narrowed_float32`'s rounding of float64 `x` on its bits."""
+    _, sign, biased, fraction = raw_fields(x)
+    significand = fraction | jnp.where(biased > 0, np.uint64(1 << 52), np.uint64(0))
+    # Its 32 leading bits of 53 and whether any below them is set, which decides a tie alone.
+    top = (significand >> np.uint64(21)).astype(jnp.uint32)
+    tail = ((significand & np.uint64((1 << 21) - 1)) != 0).astype(jnp.int32)
+    exponent = jnp.maximum(biased.astype(jnp.int32), 1) - 1075 + 21
+    special = biased == 0x7FF
+    # A normal's leading bit is bit 31 of `top`, its last place 23 below it, or the least subnormal's (no
+    # float64 subnormal rounds to a nonzero float32): no search for it.
+    limits = jnp.finfo(jnp.float32)
+    last = jnp.maximum(exponent + 31 - limits.nmant, limits.minexp - limits.nmant)
+    return rounded_binary((sign >> np.uint64(32)).astype(jnp.uint32), top, exponent, jnp.float32, tail=tail,
+                          last=last, infinite=special & (fraction == 0), nan=special & (fraction != 0))
+
+
 def quiet_nan_bits(dtype: DTypeLike) -> int:
     """The bits of `dtype`'s positive quiet NaN, an IEEE binary format: its exponent all ones and its
     mantissa's leading bit alone (`0x7FC00000` for float32), the NaN a cast of one gives."""
@@ -351,7 +441,10 @@ def widened_exactly(x: jax.typing.ArrayLike, dtype: DTypeLike) -> jax.Array:
 
     The widening is a linear map (`generation.linear_map`). Its transpose casts the cotangent back to `x`'s
     type (`cast_back`), so a product's linear map that widens its operands transposes it however JAX
-    reaches it. Its result is strongly typed, as an explicit conversion's is."""
+    reaches it; a float32's from float64 through the exact narrowing first (`narrowed_float32`, whose own
+    transpose is this widening), so every order of reverse mode rounds on the bits, a subnormal kept where a
+    flushing convert zeroed it (row 14083's review; train 1468's: one exact widening, the pair's). Its
+    result is strongly typed, as an explicit conversion's is."""
     if not isinstance(x, jax.Array | np.ndarray) or not _widens(jnp.dtype(x.dtype), jnp.dtype(dtype)):
         return jnp.asarray(x, dtype)
     # The destination as JAX resolves an explicit request (x64, or its explicit dtypes allowed without it).
@@ -365,21 +458,31 @@ def widened_exactly(x: jax.typing.ArrayLike, dtype: DTypeLike) -> jax.Array:
 
     def apply(_, moving):
         # Traced where JAX evaluates the map, which may lie outside its caller's x64 scope (`float64_sum`'s).
-        with jax.enable_x64(new_val=True) if resolved == np.dtype(np.float64) else contextlib.nullcontext():
-            sharding = jax.typeof(moving).sharding
-            if isinstance(sharding, jax.sharding.NamedSharding) and (
-                    sharding.spec.reduced or sharding.spec.unreduced):
-                axes = frozenset(sharding.spec.reduced) | frozenset(sharding.spec.unreduced)
-                spec = sharding.spec.update(partitions=())
-                with jax.sharding.use_abstract_mesh(sharding.mesh.abstract_mesh):
-                    return jax.shard_map(
-                        lambda part: _widened_bits(part, resolved),
-                        mesh=sharding.mesh, in_specs=spec, out_specs=spec,
-                        axis_names=axes, check_vma=False)(moving)
-            return _widened_bits(moving, resolved)
+        return _bitwise(lambda part: _widened_bits(part, resolved), moving,
+                        wide=resolved == np.dtype(np.float64))
+    exact = source.dtype == np.dtype(np.float32) and resolved == np.dtype(np.float64)
+
+    def pullback(_, cotangent):
+        return cast_back(narrowed_float32(cotangent) if exact else cotangent, source)
     # Its type strong, as an explicit conversion's: a weak one would yield to a strong float32 it meets.
-    return linear_map(apply, lambda _, cotangent: cast_back(cotangent, source), (), x,
-                      out_aval=source.update(dtype=resolved, weak_type=False), summed_first=True)
+    return linear_map(apply, pullback, (), x, out_aval=source.update(dtype=resolved, weak_type=False),
+                      summed_first=True)
+
+
+def _bitwise(fn, moving: jax.Array, *, wide: bool) -> jax.Array:
+    """`fn(moving)`, a map on its bits (`widened_exactly`'s, `narrowed_float32`'s), in x64 where `wide`
+    whatever x64 scope a map is traced in; over an Explicit placement holding reduced or unreduced axes,
+    each device's own part (`shard_map`), as no bit operation has a rule for them."""
+    with jax.enable_x64(new_val=True) if wide else contextlib.nullcontext():
+        sharding = jax.typeof(moving).sharding
+        if isinstance(sharding, jax.sharding.NamedSharding) and (
+                sharding.spec.reduced or sharding.spec.unreduced):
+            axes = frozenset(sharding.spec.reduced) | frozenset(sharding.spec.unreduced)
+            spec = sharding.spec.update(partitions=())
+            with jax.sharding.use_abstract_mesh(sharding.mesh.abstract_mesh):
+                return jax.shard_map(fn, mesh=sharding.mesh, in_specs=spec, out_specs=spec, axis_names=axes,
+                                     check_vma=False)(moving)
+        return fn(moving)
 
 
 def cast_back(cotangent: jax.Array, source: ShapedArray) -> jax.Array:
@@ -409,8 +512,17 @@ def _widens(source: np.dtype, target: np.dtype) -> bool:
 
 def _widened_bits(x: jax.Array, dtype: jnp.dtype) -> jax.Array:
     """`widened_exactly`'s map: a subnormal `x` placed in `dtype` from `float_bits`' reading, a normal one
-    converted."""
+    converted. Where every subnormal of `x`'s format is a normal number of `dtype` (float32's and fp16's in
+    float64, fp16's in float32), it is its fraction, an integer converted exactly, times the format's least
+    subnormal, a power of two `dtype` holds normally: no step of it a subnormal, which a flushing process
+    would drop, and a fifth of the operations of setting its bits (row 13308: 121 operations a sum's two
+    operands, 33k of a GLM-5 cell's 104k)."""
     source, target = jnp.finfo(x.dtype), jnp.finfo(dtype)
+    least = int(source.minexp) - int(source.nmant)
+    if least >= int(target.minexp):
+        _, sign, biased, fraction = raw_fields(x)
+        magnitude = fraction.astype(dtype) * np.asarray(2.0 ** least, dtype)
+        return jnp.where(biased == 0, jnp.where(sign != 0, -magnitude, magnitude), x.astype(dtype))
     word = jnp.dtype(f"uint{target.bits}")
     sign, biased, fraction, normalized, exponent = float_bits(x)
     normal = (((exponent + (1 << (target.nexp - 1)) - 1).astype(word) << word.type(target.nmant))

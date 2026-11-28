@@ -63,7 +63,7 @@ from dew.batch import (
     unboxed,
 )
 from dew.distributed.placement import Layout, RefinesLayout
-from dew.nn.dense import NVFP4_AMAX
+from dew.nn.dense import NVFP4_AMAX, QUANTIZATION
 from dew.nn.derivatives import contracted, surrogate
 from dew.nn.inspection import INSPECTED, QK, Watched, watching
 from dew.nn.kernels.options import Option, compiler_options, owned_program
@@ -825,9 +825,19 @@ class EMASpec:
 
     @classmethod
     def constant(cls, decay: float | None) -> EMASpec | None:
-        """Follow what moves at a constant `decay`, never the frozen collection; None keeps no EMA."""
-        return None if decay is None else cls(optax.constant_schedule(decay), lambda path: path[0] != FROZEN,
+        """Follow what moves at a constant `decay`, never a collection that holds still (`UNFOLLOWED`); None
+        keeps no EMA."""
+        return None if decay is None else cls(optax.constant_schedule(decay),
+                                              lambda path: path[0] not in UNFOLLOWED,
                                               stated=("constant", decay, "moving"))
+
+
+UNFOLLOWED = frozenset({FROZEN, QUANTIZATION})
+"""The collections no EMA of `EMASpec.constant`'s follows, which hold still: the frozen base and its packed
+form (`LoRA.fp8_base`'s FP8 codes and scales, which an average promoted past their own type and refused to
+compile: row 14086). An amax history (`NVFP4_HISTORY`) and what waits to roll (`NVFP4_PENDING`) the trainer
+keeps apart from any spec (`Trainer._fresh_state`): averaged by none, a frozen reference's its start's (row
+12993)."""
 
 
 class SavedTask(Protocol):

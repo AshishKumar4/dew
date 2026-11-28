@@ -19,7 +19,15 @@ from dew.nn import float_bits, precision
 from dew.nn.derivatives import KernelGlue, contracted, declared_tangent
 from dew.nn.kernels import generation
 from dew.nn.kernels.templates import axes as side_axes
-from dew.nn.sharding import explicit_placement, explicit_spec, summed_to, unbroadcast, varying_like
+from dew.nn.sharding import (
+    concrete_mesh,
+    explicit_placement,
+    explicit_spec,
+    placed_zeros,
+    summed_to,
+    unbroadcast,
+    varying_like,
+)
 
 
 def factored(run: Callable, operands: tuple, factor: jax.Array, rows: jax.Array, *, wide: Callable,
@@ -70,7 +78,7 @@ def factored(run: Callable, operands: tuple, factor: jax.Array, rows: jax.Array,
         return transpose.paired(ran, routed, (cotangent.astype(jnp.float32),), (scale,)).astype(rows.dtype)
 
     # An Explicit placement of the rows kept as a residual of no rows (`rows[:0]`, no memory): an eager
-    # pullback's allocations and transfers take its concrete devices (`_zeros`, `_placed`).
+    # pullback's allocations and transfers take its concrete devices (`sharding.placed_zeros`, `_placed`).
     anchor = None if transpose.placed is None else jax.lax.stop_gradient(rows[:0])
     routed = (gather, wide_operands, anchor)
     return generation.linear_map(apply, pullback, (factor, groups, operands, routed), rows)
@@ -98,40 +106,25 @@ def per_row(factor: jax.Array, groups: jax.Array | None, rows: int) -> jax.Array
 
 
 FACTOR_RAISE = 62
-"""The power of two `int8_epilogue` raises a subnormal scale by on a flushing platform: the least
+"""The power of two `int8_epilogue` raises a subnormal scale by: the least
 (`2**-149`) into the normals (`2**-87`), the largest still below `2**-64`, so no product of it overflows that
 the plain one would not."""
 
 
-def flushing(software: Callable[..., jax.Array], native: Callable[..., jax.Array],
-             *operands: jax.Array) -> jax.Array:
-    """`software(*operands)` where the program runs on a platform whose float32 arithmetic flushes
-    subnormal operands and results to zero (XLA's CPU, row 4023, and TPU), `native(*operands)` elsewhere,
-    the platform the program lowers for deciding (`lax.platform_dependent`), not the one it is traced on
-    (row 13569: a program traced on a CUDA host and lowered for a CPU took the native multiply)."""
-    return jax.lax.platform_dependent(*operands, cpu=software, tpu=software, default=native)
-
-
 def int8_epilogue(product: jax.Array, peak: jax.Array, factor: jax.Array, shift: jax.Array) -> jax.Array:
-    """The int8-row ternary product's epilogue (`ternary.ternary_weight_product`): `product * peak * factor *
-    2**-shift` in `precision.twice_scaled`'s order and rounded once with its lowering
-    (`float_bits.lowered_rounded`); on a flushing platform (`flushing`) a subnormal `factor` raised by
-    `2**FACTOR_RAISE` from its bits and the last multiply exact and rounded once with the lowering
-    (`lowered_product`), so a subnormal scale survives (row 13340)."""
-    def software(product, peak, factor, shift):
-        binade = float_bits.binade_of(factor)
-        raised = jnp.where((binade < jnp.finfo(jnp.float32).minexp) & (binade > -1024),
-                           jnp.int32(FACTOR_RAISE), jnp.int32(0))
-        whole = float_bits.raised_exactly(factor, raised)
-        left, right = precision.twice_scaled_operands(product, peak, whole)
-        return lowered_product(left, right, shift + raised)
-
-    def native(product, peak, factor, shift):
-        left, right = precision.twice_scaled_operands(product, peak, factor)
-        return float_bits.lowered_rounded(left * right, shift)
-
+    """The int8-row ternary product's epilogue (`ternary.ternary_weight_product`, an XLA program after its
+    launch): `product * peak * factor * 2**-shift` in `precision.twice_scaled`'s order, a subnormal `factor`
+    raised by `2**FACTOR_RAISE` from its bits and the last multiply exact and rounded once with the lowering
+    (`lowered_product`), so a subnormal scale survives whatever the platform flushes: XLA's CPU and TPU
+    flush subnormals (row 4023), and so did a GH200's compiled program (row 14172: a column scale of 2^-127
+    read zero there, where each multiply alone kept it, M-NG-73)."""
     product, peak, factor = (jnp.asarray(each, jnp.float32) for each in (product, peak, factor))
-    return flushing(software, native, product, peak, factor, jnp.asarray(shift, jnp.int32))
+    binade = float_bits.binade_of(factor)
+    raised = jnp.where((binade < jnp.finfo(jnp.float32).minexp) & (binade > -1024),
+                       jnp.int32(FACTOR_RAISE), jnp.int32(0))
+    whole = float_bits.raised_exactly(factor, raised)
+    left, right = precision.twice_scaled_operands(product, peak, whole)
+    return lowered_product(left, right, jnp.asarray(shift, jnp.int32) + raised)
 
 
 def lowered_product(left: jax.Array, right: jax.Array, k: jax.Array | int) -> jax.Array:
@@ -169,27 +162,24 @@ def _linear_scaled(tangent: jax.Array, factor: jax.Array, raised: int = 0) -> ja
 
 
 def _scaled_value(raised: int, product: jax.Array, factor: jax.Array) -> jax.Array:
-    """`owed_exactly`'s value: where the platform flushes subnormals (`flushing`), `lowered_product`'s one
-    rounding, the owed power of two its exponent's, so a subnormal factor or result survives (no multiply of
-    a subnormal, which such a platform flushes: a packed matrix's scale of `2**-127`, row 13340; a tensor
-    scale of 2**-126 whose product is 2**-129, train 1403's review); elsewhere `owed_native`'s."""
+    """`owed_exactly`'s value, an XLA program's: `lowered_product`'s one rounding, the owed power of two its
+    exponent's, so a subnormal factor or result survives whatever the platform flushes (no multiply of a
+    subnormal: a packed matrix's scale of `2**-127`, row 13340; a tensor scale of 2**-126 whose product is
+    2**-129, train 1403's review; on a GH200 the native multiply's program read a column scale of 2^-127's
+    products as zero, where each multiply alone kept them, row 14172, M-NG-73)."""
     product, factor = jnp.broadcast_arrays(product.astype(jnp.float32), jnp.asarray(factor, jnp.float32))
-
-    def software(product, factor):
-        return lowered_product(product, factor, -raised)
-
-    return flushing(software, functools.partial(owed_native, raised=raised), product, factor)
+    return lowered_product(product, factor, -raised)
 
 
 def owed_native(product: jax.Array, factor: jax.Array, *, raised: int) -> jax.Array:
-    """`owed_exactly`'s value where the platform keeps subnormals (CUDA's float32, a launch's epilogue
-    `gemm.nvfp4_product` finishes with), rounded once: the plain multiply, the factor and the owed power of
-    two one multiplier where that is finite (a subnormal factor raised exactly), else the product times the
-    power of two, exact (a subnormal product raised; one it overflows is one whose owed product past a factor
-    of 2**(128 - raised) overflows too), then times the factor, rounded once (train 1450's review: the
-    product times the factor first rounded a subnormal one on the subnormal grid before the power raised
-    it). A power past fp32's (`raised` 128 or more, which no float32 multiplier holds) is
-    `lowered_product`'s one rounding in integer arithmetic."""
+    """`owed_exactly`'s value in a packed launch's epilogue alone (`gemm._packed_finish`, its kernel's float32
+    keeping subnormals; tests/test_gemm_nvfp4.py's GPU cells hold it to the exact finish), rounded once: the
+    plain multiply, the factor and the owed power of two one multiplier where that is finite (a subnormal
+    factor raised exactly), else the product times the power of two, exact (a subnormal product raised; one it
+    overflows is one whose owed product past a factor of 2**(128 - raised) overflows too), then times the
+    factor, rounded once (train 1450's review: the product times the factor first rounded a subnormal one on
+    the subnormal grid before the power raised it). A power past fp32's (`raised` 128 or more, which no
+    float32 multiplier holds) is `lowered_product`'s one rounding in integer arithmetic."""
     # The side's columns broadcast to the accumulator's tile explicitly (an epilogue's `[columns]` factor).
     product, factor = jnp.broadcast_arrays(product, jnp.asarray(factor, product.dtype))
     if not raised:
@@ -234,10 +224,11 @@ def scaled_exactly(product: jax.Array, factor: jax.Array) -> jax.Array:
 def owed_exactly(product: jax.Array, factor: jax.Array, raised: int) -> jax.Array:
     """`product * factor * 2**raised` (`raised` a whole exponent of at least 0, an owed power of two's: an
     NVFP4 decode's, `bits.NVFP4_OWED`) in fp32 rounded once, however large or small the factor, the result
-    or the power: natively by `owed_native`'s fold, where the platform flushes subnormals in integer
-    arithmetic (`lowered_product`, `_scaled_value`; train 1403's review: an NVFP4 column's tensor scale of
-    2**122 under its decode's 2**8 overflowed a folded multiplier; train 1450's: 2**128 overflowed the power
-    itself). Its derivative is the plain product's, each perturbed operand's term alone."""
+    or the power, in integer arithmetic on every platform (`lowered_product`, `_scaled_value`: an XLA program
+    whatever it flushes, row 14172; train 1403's review: an NVFP4 column's tensor scale of 2**122 under its
+    decode's 2**8 overflowed a folded multiplier; train 1450's: 2**128 overflowed the power itself); only a
+    packed launch's epilogue folds it natively (`owed_native`). Its derivative is the plain product's, each
+    perturbed operand's term alone."""
     return _scaled(raised, product, factor)
 
 
@@ -285,7 +276,7 @@ class _Transpose:
         before = self.alone(ran, near)
         near = jax.lax.psum(near, before) if before else near
         # The pullback at zeros typed as the rows are: placed, and varying as the cotangent's partials do.
-        zeros = _zeros(self.shape, jnp.bfloat16, self.placed, anchor)
+        zeros = placed_zeros(self.shape, jnp.bfloat16, self.placed, anchor)
         at = varying_like(zeros, near, *jax.tree.leaves(ran))
         out, pull = jax.vjp(lambda each: self.run(each, *ran), at)
         # The cotangent typed as the product is (a split column scale's product split as it is not: train
@@ -463,7 +454,8 @@ class _Transpose:
         # The rows' gradient, typed and placed as the plain transpose's is (its devices' sums taken, as each
         # chunk's are; on its Explicit mesh where it has one, replicated too), so the loop's carry and the
         # branch it returns from keep its type.
-        out = varying_like(_zeros(self.shape, jnp.float32, explicit_placement(jax.typeof(plain))), plain)
+        zeros = placed_zeros(self.shape, jnp.float32, explicit_placement(jax.typeof(plain)))
+        out = varying_like(zeros, plain)
         return jax.lax.fori_loop(0, depth // chunk, pulled_chunk, out)
 
     def grids(self, binade, gather, shared) -> tuple[jax.Array, jax.Array]:
@@ -605,7 +597,7 @@ def _placed(value: jax.Array, sharding: jax.sharding.NamedSharding, anchor=None)
         if held == sharding:
             return value
         # A concrete value (an uncommitted one's single device too) beside a concrete anchor: run eagerly.
-        mesh = _concrete_mesh(anchor)
+        mesh = concrete_mesh(anchor)
         if not isinstance(value, Tracer) and mesh is not None:
             return jax.device_put(value, jax.sharding.NamedSharding(mesh, sharding.spec))
         with jax.sharding.use_abstract_mesh(sharding.mesh.abstract_mesh):
@@ -615,28 +607,6 @@ def _placed(value: jax.Array, sharding: jax.sharding.NamedSharding, anchor=None)
             return jax.sharding.reshard(value, jax.sharding.PartitionSpec())
     return value
 
-
-
-def _concrete_mesh(value) -> jax.sharding.Mesh | None:
-    """The named mesh of devices placing `value` where it is an array this process holds, run eagerly; None
-    for a tracer, None, or an array placed otherwise."""
-    if value is None or isinstance(value, Tracer):
-        return None
-    sharding = value.sharding
-    held = sharding.mesh if isinstance(sharding, jax.sharding.NamedSharding) else None
-    return held if isinstance(held, jax.sharding.Mesh) else None
-
-
-def _zeros(shape: tuple, dtype, sharding: jax.sharding.NamedSharding | None, anchor=None) -> jax.Array:
-    """Zeros of `shape` placed at `sharding` (a type's, or None), made under its own abstract mesh, so their
-    placement holds outside any mesh context (`_placed`); run eagerly (`anchor` a concrete array), made on
-    the devices of `anchor`'s own mesh, which an eager allocation needs (train 1426's review)."""
-    if sharding is None or not sharding.mesh.explicit_axes:
-        return jnp.zeros(shape, dtype)
-    if (mesh := _concrete_mesh(anchor)) is not None:
-        return jnp.zeros(shape, dtype, device=jax.sharding.NamedSharding(mesh, sharding.spec))
-    with jax.sharding.use_abstract_mesh(sharding.mesh.abstract_mesh):
-        return jnp.zeros(shape, dtype, out_sharding=sharding.spec)
 
 
 FACTORED_SLICE = 6
@@ -702,7 +672,7 @@ def _limbs(count: int, operands: tuple, columns: int, read: tuple) -> jax.Array:
                 None)
     spec = None if not meshes else jax.sharding.NamedSharding(
         meshes[0], jax.sharding.PartitionSpec(None, rows, None))
-    return _zeros((count, operands[0].shape[0], columns), jnp.int32, spec)
+    return placed_zeros((count, operands[0].shape[0], columns), jnp.int32, spec)
 
 
 def _routed(tokens: jax.Array, gather: jax.Array, limbs: jax.Array,

@@ -189,7 +189,7 @@ def _termed(fn, args, *, power: int):
         # it walks, its float64 on the GPU's FP64 units (bible §8), named as its prepare declared it.
         from truths_ahead import AT_RUN
 
-        ran[0].unprepared(f"{ran[1]}: its terms walk: {steered}", AT_RUN)
+        ran[0].unprepared(f"{ran[1]}: its terms walk: {steered}", AT_RUN, site=ran[1])
     token = POWER.set(power)
     try:
         with on_float64_device(), evaluated_on(leaves):

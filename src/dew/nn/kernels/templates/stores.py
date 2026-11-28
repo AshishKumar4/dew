@@ -135,7 +135,8 @@ def output_staging(columns: int, dtypes, staging: tuple[int, int] | None = None,
 
 
 def staging_refusal(columns: int, dtypes, staging: tuple[int, int] | None = None, *,
-                    piece: int | None = None, packed: tuple[Output, ...] = ()) -> str | None:
+                    piece: int | None = None, packed: tuple[Output, ...] = (), first: int | None = 0
+                    ) -> str | None:
     """Why a `columns`-wide output tile of `dtypes` stages in no chunks of `staging`'s (chunk columns,
     buffers), its derived ones where none is stated (`output_staging`), None where it does: what a launch's
     candidate asks of a pin before it takes it (a GEMM's tile's). A chunk divides the tile and the `piece`
@@ -144,7 +145,10 @@ def staging_refusal(columns: int, dtypes, staging: tuple[int, int] | None = None
     TMA rows in each of `dtypes` (`copies.ROW_BYTES`), by each dtype's bits (a packed fp4's half byte): a bf16
     output's chunk of 4 columns, 8 bytes a row, is refused here rather than by the tensor map it lowers
     to. Outputs stored packed (`packed`, whose dtypes `dtypes` are) are refused where a chunk, stated or
-    derived, stores no whole rows of them (`_packed_refusal`): a 128-column tile's NVFP4 scales."""
+    derived, stores no whole rows of them (`_packed_refusal`): a 128-column tile's NVFP4 scales. Stored from
+    a first row known only as it runs (`first` None: a grouped tile's group), a chunk whose rows of any
+    output are no whole 128-byte units is refused (`row_starts_aligned`): its copies would start its shared
+    rows off a tensor copy's address (row 14182: an RTX PRO 6000 faults, M-FS-115)."""
     chunk, buffers = ((staged_columns(columns, dtypes, packed=packed, piece=piece), OUTPUT_BUFFERS)
                       if staging is None else staging)
     if chunk < 1 or columns % chunk or (piece or columns) % chunk or buffers < 1:
@@ -154,6 +158,16 @@ def staging_refusal(columns: int, dtypes, staging: tuple[int, int] | None = None
     if staging is not None and not packed and partial:
         return (f"a stated chunk of {chunk} columns stores no whole {copies.ROW_BYTES}-byte TMA rows in "
                 f"{', '.join(partial)}")
+    if first is None:
+        # Each output's staged row: a packed one's its divisor's columns of its dtype, a transposed one's
+        # stored whole (`_whole_shares`).
+        rows = [*((chunk, dtype) for dtype in dtypes if not packed),
+                *((chunk // output.divisor, output.dtype) for output in packed if not output.transposed)]
+        unaligned = sorted({jnp.dtype(dtype).name for width, dtype in rows
+                            if not row_starts_aligned(width * jax.dtypes.itemsize_bits(dtype) // 8, None)})
+        if unaligned:
+            return (f"a chunk of {chunk} columns stored from a group's first row stores rows of "
+                    f"{', '.join(unaligned)} no whole {copies.SHARED_ALIGNMENT}-byte units")
     return _packed_refusal(chunk, packed)
 
 
@@ -241,9 +255,11 @@ def staged(smem, value: jax.Array, ref, place: tuple, *, write: Callable = writt
             raise ValueError("a scattered output's rows land a row at a time as computed, none packed")
     elif transposed:
         _whole_shares(smem.shape[-1], width, ref.shape[-1], first, stored)
-    elif divisor > 1 and not narrowed:
-        _aligned_ladder(width * jax.dtypes.itemsize_bits(smem.dtype) // 8, first, ladder)
-        if (ladder[1] if len(ladder) > 1 else 1) == 1 and ref.shape[-1] % width:
+    elif not narrowed:
+        # Every chunk's rows start a tensor copy at an aligned shared address, packed or not (row 14182: an
+        # ordinary 32-column bf16 chunk of a grouped tile started its copy 64 bytes into a row).
+        _aligned_ladder(width * jax.dtypes.itemsize_bits(smem.dtype) // 8, first, stored, ladder)
+        if divisor > 1 and (ladder[1] if len(ladder) > 1 else 1) == 1 and ref.shape[-1] % width:
             # A rung of one row is one contiguous run, which Mosaic GPU copies by a linear bulk copy clamped
             # at the whole tensor's end, not its row's (`launch_context.async_copy`): a last chunk past the
             # row's end would write into the next row.
@@ -288,16 +304,54 @@ def _static(value, expected: int) -> bool:
     return isinstance(value, int) and value == expected
 
 
-def _aligned_ladder(row_bytes: int, first, ladder: list) -> None:
-    """Refuse a packed chunk's row ladder (`store_rows`: copies of a power of two of rows from `first`, the
-    smallest `least`, `ladder`'s second) whose copies may start a shared row at no `copies.SHARED_ALIGNMENT`
-    bytes: a row of `row_bytes` that is no whole number of them starts aligned only at a static first row 0
-    and rungs of whole aligned rows (a dense call's 8-row least of a 16-byte NVFP4 scale row)."""
+def rungs(most: int, least: int = 1) -> list[int]:
+    """The rungs a ladder of row copies takes (`store_rows`), largest first: each power of two from the
+    largest no more than `most` down to `least`, each copied once, by its bit of the rows stored."""
+    found, size = [], most
+    while size >= least:
+        found.append(1 << int(math.log2(size)))
+        size //= 2
+    return found
+
+
+def row_starts_aligned(row_bytes: int, first: int | None, least: int = 1, most: int = 1,
+                       stored: int | None = None) -> bool:
+    """Whether every copy of a chunk's row ladder (`store_rows`, its `rungs`) from row `first` (None where
+    known only as it runs, a grouped tile's group) starts its shared source at a `copies.SHARED_ALIGNMENT`-
+    byte address: a bulk tensor copy's (the CUDA Programming Guide's asynchronous copies, Tables 26 and 28;
+    a store from another faults on an RTX PRO 6000, M-FS-115), every rung held to it, a one-row rung too
+    (Mosaic GPU copies one linearly only where its source is unswizzled and contiguous, which a ladder's
+    staging does not state). With `stored`, the rows known as it traces, the copies its bits take (each rung
+    at `first` plus the larger rungs taken); else every count's, a rung below the largest starting at
+    `first` plus a multiple of twice its rows. From an unknown first row, only where its rows are whole units
+    (row 14182: a grouped tile's 32-column bf16 chunk started a copy 64 bytes into a row). A derivation reads
+    it to derive no tile whose store a trace refuses (`_aligned_ladder`, `staging_refusal`)."""
+    unit = copies.SHARED_ALIGNMENT
+    if row_bytes % unit == 0:
+        return True
+    if first is None:
+        return False
+    ladder = rungs(most, least)
+    if stored is not None:
+        starts, at = [], first
+        for rung in ladder:
+            if stored & rung:
+                starts.append(at)
+                at += rung
+        return all(start * row_bytes % unit == 0 for start in starts)
+    return first * row_bytes % unit == 0 and all(2 * rung * row_bytes % unit == 0 for rung in ladder[1:])
+
+
+def _aligned_ladder(row_bytes: int, first, stored, ladder: list) -> None:
+    """Refuse a chunk's row ladder (`store_rows`, its rungs `ladder`'s first two) whose copies may start a
+    shared row at no aligned address (`row_starts_aligned`), from `first` for `stored` rows, each where
+    known as it traces."""
+    most = ladder[0] if ladder else 1
     least = ladder[1] if len(ladder) > 1 else 1
-    aligned = least * row_bytes % copies.SHARED_ALIGNMENT == 0
-    if row_bytes % copies.SHARED_ALIGNMENT and not (_static(first, 0) and aligned):
-        raise ValueError(f"a packed chunk's {row_bytes}-byte rows copied from row {first} in rungs of "
-                         f"{least} start a tensor copy at no {copies.SHARED_ALIGNMENT}-byte shared address")
+    if not row_starts_aligned(row_bytes, first if isinstance(first, int) else None, least, most,
+                              stored if isinstance(stored, int) else None):
+        raise ValueError(f"a chunk's {row_bytes}-byte rows copied from row {first} in rungs of {least} to "
+                         f"{most} start a tensor copy at no {copies.SHARED_ALIGNMENT}-byte shared address")
 
 
 def transposed_rows(smem, value: jax.Array, o_gmem, row_start, column, *, write: Callable = written) -> None:
@@ -356,10 +410,7 @@ def store_rows(o_smem, o_gmem, row_start, first, stored, column, most: int, leas
                                pl.ds(column, o_smem.shape[1])])
 
         start, size = first + stored // widest * widest, widest - 1
-    while size >= least:
-        rung = 1 << int(math.log2(size))
-        size //= 2
-
+    for rung in rungs(size, least):
         @pl.when(stored & rung != 0)
         def _(start=start, rung=rung):
             copy(o_smem.at[pl.ds(start, rung)],

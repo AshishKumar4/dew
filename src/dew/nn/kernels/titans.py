@@ -30,28 +30,46 @@ import jax.numpy as jnp
 from dew.nn import sharding
 from dew.nn.aligned import aligned_sum
 from dew.nn.inputs import sequence_blocks
+from dew.nn.norms import row_shift
 from dew.nn.precision import at_least_fp32
 from dew.nn.residuals import memory_chunks
 
 
-def layer_normed(x, eps: float):
-    """`x`'s LayerNorm over its last axis without an affine, `(x - mean x) / sqrt(var + eps)`: the plain
-    formula, fla's reference's and the token recurrence's, its derivatives autodiff's, so every order is
-    finite wherever the plain formula's is (docs/design/testing.md, the derivative contract). A quotient by
-    the root, not a product by `rsqrt`, whose derivative `rsqrt(v) / v` passes the range first (2^150 at
+def layer_normed(x, weight, bias, eps: float):
+    """`x`'s LayerNorm over its last axis under the affine `weight` and `bias`, `(x - mean x) / sqrt(var +
+    eps) w + b`: its rows less their shift first (`norms.row_shift`, Dew's layer norm's own, which the
+    memory's general path reads: train 1484's review, `[2^24, 2^24 + 2]` normalized unshifted to `[0, 1.15]`
+    where it is `[-1, 1] / 1.41` at an epsilon of one), then the formula over the shifted rows, its
+    derivatives autodiff's (the shift a constant, whose term a layer norm's invariance makes zero), so every
+    order is finite wherever the formula's is (docs/design/testing.md, the derivative contract). An entry
+    whose weight and row's root both pass one takes its weight into the inverse root first, as flax's layer
+    norm takes its scale, `x (w / root)`, whose every step, the pullback's `g (w / root)` too, stays within
+    the range its result is in: the plain order `(x / root) w` there rounded a centered `2^-100` under an
+    epsilon of `2^100` to zero before a weight of `2^100` (79g's review), and its pullback's `g w` overflowed
+    at a cotangent of `2^50` (its second). Every other entry keeps fla's reference's order, `(x / root) w`,
+    whose steps stay in range there (`x / root` at most the row width's root, `g w` at most the result where
+    the root is at most one), where `w / root` alone would leave it: a weight of `2^-101` over a root of
+    `2^50` underflows, a weight of `2^100` over a small root overflows (its third). Each order's operands are
+    held at zero in the other's entries, so no derivative meets a range its value does not reach. A quotient
+    by the root, not a product by `rsqrt`, whose derivative `rsqrt(v) / v` passes the range first (2^150 at
     `eps` 2^-100, its product with a zero NaN)."""
-    centered = x - jnp.mean(x, axis=-1, keepdims=True)
-    return centered / jnp.sqrt(jnp.mean(centered * centered, axis=-1, keepdims=True) + eps)
+    shifted = x - row_shift(x, -1)
+    centered = shifted - jnp.mean(shifted, axis=-1, keepdims=True)
+    root = jnp.sqrt(jnp.mean(centered * centered, axis=-1, keepdims=True) + eps)
+    folds = (root > 1) & (jnp.abs(weight) > 1)
+    folded = jnp.where(folds, centered, 0) * (jnp.where(folds, weight, 0) / jnp.where(folds, root, 1))
+    plain = (jnp.where(folds, 0, centered) / jnp.where(folds, 1, root)) * jnp.where(folds, 0, weight)
+    return jnp.where(folds, folded, plain) + bias
 
 
 def inner_gradient(k, v, km, weight, bias, eps: float):
     """Half the inner loss's gradient at the memory's readout `km` (`k M`), `[..., D]`: the memory's output
     `k + (LN(km) w + b)` (the residual around its key, as `dew.nn.memory`'s `ResidualMemory`) against the
-    value `v`, its error times `w`, through the LayerNorm's pullback (autodiff's, `layer_normed`). The
-    residual first, as the memory computes its output: against `v - k`, a key of 2^100 beside a value of 1
-    rounded the target and erased the error (a head review)."""
-    normed, pullback = jax.vjp(functools.partial(layer_normed, eps=eps), km)
-    (gradient,) = pullback(((k + (normed * weight + bias)) - v) * weight)
+    value `v`, through the affine LayerNorm's pullback (autodiff's, `layer_normed`). The residual first, as
+    the memory computes its output: against `v - k`, a key of 2^100 beside a value of 1 rounded the target and
+    erased the error (a head review)."""
+    normed, pullback = jax.vjp(functools.partial(layer_normed, weight=weight, bias=bias, eps=eps), km)
+    (gradient,) = pullback((k + normed) - v)
     return gradient
 
 
@@ -77,15 +95,22 @@ def real_gradients(k, v, readout, real, weight, bias, eps: float):
     return jnp.where(live, inner_gradient(k, v, jnp.where(live, readout, zeros), weight, bias, eps), zeros)
 
 
-def read_out(walked, queries, weight, bias, eps: float, dtype):
-    """A walk's readouts `[N, C, B, H, D]` as the call's output `[B, T, H, D]` in `dtype`, the padding
-    dropped: each query (`[B, H, T, D]`, as the walk read it) plus its readout's LayerNorm under the inner
-    loss's affine, the memory's residual around its input (Dew's `ResidualMemory`, the TTT paper's Sec
-    2.7)."""
-    out = jnp.moveaxis(walked.reshape(-1, *walked.shape[2:]), 0, 2)[:, :, :queries.shape[2]]
-    # The affine whole before the residual, as the memory's norm applies it (`ResidualMemory`): `q + (LN w +
-    # c)`, where `(q + LN w) + c` lost the query to an affine its bias cancels.
-    return jnp.moveaxis(queries + (layer_normed(out, eps) * weight + bias), 1, 2).astype(dtype)
+def read_out(reads, queries, weight, bias, eps: float):
+    """A mini-batch's outputs `[B, H, C, D]`: each query (as the walk read it) plus its readout's (`reads`,
+    `[B, H, C, D]`) LayerNorm under the inner loss's affine, the memory's residual around its input (Dew's
+    `ResidualMemory`, the TTT paper's Sec 2.7), formed in the mini-batch's own step (`memory_chunks`), so a
+    run that recomputes its chunks (`CHUNK`) recomputes the norm's intermediates with them and none lives
+    across the sequence (train 1495's review). The affine whole before the residual, as the memory's norm
+    applies it: `q + (LN w + c)`, where `(q + LN w) + c` lost the query to an affine its bias cancels."""
+    return queries + layer_normed(reads, weight, bias, eps)
+
+
+def assembled(outputs, length: int, dtype):
+    """The mini-batches' outputs `[N, B, H, C, D]` (`read_out`'s, as the walk stacks them) as the call's
+    output `[B, T, H, D]` in `dtype`, the padding past its `length` tokens dropped."""
+    out = jnp.moveaxis(outputs, 0, 2)
+    out = out.reshape(*out.shape[:2], -1, out.shape[-1])[:, :, :length]
+    return jnp.moveaxis(out, 1, 2).astype(dtype)
 
 
 def placed_alike(affine, *operands):
@@ -191,8 +216,9 @@ def titans(query, key, value, weight, bias, theta, alpha, eta, state=None, *, ch
             return pair, jnp.einsum('bhk,bhkv->bhv', q, pair[0])
 
         tokens = tuple(jnp.moveaxis(x, 2, 0) for x in (q, k, gradient, theta, alpha, eta, real))
-        return jax.lax.scan(token, pair, tokens)
+        pair, reads = jax.lax.scan(token, pair, tokens)
+        return pair, read_out(jnp.moveaxis(reads, 0, 2), q, weight, bias, eps)
 
     keys, *rest = mini_batches(chunk, k, q, v, theta, alpha, eta, valid=valid)
     final, out = memory_chunks(mini_batch, states, (rest[0], keys, *rest[1:]))
-    return read_out(out, q, weight, bias, eps, dtype), final
+    return assembled(out, q.shape[2], dtype), final

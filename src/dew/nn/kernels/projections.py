@@ -258,32 +258,43 @@ def rows_quantized(x: jax.Array) -> tuple[jax.Array, jax.Array]:
     return fake_quant.fp8_codes(blocks / scale).reshape(x.shape).astype(jnp.float8_e4m3fn), scale[..., 0]
 
 
-def blocks_quantized(w: jax.Array) -> tuple[jax.Array, jax.Array]:
+def blocks_quantized(w: jax.Array, *, k_major: bool = False) -> tuple[jax.Array, jax.Array]:
     """`w` (`[groups, depth, width]`) as E4M3 codes a 128 x 128 block at a time and each block's power-of-two
-    scale (`[groups, depth / 128, width / 128]` fp32): each block's rows and columns axes of their own, its
-    largest magnitude reduced over both where they lie, so no transposed copy of the matrix is made either
-    way (row 4518)."""
+    scale (`[groups, depth / 128, width / 128]` fp32); the codes K-major (`[groups, width, depth]`, as a
+    step-scaled product streams its matrix) where `k_major`. Each block's largest magnitude reduced at `w`'s
+    own width in two contiguous passes (`float_bits.largest_magnitude`: each row's 128 columns, then each
+    block's 128 rows), apart from the codes, each value over its block's scale broadcast over the block, so
+    no pass reads the matrix transposed but a K-major one's codes, written transposed as they are formed
+    (row 4518: one reduction over a block's both axes shared the codes' fp32 matrix, which XLA then wrote
+    through a 6.7 ms transposing fusion of an 8.8 ms quantization on a GH200, M-NG-67f). A depth an
+    Explicit axis splits in whole blocks keeps its split: each reshape splits or merges one axis, as an
+    Explicit placement's reshape takes it (the single 5-D reshape was refused there)."""
     from dew.nn import fake_quant
+    from dew.nn.float_bits import largest_magnitude
 
     groups, depth, width = w.shape
     edge = SCALE_DEPTH
-    tiles = w.astype(at_least_fp32(w.dtype)).reshape(groups, depth // edge, edge, width // edge, edge)
-    scale = fake_quant.fp8_block_scale(jnp.max(jnp.abs(tiles), axis=(2, 4), keepdims=True))
-    codes = fake_quant.fp8_codes(tiles / scale)
-    return codes.reshape(w.shape).astype(jnp.float8_e4m3fn), scale[:, :, 0, :, 0]
-
-
-def _k_major(w: jax.Array) -> tuple[jax.Array, jax.Array]:
-    """`w`'s blockwise FP8 codes, K-major (`[groups, width, depth]`, as a step-scaled product streams its
-    matrix), and their 128 x 128 blocks' scales (`blocks_quantized`)."""
-    blocks, scales = blocks_quantized(w)
-    return jnp.swapaxes(blocks, 1, 2), scales
+    # A format with no word of its own (an integer's, FP6's) read widened, exactly, as its codes are.
+    read = w if jnp.issubdtype(w.dtype, jnp.floating) and jnp.finfo(w.dtype).bits >= 8 else (
+        w.astype(at_least_fp32(w.dtype)))
+    rows = largest_magnitude(read.reshape(groups, depth, width // edge, edge), -1)
+    amax = largest_magnitude(rows.reshape(groups, depth // edge, edge, width // edge), 2)
+    scale = fake_quant.fp8_block_scale(amax.astype(at_least_fp32(w.dtype)))
+    tiles = read.reshape(groups, depth // edge, edge, width)
+    tiles = tiles.reshape(groups, depth // edge, edge, width // edge, edge)
+    spread = scale[:, :, None, :, None]
+    if k_major:
+        tiles, spread = tiles.transpose(0, 3, 4, 1, 2), spread.transpose(0, 3, 4, 1, 2)
+    codes = fake_quant.fp8_codes(tiles.astype(at_least_fp32(w.dtype)) / spread)
+    outer, inner = (width, depth) if k_major else (depth, width)
+    codes = codes.reshape(groups, outer // edge, edge, inner).reshape(groups, outer, inner)
+    return codes.astype(jnp.float8_e4m3fn), scale
 
 
 def _quantized_rows_product(rows, rows_scales, w, sizes, out_dtype, interpret) -> jax.Array:
     """A blockwise FP8 projection of rows already quantized (E4M3 codes and their 1 x 128 scales, `[depth /
     128, rows]`) by `w`: the one statement a projection, a chain's gate and its down projection read."""
-    blocks, scales = _k_major(w)
+    blocks, scales = blocks_quantized(w, k_major=True)
     return blockwise_fp8_product(rows, blocks, sizes, rows_scales, scales, out_dtype=out_dtype,
                                  interpret_on_cpu=interpret)
 
@@ -330,7 +341,7 @@ def _chain_value(x, w_ins, w_down, group_blocks, tensor_scales, activation, out_
     sizes = (group_blocks * SCALE_DEPTH).astype(jnp.int32)
     rows, rows_scales = rows_quantized(x)
     *gate, w_up = w_ins
-    up, up_scales = _k_major(w_up)
+    up, up_scales = blocks_quantized(w_up, k_major=True)
     # A gate's product stored rounded, the up product's epilogue reading it as a tile beside its own sum:
     # one accumulator a launch (two exact sums, each a running total and a step's partial, take a Hopper
     # consumer's 336 registers at FP8's least 128 columns; row 12689).
@@ -526,9 +537,7 @@ def nvfp4_projection(x: jax.Array, w: jax.Array, group_blocks: jax.Array, *, out
 
 
 def _nvfp4_value(x, w, group_blocks, tensor_scale, out_dtype, interpret):
-    return nvfp4_block_product(NvFp4Block.quantized(x, tensor_scale),
-                               NvFp4Block.quantized(jnp.swapaxes(w, 1, 2)), group_blocks, out_dtype=out_dtype,
-                               interpret_on_cpu=interpret)
+    return _nvfp4_forward(x, w, group_blocks, tensor_scale, out_dtype, interpret)[0]
 
 
 def nvfp4_amax(x: jax.Array) -> jax.Array:
@@ -574,18 +583,29 @@ each product's contraction; NVFP4, E2M1 under an E4M3 scale every 16 of it and a
 
 
 def _nvfp4_forward(x, w, group_blocks, tensor_scale, out_dtype, interpret):
-    return _nvfp4_value(x, w, group_blocks, tensor_scale, out_dtype, interpret), (x, w, group_blocks)
+    """The NVFP4 projection's value and its residuals: the operands and the tensor scales its quantization
+    took of their own (`x`'s where no delayed scale was given, `w`'s), which its backward quantizes the
+    same tensors at again, each scale one reduction of its tensor a step, not one a quantization (row
+    14083)."""
+    rows, matrices = NvFp4Block.quantized(x, tensor_scale), NvFp4Block.quantized(jnp.swapaxes(w, 1, 2))
+    value = nvfp4_block_product(rows, matrices, group_blocks, out_dtype=out_dtype, interpret_on_cpu=interpret)
+    return value, (x, w, group_blocks, (rows.scale if tensor_scale is None else None, matrices.scale))
 
 
 def _nvfp4_backward(out_dtype, interpret, residuals, cotangent):
+    """The NVFP4 projection's gradients (`nvfp4_projection`'s surrogate). `residuals`, `_nvfp4_forward`'s,
+    or a chain's operands alone (`_chain_pulled`), whose tensor scales are their own here; the cotangent's
+    tensor scale taken once for both its quantizations (row 14083)."""
     del out_dtype
-    x, w, group_blocks = residuals
-    d_x = nvfp4_block_product(NvFp4Block.quantized(cotangent), NvFp4Block.quantized(w), group_blocks,
-                              out_dtype=x.dtype, interpret_on_cpu=interpret)
+    x, w, group_blocks, *held = residuals
+    x_scale, w_scale = held[0] if held else (None, None)
+    pulled = NvFp4Block.quantized(cotangent)
+    d_x = nvfp4_block_product(pulled, NvFp4Block.quantized(w, w_scale), group_blocks, out_dtype=x.dtype,
+                              interpret_on_cpu=interpret)
     sizes = (group_blocks * SCALE_DEPTH).astype(jnp.int32)
     # Each group's tokens quantized along the tokens (the kernel gradient's contraction), every 16 a scale,
     # the tensor scales applied: a 128-row group's blocks hold whole 16s.
-    rows, cotangents = (NvFp4Block.quantized(operand.T) for operand in (x, cotangent))
+    rows, cotangents = NvFp4Block.quantized(x.T, x_scale), NvFp4Block.quantized(cotangent.T, pulled.scale)
     # An FP4 backward's exact fp32 products: the decoded codes times their scales, held whole.
     d_w = gemm_t((rows.decoded() * rows.scale).T.astype(jnp.float32),
                  (cotangents.decoded() * cotangents.scale).T.astype(jnp.float32), sizes, out_dtype=w.dtype,

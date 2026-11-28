@@ -68,14 +68,7 @@ def swap_of(params: i64) -> i64: ...
 def _carrying():
     """Which values read the state (`reads`): a term of the language (`terms.LANGUAGE`, every constructor) any
     of whose operands reads it, a reduction's among them."""
-    t = var("t", Term)
-    one = i64(1)
-    marked = []
-    for index, constructor in enumerate(terms.LANGUAGE):
-        made, children = terms.pattern_of(Term, constructor, f"c{index}")
-        marked += [rule(eq(t).to(made), eq(reads(child)).to(one)).then(set_(reads(t)).to(one))
-                   for child in children]
-    return ruleset(*marked, name="carrying")
+    return ruleset(*terms.propagated(Term, terms.LANGUAGE, reads, "c"), name="carrying")
 
 
 def _carried():

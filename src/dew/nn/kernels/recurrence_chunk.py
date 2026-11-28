@@ -38,6 +38,7 @@ from dew.algebra.derive import FORMS_HELD
 from dew.algebra.scan import RESET_DECAY, Reads
 from dew.batch import document_firsts
 from dew.mesh import mesh_axes
+from dew.nn import norms
 from dew.nn.attention_masks import repeat_kv_heads
 from dew.nn.derivatives import KernelGlue, Protected, contracted, with_gradients_formed_at
 from dew.nn.inputs import cu_seqlens
@@ -51,14 +52,23 @@ from dew.nn.precision import (
     l2norm,
     rounds_products,
 )
-from dew.nn.residuals import recomputed_memory
-from dew.nn.sharding import grouped_heads, manual_map, rows_like, rows_spec, shard_shapes, varying_like
+from dew.nn.residuals import recomputed_memory, recurrence_output
+from dew.nn.sharding import (
+    HEADS,
+    grouped_heads,
+    manual_map,
+    rows_like,
+    rows_spec,
+    shard_shapes,
+    varying,
+    varying_like,
+)
 
 from . import fla_gdn, fla_kda, generation, mamba_ssd, recurrence, recurrence_algebra as algebra
 from .chunked_launch import Forked, zero_padded
 from .generation import INHERENT, Choice, triton_runs
 from .recurrence_forked import forked_adjoint, forked_replay, forked_steps, most_segments, taken_up
-from .selection import Kernel, KernelRefused, Op, Refusal, Requirement, select, selected
+from .selection import Kernel, KernelRefused, Op, Refusal, Requirement, forced, select, selected
 from .ssd import _chunk_scan, ssd_kernel_platform
 from .templates import base, copies, report as launch_report, scan as block_scan
 
@@ -82,7 +92,9 @@ def held_chunk(chunk_size: int, key_width: int) -> int:
 def chunk_gated_delta_rule(query, key, value, g, beta, state=None, chunk_size: int = CHUNK_SIZE, *,
                            starts=None, max_segments: int | None = None,
                            write_bound: float | None = None, decay_bound: float | None = None,
-                           unit_queries: bool = False, firsts=None, loads=None, stores=None, held: int = 0):
+                           unit_queries: bool = False, firsts=None, loads=None, stores=None, held: int = 0,
+                           output: norms.OutputNorm | None = None, z=None, weight=None, dtype=None,
+                           valid=None):
     """`torch_chunk_gated_delta_rule` (modeling_qwen3_next.py:374-453) with one
     log decay per head, `g` `[B, S, H]`, or `chunk_kimi_delta_attention`
     (modeling_glm5_next.py:482-578) with one per key dimension, `[B, S, H,
@@ -109,12 +121,18 @@ def chunk_gated_delta_rule(query, key, value, g, beta, state=None, chunk_size: i
     `decay_bound` the least log decay a token the layer proves (`recurrence.Hooks.decay_bound`), which a
     decay a key dimension's template prefix reads, and `unit_queries` whether its queries are l2-normalized
     (`recurrence.Hooks.unit_queries`). `loads`, `stores` and `held` are a forked call's (`Chunk.loads`).
+    `output`, where given, is the mixer's gated norm after the rule (`recurrence.Hooks.output`), its gate `z`
+    `[B, S, Hv, Dv]` and `weight` `[Dv]`, the output then normed in `dtype` (`chunk`'s epilogue, the
+    template's output launch where it fuses it): a gated delta net's or Kimi delta attention's own. `valid`
+    `[B, S]`, where given, marks the tokens present, a padded one keeping the memory (`Chunk.valid`).
     """
     hooks = recurrence.Hooks(decay='vector' if g.ndim == 4 else 'scalar', scale=key.shape[-1] ** -0.5,
-                             write_bound=write_bound, decay_bound=decay_bound, unit_queries=unit_queries)
+                             write_bound=write_bound, decay_bound=decay_bound, unit_queries=unit_queries,
+                             output=output)
     return chunk(hooks, Chunk(query, key, value, log_decay=g, beta=beta, state=state, starts=starts,
-                              firsts=firsts, loads=loads, stores=stores, held=held),
-                 chunk_size=chunk_size, max_segments=max_segments)
+                              firsts=firsts, loads=loads, stores=stores, held=held, z=z, weight=weight,
+                              valid=valid),
+                 chunk_size=chunk_size, max_segments=max_segments, dtype=dtype)
 
 
 @jax.tree_util.register_dataclass
@@ -168,6 +186,11 @@ class Chunk(recurrence.Gated):
     entry_value: jax.Array | None = None
     entry_weight: jax.Array | None = None
     adds: jax.Array | None = None
+    valid: jax.Array | None = None
+    """`[B, S]` bool, None where every token is real: a padded token's decays (its value decay's too) and
+    write gate none, as the hooks form them (`recurrence.Hooks.gates`) or as given, so it leaves the memory as
+    it came; a hook whose transition has more (an erase of its own, turns, substeps, a coupled momentum)
+    refuses it."""
     held: int = dataclasses.field(default=0, metadata={'static': True})
 
 
@@ -225,8 +248,9 @@ def _read_checked(hooks: recurrence.Hooks, operands: Chunk) -> dict:
     tokens = given['query'].shape[1]
     stepped = {name: given[name].shape[1] for name in ('key', 'value', 'beta') if name in given}
     held = {name: given[name].shape[1] for name in ('log_decay', 'z') if name in given}
-    if operands.starts is not None:
-        held['starts'] = operands.starts.shape[1]
+    for name in ('starts', 'valid'):
+        if getattr(operands, name) is not None:
+            held[name] = getattr(operands, name).shape[1]
     if any(length != tokens * hooks.substeps for length in stepped.values()) or any(
             length != tokens for length in held.values()):
         raise ValueError(f"{tokens} tokens of {hooks.substeps} updates each take keys, values and write "
@@ -254,6 +278,11 @@ def _prologue_of(hooks: recurrence.Hooks, operands: Chunk, dtype) -> tuple:
     where `hooks` norm them, the log decay and the write gate in `work` (zero and one where `hooks` form
     none), the output's `dtype` (the operands' where None) and `work` at least fp32."""
     given = _read_checked(hooks, operands)
+    if operands.valid is not None:
+        if hooks.erase != 'tied' or hooks.turns or hooks.coupled is not None or hooks.substeps > 1:
+            raise ValueError(f"a padded token keeps the memory through its decay, write gate and value decay "
+                             f"alone (`Chunk.valid`): {hooks}'s transition has more")
+        given = _padded_zero(given, jnp.asarray(operands.valid, bool))
     query, key, value = given['query'], given['key'], given['value']
     dtype = jnp.result_type(query, key, value) if dtype is None else jnp.dtype(dtype)
     work = at_least_fp32(jnp.result_type(query, key, value))
@@ -263,12 +292,36 @@ def _prologue_of(hooks: recurrence.Hooks, operands: Chunk, dtype) -> tuple:
         # memory 30 to 41 times fla's distance from float64 in two parts (row 184's GDN cell, acb1301632c).
         query, key = (l2norm(x.astype(work)).astype(x.dtype) for x in (query, key))
     scale = (key.shape[-1] ** -0.5 if hooks.l2norm else 1.0) if hooks.scale is None else hooks.scale
-    g, beta = recurrence.log_gates(hooks, given, work)
+    # A padded token's gates formed from zeros, its head's rate among them (`log_gates`).
+    g, beta = recurrence.log_gates(hooks, given, work,
+                                   None if operands.valid is None else jnp.asarray(operands.valid, bool))
     # No decay a token's (the queries' tokens: a token of updates, `Hooks.substeps`, decays once), and every
     # update's own write gate of one.
     g = jnp.zeros((*query.shape[:2], value.shape[2]), work) if g is None else g
     beta = jnp.ones(value.shape[:3], work) if beta is None else beta
+    if operands.valid is not None:
+        # A padded token's decays and its write gate none: exp(0) = 1 and beta = 0 keep the memory.
+        valid = jnp.asarray(operands.valid, bool)
+        g = jnp.where(valid.reshape(*valid.shape, *(1,) * (g.ndim - 2)), g, 0.0)
+        beta = jnp.where(valid[..., None], beta, 0.0)
     return given, query, key, value, g, beta, scale, dtype, work
+
+
+PADDED = ('query', 'key', 'value',
+          *(field.name for field in dataclasses.fields(recurrence.Gated) if field.metadata.get('rows')))
+"""The operands a token holds of its own, a padded token's zeroed (`_padded_zero`): its query, key and value
+and every gate's entry a row's (`recurrence.Gated`'s `ROW` fields: the epilogue's gate among them, whose
+infinity met the norm weight's zero cotangent as NaN; a head review)."""
+
+
+def _padded_zero(given: dict, valid) -> dict:
+    """`given` with every token operand (`PADDED`) of a padded token (`valid` `[B, S]` False) zero, before
+    any gate is formed or product taken: a padded key of `2^70` overflowed its pair's product, `inf * 0` NaN
+    through the chunk's inverse into the live memory (train 1461's review)."""
+    def kept(x):
+        return jnp.where(valid.reshape(*valid.shape, *(1,) * (x.ndim - 2)), x, jnp.zeros((), x.dtype))
+
+    return {name: kept(x) if name in PADDED else x for name, x in given.items()}
 
 
 def chunk(hooks: recurrence.Hooks, operands: Chunk, *, chunk_size: int = CHUNK_SIZE,
@@ -322,75 +375,151 @@ def chunk(hooks: recurrence.Hooks, operands: Chunk, *, chunk_size: int = CHUNK_S
         out, final = _rated_scan(hooks, query, key, value, g, beta, given, state, starts, firsts, chunk_size,
                                  work, dtype, max_segments=max_segments, forked=forked)
     else:
-        # The delta rule's selector decides every form (`GATED_DELTA`): the forms its kernels do not run hand
-        # over to the portable math there, reported as the call's route. A kernel's output unrounded, as the
-        # portable math's, where an epilogue reads it or the caller's dtype is not the operands' (Mamba-3's
-        # fp32 rank terms add to it, `chunk_mamba3`), so the output is rounded once. The template's
-        # numbers are read once, as the selector reads them: a remat's pullback runs the launch later, under
-        # whatever precision its caller set then (a saved fp32 gradient under 'highest' took the accurate
-        # forms' three parts, whose solve no sm90 thread holds, past the fast ones the selector gave it).
-        epilogue = hooks.output is not None or dtype != jnp.result_type(query, key, value)
-        wide_out = hooks.skip or epilogue
-        # fla's simple GLA rounds as its release places it, values gated (`mainloop.Call.values_gated`).
-        values_gated = simple_gla(hooks)
-        transition, reads = _transition(hooks, correction)
-        unit_pairs = _unit_pairs(hooks)
-        # The least log decay a token the layer proves, which a decay a key dimension's prefix reads
-        # (`mainloop.Call.prefix_limbs`); a head's takes its compensated pair whatever it is.
-        decay_bound = hooks.decay_bound if hooks.decay == 'vector' else None
-        rounded = chunk_rounding(hooks.delta, jnp.result_type(query, key, value), released=values_gated)
-        skip = given['skip'] if hooks.skip else None
-        # Without the delta rule the template takes the skip, its output wide where an epilogue or the
-        # caller reads it so (`chunk_forward.forward`).
-        fused_wide = wide_out if hooks.delta else epilogue
-
-        def product_kernel(product: str) -> str:
-            return port_kernel(query, key, value, g, beta, state, starts, max_segments=max_segments,
-                               scale=scale, wide=fused_wide, bound=hooks.inverse_bound,
-                               product=product, forked=forked, delta=hooks.delta,
-                               decayed=hooks.decay != 'none', skip=None if hooks.delta else skip,
-                               rounded=rounded, firsts=firsts, readout=readout, apart=apart,
-                               values_gated=values_gated, unit_pairs=unit_pairs,
-                               decay_bound=decay_bound, turns=hooks.turns, turn=given.get('turn'),
-                               transition=transition, reads=reads)
-
-        def run(kernel, query, key, value, g, beta, skip, state, starts, firsts, turn, correction, across,
-                erase_left, *walked):
-            # Every kernel walks the packed rows, each document from its own memory, its values read once
-            # with the skip's (`_read_once`). Without the delta rule the template takes the skip, its
-            # values' gradient summed with the recurrence's before it rounds once (`chunk_forward.forward`):
-            # added after, the template's rounded to the values' dtype apart from the skip's, Mamba2's step
-            # gates' values' gradient's worst row of 40 draws was 2.9e-2 from float64 against the portable
-            # math's 3.5e-3 (interpreted).
-            carried = None if forked is None else forked.carrying(*walked)
-            wide, own = _read_once(value, work)
-            fused = kernel == 'mosaic_gpu' and not hooks.delta
-            if kernel == 'mosaic_gpu':
-                out, final = _on_template(hooks, query, key, own, g, beta, state, skip if fused else None,
-                                          turn, starts=starts, firsts=firsts, forked=carried,
-                                          max_segments=max_segments, scale=scale, wide=fused_wide,
-                                          rounded=rounded, values_gated=values_gated, unit_pairs=unit_pairs,
-                                          decay_bound=decay_bound, reads=_transition(hooks, correction)[1])
-            elif kernel == 'fla':
-                out, final = fla_rule(query, key, own, g, beta, state, starts=starts,
-                                      max_segments=max_segments, scale=scale, wide=wide_out, firsts=firsts)
-            else:
-                out, final = _on_portable(hooks, query, key, wide, g, beta, state, turn, starts=starts,
-                                          firsts=firsts, forked=carried, scale=scale, dtype=work,
-                                          own=given['own'] if hooks.own_weight else None,
-                                          chunk_size=chunk_size, correction=correction, across=across,
-                                          erase_left=erase_left)
-            out = out.astype(work)
-            return (out if fused else recurrence.skipped(hooks, out, wide, {'skip': skip}, work)), final
-
-        # The skip's `D` (operand 5) is the call's parameter.
-        out, final = _per_product(GATED_DELTA.bound(product_kernel), run, query, key, value, g, beta, skip,
-                                  state, starts, firsts, given.get('turn'), correction,
-                                  given['value_decay'].astype(work) if hooks.value_decay else None,
-                                  erase_left, *(() if forked is None else forked.walked), parameters=(5,))
+        out, final = _on_kernels(hooks, given, (query, key, value, g, beta, state, starts, firsts), forked,
+                                 erase=(erase_left, correction), max_segments=max_segments, scale=scale,
+                                 chunk_size=chunk_size, work=work, dtype=dtype, readout=readout, apart=apart,
+                                 normed=hooks.output is not None and stride == 1)
+        if hooks.output is not None and stride == 1:
+            # The normed output, which the out projection's pullback reads, named as the recurrence's where
+            # the op returns it, outside the kernels' custom rules (the read before the norm named within
+            # them): a rung keeping the recurrence's output keeps it rather than replaying every launch of the
+            # forward for it (test_lowering's remat rung: 19 launches where 15 ran unrematted, 18 within).
+            return recurrence_output(out), final
     # A token's output its last laid token's (`_laid`); the epilogue in work, the output rounded once.
     out = out[:, stride - 1::stride]
-    return recurrence.normed(hooks, out, given, work).astype(dtype), final
+    return recurrence.normed(hooks, out, given, work, dtype=dtype, axes=HEADS), final
+
+
+def _on_kernels(hooks: recurrence.Hooks, given: dict, laid: tuple, forked, *, erase: tuple, max_segments,
+                scale, chunk_size: int, work, dtype, readout: bool, apart: int, normed: bool):
+    """`chunk`'s recurrence on the kernel the delta rule's selector gives each product (`GATED_DELTA`), over
+    its `laid` operands `(query, key, value, g, beta, state, starts, firsts)`: the forms its kernels do not
+    run hand over to the portable math there, reported as the call's route. A kernel's output unrounded, as
+    the portable math's, where an epilogue reads it wider than the operands or the caller's dtype is not
+    theirs (Mamba-3's fp32 rank terms add to it, `chunk_mamba3`), so the output is rounded once. The
+    template's numbers are read once, as the selector reads them: a remat's pullback runs the launch later,
+    under whatever precision its caller set then (a saved fp32 gradient under 'highest' took the accurate
+    forms' three parts, whose solve no sm90 thread holds, past the fast ones the selector gave it). Where
+    `normed`, the output leaves through the epilogue's gated norm (`_normed_runs`) in `dtype`, else in
+    `work`."""
+    query, key, value, g, beta, state, starts, firsts = laid
+    erase_left, correction = erase
+    operand = jnp.result_type(query, key, value)
+    # An epilogue reads the kernel's own rounding where it reads the output back in the operands' dtype
+    # (`OutputNorm.read_in`), else the output wide.
+    read_in = None if hooks.output is None else hooks.output.read_in
+    narrow = read_in is not None and jnp.dtype(read_in) == operand
+    epilogue = (hooks.output is not None and not narrow) or (hooks.output is None and dtype != operand)
+    wide_out = hooks.skip or epilogue
+    # fla's simple GLA rounds as its release places it, values gated (`mainloop.Call.values_gated`).
+    values_gated = simple_gla(hooks)
+    transition, reads = _transition(hooks, correction)
+    unit_pairs = _unit_pairs(hooks)
+    # The least log decay a token the layer proves, which a decay a key dimension's prefix reads
+    # (`mainloop.Call.prefix_limbs`); a head's takes its compensated pair whatever it is.
+    decay_bound = hooks.decay_bound if hooks.decay == 'vector' else None
+    rounded = chunk_rounding(hooks.delta, operand, released=values_gated)
+    skip = given['skip'] if hooks.skip else None
+    # Without the delta rule the template takes the skip, its output wide where an epilogue or the caller
+    # reads it so (`chunk_forward.forward`).
+    fused_wide = wide_out if hooks.delta else epilogue
+    forms = {"max_segments": max_segments, "scale": scale, "rounded": rounded, "values_gated": values_gated,
+             "unit_pairs": unit_pairs, "decay_bound": decay_bound}
+
+    def product_kernel(product: str, **fused) -> str:
+        # A forward's or a training's epilogue in the template's output launch (`fused`: its norm, gate and
+        # weight), asked unreported: the call's route is its own product's.
+        return port_kernel(query, key, value, g, beta, state, starts, max_segments=max_segments, scale=scale,
+                           wide=False if fused else fused_wide, bound=hooks.inverse_bound, product=product,
+                           forked=forked, delta=hooks.delta, decayed=hooks.decay != 'none',
+                           skip=None if hooks.delta else skip, rounded=rounded, firsts=firsts,
+                           readout=readout, apart=apart, values_gated=values_gated, unit_pairs=unit_pairs,
+                           decay_bound=decay_bound, turns=hooks.turns, turn=given.get('turn'),
+                           transition=transition, reads=reads, report=not fused, **fused)
+
+    def run(kernel, query, key, value, g, beta, skip, state, starts, firsts, turn, correction, across,
+            erase_left, *walked, **fused):
+        # Every kernel walks the packed rows, each document from its own memory, its values read once with
+        # the skip's (`_read_once`). Without the delta rule the template takes the skip, its values' gradient
+        # summed with the recurrence's before it rounds once (`chunk_forward.forward`): added after, the
+        # template's rounded to the values' dtype apart from the skip's, Mamba2's step gates' values'
+        # gradient's worst row of 40 draws was 2.9e-2 from float64 against the portable math's 3.5e-3
+        # (interpreted). A template run given an epilogue (`fused`) returns its output normed.
+        carried = None if forked is None else forked.carrying(*walked)
+        wide, own = _read_once(value, work)
+        on_template = kernel == 'mosaic_gpu' and not hooks.delta
+        if kernel == 'mosaic_gpu':
+            out, final = _on_template(hooks, query, key, own, g, beta, state, skip if on_template else None,
+                                      turn, starts=starts, firsts=firsts, forked=carried,
+                                      wide=False if fused else fused_wide,
+                                      reads=_transition(hooks, correction)[1], **forms, **fused)
+            if fused:
+                return out, final
+        elif kernel == 'fla':
+            out, final = fla_rule(query, key, own, g, beta, state, starts=starts, max_segments=max_segments,
+                                  scale=scale, wide=wide_out, firsts=firsts)
+        else:
+            out, final = _on_portable(hooks, query, key, wide, g, beta, state, turn, starts=starts,
+                                      firsts=firsts, forked=carried, scale=scale, dtype=work,
+                                      own=given['own'] if hooks.own_weight else None, chunk_size=chunk_size,
+                                      correction=correction, across=across, erase_left=erase_left)
+        out = out.astype(work)
+        return out if on_template else recurrence.skipped(hooks, out, wide, {'skip': skip}, work), final
+
+    operands = (query, key, value, g, beta, skip, state, starts, firsts, given.get('turn'), correction,
+                given['value_decay'].astype(work) if hooks.value_decay else None, erase_left)
+    walked = () if forked is None else forked.walked
+    if not normed:
+        # The skip's `D` (operand 5) is the call's parameter.
+        return _per_product(GATED_DELTA.bound(product_kernel), run, *operands, *walked, parameters=(5,))
+    # The norm in the launch where no kernel is named for it: a call naming its gated norm's kernel
+    # (`dew.kernels.use(rms_norm=...)`) runs that kernel after the launches (train 1473's review).
+    fuses = (not hooks.skip and given.get('turn') is None and dtype == operand and narrow
+             and forced(Choice.RMS_NORM) is None)
+    training, alone = _normed_runs(hooks, run, product_kernel, given, work, dtype, fuses=fuses,
+                                   operands=len(operands))
+    # The skip's `D` (operand 5) and the epilogue's weight (operand 14) are the call's parameters.
+    return _per_product(GATED_DELTA.bound(product_kernel), training, *operands, given['z'], given['weight'],
+                        *walked, parameters=(5, 14), alone=alone)
+
+
+def _normed_runs(hooks: recurrence.Hooks, run, product_kernel, given: dict, work, dtype, *, fuses: bool,
+                 operands: int):
+    """`_on_kernels`' runs of a call whose output leaves through the epilogue's gated norm (`hooks.output`),
+    `(training, forward alone)`, each `run(kernel, *operands, gate, weight, *walked)`: the template's
+    launches take the norm in their output launch where the call `fuses` it (no skip, no turn, its output
+    in the operands' dtype, read back in it) and their plan for the product holds it (the forward's alone,
+    or the training's forward and backward: the norm's residual kept and its gradient the layers' norm's,
+    `template.mosaic_rule`, the output it read named as the recurrence's); elsewhere each kernel's output,
+    named as the recurrence's (a remat keeps it and forms the norm again), through the layers' norm
+    (`recurrence.normed`); `chunk` names the normed output it returns either way. A plan that does not hold,
+    or a gate or weight varying over a manual axis the recurrence's operands do not, declines the fusion, the
+    selected kernel's own route kept."""
+    def fits(product: str, gate, weight) -> bool:
+        try:
+            return product_kernel(product, normed=hooks.output, gate=gate, weight=weight) == 'mosaic_gpu'
+        except KernelRefused:
+            return False
+
+    def runs(product: str):
+        def normed_run(kernel, *given_operands):
+            head, (gate, weight), walked = (given_operands[:operands], given_operands[operands:operands + 2],
+                                            given_operands[operands + 2:])
+            # A gate or weight varying where the recurrence does not (a checked `shard_map`'s) keeps the
+            # norm apart, whose pullback sums back to the recurrence's output as JAX types it.
+            alike = varying(gate, weight) <= varying(*head[:5], head[6])
+            if fuses and alike and kernel == 'mosaic_gpu' and fits(product, gate, weight):
+                return run(kernel, *head, *walked, normed=hooks.output, gate=gate, weight=weight)
+            out, final = run(kernel, *head, *walked)
+            assert hooks.output is not None, "a gate is the epilogue's"
+            # The output the norm reads, the recurrence's own, named as a remat keeps it: the norm after it
+            # is the layers' own, formed again from it.
+            read = recurrence_output(out.astype(hooks.output.read_in or work))
+            return recurrence.normed(hooks, read, {'z': gate, 'weight': weight}, work, dtype=dtype,
+                                     axes=HEADS), final
+        return normed_run
+
+    return runs('training'), runs('forward')
 
 
 def _transition(hooks: recurrence.Hooks, correction) -> tuple[bool, jax.Array | None]:
@@ -1213,7 +1342,7 @@ def port_kernel(query, key, value, g, beta, state=None, starts=None, *, max_segm
                 firsts=None, readout: bool = True, apart: int = 0, values_gated: bool = False,
                 unit_pairs: bool = False,
                 decay_bound: float | None = None, turns: int = 0, turn=None, transition: bool = False,
-                reads=None) -> str:
+                reads=None, normed: norms.OutputNorm | None = None, gate=None, weight=None) -> str:
     """The kernel the delta rule's selector (`GATED_DELTA`) gives a call over these operands for `product`
     ('forward', 'training'), of the form `delta` and `decayed` state and the chunk inverse's `bound` its form
     proves (`recurrence.Hooks.inverse_bound`; `PortCase`), the template's
@@ -1229,7 +1358,8 @@ def port_kernel(query, key, value, g, beta, state=None, starts=None, *, max_segm
     own write (`apart`, which its call to the template carries), `turns` the key pairs its state turns
     (`PortCase.turns`, `recurrence.Hooks.turns`) and `turn` its turns, through which a turned call's launch
     binds its operands (`_turned_launch`); `reads` the reads its keys erase along where given
-    (`PortCase.reads`), which the template's call binds."""
+    (`PortCase.reads`), which the template's call binds; an epilogue's gated norm (`normed`, its `gate` and
+    `weight`) the template's forward takes in its output launch (`template.mosaic_rule`), bound with it."""
     dtype = jnp.dtype(jnp.result_type(query, key, value))
     rounded = chunk_rounding(delta, dtype) if rounded is None else rounded
     call, shards = None, (None, key, value)
@@ -1243,7 +1373,7 @@ def port_kernel(query, key, value, g, beta, state=None, starts=None, *, max_segm
             launched[0], launched[1], value, g, beta, state, starts, firsts, skip, launched[2],
             max_segments=max_segments, scale=scale, delta=delta, wide=wide, bound=bound, rounded=rounded,
             apart=apart, values_gated=values_gated, unit_pairs=unit_pairs, decay_bound=decay_bound,
-            reads=reads)
+            reads=reads, gate=gate, weight=weight, **({} if normed is None else {"normed": normed}))
     _, shard_key, shard_value, *_ = shards
     if turns and call is not None:
         # The port's case reads the call's own key heads a shard, as an unturned call's are laid (a turned
@@ -1337,7 +1467,8 @@ def _portable_training(kernel_of: Callable[[str], str]) -> bool:
         return False
 
 
-def _per_product(kernel_of: Callable[[str], str], run, *operands, parameters: tuple[int, ...]):
+def _per_product(kernel_of: Callable[[str], str], run, *operands, parameters: tuple[int, ...],
+                 alone: Callable | None = None):
     """`run(kernel, *operands)` on the kernel a selector gives each product (`kernel_of('forward')`,
     `kernel_of('training')`), differentiated at every order through the portable math (`run('xla', ...)`,
     `generation.linear_tangent`): the forward's kernel where no derivative is taken, the training kernel's
@@ -1352,7 +1483,9 @@ def _per_product(kernel_of: Callable[[str], str], run, *operands, parameters: tu
     through the products' split it traced the portable math three times over, half of a gated delta net
     layer's training step's trace on a CPU (row 3142). The operands at `parameters` are the call's
     parameters (a skip's `D`, a rate, A), whose gradients reverse mode forms with the others' cotangents
-    (`derivatives.with_gradients_formed_at`)."""
+    (`derivatives.with_gradients_formed_at`). `alone(kernel, *operands)`, where given, is the forward's own
+    run where no derivative is taken (`run`'s value, a kernel fusing more of it: an epilogue the training's
+    runs after its launches, `chunk`'s)."""
     forward = kernel_of('forward')
     if forward == 'xla' and _portable_training(kernel_of):
         return run(forward, *operands)
@@ -1368,7 +1501,7 @@ def _per_product(kernel_of: Callable[[str], str], run, *operands, parameters: tu
         with launch_report.pulled():
             return run(kernel_of('training'), *operands)
 
-    primal = functools.partial(run, forward)
+    primal = functools.partial(run if alone is None else alone, forward)
 
     def portable(*operands):
         shapes = jax.eval_shape(primal, *operands)
@@ -1545,7 +1678,7 @@ def _shard_specs(shape: tuple[int, ...], key_heads: int, decay_ndim: int) -> tup
 
 
 def template_rule(query, key, value, g, beta, state=None, starts=None, firsts=None, skip=None,
-                  forked: Forked | None = None, reads=None, **options):
+                  forked: Forked | None = None, reads=None, gate=None, weight=None, **options):
     """The recurrence template's op (`templates.recurrence.template.MOSAIC`, its `mosaic_rule`) on each
     shard (`manual_map`), placed as `fla_rule`: its tiles derived from each shard's shapes, its forward and
     its gradient on each device's own rows. Called on the whole batch, every device of a 2xH100 FSDP run ran
@@ -1553,11 +1686,12 @@ def template_rule(query, key, value, g, beta, state=None, starts=None, firsts=No
     microbatch (row 1897). `options` are the op's (`max_segments`, `scale`, `delta`, `wide`, `bound`,
     `rounded`); whether the block's remat rung recomputes the delta rule's memory is resolved as
     the selectors' binds resolve it (`recomputed_memory`). A `forked` call's documents (`Chunk.loads`), its
-    table's given memories `state` `[B, S', Hv, Dk, Dv]`, are each shard's rows'; `reads` the keys'."""
+    table's given memories `state` `[B, S', Hv, Dk, Dv]`, are each shard's rows'; `reads` the keys'; an
+    epilogue's (`options`' `normed`) `gate` the values' and `weight` every shard's."""
     from .templates.recurrence import template
 
     operands, specs, out_specs, bound = _template_launch(query, key, value, g, beta, state, starts, firsts,
-                                                         skip, forked, reads, **options)
+                                                         skip, forked, reads, gate, weight, **options)
 
     def local(*given):
         arguments, keywords = bound(*given)
@@ -1567,7 +1701,8 @@ def template_rule(query, key, value, g, beta, state=None, starts=None, firsts=No
 
 
 def template_bind(query, key, value, g, beta, state=None, starts=None, firsts=None, skip=None,
-                  forked: Forked | None = None, reads=None, **options) -> tuple[base.Call, tuple]:
+                  forked: Forked | None = None, reads=None, gate=None, weight=None,
+                  **options) -> tuple[base.Call, tuple]:
     """The template's call a selector reads (`port_kernel`, `scan_kernel`), bound as `template_rule` binds
     its launch on each shard (`_template_launch`): each shard's shapes, its documents' firsts and its
     forked call's carried tables, so the launch its eligibility certifies (`Template.holds`) is the one the
@@ -1578,7 +1713,7 @@ def template_bind(query, key, value, g, beta, state=None, starts=None, firsts=No
     from .templates.recurrence import template
 
     operands, specs, _, bound = _template_launch(query, key, value, g, beta, state, starts, firsts, skip,
-                                                 forked, reads, **options)
+                                                 forked, reads, gate, weight, **options)
     shards = shard_shapes(operands, specs)
     arguments, keywords = bound(*shards)
     return base.call((template.MOSAIC,), *arguments, **keywords), shards
@@ -1678,7 +1813,7 @@ def _value_headed(query, key, value, entry) -> tuple:
 
 
 def _template_launch(query, key, value, g, beta, state, starts, firsts, skip, forked: Forked | None, reads,
-                     **options) -> tuple:
+                     gate=None, weight=None, **options) -> tuple:
     """The template's launch on each shard: `(operands, specs, out_specs, bound)`, its operands in order with
     their placements (`_shard_specs`), its outputs', and `bound(*local)` the op's arguments and keywords
     from each shard's operands (`template_rule`'s launch and `template_bind`'s alike)."""
@@ -1689,7 +1824,9 @@ def _template_launch(query, key, value, g, beta, state, starts, firsts, skip, fo
         # The table's memories a row's and head's, and the documents' operands as `Forked` places them.
         memory = P(four[0], None, four[2], None, None)
         walked = forked.specs(four[0], four[2])
-    optional = [(state, memory), (starts, resets), (firsts, resets), (skip, P(four[2])), (reads, four)]
+    # An epilogue's gate the values' and its weight every shard's whole.
+    optional = [(state, memory), (starts, resets), (firsts, resets), (skip, P(four[2])), (reads, four),
+                (gate, four), (weight, P())]
     operands = (query, key, value, g, beta, *(x for x, _ in optional if x is not None),
                 *(() if forked is None else forked.walked))
     specs = (four, four, four, decays, three, *(spec for x, spec in optional if x is not None),
@@ -1697,10 +1834,12 @@ def _template_launch(query, key, value, g, beta, state, starts, firsts, skip, fo
 
     def bound(query, key, value, g, beta, *given):
         given = iter(given)
-        state, starts, firsts, skip, reads = (None if x is None else next(given) for x, _ in optional)
+        state, starts, firsts, skip, reads, gate, weight = (None if x is None else next(given)
+                                                            for x, _ in optional)
+        sides = {} if gate is None else {"gate": gate, "weight": weight}
         return (query, key, value, g, beta, state, starts), dict(
             firsts=firsts, skip=skip, forked=None if forked is None else forked.carrying(*given),
-            recomputed=recomputed_memory(), reads=reads, **options)
+            recomputed=recomputed_memory(), reads=reads, **sides, **options)
 
     return operands, specs, (four, P(four[0], four[2], None, None)), bound
 

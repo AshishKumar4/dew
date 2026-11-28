@@ -104,7 +104,12 @@ def main() -> None:
     parser.add_argument("--jobs", type=int, default=os.cpu_count() or 1, help="pairs lowered at once")
     parser.add_argument("--limit-mib", type=float, default=LIMIT_MIB)
     parser.add_argument("--lower", nargs=2, metavar=("STEP", "GENERATION"), help=argparse.SUPPRESS)
+    parser.add_argument("--list", action="store_true",
+                        help="print the generations a package's entries are derived for, one a line")
     arguments = parser.parse_args()
+    if arguments.list:
+        print("\n".join(GENERATIONS))
+        return
     if arguments.lower is not None:
         print(json.dumps(lowered(*arguments.lower)), flush=True)
         return

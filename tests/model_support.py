@@ -461,17 +461,21 @@ def steps_from(model, variables, cache, ids):
     return jnp.moveaxis(steps, 0, 1), cache
 
 
-@jax.jit
-def moved(tree, key: jax.Array, scale: float):
+def moved_apart(tree, key: jax.Array, scale: float):
     """`tree` with each floating leaf moved by `scale` times its own normal draw from `key`, its dtype
     kept, so no zero-initialized layer answers every input alike or takes no gradient; other leaves as
-    they are. One program draws and moves every leaf, compiled once a tree's structure and shapes."""
+    they are. Each leaf drawn and moved on its own, eagerly: a model's tree of thousands of leaves, which as
+    one program compiled for a minute (Gemma 3n's, row 14080)."""
     leaves, structure = jax.tree.flatten(tree)
     keys = jax.random.split(key, len(leaves))
     return jax.tree.unflatten(structure, [
         (leaf + scale * jax.random.normal(each, leaf.shape)).astype(leaf.dtype)
         if jnp.issubdtype(leaf.dtype, jnp.floating) else leaf
         for leaf, each in zip(leaves, keys, strict=True)])
+
+
+moved = jax.jit(moved_apart)
+"""`moved_apart` as one program drawing and moving every leaf, compiled once a tree's structure and shapes."""
 
 
 def encoded_form(quantization, tensors, names):

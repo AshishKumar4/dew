@@ -171,24 +171,19 @@ CUBLAS = {"xla_gpu_enable_triton_gemm": False}
 """XLA's options that make its GEMMs cuBLAS's at any lane flag: its Triton GEMMs off."""
 
 
-def cublas_compiled(fn, inputs, call: str):
+def cublas_compiled(fn, call: str):
     """`fn`, a program whose dots are a library's GEMMs, compiled as cuBLAS runs each (`CUBLAS`): a library
     arm held to cuBLAS's on the same inputs (docs/design/testing.md). On a GPU the executable that runs it is
-    checked (`truths_ahead.library_checked`) to call cuBLAS's `call` and to run no dot of XLA's own, fused
-    or not, so no lane flag or fusion choice gives it another GEMM: `__cublas$lt$matmul`, as XLA calls a
-    GEMM through cuBLASLt on a Hopper (a deviceless sm90 compile's), cuBLASLt's FP8
-    `__cublas$lt$matmul$f8`. Within a store of programs compiled ahead (`store_wire.COMPILED`) that is the
-    prepared executable as its run loads it (`truths_ahead.CompiledTruths._site`), or its run's own compile
-    where none was prepared (`arm_store._library_checked`), never a compile beside it (row 14096); outside
-    one, its program compiled here at `inputs`. On a CPU its dots are XLA's own."""
+    checked (`truths_ahead.library_arm`) to call cuBLAS's `call` and to run no dot of XLA's own, fused or
+    not, so no lane flag or fusion choice gives it another GEMM: `__cublas$lt$matmul`, as XLA calls a GEMM
+    through cuBLASLt on a Hopper (a deviceless sm90 compile's), cuBLASLt's FP8 `__cublas$lt$matmul$f8`.
+    The gate checks it where it runs (`assert_as_exact`): the prepared executable as its run loads it
+    (`truths_ahead.CompiledTruths._site`), else its run's own compile (`arm_store._library_checked`), never
+    a compile beside it (row 14096). On a CPU its dots are XLA's own."""
     from reference_error import without_ynn
-    from store_wire import COMPILED
-    from truths_ahead import library_arm, library_checked
+    from truths_ahead import library_arm
 
-    compiled = library_arm(without_ynn(fn, compiler_options=CUBLAS), call)
-    if jax.default_backend() == "gpu" and COMPILED.get() is None:
-        library_checked(compiled.lower(*inputs).compile(), call, "the library arm")
-    return compiled
+    return library_arm(without_ynn(fn, compiler_options=CUBLAS), call)
 
 
 PRODUCTION = ("qwen3.5-27b-gdn", "kimi-linear-kda")

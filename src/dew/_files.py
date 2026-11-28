@@ -10,6 +10,14 @@ directory, which a cache publishes once. A location with a scheme (`gs://`,
 `s3://`) is written in place: its store makes an object visible whole or not
 at all, and has no rename to stage one with. `stat_identity` is what such a
 cache keys a source file by.
+
+What it guards against (row 14088's ruling): other users sharing a release's
+parent folder. No link is followed, nothing another user owns is given a mode
+or group, a staging is private (0700) until its commit, and a name another
+entry holds is never removed. A process of the publisher's own user is not
+guarded against (it can remove or trace the publisher anyway); no removal or
+commit makes a folder to guard against it, and a group no probe can read is
+the publisher's, never refused.
 """
 
 from __future__ import annotations
@@ -254,17 +262,21 @@ def swapped(directory: Path, foreign: Callable[[Entries, Entries, Path], set[Pat
     # Whether this filesystem gives an entry its folder's group where the folder is not setgid (`grpid`),
     # read before anything is written, as the mode is.
     grpid = _keeps_folder_group(directory.parent)
-    # Where no probe read it, an inode held for the folder the commit may make under the lock to read the
-    # group one takes then (`_granted`, `_made_in`), released just before: a write that takes the
-    # filesystem's last inode leaves the commit its own (train 1443's review).
-    held_inode = None if grpid is not None else _beside(directory.parent / "probe", ".held")
     # Its publication's lock file made or opened now, before anything is written, and locked at the commit.
     lock = _publication_lock(directory)
     staging = _beside(directory, ".staging")
+    # The staging removed on the way out only once this write made it: a name another entry already holds
+    # raises before anything here is removed, which would remove that entry (train 1450's review, F4).
+    made_folders: list[Path] = []
     try:
         os.mkdir(staging, 0o700)
-        if held_inode is not None:
-            held_inode.mkdir(0o700)
+        made_folders.append(staging)
+        # The group the filesystem gave a folder made beside the release, read before anything else changes
+        # it: a folder not setgid given another group than its maker's is `grpid`'s, whatever no probe read
+        # (row 14088: no folder made at the commit).
+        initial = staging.lstat()
+        if grpid is None and not initial.st_mode & stat.S_ISGID and initial.st_gid != os.getegid():
+            grpid = True
         if before is not None:
             # The group and setgid inheritance of the tree it replaces, before anything is written in it.
             if staging.stat().st_gid != before.st_gid:
@@ -287,9 +299,6 @@ def swapped(directory: Path, foreign: Callable[[Entries, Entries, Path], set[Pat
             # The groups and access the published tree takes, bound under the lock to what the destination
             # is now (audit 2026-11-27 P05: a publisher that began before another's commit, or against no
             # tree, chose them from another view), while the staging is still private.
-            if held_inode is not None:
-                held_inode.rmdir()
-                held_inode = None
             mode = _granted(staging, directory, held_at, made, grpid, written, replaces(written, held))
             if held_at is None:
                 staging.chmod(mode)
@@ -302,9 +311,8 @@ def swapped(directory: Path, foreign: Callable[[Entries, Entries, Path], set[Pat
                 # An empty directory is replaced by a rename, which every filesystem makes in one step.
                 os.rename(staging, directory)
     finally:
-        _removed(staging)
-        if held_inode is not None:
-            _removed(held_inode)
+        for folder in made_folders:
+            _removed(folder)
         os.close(lock)
 
 
@@ -334,7 +342,12 @@ def _removed(tree: Path) -> None:
     except OSError as gone:
         log.warning("could not read %s of a save's discarded tree: %s", tree, gone)
         return
-    if (holding := _hold(tree, named, log)) is None:
+    try:
+        holding = _hold(tree, named, log)
+    except OSError as unopened:
+        log.warning("could not read %s of a save's discarded tree: %s", tree, unopened)
+        return
+    if holding is None:
         return
     root, readable = holding
     try:
@@ -385,7 +398,20 @@ def _emptied(root: int, log: logging.Logger) -> None:
             except OSError as left:
                 log.warning("could not remove %s from a save's discarded tree: %s", name, left)
                 continue
-            if (holding := _hold(name, found, log, folder)) is None:
+            try:
+                holding = _hold(name, found, log, folder)
+            except PermissionError as refused:
+                if _PIN is None:
+                    # No descriptor reaches a folder no right reads (a `0000` one) where the system has no
+                    # `O_PATH`: an empty one removed by its name, as the entry it was read as (row 14088).
+                    _rmdir_held(folder, name, found, log)
+                else:
+                    log.warning("could not remove %s from a save's discarded tree: %s", name, refused)
+                continue
+            except OSError as left:
+                log.warning("could not remove %s from a save's discarded tree: %s", name, left)
+                continue
+            if holding is None:
                 continue
             inner, readable = holding
             if not readable:
@@ -415,17 +441,13 @@ def _hold(name: Path | str, found: os.stat_result, log: logging.Logger,
     checked to be the entry `found` its name was read as before anything is read of it, and whether it
     reads (`_removed`, `_emptied`): the folder opened to read, checked against an `O_PATH` descriptor held
     first where the system has one (`_PIN`), which is closed once the read one is checked, or kept where no
-    right opens it to read; else its read descriptor alone. None, logged, where none opens or another entry
-    took the name. While it is open no other folder takes the inode, so a check of a name against it
-    holds; one a folder keeps a walk's descriptors to one a level."""
+    right opens it to read; else its read descriptor alone. None, logged, where another entry took the name;
+    an open refused raised, its caller's to decide. While it is open no other folder takes the inode, so a
+    check of a name against it holds; one a folder keeps a walk's descriptors to one a level."""
     def opened(flags: int) -> int:
         return os.open(name, flags | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=folder)
 
-    try:
-        held = opened(os.O_RDONLY if _PIN is None else _PIN)
-    except OSError as left:
-        log.warning("could not remove %s from a save's discarded tree: %s", name, left)
-        return None
+    held = opened(os.O_RDONLY if _PIN is None else _PIN)
     if not _same(held, found):
         os.close(held)
         log.warning("left %s of a save's discarded tree: another entry took its name", name)
@@ -462,8 +484,9 @@ def _listed(folder: int, log: logging.Logger) -> Iterator[str]:
 
 def _rmdir_held(folder: int, name: str, held: os.stat_result, log: logging.Logger) -> None:
     """The folder `name` of the folder the descriptor `folder` holds removed where it is still the entry
-    `held`, which its caller holds open (`_emptied`), a stat and a removal apart, not one call; a failure
-    logged, not raised."""
+    `held` (`_emptied`): its caller holds it open where a descriptor can, so no other folder takes its inode;
+    a stat and a removal apart, not one call; a failure logged, not raised. The one checked removal of a
+    folder of a discarded tree."""
     try:
         if not os.path.samestat(os.stat(name, dir_fd=folder, follow_symlinks=False), held):
             raise FileExistsError(errno.EEXIST, "another entry took its name while it was removed", name)
@@ -491,7 +514,7 @@ def _granted(staging: Path, directory: Path, held_at: os.stat_result | None, mad
 
     The root takes the group, mode and setgid bit of the tree it replaces (`held_at`), or, new, a folder's
     made there (`made`, its mode under the umask) with the setgid bit and group a folder made there now
-    takes.
+    takes, the publisher's group where no probe read the filesystem's rule (`grpid` None).
     An entry that replaces earlier ones (`replacements`) takes their group, which they share (one they do
     not, or one this process cannot give, refused, as `chown` refuses it, before anything moves), and the
     access every one of them allowed, so a component's private weights in a group of their own stay so
@@ -514,19 +537,11 @@ def _granted(staging: Path, directory: Path, held_at: os.stat_result | None, mad
     egid = os.getegid()
     if held_at is None:
         # The group and setgid bit a folder made in the parent takes now: the parent's where it is setgid or
-        # the filesystem gives its folder's (`grpid`), the publisher's otherwise, the two alike where the
-        # parent is in the publisher's group. Where neither its setgid bit, its group nor a probe of the rule
-        # decides it, read off a folder made there under the lock (`_made_in`), which states the rule too: a
-        # folder not setgid given another group than its maker's is `grpid`'s (theme 74's review: a
-        # publisher of one group in a folder of another's was refused; no inode is spent where it decides).
+        # the filesystem gives its folder's (`grpid`), the publisher's otherwise, the least it gives where no
+        # probe read the rule (row 14088's ruling: no folder made at the commit, no refusal).
         parent = directory.parent.stat()
         setgid = parent.st_mode & stat.S_ISGID
-        if setgid or grpid is not None or parent.st_gid == egid:
-            group = parent.st_gid if setgid or grpid else egid
-        else:
-            fresh = _made_in(directory.parent)
-            group, setgid = fresh.st_gid, stat.S_IMODE(fresh.st_mode) & stat.S_ISGID
-            grpid = bool(not setgid and group != egid) or None
+        group = parent.st_gid if setgid or grpid else egid
         root = (group, (made & ~stat.S_ISGID) | setgid)
     else:
         root = (held_at.st_gid, stat.S_IMODE(held_at.st_mode))
@@ -546,11 +561,7 @@ def _granted(staging: Path, directory: Path, held_at: os.stat_result | None, mad
             # the folder is setgid or the filesystem gives its folder's (`grpid`), the publisher's otherwise,
             # so no folder's group reads a new file its owner did not open to it (trains 1423 and theme 72's
             # reviews); stated, not the one the kernel gave it under the staging's own folders.
-            if not setgid and grpid is None and group != egid:
-                raise PermissionError(f"{entry} is new in a folder of another group than the publisher's, "
-                                      "which this filesystem gives it or not by a rule no probe of this "
-                                      "process reads: publish it as a user of another group, or set the "
-                                      "folder's setgid bit")
+            # Where no probe read the rule, the publisher's: the least it gives (row 14088's ruling).
             group = group if setgid or grpid else egid
             mode = (stat.S_IMODE(path.lstat().st_mode) & ~stat.S_ISGID) | setgid if kind == "folder" else None
         _grouped(path, group)
@@ -578,7 +589,7 @@ def _keeps_folder_group(parent: Path) -> bool | None:
     group (`grpid`, BSD's rule) rather than its maker's: read off a probe folder made there and removed, its
     setgid bit cleared and, where it is in the maker's group, given another group the maker may give (one
     of its own, or any where it is root), and a folder made in it. None where no other group is the
-    maker's to give, whose answer no probe reads (`_granted` refuses only where it decides a group)."""
+    maker's to give, whose answer no probe reads (`_granted` then gives the publisher's group)."""
     egid = os.getegid()
     others = sorted(set(os.getgroups()) - {egid}) or ([egid + 1] if os.geteuid() == 0 else [])
     probe = _beside(parent / "probe", ".group")
@@ -606,22 +617,16 @@ def _keeps_folder_group(parent: Path) -> bool | None:
         _removed(probe)
 
 
-def _made_in(parent: Path) -> os.stat_result:
-    """A folder made in `parent` now, read off one made and removed: the mode it takes under the process's
-    umask, the parent's setgid bit among it, read nowhere else, so no other thread's umask is changed, and
-    the group the filesystem gives it, by whatever rule (`_granted`)."""
+def _made_mode(parent: Path) -> int:
+    """The mode a folder made in `parent` takes under the process's umask, the parent's setgid bit among it:
+    read off one made and removed before anything is written, the umask read nowhere else, so no other
+    thread's is changed."""
     probe = _beside(parent / "probe", ".mode")
     probe.mkdir()
     try:
-        return probe.stat()
+        return stat.S_IMODE(probe.stat().st_mode)
     finally:
         probe.rmdir()
-
-
-def _made_mode(parent: Path) -> int:
-    """The mode a folder made in `parent` takes under the process's umask, the parent's setgid bit among it
-    (`_made_in`)."""
-    return stat.S_IMODE(_made_in(parent).st_mode)
 
 
 def _located(directory: Path) -> Path:
@@ -651,10 +656,14 @@ def _publication_lock(directory: Path) -> int:
     filesystem's last inode leaves its commit the lock (train 1443's review). The lock is keyed by the
     destination's name as given, so publishers of one release name it alike: two spellings a case-folding
     filesystem takes for one entry take two locks."""
-    # Keyed by the name as given: publishers of one release name it alike; two spellings a case-folding
-    # filesystem takes for one entry take two locks (row 13744).
-    name = PUBLISHING_LOCK + hashlib.sha256(os.fsencode(directory.name)).hexdigest()[:16]
-    return _lock_file(directory.parent / name)
+    return _lock_file(_lock_path(directory))
+
+
+def _lock_path(directory: Path) -> Path:
+    """The path of `directory`'s publication lock file (`_publication_lock`): beside it, `PUBLISHING_LOCK`
+    and a digest of its name. Keyed by the name as given: publishers of one release name it alike; two
+    spellings a case-folding filesystem takes for one entry take two locks (row 13744)."""
+    return directory.parent / (PUBLISHING_LOCK + hashlib.sha256(os.fsencode(directory.name)).hexdigest()[:16])
 
 
 @contextlib.contextmanager

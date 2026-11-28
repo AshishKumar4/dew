@@ -35,6 +35,7 @@ import hashlib
 import inspect
 import io
 import json
+import linecache
 import logging
 import os
 import pickle
@@ -48,7 +49,7 @@ from typing import Any
 import jax
 import numpy as np
 from store_wire import COMPILED, SITE_IN_PROGRESS
-from tier_wire import UNPREPARED, PastCap
+from tier_wire import LABELED, UNPREPARED, PastCap
 from tool_support import load
 
 
@@ -171,6 +172,11 @@ class CompiledTruths:
             # Stopped by its cap between draws (`tier_wire.stop_past_cap`): untried, its run prepares it.
             self.tried.difference_update(labels)
             raise
+        except BaseException as error:
+            # The innermost site an error escapes names it (`stopped_in`), whatever outer site it escapes too.
+            if not hasattr(error, SITE_OF_ERROR):
+                setattr(error, SITE_OF_ERROR, labels[0])
+            raise
         self.done.update(labels)
 
     def judged_its_zeros(self, error: BaseException, before: frozenset[str] = frozenset()) -> bool:
@@ -211,13 +217,13 @@ class CompiledTruths:
         stored = json.loads(site.read_text())
         return stored.get("at_run") if stored["stamp"] == self.stamp else None
 
-    def unprepared(self, why: str, record: str = UNPREPARED) -> None:
+    def unprepared(self, why: str, record: str = UNPREPARED, *, site: str) -> None:
         """Records in the store that its test ran a site, or an arm, unprepared (`unprepared`), where in its
-        file this process stands; under `AT_RUN`, that its run compiled it on its GPU as its prepare
-        declared."""
+        file this process stands, and which (`site`: its Check 1 label, an arm's role beside it); under
+        `AT_RUN`, that its run compiled it on its GPU as its prepare declared."""
         test = os.environ.get("PYTEST_CURRENT_TEST", "").rsplit(" (", 1)[0]
         unprepared(self.directory, test, [(frame.filename, frame.lineno) for frame in inspect.stack(0)], why,
-                   record)
+                   record, site=site)
 
     def device(self):
         """A device of the ones the store's programs compute on, whose platform picks a branch its platform
@@ -406,45 +412,69 @@ class CompiledTruths:
             programs = AheadPrograms.load(site / PROGRAMS).loaded()
             held = pickle.loads((site / HELD).read_bytes())
             for name, record in held.items():
-                # A library arm's executable, the one this run loads, held to its library's call (row 14096).
-                if record.get("library_call") is not None and jax.default_backend() == "gpu":
-                    library_checked(programs[name], record["library_call"], f"{label}: {name}")
+                # A library arm's executable, the one this run loads, held to its library's call where it runs
+                # on the platform that makes it (row 14096).
+                if (mark := record.get("library_call")) is not None:
+                    library_checked(programs[name], mark, f"{label}: {name}")
             self.read[label] = (programs, held)
         return self.read[label]
 
 
-_LIBRARY_CALLS: weakref.WeakKeyDictionary[Callable, str] = weakref.WeakKeyDictionary()
-"""Each library arm's call (`library_arm`), by its program."""
+_LIBRARY_CALLS: weakref.WeakKeyDictionary[Callable, tuple[str, str]] = weakref.WeakKeyDictionary()
+"""Each library arm's call and the platform it makes it on (`library_arm`), by its program."""
 
 
-def library_arm[Fn: Callable](fn: Fn, call: str) -> Fn:
+def library_arm[Fn: Callable](fn: Fn, call: str, platform: str = "gpu") -> Fn:
     """`fn`, a library arm's program (`generation_support.cublas_compiled`), marked as one whose executable
-    calls the library's `call`, which the gate checks it by where it runs (`library_checked`)."""
-    _LIBRARY_CALLS[fn] = call
+    calls the library's `call` where it runs on `platform` (a GPU's cuBLAS; elsewhere its dots are XLA's
+    own), which the gate checks it by where it runs there (`library_checked`): a prepared executable as its
+    run loads it (`CompiledTruths._site`), else the run's own compile (`arm_forms._LibraryChecked`)."""
+    _LIBRARY_CALLS[fn] = (call, platform)
     return fn
 
 
-def library_call(fn) -> str | None:
-    """The library call `fn`'s executable makes, where it is a library arm (`library_arm`); None otherwise,
-    a value no weak reference holds (a partial, a builtin) among them, which no arm marks."""
-    return next((call for arm, call in _LIBRARY_CALLS.items() if arm is fn), None)
+def library_call(fn) -> tuple[str, str] | None:
+    """The library call `fn`'s executable makes and the platform it makes it on, where it is a library arm
+    (`library_arm`); None otherwise, a value no weak reference holds (a partial, a builtin) among them, which
+    no arm marks. Read where an arm is prepared, whatever the host, and checked where its executable runs on
+    that platform (`library_checked`)."""
+    return next((marked for arm, marked in _LIBRARY_CALLS.items() if arm is fn), None)
 
 
-def library_checked(executable: jax.stages.Compiled, call: str, label: str) -> None:
-    """`executable`, a library arm's (`generation_support.cublas_compiled`) as it runs, read by its
-    instructions as XLA's own schema reads them (`dew.telemetry.instrumentation.hlo_instructions`): it calls
-    the library's `call` (cuBLASLt's `__cublas$lt$matmul`) and runs no dot of XLA's own, fused or not, so no
-    lane flag or fusion choice gives it another GEMM; refused otherwise, naming what it calls. Checked on
-    the executable that runs, a prepared one as its run loads it (`CompiledTruths._site`), never on a
-    compile of its own beside it (row 14096)."""
+class NotTheLibrary(AssertionError):
+    """A library arm's executable that makes no call of its library's, or runs a dot of XLA's own
+    (`library_checked`)."""
+
+
+def library_checked(executable: jax.stages.Compiled, mark: tuple[str, str], label: str) -> None:
+    """`executable`, a library arm's (`library_arm`'s `mark`, its call and the platform that makes it) as it
+    runs, read by its instructions as XLA's own schema reads them
+    (`dew.telemetry.instrumentation.hlo_instructions`) where it runs on that platform (its placements'
+    devices', not the process's default: a GPU host's CPU-placed call runs on its CPU): it calls the
+    library's call (cuBLASLt's `__cublas$lt$matmul`) and runs no dot of XLA's own, fused or not, so no lane
+    flag or fusion choice gives it another GEMM; refused otherwise, naming what it calls. Checked on the
+    executable that runs, a prepared one as its run loads it (`CompiledTruths._site`) or the run's own
+    (`arm_forms._LibraryChecked`), never on a compile of its own beside it (row 14096)."""
     from dew.telemetry.instrumentation import hlo_instructions
 
+    call, platform = mark
+    if _platform(executable) != platform:
+        return
     instructions = hlo_instructions(executable).values()
     targets = {each.target for each in instructions} - {""}
     if call not in targets:
-        raise AssertionError(f"{label}: the library arm calls {sorted(targets)}, no {call}")
+        raise NotTheLibrary(f"{label}: the library arm calls {sorted(targets)}, no {call}")
     if any(each.op == "dot" or "dot" in each.fused for each in instructions):
-        raise AssertionError(f"{label}: the library arm runs a dot of XLA's own")
+        raise NotTheLibrary(f"{label}: the library arm runs a dot of XLA's own")
+
+
+def _platform(executable: jax.stages.Compiled) -> str:
+    """The platform `executable` runs on (`telemetry.compiles.executable_platform`), 'gpu' for CUDA's and
+    ROCm's, as a library arm's mark names it."""
+    from dew.telemetry.compiles import executable_platform
+
+    platform = executable_platform(executable)
+    return "gpu" if platform in ("cuda", "rocm") else platform
 
 
 def compiled_memory(directory: Path, *, arms: bool = False) -> list[dict[str, int | str]]:
@@ -573,7 +603,7 @@ def reading() -> tuple[CompiledTruths, str] | None:
     if store is None or store.prepare or label is None:
         return None
     if not store.holds(label):
-        store.unprepared(f"{label}: its prepare did not reach this site")
+        store.unprepared(f"{label}: its prepare did not reach this site", site=label)
         return None
     return store, label
 
@@ -606,32 +636,53 @@ def running() -> tuple[CompiledTruths, str] | None:
     GPU, their float64 on its FP64 units, as a site outside a part does, named (`AT_RUN`)."""
     ran = reading()
     if ran is not None and (why := ran[0].at_run(ran[1])) is not None:
-        ran[0].unprepared(f"{ran[1]}: its truths: {why}", AT_RUN)
+        ran[0].unprepared(f"{ran[1]}: its truths: {why}", AT_RUN, site=ran[1])
         return None
     return ran
 
 
+SITE_OF_ERROR = "_dew_check1_site"
+"""The attribute an error escaping a site's prepare carries its label in (`CompiledTruths.preparing`, the
+innermost site's), which the suite's failure recorder names it by (tests/conftest.py's
+`recorded_unprepared`): no site an earlier failure, caught, left unfinished."""
+
+
+def stopped_in(error: BaseException) -> str | None:
+    """The Check 1 site `error` escaped (`SITE_OF_ERROR`), None where it escaped none."""
+    return getattr(error, SITE_OF_ERROR, None)
+
+
 def unprepared(directory: Path, test: str, frames: Sequence[tuple[str, int]], why: str,
-               record: str = UNPREPARED, cell: str | None = None) -> None:
+               record: str = UNPREPARED, cell: str | None = None, *, site: str | None = None) -> None:
     """The writer of a test's record that it ran unprepared (`UNPREPARED`, in its store `directory`),
     compiling a site or an arm on its devices with every site judged: its node id and each reason it gives,
     where (`frames`, innermost first, `(file, line)`: the first of the test's own file, else the test's file)
-    and why (`reasoned`). Under `tier_wire.DEFERRED`, a GPU flow's cell its prepare deferred to its run
-    (`gpu_flow.run_cells`), which its run's store still serves, and which the run names unprepared
-    (tests/conftest.py's `compiled_ahead`); `cell` its label, so the flow's cells deferred at one line are
-    each their own."""
+    and why (`reasoned`), and which site it is (`site`: its Check 1 label, an arm's role beside it, with the
+    source text of that line beside, else that text alone), which an edit above it does not move as it moves
+    its line, nor share with another site of one opening line (prepares.py's `knowing`). Under
+    `tier_wire.DEFERRED`, a GPU flow's cell its prepare deferred to its run (`gpu_flow.run_cells`), which its
+    run's store still serves, and which the run names unprepared (tests/conftest.py's `compiled_ahead`);
+    `cell` its label, so the flow's cells deferred at one line are each their own."""
     # The test's file as CI's grading reads a node id (`tools/armada/grading.py`'s `owning`).
     path = Path(load("grading", "tools/armada").owning(test))
-    lines = [line for file, line in frames if Path(file).name == path.name]
-    reasoned(directory / record, test, f"{path}:{lines[0]}" if lines else str(path), why, cell)
+    lines = [(file, line) for file, line in frames if Path(file).name == path.name]
+    # A label's identity says so (`tier_wire.LABELED`), its line's text beside it; a line's text alone, the
+    # fallback outside any site, as records before labels were kept (prepares.py's `knowing`).
+    text = linecache.getline(lines[0][0], lines[0][1]).strip() if lines else ""
+    # A label's identity holds its line's text beside it, which a record before labels were kept compares by.
+    site = f"{LABELED}{site}\n{text}" if site else text
+    reasoned(directory / record, test, f"{path}:{lines[0][1]}" if lines else str(path), why, cell,
+             site=site or None)
 
 
-def reasoned(record: Path, test: str, where: str, why: str, cell: str | None = None) -> None:
+def reasoned(record: Path, test: str, where: str, why: str, cell: str | None = None,
+             site: str | None = None) -> None:
     """Into a test's `record` (`UNPREPARED`, `tier_wire.DEFERRED`), a reason it ran unprepared, `where` and
     `why`, each reason once in the order given, its first's its record's own `where` and `error` (a
     prepare's, before its run's): a test with three unprepared arms names three (Main); `cell` a flow's cell's
-    label, where the reason is one."""
-    reason = {"where": where, "error": why, **({"cell": cell} if cell else {})}
+    label, where the reason is one; `site` the source text of the line `where` names (`unprepared`)."""
+    reason = {"where": where, "error": why, **({"cell": cell} if cell else {}),
+              **({"site": site} if site else {})}
     if record.exists():
         held = json.loads(record.read_text())
         if reason not in held["reasons"]:

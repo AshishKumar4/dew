@@ -57,18 +57,30 @@ DECLARING = ("dew.algebra.acceptance", "dew.algebra.attention_cases", "dew.algeb
 """Modules that declare generated functions, imported before generation reads `DECLARATIONS`."""
 
 
+type Draw = Callable[[int, tuple[jax.ShapeDtypeStruct, ...]], tuple]
+"""A case's operands by seed (`Cases.draw`)."""
+
+
 @dataclasses.dataclass(frozen=True)
 class Cases:
     """Where a declaration is generated and checked: each case's operands, by shape and dtype; the draw of a
-    case's operands by seed (`draw(seed, operands)`: the gate's drawn and adversarial families, the
-    declaration's own); the seeds its check 1 judges over; the policies it is generated for (`POLICIES`);
-    and the targets it is priced for (`dew.algebra.cost.target`'s names)."""
+    case's operands by seed (`draw(seed, operands)`, the declaration's own domain), and its adversarial
+    families (`families`, by name: the gate's cancellation, wide ranges, near-equal operands and one-key rows
+    as the declaration's domain holds them), each judged on its own (`judged`); the seeds its check 1 judges
+    over; the policies it is generated for (`POLICIES`); and the targets it is priced for
+    (`dew.algebra.cost.target`'s names)."""
 
     operands: tuple[tuple[jax.ShapeDtypeStruct, ...], ...]
-    draw: Callable[[int, tuple[jax.ShapeDtypeStruct, ...]], tuple]
+    draw: Draw
     seeds: int
     policies: tuple[str, ...] = POLICIES
     targets: tuple[str, ...] = ("sm90",)
+    families: Mapping[str, Draw] = dataclasses.field(default_factory=dict)
+
+    def judged(self) -> tuple[tuple[str, Draw], ...]:
+        """Each draw a candidate is judged on, labelled: the declaration's own first, then each adversarial
+        family (each judged whatever its label, none in place of another)."""
+        return (("drawn", self.draw), *self.families.items())
 
 
 @dataclasses.dataclass(frozen=True)
@@ -326,9 +338,10 @@ def _free(qualified: str, form, registry: dict[str, StableForm | ComponentForm] 
 def admits(function: Callable, operands: tuple[jax.ShapeDtypeStruct, ...], cases: Cases,
            label: str) -> Callable[[Callable, Callable], bool]:
     """The gate a candidate is admitted by (`error.choose`'s `admits`): whether it is as exact as a
-    reference from `function`'s float64 truth over the cases' draws of `operands` (check 1,
-    `dew.parity.judge`: a site over or left unresolved admits none), each compiled through Dew's compile
-    point with the pass off (`options.owned_program`, `algebra.passes`)."""
+    reference from `function`'s float64 truth over each of the cases' draws of `operands` (`Cases.judged`:
+    the declaration's own and each adversarial family, judged apart; check 1, `dew.parity.judge`: a site
+    over or left unresolved admits none), each compiled through Dew's compile point with the pass off
+    (`options.owned_program`, `algebra.passes`)."""
     from dew import algebra
     from dew.nn.kernels import options
 
@@ -338,16 +351,21 @@ def admits(function: Callable, operands: tuple[jax.ShapeDtypeStruct, ...], cases
         ours, theirs = options.owned_program(candidate), options.owned_program(reference)
 
         # Each form computed as it is: the pass off, as the gate holds it for a reference and the truth.
-        def draw(seed: int):
-            values = cases.draw(seed, operands)
-            with algebra.passes(on=False):
-                mine, other = ours(*values), theirs(*values)
-                with jax.enable_x64(new_val=True):
-                    true = truth(*map(_widened, values))
-            return mine, other, true
+        def judged(drawn: Draw) -> Callable[[int], tuple]:
+            def draw(seed: int):
+                values = drawn(seed, operands)
+                with algebra.passes(on=False):
+                    mine, other = ours(*values), theirs(*values)
+                    with jax.enable_x64(new_val=True):
+                        true = truth(*map(_widened, values))
+                return mine, other, true
+            return draw
 
+        # On each family apart, as the gate judges a rule's (`rules.Drawn.adversarial`): one family's
+        # errors are no other's population.
         try:
-            parity.judge(draw, cases.seeds, label)
+            for family, drawn in cases.judged():
+                parity.judge(judged(drawn), cases.seeds, f"{label}, {family}")
         except parity.GateFailure:
             return False
         return True

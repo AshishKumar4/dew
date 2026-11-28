@@ -567,7 +567,8 @@ def family(generation: str) -> str | None:
 
 @dataclasses.dataclass(frozen=True)
 class Measured:
-    """One part's facts as its kernels meet them, measured (tools/device_facts.py): its device-memory read
+    """One part's memory-system facts as its kernels meet them, measured (tools/device_facts.py), each the
+    part's own (`GpuTarget.measured`: two parts of one die differ in memory and power): its device-memory read
     against its bytes, cold (one kernel streaming N bytes after the L2 is evicted, the least-squares line over
     1 MiB to 1 GiB), `fixed` seconds before the stream (launch and first byte) and `bytes_per_second` after,
     the plateau a long transfer reaches, below what the memory clock and bus give; `launch`, the seconds a
@@ -582,13 +583,46 @@ class Measured:
     launch: float | None = None
     handoff: float | None = None
     loaded_clock: float | None = None
-    product: tuple[float, float] | None = None
-    """A tile walk's step's latencies (`templates.cost.Chain`, `chained`): a warpgroup product waited on, its
-    fixed seconds and its seconds a column (a 64 x N product of 16-bit operands 64 deep); `barrier`, two
-    warpgroups' round trip through a block's barriers; `copy`, a tile copy into shared memory waited on, read
-    from device memory, its fixed seconds and its seconds a byte. None where not measured."""
-    barrier: float | None = None
+    l2_bytes_per_second: float | None = None
+    """The L2's read plateau: bytes a second a read of an array the L2 holds streams at
+    (tools/device_facts.py's warm reads past a launch's floor), the rate a tile's repeated reads meet
+    (`templates.cost.Work.l2_bytes`, rows 12699, 14180). None where not measured."""
     copy: tuple[float, float] | None = None
+    """A tile copy into shared memory waited on, read from device memory past an L2 eviction (a tile walk's
+    step's, `templates.cost.Chain`, `chained`): its fixed seconds and its seconds a byte. None where not
+    measured."""
+
+
+@dataclasses.dataclass(frozen=True)
+class Clocked:
+    """A die's step latencies at its clock, measured, which every part of that die at that clock shares
+    (`GpuTarget.clocked`: an A100-SXM4's 40 GB and 80 GB parts, one GA100 at one 1410 MHz boost; never a part
+    of another clock or power limit, a Workstation RTX PRO 6000's beside a Server Edition's). None where not
+    measured."""
+
+    step: float | None = None
+    """The least one step of a form's dependent chain costs on XLA's path (the work-span model's step,
+    `templates.cost.Work.span`), each step reading the last: the slope over its iterations of a loop XLA
+    lowers, measured per device (FS-STEP-SECONDS1's script). A span counts dependent steps, a chunk's
+    forward-substitution row (64 rows of 128 values) two of them on every device, its contraction and its set
+    (`dew.algebra.linear_scan`'s `Chunk.substituted`). What bounds a step is the device's: on a GPU each
+    iteration's launch, a one-element loop's launch and predicate; on a TPU, whose iterations launch nothing
+    (a one-element loop's slope zero within 1e-9 s), its body, half the substitution row's slope, a step of
+    two vector operations: a form whose iteration body is longer is priced approximately there until measured
+    as its own. None where none was measured, so a form's span there is priced by no time."""
+    kernel_step: float | None = None
+    """One dependent step's latency within a kernel: a tile's 128-lane reduction broadcast into the next
+    step's operand, in one program, each reading the last (a template walk's span, `templates.cost.walked`),
+    measured as the slope over 1,024 to 16,384 steps (FS-STEP-SECONDS1's kernel path)."""
+    product: tuple[float, float] | None = None
+    """A tile walk's warpgroup product waited on (`templates.cost.Chain`, `chained`): its fixed seconds and
+    its seconds a column (a 64 x N product of 16-bit operands 64 deep)."""
+    barrier: float | None = None
+    """Two warpgroups' round trip through a block's barriers (`templates.cost.chained`)."""
+
+
+UNCLOCKED = Clocked()
+"""A die no one measured at its clock: every latency None."""
 
 
 class Frozen(Mapping):
@@ -688,6 +722,7 @@ class GpuTarget:
     contraction's) holds its re-read footprint against: the datasheet's, where NVIDIA's tuning guide states
     it, else unknown; a real device's own (`runtime_facts`)."""
     measured: Mapping[str, Measured] = dataclasses.field(default_factory=dict, hash=False)
+    clocked: Mapping[str, Clocked] = dataclasses.field(default_factory=dict, hash=False)
     int8_triton_gemm: bool = False
     """Whether XLA's Triton GEMM fusion computes int8 dots right on this GPU: on none measured, an
     A100 and an RTX PRO 6000 Blackwell, at jaxlib 0.11.2 (openxla/xla#51016;
@@ -696,21 +731,6 @@ class GpuTarget:
     """Whether a training step keeps XLA's Triton GEMM fusions on this GPU (`dew.training.memory`): off
     where a step measured cuBLAS's GEMMs faster with them off, an A100's (26a01bc18), an L4's
     (71966bcea) and an H100's (0fb7f065e), unless a module the step runs keeps them (`TritonGemm`)."""
-    step_seconds: float | None = None
-    """The least one step of a form's dependent chain costs on XLA's path (the work-span model's step,
-    `templates.cost.Work.span`), each step reading the last: the slope over its iterations of a loop XLA
-    lowers, measured per device (FS-STEP-SECONDS1's script). A span counts dependent steps, a chunk's
-    forward-substitution row (64 rows of 128 values) two of them on every device, its contraction and its set
-    (`dew.algebra.linear_scan`'s `Chunk.substituted`). What bounds a step is the device's: on a GPU each
-    iteration's launch, a one-element loop's launch and predicate; on a TPU, whose iterations launch nothing
-    (a one-element loop's slope zero within 1e-9 s), its body, half the substitution row's slope, a step of
-    two vector operations: a form whose iteration body is longer is priced approximately there until measured
-    as its own. None where none was measured, so a form's span there is priced by no time."""
-    kernel_step_seconds: float | None = None
-    """One dependent step's latency within a kernel: a tile's 128-lane reduction broadcast into the next
-    step's operand, in one program, each reading the last (a template walk's span, `templates.cost.walked`),
-    measured per device as the slope over 1,024 to 16,384 steps (FS-STEP-SECONDS1's kernel path); None
-    where none was."""
     vmem_rate: float | None = None
     """A TPU's VMEM bytes a second, read and written by its vector unit: what XLA's path moves between its
     vector registers and VMEM costs (`templates.cost.Work.kept_bytes`, `templates.cost.rates`), measured as a
@@ -727,12 +747,17 @@ class GpuTarget:
     together (an H100's "PCIe Gen5: 128 GB/s" is 64e9 here, a GH200's 900 GB/s C2C 450e9). What a step that
     streams its parameters from the host moves them over (`dew.training.memory.streamed_seconds`); a part
     this states none of streams nothing priced (`host_link_rate`)."""
+    clocks: Clocked = dataclasses.field(init=False, repr=False, compare=False, hash=False, default=UNCLOCKED)
+    """The step latencies of this device's die at its clock (`clocked`, under the longest device-kind prefix
+    it starts with), resolved as the target is made, a price reading them on every walk; `UNCLOCKED` where
+    none was measured."""
 
     def __post_init__(self) -> None:
         # Its mappings its own and unchangeable, nested ones too (`Frozen`): a launch's cache holds a target
         # whole as its key does (`tuning.holdable`, which refuses what may change after it is held).
-        for name in ("dense_peaks", "measured", "host_links"):
+        for name in ("dense_peaks", "measured", "clocked", "host_links"):
             object.__setattr__(self, name, _frozen(getattr(self, name)))
+        object.__setattr__(self, "clocks", self._part(self.clocked) or UNCLOCKED)
 
     @property
     def architecture(self) -> Architecture:
@@ -850,16 +875,31 @@ class GpuTarget:
         return stated if measured is None else measured
 
     @property
+    def step_seconds(self) -> float | None:
+        """A dependent step's least cost on XLA's path on this die at its clock (`Clocked.step`)."""
+        return self.clocks.step
+
+    @property
+    def kernel_step_seconds(self) -> float | None:
+        """A dependent step's latency within a kernel on this die at its clock (`Clocked.kernel_step`)."""
+        return self.clocks.kernel_step
+
+    @property
     def product_latency(self) -> tuple[float, float] | None:
-        """A waited warpgroup product's fixed seconds and seconds a column on the part (`Measured.product`);
-        None where unmeasured."""
-        return None if self.part is None else self.part.product
+        """A waited warpgroup product's fixed seconds and seconds a column on this die at its clock
+        (`Clocked.product`); None where unmeasured."""
+        return self.clocks.product
 
     @property
     def barrier_seconds(self) -> float | None:
-        """Two warpgroups' round trip through a block's barriers on the part (`Measured.barrier`); None where
-        unmeasured."""
-        return None if self.part is None else self.part.barrier
+        """Two warpgroups' round trip through a block's barriers on this die at its clock
+        (`Clocked.barrier`); None where unmeasured."""
+        return self.clocks.barrier
+
+    @property
+    def l2_rate(self) -> float | None:
+        """The L2's read plateau on the part (`Measured.l2_bytes_per_second`); None where unmeasured."""
+        return None if self.part is None else self.part.l2_bytes_per_second
 
     @property
     def copy_latency(self) -> tuple[float, float] | None:
@@ -962,18 +1002,18 @@ TARGETS = {target.generation: target for target in (
               memory=16 * 10 ** 9,
               # PCIe Gen3 x16, the T4 datasheet's 32 GB/s both ways.
               host_links={'Tesla T4': 16e9, 'NVIDIA Tesla T4': 16e9}),
-    # A dependent step on XLA's path: an A100-SXM4-40GB's loop iteration, 5.96 us (FS-STEP-SECONDS1-a100,
-    # its one-element loop's slope over 64 to 1024 iterations, 0.4% from the line).
     GpuTarget('sm80', 'NVIDIA A100-SXM4-80GB', 163 * 1024,
               {'NVIDIA A100': {'bf16': 312e12}}, ('gpu:a100', 'a100'), multiprocessors=108, clock_hz=1410e6,
               # The A100 40 GB's, the least an A100 holds and streams: 1215 MHz HBM2 over 5120 bits, 1555
               # GB/s (the 80 GB part's 2039 priced the fleet's 40 GB A100s 1.31x too fast; their clocks.json).
-              memory_bandwidth=1555e9, memory=40 * 10 ** 9, triton_gemm_fusions=False, step_seconds=5.96e-6,
+              memory_bandwidth=1555e9, memory=40 * 10 ** 9, triton_gemm_fusions=False,
               # The Ampere Tuning Guide's "Increased L2 Capacity": A100's 40 MB.
               l2_bytes=40 * 2 ** 20,
-              # In-kernel: a dependent lane reduction's 225.3 ns (FS-STEP-SECONDS1-a100, its two rounds 225.32
-              # and 225.25).
-              kernel_step_seconds=225.3e-9,
+              # An A100-SXM4-40GB's steps, its 80 GB part's alike (one GA100 at one 1410 MHz boost): on
+              # XLA's path a loop iteration, 5.96 us (FS-STEP-SECONDS1-a100, its one-element loop's slope over
+              # 64 to 1024 iterations, 0.4% from the line); in-kernel a dependent lane reduction's 225.3 ns
+              # (its two rounds 225.32 and 225.25).
+              clocked={'NVIDIA A100-SXM4': Clocked(step=5.96e-6, kernel_step=225.3e-9)},
               # tools/device_facts.py on an A100-SXM4-40GB: its stream FS-DEVICEFACTS2-a100's (1.555 TB/s by
               # its clocks), its launch FS-DEVICEFACTS4-a100's.
               measured={'NVIDIA A100-SXM4-40GB': Measured(6.04e-6, 1.486e12, launch=2.11e-6)},
@@ -1001,10 +1041,7 @@ TARGETS = {target.generation: target for target in (
         'NVIDIA H200': {'bf16': 989e12, 'fp8': 1979e12},
         'NVIDIA H200 NVL': {'bf16': 835e12, 'fp8': 1670.5e12},
         'NVIDIA GH200': {'bf16': 989e12, 'fp8': 1979e12}}, multiprocessors=132,
-              # A loop iteration on XLA's path, 4.93 us (FS-STEP-SECONDS1-h100's second round, 0.3% from the
-              # line; its first's 4.80 us lay 17% from it).
               clock_hz=1830e6, memory_bandwidth=3350e9, memory=80 * 10 ** 9, triton_gemm_fusions=False,
-              step_seconds=4.93e-6,
               # The Hopper Tuning Guide's "Increased L2 Capacity": H100's 50 MB.
               l2_bytes=50 * 2 ** 20,
               # A step whose head takes its gradient in the backward a tile at a time, unfused, compiled for
@@ -1014,9 +1051,19 @@ TARGETS = {target.generation: target for target in (
               # 10.8 and 8.5, each layer's weight gradient run in its backward, and the 0.8B's 8.6 for an
               # RTX PRO 6000 (row 3341's calibration, compile-only; an L4's attention kernel compiles
               # for none).
-              # In-kernel: a dependent lane reduction's 142.7 ns on an H100 80GB HBM3 (FS-STEP-SECONDS1-h100,
-              # its two rounds 142.72 and 142.61).
-              kernel_step_seconds=142.7e-9,
+              # An H100 80GB HBM3's steps: on XLA's path a loop iteration, 4.93 us (FS-STEP-SECONDS1-h100's
+              # second round, 0.3% from the line; its first's 4.80 us lay 17% from it); in-kernel a dependent
+              # lane reduction's 142.7 ns (its two rounds 142.72 and 142.61). A GH200's, its own power
+              # limit's: on XLA's path a one-element loop's iteration, 3.00 us (M-FS-114-gh200's second
+              # round, 1.2% from the line; its first's 3.07 us 1.7%), in-kernel a dependent lane
+              # reduction's 153.7 ns (its two rounds 153.69 and 153.75), its graphics clock locked at 1.98
+              # GHz, its SM clock sampled at 1.83 before and after the rounds; its products 20.6 ns and
+              # 1.156 ns a column over N 64 to 256 and a barrier round trip 85.0 ns, its clock locked at
+              # 1.98 GHz (1.83 GHz at its end; FS-4123-LATENCIES2-gh200, M-FS-19, two rounds within 0.5%;
+              # its first rounds, unlocked: products 12.9 ns and 1.194 ns a column, a barrier 80.1 ns).
+              clocked={'NVIDIA H100 80GB HBM3': Clocked(step=4.93e-6, kernel_step=142.7e-9),
+                       'NVIDIA GH200 480GB': Clocked(step=3.00e-6, kernel_step=153.7e-9,
+                                                     product=(20.6e-9, 1.156e-9), barrier=85.0e-9)},
               # tools/device_facts.py on an H100 SXM and a GH200: their streams FS-DEVICEFACTS2-h100's and
               # -gh200's, their launches and hand-offs FS-DEVICEFACTS4's; the H200's stream the same line
               # through the kernel challenge's best read at each size, 16.8 MB to 805 MB, cold L2 under graph
@@ -1029,15 +1076,11 @@ TARGETS = {target.generation: target for target in (
                         # time-weighted mean of sm__cycles_elapsed.avg.per_second over 18 GEMM launches under
                         # ncu (1.476 to 1.522; the template's, cuBLASLt's and a pair's alike; M-EM-36-gh200),
                         # against its 1.98 GHz clock locked.
-                        # A step's latencies, the slope of a chain of 256 to 4,096 waited steps, its clock
-                        # locked at 1.98 GHz (1.83 GHz at its end; FS-4123-LATENCIES2-gh200, M-FS-19, two
-                        # rounds within 0.5%): products 20.6 ns and 1.156 ns a column over N 64 to 256; a
-                        # barrier round trip 85.0 ns; a tile copied from device memory past an L2 eviction
-                        # 464.5 ns and 5.17 ps a byte over 4 to 64 KiB (from L2, 203.1 ns and 5.06 ps). Its
-                        # first rounds, unlocked: products 12.9 ns and 1.194 ns a column, a barrier 80.1 ns.
+                        # A tile copied from device memory past an L2 eviction, waited on: 464.5 ns and
+                        # 5.17 ps a byte over 4 to 64 KiB (from L2, 203.1 ns and 5.06 ps;
+                        # FS-4123-LATENCIES2-gh200).
                         'NVIDIA GH200 480GB': Measured(2.51e-6, 3.812e12, launch=0.86e-6, handoff=0.71e-6,
-                                                       loaded_clock=1.496e9, product=(20.6e-9, 1.156e-9),
-                                                       barrier=85.0e-9, copy=(464.5e-9, 5.17e-12)),
+                                                       loaded_clock=1.496e9, copy=(464.5e-9, 5.17e-12)),
                         'NVIDIA H200': Measured(2.81e-6, 4.617e12)},
               # PCIe Gen5 x16 (the H100 and H200 datasheets' 128 GB/s both ways, SXM, PCIe and NVL alike);
               # the GH200's NVLink-C2C to its Grace (the GH200 datasheet's 900 GB/s both ways).
@@ -1053,11 +1096,10 @@ TARGETS = {target.generation: target for target in (
               clock_hz=1965e6, memory_bandwidth=8e12, memory=180 * 10 ** 9,
               # A B200's L2 as its driver states it (cudaDevAttrL2CacheSize, 126.5 MiB).
               l2_bytes=132_644_864,
-              # A loop iteration on XLA's path, 5.41 us (a one-element loop's slope over 64 to 1024
-              # iterations, its second round 1.1% from the line; its first's 5.30 us 1.3%).
-              step_seconds=5.41e-6,
-              # In-kernel: a dependent lane reduction's 144.0 ns (its two rounds 144.05 and 144.04).
-              kernel_step_seconds=144.0e-9,
+              # A B200's steps: on XLA's path a loop iteration, 5.41 us (a one-element loop's slope over 64
+              # to 1024 iterations, its second round 1.1% from the line; its first's 5.30 us 1.3%); in-kernel
+              # a dependent lane reduction's 144.0 ns (its two rounds 144.05 and 144.04).
+              clocked={'NVIDIA B200': Clocked(step=5.41e-6, kernel_step=144.0e-9)},
               # tools/device_facts.py on a B200: its stream's line over 1 MiB to
               # 1 GiB, 6.43 TB/s read at 1 GiB, as HS-CAL-b200's dram read of its 1.07 GB (6.40); its
               # launch HS-CAL-b200's, a kernel after another with no programmatic dependent launch (1.20 us);
@@ -1090,9 +1132,24 @@ TARGETS = {target.generation: target for target in (
               aliases=('gpu:g4', 'g4'), multiprocessors=188, clock_hz=2617e6, memory_bandwidth=1597e9,
               # Its 96 GB of GDDR7 (the Server Edition's datasheet).
               memory=96 * 10 ** 9,
-              # In-kernel: a dependent lane reduction's 137.7 ns (FS-STEP-SECONDS1-g4, its two rounds 137.68
-              # and 137.66).
-              step_seconds=3.68e-6, kernel_step_seconds=137.7e-9,
+              # The Server Edition's steps, its clock unlocked at 2.27 to 2.28 GHz, a Workstation part's
+              # clock and power its own: on XLA's path a loop iteration, 3.68 us; in-kernel a dependent lane
+              # reduction's 137.7 ns (FS-STEP-SECONDS1-g4, its two rounds 137.68 and 137.66); the slope of a
+              # chain of 256 to 4,096 waited steps (M-NG-69Lb-g4, tools' latencies chains at main a10579a293):
+              # mma.sync products (64 x 64 by 64 x N, each onto the last's register accumulator) 38.1 ns and
+              # 3.607 ns a column over N 64 to 256, a warpgroup barrier round trip 140.0 ns, every fit within
+              # 2.5%.
+              clocked={'NVIDIA RTX PRO 6000 Blackwell Server Edition': Clocked(
+                  step=3.68e-6, kernel_step=137.7e-9, product=(38.08e-9, 3.607e-9), barrier=140.0e-9)},
+              # Its memory's: tools/device_facts.py's read stream past an L2 eviction, 2.877 us and 1.535 TB/s
+              # over 1 MiB to 1 GiB, its L2's warm read 6.74 TB/s over 4 to 64 MiB (6.737 and 6.751, each
+              # within 2.5% of its line), its launch 1.19 us and its hand-off 0.50 us (M-FS-113-g4, two rounds
+              # within 0.2%; its copy fit, L2-resident below 128 MiB, is none); a tile copied by TMA from
+              # device memory past an L2 eviction, waited on, 476.5 ns and 12.90 ps a byte over 4 to 64 KiB
+              # (from L2, 199.5 ns and 13.71 ps; M-NG-69Lb-g4).
+              measured={'NVIDIA RTX PRO 6000 Blackwell Server Edition': Measured(
+                  2.877e-6, 1.535e12, launch=1.19e-6, handoff=0.50e-6, l2_bytes_per_second=6.74e12,
+                  copy=(476.5e-9, 12.90e-12))},
               # PCIe Gen5 x16 (the Server Edition's datasheet, 128 GB/s both ways).
               host_links={'NVIDIA RTX PRO 6000 Blackwell': 64e9}),
     # A TPU's host link is stated where a primary source states it: v6e's alone (below); the others stream
@@ -1109,10 +1166,9 @@ TARGETS = {target.generation: target for target in (
               # A step of a form's chain on XLA's path, 0.89 us: half the substitution row's slope over 64 to
               # 1024 iterations, a row two steps (FS-STEP-SECONDS1's script on a Colab v5e, colab7062's
               # steps-v5e1, its two rounds 1.772 and 1.770 us a row, 1.8% from the line); its one-element
-              # loop's slopes +-1e-9 s, zero.
-              step_seconds=1.77e-6 / 2,
-              # In-kernel: a dependent lane reduction's 133.8 ns (its two rounds 133.78 and 133.70).
-              kernel_step_seconds=133.8e-9,
+              # loop's slopes +-1e-9 s, zero. In-kernel: a dependent lane reduction's 133.8 ns (its two rounds
+              # 133.78 and 133.70).
+              clocked={'TPU v5 lite': Clocked(step=1.77e-6 / 2, kernel_step=133.8e-9)},
               # 0.65 us an iteration of 4 MiB (`vmem_rate`).
               vmem_rate=6.5e12),
     # A chip a device (its megacore), 459 TF of bf16 and 2765 GB/s of HBM (cloud.google.com/tpu/docs/v5p); the
@@ -1128,10 +1184,9 @@ TARGETS = {target.generation: target for target in (
               clock_hz=918e12 / 524288, memory_bandwidth=1638e9, host_links={'TPU v6 lite': 32e9},
               # A step of a form's chain on XLA's path, 1.23 us: half the substitution row's slope, a row two
               # steps (colab7062's steps-v6e1, its two rounds 2.452 and 2.445 us a row); its one-element
-              # loop's slopes 6e-9 and 2e-10 s.
-              step_seconds=2.45e-6 / 2,
-              # In-kernel: a dependent lane reduction's 141.1 ns (its two rounds 141.12 and 141.07).
-              kernel_step_seconds=141.1e-9,
+              # loop's slopes 6e-9 and 2e-10 s. In-kernel: a dependent lane reduction's 141.1 ns (its two
+              # rounds 141.12 and 141.07).
+              clocked={'TPU v6 lite': Clocked(step=2.45e-6 / 2, kernel_step=141.1e-9)},
               # 0.28 us an iteration of 4 MiB (`vmem_rate`).
               vmem_rate=1.5e13, compile_topology='v6e:2x2'),
     # A TensorCore a device, half a chip's 2307 TF of bf16, 4614 TF of fp8 and 7380 GB/s of HBM
@@ -1743,9 +1798,13 @@ def _held_still(forward: Callable, portable: Callable, kind: TangentKind) -> Cal
     return run
 
 
-def _symbolic_tangent(portable: Callable, operands, tangents, output):
-    """`portable`'s tangent at `operands` along `tangents`, a tree like them whose symbolic zeros
-    (`SymbolicZero`) hold their operands still (`_perturbed_tangent`)."""
+def symbolic_tangent(portable: Callable, operands, tangents, output):
+    """`portable(*operands)`'s tangent along `tangents`, for a custom JVP rule declared with symbolic zeros:
+    `operands` a tree (a call's arguments, None leaves dropped as JAX flattens them) and `tangents` a tree
+    like it whose `SymbolicZero` leaves hold their operands still, the moving operands alone perturbed, so a
+    held one's zero direction never meets an infinite factor (`_perturbed_tangent`); with none moving,
+    `output`'s symbolic zero (`zero_from_primal`). A kernel's portable tangent (`linear_tangent`) and a
+    group's exact sum's (`dew.algebra.scan._portable_pair_jvp`) alike."""
     import jax
     from jax.custom_derivatives import SymbolicZero
 
@@ -1757,14 +1816,16 @@ def _symbolic_tangent(portable: Callable, operands, tangents, output):
 def _perturbed_tangent(portable: Callable, operands, live: Sequence[bool], moving, output=None):
     """`portable`'s tangent at `operands` along `moving`, the directions of the leaves `live` masks alone,
     the others held as constants: a zero direction would meet an infinite factor (inf * 0, NaN, where a
-    bias's own tangent was 1: rows 8757, 6740). With none live, `output`'s zeros, in its dtypes."""
+    bias's own tangent was 1: rows 8757, 6740). With none live, `output`'s symbolic zeros, in its dtypes:
+    an instantiated zero met the next infinite factor past the rule (a held group of
+    `scan._portable_pairs`, its pairs zero, through a `sqrt`: 0 * (0.5 / 0), NaN; train 1484's K-F2)."""
     import jax
     from jax.custom_derivatives import zero_from_primal
 
     from dew.nn import programs
 
     if not any(live):
-        return zero_from_primal(output)
+        return zero_from_primal(output, symbolic_zeros=True)
     perturbed, fill = programs.holes(operands, live)
     return jax.jvp(lambda *values: portable(*fill(values)), tuple(perturbed), tuple(moving))[1]
 
@@ -1813,7 +1874,7 @@ def linear_tangent(forward: Callable, backward: Callable, portable: Callable, *,
 
     def produced_jvp(primals, tangents):
         output, saved = produced(*primals)
-        moved = _symbolic_tangent(portable, primals, tangents, output)
+        moved = symbolic_tangent(portable, primals, tangents, output)
         # `saved` reaches only `pulled`, whose tangent reads the operands' instead.
         return (output, saved), (moved, zero_from_primal(saved))
 
@@ -1838,7 +1899,7 @@ def linear_tangent(forward: Callable, backward: Callable, portable: Callable, *,
             return whole if live is None else tuple(jax.tree.leaves(whole)[index] for index in live)
 
         value = pulled(saved, operands, cotangent, live)
-        return value, _symbolic_tangent(pullback, (operands, cotangent), (doperands, dcotangent), value)
+        return value, symbolic_tangent(pullback, (operands, cotangent), (doperands, dcotangent), value)
 
     pulled = pulled_by if traced else contracted("test_an_embedding_lookup_holds_every_order")(
         declared_tangent(kind, pulled_by, pulled_jvp, nondiff_argnums=(3,), symbolic_zeros=True))
@@ -1931,14 +1992,17 @@ def _unmapped(*axes) -> bool:
     return all(axis is None for axis in jax.tree.leaves(axes, is_leaf=lambda axis: axis is None))
 
 
-def _summed_batch(cotangent):
-    """A batch's cotangent (a tree, the batch its leaves' first axis) summed over the batch in each leaf's own
-    type (`lax.reduce_sum`), whatever x64 scope a pullback runs in; a `float0` leaf's zeros without it."""
+def _batch_summed(leaf):
+    """A cotangent leaf's batch (its first axis) summed in its own type (`lax.reduce_sum`, as JAX's own
+    transpose of a broadcast sums it), whatever x64 scope a pullback runs in: a float64 cotangent an exact
+    widening's pullback forms, summed outside x64, is never asked for as float32 first (two of 2^127 an
+    infinity; row 14083's review); a `float0` leaf's zeros."""
     import jax
     import numpy as np
 
-    return jax.tree.map(lambda leaf: np.zeros(leaf.shape[1:], jax.dtypes.float0)
-                        if leaf.dtype == jax.dtypes.float0 else jax.lax.reduce_sum(leaf, (0,)), cotangent)
+    if leaf.dtype == jax.dtypes.float0:
+        return np.zeros(leaf.shape[1:], jax.dtypes.float0)
+    return jax.lax.reduce_sum(leaf, (0,))
 
 
 @functools.cache
@@ -1946,7 +2010,6 @@ def _linear_primitive() -> type:
     """`linear_map`'s primitive, defined at its first call: this module imports no JAX of its own."""
     import jax
     import jax.numpy as jnp
-    import numpy as np
     from jax.experimental import hijax
 
     from dew.nn import programs
@@ -1977,12 +2040,6 @@ def _linear_primitive() -> type:
             return nothing(out_aval)
         return jax.jvp(lambda *moved: apply(*fill(moved)), tuple(moving),
                        tuple(itertools.compress(directions, live)))[1]
-
-    def unbatched(cotangent):
-        """An unbatched operand's cotangent: its batch's sum."""
-        if cotangent.dtype == jax.dtypes.float0:
-            return np.zeros(cotangent.shape[1:], jax.dtypes.float0)
-        return cotangent.sum(0)
 
     class Linear(hijax.HiPrim):
         apply: Callable
@@ -2049,12 +2106,12 @@ def _linear_primitive() -> type:
 
             def pulled(residuals, cotangent):
                 if self.summed_first and _unmapped(residual_axes, moving_axes):
-                    return self.pullback(residuals, _summed_batch(cotangent))
+                    return self.pullback(residuals, jax.tree.map(_batch_summed, cotangent))
                 back = jax.vmap(self.pullback, in_axes=(residual_axes, 0), **mapped)(residuals, cotangent)
                 leaves, tree = jax.tree.flatten(back)
                 axes = jax.tree.leaves(moving_axes, is_leaf=lambda axis: axis is None)
                 return jax.tree.unflatten(tree, [
-                    unbatched(leaf) if axis is None else jnp.moveaxis(leaf, 0, axis)
+                    _batch_summed(leaf) if axis is None else jnp.moveaxis(leaf, 0, axis)
                     for leaf, axis in zip(leaves, axes, strict=True)])
 
             return (linear_map(applied, pulled, *args, zero_cotangents=self.zero_cotangents,

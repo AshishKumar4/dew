@@ -7,6 +7,9 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
 
 ## Unreleased
 
+- A correctly rounded fp32 division compiles on a CPU through float64, in a fraction of its software form's
+  operations and its correctly rounded results unchanged, and runs eagerly as one program rather than one
+  an operation.
 - On Linux, Dew's build of egglog is 14.0.0.post2 from Dew's package index: a repeated run of the e-graph costs
   what is new to it (a wholly added ruleset returned at once, declarations' hashes kept), Dew's attention
   derivations 4.069 s to 3.599 s of CPU a round.

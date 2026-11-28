@@ -768,12 +768,19 @@ def _rtx_4080_placements() -> tuple[tuning.Placement, tuning.Placement]:
 class _Facted(norm_swiglu.RmsForward):
     """The norm's forward, its space and its configs read at the GPU in effect: on a GPU of 76
     multiprocessors its space lacks one of its configs (`UNSPACED`) and it refuses another (`REFUSED`) as a
-    pin, a tile one GPU's budget holds and another's of the same model does not; each GPU its space and its
-    configs were read at recorded (`asked`)."""
+    pin, a tile one GPU's budget holds and another's of the same model does not, and it derives another
+    config (`DERIVED`, half the rows), so a derivation states the GPU it was read at; each GPU its space and
+    its configs were read at recorded (`asked`)."""
 
     REFUSED: ClassVar = None
     UNSPACED: ClassVar = None
     asked: ClassVar[list] = []
+
+    def _get_heuristics_config(self, ba):
+        derived = super()._get_heuristics_config(ba)
+        if generation.gpu_target().multiprocessors != 76:
+            return derived
+        return dataclasses.replace(derived, rows=max(1, derived.rows // 2))
 
     def _get_autotuning_configs(self, ba):
         target = generation.gpu_target()
@@ -835,7 +842,9 @@ def test_a_launch_measured_for_some_calls_keeps_the_timings_its_other_calls_take
     held[key] = tuning.Timings({_Facted.UNSPACED: _timed(1.0), _Facted.REFUSED: _timed(1.5)})
     # A GPU of the launch's model, its measurement timing one config its calls take, its store recorded.
     stored = []
-    measurer = tuning.Measurer(kind, lambda *_: tuning.Timings({others[0]: _timed(2.0)}),
+    with tuning._placed_in(catalog):
+        attached = generation.gpu_target()
+    measurer = tuning.Measurer(kind, attached, lambda *_: tuning.Timings({others[0]: _timed(2.0)}),
                                lambda _, fresh: stored.append(fresh))
     picks = calls[0].op.get_autotuning_cache(kind)
     try:
@@ -850,6 +859,80 @@ def test_a_launch_measured_for_some_calls_keeps_the_timings_its_other_calls_take
     finally:
         held.pop(key, None)
         picks.pop(key, None)
+
+
+def test_a_launch_an_assumed_device_chose_is_timed_on_no_other_gpu(monkeypatch):
+    """A launch traced under an assumed device and no mesh naming it (an RTX 4080's tiles traced on this
+    host, `generation.assumed` alone) keys its picks by the attached device's model (`_mesh_kind`), and so
+    reaches the attached GPU's measurer, but was chosen for the assumed GPU: it is timed on none other
+    (`tuning._chosen_for`), nothing measured or stored, its launch left without a pick; the attached GPU's
+    own launches still are (Train 1478's review: an sm80 launch was timed on a Hopper and stored in its
+    picks)."""
+    with generation.assumed(generation.gpu_target("NVIDIA GeForce RTX 4080")):
+        assumed = tuning.Placement.current()
+    attached = tuning.Placement.current()
+    with generation.reassumed(None):
+        here = generation.gpu_target()
+    [call] = _facted_calls(assumed)
+    measured, stored = [], []
+    measurer = tuning.Measurer(tuning._mesh_kind(assumed), here,
+                               lambda *args: measured.append(args) or tuning.Timings(),
+                               lambda _, fresh: stored.append(fresh))
+    assert tuning._mesh_kind(assumed) == tuning._mesh_kind(attached)
+    assert tuning._settle([call], measurer=measurer) == 1
+    assert (measured, stored) == ([], [])
+    assert tuning._chosen_for(attached, here) and not tuning._chosen_for(assumed, here)
+    # One key traced both under an assumed RTX 4080 of 76 multiprocessors (whose space lacks one config and
+    # refuses another, `_Facted`) and as this host runs it, in either order: timed once, at the call the
+    # attached GPU's placement chose, its placement the one compiled at, over the configs both calls take
+    # (`_takes`: neither the one the assumed space lacks nor the one it refuses), the pick one of them and
+    # the timings stored (Train 1484's review: an assumed call traced first kept its peer from being timed).
+    with generation.assumed(dataclasses.replace(generation.gpu_target("NVIDIA GeForce RTX 4080"),
+                                                multiprocessors=76)):
+        restricted = tuning.Placement.current()
+
+    def timed_common(op, ba, calls):
+        measured.append(calls)
+        return tuning.Timings({config: _timed(1.0 + at) for at, config in enumerate(tuning._takes(calls))})
+
+    common = measurer._replace(measured=timed_common)
+    for order in ((restricted, attached), (attached, restricted)):
+        measured.clear()
+        stored.clear()
+        both = _facted_calls(*order)
+        kind, (op, key) = tuning._mesh_kind(attached), tuning._launch_key(both[0].keyed)
+        picks = both[0].op.get_autotuning_cache(kind)
+        try:
+            assert len({tuning._distinct_key(call) for call in both}) == 1
+            assert tuning._settle(both, measurer=common) == 0
+            [calls] = measured
+            assert [call.placed for call in calls] == [attached, restricted]
+            [fresh] = stored
+            described, timings = fresh[(op, key)]
+            # Its derivation the attached placement's, where the timings were measured, not the restricted
+            # GPU's half-row one (`_Facted`), whichever call traced first.
+            with tuning._placed_in(attached):
+                derived = both[0].keyed.heuristics_config
+            with tuning._placed_in(restricted):
+                assert both[0].keyed.heuristics_config != derived
+            assert tuning.decoded(described["derived"]) == derived
+            assert set(timings) == set(tuning._takes(both))
+            assert {_Facted.REFUSED, _Facted.UNSPACED}.isdisjoint(timings)
+            assert picks[key].fastest_config in timings
+        finally:
+            tuning._TIMINGS.get((op, kind), {}).pop(key, None)
+            picks.pop(key, None)
+    # A process's measurer is the device that runs the timing, whatever GPU the caller's mesh names: under an
+    # RTX 4080's abstract mesh, this host's own device's facts, which that mesh's launches were not chosen
+    # for (the k01-69 review: the mesh's catalog facts were read as the attached GPU's).
+    catalog, _ = _rtx_4080_placements()
+    # The measuring arm's flags: picks kept (no deterministic ops) and the GPU its own (no read-only cache).
+    monkeypatch.setenv("XLA_FLAGS", without_flags(keeping_picks(), READ_ONLY.split("=")[0]))
+    with tuning._placed_in(catalog):
+        measurer = tuning._measurer(measure=True)
+    device = jax.devices()[0]
+    assert measurer is not None and measurer.target == generation.device_target(device)
+    assert not tuning._chosen_for(catalog, measurer.target)
 
 def test_a_launchs_candidates_are_read_taken_and_compiled_at_its_placement():
     """A launch measured at its call's placement (`tuning._candidate_compiles`, `_measured`'s): its space is

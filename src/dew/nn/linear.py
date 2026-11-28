@@ -42,11 +42,12 @@ from jax.sharding import PartitionSpec as P
 
 from dew.batch import Coordinates, Forks, document_ranks, prefix_sum, real_bounds, valid_order
 from dew.mesh import SEQUENCE_AXIS, LayoutRefused, MeshAxes, logical_spec, mesh_axes
-from dew.nn.dense import Dense
+from dew.nn.dense import Dense, watched_or_owned
 from dew.nn.kernels import recurrence, short_conv
 from dew.nn.kv_cache import Opened, cache_variables, compute_dtype, kept, stated
-from dew.nn.residuals import Residual
+from dew.nn.residuals import Residual, recurrence_output
 
+from . import norms
 from .activations import silu
 from .attention_masks import repeat_kv_heads
 from .blocks import normal_kernel
@@ -59,6 +60,8 @@ from .kernels.generation import INHERENT, Choice
 from .kernels.recurrence_chunk import (
     CHUNK_SIZE,
     RESET_DECAY,
+    Chunk,
+    chunk,
     chunk_gated_delta_rule,
     entering_memory,
     kernel_routed,
@@ -414,7 +417,7 @@ def scan_cache(rows: int, taps: int, width: int, state: str, state_shape: tuple[
 
 def held_scan(module: nn.Module, mixed, taps, bias, scan, state_shape: tuple[int, ...], *, decode: bool,
               coordinates: Coordinates, spec: Mapping[str, Opened] | None = None, state: str = 'ssm_state',
-              state_dtype=None, conv_dtype=None, parts=None, dtype=None, token=None):
+              state_dtype=None, conv_dtype=None, parts=None, dtype=None, token=None, named: bool = True):
     """The conv and scan of a mixer that holds per-row state: a decode step or
     prefill advancing `module`'s flax cache, `conv_state` `[B, K-1, D]` held
     in `conv_dtype` and `state` `[B, *state_shape]` held in `state_dtype`
@@ -437,7 +440,9 @@ def held_scan(module: nn.Module, mixed, taps, bias, scan, state_shape: tuple[int
     state its parent leaves, a root from the row's start (`forked_conv`, `forked_scan`), `scan` taking a
     forked call's table (`forked` its `(loads, stores, held)`, `held` its given memories,
     `recurrence_chunk.Chunk.loads`) in a state at least fp32 (`state_dtype` widened); a cached one starts
-    from the cache and leaves it as it was."""
+    from the cache and leaves it as it was. The scan's output is named as a remat keeps it
+    (`residuals.recurrence_output`) unless `named` is False: a scan whose op names its own output, before and
+    after an epilogue it fuses (`recurrence_chunk.chunk`'s gated norm), the scan's output its normed one."""
     batch = mixed.shape[0]
     held = conv_state = None
     if decode:
@@ -450,7 +455,7 @@ def held_scan(module: nn.Module, mixed, taps, bias, scan, state_shape: tuple[int
         return _forked(mixed, taps, bias, scan, state_shape, coordinates=coordinates,
                        held=None if held is None or conv_state is None else (conv_state.value, held.value),
                        wide=jnp.promote_types(at_least_fp32(mixed.dtype), state_dtype or mixed.dtype),
-                       parts=parts, dtype=dtype)
+                       parts=parts, dtype=dtype, named=named)
     if decode:
         assert conv_state is not None and held is not None
         if token is not None:
@@ -458,7 +463,7 @@ def held_scan(module: nn.Module, mixed, taps, bias, scan, state_shape: tuple[int
             # The history and the state kept in the cache's dtypes, as they always were.
             kept(conv_state, history.astype(conv_state.value.dtype), 'conv_state')
             kept(held, final.astype(held.value.dtype), state)
-            return checkpoint_name(checkpoint_name(out, Residual.SCAN), Residual.CONTEXT)
+            return recurrence_output(out)
     valid = coordinates.valid
     mixed, history = held_conv1d(mixed, taps, valid,
                                  None if conv_state is None else conv_state.value.astype(mixed.dtype),
@@ -472,7 +477,7 @@ def held_scan(module: nn.Module, mixed, taps, bias, scan, state_shape: tuple[int
         kept(held, final.astype(held.value.dtype), state)
     # The scan's output under both names a remat policy reads it by (`RESIDUALS`): a mixer's
     # 'context', as MaxText's recipes keep it, and the 'scan' only a recurrence marks.
-    return checkpoint_name(checkpoint_name(out, Residual.SCAN), Residual.CONTEXT)
+    return recurrence_output(out) if named else out
 
 
 def fork_histories(x, documents, real, forks: Forks, width: int, history=None):
@@ -547,7 +552,7 @@ def fork_start(held, shape: tuple[int, ...], dtype):
     return jnp.zeros(shape, dtype) if held is None else held.astype(dtype)
 
 
-def forked_scan(convolved, rule, coordinates: Coordinates, start):
+def forked_scan(convolved, rule, coordinates: Coordinates, start, *, named: bool = True):
     """The recurrence of a call over forks (`Coordinates.forks`) after its conv (`forked_conv`): each
     document from the memory its parent's tokens leave, a root from the row's start (`start`, a pytree of
     `[B, ...]` leaves: a cached call's state or zero, `fork_start`; Mamba-3's carry, four), as its own row of
@@ -559,7 +564,8 @@ def forked_scan(convolved, rule, coordinates: Coordinates, start):
     enters table slot `loads[d]` and leaves its final in stored slot `stores[d]`, returning `(output,
     final)`. A document holding no real token passes its parent's memory on, so its children enter that.
     The gradient of a memory entered sums over the documents continuing it. A cached call leaves the cache
-    as it was: no document's final is the row's."""
+    as it was: no document's final is the row's. The output is named as `held_scan`'s is, unless `named` is
+    False."""
     forks = coordinates.forks
     assert forks is not None and coordinates.segments is not None
     if forks.held is None:
@@ -601,23 +607,25 @@ def forked_scan(convolved, rule, coordinates: Coordinates, start):
     given = jax.tree.map(lambda leaf: leaf[:, None], start)
     out, _ = rule(convolved, valid=real, starts=begins, state=given, loads=loads, stores=stores,
                   held=forks.held)
-    return checkpoint_name(checkpoint_name(out, Residual.SCAN), Residual.CONTEXT)
+    return recurrence_output(out) if named else out
 
 
 def _forked(mixed, taps, bias, scan, state_shape: tuple[int, ...], *, coordinates: Coordinates, held,
-            wide, parts, dtype):
+            wide, parts, dtype, named: bool = True):
     """`held_scan` of a call over forks: its conv (`forked_conv`) and its scan a level of the forks' chains
     in one pass (`forked_scan`), `scan(convolved, *, starts, valid, held, forked)` running each document from
     its table slot (`forked` its `(loads, stores, held)`, `held` its given memories, `Chunk.loads`); a cached
     call from the layer's held conv history and state `held`, read and left as they were. Under a sequence
-    axis the call runs whole, its documents read across the axis (`sequence_split`)."""
+    axis the call runs whole, its documents read across the axis (`sequence_split`); its output named unless
+    `named` is False (`held_scan`'s)."""
     history, held = (None, None) if held is None else held
     convolved = forked_conv(mixed, taps, coordinates, history=history, bias=bias, parts=parts, dtype=dtype)
 
     def rule(convolved, *, valid, starts, state, loads, stores, held):
         return scan(convolved, starts=starts, valid=valid, held=state, forked=(loads, stores, held))
 
-    return forked_scan(convolved, rule, coordinates, fork_start(held, (mixed.shape[0], *state_shape), wide))
+    return forked_scan(convolved, rule, coordinates, fork_start(held, (mixed.shape[0], *state_shape), wide),
+                       named=named)
 
 
 def sequence_split(decode: bool, coordinates: Coordinates) -> int:
@@ -772,49 +780,66 @@ def sequence_halo(mixed, valid, segments, width: int):
     return jnp.where((halo_documents == first)[:, :, None], halo, 0)
 
 
-def split_delta_rule(mixed, g, beta, segments, starts, valid, taps, *, widths, parts, dtype, rule,
-                     chunk_size: int):
+def split_delta_rule(mixed, g, beta, segments, starts, valid, taps, *, widths, parts, conv_dtype, rule,
+                     chunk_size: int, epilogue: Mapping | None = None):
     """A delta-rule mixer's conv and rule over this shard's slice of whole training sequences and of its
     heads, inside a `shard_map` that holds the sequence axis manual (`sequence_delta_rule`): the conv with
     its halo (`sequence_conv`, its `parts` the queries', keys' and values' channels and l2-normed widths,
-    `mixed` and `taps` each this shard's heads of each part laid in turn), the pieces in heads of their
-    `widths`, and `rule(query, key, value, g, beta, state, starts=)` (its chunk `chunk_size`, bound by
-    `sequence_delta_rule`) from the memory this shard's slice enters with (`entering_memory`, its transfer at
-    the same `chunk_size`), its output named as `held_scan`'s."""
+    `mixed` and `taps` each this shard's heads of each part laid in turn, rounded to `conv_dtype`), the
+    pieces in heads of their `widths`, and `rule(query, key, value, g, beta, state, starts=)` (its chunk
+    `chunk_size`, bound by `sequence_delta_rule`) from the memory this shard's slice enters with
+    (`entering_memory`, its transfer at the same `chunk_size`), each run reading the slice's `valid` tokens
+    (`Chunk.valid`), its output named as `held_scan`'s. Its `epilogue` (the gated norm's `output`, `z`,
+    `weight` and `dtype`, `chunk_gated_delta_rule`'s), where given, the run from that memory takes, its
+    output normed and named by the op (`recurrence_chunk.chunk`); the slice's summary from zero reads the
+    final memory alone."""
     query, key, value = (piece.reshape(*piece.shape[:2], -1, width) for piece, width in
-                         zip(sequence_conv(mixed, taps, None, segments, valid, parts=parts, dtype=dtype),
+                         zip(sequence_conv(mixed, taps, None, segments, valid, parts=parts, dtype=conv_dtype),
                              widths, strict=True))
+    # The shard's padded tokens keep the memory in its runs alike, as the unsplit op's (`Chunk.valid`).
+    rule = functools.partial(rule, valid=valid)
     state = entering_memory(rule, query, key, value, g, beta, starts, axis=SEQUENCE_AXIS,
                             chunk_size=chunk_size)
-    out, _ = rule(query, key, value, g, beta, state, starts=starts)
-    return checkpoint_name(checkpoint_name(out, Residual.SCAN), Residual.CONTEXT)
+    out, _ = rule(query, key, value, g, beta, state, starts=starts, **(epilogue or {}))
+    return out if epilogue else recurrence_output(out)
 
 
 def sequence_delta_rule(mixed, taps, g, beta, coordinates, valid, *, shards: int, key_heads: int, widths,
-                        parts: Pieces, dtype, rule, chunk_size: int):
+                        parts: Pieces, conv_dtype, rule, chunk_size: int,
+                        output: norms.OutputNorm | None = None, z=None, weight=None, dtype=None):
     """A delta-rule mixer's conv and rule (`split_delta_rule`) on shards that split the rows, the sequence and
     the heads (`over_sequence`, the split dividing its `key_heads`): each of `parts`' channels of `mixed`
     `[B, S, C]` and of the conv's `taps` `[C, K]` an operand split by its heads, the queries', keys' and
-    values' laid in turn on each shard, `g` and `beta` by theirs. `rule` takes its chunk here, `chunk_size`
-    the layer's, bound once for the rule and its shards' transfers alike. Where a tensor axis held every head
-    whole, each of its devices ran the whole mixer's conv and scan (row 1437); each still runs its heads over
-    its slice of the sequence whole."""
+    values' laid in turn on each shard, `g` and `beta` by theirs, the conv rounded to `conv_dtype`. `rule`
+    takes its chunk here, `chunk_size` the layer's, bound once for the rule and its shards' transfers alike.
+    Where a tensor axis held every head whole, each of its devices ran the whole mixer's conv and scan (row
+    1437); each still runs its heads over its slice of the sequence whole. A mixer's gated norm (`output`,
+    `recurrence.Hooks.output`, its gate `z` `[B, S, Hv, Dv]` and `weight` `[Dv]`, the output in `dtype`:
+    `chunk_gated_delta_rule`'s) each shard's rule takes in its epilogue, as the unsplit layer's chunked op
+    does, so each shard's launches are the unsplit layer's over its slice: the gate split as the values are,
+    the weight every shard's, its gradient the shards' sum as the map's boundary sums a replicated
+    operand's."""
     edges = np.cumsum([width for width, _ in parts])[:-1]
     count = len(parts)
     rule = functools.partial(rule, chunk_size=chunk_size)
 
     def local(*operands):
-        pieces, (g, beta, segments, starts, valid), held = (operands[:count], operands[count:count + 5],
-                                                            operands[count + 5:])
+        pieces, (g, beta, segments, starts, valid, z), (*held, weight) = (
+            operands[:count], operands[count:count + 6], operands[count + 6:])
         # Each shard's heads of each part laid in turn, each part's width its own piece's.
         mine = tuple((piece.shape[-1], head) for piece, (_, head) in zip(pieces, parts, strict=True))
+        epilogue = None if output is None else {'output': output, 'z': z, 'weight': weight, 'dtype': dtype}
         return split_delta_rule(jnp.concatenate(pieces, axis=-1), g, beta, segments, starts, valid,
-                                jnp.concatenate(held, axis=0), widths=widths, parts=mine, dtype=dtype,
-                                rule=rule, chunk_size=chunk_size)
+                                jnp.concatenate(held, axis=0), widths=widths, parts=mine,
+                                conv_dtype=conv_dtype, rule=rule, chunk_size=chunk_size, epilogue=epilogue)
 
-    tokens = (*jnp.split(mixed, edges, axis=-1), g, beta, coordinates.segments, coordinates.starts, valid)
-    at = dict.fromkeys(range(count + 2), 2) | dict.fromkeys(range(len(tokens), len(tokens) + count), 0)
-    return over_sequence(local, shards, tokens, tuple(jnp.split(taps, edges, axis=0)),
+    tokens = (*jnp.split(mixed, edges, axis=-1), g, beta, coordinates.segments, coordinates.starts, valid,
+              None if output is None else z)
+    # The pieces, `g`, `beta` and the norm's gate hold their heads at 2, the taps at 0.
+    at = (dict.fromkeys((*range(count + 2), len(tokens) - 1), 2)
+          | dict.fromkeys(range(len(tokens), len(tokens) + count), 0))
+    return over_sequence(local, shards, tokens,
+                         (*jnp.split(taps, edges, axis=0), None if output is None else weight),
                          heads=Heads(beta.shape[2], key_heads, at))
 
 
@@ -1282,13 +1307,13 @@ class GatedDeltaNet(nn.Module):
         return scan_cache(rows, self.conv_kernel, self.conv_features, 'recurrent_state',
                           (self.num_v_heads, self.head_k_dim, self.head_v_dim), stored, conv)
 
-    def _decode_kernel(self, x, operand) -> str:
+    def _decode_kernel(self, x, operand, *, fuses: bool) -> str:
         """The kernel a decode token runs (`decode_kernel`): the fused step with the layer's conv,
-        gates and norm (`_fused_token`), the step alone between them (`decode_gated_delta_rule`), or
-        the portable recurrence ('xla')."""
+        gates and norm (`_fused_token`) where it `fuses` them, the step alone between them
+        (`decode_gated_delta_rule`), or the portable recurrence ('xla')."""
         state = jax.ShapeDtypeStruct((x.shape[0], self.num_v_heads, self.head_k_dim, self.head_v_dim),
                                      self._stored(operand)[0])
-        return decode_kernel(state, groups=self.num_k_heads, fuses=True)
+        return decode_kernel(state, groups=self.num_k_heads, fuses=fuses)
 
     @property
     def _gates(self) -> recurrence.Gates:
@@ -1302,8 +1327,16 @@ class GatedDeltaNet(nn.Module):
         read back first in `operand`, the input projection's dtype."""
         return recurrence.Hooks(conv=recurrence.Conv('silu'), l2norm=True, decay='scalar',
                                 gates=self._gates,
-                                output=recurrence.OutputNorm(self.norm_eps, self.gate_activation,
+                                output=norms.OutputNorm(self.norm_eps, self.gate_activation,
                                                              read_in=jnp.dtype(operand).name))
+
+    def _chunk_hooks(self, operand, normed: bool) -> recurrence.Hooks:
+        """The sequence's chunked op (`chunk`) on the decode token's hooks (`_fused_hooks`), the conv and the
+        l2 norm before it (the conv's pieces, `held_scan`): the gates from their pre-activations and, where
+        `normed`, the gated norm in its epilogue, under the layer's declared bounds (`declared`)."""
+        fused = self._fused_hooks(operand)
+        return dataclasses.replace(fused, conv=None, l2norm=False, scale=self.head_k_dim ** -0.5,
+                                   output=fused.output if normed else None, **self.declared)
 
     def _fused_token(self, z, b, a, valid, operand):
         """A decode token's conv, gates, update and gated norm in one launch (`fused_token`): the
@@ -1329,9 +1362,12 @@ class GatedDeltaNet(nn.Module):
         operand = mixed.dtype
         token, stepped = None, False
         forked = tokens.forks is not None
+        # A caller watching or capturing the norm's call (`dense.watched_or_owned`) has it run as its module:
+        # no kernel takes it in an epilogue then (train 1484's K-F3).
+        fusing = not self.is_initializing() and not watched_or_owned(self.norm)
         # An initialization runs the general path, where the layer makes its parameters.
         if decode and S == 1 and not forked and not self.is_initializing():
-            kernel = self._decode_kernel(x, operand)
+            kernel = self._decode_kernel(x, operand, fuses=fusing)
             token = self._fused_token(z, b, a, valid, operand) if kernel == 'fused' else None
             stepped = kernel == 'step'
 
@@ -1339,8 +1375,12 @@ class GatedDeltaNet(nn.Module):
         # underflow to -inf (modeling_qwen3_next.py:652-653); at least fp32,
         # so a float64 model's stays float64 (`at_least_fp32`).
         wide = at_least_fp32(operand)
+        # A padded token's gates formed from zeros, its head's rate among them (`recurrence.gated`), as the
+        # chunked op forms them: a rate of exp(100) beside its zero cotangent was NaN in the split rule's
+        # gradient (train 1484's K-F4).
         g, beta = recurrence.gated(self._gates, a.astype(wide), self.A_log.astype(wide),
-                                   self.dt_bias.astype(wide), b.astype(wide))
+                                   self.dt_bias.astype(wide), b.astype(wide), valid)
+        assert beta is not None, "the gated delta rule's write gate is its sigmoid's"
         if valid is not None:
             # exp(0)=1 and beta=0 preserve recurrent memory for invalid input.
             beta = jnp.where(valid[:, :, None], beta, 0.0)
@@ -1354,25 +1394,38 @@ class GatedDeltaNet(nn.Module):
         # beta a sigmoid's, of the queries and keys the conv l2-normalized (`causal_conv1d`'s pieces).
         ported = S > 1 and kernel_routed(rows, keys, values, g, beta, **self.declared)
 
+        gate = z.reshape(B, S, -1, self.head_v_dim)
+        if valid is not None:
+            # A padded token's output gate zero, as the chunked op's epilogue zeroes it (`Chunk.valid`): the
+            # norm the module runs where a caller watches it met an infinite one beside its zero cotangent as
+            # NaN in the shared weight's gradient (head review of train 1484's K-F3).
+            gate = jnp.where(valid[:, :, None, None], gate, jnp.zeros((), gate.dtype))
+        # The chunked op forms the gates from their pre-activations and, where the layer has made its
+        # parameters, gates and norms its output in its epilogue (`_chunk_hooks`), as the decode token does:
+        # its gate, weight and output dtype, the sequence's either path's.
+        chunked = S > 1 or forked
+        normed = chunked and fusing
+        hooks = self._chunk_hooks(operand, normed)
+        sides = {'z': gate, 'weight': self.norm.variables['params']['weight']} if normed else {}
+        normed_dtype = (self.norm.dtype or operand) if normed else None
+
         def scan(convolved, *, starts, valid, held, forked=None):
             query, key, value = (self._split_heads(part, width)
                                  for part, width in zip(convolved, widths, strict=True))
             state = None if held is None else held.astype(wide)
-            if S > 1 or forked is not None:
+            if chunked:
                 # fla's layer hands its rule the projections' dtype, the
-                # queries and keys on their own heads and beta beside them. A
-                # held history can make the convolved operands vary where the
-                # projections did not, so the route is asked again of them.
+                # queries and keys on their own heads and the gates beside them.
                 # The batch's documents' firsts, built once with it (`Coordinates.firsts`); a forked call's
                 # documents from its table (`held_scan`, `Chunk.loads`), its padded tokens keeping the
-                # memory (exp(0)=1, beta=0).
-                kept = None if forked is None else valid[:, :, None]
+                # memory (`Chunk.valid`).
                 loads, stores, held = (None, None, 0) if forked is None else forked
-                return chunk_gated_delta_rule(
-                    query, key, value, g if kept is None else jnp.where(kept, g, 0.0),
-                    beta if kept is None else jnp.where(kept, beta, 0.0), state, self.chunk_size,
-                    starts=starts, max_segments=tokens.max_segments, **self.declared,
-                    firsts=tokens.firsts if forked is None else None, loads=loads, stores=stores, held=held)
+                return chunk(hooks, Chunk(
+                    query, key, value, gate=a.astype(wide), log_a=self.A_log.astype(wide),
+                    bias=self.dt_bias.astype(wide), beta=b.astype(wide), state=state, starts=starts,
+                    firsts=tokens.firsts if forked is None else None, loads=loads, stores=stores, held=held,
+                    valid=tokens.valid if forked is None else valid, **sides),
+                    chunk_size=self.chunk_size, max_segments=tokens.max_segments, dtype=normed_dtype)
             # One key head serves `per_v` value heads, the reference's `repeat_interleave`.
             query, key = (repeat_kv_heads(x, self.num_v_heads) for x in (query, key))
             if stepped and held is not None:
@@ -1393,23 +1446,28 @@ class GatedDeltaNet(nn.Module):
         if shards > 1:
             rule = functools.partial(chunk_gated_delta_rule, max_segments=tokens.max_segments,
                                      **self.declared)
+            # Each shard's rule gates and norms its output in its epilogue, as the unsplit op does.
             out = sequence_delta_rule(mixed, self.conv1d()[0], g, beta, tokens, valid, shards=shards,
                                       key_heads=self.num_k_heads, widths=widths, parts=heads,
-                                      dtype=operand if ported else wide, rule=rule,
-                                      chunk_size=self.chunk_size)
+                                      conv_dtype=operand if ported else wide, rule=rule,
+                                      chunk_size=self.chunk_size, output=hooks.output, dtype=normed_dtype,
+                                      **sides)
         else:
             out = held_scan(self, mixed, self.conv1d()[0], None, scan,
                             (self.num_v_heads, self.head_k_dim, self.head_v_dim), decode=decode,
                             coordinates=tokens, spec=self.cache_spec(B) if decode else None,
                             state='recurrent_state', state_dtype=stored, conv_dtype=conv,
-                            parts=heads, dtype=operand if ported else wide, token=token)
+                            parts=heads, dtype=operand if ported else wide, token=token,
+                            # The chunked op names the recurrence's output before its gated norm.
+                            named=not normed)
         if token is not None:
             # The fused step gated and normalized its output (`_fused_hooks`), in its epilogue's dtype.
             return self.out_proj(out.astype(mixed.dtype))
 
-        gate = z.reshape(B, S, -1, self.head_v_dim)
-        # The scan read back in its projections' dtype, as Qwen3-Next's `.to(initial_dtype)` (the query's).
-        out = self.norm(out.astype(mixed.dtype), gate)  # the norm scales, then the activation gates
+        if not normed:
+            # The scan read back in its projections' dtype, as Qwen3-Next's `.to(initial_dtype)` (the
+            # query's); the norm scales, then the activation gates.
+            out = self.norm(out.astype(mixed.dtype), gate)
         out = out.reshape(B, S, self.value_features)
         return self.out_proj(out)
 

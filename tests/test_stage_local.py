@@ -233,12 +233,14 @@ def on_host(tree):
 
 
 def stepped(model, optimizer, mesh: MeshSpec, devices: int, initial, *, variables=None, exact: bool = False,
-            stage_local: bool = True, ema: float | None = 0.9):
+            stage_local: bool = True, ema: float | None = 0.9, per_step: bool = False):
     """`STEPS` steps of `model` from the seed's state (`initial`) on the batch a draw gives, over
     `mesh`, its pipelined runs stage-local or whole on every stage (`stage_local`), its step compiled
     once for every draw, returning the variables, optimizer state and EMA as a checkpoint holds them,
     every layer its own (`StageLocal.saved`). `exact` runs in float64 from the state widened, under the
-    caller's float64."""
+    caller's float64. With `per_step`, each step's loss (`losses`) and the optimizer state each step leaves
+    (`moments`: an Adam step's first moment holds its gradient), so a run is held step by step, not by its
+    end alone."""
     built = []
 
     @as_given
@@ -254,10 +256,16 @@ def stepped(model, optimizer, mesh: MeshSpec, devices: int, initial, *, variable
         batch = shard_batch(steps.device_mesh, {"text": tokens})
         if len(built) == 1:
             built.append(steps.compile(state, batch))
+        losses, moments = [], []
         for _ in range(STEPS):
-            state, *_ = built[1](state, batch)
+            state, loss, *_ = built[1](state, batch)
+            if per_step:
+                # Read off the step before the next donates it.
+                losses.append(jax.device_get(loss))
+                moments.append(jax.device_get(steps.stored(state).opt_state))
         saved = steps.stored(state)
-        return jax.device_get({name: getattr(saved, name) for name in ("variables", "opt_state", "ema")})
+        held = jax.device_get({name: getattr(saved, name) for name in ("variables", "opt_state", "ema")})
+        return {**held, "losses": losses, "moments": moments} if per_step else held
     return run
 
 
@@ -283,11 +291,20 @@ def assert_trains_as_replicated(model, optimizer, label: str, variables=None, *,
     given = None if variables is None else variables(0)
     assert saving(functools.partial(trainer, model, optimizer, mesh, devices, variables=given)) > 0, \
         "the decoder's run splits over its stages"
+    assert_trains_as_unstaged(model, optimizer, label, variables, mesh=mesh, devices=devices)
+
+
+def assert_trains_as_unstaged(model, optimizer, label: str, variables=None, *, mesh: MeshSpec | None = None,
+                              devices: int = 1):
+    """`STEPS` steps over `mesh` with each run stage-local and with none (`Layout.stage_local`) leave the
+    variables, optimizer state and EMA a checkpoint of each holds on par, against one device's float64
+    (check 1), each seed's state its own (`initials`, `variables(seed)` where given)."""
+    given, mesh = None if variables is None else variables(0), MeshSpec() if mesh is None else mesh
     initial = initials(model, optimizer, variables)
-    local, replicated = (stepped(model, optimizer, mesh, devices, initial, variables=given, stage_local=held)
-                         for held in (True, False))
+    local, whole = (stepped(model, optimizer, mesh, devices, initial, variables=given, stage_local=held)
+                    for held in (True, False))
     truth = stepped(model, optimizer, MeshSpec(), 1, initial, variables=given, exact=True)
-    assert_as_exact(local, replicated, draw, label, seeds=SEEDS, truth_fn=truth)
+    assert_as_exact(local, whole, draw, label, seeds=SEEDS, truth_fn=truth)
 
 
 @pytest.mark.mesh(devices=8)
@@ -304,12 +321,14 @@ def test_a_stage_local_decoder_trains_as_the_replicated_pipeline_through_each_op
     assert_trains_as_replicated(decoder(**fields), optimizer, f"stage-local {name}")
 
 
-def lora(seed: int = 0):
-    """A decoder adapted on its query and value projections, its base and factors drawn by `seed`, the
-    factors apart from zero so its forward and every factor's gradient read them."""
-    model = decoder()
+def lora(seed: int = 0, model=None, fp8_base=None):
+    """A decoder (`model`, this module's by default) adapted on its query and value projections, its base
+    and factors drawn by `seed`, the factors apart from zero so its forward and every factor's gradient read
+    them; its base packed in FP8 where `fp8_base` makes its record from the base's variables."""
+    model = decoder() if model is None else model
     variables = model.init(jax.random.key(seed), jnp.zeros((1, SEQ), jnp.int32))
-    adapter = LoRA(rank=2, modules=("q_proj", "v_proj")).apply(model, variables, key=seed + 1)
+    packed = {} if fp8_base is None else {"fp8_base": fp8_base(variables)}
+    adapter = LoRA(rank=2, modules=("q_proj", "v_proj")).apply(model, variables, key=seed + 1, **packed)
     rng = np.random.default_rng(seed + 1)
 
     def drawn(leaf):
@@ -1067,12 +1086,8 @@ def test_a_head_only_run_over_frozen_layers_read_where_they_lie_trains_as_one_ho
         base = nn.unbox(model.init(jax.random.key(seed), jnp.zeros((1, SEQ), jnp.int32)))
         return freeze(base, lambda path: not any(key.startswith("layers_") for key in path))
 
-    initial = initials(model, LORA_OPTIMIZER, head)
-    local, whole = (stepped(model, LORA_OPTIMIZER, MeshSpec(), 1, initial, variables=head(0),
-                            stage_local=held) for held in (True, False))
-    truth = stepped(model, LORA_OPTIMIZER, MeshSpec(), 1, initial, variables=head(0), exact=True)
-    assert_as_exact(local, whole, draw, "a head-only run's frozen layers read where they lie", seeds=SEEDS,
-                    truth_fn=truth)
+    assert_trains_as_unstaged(model, LORA_OPTIMIZER, "a head-only run's frozen layers read where they lie",
+                              head)
 
 
 @pytest.mark.mesh(devices=8)

@@ -1,14 +1,18 @@
 """A file written through dew._files is the old one or the new one, never part of one."""
 
 import concurrent.futures
+import errno
 import inspect
 import os
+import secrets
 import stat
+import subprocess
 import sys
+from pathlib import Path
 
 import pytest
 
-from dew._files import published, replacing, staged, swapped, write_atomically
+from dew._files import _lock_path, published, replacing, staged, swapped, write_atomically
 
 
 def test_a_write_that_fails_leaves_the_old_file_and_no_temporary(tmp_path):
@@ -267,12 +271,8 @@ def test_a_private_file_stays_private_through_its_replacement(tmp_path):
 def test_a_lock_that_is_no_regular_file_is_refused_without_waiting(tmp_path):
     """A FIFO where a destination's publication lock is, which an open for writing would wait on a reader
     for, is refused at once, the destination as it was (train 1406's review)."""
-    import hashlib
-
-    from dew._files import PUBLISHING_LOCK
-
     release = tmp_path / "release"
-    os.mkfifo(tmp_path / (PUBLISHING_LOCK + hashlib.sha256(b"release").hexdigest()[:16]))
+    os.mkfifo(_lock_path(release))
     with pytest.raises(FileExistsError), swapped(release, _nothing_foreign) as staging:
         (staging / "model.safetensors").write_text("new")
     assert not release.exists()
@@ -356,6 +356,82 @@ def test_a_build_published_second_is_removed_whole_with_an_empty_folder_no_one_m
     (built / "sealed").chmod(0)
     assert not published(built, directory)
     assert not built.exists()
+
+
+def test_a_staging_name_another_entry_holds_is_refused_and_that_entry_kept(tmp_path, monkeypatch):
+    """A release whose staging is named as an entry that already exists refuses the write and leaves that
+    entry as it was: the staging is removed on the way out only once the write made it (train 1450's
+    review, F4: the cleanup removed the other entry)."""
+    # Every name a write gives a folder of its own drawn as one token, so the entry this case makes collides.
+    monkeypatch.setattr(secrets, "token_hex", lambda size: "0" * 2 * size)
+    taken = tmp_path / f".dew-{'0' * 16}.staging"
+    taken.mkdir()
+    (taken / "sentinel").write_text("kept")
+    with pytest.raises(FileExistsError), swapped(tmp_path / "release", _nothing_foreign):
+        pass
+    assert (taken / "sentinel").read_text() == "kept"
+
+
+def foreign_folder(tmp_path) -> Path:
+    """A folder of another group than this process's, not setgid, that it may write in, made in the test's
+    own disk-backed folder and given another of its groups (any, as root); skipped where it can give none
+    (train 1455's review: never the system's shared temporary folder)."""
+    groups = sorted({*os.getgroups(), os.getgid()} - {os.getgid()})
+    other = groups[0] if groups else (os.getgid() + 1 if os.geteuid() == 0 else None)
+    if other is None:
+        pytest.skip("this process can give a folder no group but its own")
+    made = tmp_path / "shared"
+    made.mkdir()
+    os.chown(made, -1, other)
+    made.chmod(0o775)
+    return made
+
+
+def test_a_release_new_in_a_folder_of_another_group_commits_making_no_folder(tmp_path, monkeypatch):
+    """A release new in a folder of another group than its publisher's, not setgid, by a publisher of one
+    group (whose filesystem's rule no probe reads), commits with no folder made at its commit, so a write
+    that took the filesystem's last inode leaves the commit what it needs: its root and its new entries take
+    the group the filesystem gave its staging, else the publisher's (row 14088's ruling)."""
+    parent = foreign_folder(tmp_path)
+    destination = parent / "release"
+
+    def no_inode(*args, **kwargs):
+        raise OSError(errno.ENOSPC, "no inode left")
+
+    monkeypatch.setattr(os, "getgroups", list)
+    monkeypatch.setattr(os, "geteuid", lambda: 1)
+    with swapped(destination, _nothing_foreign) as staging:
+        given = staging.lstat().st_gid
+        (staging / "nested").mkdir()
+        (staging / "nested" / "model.safetensors").write_text("ours")
+        monkeypatch.setattr(os, "mkdir", no_inode)
+    monkeypatch.undo()
+    assert (destination / "nested" / "model.safetensors").read_text() == "ours"
+    assert {path.lstat().st_gid for path in (destination, *destination.rglob("*"))} == {given}
+
+
+WITHOUT_PINS = """
+import os, sys
+from pathlib import Path
+if hasattr(os, "O_PATH"):
+    del os.O_PATH
+from dew._files import published
+directory, built = Path(sys.argv[1]), Path(sys.argv[2])
+print(published(built, directory), built.exists())
+"""
+
+
+def test_a_build_with_an_empty_folder_no_one_may_open_is_removed_where_no_descriptor_pins_one(tmp_path):
+    """On a system with no descriptor that holds a folder it cannot read (no `O_PATH`, macOS's), a build that
+    loses its publication holding an empty folder of mode `0000` is removed whole: the folder removed by its
+    name once, which needs no right on it (row 14088's ruling)."""
+    directory, built = losing_build(tmp_path)
+    (built / "sealed").mkdir()
+    (built / "sealed").chmod(0)
+    ran = subprocess.run([sys.executable, "-c", WITHOUT_PINS, str(directory), str(built)],
+                         capture_output=True, text=True, timeout=120)
+    assert ran.returncode == 0, ran.stderr[-2000:]
+    assert ran.stdout.split() == ["False", "False"], ran.stdout
 
 
 def test_a_release_takes_the_group_of_the_tree_it_replaces_as_the_lock_finds_it(tmp_path):

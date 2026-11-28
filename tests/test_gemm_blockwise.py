@@ -117,7 +117,7 @@ def test_equal_shares_blockwise_reference_and_truth_hold_check_1_on_this_cpu():
 
     with on_the_host():
         taken = _shares_hold_check_1(grouped_cells.Blockwise(256, 512, 256, 4, 128),
-                                     "blockwise equal shares 256x512x256", arm=lambda fn, inputs: jax.jit(fn))
+                                     "blockwise equal shares 256x512x256", arm=jax.jit)
     assert taken == {"xla"}, taken
 
 
@@ -186,7 +186,7 @@ def _shares_hold_check_1(cell: grouped_cells.Blockwise, label: str, *,
             rows, width)
 
     with generation.routes() as routes:
-        assert_as_exact(jax.jit(unnamed), arm(reference, draw(0)), draw, label, seeds=blockwise_matrix.SEEDS,
+        assert_as_exact(jax.jit(unnamed), arm(reference), draw, label, seeds=blockwise_matrix.SEEDS,
                         truth_fn=jax.jit(truth))
     return {route.kernel for route in routes if route.choice == "blockwise_fp8"}
 
@@ -346,7 +346,7 @@ def a_blockwise_kernel_gradient_is_on_par(interpret: bool = False):
     GEMM on the same codes a block at a time (check 1, `_gradient_cublaslt`: block-scaled FP8 on Hopper is
     held at parity with cuBLASLt), from float64; an empty group's gradient is zero. On this GPU, or
     `interpret`ed (test_gpu_gemm's cell)."""
-    reference = blockwise_matrix.cublaslt_arm(_gradient_cublaslt, _gradient_operands(0))
+    reference = blockwise_matrix.cublaslt_arm(_gradient_cublaslt)
     with generation.routes() as routes:
         assert_as_exact(jax.jit(_gradient("mosaic", interpret)), reference, _gradient_operands,
                         "blockwise kernel gradient", seeds=blockwise_matrix.SEEDS,
@@ -565,6 +565,140 @@ def test_a_blockwise_fp8_epilogues_codes_and_scales_are_the_recipes():
     np.testing.assert_array_equal(np.asarray(codes).view(np.uint8), np.asarray(want_codes).view(np.uint8))
     np.testing.assert_array_equal(np.asarray(stored_scales).view(np.uint32),
                                   np.asarray(want_scales.T).view(np.uint32))
+
+
+def test_a_nan_among_normal_draws_scales_its_block_as_a_nan_maximum():
+    """A NaN among normal draws, one a row at its own column, through the blockwise FP8 recipe
+    (`projections.rows_quantized`) and the quantizing epilogue (`quantized.blockwise_fp8_epilogue`): each
+    1 x 128 block holding it takes a NaN maximum's scale (`fake_quant.fp8_block_scale`'s -0.0), every other
+    block a power of two, and the epilogue's codes and scales are the recipe's (row 14083's train 1477: the
+    recipe's float block maximum, which XLA:CPU's YNNPACK reduction takes, dropped the NaN beside normal
+    draws, 2.53 for a NaN block's maximum)."""
+    from dew.nn.kernels.templates.gemm import quantized
+
+    rng = np.random.default_rng(14083)
+    values = rng.normal(size=(64, 256)).astype(np.float32)
+    columns = (np.arange(64) * 37) % 256
+    values[np.arange(64), columns] = np.nan
+    acc = jnp.asarray(values)
+    _, codes, scales = quantized.blockwise_fp8_epilogue()(acc)
+    want_codes, want_scales = projections.rows_quantized(acc.astype(jnp.bfloat16))
+    held = np.asarray(want_scales).view(np.uint32)
+    holding = np.zeros((64, 2), bool)
+    holding[np.arange(64), columns // 128] = True
+    np.testing.assert_array_equal(held == 0x80000000, holding)
+    np.testing.assert_array_equal(np.asarray(codes).view(np.uint8), np.asarray(want_codes).view(np.uint8))
+    np.testing.assert_array_equal(np.asarray(quantized.stored(scales, (128, True))).view(np.uint32), held.T)
+
+
+@pytest.mark.parametrize("dtype", [jnp.bfloat16, jnp.float8_e4m3fnuz])
+def test_a_nan_in_a_weight_block_among_normal_draws_scales_that_block_alone(dtype):
+    """A bank of normal draws holding one NaN in each matrix, quantized 128 x 128 blocks at a time
+    (`projections.blocks_quantized`): the block holding it takes a NaN maximum's scale
+    (`fake_quant.fp8_block_scale`'s -0.0), every other block a power of two (row 14083's review: a float
+    block maximum, which XLA:CPU's YNNPACK reduction takes over both a block's axes, dropped the NaN), at
+    bf16 and in an FNUZ format, whose NaN is its sign bit alone."""
+    rng = np.random.default_rng(14083)
+    w = rng.normal(size=(4, 256, 256)).astype(np.float32)
+    at = [(2, 130), (37, 5), (200, 211), (129, 128)]
+    for group, (row, column) in enumerate(at):
+        w[group, row, column] = np.nan
+    _, scales = projections.blocks_quantized(jnp.asarray(w, dtype))
+    held = np.asarray(scales).view(np.uint32)
+    holding = np.zeros(held.shape, bool)
+    for group, (row, column) in enumerate(at):
+        holding[group, row // 128, column // 128] = True
+    np.testing.assert_array_equal(held == 0x80000000, holding)
+
+
+@pytest.mark.mesh(devices=2)
+@pytest.mark.parametrize("k_major", [False, True])
+def test_a_bank_split_by_whole_depth_blocks_quantizes_on_an_explicit_mesh(k_major):
+    """`projections.blocks_quantized` of a bank whose depth an Explicit axis splits in whole 128-row blocks,
+    jitted, natural or K-major: its codes and scales bitwise the unsplit bank's (theme 22's review: a scale
+    spread by `jnp.repeat` over the split axis was refused, and main's one reshape splitting both axes)."""
+    from jax.sharding import NamedSharding, PartitionSpec
+
+    w = np.random.default_rng(4518).normal(size=(2, 512, 256)).astype(np.float32)
+    mesh = jax.make_mesh((2,), ("i",), (jax.sharding.AxisType.Explicit,), devices=jax.devices()[:2])
+    quantized = jax.jit(functools.partial(projections.blocks_quantized, k_major=k_major))
+    whole = quantized(jnp.asarray(w, jnp.bfloat16))
+    placed = jax.device_put(jnp.asarray(w, jnp.bfloat16), NamedSharding(mesh, PartitionSpec(None, "i")))
+    with jax.set_mesh(mesh):
+        split = quantized(placed)
+    for got, want in zip(split, whole, strict=True):
+        np.testing.assert_array_equal(np.asarray(got).view(np.uint8), np.asarray(want).view(np.uint8))
+    # The split kept on the codes' depth and the scales' depth blocks.
+    codes, scales = (tuple(array.sharding.spec) + (None,) * (3 - len(array.sharding.spec)) for array in split)
+    assert codes == ((None, None, "i") if k_major else (None, "i", None))
+    assert scales == (None, "i", None)
+
+
+@pytest.mark.parametrize("k_major", [False, True])
+def test_an_integer_bank_quantizes_as_its_widened_values(k_major):
+    """`projections.blocks_quantized` of an int8 bank, which has no float word to reduce: its codes and
+    scales bitwise those of its values widened to fp32, an exact widening (theme 22's review)."""
+    w = np.random.default_rng(4518).integers(-127, 128, size=(2, 256, 256)).astype(np.int8)
+    integers = projections.blocks_quantized(jnp.asarray(w), k_major=k_major)
+    widened = projections.blocks_quantized(jnp.asarray(w, jnp.float32), k_major=k_major)
+    for got, want in zip(integers, widened, strict=True):
+        np.testing.assert_array_equal(np.asarray(got).view(np.uint8), np.asarray(want).view(np.uint8))
+
+
+def fp8_codes_convert_as_the_rounding_does():
+    """On a GPU, `fake_quant.fp8_codes`' conversion (XLA's float32 to E4M3FN and back) is its rounding by
+    arithmetic (`fake_quant._round_e4m3fn`) bit for bit, at every E4M3 code, each midpoint between two and
+    the float32s either side of it, the subnormal codes' range, both zeros, values past 448 and NaN (row
+    14171). Run by tests/test_gpu_gemm.py's cells: a CPU's codes take the rounding alone."""
+    from dew.nn import fake_quant
+
+    grid = np.unique(np.abs(np.arange(256, dtype=np.uint8).view(jnp.float8_e4m3fn).astype(np.float32)))
+    grid = grid[np.isfinite(grid)]
+    midpoints = (grid[:-1] + grid[1:]) / 2
+    near = np.concatenate([np.nextafter(points, direction) for points in (grid, midpoints)
+                           for direction in (-np.inf, np.inf)])
+    small = np.float32(2.0 ** -9) * np.linspace(0, 2, 4097, dtype=np.float32)
+    # Past 448 (448 to 464 among them) the clip ahead of the convert takes each value to 448.
+    past = np.concatenate([np.linspace(448, 464, 65, dtype=np.float32), [480.0, 1e9, np.inf]])
+    every = np.concatenate([grid, midpoints, near, small, past, [0.0]])
+    values = jnp.asarray(np.concatenate([every, -every, [np.nan]]).astype(np.float32))
+    rounded = jax.jit(lambda x: fake_quant._round_e4m3fn(jnp.clip(x, -448, 448)))(values)
+    for excess in (False, True):
+        # Under XLA GPU's excess precision too, which deletes a bare f32 -> f8 -> f32 pair (its review).
+        converted = jax.jit(fake_quant.fp8_codes,
+                            compiler_options={"xla_allow_excess_precision": excess})(values)
+        _same_codes(converted, rounded)
+    # Its derivative the rounding's, zero, on a GPU as on a CPU (train 1495's review K-F1: the casts' own
+    # passed the tangent through, ones for zeros).
+    differentiated = jax.jit(lambda x, dx: jax.jvp(fake_quant.fp8_codes, (x,), (dx,)))
+    _, tangent = differentiated(values, jnp.ones_like(values))
+    np.testing.assert_array_equal(np.asarray(tangent), np.zeros(values.shape, np.float32))
+
+
+def test_the_converted_codes_derivative_is_the_roundings():
+    """`fake_quant.fp8_codes`' CUDA branch (`_converted`: XLA's convert to E4M3FN and back, held by a
+    barrier), evaluated where it runs here, differentiates as the rounding does: zero at every order (train
+    1495's review K-F1), its straight-through estimate its caller's (`fp8_rounded`)."""
+    from dew.nn import fake_quant
+
+    x = jnp.linspace(-500, 500, 64, dtype=jnp.float32)
+    _, tangent = jax.jvp(fake_quant._converted, (x,), (jnp.ones_like(x),))
+    np.testing.assert_array_equal(np.asarray(tangent), np.zeros(64, np.float32))
+    np.testing.assert_array_equal(np.asarray(jax.grad(lambda x: fake_quant._converted(x).sum())(x)),
+                                  np.zeros(64, np.float32))
+
+
+def _same_codes(converted, rounded):
+    """`fp8_codes_convert_as_the_rounding_does`' comparison: the stored E4M3FN bytes alike, and every value
+    but a NaN's (whose payload no code stores) alike."""
+    for array in (converted, rounded):
+        assert np.asarray(array).dtype == np.float32
+    np.testing.assert_array_equal(np.asarray(converted.astype(jnp.float8_e4m3fn)).view(np.uint8),
+                                  np.asarray(rounded.astype(jnp.float8_e4m3fn)).view(np.uint8))
+    number = ~np.isnan(np.asarray(rounded))
+    np.testing.assert_array_equal(np.isnan(np.asarray(converted)), ~number)
+    np.testing.assert_array_equal(np.asarray(converted)[number].view(np.uint32),
+                                  np.asarray(rounded)[number].view(np.uint32))
 
 
 @pytest.mark.parametrize("rows", [200, 256])

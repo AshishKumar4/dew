@@ -600,6 +600,27 @@ class Flops:
 
 
 @attending("xla")
+def test_a_phased_run_resumed_under_other_phase_passes_is_refused(tmp_path):
+    """A phased run's checkpoint records the passes each phase ran (`PhasePasses.training_record`): a resume
+    whose phases run other counts, the first phase's 1 now 2, or none, the loop's own count throughout,
+    computes another step and is refused, where a resume under its own counts goes on (row 14126: resumed
+    without detection)."""
+    from dew.training import Checkpoints
+
+    tokens, _ = phased_draw(0)
+
+    def fitted(phases, steps, **options):
+        return phased_trainer(looped(), 0, phases, checkpoints=Checkpoints(str(tmp_path), keep=8)).fit(
+            phased_loader(tokens), steps=steps, log_every=100, checkpoint_every=1, **options)
+
+    fitted((1, STEPS), 2)
+    # Other counts, or none: the same model at its loop's own count throughout (review).
+    for phases in ((2, STEPS), None):
+        with pytest.raises(ValueError):
+            fitted(phases, 3, resume="require")
+    assert int(fitted((1, STEPS), 3, resume="require").step) == 3
+
+
 def test_a_phased_runs_work_counts_each_step_at_its_phases_pass_count():
     """A fit over two phases, its loop one pass in the first and three in the second (`phase_passes`),
     counts each step's work (`train/flops`, which train/mfu divides) as a run of its phase's pass count

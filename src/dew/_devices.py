@@ -18,7 +18,7 @@ import shutil
 import sys
 from collections.abc import Callable, Mapping, Sequence
 
-from dew import _pool
+from dew import _pool, _xla_flags
 from dew._builds import (
     CUDA_BUILDS,
     LEAST_CUBLAS_BESIDE_TENSOR_MEMORY,
@@ -106,11 +106,9 @@ def hold_xla_flags(flags: str | None) -> None:
 
 
 def _carries(loaded: str, flags: str) -> bool:
-    """Whether the XLA_FLAGS `loaded` carry every flag of `flags`, as `flags_hold` reads them."""
-    asked = {}
-    for token in flags.split():
-        name, equals, value = token.removeprefix("--").partition("=")
-        asked[name] = value if equals else "true"
+    """Whether the XLA_FLAGS `loaded` carry every flag of `flags`, both read as XLA reads them
+    (`dew._xla_flags`)."""
+    asked = {name.removeprefix("--"): _xla_flags.value(name, span) for name, span in _xla_flags.spans(flags)}
     return all(_flag(loaded, name) == value for name, value in asked.items())
 
 
@@ -139,14 +137,9 @@ def xla_flag(name: str) -> str | None:
 
 
 def _flag(flags: str, name: str) -> str | None:
-    """The value `--<name>` carries in `flags`, as `xla_flag` reads it."""
-    value = None
-    for token in flags.split():
-        if token == f"--{name}":
-            value = 'true'
-        elif token.startswith(f"--{name}="):
-            value = token.split('=', 1)[1]
-    return value
+    """The value `--<name>` carries in `flags`, as `xla_flag` reads it: as XLA does (`dew._xla_flags`), a
+    quoted value naming another flag no flag of its own."""
+    return _xla_flags.flag(flags, name)
 
 
 def keep_roundings() -> None:

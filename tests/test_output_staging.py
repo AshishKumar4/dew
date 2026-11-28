@@ -8,7 +8,7 @@ import pytest
 from generation_support import INTERPRETS, on_the_host
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
-from dew.nn.kernels.templates import bundles, stores, swizzling
+from dew.nn.kernels.templates import bundles, copies, stores, swizzling
 
 NVFP4 = (stores.Output((64, 256), jnp.uint8, 2), stores.Output((64, 256), jnp.float8_e4m3fn, 16))
 """A 64-row share of a 256-column NVFP4 tile's codes (two to a byte) and scales (one a 16-column block)."""
@@ -159,15 +159,79 @@ def test_a_transposed_store_of_a_share_of_some_of_its_rows_is_refused(first, sto
 
 
 @INTERPRETS
-@pytest.mark.parametrize("first, least", [(jnp.int32(0), 8), (0, 1)], ids=["traced-first", "single-rows"])
-def test_a_packed_row_ladder_starting_unaligned_is_refused(first, least):
-    """A packed chunk's 16-byte rows (four fp32 a row) copied in rungs that may start at a row no 128 bytes
-    from its buffer's (a first row known only as it runs, rungs of one row) are refused as they trace: a
-    tensor copy's shared address is 128-byte aligned. A static first row 0 and rungs of 8 rows hold
-    (`test_a_packed_output_stores_each_chunks_columns_at_its_stored_place`)."""
+@pytest.mark.parametrize("first, least, stored", [(jnp.int32(0), 8, None), (0, 1, 7)],
+                         ids=["traced-first", "single-rows"])
+def test_a_packed_row_ladder_starting_unaligned_is_refused(first, least, stored):
+    """A packed chunk's 16-byte rows (four fp32 a row) copied in rungs that start at a row no 128 bytes
+    from its buffer's (a first row known only as it runs; seven rows in rungs down to one, a two-row copy 64
+    bytes in) are refused as they trace: a tensor copy's shared address is 128-byte aligned. A static first
+    row 0 and rungs of 8 rows hold (`test_a_packed_output_stores_each_chunks_columns_at_its_stored_place`)."""
     with on_the_host(), pytest.raises(ValueError):
-        _packed_store(8, 64, 4, 16, transposed=False, first=first, least=least)()
+        _packed_store(8, 64, 4, 16, transposed=False, first=first, stored=stored, least=least)()
 
+
+
+
+def test_a_ladder_is_aligned_exactly_where_every_copy_store_rows_takes_starts_on_a_shared_unit():
+    """`stores.row_starts_aligned` against the copies `store_rows` emits, recorded through its `copy` seam:
+    for a known count, exactly where each copy it takes starts at a whole number of 128-byte units; for
+    every count it may store (a multiple of its smallest rung below twice its largest), exactly where all of
+    theirs do; from a first row known only as it runs, exactly where they do from every first row (row
+    14182: every copy a bulk tensor copy's address, a one-row one's too)."""
+    class Recorded:
+        shape = (256, 8)
+
+        @property
+        def at(self):
+            return self
+
+        def __getitem__(self, index):
+            return index
+
+    def taken(first: int, rows: int, least: int, most: int) -> list[int]:
+        copied = []
+        stores.store_rows(Recorded(), Recorded(), 0, first, rows, 0, most, least,
+                          copy=lambda source, _: copied.append(source.start))
+        return copied
+
+    def aligned(row_bytes: int, starts) -> bool:
+        return all(start * row_bytes % copies.SHARED_ALIGNMENT == 0 for start in starts)
+
+    for row_bytes in (16, 32, 48, 64, 128, 192):
+        for least, most in ((1, 1), (1, 8), (2, 8), (4, 8), (8, 8), (1, 64), (8, 64)):
+            counts = range(least, 2 * most, least)
+            for first in range(8):
+                for rows in counts:
+                    assert stores.row_starts_aligned(row_bytes, first, least, most, rows) == aligned(
+                        row_bytes, taken(first, rows, least, most)), (row_bytes, first, rows, least, most)
+                assert stores.row_starts_aligned(row_bytes, first, least, most) == all(
+                    aligned(row_bytes, taken(first, rows, least, most)) for rows in counts)
+            anywhere = all(aligned(row_bytes, taken(first, rows, least, most))
+                           for first in range(16) for rows in counts)
+            assert stores.row_starts_aligned(row_bytes, None, least, most) == anywhere, (row_bytes, most)
+
+@INTERPRETS
+@pytest.mark.parametrize("chunk, first, stored, refused",
+                         [(16, 0, 8, False), (8, 0, 6, False), (4, 0, 8, False), (8, 0, 7, True),
+                          (4, 0, 6, True), (16, jnp.int32(0), 8, True)],
+                         ids=["64-byte-rows", "32-byte-rows-six", "16-byte-rows-whole", "32-byte-rows-seven",
+                              "16-byte-rows-six", "grouped-64-byte-rows"])
+def test_an_ordinary_row_ladder_starts_each_copy_on_a_shared_unit(chunk, first, stored, refused):
+    """An ordinary chunk's rows (fp32, `chunk` columns a row) stored `stored` of 8 in rungs down to one row
+    from row 0 (`stores.row_starts_aligned`): the copies each count takes start on 128-byte units for
+    64-byte rows, for 32-byte rows' six (four at 0, two at 128 bytes) and for 16-byte rows' eight (one copy
+    at 0), and store each row at its place; 32-byte rows' seven (a one-row copy 192 bytes in), 16-byte rows'
+    six (a two-row copy 64 bytes in) and a first row known only as it runs (a grouped tile's group) are
+    refused as they trace (row 14182: only packed chunks were held to it)."""
+    if refused:
+        with on_the_host(), pytest.raises(ValueError):
+            _packed_store(8, 64, 1, chunk, transposed=False, first=first, stored=stored, least=1)()
+        return
+    with on_the_host():
+        got = np.asarray(_packed_store(8, 64, 1, chunk, transposed=False, first=first, stored=stored,
+                                       least=1)())
+    expected = np.arange(64)[None, :] + 1000.0 * np.arange(8)[:, None]
+    np.testing.assert_array_equal(got[:stored], expected[:stored])
 
 def test_a_packed_chunk_is_sought_within_the_tile_and_its_issuers_piece_alike():
     """A 96-column tile whose issuer emits 64 columns at once stages NVFP4 codes (two a byte) in chunks

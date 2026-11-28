@@ -376,17 +376,19 @@ def explicit_rows_run(module: InContextMemory):
 
 
 MESHED = {"titans": layer("titans"), "titans committed": layer("titans").clone(commit="chunk"),
+          "ttt_linear": layer("ttt_linear"), "titans_linear": layer("titans_linear"),
           "gated_linear_attention": layer("gated_linear_attention"),
           "cms": layer("cms").clone(normalize=True, learning_rate=Gate(scale=STEP))}
 """The memories the mesh check splits: Titans' each token reading its own step or its chunk's start,
-a linear memory on the recurrence, and a continuum-memory level, an existing gated MLP over the stream
-committing per chunk, its keys and queries normalized as the papers' and at their step (over the raw
-stream, at the level's own hundredth or the papers' step, its weights' gradients do not resolve within
-512 seeds)."""
+TTT-Linear's linear memory on its mini-batched kernel and Titans' on its chunked path, a linear memory on the
+recurrence, and a continuum-memory level, an existing gated MLP over the stream committing per chunk,
+its keys and queries normalized as the papers' and at their step (over the raw stream, at the level's
+own hundredth or the papers' step, its weights' gradients do not resolve within 512 seeds)."""
 
 
 @pytest.mark.mesh(devices=2)
 @pytest.mark.parametrize(("name", "axis"), [("titans", "Explicit"), ("titans committed", "Explicit"),
+                                            ("ttt_linear", "Explicit"), ("titans_linear", "Explicit"),
                                             ("gated_linear_attention", "Explicit"), ("cms", "Explicit"),
                                             ("cms", "Auto")])
 def test_a_memory_runs_its_rows_split_over_a_data_axis(name, axis):

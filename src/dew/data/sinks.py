@@ -56,7 +56,7 @@ def _hub_export(
     resolved = fs.resolve_path(path)
     if not isinstance(resolved, HfFileSystemResolvedRepositoryPath):
         raise ValueError(f"HF export needs a repository URL, not a bucket URL: {url}")
-    api = HfApi(token=fs.token)
+    api = HfApi(endpoint=fs.endpoint, token=fs.token)
     parent = api.repo_info(resolved.repo_id, repo_type=resolved.repo_type, revision=resolved.revision).sha
     if parent is None:
         raise ValueError(f"HF export has no parent commit at {url}")

@@ -21,7 +21,7 @@ import numpy as np
 import optax
 import pytest
 from float64_terms import float32_values, float64_forward
-from model_support import attending
+from model_support import attending, moved_apart
 from multimodal_families import (
     DRAWN,
     FAMILIES,
@@ -697,13 +697,14 @@ def test_source_backward_matches_reference(source_draw):
 
 @attending("reference")
 def test_source_trained_export_and_frozen_buffers_match_reference(family_source, tmp_path):
-    """The model trained one SGD step exports under the source's tensor names and reloads to the logits
-    the trained model computes, and every non-parameter collection (Gemma4's standardization and clipping
-    buffers) survives training bitwise. Qwen3.5's root tie_word_embeddings=False overrides its nested text
-    flag: tying the head keeps the initial logits but misses this update."""
+    """The model with every parameter moved, each leaf by a draw of its own as a step of training moves it,
+    exports under the source's tensor names and reloads to the logits the moved model computes, and every
+    non-parameter collection (Gemma4's standardization and clipping buffers) survives bitwise. Qwen3.5's
+    root tie_word_embeddings=False overrides its nested text flag: tying the head keeps the initial logits
+    but misses this move. The gradient a step takes is test_source_backward_matches_reference's; moved by
+    one here, Gemma 3n's took 129 s (row 14080)."""
     _, loaded, inputs, _ = family_source
-    _, gradient, _ = jax.jit(lambda variables: _stepped(loaded.model, variables, inputs))(loaded.variables)
-    stepped = _trained(loaded.variables, gradient)
+    stepped = {**loaded.variables, "params": moved_apart(loaded.variables["params"], jax.random.key(7), 1e-2)}
     forward = jax.jit(lambda model, variables: model.apply(variables, inputs.tokens, **inputs.kwargs()),
                       static_argnums=0)
     loaded.save(tmp_path / "trained", variables=stepped)

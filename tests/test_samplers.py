@@ -1105,6 +1105,47 @@ def test_ddim_at_eta_one_walks_as_diffusers_ddim_scheduler_on_the_same_draws():
                     truth_fn=as_given(source(torch.float64)))
 
 
+class Modelled(nn.Module):
+    """A raw-F model whose arithmetic lies in a scope of its own, "modelled", where a lowering names it."""
+
+    @nn.compact
+    def __call__(self, x_scaled, temb):
+        with jax.named_scope("modelled"):
+            return x_scaled * 0.5 + expand(temb, x_scaled) * 0.25
+
+
+def test_a_cpu_walks_step_marks_its_own_arithmetic_and_not_the_model_it_calls():
+    """A CPU walk's solver step rounds its own adds and multiplies alone (`dew.sampling.walks`, the pinned
+    jaxlib's no-contract mark), and the model it calls inside its step (KDPM2's midpoint) traces unmarked,
+    as the walk's own call of it does: lowered for a CPU, the step's float arithmetic is marked and no
+    float add or multiply of the model's scope is (review of train 1492's fold: the step's marks reached
+    the model's midpoint call)."""
+    from jax.extend.backend import no_contract_attribute
+    from jax.extend.mlir import ir
+
+    from dew.nn.kernels.lowered import frontend_attributes, read_operations
+
+    name = no_contract_attribute()
+    assert name is not None
+    process, _ = karras_process()
+    denoise = process.denoiser(Modelled(), {}, {})
+    cpu = jax.devices("cpu")[0]
+    x_T = jax.device_put(jnp.ones((2, 4, 4, 3), jnp.float32), cpu)
+    walk = jax.jit(lambda x: sample(denoise, x, 3, solver=KDPM2(), key=jax.random.key(1)))
+    with jax.default_device(cpu):
+        lowered = walk.trace(x_T).lower(lowering_platforms=("cpu",))
+
+    def read(operation):
+        if operation.name not in ("stablehlo.add", "stablehlo.subtract", "stablehlo.multiply") or (
+                not isinstance(ir.RankedTensorType(operation.results[0].type).element_type, ir.FloatType)):
+            return None
+        return ("modelled" in str(operation.location), frontend_attributes(operation).get(name) == "true")
+
+    marks = read_operations(lowered, read)
+    assert any(modelled for modelled, _ in marks) and any(marked for _, marked in marks)
+    assert not any(marked for modelled, marked in marks if modelled)
+
+
 def test_rk4s_update_divides_by_six_as_ieee_division_does():
     """RK4's update, x + (k1 + 2 k2 + 2 k3 + k4) dt / 6, divides by six as IEEE does
     (`dew.nn.precision.divided`), bit for bit: with every stage's eps the same sixteenths, so

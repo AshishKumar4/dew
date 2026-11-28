@@ -15,6 +15,21 @@ import jax
 from dew import _cache
 
 
+def executable_platform(executable: jax.stages.Compiled) -> str:
+    """The backend a compiled `executable` targets ('cpu', 'cuda', 'rocm', 'tpu'): a loaded one's devices'
+    (`communicators.loaded_program`, its runtime's, no tree of its rebuilt), else one compiled for devices
+    this process has not (a compile-only GPU's) read from its arguments' and results' placements, whose
+    reading rebuilds its trees (whose nodes may refuse leaves of another kind: a dataclass validating its
+    fields); "none" for one that places neither."""
+    from dew.communicators import loaded_program
+
+    loaded = loaded_program(executable)
+    if loaded is not None and loaded.devices:
+        return loaded.devices[0].platform
+    placed = [*jax.tree.leaves(executable.input_shardings), *jax.tree.leaves(executable.output_shardings)]
+    return next(iter(placed[0].device_set)).platform if placed else "none"
+
+
 class Span:
     """A compile through Dew's compile point (`dew.nn.kernels.options.OuterProgram`) and the work JAX does
     for it, wherever its context runs (a thread it is copied to among them): the program it compiles
@@ -31,14 +46,9 @@ class Span:
 
     @property
     def platform(self) -> str | None:
-        """The backend its executable targets, read from its arguments' and results' placements where a
-        ledger asks (a compile's own reading them rebuilds its trees, whose nodes may refuse leaves of
-        another kind: a dataclass validating its fields); None before it is compiled."""
-        if self.executable is None:
-            return None
-        placed = [*jax.tree.leaves(self.executable.input_shardings),
-                  *jax.tree.leaves(self.executable.output_shardings)]
-        return next(iter(placed[0].device_set)).platform if placed else "none"
+        """The backend its executable targets (`executable_platform`), read where a ledger asks; None before
+        it is compiled."""
+        return None if self.executable is None else executable_platform(self.executable)
 
 
 class Owner:

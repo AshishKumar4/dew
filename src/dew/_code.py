@@ -72,6 +72,10 @@ REVIEWED = {
     "dew.registry:module_from_file:<loader>": "a user's file a run names, the user's code",
     "dew.clusters:tpu_chips:<loader>":
         "JAX's hardware_utils, read by its file to count TPU chips: JAX's code",
+    "dew.telemetry.benchmark:_lexer:<loader>":
+        "dew/_xla_flags.py beside the instrument, read by its file as the instrument loads into an arm's "
+        "process whose Dew may state none: Dew's own module, a closure of Dew's GPU code holding it through "
+        "dew._devices",
     "dew.data.sources.codec:_dataclass_decoded:module":
         "a dataclass a stored artifact names, rebuilt as data from its fields, as "
         "`dew.registry:imported:module`",

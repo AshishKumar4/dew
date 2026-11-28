@@ -6,7 +6,14 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from contract_support import EDGES, FORWARD_ORDERS, assert_contract, assert_drawn_contract, normal_draw
+from contract_support import (
+    EDGES,
+    FORWARD_ORDERS,
+    assert_contract,
+    assert_drawn_contract,
+    contract_draw,
+    normal_draw,
+)
 from map_judge import marked_seeds
 
 from dew.nn import categorical, inspection
@@ -45,13 +52,8 @@ def test_the_categorical_losses_hold_every_order(edge):
                                                - jax.nn.log_softmax(x, axis=-1)), axis=-1), (3,)),
     }
     for name, (fn, plain, shape) in sites.items():
-
-        def inputs(seed, scale, shape=shape):
-            """A seed's logits and direction at `scale`, and its cotangent."""
-            return (normal_draw((2645, seed), (3, 6), scale=scale),
-                    normal_draw((2646, seed), (3, 6), scale=scale), normal_draw((2647, seed), shape)[0])
-
-        assert_drawn_contract(fn, inputs, EDGES[edge], f"{name} {edge}", truth_fn=plain, plain_fn=plain)
+        assert_drawn_contract(fn, contract_draw(2645, ((3, 6),), shape), EDGES[edge], f"{name} {edge}",
+                              truth_fn=plain, plain_fn=plain)
 
 
 @pytest.mark.parametrize("edge", EDGES)
@@ -94,13 +96,8 @@ def test_the_label_terms_hold_every_order(edge):
         return jnp.stack([-jax.nn.log_softmax(logits, axis=-1)[rows, targets],
                           jax.nn.logsumexp(logits, axis=-1)])
 
-    def inputs(seed, scale):
-        """A seed's logits and direction at `scale`, and its cotangent."""
-        return (normal_draw((2701, seed), (4, 7), scale=scale),
-                normal_draw((2702, seed), (4, 7), scale=scale), normal_draw((2703, seed), (2, 4))[0])
-
-    assert_drawn_contract(whole, inputs, EDGES[edge], f"whole logits' losses {edge}", truth_fn=plain,
-                          plain_fn=plain)
+    assert_drawn_contract(whole, contract_draw(2701, ((4, 7),), (2, 4)), EDGES[edge],
+                          f"whole logits' losses {edge}", truth_fn=plain, plain_fn=plain)
 
 
 @pytest.mark.parametrize(("edge", "head"), [

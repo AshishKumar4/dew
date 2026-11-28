@@ -108,6 +108,7 @@ from dew.training.tracker import Tracker, WandbTracker
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import peak_memory
+import xla_flags
 from benchmark_cases import (
     Case,
     canvas_split,
@@ -559,12 +560,10 @@ def tuning_digest() -> dict[str, object] | None:
     (--xla_gpu_per_fusion_autotune_cache_dir) as it stands at the row: its result files' count and the
     sha256 of their names and contents. The directory is a node's, shared by its jobs, so the digest names
     what it held then, not the picks this step alone used; None where no such directory is named."""
-    flags = os.environ.get("XLA_FLAGS", "").split()
-    option = "--xla_gpu_per_fusion_autotune_cache_dir="
-    named = [flag.removeprefix(option) for flag in flags if flag.startswith(option)]
-    if not named or not named[-1]:
+    named = xla_flags.flag(os.environ.get("XLA_FLAGS", ""), "xla_gpu_per_fusion_autotune_cache_dir")
+    if not named:
         return None
-    directory = Path(named[-1])
+    directory = Path(named)
     files = sorted(path for path in directory.rglob("*.textproto")
                    if path.is_file()) if directory.is_dir() else []
     digest = hashlib.sha256()

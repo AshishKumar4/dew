@@ -283,6 +283,32 @@ def test_two_finalizers_publish_only_one_snapshot(store):
     assert store.read() == next(result for result in results if isinstance(result, bytes))
 
 
+_COMMIT_OF = """
+import json, sys
+from huggingface_hub import HfFileSystem
+from dew.data.storage import _hub_commit
+print(json.dumps(_hub_commit(HfFileSystem(endpoint=sys.argv[1]), "owner/data@main/rows.json")))
+"""
+"""A process's pin of a loopback Hub's file, its filesystem's endpoint the Hub's (`_hub_commit`)."""
+
+
+def test_a_hub_objects_commit_is_asked_of_its_filesystems_own_endpoint(tmp_path):
+    """A Hub object's commit is asked of the endpoint its filesystem reads (a private Hub's, a mirror's),
+    not the process's default Hub, here one that answers nothing: a loopback Hub's repo pins to its own
+    commit (row 14125: asked of the default Hub, it failed or named another repository's commit)."""
+    from local_hub import LocalHub, hub_environment
+
+    (tmp_path / "rows.json").write_text("[]")
+    with LocalHub({"owner/data": {"rows.json": tmp_path / "rows.json"}}) as hub:
+        # The default Hub a closed port: only the filesystem's own endpoint answers.
+        env = {**hub_environment(None, tmp_path), "HF_ENDPOINT": "http://127.0.0.1:9"}
+        done = subprocess.run([sys.executable, "-c", _COMMIT_OF, hub.endpoint], env=env, capture_output=True,
+                              text=True, check=False, timeout=120)
+        commit = hub.commit("owner/data")
+    assert done.returncode == 0, done.stderr[-2000:]
+    assert json.loads(done.stdout) == [commit, f"models/owner/data@{commit}/rows.json"]
+
+
 def test_named_profile_resolves_secrets_lazily(monkeypatch):
     _profile("credentialtest", "memory", {"credential": "env:DEW_TEST_MISSING_SECRET"})
     monkeypatch.delenv("DEW_TEST_MISSING_SECRET", raising=False)

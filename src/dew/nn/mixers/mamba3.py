@@ -32,7 +32,6 @@ import numpy as np
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 from jax import lax
-from jax.ad_checkpoint import checkpoint_name
 
 from dew.algebra import scan
 from dew.batch import document_firsts, real_bounds
@@ -52,7 +51,7 @@ from dew.nn.mixers.mamba import inverse_softplus_step
 from dew.nn.mixers.mamba2 import MambaRMSNormGated
 from dew.nn.norms import RMSNorm
 from dew.nn.precision import at_least_fp32, float32_dot_general, softplus
-from dew.nn.residuals import Residual
+from dew.nn.residuals import Residual, recurrence_output
 from dew.nn.scatter import gather_positions
 
 CHUNK_SIZE = 64
@@ -557,7 +556,7 @@ class Mamba3(nn.Module):
                 kept(variable, value.astype(variable.value.dtype), name)
         # The scan's output under both names a remat policy reads it by (`RESIDUALS`), as `held_scan` marks
         # it.
-        out = checkpoint_name(checkpoint_name(out, Residual.SCAN), Residual.CONTEXT)
+        out = recurrence_output(out)
         # The skip by the shared product (`recurrence.skip_added`): written here, D's gradient was one
         # reduction over every token's products, whose order XLA:CPU took by the input's shape, a packed
         # tiny decoder's 1.65 times the error of its documents laid a row each (row 6479).

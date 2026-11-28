@@ -20,10 +20,12 @@ from __future__ import annotations
 import contextlib
 import ctypes
 import dataclasses
+import functools
 import html
 import math
 import os
 import re
+import runpy
 import select
 import statistics
 import threading
@@ -278,6 +280,14 @@ loads into a timing worker beside any tree's Dew (tools/timing.py's `instrument`
 program's options read too (`options_of`)."""
 
 
+@functools.cache
+def _lexer() -> dict:
+    """Dew's XLA flag lexer (src/dew/_xla_flags.py) beside this file, its names as running it leaves them
+    (`runpy.run_path`): the instrument loads by its path into an arm's process, whose Dew may be a checkout
+    that states none (row 12063)."""
+    return runpy.run_path(str(Path(__file__).resolve().parents[1] / "_xla_flags.py"))
+
+
 def options_of(flags: str) -> dict[str, str]:
     """The XLA options `flags`, in XLA_FLAGS' form, name: a program compiled with them runs as a process
     given them does (`UNGRAPHED_FLAG`'s, `dew.nn.kernels.options.UNGRAPHED_OPTIONS`)."""
@@ -292,10 +302,10 @@ def graphs() -> bool:
     a checkout that states none of its own reader (row 12063: an older baseline raised ImportError)."""
     name = UNGRAPHED_FLAG.removesuffix("=")
     kinds: set[str] | None = None
-    for token in os.environ.get("XLA_FLAGS", "").split():
-        named, _, value = token.partition("=")
+    for named, span in _lexer()["spans"](os.environ.get("XLA_FLAGS", "")):
         if named != name:
             continue
+        value = _lexer()["value"](named, span)
         listed = [kind.strip().upper() for kind in value.split(",") if kind.strip()]
         if not (listed and all(kind[0] in "+-" for kind in listed)):
             kinds = set(listed)
@@ -417,7 +427,7 @@ def tpu_ops(directory: str | Path, devices: Iterable[int], module: str, *, annot
     every op within that run's span on the device's `XLA Ops` line, each its device milliseconds. A TPU core
     runs one program at a time, so the ops inside a run's span are its own: a v5e's XProf names a run's
     program in its name alone and its ops state none (M-FS-90); a run stating its program by stat takes the
-    ops stating it, no host transfer. Where its ops state none, each is read as the instruction of the
+    ops stating it, no host transfer. Either way, each op inside the run is read as the instruction of the
     call's module it names (`instructions`, each instruction's opcode by name as it runs, `_opcodes`: a
     generic async op's its wrapped op's; an op's name the instruction's, or its HLO text, `%name = ...`,
     `_opcode_of`): one no instruction of the module names is
@@ -473,16 +483,17 @@ def tpu_ops(directory: str | Path, devices: Iterable[int], module: str, *, annot
         if not inside:
             raise NoKernels(f"{module}'s run under {directory} holds no op on TPU {device} of the call's "
                             f"{sorted(runs)}")
-        if not stated:
-            named = [_opcode_of(op.name, instructions) for op in inside]
-            opcodes = [opcode for opcode in named if opcode is not None]
-            if len(opcodes) < len(named):
-                unnamed = [op.name for op, opcode in zip(inside, named, strict=True) if opcode is None]
-                raise AmbiguousCapture(f"{module}'s run under {directory} holds ops on TPU {device} no "
-                                       f"instruction of its module names: {unnamed}")
-            if all(trace.moves_only(opcode) for opcode in opcodes):
-                raise NoKernels(f"{module}'s run under {directory} holds transfers alone on TPU {device}: "
-                                f"{[op.name for op in inside]}")
+        # Each op the instruction it names, whichever way its run states its program (row 14120: a run of
+        # ops stating it by stat was timed whole, transfers alone among them).
+        named = [_opcode_of(op.name, instructions) for op in inside]
+        opcodes = [opcode for opcode in named if opcode is not None]
+        if len(opcodes) < len(named):
+            unnamed = [op.name for op, opcode in zip(inside, named, strict=True) if opcode is None]
+            raise AmbiguousCapture(f"{module}'s run under {directory} holds ops on TPU {device} no "
+                                   f"instruction of its module names: {unnamed}")
+        if all(trace.moves_only(opcode) for opcode in opcodes):
+            raise NoKernels(f"{module}'s run under {directory} holds transfers alone on TPU {device}: "
+                            f"{[op.name for op in inside]}")
         timed += [KernelTime(op.name, op.duration_ns / 1e6) for op in inside]
     return tuple(timed)
 

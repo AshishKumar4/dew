@@ -6,28 +6,56 @@ from __future__ import annotations
 
 import dataclasses
 import json
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 
 from dew._records import JSON, json_value
 from dew.data.analysis import _member_keys, _members, _name, _until, same_stage
 from dew.data.pipeline import BatchStage, Combined, Mixture, Phases, Pipeline, TokenBudget
-from dew.data.plan import fingerprint, structured
+from dew.data.plan import fingerprint, identified, structured
 
 
-def _corpus_key(chain: Pipeline) -> str:
+def _corpus_key(chain: Pipeline, *, local: bool = False) -> str:
     """A corpus (`_corpora`) as phases share it, whatever a chain names it: its store's content
     (`Source.fingerprint`); a concatenation's, its members' in order, each what it reads and the steps it
-    reads it through (`dew.data.plan.structured`)."""
+    reads it through (`dew.data.plan.structured`). With `local`, a store whose content only its name states
+    (a Grain dataset, an iterator), given none, is besides the one object it is in this process
+    (`describe`: its place among the unnamed), which `_corpus_keys` reads its run's corpora apart by."""
     def read_of(pipeline: Pipeline) -> JSON:
         source = pipeline.source
         if not isinstance(source, Combined):
-            return json.loads(json.dumps(source.fingerprint(), sort_keys=True, default=str))
+            stated = json.loads(json.dumps(source.fingerprint(), sort_keys=True, default=str))
+            if local and not identified(stated):
+                stated = {"unnamed": source.describe(), **stated}
+            return stated
         weights = {"weights": list(source.weights)} if isinstance(source, Mixture) else {}
         members = [[read_of(child), [structured(stage) for stage in child.stages]]
                    for child in source.pipelines]
         return json_value({type(source).__name__: members, **weights}, "a corpus's key")
 
     return fingerprint(read_of(chain))
+
+
+def _corpus_keys(phases: Phases) -> Callable[[Pipeline], str]:
+    """The key each corpus `phases` read is shared and saved by: its content's (`_corpus_key`), the key a
+    run's saved cursor names, for the first corpus in phase order that states that content, an unnamed
+    store reused across phases among them; for each later corpus of one content (another unnamed store
+    alike in every stated field), the content's with its place among them, so they share no corpus (row
+    14119) and no saved cursor's key moves, a phase appended after them included (train 1484: a reused
+    unnamed store's moved, its phase read again from its start). A corpus's own place in the process
+    (`_corpus_key`'s `local`) tells a repeat of it from another; no key states it."""
+    chains = [chain for pipeline in phases.pipelines for chain in (pipeline, *_corpora(pipeline))]
+    seen: dict[str, list[str]] = {}
+    for chain in chains:
+        held = seen.setdefault(_corpus_key(chain), [])
+        if (local := _corpus_key(chain, local=True)) not in held:
+            held.append(local)
+
+    def key(chain: Pipeline) -> str:
+        content = _corpus_key(chain)
+        place = seen[content].index(_corpus_key(chain, local=True))
+        return content if place == 0 else fingerprint({"content": content, "place": place})
+
+    return key
 
 
 def _alone_mixed(phases: Phases) -> Phases:
@@ -38,12 +66,13 @@ def _alone_mixed(phases: Phases) -> Phases:
     read alone continues as `mix([(corpus, 1.0)])` written in each phase does, where it was refused. A
     phase that reads it otherwise (in a mix of its own, a concatenation) stays as written. Every phase of a
     read on its own streams is staged from the phases so read (`dew.data.compile._compile_phases`)."""
-    keys = [{_corpus_key(chain) for chain in _corpora(pipeline)} for pipeline in phases.pipelines]
+    key = _corpus_keys(phases)
+    keys = [{key(chain) for chain in _corpora(pipeline)} for pipeline in phases.pipelines]
     shared = {key for index, held in enumerate(keys) for key in held
               if any(key in others for at, others in enumerate(keys) if at != index)}
 
     def mixed(pipeline: Pipeline) -> Pipeline:
-        if isinstance(pipeline.source, Combined) or _corpus_key(pipeline) not in shared:
+        if isinstance(pipeline.source, Combined) or key(pipeline) not in shared:
             return pipeline
         cut = _until(pipeline.stages, (BatchStage, TokenBudget))
         # The member the corpus and its steps, named as the phase names it; its read and loading the phase's.
@@ -61,10 +90,11 @@ def _shared(phases: Phases) -> tuple[dict[str, str], ...]:
     Refuses a shared corpus a phase reads other than as a member of its own mix, whose position no key
     names, and one two phases read through other steps before their mixes, where the earlier's draws are
     no draws of the later's."""
+    key = _corpus_keys(phases)
     reads: dict[str, list[tuple[int, Pipeline]]] = {}
     for index, pipeline in enumerate(phases.pipelines):
         for chain in _corpora(pipeline):
-            reads.setdefault(_corpus_key(chain), []).append((index, chain))
+            reads.setdefault(key(chain), []).append((index, chain))
     shared = {key: read for key, read in reads.items() if len({index for index, _ in read}) > 1}
     members: list[dict[str, str]] = [{} for _ in phases.pipelines]
     keyed: dict[str, str] = {}

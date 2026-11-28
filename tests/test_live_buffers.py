@@ -34,9 +34,13 @@ from live_buffers_support import (
     module_bytes,
     of,
     read,
+    scanned_hidden,
 )
 
-from dew.training.live_buffers import LiveBuffer, LiveInterval, peak_live
+from dew._cache import uncached
+from dew.nn.kernels.generation import compile_only_gpus
+from dew.telemetry import hlo
+from dew.training.live_buffers import LiveBuffer, LiveInterval, live_intervals, peak_live
 from dew.training.memory import LiveProfile
 
 FIXTURES = Path(__file__).parent / "fixtures" / "live_buffers"
@@ -72,20 +76,25 @@ def test_an_interval_shares_memory_only_with_a_buffer_still_live():
     where a freed buffer was is new memory again (XLA's FREE then SHARE_WITH); a heap's pages each hold their
     own buffers of one trace; an allocation simulated per computation has a trace each, positions from 0 in
     each; a share of a share, freed or not, lies in the first's memory; XLA's count of a peak charges a share
-    of a live buffer nothing and a buffer of no bytes never."""
+    of a live buffer nothing and a buffer of no bytes never. An allocation is complete where its every array
+    is simulated: an array placed unsimulated leaves it incomplete, a tuple's index table placed past its
+    heap (sm90's gemm fusions' tuples) does not."""
     module = module_bytes(INTERVALS)
     defined = instruction_ids(module)
     assignment: Any = empty_assignment()
-    ids = {"a": 1, "b": 2, "c": 3, "d": 4, "e": 5, "p": 6, "z": 7}
-    sizes = {"z": 0}
+    ids = {"a": 1, "b": 2, "c": 3, "d": 4, "e": 5, "p": 6, "z": 7, "t": 8}
+    sizes = {"z": 0, "t": 16}
     for name, buffer in ids.items():
         logical = assignment.logical_buffers.add(id=buffer, size=sizes.get(name, 16))
         logical.defined_at.instruction_id = defined[name].id
-    # p is placed in the second page unsimulated, as XLA places a reused heap's.
-    for index, names in enumerate(("abz", "cdep")):
+    table = hlo.pool().FindEnumTypeByName("xla.PrimitiveType").values_by_name["TUPLE"].number
+    # p is placed in the second page unsimulated, as XLA places a reused heap's; t, a tuple's index table,
+    # in the first past its heap.
+    for index, names in enumerate(("abzt", "cdep")):
         allocation = assignment.buffer_allocations.add(index=index, size=32)
         for name in names:
-            allocation.assigned.add(logical_buffer_id=ids[name], size=sizes.get(name, 16))
+            allocation.assigned.add(logical_buffer_id=ids[name], size=sizes.get(name, 16),
+                                    element_type=table if name == "t" else 0)
     alloc, free, share = 0, 1, 2
     events = [(alloc, "a", None), (alloc, "c", None), (free, "a", None), (share, "b", "a"), (share, "d", "c"),
               (free, "c", None), (free, "d", None), (share, "e", "d"), (free, "e", None), (free, "b", None),
@@ -327,6 +336,25 @@ def test_a_residual_a_policy_saves_is_named_by_its_checkpoint_name():
     assert sorted(buffer.parameter for buffer in live if buffer.kind == "parameter") == [0, 1]
 
 
+@pytest.mark.parametrize("generation", ["sm80", "sm90"])
+def test_a_gpu_compiles_scan_stack_is_one_stack_in_each_buffer_holding_it(generation):
+    """A scan saving its named residual, its gradient compiled anew by XLA:GPU for a compile-only device of
+    `generation` (sm90's: the stack written by an async dynamic-update-slice fusion, its index table of a
+    gemm fusion's tuple past the heap): every buffer holding the stack, the zeros, each step's write and the
+    loop's value, is the one stack the loop writes alone, and every array of each allocation is simulated
+    (rows 14089 and 14091's sm90 twins)."""
+    devices = compile_only_gpus(generation, 1, 80 << 30)
+    sharding = jax.sharding.NamedSharding(jax.sharding.Mesh(devices, ("x",)), jax.sharding.PartitionSpec())
+    rows = jax.ShapeDtypeStruct((16, 512, 256), jnp.float32, sharding=sharding)
+    weight = jax.ShapeDtypeStruct((256, 256), jnp.float32, sharding=sharding)
+    with uncached():
+        intervals = live_intervals(jax.jit(jax.grad(scanned_hidden, argnums=1)).lower(rows, weight).compile())
+    assert intervals and all(each.complete for each in intervals)
+    stacked = [each for each in intervals if each.shape == (16, 512, 256) and each.kind != "parameter"]
+    assert len({each.instruction for each in stacked}) > 1
+    assert len({each.stack for each in stacked}) == 1 and stacked[0].stack is not None
+
+
 _LOOP = (FIXTURES / "loop.hlo").read_text()
 """A loop of seven state elements, `STEPS` its trip count (`_loop_names`)."""
 
@@ -354,6 +382,27 @@ def _loop_names(steps: int, config: str = _STATED) -> dict[str, tuple[str, ...]]
         alias.location.shape_index.append(element)
         peak.logical_buffer_ids.append(element)
     return {buffer.instruction: buffer.names for buffer in read(assignment, module).live()}
+
+
+def test_a_stack_is_scoped_by_its_row_however_it_is_assigned():
+    """A viewed stack's buffer, whether its initial broadcast's aliased to the loop's element or the loop's
+    own element, is made by the row its body writes, in the row's rung scope, not by the broadcast or the
+    loop (train 1474's P-F3)."""
+    text = _LOOP.replace("STEPS", "4")
+    module = module_bytes(text)
+    defined = instruction_ids(module, "e")
+    assignment: Any = empty_assignment()
+    assignment.buffer_allocations.add(index=0, size=32)
+    peak = assignment.peak_buffers.add(index=0)
+    buffer = assignment.logical_buffers.add(id=0, size=32)
+    buffer.defined_at.instruction_id = defined["viewed"].id
+    alias = assignment.buffer_aliases.add(source_buffer_id=0)
+    alias.location.instruction_id = defined["loop"].id
+    alias.location.shape_index.append(8)
+    peak.logical_buffer_ids.append(0)
+    [aliased] = read(assignment, module).live()
+    assert (aliased.names, aliased.op_name) == (("viewed",), "jit(f)/jvp(g)/dew_rung/seen")
+    assert _defined_at_loop(text, (8,)) == {("viewed",): "jit(f)/jvp(g)/dew_rung/seen"}
 
 
 _VIEWED_OUTSIDE = (("  flat = f32[4,2]{1,0} parameter(0)\n  stack = f32[4,1,2]{2,1,0} bitcast(flat)",
@@ -449,6 +498,128 @@ def test_a_loops_state_is_named_only_by_a_scans_whole_stack():
     # A config XLA's parser holds as an opaque string states no trip count: no stack is named by it.
     assert _loop_names(4, 'backend_config="opaque"') == _loop_names(2)
     assert _loop_names(4, 'backend_config="\\377"') == _loop_names(2)
+
+
+_ELEMENTS = (*enumerate(("zeros", "ones", "populated", "filled", "spread", "blank", "tardy")), (8, "viewed"),
+             (9, "fused"), (10, "called"), (0, "written"), (6, "ended"), (8, "stacked"))
+"""Each loop state element of `_LOOP` by an instruction holding its value: the initial element's, or the
+body's write into it."""
+
+
+def _loop_stacks(text: str, elements=_ELEMENTS) -> dict[str, tuple[str, int | None]]:
+    """The name and stack `Assignment.live` reads each buffer of `elements` (each a loop state element, or
+    several read in order, and an instruction defining a value) of loop module `text` as, by the instruction
+    defining it, each aliased to the loop's elements, as XLA's alias analysis holds a loop state's values,
+    all live at one peak; a stack by its state element, not the loop's id."""
+    module = module_bytes(text)
+    defined = {**instruction_ids(module, "body"), **instruction_ids(module, "e")}
+    loop = defined["loop"]
+    assignment: Any = empty_assignment()
+    assignment.buffer_allocations.add(index=0, size=32 * len(elements))
+    peak = assignment.peak_buffers.add(index=0)
+    for buffer_id, (element, name) in enumerate(elements):
+        buffer = assignment.logical_buffers.add(id=buffer_id, size=32)
+        buffer.defined_at.instruction_id = defined[name].id
+        for each in (element,) if isinstance(element, int) else element:
+            alias = assignment.buffer_aliases.add(source_buffer_id=buffer_id)
+            alias.location.instruction_id = loop.id
+            alias.location.shape_index.append(each)
+        peak.logical_buffer_ids.append(buffer_id)
+    found = {}
+    for buffer in read(assignment, module).live():
+        assert buffer.stack is None or buffer.stack[0] == loop.id
+        stack = None if buffer.stack is None else buffer.stack[1]
+        found[buffer.instruction] = (",".join(buffer.names), stack)
+    return found
+
+
+def test_each_buffer_of_a_stack_its_loop_writes_alone_is_that_stack():
+    """A scan's stack is one stack in each buffer holding its values, the zeros before the loop and each
+    step's write into them, fused, viewed through bitcasts or run asynchronously (row 12463: a cold 4B
+    start's forward held 167 GiB of its stacks' in-loop values, read as no stack, so no remat was priced to
+    free them); an element the loop does not write a row a step (overwritten in place, written at a fixed
+    row, laid out anew, written at a counter through another op) is none."""
+    assert _loop_stacks(_LOOP.replace("STEPS", "4")) == {
+        "zeros": ("hidden", 0), "ones": ("late", 1), "populated": ("", None), "filled": ("", None),
+        "spread": ("", None), "blank": ("", None), "tardy": ("deep", 6), "viewed": ("viewed", 8),
+        "fused": ("fused", 9), "called": ("called", 10), "written": ("hidden", 0), "ended": ("deep", 6),
+        "stacked": ("viewed", 8)}
+
+
+@pytest.mark.parametrize(("where", "read"), [
+    ("  over = ", "  peek = f32[1,2]{1,0} dynamic-slice(stack, i, zero), dynamic_slice_sizes={1,2}\n"),
+    ("  late = ", "  peek = f32[4,2]{1,0} negate(written)\n"),
+    ("  bound = ", ("  first = f32[4,2]{1,0} get-tuple-element(state), index=0\n"
+                    "  peek = f32[4,2]{1,0} negate(first)\n")),
+], ids=["body-reads-the-stack", "body-reads-its-write", "condition-reads-the-stack"])
+def test_a_stack_its_loop_reads_besides_writing_it_is_none(where, read):
+    """A loop's element whose rows its body or its condition reads, the state or the step's write into
+    it, is needed by the loop's own steps: none of its buffers is a stack a step that saves no row builds
+    none of, though it is named by the row it writes all the same."""
+    text = _LOOP.replace("STEPS", "4")
+    assert where in text
+    found = _loop_stacks(text.replace(where, read + where, 1))
+    assert (found["zeros"], found["written"]) == (("hidden", None), ("hidden", None))
+    assert found["ones"] == ("late", 1)
+
+
+def test_a_value_aliased_to_a_stack_but_none_of_its_own_is_no_stack():
+    """XLA's alias set of a loop's stack can hold a value that is none of the loop's own (a conditional
+    returning the stack from one branch and another array from the other): only the stack's own values, its
+    zeros, the loop's phis and output and each step's write, are the stack; another is none, whatever its
+    alias set (review of row 12463)."""
+    found = _loop_stacks(_LOOP.replace("STEPS", "4"), ((0, "zeros"), (0, "fused"), (0, "written")))
+    assert (found["zeros"][1], found["written"][1], found["fused"][1]) == (0, 0, None)
+
+
+def test_a_stack_is_read_as_the_loop_element_its_value_is_whatever_element_is_read_first():
+    """A loop's write aliased first to another stack's element and then to its own is its own stack's,
+    named as its own row: an alias set can hold two loops' stacks (a conditional returning one scan's
+    from one branch and another's from the other; review of row 12463)."""
+    found = _loop_stacks(_LOOP.replace("STEPS", "4"), (((1, 0), "written"), ((0, 1), "reversed")))
+    assert (found["written"], found["reversed"]) == (("hidden", 0), ("late", 1))
+
+
+def test_a_stack_whose_zeros_another_op_reads_is_none():
+    """A scan's stack whose zeros another op reads besides its loop (a metric of the broadcast) is needed
+    past its loop's own reads: none of its buffers is a stack (review of row 12463)."""
+    text = _LOOP.replace("STEPS", "4")
+    assert "  unit = f32[] constant(1)\n" in text
+    found = _loop_stacks(text.replace("  unit = f32[] constant(1)\n",
+                                      "  unit = f32[] constant(1)\n  side = f32[4,2]{1,0} negate(zeros)\n"))
+    assert (found["zeros"], found["written"]) == (("hidden", None), ("hidden", None))
+    assert found["ones"] == ("late", 1)
+
+
+def test_a_stack_whose_zeros_producer_another_op_reads_whole_is_none():
+    """A scan's stack whose zeros are one output of a producer of several, another op reading that
+    producer's tuple whole (a call taking it), may be read past its loop's own reads: none of its buffers is
+    a stack (review of row 12463)."""
+    text = _LOOP.replace("STEPS", "4")
+    zeros = "  zeros = f32[4,2]{1,0} broadcast(a), dimensions={}\n"
+    assert zeros in text
+    paired = ("  pair = (f32[4,2]{1,0}, f32[4,2]{1,0}) fusion(a), kind=kLoop, calls=paired\n"
+              "  zeros = f32[4,2]{1,0} get-tuple-element(pair), index=0\n")
+    producer = ("paired {\n  value = f32[] parameter(0)\n"
+                "  spread = f32[4,2]{1,0} broadcast(value), dimensions={}\n"
+                "  ROOT both = (f32[4,2]{1,0}, f32[4,2]{1,0}) tuple(spread, spread)\n}\n\nENTRY e {")
+    alone = text.replace(zeros, paired).replace("ENTRY e {", producer)
+    assert _loop_stacks(alone, ((0, "zeros"), (0, "written")))["written"] == ("hidden", 0)
+    whole = alone.replace(paired, paired + "  read = (f32[4,2]{1,0}, f32[4,2]{1,0}) copy(pair)\n")
+    assert _loop_stacks(whole, ((0, "zeros"), (0, "written")))["written"] == ("hidden", None)
+
+
+def test_a_stack_whose_async_write_passes_it_on_besides_is_none():
+    """A stack an async call writes, whose start's operands another op reads through its output besides
+    the call's own done, is read past its write: none of its buffers is a stack (review of row 12463)."""
+    text = _LOOP.replace("STEPS", "4")
+    begun = "  ended = f32[4,2]{1,0} async-done(begun)\n"
+    assert begun in text
+    found = _loop_stacks(text.replace(begun, begun + (
+        "  operands = (f32[4,2]{1,0}, f32[2]{0}, s32[]) get-tuple-element(begun), index=0\n"
+        "  peeked = f32[4,2]{1,0} get-tuple-element(operands), index=0\n")))
+    assert (found["tardy"], found["ended"]) == (("deep", None), ("deep", None))
+    assert found["zeros"] == ("hidden", 0)
 
 
 def test_a_residual_named_through_reshapes_names_the_buffer_they_bitcast():

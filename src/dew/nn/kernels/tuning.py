@@ -395,12 +395,12 @@ against them (`encoded`) and a stored object read by its tag (`decoded`)."""
 
 def _launch_json(ba: tokamax.BoundArguments) -> dict[str, JSON]:
     """A launch as JSON: its op as its picks name it (`_identity`) and its arguments, a hook among them
-    by its presence (`_traced`)."""
+    by what it computes (`KernelOp.identified`)."""
     op = ba.op
     hooks = op.HOOKS if isinstance(op, KernelOp) else ()
     return {"op": encoded(_identity(op)),
-            "arguments": {name: encoded(op.traced(name, value) if isinstance(op, KernelOp) and name in hooks
-                                        else value)
+            "arguments": {name: encoded(op.identified(name, value) if isinstance(op, KernelOp)
+                                        and name in hooks else value)
                           for name, value in ba.arguments.items()}}
 
 
@@ -961,7 +961,7 @@ class KernelOp(tokamax.Op):
     def _get_autotuning_cache_key(self, ba: tokamax.BoundArguments) -> Mapping[str, object]:
         key = super()._get_autotuning_cache_key(ba)
         return type(key)({name: bucketed(spec) if name in self.ROWS and spec is not None
-                          else self.traced(name, spec) if name in self.HOOKS else spec
+                          else self.identified(name, spec) if name in self.HOOKS else spec
                           for name, spec in key.items()})
 
     def padded(self, ba: tokamax.BoundArguments, config) -> float | None:
@@ -1003,7 +1003,9 @@ class KernelOp(tokamax.Op):
             return found[1]
         key = self.traced(name, value)
         try:
-            refs = tuple(weakref.ref(leaf, lambda _, place=place: _TRACED.pop(place, None))
+            # The cache the callback drops its entry from bound as it is made: a leaf collected as the
+            # interpreter exits outlives the module's globals, `_TRACED` then None.
+            refs = tuple(weakref.ref(leaf, lambda _, place=place, held=_TRACED: held.pop(place, None))
                          for leaf in leaves)
         except TypeError:
             # A callable no weak reference holds: traced each time.
@@ -1333,17 +1335,16 @@ def _held_dtype(value) -> np.dtype:
     return jax.dtypes.canonicalize_dtype(np.asarray(value).dtype)
 
 
-def _identity(op: tokamax.Op, *, traced: bool = True) -> tokamax.Op:
-    """`op` as its picks name it: without the config and the vjp a call sets, its hook
-    fields by what they compute (`KernelOp.traced`, a tuning run's alone: `reading`, `seen`, `tune`, whose
-    picks persist under it across checkouts), or, not `traced`, as every launch's identity reads them
-    (`KernelOp.identified`, `report._identity`), tracing nothing; its `pulled` out of the repr that identity
-    reads, a launch's certification keying its reverse mode itself (`report.certified`)."""
+def _identity(op: tokamax.Op) -> tokamax.Op:
+    """`op` as its picks name it: without the config and the vjp a call sets, its hook fields by what they
+    compute, read once for each hook while it lives (`KernelOp.identified`: the same digest a tuning run's
+    picks persist under across checkouts and every launch's identity reads, `report._identity`, a model's
+    shared hooks traced once, row 14185); its `pulled` out of the repr that identity reads, a launch's
+    certification keying its reverse mode itself (`report.certified`)."""
     if not isinstance(op, KernelOp):
         return op.replace(config=None, vjp=None)
     fields = {field.name for field in dataclasses.fields(op)}
-    read = op.traced if traced else op.identified
-    hooks = {name: read(name, getattr(op, name)) for name in op.HOOKS if name in fields}
+    hooks = {name: op.identified(name, getattr(op, name)) for name in op.HOOKS if name in fields}
     return op.replace(config=None, vjp=None, **hooks)
 
 
@@ -2149,11 +2150,13 @@ def _timings_of(observed: Observed) -> Timings | None:
 
 
 class Measurer(NamedTuple):
-    """The GPU a process measures launches on (`_settle`): its model (`kind`), its timing of a launch's
-    configs every call takes (`measured`, `_measured`'s) and its store of the timings (`store`,
-    `_store`'s)."""
+    """The GPU a process measures launches on (`_settle`): its model (`kind`, the store its picks key by), its
+    facts (`target`: the attached GPU's, which a launch is timed for only where its placement chose it,
+    `_chosen_for`), its timing of a launch's configs every call takes (`measured`, `_measured`'s) and its
+    store of the timings (`store`, `_store`'s)."""
 
     kind: str
+    target: generation.GpuTarget
     measured: Callable[[KernelOp, tokamax.BoundArguments, Sequence[Observed]], Timings]
     store: Callable[[str, Mapping[tuple[tokamax.Op, Hashable], tuple[dict[str, JSON], Timings]]], None]
 
@@ -2164,7 +2167,20 @@ def _measurer(measure: bool) -> Measurer | None:
     none."""
     if not (measure and _cache.measures_picks()):
         return None
-    return Measurer(get_default_device().device_kind, _measured, _store)
+    # The device that runs the timing, its own facts whatever the caller assumes or its mesh names.
+    device = get_default_device()
+    return Measurer(device.device_kind, generation.device_target(device), _measured, _store)
+
+
+def _chosen_for(placed: Placement, target: generation.GpuTarget) -> bool:
+    """Whether a launch traced at `placed` was chosen for `target`: the GPU its placement states
+    (`gpu_target` within it: the device it assumed, its facts its own, else its mesh's or the attached
+    one's) is `target`, its kernels compiled for it, not interpreted. A launch an assumed device chose (an
+    A100's tiles traced on an H100's host, no mesh naming it) is never timed on another GPU, nor its timings
+    stored in that GPU's picks (Train 1478's review)."""
+    with _placed_in(placed):
+        chosen = generation.gpu_target()
+    return (placed.assumption is None or not placed.assumption.interpreted) and chosen == target
 
 
 def _settle(found: Sequence[Observed], *, measurer: Measurer | None) -> int:
@@ -2193,9 +2209,14 @@ def _settle(found: Sequence[Observed], *, measurer: Measurer | None) -> int:
             op, ba = observed.launch
             group = calls[_distinct_key(observed)]
             fastest = None if (held := _timings_of(observed)) is None else _usable(held, group)
-            fresh = None
-            if fastest is None and measuring is not None:
-                measured = measuring.measured(op, ba, group)
+            # Timed only at a call's placement that chose it for the GPU attached, whichever call traced
+            # first: that call first, its placement the one its candidates compile at
+            # (`_candidate_compiles`), every call's legality still read (`_measurable`).
+            timing = None if fastest is not None or measuring is None else next(
+                (call for call in group if _chosen_for(call.placed, measuring.target)), None)
+            if timing is not None and measuring is not None:
+                ordered = [timing, *(call for call in group if call is not timing)]
+                measured = measuring.measured(op, ba, ordered)
                 if not measured.prune_errors():
                     _log.warning("no config of %s compiled or ran; it keeps its heuristic: %s",
                                  type(op).__name__, next(iter(measured.values()), None))
@@ -2207,14 +2228,15 @@ def _settle(found: Sequence[Observed], *, measurer: Measurer | None) -> int:
                 timings = Timings({**(held.prune_errors() if held is not None else {}), **fresh})
                 identity, key = _launch_key(ba)
                 _TIMINGS.setdefault((identity, kind), _Picks())[key] = timings
+                # Stored at the placement they were measured at, its derivation theirs.
+                with _placed_in(timing.placed):
+                    timed[_launch_key(ba)] = _described(ba), fresh
                 fastest = _usable(timings, group)
             if fastest is None:
                 continue
             # Each entry made at its launch's placement, the derived config it carries its GPU's (`_entry`).
             with _placed_in(observed.placed):
                 decisions.append(_entry(ba, fastest))
-                if fresh is not None:
-                    timed[_launch_key(ba)] = _described(ba), fresh
         if timed and measuring is not None:
             measuring.store(kind, timed)
         return _picks_json(kind, decisions)
