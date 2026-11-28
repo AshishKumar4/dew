@@ -16,7 +16,7 @@ from flax.typing import Dtype, PrecisionLike
 from jax.custom_derivatives import SymbolicZero
 
 from ..derivatives import KernelGlue, Protected, contracted, declared_tangent
-from ..precision import accumulated, at_least_fp32, rounded_operand, scaled_partial, stated_algorithm
+from ..precision import accumulated, at_least_fp32, ragged, rounded_operand, scaled_partial, stated_algorithm
 from . import generation
 from .templates.product import SCALE_DEPTH, eight
 
@@ -208,9 +208,10 @@ def placed_ragged_dot(values: jax.Array, matrices: jax.Array, group_sizes: jax.A
                       precision: PrecisionLike = None,
                       preferred_element_type: Dtype | None = None) -> jax.Array:
     """`jax.lax.ragged_dot` as written (its one primitive, which a fuser reads as the program's dot), placed
-    where an Explicit mesh axis places its operands (`ragged_product`)."""
-    return ragged_product(values, matrices, precision=precision)(
-        values, matrices, group_sizes, preferred_element_type=preferred_element_type)
+    where an Explicit mesh axis places its operands (`ragged_product`); its zeros where it has no groups
+    (`precision.ragged`)."""
+    return ragged(ragged_product(values, matrices, precision=precision), values, matrices, group_sizes,
+                  preferred_element_type=preferred_element_type)
 
 
 def ragged_placement(sources: tuple) -> jax.sharding.NamedSharding | None:
