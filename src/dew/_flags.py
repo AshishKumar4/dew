@@ -103,10 +103,10 @@ def record_flags[R: Bound](record: type[R], member: type | Callable[..., registr
         kept = {name: value for name, value in self.bound.keywords.items() if name not in merged}
         given = {name: vars(self)[name] for name in stated_defaults
                  if vars(self)[name] != stated_defaults[name]}
-        bound = functools.partial(member, **{**kept, **given})
-        vars(bound)[MERGED] = frozenset(given)
-        object.__setattr__(self, "bound", bound)
+        object.__setattr__(self, "bound", functools.partial(member, **{**kept, **given}))
         record.__post_init__(self)
+        # Named on the binding the record holds once its own normalizing (`Bound.__post_init__`) has made it.
+        vars(self.bound)[MERGED] = frozenset(given)
 
     namespace = {"__post_init__": __post_init__, "__module__": __name__, "_alias": alias.replace("_", "-"),
                  "_flags": flats, "__doc__": (member.__doc__ or "").split("\n\n")[0]}
