@@ -17,7 +17,7 @@ from reference_error import ahead_arm
 
 from dew.nn import precision, programs
 from dew.nn.kernels import generation
-from dew.nn.kernels.templates import cost, emission, mosaic, swizzling
+from dew.nn.kernels.templates import cost, emission, mosaic, mosaic_sm100, swizzling
 from dew.nn.kernels.templates.cost import Stated, Work
 
 _ROW = jax.ShapeDtypeStruct((128,), jnp.float32)
@@ -559,6 +559,26 @@ def test_an_async_smem_to_tmem_copy_charges_shared_bytes_from_its_source_without
     assert sliced_work.shared_bytes == 128 * 64 * 2 and sliced_work.device_bytes == 0
     assert packed_work.shared_bytes == 128 * 64 // 2 and packed_work.device_bytes == 0
 
+
+
+def test_a_prefetch_a_global_ref_and_a_scales_copy_are_priced_as_what_they_move():
+    """A GEMM body's prefetch into the L2 (`plgpu.async_prefetch`) moves no bytes a unit counts, the copies
+    after it reading them; a global allocation's ref (`pl.get_global`, a flag's semaphore) moves none
+    itself; and a block-scaled product's scales copied into tensor memory (`plgpu.async_copy_scales_to_tmem`)
+    read their shared tile's bytes, a 128-row tile's four one-byte e8m0 scales a row 512 (row 14181's
+    launches)."""
+    def body(out_gmem, scales, tensor_scales):
+        plgpu.async_prefetch(out_gmem)
+        pl.get_global(plgpu.SemaphoreType.REGULAR)
+        plgpu.async_copy_scales_to_tmem(scales, tensor_scales)
+
+    tile = mosaic_sm100.scale_tiles(128, 4)
+    launch = plgpu.kernel(body, out_type=_ROW, num_threads=1, thread_name="wg",
+                          scratch_types=[plgpu.SMEM(tile, jnp.float8_e8m0fnu),
+                                         plgpu.TMEM(mosaic_sm100.scale_memory(tile, 1), jnp.float8_e8m0fnu,
+                                                    layout=plgpu.TMEMLayout.SCALES_LAYOUT)])
+    work = emission.emitted(jax.make_jaxpr(launch)(), 1, "wg").roles[0].fixed
+    assert (work.shared_bytes, work.device_bytes, work.device_reads) == (128 * 4, 0, 0)
 
 
 def test_a_walks_serial_loops_compose_their_paths_before_their_mean():

@@ -333,9 +333,12 @@ _FREE = frozenset({
     pallas.program_id_p, tpu.dma_wait_p, gpu.wait_gmem_to_smem_p, pjit.reshard_p, lax.gather_p,
     lax.dynamic_slice_p, lax.dynamic_update_slice_p, lax.concatenate_p, lax.pad_p, lax.rev_p, lax.split_p,
     lax.stack_p, lax.tile_p, lax.unstack_p, gpu.commit_group_p, ad_util.stop_gradient_p, jax_core.pvary_p,
-    jax_core.reduced_vary_cast_p})
+    jax_core.reduced_vary_cast_p, pallas.get_global_p, gpu.async_prefetch_p})
 """What moves no data between memories and computes nothing a unit's rate prices: synchronization, layouts,
-a value's type cast along manual mesh axes (to vary, or from reduced: no value changes),
+a value's type cast along manual mesh axes (to vary, or from reduced: no value changes), a global
+allocation's ref (`pl.get_global`: its semaphores' and flags' uses count where they move data), a prefetch
+into the L2 (the copies after it read the bytes it warms and count them, the device traffic it moves early
+the launch's statement's, `Stated`),
 indices, a value's elements rearranged among a role's registers (a gather's, a slice's, a concatenation's;
 every layout move the Pallas fuser tiles: a dynamic slice and its update, whose index arithmetic is scalar,
 which nothing counts, a split, a stack, a tile and an unstack, so a fused prologue's stage holds no
@@ -347,6 +350,10 @@ _PRODUCTS = frozenset({gpu.wgmma_ref_p, gpu.tcgen05_mma_p})
 
 _COPIES = frozenset({gpu.copy_gmem_to_smem_p, gpu.copy_smem_to_gmem_p})
 """Copies between device and shared memory (`_copied`)."""
+
+_TO_TENSOR_MEMORY = frozenset({gpu.async_copy_smem_to_tmem_p, gpu.async_copy_scales_to_tmem_p})
+"""Copies from shared into tensor memory, a block-scaled product's scales among them
+(`_smem_to_tmem_bytes`)."""
 
 def _surely(value) -> bool:
     """Whether a predicate the count holds as `value` is known true here (`programs.integral_scalar`)."""
@@ -525,8 +532,8 @@ def _copied(equation) -> int:
 
 
 def _smem_to_tmem_bytes(equation) -> int:
-    """An `async_copy_smem_to_tmem` copy's shared-memory read bytes: its SMEM source's, as its transforms
-    slice it (`smem_tree` leaves after `(smem_ref, tmem_ref)`, rows 9106, 9476)."""
+    """A copy into tensor memory's shared-memory read bytes (`_TO_TENSOR_MEMORY`): its SMEM source's, as its
+    transforms slice it (`smem_tree` leaves after `(smem_ref, tmem_ref)`, rows 9106, 9476)."""
     params, avals = equation.params, [variable.aval for variable in equation.invars]
     smem_tree = params["smem_tree"]
     shaped = _transformed(avals[0], smem_tree, avals[2:2 + smem_tree.num_leaves])
@@ -850,7 +857,7 @@ class _Counting:
             surely = not params.get("has_user_predicate") or _surely(values[-1])
             read = copied if primitive is gpu.copy_gmem_to_smem_p and self.guaranteed and surely else 0
             self.add(Work(device_bytes=copied, shared_bytes=copied, device_reads=read))
-        elif primitive is gpu.async_copy_smem_to_tmem_p:
+        elif primitive in _TO_TENSOR_MEMORY:
             self.add(Work(shared_bytes=_smem_to_tmem_bytes(equation)))
         elif primitive is tpu.dma_start_p:
             # A TPU core's copy between HBM and VMEM: its destination's bytes as its transforms read it.
