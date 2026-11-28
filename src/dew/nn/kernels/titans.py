@@ -95,15 +95,22 @@ def real_gradients(k, v, readout, real, weight, bias, eps: float):
     return jnp.where(live, inner_gradient(k, v, jnp.where(live, readout, zeros), weight, bias, eps), zeros)
 
 
-def read_out(walked, queries, weight, bias, eps: float, dtype):
-    """A walk's readouts `[N, C, B, H, D]` as the call's output `[B, T, H, D]` in `dtype`, the padding
-    dropped: each query (`[B, H, T, D]`, as the walk read it) plus its readout's LayerNorm under the inner
-    loss's affine, the memory's residual around its input (Dew's `ResidualMemory`, the TTT paper's Sec
-    2.7)."""
-    out = jnp.moveaxis(walked.reshape(-1, *walked.shape[2:]), 0, 2)[:, :, :queries.shape[2]]
-    # The affine whole before the residual, as the memory's norm applies it (`ResidualMemory`): `q + (LN w +
-    # c)`, where `(q + LN w) + c` lost the query to an affine its bias cancels.
-    return jnp.moveaxis(queries + layer_normed(out, weight, bias, eps), 1, 2).astype(dtype)
+def read_out(reads, queries, weight, bias, eps: float):
+    """A mini-batch's outputs `[B, H, C, D]`: each query (as the walk read it) plus its readout's (`reads`,
+    `[B, H, C, D]`) LayerNorm under the inner loss's affine, the memory's residual around its input (Dew's
+    `ResidualMemory`, the TTT paper's Sec 2.7), formed in the mini-batch's own step (`memory_chunks`), so a
+    run that recomputes its chunks (`CHUNK`) recomputes the norm's intermediates with them and none lives
+    across the sequence (train 1495's review). The affine whole before the residual, as the memory's norm
+    applies it: `q + (LN w + c)`, where `(q + LN w) + c` lost the query to an affine its bias cancels."""
+    return queries + layer_normed(reads, weight, bias, eps)
+
+
+def assembled(outputs, length: int, dtype):
+    """The mini-batches' outputs `[N, B, H, C, D]` (`read_out`'s, as the walk stacks them) as the call's
+    output `[B, T, H, D]` in `dtype`, the padding past its `length` tokens dropped."""
+    out = jnp.moveaxis(outputs, 0, 2)
+    out = out.reshape(*out.shape[:2], -1, out.shape[-1])[:, :, :length]
+    return jnp.moveaxis(out, 1, 2).astype(dtype)
 
 
 def placed_alike(affine, *operands):
@@ -209,8 +216,9 @@ def titans(query, key, value, weight, bias, theta, alpha, eta, state=None, *, ch
             return pair, jnp.einsum('bhk,bhkv->bhv', q, pair[0])
 
         tokens = tuple(jnp.moveaxis(x, 2, 0) for x in (q, k, gradient, theta, alpha, eta, real))
-        return jax.lax.scan(token, pair, tokens)
+        pair, reads = jax.lax.scan(token, pair, tokens)
+        return pair, read_out(jnp.moveaxis(reads, 0, 2), q, weight, bias, eps)
 
     keys, *rest = mini_batches(chunk, k, q, v, theta, alpha, eta, valid=valid)
     final, out = memory_chunks(mini_batch, states, (rest[0], keys, *rest[1:]))
-    return read_out(out, q, weight, bias, eps, dtype), final
+    return assembled(out, q.shape[2], dtype), final

@@ -122,6 +122,9 @@ CHUNK = MEMORY_RESIDUALS[1]
 (`dew.nn.residuals.RESIDUALS`), and of a chunk's own values, which a rung naming it recomputes from that
 state (`residuals.RECOMPUTED`: the heaviest rung's, `decoder_block.recomputed_inside`)."""
 
+MINI_BATCHED = "memory_mini_batched"
+"""The scope a call's mini-batched kernel runs under (`jax.named_scope`, `InContextMemory._mini_batch`): the
+route a call of rows of one document takes, told apart from the general path by a program's reader."""
 STATE, MOMENTUM, START, COUNT = "memory_state", "memory_momentum", "memory_start", "memory_count"
 """The decode cache's variables: the network's fast parameters now, the momentum, the parameters at the
 chunk's start, and the real tokens of each row's current document seen, rows first. A row that has
@@ -750,9 +753,10 @@ class InContextMemory(LinearProducts):
         weight, bias = (jnp.stack([head.held["norm"][name] for head in heads]) for name in ("scale", "bias"))
         memory = jnp.stack([row["kernel"] for row in rows], axis=1)
         offset = jnp.stack([row["bias"] for row in rows], axis=1)[:, :, None]
-        return ttt.ttt_linear(steps.query, steps.key, steps.value, weight, bias, steps.theta,
-                              state=(memory, offset), chunk=self.chunk, scale=1.0, eps=network.epsilon,
-                              valid=steps.real)[0]
+        with jax.named_scope(MINI_BATCHED):
+            return ttt.ttt_linear(steps.query, steps.key, steps.value, weight, bias, steps.theta,
+                                  state=(memory, offset), chunk=self.chunk, scale=1.0, eps=network.epsilon,
+                                  valid=steps.real)[0]
 
     # The function, token by token and chunk by chunk.
 
