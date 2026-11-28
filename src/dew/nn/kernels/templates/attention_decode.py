@@ -647,10 +647,7 @@ def _planned_step(query: jax.Array, key: jax.Array, value: jax.Array, spans: Key
             state = algebra.merged_state(spec, padded, stacked[0], stacked[1], initial)
         else:
             state = merged.merged_split(spec, padded, stacked, queries=queries, width=width, initial=initial)
-        if finished:
-            state = state if initial is not None else algebra.nan_massless(spec, state)
-            return ungrouped_rows(algebra.finish(spec, state, initial=True, normalized=True)[0],
-                                  heads).astype(query.dtype)
+        # An unfinished step's state: a finished one's merge finished it (`merge_branch`).
         return _unpacked_state(resumable(spec, state), heads)
 
     def common() -> jax.Array | Initial:
