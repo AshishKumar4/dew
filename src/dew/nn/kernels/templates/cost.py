@@ -17,6 +17,7 @@ import math
 from collections.abc import Sequence
 from typing import TYPE_CHECKING, NamedTuple
 
+import jax
 from jax.experimental import pallas as pl
 
 from dew.nn.kernels import generation
@@ -35,10 +36,11 @@ def estimate(flops: float, *arrays, transcendentals: float = 0) -> pl.CostEstima
 
 def stored(*arrays) -> int:
     """The bytes `arrays` take in memory, each once (`resources.stored_bytes`: a packed dtype's two elements a
-    byte)."""
+    byte); a semaphore's or a barrier's none, an extended dtype of no data (a GEMM's tail flags)."""
     from dew.nn.kernels.templates import resources
 
-    return int(sum(resources.stored_bytes(array.shape, array.dtype) for array in arrays))
+    return int(sum(resources.stored_bytes(array.shape, array.dtype) for array in arrays
+                   if not jax.dtypes.issubdtype(array.dtype, jax.dtypes.extended)))
 
 
 @dataclasses.dataclass(frozen=True)

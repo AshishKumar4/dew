@@ -581,6 +581,15 @@ def test_a_prefetch_a_global_ref_and_a_scales_copy_are_priced_as_what_they_move(
     assert (work.shared_bytes, work.device_bytes, work.device_reads) == (128 * 4, 0, 0)
 
 
+def test_a_semaphore_or_a_barrier_stores_no_bytes():
+    """A launch's semaphores and barriers (extended dtypes of no data: a GEMM's tail flags, `pl.get_global`)
+    store no bytes beside its data's (`cost.stored`), so a launch holding them states and footprints its data
+    alone (row 14181's launches)."""
+    row = jax.ShapeDtypeStruct((128,), jnp.float32)
+    flags = plgpu.SemaphoreType.REGULAR((4,)).get_ref_aval()
+    assert cost.stored(row, flags, plgpu.Barrier().get_ref_aval()) == cost.stored(row) == 512
+
+
 def test_a_walks_serial_loops_compose_their_paths_before_their_mean():
     """A walk's loops (its opening, steady and closing segments) run one after another through one ring: a
     step's path is their paths followed one by the other, then their mean, so two segments of one barrier
