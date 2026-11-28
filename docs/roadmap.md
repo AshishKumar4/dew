@@ -14,6 +14,7 @@ This page is generated from the maintainers' findings ledger as each change land
 - The kernel challenge's lessons in the templates. [5271]
 - 4B Real-Token MFU Breakthrough from Existing Profiles. [11941, 11942]
 - Cached and block visibility on the template's spans. [245]
+- Low-precision and decode-size GEMMs. [483, 4518, 4519]
 - Performance measurements. [569, 1378]
 - One attention algebra: state, visibility, hooks. [1293]
 - The template beats FA2 and FA3, its resources the model's. [1299, 13288, 13509, 5284, 5285, 5293]
@@ -28,8 +29,8 @@ This page is generated from the maintainers' findings ledger as each change land
 - Every consumer runs the template's program. [13741]
 - Log-linear bf16 training backward regression. [13750]
 - Log-linear NaN across live spans. [13991]
-- Low-precision and decode-size GEMMs. [483, 4518, 4519]
-- Model consumers fused through the template's hooks. [1376, 3422, 3428, 822]
+- A per-key decay's recurrence walk traced the portable pairs once per sub-chunk block. [14081]
+- Model consumers fused through the template's hooks. [1376, 3422, 3428, 822, 14084]
 - Further attention variants. [1461, 1462, 1463, 1465, 1317, 1466]
 - Native TPU GEMM dispatch. [1560]
 - Flax's dot_product_attention with force_fp32_for_softmax keeps the softmax's float32 probabilities into the PV product (a float32 output), a legitimate…. [4860]
@@ -46,13 +47,13 @@ This page is generated from the maintainers' findings ledger as each change land
 - A Mosaic GPU kernel's reduction along a tile's rows issues its butterfly's shuffles (SHFL) and cross-lane combines, which emission does not count. [12889]
 - Exact on every path, every edge and every derivative order. [2656]
 - MoE transport, role-aware low precision and observability. [4515]
+- The suite's wall. [5478]
 - A 4B decision start's cold fit spends 152.8 s (template) and 162.2 s (vendor) in 12 traces of templates/report.py's certification program pulled_back…. [6593]
 - Pallas's interpreter compiles a thread map's body once per leased CPU client. [7087]
 
 ## Models and interop
 
 - Every recurrence transition and state family. [1300, 1448, 1450, 1451, 1452, 1454, 1457, 1459, 1460, 1646]
-- The suite's wall. [5478, 12431, 12433]
 - Dew's per-destination publication lock (dew._files._publishing, theme 63c) is keyed by the destination's name as given. [13744]
 - The remaining releases' media towers. [851, 879]
 - Formats read and written. [871, 2548]
