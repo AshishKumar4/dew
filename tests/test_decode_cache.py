@@ -134,7 +134,8 @@ def _kernels_branched(jaxpr) -> tuple[int, int]:
     staged = branched = 0
     for equation in jaxpr.eqns:
         staged += equation.primitive in programs.NATIVE_KERNELS
-        index = produced.get(equation.invars[0]) if equation.invars else None
+        index = (produced.get(equation.invars[0])
+                 if equation.invars and programs.computed(equation.invars[0]) else None)
         platform = index is not None and index.primitive.name == "platform_index"
         runs = equation.primitive.name == "cond" and not platform
         for body in programs.bodies(equation):
@@ -152,8 +153,8 @@ def test_a_decode_step_whose_kernel_takes_its_start_stages_it_unbranched(layout)
     stays there): the step stages that kernel on no branch of whether a start narrows, where the branch
     staged it twice a layer and the host waited on its predicate each layer of each step (57% of a
     GH200's decode samples, row 6107)."""
-    model = CausalTransformer(vocab_size=37, **{**TINY_DECODER, "emb_features": 64}, dtype=jnp.bfloat16,
-                              kv_cache=layout)
+    model = CausalTransformer(vocab_size=37, **{**TINY_DECODER, "emb_features": 64, "max_seq_len": 64},
+                              dtype=jnp.bfloat16, kv_cache=layout)
     ids = jnp.zeros((2, 6), jnp.int32)
     params = model.init(jax.random.key(0), ids)
     cache = model.init(jax.random.key(0), ids[:, :1], decode=True)["cache"]
