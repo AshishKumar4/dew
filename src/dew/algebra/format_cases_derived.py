@@ -43,18 +43,18 @@ from dew.algebra import _generated
 from dew.algebra.shared_derived import (
     shared_component_4,
     shared_component_13,
-    shared_component_15,
+    shared_component_14,
     shared_component_18,
-    shared_component_23,
+    shared_component_21,
     shared_component_24,
     shared_component_27,
     shared_component_30,
     shared_component_32,
-    shared_component_37,
-    shared_component_43,
-    shared_component_45,
+    shared_component_38,
+    shared_component_44,
     shared_component_46,
     shared_component_47,
+    shared_component_48,
 )
 
 
@@ -64,7 +64,7 @@ def _decode_e4m3_0(x1):
         jnp.dtype('float32'))
     v15 = lax.mul_p.bind(
         v14, np.array(float.fromhex('0x1.0000000000000p-9'), dtype=jnp.dtype('float32')), out_dtype=None)
-    v20, v21 = shared_component_37(v4, v7, v15, v13, v2, 0, jnp.dtype('uint32'), 127)
+    v20, v21 = shared_component_38(v4, v7, v15, v13, v2, 0, jnp.dtype('uint32'), 127)
     v29, = shared_component_32(
         v21, v7, v20, 126, jnp.dtype('uint32'), 0, lax.shift_left_p, 31, 2143289344, jnp.dtype('float32'))
     return (v29,)
@@ -76,7 +76,7 @@ def _decode_e5m2_0(x1):
         jnp.dtype('float32'))
     v15 = lax.mul_p.bind(
         v14, np.array(float.fromhex('0x1.0000000000000p-16'), dtype=jnp.dtype('float32')), out_dtype=None)
-    v20, v21 = shared_component_37(v4, v7, v15, v13, v2, 0, jnp.dtype('uint32'), 127)
+    v20, v21 = shared_component_38(v4, v7, v15, v13, v2, 0, jnp.dtype('uint32'), 127)
     v22 = lax.or_p.bind(v7, np.array(2139095040, dtype=jnp.dtype('uint32')))
     v23 = lax.bitcast_convert_type_p.bind(v22, new_dtype=jnp.dtype('float32'))
     v24 = lax.eq_p.bind(v21, np.array(124, dtype=jnp.dtype('uint32')))
@@ -123,21 +123,21 @@ def _e8m0_exponents_0(x1):
 
 
 def _fp8_epilogue_0(x1):
-    v2, v23, v215 = shared_component_15(
-        x1, jnp.dtype('bfloat16'), jnp.dtype('float32'), (32, 1, 128), (2,), (x1.shape[0], 1, x1.shape[1]),
-        (0, 1), (32, 128), jnp.dtype('uint32'), lax.shift_right_logical_p, 23, 255, 8388607,
-        jnp.dtype('int32'), 127, 0, (x1.shape[0], x1.shape[1]), (), lax.shift_left_p, 254, 2147483648,
-        jnp.dtype('uint8'), jnp.dtype('float8_e4m3fn'))
-    return (v2, v215, v23)
+    v2, v26, v218 = shared_component_14(
+        x1, jnp.dtype('bfloat16'), jnp.dtype('float32'), (32, 1, 128), jnp.dtype('uint32'), 2147483648, (2,),
+        (x1.shape[0], 1, x1.shape[1]), (0, 1), (32, 128), lax.shift_right_logical_p, 23, 255, 8388607,
+        jnp.dtype('int32'), 127, 0, (x1.shape[0], x1.shape[1]), (), lax.shift_left_p, 254, jnp.dtype('uint8'),
+        jnp.dtype('float8_e4m3fn'))
+    return (v2, v218, v26)
 
 
 def _fp8_epilogue_1(x1):
-    v2, v23, v215 = shared_component_15(
-        x1, jnp.dtype('bfloat16'), jnp.dtype('float32'), (64, 2, 128), (2,), (x1.shape[0], 2, 128), (0, 1),
-        (64, 256), jnp.dtype('uint32'), lax.shift_right_logical_p, 23, 255, 8388607, jnp.dtype('int32'), 127,
-        0, (x1.shape[0], x1.shape[1]), (), lax.shift_left_p, 254, 2147483648, jnp.dtype('uint8'),
+    v2, v26, v218 = shared_component_14(
+        x1, jnp.dtype('bfloat16'), jnp.dtype('float32'), (64, 2, 128), jnp.dtype('uint32'), 2147483648, (2,),
+        (x1.shape[0], 2, 128), (0, 1), (64, 256), lax.shift_right_logical_p, 23, 255, 8388607,
+        jnp.dtype('int32'), 127, 0, (x1.shape[0], x1.shape[1]), (), lax.shift_left_p, 254, jnp.dtype('uint8'),
         jnp.dtype('float8_e4m3fn'))
-    return (v2, v215, v23)
+    return (v2, v218, v26)
 
 
 def _gemm_partial_scale_0(x1, x2, x3):
@@ -181,7 +181,7 @@ def _gemm_partial_scale_0(x1, x2, x3):
 
 
 def _mxfp8_block_decode_0(x1, x2):
-    v130, = shared_component_45(
+    v130, = shared_component_46(
         x2, x1, jnp.dtype('float8_e8m0fnu'), jnp.dtype('uint8'), jnp.dtype('int32'),
         (x1.shape[0], x2.shape[1], x1.shape[0]), (0, 1), (32, 256), jnp.dtype('float8_e4m3fn'),
         jnp.dtype('float32'), jnp.dtype('uint32'), lax.shift_right_logical_p, lax.shift_left_p,
@@ -190,7 +190,7 @@ def _mxfp8_block_decode_0(x1, x2):
 
 
 def _mxfp8_block_decode_1(x1, x2):
-    v130, = shared_component_45(
+    v130, = shared_component_46(
         x2, x1, jnp.dtype('float8_e8m0fnu'), jnp.dtype('uint8'), jnp.dtype('int32'),
         (x1.shape[0], x2.shape[1], 32), (0, 1), (64, 128), jnp.dtype('float8_e4m3fn'), jnp.dtype('float32'),
         jnp.dtype('uint32'), lax.shift_right_logical_p, lax.shift_left_p, (x1.shape[0], x1.shape[1]), ())
@@ -198,7 +198,7 @@ def _mxfp8_block_decode_1(x1, x2):
 
 
 def _mxfp8_block_decode_bf16_0(x1, x2):
-    v132, = shared_component_43(
+    v132, = shared_component_44(
         x2, x1, jnp.dtype('float8_e8m0fnu'), jnp.dtype('uint8'), jnp.dtype('int32'),
         (x1.shape[0], x2.shape[1], x1.shape[0]), (0, 1), (32, 256), jnp.dtype('float8_e4m3fn'),
         jnp.dtype('float32'), jnp.dtype('uint32'), lax.shift_right_logical_p, lax.shift_left_p,
@@ -207,7 +207,7 @@ def _mxfp8_block_decode_bf16_0(x1, x2):
 
 
 def _mxfp8_block_decode_bf16_1(x1, x2):
-    v132, = shared_component_43(
+    v132, = shared_component_44(
         x2, x1, jnp.dtype('float8_e8m0fnu'), jnp.dtype('uint8'), jnp.dtype('int32'),
         (x1.shape[0], x2.shape[1], 32), (0, 1), (64, 128), jnp.dtype('float8_e4m3fn'), jnp.dtype('float32'),
         jnp.dtype('uint32'), lax.shift_right_logical_p, lax.shift_left_p, (x1.shape[0], x1.shape[1]), (), 16,
@@ -412,16 +412,16 @@ def mxfp8_block_decode_bf16(*operands, policy: str = 'default', target: str = 's
 _mxfp8_epilogue_forms = _generated.Forms(single=False, cases={
     ('default', 'sm90', (((32, 128), 'float32'),)):
         functools.partial(
-        shared_component_23, p1=(32, 4, 32), p2=(2,), p3=(32, 4, 32), p4=(0, 1), p5=(32, 128),
-        p6=jnp.dtype('uint32'), p7=lax.shift_right_logical_p, p10=jnp.dtype('int32'), p15=(32, 128), p16=(),
-        p17=127, p20=lax.shift_left_p, p21=23, p23=jnp.dtype('float32'), p43=jnp.dtype('uint8'),
-        p44=jnp.dtype('float8_e4m3fn'), p46=jnp.dtype('float8_e8m0fnu')),
+        shared_component_21, p1=(32, 4, 32), p2=jnp.dtype('uint32'), p3=2147483648, p5=(2,),
+        p6=jnp.dtype('float32'), p7=(32, 4, 32), p8=(0, 1), p9=(32, 128), p11=lax.shift_right_logical_p,
+        p14=jnp.dtype('int32'), p19=(32, 128), p20=(), p21=127, p24=lax.shift_left_p, p25=23,
+        p47=jnp.dtype('uint8'), p48=jnp.dtype('float8_e4m3fn'), p50=jnp.dtype('float8_e8m0fnu')),
     ('default', 'sm90', (((64, 128), 'float32'),)):
         functools.partial(
-        shared_component_23, p1=(64, 4, 32), p2=(2,), p3=(64, 4, 32), p4=(0, 1), p5=(64, 128),
-        p6=jnp.dtype('uint32'), p7=lax.shift_right_logical_p, p10=jnp.dtype('int32'), p15=(64, 128), p16=(),
-        p17=127, p20=lax.shift_left_p, p21=23, p23=jnp.dtype('float32'), p43=jnp.dtype('uint8'),
-        p44=jnp.dtype('float8_e4m3fn'), p46=jnp.dtype('float8_e8m0fnu')),
+        shared_component_21, p1=(64, 4, 32), p2=jnp.dtype('uint32'), p3=2147483648, p5=(2,),
+        p6=jnp.dtype('float32'), p7=(64, 4, 32), p8=(0, 1), p9=(64, 128), p11=lax.shift_right_logical_p,
+        p14=jnp.dtype('int32'), p19=(64, 128), p20=(), p21=127, p24=lax.shift_left_p, p25=23,
+        p47=jnp.dtype('uint8'), p48=jnp.dtype('float8_e4m3fn'), p50=jnp.dtype('float8_e8m0fnu')),
 })
 
 
@@ -468,12 +468,12 @@ def nvfp4_block_decode(*operands, policy: str = 'default', target: str = 'sm90')
 _nvfp4_payload_forms = _generated.Forms(single=True, cases={
     ('default', 'sm90', (((16, 32), 'uint32'),)):
         functools.partial(
-        shared_component_46, p1=(1, 0), p2=(32, 2, 8), p3=jnp.dtype('uint32'), p4=(8,), p6=(1, 1, 8), p7=(2,),
+        shared_component_47, p1=(1, 0), p2=(32, 2, 8), p3=jnp.dtype('uint32'), p4=(8,), p6=(1, 1, 8), p7=(2,),
         p8=lax.shift_left_p, p10=(32, 2), p11=(), p12=jnp.dtype('uint8'), p14=lax.shift_right_logical_p,
         p21=jnp.dtype('uint16'), p22=(32, 16), p24=jnp.dtype('float32'), p25=jnp.dtype('int32')),
     ('default', 'sm90', (((32, 64), 'uint32'),)):
         functools.partial(
-        shared_component_46, p1=(1, 0), p2=(64, 4, 8), p3=jnp.dtype('uint32'), p4=(8,), p6=(1, 1, 8), p7=(2,),
+        shared_component_47, p1=(1, 0), p2=(64, 4, 8), p3=jnp.dtype('uint32'), p4=(8,), p6=(1, 1, 8), p7=(2,),
         p8=lax.shift_left_p, p10=(64, 4), p11=(), p12=jnp.dtype('uint8'), p14=lax.shift_right_logical_p,
         p21=jnp.dtype('uint16'), p22=(64, 32), p24=jnp.dtype('float32'), p25=jnp.dtype('int32')),
 })
@@ -529,9 +529,9 @@ def quantized_ste_tangent(*operands, policy: str = 'default', target: str = 'sm9
 
 _rounded_forms = _generated.Forms(single=True, cases={
     ('default', 'sm90', (((16, 32), 'float32'),)):
-        functools.partial(shared_component_47, p1=jnp.dtype('bfloat16'), p2=jnp.dtype('float32')),
+        functools.partial(shared_component_48, p1=jnp.dtype('bfloat16'), p2=jnp.dtype('float32')),
     ('default', 'sm90', (((8, 64), 'float32'),)):
-        functools.partial(shared_component_47, p1=jnp.dtype('bfloat16'), p2=jnp.dtype('float32')),
+        functools.partial(shared_component_48, p1=jnp.dtype('bfloat16'), p2=jnp.dtype('float32')),
 })
 
 
@@ -542,9 +542,9 @@ def rounded(*operands, policy: str = 'default', target: str = 'sm90'):
 
 _rounded_fp16_forms = _generated.Forms(single=True, cases={
     ('default', 'sm90', (((16, 32), 'float32'),)):
-        functools.partial(shared_component_47, p1=jnp.dtype('float16'), p2=jnp.dtype('float32')),
+        functools.partial(shared_component_48, p1=jnp.dtype('float16'), p2=jnp.dtype('float32')),
     ('default', 'sm90', (((8, 64), 'float32'),)):
-        functools.partial(shared_component_47, p1=jnp.dtype('float16'), p2=jnp.dtype('float32')),
+        functools.partial(shared_component_48, p1=jnp.dtype('float16'), p2=jnp.dtype('float32')),
 })
 
 
