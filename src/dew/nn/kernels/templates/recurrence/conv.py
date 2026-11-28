@@ -14,13 +14,17 @@ is `short_conv`'s: the products summed tap by tap from the oldest (`short_conv.p
 the SiLU's sigmoid one quotient, the norm's root and inverse each rounded once.
 """
 
+import functools
 from collections.abc import Callable
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from jax import lax
 from jax.experimental import pallas as pl
+from jax.experimental.mosaic.gpu import fragmented_array as fa
 from jax.experimental.pallas import mosaic_gpu as plgpu
+from jax.extend.mlir.dialects import vector as vector_dialect
 
 from dew.nn.kernels import generation, short_conv, tuning
 from dew.nn.kernels.templates import cost, mosaic, outputs, scan
@@ -142,19 +146,46 @@ def _activated(pre, activation: bool):
     return pre / (1.0 + jnp.exp(-pre)), logistic_value(pre)
 
 
+def _taps(ref, columns, count: int, lanes_: int, *, interpret: bool) -> tuple:
+    """The taps `[lanes, count]` of `columns` (`ref` `[C, K]`, the checkpoint's order, `DepthwiseConv1d`'s), a
+    vector `[lanes]` a tap in the scan's layout (`scan.blocked`): each lane's taps read whole once, a thread
+    `width` lanes' `count` taps side by side, and split in its registers (`_split_taps`, a shuffle a tap).
+    Read a tap at a time down `[K, C]`, the call transposed its weight first, a launch a layer a decode step
+    (row 14174: 12 of an LM_HYBRID B8 step's, weight-only work)."""
+    width = lanes_ // scan.THREADS
+    side_by_side = plgpu.Layout.WG_STRIDED((lanes_, count), vec_size=width * count)
+    weights = plgpu.load(ref.at[columns, :], layout=side_by_side, optimized=False).astype(jnp.float32)
+    if interpret:
+        return tuple(weights[:, tap] for tap in range(count))
+    tap_vector = plgpu.ShapeDtypeStruct((lanes_,), jnp.dtype(jnp.float32), layout=scan.blocked(lanes_))
+    inline = plgpu.inline_mgpu(arg_types=(side_by_side,), return_type=(tap_vector,) * count)
+    return inline(functools.partial(_split_taps, lanes_=lanes_, count=count))(weights)
+
+
+def _split_taps(_, held, *, lanes_: int, count: int) -> tuple:
+    """`_taps`' body (`plgpu.inline_mgpu`'s): a thread's register of its lanes' taps side by side, a vector of
+    its lanes a tap (`vector.shuffle` of every `count`-th element from the tap's)."""
+    width = lanes_ // scan.THREADS
+    (register,) = held.registers.flat
+    lane = fa.WGStridedFragLayout((lanes_,), vec_size=width)
+    return tuple(fa.FragmentedArray(_registers=np.array([vector_dialect.shuffle(
+        register, register, list(range(tap, width * count, count)))], dtype=object), _layout=lane,
+        _is_signed=None) for tap in range(count))
+
+
 class _Piece:
     """A program's view of its piece: its row, its tokens' first, its channels in the operand and the
     piece, the taps and bias it reads, and the masks."""
 
-    def __init__(self, refs, *, first: int, local, length: int, count: int, tokens: int, lanes_: int):
+    def __init__(self, refs, *, first: int, local, length: int, count: int, tokens: int, lanes_: int,
+                 interpret: bool):
         self.x_ref, self.w_ref, self.b_ref, self.valid_ref, self.documents_ref = refs
         self.row, self.length, self.count = lax.axis_index("rows"), length, count
         self.start = lax.axis_index("tokens") * tokens
         self.local, self.columns = pl.ds(local, lanes_), pl.ds(first + local, lanes_)
         self.lanes = lanes_
         layout = scan.blocked(lanes_)
-        self.taps = [plgpu.load(self.w_ref.at[tap, self.columns], layout=layout, optimized=False)
-                     .astype(jnp.float32) for tap in range(count)]
+        self.taps = _taps(self.w_ref, self.columns, count, lanes_, interpret=interpret)
         self.bias = (None if self.b_ref is None else plgpu.load(
             self.b_ref.at[self.columns], layout=layout, optimized=False).astype(jnp.float32))
 
@@ -231,7 +262,7 @@ def forward(x, taps, bias, valid, documents, *, parts: tuple, activation: bool, 
     H100 against the Triton conv's one at 4.8 (M-JS-25)."""
     rows, length, _ = x.shape
     count, tokens, lanes_ = taps.shape[1], _tokens(length), lanes(parts, x.dtype)
-    operands = [x, taps.T, bias, valid, documents]
+    operands = [x, taps, bias, valid, documents]
     bounds = _programs(parts, lanes_)
 
     def walk(piece: _Piece, out_ref, exchanged, head: int | None):
@@ -254,7 +285,7 @@ def forward(x, taps, bias, valid, documents, *, parts: tuple, activation: bool, 
             @pl.when((program >= lo) & (program < hi))
             def _(lo=lo, first=first, head=head, out_ref=out_ref):
                 walk(_Piece(found, first=first, local=(program - lo) * lanes_, length=length, count=count,
-                            tokens=tokens, lanes_=lanes_), out_ref, exchanged, head)
+                            tokens=tokens, lanes_=lanes_, interpret=interpret), out_ref, exchanged, head)
 
     # Each piece's rows and tokens `x`'s, its width its own (a share of the channels the config sets).
     out_type = tuple(outputs.output(dtype, outputs.axis(x, 0), outputs.axis(x, 1), width)
@@ -282,7 +313,7 @@ def through(x, taps, bias, valid, documents, dys: tuple, *, parts: tuple, activa
     rows, length, _ = x.shape
     count, tokens, lanes_ = taps.shape[1], _tokens(length), lanes(parts, x.dtype)
     unrolled = _unrolled(tokens)
-    operands = [x, taps.T, bias, valid, documents]
+    operands = [x, taps, bias, valid, documents]
 
     def normed(piece: _Piece, dy_ref, out_ref, exchanged, head: int):
         group = _group(head, lanes_)
@@ -322,7 +353,7 @@ def through(x, taps, bias, valid, documents, dys: tuple, *, parts: tuple, activa
                            pl.ds(first + local, lanes_), dy_ref, out_ref)
                     return
                 normed(_Piece(found, first=first, local=local, length=length, count=count, tokens=tokens,
-                              lanes_=lanes_), dy_ref, out_ref, exchanged, head)
+                              lanes_=lanes_, interpret=interpret), dy_ref, out_ref, exchanged, head)
 
     out_type = outputs.output(jnp.float32, outputs.axis(x, 0), outputs.axis(x, 1), outputs.axis(x, 2))
     grid = (rows, pl.cdiv(length, tokens), x.shape[-1] // lanes_)
@@ -372,14 +403,15 @@ def _backward(x, taps, bias, valid, documents, dy, *, activation: bool, family: 
     rows, length, channels = x.shape
     count, lanes_ = taps.shape[1], lanes(((channels, None),), x.dtype)
     blocks = pl.cdiv(length, tokens)
-    operands = [x, taps.T, bias, valid, documents]
+    operands = [x, taps, bias, valid, documents]
 
     def entry(*refs):
         *given, dy_ref, dx_ref, dw_ref, db_ref = refs
         given = iter(given)
         found = [next(given) if operand is not None else None for operand in operands]
         local = lax.axis_index("channels") * lanes_
-        piece = _Piece(found, first=0, local=local, length=length, count=count, tokens=tokens, lanes_=lanes_)
+        piece = _Piece(found, first=0, local=local, length=length, count=count, tokens=tokens,
+                       lanes_=lanes_, interpret=interpret)
         _backward_walk(piece, dy_ref, (dx_ref, dw_ref, db_ref), activation=activation, tokens=tokens,
                        family=family)
 
@@ -387,7 +419,7 @@ def _backward(x, taps, bias, valid, documents, dy, *, activation: bool, family: 
     # (`x`'s tokens over `tokens`), the taps' count and the channels.
     row, spans, channel = outputs.axis(x, 0), outputs.axis(x, 1).ceil_div(tokens), outputs.axis(x, 2)
     out_type = (outputs.output(x.dtype, row, outputs.axis(x, 1), channel),
-                outputs.output(jnp.float32, row, spans, outputs.axis(operands[1], 0), channel),
+                outputs.output(jnp.float32, row, spans, outputs.axis(taps, 1), channel),
                 outputs.output(jnp.float32, row, spans, channel))
     launched = mosaic.kernel(entry, out_type=out_type, grid=(rows, blocks, channels // lanes_),
                              grid_names=("rows", "tokens", "channels"), warpgroups=1, interpret=interpret,
