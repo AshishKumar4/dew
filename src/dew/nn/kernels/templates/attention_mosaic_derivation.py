@@ -70,12 +70,18 @@ def _priced(target: generation.GpuTarget) -> generation.GpuTarget:
     as one of its generation still: a run of a canonical build reads the part it runs on, and a part's own
     facts priced there named a GH200's kernels apart from the H100 build it ran (row 13252, reopened).
     Pricing alone: a launch's other schedule decisions that read a part's live facts
-    (`attention_mosaic_forward.rewalks_in_place`'s bandwidth and launch latency) still may differ."""
+    (`attention_mosaic_forward.rewalks_in_place`'s bandwidth and launch latency) still may differ. Its L2's
+    read plateau none: a part's own (`Measured.l2_bytes_per_second`), which no other part of its generation
+    reads (kernel-templates.md §6: a part no measurement names states none; Train 1508's F2, a Workstation
+    part priced at the Server Edition's L2). The canonical part's other measured facts it reads still (row
+    14210)."""
     canonical = generation.TARGETS.get(target.generation)
     if canonical is None:
         return target
+    measured = {kind: dataclasses.replace(part, l2_bytes_per_second=None)
+                for kind, part in canonical.measured.items()}
     return dataclasses.replace(canonical, multiprocessors=target.multiprocessors,
-                               shared_limit=target.shared_limit)
+                               shared_limit=target.shared_limit, measured=measured)
 
 
 def _choice_key(op, ba: tokamax.BoundArguments, candidates: tuple[Tiles, ...] | tuple[BackwardTiles, ...],

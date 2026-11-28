@@ -47,6 +47,7 @@ from dew.nn.kernels.templates.cost import (
     most,
     multiplied,
     repeated,
+    stored,
 )
 from dew.nn.kernels.templates.product import product_mode
 
@@ -347,6 +348,12 @@ _PRODUCTS = frozenset({gpu.wgmma_ref_p, gpu.tcgen05_mma_p})
 _COPIES = frozenset({gpu.copy_gmem_to_smem_p, gpu.copy_smem_to_gmem_p})
 """Copies between device and shared memory (`_copied`)."""
 
+def _unread(work: Work) -> Work:
+    """`work` with no copies' reads counted (`Work.device_reads`): a trip's that no bound every trip makes
+    holds (`_Counting.loop`)."""
+    return dataclasses.replace(work, device_reads=0.0)
+
+
 def _folded(equation, operands: list) -> list:
     """`equation` over its concrete integer and boolean scalar operands, each admitted at its atom's dtype
     (`programs.admitted`), as its primitive computes it on the GPU (`programs.scalar_folded`): a width's wrap,
@@ -585,8 +592,12 @@ class _Counting:
     def __init__(self, axis: str | None, index: int, loops: int = 0, warp: tuple | None = None,
                  forms: Mapping | None = None, arrivals: _Arrivals | None = None, lanes: int | None = None,
                  hoisted: dict[tuple, Work] | None = None, sites: Sequence = (),
-                 expansions: dict[int, tuple] | None = None, laid: Mapping | None = None):
+                 expansions: dict[int, tuple] | None = None, laid: Mapping | None = None,
+                 guaranteed: bool = True):
         self.axis, self.index, self.warp, self.forms = axis, index, warp, forms
+        # Whether every path its data may take runs it: none within an arm of a conditional its data decides,
+        # whose copies' reads count none (`Work.device_reads`, a bound on a launch's rereads).
+        self.guaranteed = guaranteed
         # Static work inside a loop, by its site: computed once outside every loop, as the compiler hoists
         # it, whichever trip or arm of whichever trial reaches it (`hoist`, row 12767), so every count within
         # that loop shares it; a conditional's arm outside every loop hoists into its own, its arm's (the
@@ -825,7 +836,7 @@ class _Counting:
             self.add(_tensor(lhs.dtype, 2 * acc.shape[0] * acc.shape[1] * lhs.shape[1]))
         elif primitive in _COPIES:
             copied = _copied(equation)
-            read = copied if primitive is gpu.copy_gmem_to_smem_p else 0
+            read = copied if primitive is gpu.copy_gmem_to_smem_p and self.guaranteed else 0
             self.add(Work(device_bytes=copied, shared_bytes=copied, device_reads=read))
         elif primitive is gpu.async_copy_smem_to_tmem_p:
             self.add(Work(shared_bytes=_smem_to_tmem_bytes(equation)))
@@ -917,7 +928,7 @@ class _Counting:
             trial = _Counting(self.axis, self.index, loops=len(self.loops) + 1, warp=self.warp,
                               forms=self.forms, arrivals=self.arrivals, lanes=self.lanes,
                               hoisted=self.hoisted, sites=self.sites, expansions=self.expansions,
-                              laid=self.laid)
+                              laid=self.laid, guaranteed=self.guaranteed)
             trial.run(body, inputs, static=static)
             self.arrivals.left(trial.landing)
             return trial
@@ -928,16 +939,20 @@ class _Counting:
         # other trips' places.
         steady = trip("steady", 0)
         odd = trip("steady", 1) if "parity" in consulted else steady
+        # Its reads a bound every trip makes (`Work.device_reads`): a trip that read its place or parity reads
+        # as they decide, one trip may be every place at once, so such a loop's trips count none.
+        unread = bool(consulted)
         self.fixed = self.fixed + steady.fixed
-        self.walks.extend(steady.walks)
-        found = _Loop(_mean([steady.loops[-1].work, odd.loops[-1].work]), steady.loops[-1].marks)
+        self.walks.extend(_unread(walk) if unread else walk for walk in steady.walks)
+        work = _mean([steady.loops[-1].work, odd.loops[-1].work])
+        found = _Loop(_unread(work) if unread else work, steady.loops[-1].marks)
         self.ended(found, walks=True)
         if ranged is not None and found.marks and not self.loops:
             # The first and last trips each take their own work in place of a steady one's.
             for at in _PLACES[1:]:
                 taken = (_mean([trip(at, parity).loops[-1].work for parity in (0, 1)]) if "at" in consulted
                          else found.work)
-                self.fixed = self.fixed + taken + repeated(found.work, -1)
+                self.fixed = self.fixed + (_unread(taken) if unread else taken) + repeated(found.work, -1)
 
     def warps(self, equation, values: list, given: list[bool]) -> None:
         """A warpgroup's warps each running its role (`plgpu.warp_map`'s `mpmd_map`: tcgen05's load and
@@ -956,7 +971,7 @@ class _Counting:
                                 forms=self.forms, arrivals=self.arrivals,
                                 lanes=warp if isinstance(mesh, gpu_core.WarpMesh) else self.lanes,
                                 hoisted=self.hoisted, sites=[*self.sites, (name, warp)],
-                                expansions=self.expansions, laid=self.laid)
+                                expansions=self.expansions, laid=self.laid, guaranteed=self.guaranteed)
             counted.run(inner, barriers)
             if self.loops:
                 self.arrivals.left(counted.landing)
@@ -1041,7 +1056,7 @@ class _Counting:
             trial = _Counting(self.axis, self.index, loops=len(self.loops), warp=self.warp,
                               forms=self.forms, arrivals=self.arrivals, lanes=self.lanes,
                               hoisted=self.hoisted if self.loops else {}, sites=self.sites,
-                              expansions=self.expansions, laid=self.laid)
+                              expansions=self.expansions, laid=self.laid, guaranteed=False)
             trial.run(branch, operands, static=given[1:])
             if self.loops:
                 self.arrivals.left(trial.landing)
@@ -1561,7 +1576,7 @@ def _launched(kernel, stated: Stated) -> "Launched":
     # them all, so at most its rereads: a first read a statement omits is no reread (an operand's, an
     # output's read back), nor a store or a reduction; a buffer read in part or written alone only hides
     # another's.
-    footprint = sum(_bytes(var.aval) for var in (*kernel.invars, *kernel.outvars))
+    footprint = stored(*(var.aval for var in (*kernel.invars, *kernel.outvars)))
     reads = counted.issued(lambda work: work.device_reads, stated.steps, programs)
     work = Work(**{unit: issued(unit) for unit in ISSUED_UNITS if unit != "issue_excess"},
                 device_bytes=stated.bytes_accessed, l2_bytes=max(0.0, reads - footprint),

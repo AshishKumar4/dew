@@ -2,6 +2,7 @@
 counted from its body, as each warpgroup runs it."""
 
 import contextlib
+import functools
 import math
 
 import jax
@@ -1659,6 +1660,37 @@ def test_an_atomic_add_counts_its_bytes_reduced_where_global_and_an_a100_prices_
     assert work.global_reductions in cost.units(work, cost.rates(hopper, device=False))[1]
 
 
+def _row_kernel(body, dtype=jnp.float32, elements: int = 128):
+    """The kernel equation of a one-warpgroup launch running `body` over a row of `elements` of `dtype`, its
+    output alike, a shared buffer of the row and a barrier."""
+    row = jax.ShapeDtypeStruct((elements,), dtype)
+    launch = plgpu.kernel(body, out_type=row, num_threads=1, thread_name="wg",
+                          scratch_types=[plgpu.SMEM((elements,), dtype), plgpu.Barrier()])
+    (kernel,) = [equation for equation in programs.equations(jax.make_jaxpr(launch)(row).jaxpr)
+                 if equation.primitive.name in ("mpmd_map", "pallas_call")]
+    return kernel
+
+
+def _read(source, staged, barrier, times: int = 1):
+    """`source` copied into `staged` `times` times, each copy awaited at `barrier`."""
+    for _ in range(times):
+        plgpu.copy_gmem_to_smem(source, staged, barrier)
+        plgpu.barrier_wait(barrier)
+
+
+def _stored(staged, out, times: int = 1):
+    """`staged` stored to `out` `times` times, each store awaited."""
+    for _ in range(times):
+        plgpu.copy_smem_to_gmem(staged, out)
+        plgpu.wait_smem_to_gmem(0)
+
+
+def _l2_bytes(body, dtype=jnp.float32, elements: int = 128, stated: int = 0) -> float:
+    """`_row_kernel`'s launch's L2 bytes (`launch_work`), `stated` its compulsory bytes."""
+    kernel = _row_kernel(body, dtype, elements)
+    return emission.launch_work(kernel, Stated(steps=0, bytes_accessed=stated)).l2_bytes
+
+
 def test_a_launchs_reads_past_its_buffers_whole_are_its_l2_traffic_priced_at_the_l2():
     """A launch reading its 512-byte row three times reads 512 bytes past its row and its output whole: its
     L2 traffic (`Work.l2_bytes`), whatever bytes it states its compulsory ones (`Work.device_bytes`); reading
@@ -1668,29 +1700,19 @@ def test_a_launchs_reads_past_its_buffers_whole_are_its_l2_traffic_priced_at_the
     stream, one memory's two levels, and at none where the part measured no L2 (row 14180)."""
     def launched(reads: int, stores: int = 1, back: bool = False):
         def body(row, out, staged, barrier):
-            for _ in range(reads):
-                plgpu.copy_gmem_to_smem(row, staged, barrier)
-                plgpu.barrier_wait(barrier)
-            for _ in range(stores):
-                plgpu.copy_smem_to_gmem(staged, out)
-                plgpu.wait_smem_to_gmem(0)
-            if back:
-                plgpu.copy_gmem_to_smem(out, staged, barrier)
-                plgpu.barrier_wait(barrier)
+            _read(row, staged, barrier, times=reads)
+            _stored(staged, out, times=stores)
+            _read(out, staged, barrier, times=int(back))
 
-        launch = plgpu.kernel(body, out_type=_ROW, num_threads=1, thread_name="wg",
-                              scratch_types=[plgpu.SMEM((128,), jnp.float32), plgpu.Barrier()])
-        (kernel,) = [equation for equation in programs.equations(jax.make_jaxpr(launch)(_ROW).jaxpr)
-                     if equation.primitive.name in ("mpmd_map", "pallas_call")]
-        return kernel
+        return body
 
     row = 128 * 4
-    thrice = launched(3)
+    thrice = _row_kernel(launched(3))
     for stated in (0, row, 4 * row):
         work = emission.launch_work(thrice, Stated(steps=0, bytes_accessed=stated))
         assert (work.device_bytes, work.l2_bytes) == (stated, row)
     for unread in (launched(2), launched(1, stores=2), launched(1, back=True)):
-        assert emission.launch_work(unread, Stated(steps=0, bytes_accessed=row)).l2_bytes == 0
+        assert _l2_bytes(unread, stated=row) == 0
     g4, h100 = (generation.gpu_target(kind) for kind in ("NVIDIA RTX PRO 6000 Blackwell Server Edition",
                                                        "NVIDIA H100 80GB HBM3"))
     work = emission.launch_work(thrice, Stated(steps=0, bytes_accessed=2 * row))
@@ -1699,3 +1721,68 @@ def test_a_launchs_reads_past_its_buffers_whole_are_its_l2_traffic_priced_at_the
     assert g4_seconds.device == 2 * row / g4.memory_rate + row / g4.l2_rate
     assert h100_seconds.device == 2 * row / h100.memory_rate
     assert not any(g4_unpriced) and not any(h100_unpriced)
+
+
+def test_a_launchs_l2_traffic_is_the_reads_every_path_makes_at_its_buffers_packed_sizes():
+    """A launch's L2 traffic is a bound its reads guarantee: a copy under a conditional its data decides reads
+    on no path every run takes, so it counts none, its arm's loop of six alike (three reads past its 512-byte
+    row and output, 512 bytes, whatever its arms copy), and its buffers count the bytes they take, a packed
+    FP4 row's 1,024 codes 512 bytes (three reads of it 512 past it and its output; Train 1508's F1 and F3)."""
+    def guarded(arm):
+        def body(row, out, staged, barrier):
+            _read(row, staged, barrier, times=3)
+            lax.cond(staged[0] > 0, lambda: arm(row, staged, barrier), lambda: None)
+            _stored(staged, out)
+
+        return body
+
+    def looped(row, staged, barrier):
+        lax.fori_loop(0, 6, lambda step, carry: (_read(row, staged, barrier), carry)[1], 0)
+
+    def thrice(row, out, staged, barrier):
+        _read(row, staged, barrier, times=3)
+        _stored(staged, out)
+
+    assert _l2_bytes(guarded(_read)) == _l2_bytes(guarded(looped)) == 512
+    assert _l2_bytes(thrice, jnp.float4_e2m1fn, 1024) == 512
+
+
+def test_a_walk_whose_trips_read_their_place_counts_no_reads():
+    """A walk whose trips copy its row as their place decides counts none of their reads, as a bound every
+    trip makes holds none of them: one trip may be its first and its last at once (Train 1508's F1). Its first
+    and last trips copying the row three times and its steady trip as its data decides, or every trip but one
+    both first and last copying it twice, a walk of one trip makes no reread, and the launch's one read
+    before the walk none past its row and output."""
+    def walked(step_reads):
+        def body(row, out, staged, barrier):
+            _read(row, staged, barrier)
+            trips = staged[0].astype(jnp.int32)
+
+            def step(index, carry):
+                mosaic.step_index(index)
+                step_reads(index, trips, functools.partial(_read, row, staged, barrier), staged)
+                return carry
+
+            lax.fori_loop(0, trips, step, 0)
+            _stored(staged, out)
+
+        return body
+
+    def ends(index, trips, read, staged):
+        def thrice():
+            read(times=3)
+
+        def inner():
+            lax.cond(index + 1 < trips, lambda: lax.cond(staged[1] > 0, thrice, lambda: None), thrice)
+
+        lax.cond(index == 0, thrice, inner)
+
+    def apart(index, trips, read, staged):
+        def twice():
+            read(times=2)
+
+        lax.cond(index != 0, twice, lambda: lax.cond(index + 1 < trips, twice, lambda: None))
+
+    for step_reads in (ends, apart):
+        work = emission.launch_work(_row_kernel(walked(step_reads)), Stated(steps=1, bytes_accessed=0))
+        assert work.l2_bytes == 0, step_reads.__name__

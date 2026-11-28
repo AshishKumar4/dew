@@ -154,8 +154,9 @@ class Work:
     programs read, met in the L2 (`GpuTarget.l2_rate`), the device memory's own unit's rate a level up
     (`units`: row 14180, the two-level memory a launch's body counts)."""
     device_reads: float = dataclasses.field(default=0.0, metadata=_NOT_ISSUED)
-    """The bytes of a body's `device_bytes` its copies into shared memory read (no store or reduction),
-    which a launch's `l2_bytes` reads past its buffers (`emission.launch_work`)."""
+    """The bytes of a body's `device_bytes` its copies into shared memory read on every path its data may
+    take (no store or reduction, nor a copy under a conditional its data decides), which a launch's
+    `l2_bytes` reads past its buffers (`emission.launch_work`)."""
     shared_bytes: float = 0.0
     tf32_flops: float = 0.0
     span: float = dataclasses.field(default=0.0, metadata=_NOT_ISSUED)
