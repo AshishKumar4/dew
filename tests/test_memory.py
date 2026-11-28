@@ -259,11 +259,13 @@ def test_a_residual_memory_built_by_position_reads_its_fields_as_given():
     """`ResidualMemory(None, "gelu", True, dtype)` is a linear memory with its layer norm, its fourth field
     its dtype and its bias at its default (train 1484's review: a bias field ahead of `dtype` took the
     fourth, a None dropping the bias, a bfloat16 computing in float32)."""
-    params = ResidualMemory(None, "gelu", True, None).init(jax.random.key(0), jnp.ones((1, 4)))
+    # The fields an earlier memory was given by position: `hidden`, `activation`, `norm` and `dtype`.
+    earlier = (None, "gelu", True)
+    params = ResidualMemory(*earlier, None).init(jax.random.key(0), jnp.ones((1, 4)))
     assert set(params["params"]["down"]) == {"kernel", "bias"}
-    narrow = ResidualMemory(None, "gelu", True, jnp.bfloat16)
+    narrow = ResidualMemory(*earlier, jnp.bfloat16)
     x = jnp.ones((1, 4), jnp.bfloat16)
-    assert narrow.apply(narrow.init(jax.random.key(0), x), x).dtype == jnp.bfloat16
+    assert jnp.result_type(narrow.apply(narrow.init(jax.random.key(0), x), x)) == jnp.bfloat16
 
 
 def test_packed_documents_read_as_each_alone():
