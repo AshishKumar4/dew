@@ -229,10 +229,12 @@ def test_a_run_started_from_a_saved_run_resumes_and_serves_on_hosts_whose_caches
     cache("serving_host")
     np.testing.assert_array_equal(answered(Decide.from_run(second, step=1)), served)
     np.testing.assert_array_equal(answered(pipeline(second, step=2)), stepped)
-    # A fourth host, lacking both releases, exporting the run to a store: refused before the run is pinned,
-    # so no release of the saved run is written into its cache (train 1478's review, P-F3).
+    # A fourth host, lacking both releases (the resuming host's cache gone too), exporting the run to a store:
+    # refused before the run is pinned, whose pin would write its release of the saved run into this host's
+    # cache (train 1478's review, P-F3).
     from dew._cli.main import main
 
+    shutil.move(resumed_on.parent.parent, tmp_path / "kept resumed")
     exporting = cache("exporting_host")
     with pytest.raises(ValueError):
         main(["export", second, "memory://refused-export"])
