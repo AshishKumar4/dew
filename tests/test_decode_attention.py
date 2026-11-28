@@ -25,6 +25,7 @@ from dew.nn.attention_masks import with_key_lengths
 from dew.nn.decode_geometry import folded_attention
 from dew.nn.kernels import decode_attention
 from dew.nn.kernels.generation import chosen
+from dew.nn.kernels.templates import assembled
 from dew.nn.precision import FP32_SUMS
 
 pytestmark = pytest.mark.kernel
@@ -745,7 +746,7 @@ def test_a_decode_step_launches_the_decode_kernel_on_each_shard_of_its_mesh(axes
 
     calls = [call for call in custom_calls(lowered) if custom_call_kind(call.target) == "triton"]
     launches = [call for call, kernel in zip(calls, triton_calls(lowered), strict=True)
-                if kernel.name == "decode_attention"]
+                if assembled.kernel_of(kernel.name)[0] == "decode_attention"]
     assert launches
     for call in launches:
         spans, query = call.operands[:2]

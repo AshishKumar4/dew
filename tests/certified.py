@@ -1321,6 +1321,17 @@ def _pair_and_plain_held(params, operands, results, fmt) -> list[np.ndarray]:
     return [*paired, plain]
 
 
+def online_spread(shifted, count: int, reach: float, fmt: Format) -> np.ndarray:
+    """An online softmax's term `e^(x - M)`, `shifted` its `x - M` (at most 0), as its sum holds it: through
+    at most `count` combines, each a subtraction of maxima (its error in the exponent, u|m - M|, summing
+    along the path to at most u(M - x)), an exponential (`reach`, its relative error), a product and a sum,
+    so within this relative error of itself, `e^(u(M - x) + count(reach + 3u)) - 1` (`_softmax_held`'s, and
+    tests/attention_witness.py's of a forward's denominator)."""
+    u = fmt.unit_roundoff
+    with np.errstate(over="ignore"):
+        return np.exp(np.minimum(-u * shifted + count * (reach + 3 * u), 700.0)) - 1
+
+
 def _softmax_held(params, operands, results, fmt) -> list[np.ndarray]:
     """A row's online softmax (`chunked._row_terms`' reduction of `(logits, ones, rest[, columns])`): its
     maximum exact, its maximum's first column exact, and each sum of exponentials scaled to the maximum
@@ -1350,7 +1361,7 @@ def _softmax_held(params, operands, results, fmt) -> list[np.ndarray]:
     with np.errstate(invalid="ignore", over="ignore"):
         shifted = np.where(empty[..., None], 0.0, logits - peak[..., None])
         terms = np.exp(shifted)
-        spread = np.exp(np.minimum(-u * shifted + count * (reach + 3 * u), 700.0)) - 1
+        spread = online_spread(shifted, count, reach, fmt)
     for scale, result in zip(scales, results[1:3], strict=True):
         weighted = scale * terms
         exact, magnitude = exact_sum(weighted, -1), magnitude_sum(weighted, -1)

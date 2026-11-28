@@ -2295,6 +2295,7 @@ def test_a_host_step_lowers_for_a_gpu_here_compiling_nothing():
     companion's for this host, none of them compiled."""
     import dew
     from dew.nn.kernels.lowered import triton_kernels
+    from dew.nn.kernels.templates import assembled
     from dew.telemetry.compiles import Compiles
     from dew.training._lowering import Lowered
 
@@ -2307,11 +2308,14 @@ def test_a_host_step_lowers_for_a_gpu_here_compiling_nothing():
     batch = {"text": jax.ShapeDtypeStruct((jax.device_count(), 129), jnp.int32)}
     with Compiles(None) as compiles, dew.kernels.use(rms_norm="pallas"), pytest.raises(Lowered) as lowered:
         trainer.compile(state, batch)
-    kernels = {name: set(triton_kernels(program)) for name, program in lowered.value.programs}
+    # Each kernel's name less its launch's digest (`report.named`).
+    kernels = {name: {assembled.kernel_of(kernel)[0] for kernel in triton_kernels(program)}
+               for name, program in lowered.value.programs}
     assert compiles.count == 0, compiles.programs
     assert any({"rms_norm_forward", "rms_norm_backward"} & found for found in kernels.values()), kernels
     assert any(not found for found in kernels.values()), kernels
-    assert {"rms_norm_forward"} <= {launch["name"] for launch in lowered.value.kernels.record()["launches"]}
+    assert {"rms_norm_forward"} <= {assembled.kernel_of(launch["name"])[0]
+                                    for launch in lowered.value.kernels.record()["launches"]}
 
 
 @pytest.mark.usefixtures("scanned_stacks")

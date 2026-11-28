@@ -171,14 +171,15 @@ class Lowered(SystemExit):
     this host is not compiles ahead (`dew.training.ahead`).
     """
 
-    def __init__(self, target: str, programs: Sequence[tuple[str, jax.stages.Lowered]], routes=(), *,
-                 options: jax.stages.CompilerOptions | None = None):
+    def __init__(self, target: str | generation.GpuTarget, programs: Sequence[tuple[str, jax.stages.Lowered]],
+                 routes=(), *, options: jax.stages.CompilerOptions | None = None):
         super().__init__(0)
-        self.generation = target
+        # The generation lowered for: a target's own (an attached GPU's SKU, `TrainerAdvanced.lower_for`).
+        self.generation = target if isinstance(target, str) else target.generation
         self.programs = tuple(programs)
         self.options = options
         self.kernels = kernel_report(routes, *(lowered for _, lowered in self.programs))
-        _log.info("the step lowered for %s; its %s", target, self.kernels.summary())
+        _log.info("the step lowered for %s; its %s", self.generation, self.kernels.summary())
 
     @property
     def lowered(self) -> jax.stages.Lowered:

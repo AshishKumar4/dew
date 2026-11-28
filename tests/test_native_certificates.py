@@ -37,11 +37,13 @@ from attention_witness import (
     FORMS,
     assert_backward_faults_refused,
     assert_backward_witnessed,
+    assert_contracted_row_held,
     assert_faults_refused,
+    assert_logit_past_its_maximum_held,
     assert_witnessed,
 )
 from gpu_flow import RUNNING, Cell, in_parts, run_cells
-from interval_certificates import Lane, exp2_reach, tanh_reach
+from interval_certificates import Lane, exp2_reach, exp_reach, tanh_reach
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 from native_certificates import (
@@ -258,8 +260,7 @@ def depth_step(launch: type, fn, *operands) -> tuple[int, bool]:
     keep, and unsplit, as exact sums are."""
     with as_run(), tuning.seen() as launches:
         jax.jit(fn).trace(*operands)
-    [tile] = [config for (op, _), (config, _) in zip(launches, launches.taken, strict=True)
-              if isinstance(op, launch)]
+    [tile] = [observed.config for observed in launches if isinstance(observed.op, launch)]
     field, aligned = STEPS[launch]
     width = getattr(tile, field)
     assert width >= 16 and width & (width - 1) == 0 and getattr(tile, "splits", 1) == 1, tile
@@ -639,10 +640,13 @@ def mosaic_lane() -> Lane:
     """The arithmetic the recurrence mainloop's launches run in on this GPU, probed natively in each lowering
     its bundles take: `exp2`'s reach (`interval_certificates.exp2_reach`), approximated or not, at most
     PTX's (`PTX_EX2`, past it a finding); `tanh`'s unapproximated (`interval_certificates.tanh_reach`, a
-    capped attention score's); and whether an fp32 product below the normal range flushes (2^-30 times
-    2^-100); a 16-bit call's. Its fp32 adds, multiplies, contractions and casts to bf16 and fp16 round to
-    nearest, subnormals kept (row 2084's link 3 probe, both GPUs and lowerings)."""
-    reaches, flushes, tanh_reaches = [], False, []
+    capped attention score's); `exp`'s unapproximated (`interval_certificates.exp_reach`, an accurate
+    backward's weights', `attention_gradient.below`), which keeps every subnormal weight (its probe refusing
+    a flushed one: no lowering under test grants itself the flush); and whether an fp32 product below the
+    normal range
+    flushes (2^-30 times 2^-100); a 16-bit call's. Its fp32 adds, multiplies, contractions and casts to bf16
+    and fp16 round to nearest, subnormals kept (row 2084's link 3 probe, both GPUs and lowerings)."""
+    reaches, flushes, tanh_reaches, exp_reaches = [], False, [], []
     for semantics in ("Lane", "Warpgroup"):
         for approx in (True, False):
             run = mosaic_exp2(semantics, approx=approx)
@@ -650,11 +654,13 @@ def mosaic_lane() -> Lane:
             flushes |= bool(np.any(run(np.full(128, 2.0 ** -30, np.float32))[1] == 0))
         tanh_run = mosaic_exp2(semantics, jnp.tanh, approx=False)
         tanh_reaches.append(tanh_reach(lambda x, run=tanh_run: run(x)[0]))
-    # The witness takes the ISA's stated reach, the probes within it, not the sampled one; tanh's, which no
-    # instruction states (LLVM's expansion, a capped launch taking no approximation), its sampled one.
+        exp_run = mosaic_exp2(semantics, jnp.exp, approx=False)
+        exp_reaches.append(exp_reach(lambda x, run=exp_run: run(x)[0], flushes=False))
+    # The witness takes the ISA's stated reach, the probes within it, not the sampled one; tanh's and exp's,
+    # which no instruction states (LLVM's expansions, taking no approximation), their sampled ones.
     assert max(reaches) <= PTX_EX2, reaches
     return Lane(PTX_EX2, flushes, mainloop.block_of(mainloop.family_of(jnp.bfloat16)),
-                tanh_reach=max(tanh_reaches))
+                tanh_reach=max(tanh_reaches), exp_reach=max(exp_reaches), exp_flushes=False)
 
 
 def the_recurrence_templates_records_certify_natively_a_step_at_a_time(generation_name, regime):
@@ -771,6 +777,16 @@ def the_attention_backward_witness_refuses_its_faults_natively(generation_name):
         assert_backward_faults_refused(interpret=False, lane=mosaic_lane())
 
 
+def the_attention_backward_holds_its_logits_past_their_maximum_natively(generation_name):
+    """The backward witness holds a native call's weights past one: a full row whose fold's FMA keeps its
+    product's residual past the stored maximum (`attention_witness.assert_contracted_row_held`), and two
+    launches over a row whose recomputed logit passes it (`assert_logit_past_its_maximum_held`, the GPU
+    tier's deterministic ops)."""
+    with generation.assumed(generation_name):
+        assert_contracted_row_held(interpret=False, lane=mosaic_lane())
+        assert_logit_past_its_maximum_held(interpret=False, lane=mosaic_lane())
+
+
 def the_attention_witness_refuses_its_faults_natively(generation_name):
     """The attention step witness's faults, each refused where it lands natively
     (`attention_witness.assert_faults_refused`): a dropped rescale, a maximum from the wrong tile, sums
@@ -843,6 +859,8 @@ FLOWS = {
         *(cell(the_attention_backwards_gradients_certify_natively, g, form)
           for g in GENERATIONS for form in FORMS),
         *(cell(the_attention_backward_witness_refuses_its_faults_natively, g)
+          for g in GENERATIONS),
+        *(cell(the_attention_backward_holds_its_logits_past_their_maximum_natively, g)
           for g in GENERATIONS)],
 }
 """The flows the native cells run in (`gpu_flow.run_cells`), a family's links each: a GPU part runs each

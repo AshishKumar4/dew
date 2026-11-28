@@ -376,8 +376,8 @@ def test_a_b200s_products_lower_at_the_tiles_their_launch_derives():
     for name, (call, specs) in calls.items():
         with generation.assumed("sm100"), generation.chosen(grouped_matmul="mosaic"), tuning.seen() as seen:
             lowered_for(call, specs, "sm100")
-        taken = [(op, config, ba) for (op, _), (config, ba) in zip(seen, seen.taken, strict=True)
-                 if isinstance(op, grouped_matmul.MosaicGmm)]
+        taken = [(observed.op, observed.config, observed.arguments) for observed in seen
+                 if isinstance(observed.op, grouped_matmul.MosaicGmm)]
         assert taken, name
         with generation.assumed("sm100"):
             assert all(op.legal(ba, config, generation.gpu_target()) for op, config, ba in taken), name

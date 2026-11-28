@@ -361,8 +361,8 @@ def test_an_arm_ahead_returns_the_launches_of_the_program_it_ran(tmp_path):
             with compiled_truths(tmp_path, prepare=prepare, stamp="launched"):
                 stored.extend(ahead_arm(arm, f"a stored kernel gradient, {at}", launched=True)(x, dy)[1]
                               for at, arm in enumerate((gradient, without_ynn(gradient))))
-    expected = [type(op) for op, _ in traced]
-    assert expected and all([type(op) for op, _ in launches] == expected
+    expected = [type(observed.op) for observed in traced]
+    assert expected and all([type(observed.op) for observed in launches] == expected
                             for launches in (*(found for _, found in made), *stored))
     np.testing.assert_array_equal(np.asarray(made[0][0]), np.asarray(made[1][0]))
 

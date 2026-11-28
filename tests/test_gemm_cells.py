@@ -150,8 +150,8 @@ def test_a_pinned_split_runs_only_where_its_partials_fit_the_workspace():
         with generation.chosen(grouped_matmul="mosaic"):
             with tuning.pinned({grouped_matmul.MosaicGmm: tile}), tuning.seen() as launches:
                 jax.jit(run).trace(*shapes(248))
-            assert tile in {config for (op, _), (config, _) in zip(launches, launches.taken, strict=True)
-                            if isinstance(op, grouped_matmul.MosaicGmm)}
+            assert tile in {observed.config for observed in launches
+                            if isinstance(observed.op, grouped_matmul.MosaicGmm)}
             with tuning.pinned({grouped_matmul.MosaicGmm: tile}), pytest.raises(tuning.Unpinnable):
                 jax.jit(run).trace(*shapes(264))
 
