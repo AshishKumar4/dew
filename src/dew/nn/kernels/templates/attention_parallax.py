@@ -949,7 +949,7 @@ def _dense_tangent(dtype: str, primals, tangents, value) -> jax.Array:
 
 def _centred(weights: jax.Array, direction: jax.Array) -> jax.Array:
     """`w (Σ w d - d)` over a row's keys: a direction centred by the row's weights, as plain fp32 forms it,
-    one contraction; its own transpose."""
+    one contraction (`_second_pulled` its transpose)."""
     return weights * (jnp.sum(weights * direction, axis=-1, keepdims=True) - direction)
 
 
@@ -963,13 +963,15 @@ def _second_moved(residuals: tuple, direction: jax.Array) -> jax.Array:
 
 
 def _second_pulled(residuals: tuple, cotangent: jax.Array) -> jax.Array:
-    """`_second_moved`'s transpose: the cotangent met by the values (`dO · v` a key), centred by the row's
-    weights, then taken back by `2^-p`, so a cotangent near fp32's largest cancels before the power doubles
-    it (restored first, `dO · v = 2^127` read `inf - inf`)."""
+    """`_second_moved`'s transpose: the cotangent met by the values (`dO · v` a key), weighed before it is
+    centred, `w Σ (w c) - w c` (`_centred`'s transpose in the order that shrinks first), then taken back by
+    `2^-p`, so a cotangent near fp32's largest cancels before the power doubles it (restored first,
+    `dO · v = 2^127` read `inf - inf`; centred before weighed, `3 · 2^126` overflowed)."""
     weights, values, rows = residuals
     met = float32_einsum("bhgqd,bkhd->bhgqk", cotangent, values, precision=REFERENCE_PRECISION,
                          preferred_element_type=cotangent.dtype)
-    return power2(_centred(weights, met), -rows)
+    weighed = weights * met
+    return power2(weights * jnp.sum(weighed, axis=-1, keepdims=True) - weighed, -rows)
 
 
 _dense = contracted("test_parallax_holds_every_order")(

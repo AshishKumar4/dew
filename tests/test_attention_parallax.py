@@ -1125,6 +1125,22 @@ def test_a_second_queries_tangent_restores_its_rows_power_after_the_values(secon
     assert float(tangent[0, 0, 0, 0]) == expected
 
 
+def test_a_second_keys_pullback_weighs_its_cotangent_before_it_centres_it():
+    """The dense call's pullback along its second keys over four equal logits, a second query 1, second keys
+    0 and values `[1, 1, 1, -1]`, under a cotangent of `3 · 2^126`: `[-3, -3, -3, 9] · 2^123`, each key's
+    `dO · v` weighed before the row centres it, where centred first the last key's `9 · 2^125` overflowed
+    (train 1500's fix's confirm review)."""
+    one = jnp.ones((1, 1, 1, 1), jnp.float32)
+    value = jnp.asarray([1.0, 1.0, 1.0, -1.0], jnp.float32).reshape(1, 4, 1, 1)
+    spans = template.spans(1, 4, 1)
+    _, pull = jax.vjp(lambda second_key: attention_parallax.reference(
+        jnp.zeros((1, 1, 1, 1), jnp.float32), one, jnp.zeros((1, 4, 1, 1), jnp.float32), second_key, value,
+        spans, scale=1.0), jnp.zeros((1, 4, 1, 1), jnp.float32))
+    found = pull(jnp.full((1, 1, 1, 1), 3 * 2.0 ** 126, jnp.float32))[0]
+    expected = np.asarray([-3, -3, -3, 9], np.float32) * 2.0 ** 123
+    np.testing.assert_array_equal(np.asarray(found).ravel(), expected)
+
+
 def test_a_float64_keys_query_takes_its_power_of_two_wide():
     """Parallax with x64 on over an fp32 query of `2^-126` and float64 keys `0` and `2^150` at a scale of
     `2^-24`: the query widened before its power of two, so the second key's logit is 1 and the output over
