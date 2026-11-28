@@ -53,30 +53,38 @@ def test_a_donated_decode_reads_each_conv_weight_as_stored(delta_decode):
     `[K, C]` the step transposed each layer's weight first, weight-only work a layer a step (row 14174: 12 of
     an LM_HYBRID B8 step's), and a repack of it, a copy or a transpose of its own, would read it twice."""
     every = list(hlo.instructions(_decode_module('sm90', delta_decode)))
-    # A fusion wrapping a kernel (XLA's dynamic-slice fusion around the fused step's custom call) is that
-    # kernel's launch.
-    launching = {op.computation for op in every if op.opcode == 'custom-call'}
-    instructions = [op for op in every if op.entry]
-    users: dict[str, list] = {op.name: [] for op in instructions}
-    for op in instructions:
+    users: dict[tuple[str, str], list] = {(op.computation, op.name): [] for op in every}
+    for op in every:
         for operand in op.operands:
-            users[operand].append(op)
-    weights = [op.name for op in instructions if op.opcode == 'parameter' and 'conv1d____weight' in op.name]
+            users[op.computation, operand].append(op)
+    weights = [op.name for op in every
+               if op.entry and op.opcode == 'parameter' and 'conv1d____weight' in op.name]
 
-    def reached(name: str) -> tuple[set, set]:
-        """The kernels `name` reaches through no-copy views, and the other instructions it meets."""
-        kernels, others, frontier = set(), set(), [name]
+    def parameter(computation: str, index: int) -> str:
+        return next(op.name for op in every if op.computation == computation and op.opcode == 'parameter'
+                    and op.proto.parameter_number == index)
+
+    def reached(computation: str, name: str) -> tuple[set, set]:
+        """The kernels `name` reaches through no-copy views (`bitcast`), into a fusion through its parameter
+        (XLA's dynamic-slice fusion wrapping the fused step's launch), and the other instructions it meets."""
+        kernels, others, frontier = set(), set(), [(computation, name)]
         while frontier:
-            for op in users[frontier.pop()]:
+            where, value = frontier.pop()
+            for op in users[where, value]:
                 if op.opcode == 'bitcast':
-                    frontier.append(op.name)
-                elif op.opcode == 'custom-call' or (op.opcode == 'fusion' and launching & set(op.called)):
+                    frontier.append((where, op.name))
+                elif op.opcode == 'custom-call':
                     kernels.add(op.name)
+                elif op.opcode == 'fusion':
+                    (called,) = op.called
+                    frontier.extend((called, parameter(called, index))
+                                    for index, operand in enumerate(op.operands) if operand == value)
                 else:
                     others.add(f'{op.opcode} {op.name}')
         return kernels, others
 
-    found = {weight: reached(weight) for weight in weights}
+    entry = next(op.computation for op in every if op.entry)
+    found = {weight: reached(entry, weight) for weight in weights}
     assert weights and all(kernels and not others for kernels, others in found.values()), found
 
 
@@ -89,7 +97,8 @@ def test_a_donated_state_steps_in_place_unless_a_checked_map_types_it(shards, ch
     launch reads and writes the state in place (one operand aliased to its output), where an output of its
     own had the donated cache copy it back, 4 MiB a layer a step (row 14174); called inside a checked map
     (`jax.shard_map`, `check_vma`), whose state keeps its manual axes' type, which no launch takes as a ref,
-    it takes the state's own output and compiles (head review of row 14174's in-place state)."""
+    it takes the state's own output and compiles (head review of row 14174's in-place state). The same jitted
+    function traced outside the scope, first, keeps the state's own output: the scope keys its trace."""
     mesh = _device('sm90', (('data', shards),))
     sharding = NamedSharding(mesh, PartitionSpec('data'))
 
@@ -105,10 +114,18 @@ def test_a_donated_state_steps_in_place_unless_a_checked_map_types_it(shards, ch
         rows_spec = PartitionSpec('data')
         decode = jax.shard_map(decode_gated_delta_rule, in_specs=(rows_spec,) * 6, out_specs=rows_spec,
                                check_vma=True)
-    with (assumed('sm90'), jax.set_mesh(mesh), donated_state(),
-          mgpu_core.artificial_shared_memory_limit(gpu_target('sm90').shared_limit)):
-        compiled = jax.jit(decode, donate_argnums=(5,)).trace(*operands).lower().compile()
-    (module,) = compiled.runtime_executable().hlo_modules()
-    aliased = [op.name for op in hlo.instructions(module) if op.opcode == 'custom-call'
-               and op.proto.output_operand_aliasing]
-    assert bool(aliased) == (not checked), aliased
+    stepped = jax.jit(decode, donate_argnums=(5,))
+
+    def aliased() -> list:
+        """The custom calls of `stepped`'s program whose output aliases an operand."""
+        with (assumed('sm90'), jax.set_mesh(mesh),
+              mgpu_core.artificial_shared_memory_limit(gpu_target('sm90').shared_limit)):
+            (module,) = stepped.trace(*operands).lower().compile().runtime_executable().hlo_modules()
+        return [op.name for op in hlo.instructions(module) if op.opcode == 'custom-call'
+                and op.proto.output_operand_aliasing]
+
+    # The same jitted function on either side of the scope: its trace keyed on it (`_cache.DONATED_STATE`).
+    kept = aliased()
+    with donated_state():
+        donated = aliased()
+    assert not kept and bool(donated) == (not checked), (kept, donated)

@@ -454,6 +454,11 @@ KERNEL_CHOICES = _context(())
 this thread, keyed on as `KERNEL_TUNES` is, so a program traced before a
 choice traces again within it."""
 
+DONATED_STATE = _context(0)
+"""1 where this thread traces a program that owns and donates the recurrent states it steps
+(`dew.nn.kernels.templates.recurrence.step.donated_state`), else 0, keyed on as `DRAWING` is: its steps
+update their states in place, so its trace is never a keeping caller's, nor theirs its."""
+
 DRAWING = _context(0)
 """1 where this thread traces a draw of a model's variables (`dew.nn.kernels.generation.drawing`), else 0,
 keyed on as `KERNEL_CHOICES` is: a draw selects no kernel, so its trace is never another's, and one draw's

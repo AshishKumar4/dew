@@ -13,7 +13,6 @@ columns. The arithmetic is `recurrence.step_reference`'s, fp32 throughout, the h
 """
 
 import contextlib
-import contextvars
 import dataclasses
 import functools
 
@@ -23,6 +22,7 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
+from dew import _cache
 from dew.nn import norms
 from dew.nn.kernels import generation, recurrence, recurrence_algebra, short_conv, tuning
 from dew.nn.kernels.templates import cost, mosaic, resources, scan
@@ -120,10 +120,6 @@ def _joining(halves: int, block: "_Block") -> tuple:
             plgpu.Barrier(num_arrivals=halves, num_barriers=3))
 
 
-_DONATED: contextvars.ContextVar[bool] = contextvars.ContextVar("dew_donated_state", default=False)
-"""Whether the program tracing a step owns and donates the state it steps (`donated_state`)."""
-
-
 @contextlib.contextmanager
 def donated_state():
     """Within it the program being traced owns the recurrent states it steps and donates them (a serving
@@ -131,12 +127,11 @@ def donated_state():
     launch reads and writes (`jax.new_ref`), so the donated buffer is the next state's. Returned as an output
     of its own, the launch wrote the next state apart, which the donated cache then copied back, 4 MiB a
     layer a step (row 14174: an LM_HYBRID B8 decode's 12). Outside it, a caller that keeps its state (a
-    state not donated, which an in-place update would have XLA copy first) takes the state's own output."""
-    token = _DONATED.set(True)
-    try:
+    state not donated, which an in-place update would have XLA copy first) takes the state's own output.
+    JAX keys its trace and compile caches on it (`dew._cache.DONATED_STATE`): a jitted function traced on
+    one side of it traces again on the other."""
+    with _cache.DONATED_STATE(1):
         yield
-    finally:
-        _DONATED.reset(token)
 
 
 def step(hooks: recurrence.Hooks, operands: recurrence.Step, *, dtype, family: mosaic.Family,
@@ -150,7 +145,8 @@ def step(hooks: recurrence.Hooks, operands: recurrence.Step, *, dtype, family: m
     block = _block(value_width)
     programs = rows * (value_heads // block.heads) * (value_width // block.columns)
     target = generation.interpreted_target() if interpret else generation.gpu_target()
-    in_place = _DONATED.get() and jax.typeof(operands.state).manual_axis_type == jax.sharding.ManualAxisType()
+    in_place = (_cache.DONATED_STATE.value > 0
+                and jax.typeof(operands.state).manual_axis_type == jax.sharding.ManualAxisType())
     return _launched(hooks, operands, dtype=dtype, family=family, plan=_plan(key_width, programs, target),
                      interpret=interpret, in_place=in_place)
 
