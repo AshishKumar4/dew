@@ -308,7 +308,7 @@ def pytest_runtest_setup(item):
     if jax.device_count() < needed:
         pytest.skip(f"needs a {needed}-device mesh; this run has "
                     f"{jax.device_count()} {jax.default_backend()} device(s)")
-    # The GPU lane runs and prepares a file's gpu-marked tests alone (`tier_wire.GPU_TIER`); the file's other
+    # A GPU tier runs and prepares a file's gpu-marked tests alone (`tier_wire.GPU_TIER`); the file's other
     # tests are other lanes'. Skipped at setup, not deselected, so a file's split cuts and keys stay as
     # they are.
     if os.environ.get(tier_wire.GPU_TIER) == "1" and item.get_closest_marker("gpu") is None:
