@@ -51,16 +51,16 @@ class Export:
 
     def run_command(self) -> int:
         from dew.inference.tasks import SavedRun
-        from dew.interop.saved_sources import export_run, refused_stores
+        from dew.interop.saved_sources import export_admitted, refused_stores
 
-        # A store's location refused before the run is pinned, which fetches any release it names into the
-        # local cache (train 1478's review, P-F3).
+        # A store's location refused before the run is pinned, which writes this host's releases of the
+        # saved runs it names into the local cache (train 1478's review, P-F3).
         refused_stores(self.destination)
         # A task that publishes its own released layout (a decision run's) writes it; any other
         # run writes its model in the source layout its family reads, both at the step pinned here.
         # A pool sharing the destination publishes it from its first process (`export_run`).
         # The destination as given: a store's URI (`gs://...`) taken as a path loses its `//` (row 14124).
-        export_run(SavedRun.pinned(self.run, self.step, self.trust), self.destination, ema=self.ema)
+        export_admitted(SavedRun.pinned(self.run, self.step, self.trust), self.destination, ema=self.ema)
         emit(f"exported {self.run} to {self.destination}")
         return 0
 

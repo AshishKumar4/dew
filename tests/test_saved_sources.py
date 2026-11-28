@@ -118,25 +118,23 @@ def test_a_decision_run_whose_head_holds_no_backbone_of_its_family_exports_as_it
 @pytest.mark.shared_setup("native_release_run")
 def test_a_run_exported_to_a_store_is_refused_before_anything_is_written(native_release_run, tmp_path,
                                                                         monkeypatch):
-    """`dew export <run> <store URI>` is refused before anything is written, the store, this host's disk and
-    its release cache alike, the run not even pinned (which fetches the releases it names into the cache),
-    as a store has no rename to publish a release whole; a local destination exports (row 14124:
+    """`dew export <run> <store URI>` is refused before anything is written, the store and this host's disk
+    alike, as a store has no rename to publish a release whole; a local destination exports (row 14124:
     `gs://bucket/x` taken as a path was written under `gs:/bucket/x` on the local disk, the export reported
-    as published in the store; train 1478's review, P-F3: the refusal came after the run was pinned)."""
+    as published in the store)."""
     import uuid
 
     from dew._cli.main import main
     from dew.data.storage import Store
 
     root, _, source, _ = native_release_run
+    monkeypatch.setenv("XDG_CACHE_HOME", str(root / "cache"))
     monkeypatch.chdir(tmp_path)
     remote = f"memory://export-{uuid.uuid4().hex}"
-    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
     with pytest.raises(ValueError):
         main(["export", str(source), remote])
     fs, path = Store(remote).resolve()
     assert not fs.exists(path) and not list(tmp_path.iterdir())
-    monkeypatch.setenv("XDG_CACHE_HOME", str(root / "cache"))
     assert main(["export", str(source), str(tmp_path / "local")]) == 0
     assert (tmp_path / "local").is_dir()
 
@@ -192,7 +190,8 @@ def test_a_run_started_from_a_saved_run_resumes_and_serves_on_hosts_whose_caches
     where it trained: the pin they share writes this host's release of the same saved run
     (`SavedRun.pinned`, `releases_here`), where the record's paths raised Hugging Face's repo-id error. On a
     host that lacks the saved run too, a reader of the weights alone (`dew.checkpoints.averaged`) reads them,
-    and a reader that opens the record's paths is refused, naming the saved run."""
+    and a reader that opens the record's paths is refused, naming the saved run. An export of it to a store
+    is refused before its pin writes any release (train 1478's review, P-F3)."""
     from dew.checkpoints import averaged
     from dew.decision import Choice, Decide
     from dew.inference.loading import pipeline
@@ -230,6 +229,14 @@ def test_a_run_started_from_a_saved_run_resumes_and_serves_on_hosts_whose_caches
     cache("serving_host")
     np.testing.assert_array_equal(answered(Decide.from_run(second, step=1)), served)
     np.testing.assert_array_equal(answered(pipeline(second, step=2)), stepped)
+    # A fourth host, lacking both releases, exporting the run to a store: refused before the run is pinned,
+    # so no release of the saved run is written into its cache (train 1478's review, P-F3).
+    from dew._cli.main import main
+
+    exporting = cache("exporting_host")
+    with pytest.raises(ValueError):
+        main(["export", second, "memory://refused-export"])
+    assert not exporting.exists() or not any(exporting.iterdir())
     # A host lacking the saved run too: a reader of the weights alone reads them, and one that opens the
     # record's paths is refused, naming the saved run.
     shutil.move(source, tmp_path / "moved")

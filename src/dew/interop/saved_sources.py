@@ -61,7 +61,7 @@ if TYPE_CHECKING:
 def refused_stores(destination: str | Path) -> None:
     """Refuse an export to a store's location (`releases.refused_store`, row 14124) by every process of a
     pool alike, each naming its own destination, before any other round of its export, any release its run
-    names fetched or a write: what `dew export` and `export_run` ask first."""
+    names fetched or a write: what `export_run` and `dew export` ask once, first."""
     from dew.interop.releases import refused_store
 
     for named_by in from_every_process(str(destination)):
@@ -71,10 +71,21 @@ def refused_stores(destination: str | Path) -> None:
 def export_run(run: SavedRun, destination: str | Path, *, ema: bool | None = None,
                mesh: MeshSpec | Mesh | None = None, layout: Layout | None = None,
                publishes: bool | None = None, staging: bool = False) -> None:
+    """`export_admitted` of `run` where `destination` is no store's location, refused by a pool alike first
+    (`refused_stores`): the one entry of a saved run's export. `dew export` refuses the destination before
+    it pins the run and writes through `export_admitted` (train 1478's review, P-F3)."""
+    refused_stores(destination)
+    export_admitted(run, destination, ema=ema, mesh=mesh, layout=layout, publishes=publishes,
+                    staging=staging)
+
+
+def export_admitted(run: SavedRun, destination: str | Path, *, ema: bool | None = None,
+                    mesh: MeshSpec | Mesh | None = None, layout: Layout | None = None,
+                    publishes: bool | None = None, staging: bool = False) -> None:
     """Write `run`'s pinned checkpoint (`SavedRun.pinned`) to `destination` as its release (`run_plan`),
-    its EMA weights where `ema`: the one entry of a saved run's export, from one process or every process
-    of a pool. Its weights restore where `mesh` and `layout` place them, so no device holds more of them
-    than a load does, and the writer reads them home a tensor at a time as it writes them, one shard of
+    its EMA weights where `ema`, `destination` one `refused_stores` admitted, from one process or every
+    process of a pool. Its weights restore where `mesh` and `layout` place them, so no device holds more of
+    them than a load does, and the writer reads them home a tensor at a time as it writes them, one shard of
     the release at a time (`save_sharded`). On a pool every process runs this same writer, reading each
     tensor that spans the pool's processes home together (`reading_home`), so each host holds a shard of
     the release, not the model (ledger 2874). The process that `publishes` writes the release; another
@@ -88,7 +99,6 @@ def export_run(run: SavedRun, destination: str | Path, *, ema: bool | None = Non
     2992)."""
     from dew.interop.releases import pooled_destination
 
-    refused_stores(destination)
     named, shared = Path(destination), False
     if publishes is None:
         shared = (jax.process_count() > 1 and len(set(from_every_process(named.name))) == 1
