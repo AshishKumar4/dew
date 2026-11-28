@@ -941,13 +941,35 @@ def _dense_tangent(dtype: str, primals, tangents, value) -> jax.Array:
     # The direction centred before it meets the values, `w (Σ w dt - dt)`, as plain fp32 forms it: one
     # contraction, never a mean's and a weighted sum's products apart (`2^128` before `3 · 2^126` met it).
     weights = jnp.where(seen, tile.masses / over, 0.0)
-    centred = weights * (jnp.sum(weights * dseconds, axis=-1, keepdims=True) - dseconds)
-    # The second products held at their rows' power `2^p` (`_called`): their centred direction taken back by
-    # `2^-p` before the values meet it, so its transpose restores the contraction's cotangent, never the
-    # output's (train 1500's review: `[2^124, -2^124]` read half; restored on the output, a cotangent of
-    # `2^127` overflowed before small values met it).
-    secondly = _weighed(power2(centred, -rows), values)
+    wide = dseconds.dtype
+    secondly = generation.linear_map(_second_moved, _second_pulled, (weights, values, rows.astype(wide)),
+                                     dseconds)
     return moved + _ungrouped(valued + secondly).astype(dtype)
+
+
+def _centred(weights: jax.Array, direction: jax.Array) -> jax.Array:
+    """`w (Σ w d - d)` over a row's keys: a direction centred by the row's weights, as plain fp32 forms it,
+    one contraction; its own transpose."""
+    return weights * (jnp.sum(weights * direction, axis=-1, keepdims=True) - direction)
+
+
+def _second_moved(residuals: tuple, direction: jax.Array) -> jax.Array:
+    """The second products' tangent `Σ w (a - v) dt` (`_dense_tangent`), `direction` the second products'
+    at their rows' power `2^p` (`_called`): centred (`_centred`), met by the values, then taken back by
+    `2^-p`, so a direction the power held meets small values before the power restores it (train 1500's
+    review: restored first, `∓2^124` read infinity against values `2^-10`)."""
+    weights, values, rows = residuals
+    return power2(_weighed(_centred(weights, direction), values), -rows)
+
+
+def _second_pulled(residuals: tuple, cotangent: jax.Array) -> jax.Array:
+    """`_second_moved`'s transpose: the cotangent met by the values (`dO · v` a key), centred by the row's
+    weights, then taken back by `2^-p`, so a cotangent near fp32's largest cancels before the power doubles
+    it (restored first, `dO · v = 2^127` read `inf - inf`)."""
+    weights, values, rows = residuals
+    met = float32_einsum("bhgqd,bkhd->bhgqk", cotangent, values, precision=REFERENCE_PRECISION,
+                         preferred_element_type=cotangent.dtype)
+    return power2(_centred(weights, met), -rows)
 
 
 _dense = contracted("test_parallax_holds_every_order")(

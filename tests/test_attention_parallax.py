@@ -1086,12 +1086,12 @@ def test_a_small_tiles_cotangent_keeps_its_size_beside_a_cancelling_tile():
 
 def test_a_second_keys_pullback_restores_its_rows_power_after_the_values():
     """The dense call's pullback along its second keys (`reference`'s, the derivative's higher orders):
-    second keys `[2^124, -2^124]` of a second query 1 over constant values `2^-10` under a cotangent of
-    `2^127` pull back exactly 0, the rows' power `2^-1` restored once the values met the cotangent, where
-    restored on the cotangent first it doubled `2^127` to infinity and the centring read NaN (train 1500's
-    fix's review)."""
+    second keys `[2^124, -2^124]` of a second query 1 over constant values 1 under a cotangent of `2^127`
+    pull back exactly 0, the rows' power `2^-1` restored once the values met the cotangent and the row
+    centred it, where restored on the cotangent, or before the centring, it doubled `2^127` to infinity
+    and read NaN (train 1500's fix's reviews)."""
     second_key = jnp.asarray([2.0 ** 124, -(2.0 ** 124)], jnp.float32).reshape(1, 2, 1, 1)
-    value = jnp.full((1, 2, 1, 1), 2.0 ** -10, jnp.float32)
+    value = jnp.ones((1, 2, 1, 1), jnp.float32)
     one = jnp.ones((1, 1, 1, 1), jnp.float32)
     spans = template.spans(1, 2, 1)
     _, pull = jax.vjp(lambda second_key: attention_parallax.reference(
@@ -1100,23 +1100,29 @@ def test_a_second_keys_pullback_restores_its_rows_power_after_the_values():
     np.testing.assert_array_equal(np.asarray(pull(jnp.full((1, 1, 1, 1), 2.0 ** 127, jnp.float32))[0]), 0.0)
 
 
-def test_a_second_products_direction_is_taken_back_by_its_rows_power():
+@pytest.mark.parametrize(("second", "second_key", "value", "direction", "expected"), [
+    (1.0, 2.0 ** 124, 1.0, 1.0, -(2.0 ** 124)),
+    (2.0 ** 8, 2.0 ** 119, 2.0 ** -10, 2.0 ** 10, -(2.0 ** 119)),
+], ids=["power taken back", "small values first"])
+def test_a_second_queries_tangent_restores_its_rows_power_after_the_values(second, second_key, value,
+                                                                           direction, expected):
     """Parallax's forward-mode tangent along its second query (`reference`'s, the derivative's higher
-    orders), one query over second keys `[2^124, -2^124]` of a second query 1 and values `[1, -1]`, whose
-    rows' power `2^-1` holds the products: along a unit direction it is the plain formula's `-2^124`, where
-    the direction's contraction read `-2^123`, its power not taken back (train 1500's review)."""
-    second_key = jnp.asarray([2.0 ** 124, -(2.0 ** 124)], jnp.float32).reshape(1, 2, 1, 1)
-    value = jnp.asarray([1.0, -1.0], jnp.float32).reshape(1, 2, 1, 1)
+    orders), one query over second keys `±second_key` and values `±value`, whose rows' power holds the
+    products: the plain formula's `expected`, the centred direction met by the values before the power
+    restores it. Second keys `±2^124` read `-2^123`, the power not taken back (train 1500's review); `2^8`
+    against `±2^119` over values `±2^-10` along `2^10` read infinity, restored before the values (its fix's
+    review)."""
+    keys = jnp.asarray([second_key, -second_key], jnp.float32).reshape(1, 2, 1, 1)
+    values = jnp.asarray([value, -value], jnp.float32).reshape(1, 2, 1, 1)
     spans = template.spans(1, 2, 1)
 
     def along(second):
         return attention_parallax.attend(jnp.zeros((1, 1, 1, 1), jnp.float32), second,
-                                         jnp.zeros((1, 2, 1, 1), jnp.float32), second_key, value, spans,
-                                         scale=1.0)
+                                         jnp.zeros((1, 2, 1, 1), jnp.float32), keys, values, spans, scale=1.0)
 
-    one = jnp.ones((1, 1, 1, 1), jnp.float32)
-    tangent = jax.jvp(along, (one,), (one,))[1]
-    assert float(tangent[0, 0, 0, 0]) == -(2.0 ** 124)
+    tangent = jax.jvp(along, (jnp.full((1, 1, 1, 1), second, jnp.float32),),
+                      (jnp.full((1, 1, 1, 1), direction, jnp.float32),))[1]
+    assert float(tangent[0, 0, 0, 0]) == expected
 
 
 def test_a_float64_keys_query_takes_its_power_of_two_wide():
