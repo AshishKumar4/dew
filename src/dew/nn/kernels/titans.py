@@ -15,8 +15,8 @@ x sum(g x)) / (D sigma)`, `sigma = sqrt(var + eps)`; fla's Titans reference writ
 
 `titans` takes a mini-batch at a time (docs/design/kernel-templates.md's C class: its orchestration outside
 the recurrence tile): its tokens' gradients at once at the memory entering it, then its tokens a step at a
-time, each writing its own and reading the pair it leaves, their steps composed apart from the pair entering
-the mini-batch as the memory's general path composes them (`dew.nn.memory`), so no query meets a key (a live
+time, each writing its own and reading the pair it leaves, its changes held apart from the pair entering the
+mini-batch as the memory's general path holds its steps (`dew.nn.memory`), so no query meets a key (a live
 score of 2^70 by 2^70 overflowed beside a zero write) and no state is weighed after a read (a memory of 2^70
 forgotten whole read `0 * inf`). Documents are not packed: a mini-batch is the sequence's `chunk` tokens,
 which a document starting within one would split (fla's reference takes none either)."""
@@ -182,7 +182,7 @@ def titans(query, key, value, weight, bias, theta, alpha, eta, state=None, *, ch
         gradient = real_gradients(k, v, k @ pair[0], real, weight, bias, eps)
         memory0, momentum0 = pair
 
-        def token(composed, along):
+        def token(changes, along):
             q, k, gradient, theta, alpha, eta, real = along
             # The write `2 theta k u` one exact product of the 2, the rate, the key and the gradient, rounded
             # once (`aligned_sum`), its transpose's alike: no partial product leaves the range its value does
@@ -192,32 +192,25 @@ def titans(query, key, value, weight, bias, theta, alpha, eta, state=None, *, ch
             # 2^127 doubled first overflowed, train 1461's).
             write = aligned_sum([[jnp.asarray(coefficient, theta.dtype), theta[..., None, None],
                                   k[..., :, None], gradient[..., None, :]]])
-            # The pair the mini-batch's tokens reach, as the memory's general path composes its steps
-            # (`dew.nn.memory`'s chunk): `S_t = m_t S_0 + o_t` and `M_t = a_t M_0 + c_t S_0 + p_t`, the
-            # entering pair apart from the writes the steps carry, so a write below the entering memory's last
-            # place is kept rather than rounded away token by token (79g's review: four writes of 0.98 into a
-            # memory of 2^25 left it as it was).
-            decay, kept, momentum_scale, momentum_offset, memory_offset = composed
-            forget = (1.0 - alpha)[..., None, None]
-            carry = eta[..., None, None]
-            momentum_offset = carry * momentum_offset - write
-            stepped = (forget * decay, forget * kept + carry * momentum_scale, carry * momentum_scale,
-                       momentum_offset, forget * memory_offset + momentum_offset)
-            # A padded token leaves the composition as it was.
-            composed = tuple(jnp.where(real[..., None, None], new, old)
-                             for new, old in zip(stepped, composed, strict=True))
-            decay, kept, _, _, memory_offset = composed
-            memory = (decay * memory0 + kept * momentum0) + memory_offset
-            return composed, jnp.einsum('bhk,bhkv->bhv', q, memory)
+            # The pair's changes since the mini-batch entered, `D = M - M_0` and `E = S - S_0`, stepped apart
+            # from the entering pair, as the memory's general path holds its steps apart from the state its
+            # chunk entered (`dew.nn.memory`): a change below the entering memory's last place is kept rather
+            # than rounded away token by token (79g's review: four writes of 0.98 into a memory of 2^25 left
+            # it as it was). `S' = eta S - w` and `M' = (1 - alpha) M + S'` as changes:
+            # `E' = (eta E - w) - (1 - eta) S_0` and `D' = ((1 - alpha) D - alpha M_0) + (S_0 + E')`.
+            memory_change, momentum_change = changes
+            forget, carry = (1.0 - alpha)[..., None, None], eta[..., None, None]
+            momentum_change = (carry * momentum_change - write) - (1.0 - carry) * momentum0
+            memory_change = ((forget * memory_change - alpha[..., None, None] * memory0)
+                             + (momentum0 + momentum_change))
+            # A padded token leaves the changes as they were.
+            changes = tuple(jnp.where(real[..., None, None], new, old) for new, old in
+                            zip((memory_change, momentum_change), changes, strict=True))
+            return changes, jnp.einsum('bhk,bhkv->bhv', q, memory0 + changes[0])
 
-        # The identity composition, typed as the entering pair varies (every operand's axes).
-        ones, zeros = jnp.ones_like(memory0[..., :1, :1]), jnp.zeros_like(memory0)
-        identity = (ones, jnp.zeros_like(ones), ones, zeros, zeros)
         tokens = tuple(jnp.moveaxis(x, 2, 0) for x in (q, k, gradient, theta, alpha, eta, real))
-        composed, reads = jax.lax.scan(token, identity, tokens)
-        decay, kept, momentum_scale, momentum_offset, memory_offset = composed
-        return ((decay * memory0 + kept * momentum0) + memory_offset,
-                momentum_scale * momentum0 + momentum_offset), reads
+        changes, reads = jax.lax.scan(token, tuple(jnp.zeros_like(held) for held in pair), tokens)
+        return tuple(held + change for held, change in zip(pair, changes, strict=True)), reads
 
     keys, *rest = mini_batches(chunk, k, q, v, theta, alpha, eta, valid=valid)
     final, out = memory_chunks(mini_batch, states, (rest[0], keys, *rest[1:]))
