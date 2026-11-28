@@ -250,10 +250,12 @@ def plan(jaxpr: jcore.Jaxpr) -> Plan:
     weighed as it weighs it (`_weighed_body`), and the layer flattened (`flattened`) weighed whole, each
     variant stating the boundaries it crosses; recognition's calls over the flattened layer."""
     from dew.algebra import fusion, program, recognize
+    from dew.nn.kernels import generation
 
+    # The bodies the pass weighs on the platform the step lowers for: a platform choice's branch it runs.
     today = tuple(found for each in program.fused_bodies(jaxpr, lambda path, body: _weighed_body(
-        body, "step" + "".join(f"/{name}@{place}.{number}" for name, place, number in path)))
-        for found in each)
+        body, "step" + "".join(f"/{name}@{place}.{number}" for name, place, number in path)),
+        platform=generation.lowering_platform()) for found in each)
     flat = flattened(jaxpr)
     search = _weighed_body(flat.body, "flattened", flat)
     index = fusion.Index(flat.body)
@@ -265,20 +267,16 @@ def plan(jaxpr: jcore.Jaxpr) -> Plan:
 
 
 def _weighed_body(body: jcore.Jaxpr, path: str, flat: Flat | None = None) -> tuple[Weighed, ...]:
-    """Each product region of `body` (`fusion.regions`) no recognized attention or recurrence call holds (as
-    the pass sets them aside) and its variants of fewer stages (`fusion.fewer`, in the pass's order), weighed
-    over the body's one `fusion.Index` (`_weighed`), the crossings of each its flattened layer's (`flat`, of
-    every place it replays, a shared prologue's among them; none in a body the pass weighs), the variant the
-    pass selects (`fusion.taken`) and where its growth stopped (`_stops`)."""
-    from dew.algebra import fusion, recognize
+    """Each product region of `body` the pass weighs (`fusion.eligible`: recognized attention and recurrence
+    calls set aside) and its variants of fewer stages (`fusion.fewer`, in the pass's order), each weighed as
+    the pass decides it over the body's one `fusion.Index` (`_weighed`), the crossings of each its flattened
+    layer's (`flat`, of every place it replays, a shared prologue's among them; none in a body the pass
+    weighs), the variant the pass selects (`fusion.taken`) and where its growth stopped (`_stops`)."""
+    from dew.algebra import fusion
 
     index = fusion.Index(body)
-    calls = (*recognize.ATTENTION, *recognize.RECURRENCES)
-    held = {place for written in recognize.recognized(body, index, calls) for place in written.places}
     found = []
-    for region in fusion.regions(index):
-        if held & set(region.places):
-            continue
+    for region in fusion.eligible(index):
         variants = (region, *fusion.fewer(index, region))
         product = next(place for place in region.places if fusion.product_form(body.eqns[place]) is not None)
         taken = fusion.taken(index, region)
@@ -301,16 +299,15 @@ def _stops(body: jcore.Jaxpr, index, region) -> tuple[str, ...]:
 
 
 def _weighed(index, region, crossings: tuple[Crossing, ...]) -> Segment:
-    """`region` as the pass weighs it (`fusion.analyzed`): its product's route as its selector takes it, and
-    whether the pass takes it (`fusion.decided`, the pass's own rule)."""
+    """`region` as the pass decides it (`fusion.decided`, the pass's own rule): whether it takes it, and its
+    product's route as its selector takes it, from the analysis the decision was priced by
+    (`RegionDecision.analysis`)."""
     from dew.algebra import fusion
-    from dew.nn.kernels import generation
 
-    # Weighed apart from any routes its caller collects (`generation.routes`), as the pass's own decision is:
-    # the calls an analysis traces are no program's.
-    with generation.routes(alone=True):
-        analysis = fusion.analyzed(index, region)
-    takes = fusion.decided(index, region).taken
+    decision = fusion.decided(index, region)
+    takes, analysis = decision.taken, decision.analysis
+    # A region the pass decides is one it priced (`RegionDecision.analysis`, none for `fewer`'s walk alone).
+    assert analysis is not None, region
     # Its stages as its equations hold them, whatever its analysis reached (one a refused stage stopped
     # states no routes, `fused_gemm.Analysis.refused`).
     stages = (*(("prologue",) if region.prologue else ()), "product",

@@ -248,103 +248,7 @@
   "today": [
    {
     "best": null,
-    "body": "step/custom_jvp_call@7.0/marked_call@0.0/custom_vmap_call@0.0/cond@1.1",
-    "chosen": null,
-    "passed": null,
-    "product": 1,
-    "stops": [],
-    "variants": [
-     {
-      "cheaper": false,
-      "cites": [],
-      "crossings": [],
-      "fused": null,
-      "kernel": "xla",
-      "refusal": "measured",
-      "refused": null,
-      "stages": [
-       "product"
-      ],
-      "takes": false,
-      "unfused": null
-     }
-    ]
-   },
-   {
-    "best": null,
-    "body": "step/custom_jvp_call@7.0/marked_call@0.0/custom_vmap_call@0.0/cond@1.1",
-    "chosen": null,
-    "passed": null,
-    "product": 3,
-    "stops": [],
-    "variants": [
-     {
-      "cheaper": false,
-      "cites": [],
-      "crossings": [],
-      "fused": null,
-      "kernel": "xla",
-      "refusal": "measured",
-      "refused": null,
-      "stages": [
-       "product"
-      ],
-      "takes": false,
-      "unfused": null
-     }
-    ]
-   },
-   {
-    "best": null,
-    "body": "step/custom_jvp_call@7.0/marked_call@0.0/custom_vmap_call@0.0/cond@1.1",
-    "chosen": null,
-    "passed": null,
-    "product": 5,
-    "stops": [],
-    "variants": [
-     {
-      "cheaper": false,
-      "cites": [],
-      "crossings": [],
-      "fused": null,
-      "kernel": "xla",
-      "refusal": "measured",
-      "refused": null,
-      "stages": [
-       "product"
-      ],
-      "takes": false,
-      "unfused": null
-     }
-    ]
-   },
-   {
-    "best": null,
     "body": "step/custom_jvp_call@133.0/marked_call@0.0/custom_vmap_call@0.0/cond@1.0",
-    "chosen": null,
-    "passed": null,
-    "product": 1,
-    "stops": [],
-    "variants": [
-     {
-      "cheaper": false,
-      "cites": [],
-      "crossings": [],
-      "fused": null,
-      "kernel": "xla",
-      "refusal": "measured",
-      "refused": null,
-      "stages": [
-       "product"
-      ],
-      "takes": false,
-      "unfused": null
-     }
-    ]
-   },
-   {
-    "best": null,
-    "body": "step/custom_jvp_call@133.0/marked_call@0.0/custom_vmap_call@0.0/cond@1.1",
     "chosen": null,
     "passed": null,
     "product": 1,
@@ -392,30 +296,6 @@
    },
    {
     "best": null,
-    "body": "step/custom_jvp_call@140.0/marked_call@0.0/custom_vmap_call@0.0/cond@1.1",
-    "chosen": null,
-    "passed": null,
-    "product": 1,
-    "stops": [],
-    "variants": [
-     {
-      "cheaper": false,
-      "cites": [],
-      "crossings": [],
-      "fused": null,
-      "kernel": "xla",
-      "refusal": "measured",
-      "refused": null,
-      "stages": [
-       "product"
-      ],
-      "takes": false,
-      "unfused": null
-     }
-    ]
-   },
-   {
-    "best": null,
     "body": "step/custom_jvp_call@145.0/marked_call@0.0/custom_vmap_call@0.0/cond@1.0",
     "chosen": null,
     "passed": null,
@@ -440,55 +320,7 @@
    },
    {
     "best": null,
-    "body": "step/custom_jvp_call@145.0/marked_call@0.0/custom_vmap_call@0.0/cond@1.1",
-    "chosen": null,
-    "passed": null,
-    "product": 1,
-    "stops": [],
-    "variants": [
-     {
-      "cheaper": false,
-      "cites": [],
-      "crossings": [],
-      "fused": null,
-      "kernel": "xla",
-      "refusal": "measured",
-      "refused": null,
-      "stages": [
-       "product"
-      ],
-      "takes": false,
-      "unfused": null
-     }
-    ]
-   },
-   {
-    "best": null,
     "body": "step/custom_jvp_call@153.0/marked_call@0.0/custom_vmap_call@0.0/cond@1.0",
-    "chosen": null,
-    "passed": null,
-    "product": 1,
-    "stops": [],
-    "variants": [
-     {
-      "cheaper": false,
-      "cites": [],
-      "crossings": [],
-      "fused": null,
-      "kernel": "xla",
-      "refusal": "measured",
-      "refused": null,
-      "stages": [
-       "product"
-      ],
-      "takes": false,
-      "unfused": null
-     }
-    ]
-   },
-   {
-    "best": null,
-    "body": "step/custom_jvp_call@153.0/marked_call@0.0/custom_vmap_call@0.0/cond@1.1",
     "chosen": null,
     "passed": null,
     "product": 1,
