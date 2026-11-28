@@ -899,12 +899,14 @@ def test_each_role_compiles_and_reads_its_own_steps_ahead_whatever_its_trees_are
                           out=str(tmp_path / "gate.json"), environments=str(tmp_path / "environments"),
                           ahead=str(ahead))
     assert gate.run(run) == 0
-    stepped = [(tree, command) for tree, command, _ in rows
+    # The base, the head and the A/A, each by its own compile cache (`run`'s per arm): each arm's step rows
+    # handed its role's directory, every round.
+    stepped = [(command, env) for _, command, env in rows
                if len(command) > 1 and Path(command[1]).name == "benchmark_step.py"]
-    handed = sorted((tree.parent.name, command[command.index("--ahead") + 1]) for tree, command in stepped)
-    # The base, the head and the A/A: each arm's step rows handed its role's directory.
+    handed = {(Path(env["JAX_COMPILATION_CACHE_DIR"]).name, command[command.index("--ahead") + 1])
+              for command, env in stepped}
     base_dir, head_dir = str(ahead / "base"), str(ahead / "head")
-    assert handed == [("new", head_dir), ("old", base_dir), ("old", base_dir)]
+    assert handed == {("base", base_dir), ("head", head_dir), ("alone", base_dir)}
 
 
 def test_a_base_and_head_of_one_name_are_refused(gate, tmp_path):
