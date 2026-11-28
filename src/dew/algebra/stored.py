@@ -126,8 +126,9 @@ def key(closed, region: terms.Region, sets: Sequence[str], parts: Sequence[objec
 
 
 def loaded(name: str, region: terms.Region, assembled: Callable[..., _Forms], *,
-           rescaled: frozenset[str]) -> _Forms | None:
-    """The stored derivation `name` over `region`, traced afresh, its appended parameters, literals and
+           rescaled: frozenset[str]) -> tuple[_Forms, dict] | None:
+    """The stored derivation `name` over `region`, and its record (which a class of sizes binds at its
+    others, `dew.algebra.derive._classed`), traced afresh, its appended parameters, literals and
     shapes replayed once the whole entry reads (`assembled(record, decoded=..., ...)` its forms, each decoded
     term checked against the region, `_Decoded`, a rescale reading an exponential of `rescaled`, those its
     declaration's own rescale reads, `_operated`); None where none is stored, or where the entry fails to
@@ -149,31 +150,45 @@ def loaded(name: str, region: terms.Region, assembled: Callable[..., _Forms], *,
         return None
     try:
         record = _record(name, text)
-        if (record.get("params_from"), record.get("literals_from"), record.get("shapes_from")) != (
-                len(region.params), len(region.literals), len(region.shapes)):
-            raise ValueError("an entry of another trace's region")
-        params = [_parameter(entry) for entry in _listed(record["params"])]
-        literals = [_literal(value) for value in _listed(record["literals"])]
-        decoded = _decoded(_listed(record["terms"]), leaves=region.leaves,
-                           literals=len(region.literals) + len(literals),
-                           primitives=[primitive for primitive, _ in (*region.params, *params)],
-                           states=len(_listed(record["steps"])), rescaled=rescaled)
-        made = assembled(record, decoded=decoded, value=_value)
-        # Each literal a derivation appends is shaped as it is (`_appended`).
-        shapes = [(Term.literal(i64(index)), literal.shape)
-                  for index, literal in enumerate(literals, start=len(region.literals))]
+        made = bound(record, region, assembled, rescaled=rescaled)
     except (KeyError, TypeError, ValueError, IndexError, OverflowError, RecursionError,
             ConvertError) as failed:
         # ConvertError: an argument of a sort its constructor does not take; OverflowError: a float past
         # range; RecursionError: a value nested past Python's depth.
         _invalid(path, failed)
         return None
-    # The region extended once the whole entry has read: one that fails leaves it as traced.
+    kernel_report.record_stored("hit")
+    return made, record
+
+
+def bound(record: Mapping, region: terms.Region, assembled: Callable[..., _Forms], *,
+          rescaled: frozenset[str], resized: Callable[[Mapping], dict] | None = None) -> _Forms:
+    """The forms `record` holds (`record_of`'s) over `region`, traced afresh, its appended parameters,
+    literals and shapes replayed once the whole record reads (`assembled(record, decoded=..., ...)` its
+    forms, each decoded term checked against the region, `_Decoded`, a rescale reading an exponential of
+    `rescaled`, `_operated`; each appended parameter's values `resized` where given, a record of another
+    size of the region's class, `dew.algebra.derive._classed`): the region extended past what it traced once
+    every form decodes, and left as traced where one fails (`KeyError`, `TypeError`, `ValueError`,
+    `IndexError`, `OverflowError`, `RecursionError` or egglog's `ConvertError`)."""
+    if (record.get("params_from"), record.get("literals_from"), record.get("shapes_from")) != (
+            len(region.params), len(region.literals), len(region.shapes)):
+        raise ValueError("an entry of another trace's region")
+    params = [parameter(entry) for entry in _listed(record["params"])]
+    if resized is not None:
+        params = [(primitive, resized(values)) for primitive, values in params]
+    literals = [_literal(value) for value in _listed(record["literals"])]
+    decoded = _decoded(_listed(record["terms"]), leaves=region.leaves,
+                       literals=len(region.literals) + len(literals),
+                       primitives=[primitive for primitive, _ in (*region.params, *params)],
+                       states=len(_listed(record["steps"])), rescaled=rescaled)
+    made = assembled(record, decoded=decoded, value=_value)
+    # Each literal a derivation appends is shaped as it is (`_appended`).
+    shapes = [(Term.literal(i64(index)), literal.shape)
+              for index, literal in enumerate(literals, start=len(region.literals))]
     region.params.extend(params)
     region.literals.extend(literals)
     for term, extent in shapes:
         region.shaped(term, extent)
-    kernel_report.record_stored("hit")
     return made
 
 
@@ -247,34 +262,55 @@ def _invalid(path: str, failed: Exception) -> None:
 
 
 def stored(name: str, region: terms.Region, params_from: int, literals_from: int, shapes_from: int,
-           encoded: Callable[..., Mapping[str, object]]) -> None:
-    """Write a derivation's forms derived afresh over `region` as the entry `name` (`encoded(term=...,
-    maybe=..., value=...)` its forms), with the parameters, literals and shapes the derivation appended to its
-    region past `params_from`, `literals_from` and `shapes_from`: counted `miss` once written; `unstorable`,
-    and not written, where the codec does not state it or the entry cannot be written."""
-    writer = _Writer()
+           encoded: Callable[..., Mapping[str, object]]) -> dict | None:
+    """Write a derivation's forms derived afresh over `region` as the entry `name` (`record_of`'s record),
+    and the record, which a class of sizes binds at its others (`dew.algebra.derive._classed`): counted
+    `miss` once written; `unstorable`, and not written, where the codec does not state it (no record) or the
+    entry cannot be written."""
+    record = None
     try:
-        forms = encoded(term=writer.term, maybe=writer.maybe, value=_encoded_value)
-        _appended(region, literals_from, shapes_from)
-        record = {"format": FORMAT, "params_from": params_from, "literals_from": literals_from,
-                  "shapes_from": shapes_from,
-                  # Each parameter in its order: a primitive's parameters bind as traced.
-                  "params": [[_primitive_name(primitive), [[key, _encoded_value(value)]
-                                                           for key, value in params.items()]]
-                             for primitive, params in region.params[params_from:]],
-                  "literals": [_encoded_value(np.asarray(value))
-                               for value in region.literals[literals_from:]],
-                  **forms, "terms": writer.table}
-        body = json.dumps(record, sort_keys=True)
-        if _one_directory(directory(), shipped()):
-            raise Unstated("Dew's cache is the read-only store (`DEW_DERIVATIONS`), never written")
-        os.makedirs(directory(), exist_ok=True)
-        _files.write_atomically(os.path.join(directory(), f"{name}.json"), f"{_summed(name, body)}\n{body}")
+        record = record_of(region, params_from, literals_from, shapes_from, encoded)
+        written(name, record)
     except (Unstated, OSError) as unstated:
         _log.info("a derivation not stored: %s", unstated)
         kernel_report.record_stored("unstorable")
-        return
+        return record
     kernel_report.record_stored("miss")
+    return record
+
+
+def record_of(region: terms.Region, params_from: int, literals_from: int, shapes_from: int,
+              encoded: Callable[..., Mapping[str, object]]) -> dict:
+    """A derivation's forms over `region` as a record (`encoded(term=..., maybe=..., value=...)` its forms,
+    each term by its index in one table of the codec's), with the parameters, literals and shapes the
+    derivation appended to its region past `params_from`, `literals_from` and `shapes_from`: what an entry
+    holds (`stored`) and a family of its structure (`dew.algebra.derive._Family`); `Unstated` where the
+    codec does not state it."""
+    writer = _Writer()
+    forms = encoded(term=writer.term, maybe=writer.maybe, value=encoded_value)
+    _appended(region, literals_from, shapes_from)
+    return {"format": FORMAT, "params_from": params_from, "literals_from": literals_from,
+            "shapes_from": shapes_from,
+            # Each parameter in its order: a primitive's parameters bind as traced.
+            "params": [encoded_parameter(primitive, params)
+                       for primitive, params in region.params[params_from:]],
+            "literals": [encoded_value(np.asarray(value)) for value in region.literals[literals_from:]],
+            **forms, "terms": writer.table}
+
+
+def encoded_parameter(primitive: Primitive, params: Mapping) -> list:
+    """A parameter as a record holds it (`record_of`; `_parameter` reads it back)."""
+    return [_primitive_name(primitive), [[key, encoded_value(value)] for key, value in params.items()]]
+
+
+def written(name: str, record: Mapping) -> None:
+    """`record` written as the entry `name` in Dew's cache; `Unstated` where Dew's cache is the read-only
+    store, `OSError` where it cannot be written."""
+    body = json.dumps(record, sort_keys=True)
+    if _one_directory(directory(), shipped()):
+        raise Unstated("Dew's cache is the read-only store (`DEW_DERIVATIONS`), never written")
+    os.makedirs(directory(), exist_ok=True)
+    _files.write_atomically(os.path.join(directory(), f"{name}.json"), f"{_summed(name, body)}\n{body}")
 
 
 def _appended(region: terms.Region, literals_from: int, shapes_from: int) -> None:
@@ -471,7 +507,7 @@ def _literal(encoded) -> np.ndarray:
     return value
 
 
-def _parameter(entry) -> tuple[Primitive, dict]:
+def parameter(entry) -> tuple[Primitive, dict]:
     """An appended parameter read from JSON: its primitive by name and its values by theirs."""
     primitive, given = _listed(entry)
     values = {}
@@ -545,7 +581,7 @@ def _primitive(name) -> Primitive:
     return _primitives()[name]
 
 
-def _encoded_value(value) -> list:
+def encoded_value(value) -> list:
     """`value` as an entry writes it, its type kept: an integer an integer, a dtype a dtype and a NumPy
     scalar class that class."""
     if value is None or isinstance(value, (bool, int, str)):
@@ -553,7 +589,7 @@ def _encoded_value(value) -> list:
     if isinstance(value, float):
         return ["x", value.hex()]
     if isinstance(value, tuple):
-        return ["T", [_encoded_value(part) for part in value]]
+        return ["T", [encoded_value(part) for part in value]]
     if isinstance(value, np.dtype):
         return ["d", value.name]
     if isinstance(value, type) and issubclass(value, np.generic):
@@ -566,7 +602,7 @@ def _encoded_value(value) -> list:
 
 
 def _value(encoded: list):
-    """A value `_encoded_value` wrote, checked of its kind's type (`ValueError` otherwise)."""
+    """A value `encoded_value` wrote, checked of its kind's type (`ValueError` otherwise)."""
     kind, *parts = _listed(encoded)
     if kind == "p" and len(parts) == 1 and (parts[0] is None or isinstance(parts[0], (bool, int, str))):
         return parts[0]

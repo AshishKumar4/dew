@@ -28,10 +28,11 @@ import collections
 import dataclasses
 import functools
 import itertools
+import logging
 import math
 import numbers
 import time
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Hashable, Mapping, Sequence
 from typing import Literal
 
 import jax
@@ -59,9 +60,11 @@ from egglog import (
     vars_,
 )
 from egglog.bindings import EggSmolError
+from jax.extend import core as jcore
 
 from dew import _cache
 from dew._cache import ALGEBRA, unintercepted
+from dew._facts import Facts, Held, recording, replay
 from dew.algebra import cost, derive_moments, extract, program, rules, stored, terms
 from dew.algebra.cost import Work
 from dew.algebra.derive_moments import (
@@ -287,6 +290,8 @@ maximum of a value at least it."""
 def floor_of(literal: Term) -> i64: ...
 """The class of a literal's value among the walk's floors (`_floors`): literals of one value one class."""
 
+
+_log = logging.getLogger(__name__)
 
 EXPONENTIALS = {"e": "exp", 2: "exp2"}
 """The language's exponential of each base a declaration states (`Reduction.exponent`): the exponentials a
@@ -711,14 +716,17 @@ def context() -> tuple:
     `scan.derive_scan`'s carry splits): forms traced under one abstract
     mesh hold its avals in their literals (a sharded step's bound under a local one's mesh refused to lower),
     and are priced for one target's pricing facts (`cost.pricing_key`), under one run's numerics and
-    precision.
+    precision, with 64-bit values on or off, and under each of JAX's promotion modes (rank and dtype): what a
+    declaration's trace may read of JAX's numerics, not the device a trace is assumed for (its capacity
+    priced apart, `cost.pricing_key`).
     The extractor oracle may be on or off (`Passes.checked`), and the pass may leave out a registered set
     of rules (`Passes.without`, a receipt's arm, which shares no derivation or recognition with another arm).
     Identity-keyed collections (`dew._cache.KERNEL_ROUTES`, `KERNEL_SEEN`) are not part of this key:
     they are new in each lowering, which would derive again and grow the cache without end."""
     return (jax.sharding.get_abstract_mesh(), cost.pricing_key(cost.target()), generation.numerics(),
-            jax.config.jax_default_matmul_precision, ALGEBRA.value.checked, ALGEBRA.value.without,
-            ALGEBRA.value.dev)
+            jax.config.jax_default_matmul_precision, jax.config.jax_enable_x64,
+            jax.config.jax_numpy_rank_promotion, jax.config.jax_numpy_dtype_promotion, ALGEBRA.value.checked,
+            ALGEBRA.value.without, ALGEBRA.value.dev)
 
 FORMS_HELD = 64
 """The derived forms one declaration keeps, its least recently traced dropped past them: a process's distinct
@@ -737,10 +745,11 @@ def derive(declaration: Reduction, *, accurate: bool, saturation: program.Satura
                 (EXPONENTIALS[declaration.exponent], declaration.exponential),
                 "rescale": declaration.rescale}
     held: collections.OrderedDict = collections.OrderedDict()
+    classes: collections.OrderedDict[Hashable, Held[dict | None]] = collections.OrderedDict()
 
     def derived_at(keyed: tuple) -> _Forms:
         shapes = {name: (shape, dtype) for name, shape, dtype in keyed}
-        made = _derived(declaration, names, walked_axes, shapes, accurate, saturation)
+        made = _derived(declaration, names, walked_axes, shapes, accurate, saturation, classes)
         kernel_report.record_rewrite(made.report)
         return made
 
@@ -855,47 +864,102 @@ def _role(reduction: Term) -> str:
     return found[0]
 
 
-def _derived(declaration: Reduction, names: tuple[str, ...], walked_axes: Mapping[str, int],
-             shapes: Mapping, accurate: bool, saturation: program.Saturation) -> _Forms:
-    """The forms at one tile's `shapes` (the module's account)."""
-    began = time.perf_counter()
+def _traced(declaration: Reduction, names: tuple[str, ...], shapes: Mapping) -> tuple:
+    """`declaration` traced at one tile's `shapes` (a model's intercepted quantized products not among it: a
+    declaration is the algebra's statement), and its region (`terms.region`)."""
     def named(*values):
         return declaration.function(**dict(zip(names, values, strict=True)))
 
     avals = [jax.ShapeDtypeStruct(*shapes[name]) for name in names]
-    # A declaration is the algebra's statement, not a model's intercepted quantized products.
     ranges = {index: declaration.ranges[name] for index, name in enumerate(names)
               if name in declaration.ranges}
     with jax.disable_jit():
         closed = jax.make_jaxpr(unintercepted(inlined(named, ranges=ranges)))(*avals)
-    region = terms.region(closed, ranges)
+    return closed, terms.region(closed, ranges)
+
+
+def _derived(declaration: Reduction, names: tuple[str, ...], walked_axes: Mapping[str, int],
+             shapes: Mapping, accurate: bool, saturation: program.Saturation,
+             classes: collections.OrderedDict | None = None) -> _Forms:
+    """The forms at one tile's `shapes` (the module's account): its class's (`_classed`: the forms derived at
+    the class's canonical sizes, held in `classes` by the class, bound at these), where a caller holds its
+    classes, else stored or derived afresh (`_held`)."""
+    began = time.perf_counter()
+    with recording() as facts:
+        closed, region = _traced(declaration, names, shapes)
     admitted = rules.admitted(accurate)
-    # Stored across processes, keyed by everything the forms read (`stored.key`), its sets by their names
-    # where the source registers them all (`rules.sourced`). The extractor's oracle checks the extraction
-    # itself: it derives, and reads and writes no store. Both derive from the one live set of rules.
+    tile = _traced_tile(declaration, names, walked_axes, shapes, closed, region, accurate, saturation, began,
+                        facts)
+    classed = None if classes is None else _classed(tile, admitted, classes)
+    return classed if classed is not None else _held(tile, admitted)[0]
+
+
+@dataclasses.dataclass(frozen=True)
+class _Tile:
+    """A declaration traced at one tile (`_derived`): what derives its forms there, stores them, and binds a
+    record over its region."""
+
+    declaration: Reduction
+    names: tuple[str, ...]
+    walked_axes: Mapping[str, int]
+    shapes: Mapping
+    closed: jcore.Jaxpr
+    region: terms.Region
+    accurate: bool
+    saturation: program.Saturation
+    began: float
+    facts: Facts
+    """The facts the tile's trace read (`_facts.recording`): what a class its own sizes seed holds."""
+    traced: tuple[int, int, int]
+    """The region's tables as traced, before a derivation appends to them: its parameters, literals and
+    shapes (`_traced_tile`)."""
+
+    @property
+    def rescaled(self) -> frozenset[str]:
+        """The exponentials a stored rescale may read (`stored._operated`)."""
+        return frozenset() if self.declaration.rescale is None else frozenset(EXPONENTIALS.values())
+
+    def assembled(self, spent: float = 0.0) -> Callable[..., _Forms]:
+        """The forms a record's decoded terms assemble over the region (`_assembled`), timed from the tile's
+        trace less `spent` (a class's canonical derivation the tile waited on, its own report's)."""
+        return functools.partial(_assembled, region=self.region, closed=self.closed,
+                                 walked_leaves=_walked_leaves(self.closed, self.names, self.walked_axes),
+                                 began=self.began + spent)
+
+
+def _traced_tile(declaration: Reduction, names: tuple[str, ...], walked_axes: Mapping[str, int],
+                 shapes: Mapping, closed: jcore.Jaxpr, region: terms.Region, accurate: bool,
+                 saturation: program.Saturation, began: float, facts: Facts) -> _Tile:
+    """A tile of `region` as traced (`_Tile`), its tables counted before any derivation appends to them."""
+    return _Tile(declaration, names, walked_axes, shapes, closed, region, accurate, saturation, began, facts,
+                 (len(region.params), len(region.literals), len(region.shapes)))
+
+
+def _held(tile: _Tile, admitted: tuple[rules.Rules, ...]) -> tuple[_Forms, dict | None]:
+    """The forms at `tile`, stored or derived afresh and stored, and the record the store read or wrote
+    (none where it reads and writes none): the extractor's oracle derives each afresh and reads and writes no
+    store."""
+    declaration, names, shapes = tile.declaration, tile.names, tile.shapes
     if ALGEBRA.value.checked:
-        return _derived_afresh(declaration, names, walked_axes, closed, region, admitted, saturation, began)
+        return _derived_afresh(declaration, names, tile.walked_axes, tile.closed, tile.region, admitted,
+                               tile.saturation, tile.began), None
+    # Stored across processes, keyed by everything the forms read (`stored.key`), its sets by their names
+    # where the source registers them all (`rules.sourced`). Both derive from the one live set of rules.
     sourced = [sets.name for sets in admitted]
-    name = None if not rules.sourced(admitted) else stored.key(closed, region, sourced, (
-        names, tuple(sorted(walked_axes.items())),
-        tuple((n, tuple(shapes[n][0]), np.dtype(shapes[n][1]).name) for n in names), accurate,
-        (saturation.growth, saturation.depth), declaration.walked, declaration.exponent,
+    name = None if not rules.sourced(admitted) else stored.key(tile.closed, tile.region, sourced, (
+        names, tuple(sorted(tile.walked_axes.items())),
+        tuple((n, tuple(shapes[n][0]), np.dtype(shapes[n][1]).name) for n in names), tile.accurate,
+        (tile.saturation.growth, tile.saturation.depth), declaration.walked, declaration.exponent,
         tuple(sorted(declaration.ranges.items())), declaration.exact, declaration.rescale is None, context()))
-    params_from, literals_from, shapes_from = len(region.params), len(region.literals), len(region.shapes)
-    # A rescale reads an exponential's parameters only where the declaration states its own rescale, whose
-    # walk alone writes one (`DECOUPLED_RESCALED`).
-    rescaled = frozenset() if declaration.rescale is None else frozenset(EXPONENTIALS.values())
-    if name is not None and (made := stored.loaded(name, region, functools.partial(
-            _assembled, region=region, closed=closed,
-            walked_leaves=_walked_leaves(closed, names, walked_axes), began=began),
-            rescaled=rescaled)) is not None:
-        return made
-    made = _derived_afresh(declaration, names, walked_axes, closed, region, admitted, saturation, began)
+    if name is not None and (
+            read := stored.loaded(name, tile.region, tile.assembled(), rescaled=tile.rescaled)) is not None:
+        return read
+    made = _derived_afresh(declaration, names, tile.walked_axes, tile.closed, tile.region, admitted,
+                           tile.saturation, tile.began)
     if name is None:
         kernel_report.record_stored("unstorable")
-    else:
-        stored.stored(name, made.region, params_from, literals_from, shapes_from, _encoded(made))
-    return made
+        return made, None
+    return made, stored.stored(name, made.region, *tile.traced, _encoded(made))
 
 
 def _derived_afresh(declaration: Reduction, names: tuple[str, ...], walked_axes: Mapping[str, int], closed,
@@ -1034,7 +1098,8 @@ def _encoded(made: _Forms) -> Callable[..., Mapping[str, object]]:
                            for part in getattr(made, field)] for field in _PARTS},
                 "floors": [value(floor) for floor in made.floors],
                 "mapped": list(made.mapped),
-                "report": [report.equations, list(report.admitted), sorted(report.fired.items()),
+                "report": [report.equations, list(report.admitted),
+                           [list(pair) for pair in sorted(report.fired.items())],
                            list(report.limits), report.iterations, report.nodes, report.limited,
                            value(report.before), value(report.after)]}
     return encoded
@@ -1098,6 +1163,197 @@ def _assembled(record: Mapping, *, decoded: stored._Decoded, value: Callable, re
                   tuple(closed.consts), report, parts("accumulated", (0,), 3, frozenset({0})),
                   parts("added", (0,), 3, frozenset()), parts("merged", (0, 1), 2, frozenset()),
                   floors, held["anchors"], held["scales"])
+
+
+SIZED_PARAMETERS = ("shape", "new_sizes", "slice_sizes")
+"""The parameters an equation states extents by (a broadcast's, a reshape's, a dynamic slice's): symbols in a
+class's key (`_shape_of`), and its canonical sizes' mapped to another size of the class (`_classed`); every
+other parameter's value its own."""
+
+
+@dataclasses.dataclass(frozen=True)
+class _Shape:
+    """A traced region's structure as a class of its sizes keys it (`_shape_of`): its key, and the extents
+    past one it holds in the order they are first read (each a symbol in the key)."""
+
+    key: Hashable
+    sizes: tuple[int, ...]
+
+
+class Diverged(AssertionError):
+    """A class's forms bound at sizes of it state tables a derivation afresh there does not (`_checked`): the
+    facts its key reads of the sizes (`_shape_of`) do not hold every fact a derivation states of them."""
+
+
+def _shape_of(closed, region: terms.Region, parts: Hashable) -> _Shape | None:
+    """`region`'s structure (`closed`'s, read beside `parts`, held as they are) with each extent past one a
+    symbol, numbered as first read, and what the facts a derivation states read of its sizes beside them:
+    each symbol's power of two (`rules.log2_of`), the order of their values (a table built in it,
+    `program._products`), each reduction's length's power and whether it counts exactly, and each product's
+    contracted length's power and whether it is at most 256 (`program.reduced`, `program.contracted`, the
+    facts' own); every other value its own.
+    Two regions of one key differ in their sizes alone, and a derivation states of each the same facts but
+    for its extents (an extent of none or one its own in the key), each rule reading an extent only as one
+    (equal to another, ordered, its power): forms derived at one compute the declaration at the other
+    (`_classed`). None where the region holds an equation outside the language (whose parameters state
+    what the key does not read), a captured constant no host holds (an outer trace's), or a part a key
+    holds by identity."""
+    if region.opaque or not all(isinstance(const, (np.ndarray, np.generic, bool, int, float))
+                                for const in closed.consts):
+        return None
+    inventory = stored._inventory(region)
+    if inventory is None:
+        return None
+    sizes: dict[int, int] = {}
+
+    def symbol(size) -> int | tuple[str, int]:
+        size = int(size)
+        return size if size < 2 else ("extent", sizes.setdefault(size, len(sizes)))
+
+    table, outputs, opaque, shaped, params = inventory
+    shaped = [[term, [symbol(size) for size in extent]] for term, extent in shaped]
+    params = [(name, {field: (tuple(symbol(size) for size in value)
+                              if field in SIZED_PARAMETERS and value is not None else value)
+                      for field, value in values.items()}) for name, values in params]
+    coarse = [(program.reduced(region, term), program.contracted(region, term)) for term, _ in region.shapes]
+    held = list(sizes)
+    stated = terms.plain_key((
+        table, outputs, opaque, shaped, params, coarse, [max(size - 1, 0).bit_length() for size in held],
+        sorted(range(len(held)), key=held.__getitem__), region.leaves, region.depth, region.equations,
+        [stored.encoded_value(np.asarray(value)) for value in region.literals],
+        [stored.encoded_value(np.asarray(value)) for value in region.literal_outputs],
+        sorted((repr(key), np.dtype(dtype).name) for key, dtype in region.dtypes.items()),
+        sorted((repr(key), repr(held_bound)) for key, held_bound in region.magnitudes.items()),
+        sorted((repr(key), repr(apart)) for key, apart in region.floors.items()),
+        sorted(map(repr, region.nonnegative)), sorted(map(repr, region.unplaced_full_fp32)),
+        [(terms.key(narrow), terms.key(original)) for narrow, original in region.exact_roundtrips],
+        sorted((index, repr(product)) for index, product in region.products.items()),
+        sorted(region.stock.items()), len(closed.jaxpr.constvars),
+        [stored.encoded_value(np.asarray(const)) for const in closed.consts]))
+    return None if stated is None else _Shape((stated, parts), tuple(held))
+
+
+def _canonical(sizes: tuple[int, ...]) -> tuple[int, ...] | None:
+    """The canonical sizes of a class (`_shape_of`'s, of `sizes`, its extents past one): each extent the top
+    of its power of two's range (`2**p`, `p` its `rules.log2_of`), extents of one power apart below it, the
+    largest highest, so their order holds; None where they are more than its range holds. A function of the
+    class alone: every size of it derives at the same sizes, whichever the process derives first."""
+    powers: dict[int, list[int]] = {}
+    for size in sizes:
+        powers.setdefault((size - 1).bit_length(), []).append(size)
+    canonical: dict[int, int] = {}
+    for power, members in powers.items():
+        for rank, size in enumerate(sorted(members, reverse=True)):
+            if (value := (1 << power) - rank) <= 1 << (power - 1):
+                return None
+            canonical[size] = value
+    return tuple(canonical[size] for size in sizes)
+
+
+def _resized(values: Mapping, sizes: Mapping[int, int]) -> dict:
+    """A parameter's `values` with each extent of its sized fields (`SIZED_PARAMETERS`) its size in `sizes`
+    (one past none its own)."""
+    return {field: (tuple(int(size) if int(size) < 2 else sizes[int(size)] for size in value)
+                    if field in SIZED_PARAMETERS and value is not None else value)
+            for field, value in values.items()}
+
+
+def _classed(tile: _Tile, admitted: tuple[rules.Rules, ...], classes: collections.OrderedDict
+             ) -> _Forms | None:
+    """The forms at `tile` its class's canonical sizes hold (`_canonical`), bound over its region as a stored
+    entry's are (`stored.bound`, each appended parameter's extents mapped to its sizes, `_resized`): the same
+    forms for every size of a class however a process came to them, one derivation a class. A class's record
+    is held in `classes` by the class's key (its traced structure and parts, `_shape_of`, `context` among
+    them: never by the canonical sizes alone, whose trace may read what a shape does not), through
+    `_cache.holding`, with the facts its canonical trace read checked where it is taken; a size of a known
+    class traces nothing more, an unknown one derives its class (`_class_record`). A rebound size is held by
+    the oracle to a derivation afresh there (`_checked`). None where the class has no canonical sizes or
+    record; where a set the source does not register is admitted (a set registered at run time states no
+    class's contract, `rules.sourced`)."""
+    if not rules.sourced(admitted):
+        return None
+    parts = (context(), tuple(sets.name for sets in admitted))
+    shaped = _shape_of(tile.closed, tile.region, parts)
+    sizes = None if shaped is None else _canonical(shaped.sizes)
+    if shaped is None or sizes is None:
+        return None
+    # The canonical sizes asked themselves derive in the making, their own forms taken as they are.
+    own: list[_Forms] = []
+    began = time.perf_counter()
+    record = _cache.holding(classes, shaped.key,
+                            lambda: _class_record(tile, admitted, parts, shaped, sizes, own), FORMS_HELD)
+    if own:
+        return own[0]
+    if record is None:
+        return None
+    spent = time.perf_counter() - began
+    back = dict(zip(sizes, shaped.sizes, strict=True))
+    made = stored.bound(record, tile.region, tile.assembled(spent), rescaled=tile.rescaled,
+                        resized=None if sizes == shaped.sizes else functools.partial(_resized, sizes=back))
+    if ALGEBRA.value.checked:
+        _checked(record, back, tile, admitted)
+    return made
+
+
+def _class_record(tile: _Tile, admitted: tuple[rules.Rules, ...], parts: Hashable, shaped: _Shape,
+                  sizes: tuple[int, ...], own: list[_Forms]) -> dict | None:
+    """A class's record (`stored.record_of`'s, the one the store read or wrote where it did), its forms
+    derived at its canonical `sizes` (`_held`): `tile`'s own where they are its sizes (its forms put in
+    `own`, the facts its trace read recorded as this making's), else the declaration traced there (a probe of
+    sizes no caller asked for: whatever it raises leaves the class to each size's own derivation), held to
+    the class's key and to those sizes, its report recorded as a derivation's and timed apart. None where it
+    does not hold or the codec states no record."""
+    there = tile
+    if sizes == shaped.sizes:
+        replay(tile.facts)
+    else:
+        to = dict(zip(shaped.sizes, sizes, strict=True))
+        shapes = {name: (tuple(int(size) if int(size) < 2 else to[int(size)] for size in shape), dtype)
+                  for name, (shape, dtype) in tile.shapes.items()}
+        began = time.perf_counter()
+        try:
+            # Within the class's making, whose recording holds what this trace reads.
+            closed, region = _traced(tile.declaration, tile.names, shapes)
+        except Exception as untraced:
+            _log.info("a class's canonical sizes do not trace, derived at its own: %s", untraced)
+            return None
+        traced_there = _shape_of(closed, region, parts)
+        if traced_there is None or traced_there.key != shaped.key or traced_there.sizes != sizes:
+            return None
+        there = _traced_tile(tile.declaration, tile.names, tile.walked_axes, shapes, closed, region,
+                             tile.accurate, tile.saturation, began, {})
+    made, record = _held(there, admitted)
+    if there is tile:
+        own.append(made)
+    else:
+        kernel_report.record_rewrite(made.report)
+    if record is not None:
+        return record
+    try:
+        return stored.record_of(made.region, *there.traced, _encoded(made))
+    except stored.Unstated as unstated:
+        _log.info("a class's forms not bound past its canonical sizes: %s", unstated)
+        return None
+
+
+def _checked(record: Mapping, back: Mapping[int, int], tile: _Tile,
+             admitted: tuple[rules.Rules, ...]) -> None:
+    """The oracle's hold of a class's `record` bound at `tile` (`_classed`'s, its extents mapped by `back`)
+    to a derivation afresh there: the tables it appends are the ones the class's bound (each fact it states
+    of these sizes the one the class's canonical sizes stated, mapped); `Diverged` otherwise."""
+    closed, region = _traced(tile.declaration, tile.names, tile.shapes)
+    traced = (len(region.params), len(region.literals), len(region.shapes))
+    made = _derived_afresh(tile.declaration, tile.names, tile.walked_axes, closed, region, admitted,
+                           tile.saturation, tile.began)
+    try:
+        fresh = stored.record_of(made.region, *traced, _encoded(made))
+    except stored.Unstated as unstated:
+        _log.info("a class's tables not held to a derivation's: %s", unstated)
+        return
+    bound = [stored.encoded_parameter(primitive, _resized(values, back))
+             for primitive, values in map(stored.parameter, record["params"])]
+    if (fresh["params"], fresh["literals"]) != (bound, record["literals"]):
+        raise Diverged(f"a class's tables at {tile.shapes} are not a derivation's there")
 
 
 def _decoupled_through(graph: EGraph, region: terms.Region, facts: Schedule, decoupled: rules.Rules) -> None:
@@ -1344,7 +1600,8 @@ def _lift(graph: EGraph, region: terms.Region, reductions) -> None:
     anchor's to the sum's shape along no axis, a vector's along each of the sum's axes of its extent, of which
     the rules take the one its anchor's lies along (`anchored`). An anchor of more axes has none: its sum's
     correction is no broadcast of these, and the declaration is refused."""
-    anchors = {extent for term, extent in region.shapes if _holds(graph, anchor(term))}
+    # In the region's order, which no size changes (a set's of their extents a hash's).
+    anchors = dict.fromkeys(extent for term, extent in region.shapes if _holds(graph, anchor(term)))
     lifted = set()
     facts = []
     for reduction in reductions:

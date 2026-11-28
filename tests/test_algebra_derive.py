@@ -98,14 +98,23 @@ def whole(function):
     return lambda q, k, v: function(q, k, v, ROWS, PLACES)
 
 
+def drawn(rows: int, keys: int):
+    """Queries, keys and values at `rows` queries and `keys` keys whose logits span six decades of magnitude
+    across rows, so a row's maximum moves from tile to tile and the rescale matters: a function of a
+    seed."""
+    def made(seed):
+        rng = np.random.default_rng(seed)
+        scale = 10.0 ** rng.uniform(-1, 2, (rows, 1))
+        return (jnp.asarray(rng.standard_normal((rows, WIDTH)) * scale, jnp.float32),
+                jnp.asarray(rng.standard_normal((keys, WIDTH)), jnp.float32),
+                jnp.asarray(rng.standard_normal((keys, WIDTH)), jnp.float32))
+
+    return made
+
+
 def draw(seed):
-    """Queries, keys and values whose logits span six decades of magnitude across rows, so a row's maximum
-    moves from tile to tile and the rescale matters."""
-    rng = np.random.default_rng(seed)
-    scale = 10.0 ** rng.uniform(-1, 2, (QUERIES, 1))
-    return (jnp.asarray(rng.standard_normal((QUERIES, WIDTH)) * scale, jnp.float32),
-            jnp.asarray(rng.standard_normal((KEYS, WIDTH)), jnp.float32),
-            jnp.asarray(rng.standard_normal((KEYS, WIDTH)), jnp.float32))
+    """`drawn`'s at the tests' queries and keys."""
+    return drawn(QUERIES, KEYS)(seed)
 
 
 def declared(function, exponent: Literal[2, "e"] = "e") -> derive.Reduction:

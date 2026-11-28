@@ -1281,6 +1281,27 @@ a derived form replaces a hand-written one only where it states the walk, passes
   (`report.recording`). A cold attention step's 20
   forms (9 s of 25 s on armada) read back in a fresh process with the store alone warm, the step 15 s, its
   program the same.
+- A declaration's tiles of one class of sizes take one derivation: the class's canonical sizes'
+  (`derive._classed`). A class is its region's structure with each extent past one a symbol and what a
+  derivation reads of the sizes beside it (`derive._shape_of`): each extent's power of two (`rules.log2_of`),
+  the order of their values, each reduction's length's power and whether it counts exactly, each product's
+  contracted length's power and whether it is at most 256 (`program.reduced`, `program.contracted`, the facts'
+  own), and every other value as it is (an extent of none or one, a literal, a bound, a captured constant a
+  host holds) beside what every derivation reads (`derive.context`, 64-bit values and JAX's promotion modes
+  among it); every rule reads an extent only as that (equal to another, ordered, its power), so forms derived
+  at one size of a class compute the declaration at every other. A class is taken only under the source's rule
+  sets (`rules.sourced`: a set registered at run time states no such contract). Its canonical sizes are the
+  class's alone (`derive._canonical`: each extent the top of its power of two's range, distinct extents of one
+  power just below it in their order), traced once a class and held to the class's key and to those sizes (a
+  declaration's own test of a size, or a reshape of its sizes, derives that size at its own), derived and
+  stored as any sizes are, and the class's record held by its key (never by the canonical sizes alone, whose
+  trace may read what a shape does not) with the facts its canonical trace read, checked wherever it is taken
+  (`_cache.holding`): each size of the class is bound from it as a stored entry is, its appended parameters'
+  extents mapped (`derive.SIZED_PARAMETERS`), at its own trace's cost, and its forms are its class's whichever
+  size a process (or an earlier one, through the store) derived first. They are priced at the canonical sizes,
+  not at each size's own: each extent of a class lies within twice another's, a price over several extents
+  further apart. The oracle derives each classed size afresh beside it and holds the tables it appends to the
+  class's (`derive.Diverged`).
 - A released package ships the entries of the derivations its declared steps' templates request
   (`tools/derived_catalogue.py`, run by the release CI's derived job for the CUDA generations it configures
   and handed to the package's build, `tools/ci/package.sh`'s `DEW_DERIVED`, its output the package data under

@@ -989,12 +989,10 @@ def stated(graph: EGraph, region: terms.Region, *registered) -> None:
                 facts.append(set_(rules.dtype(term)).to(String(np.dtype(dtype).name)))
             if (back := widened.get(dtype)) is not None:
                 facts.append(set_(rules.narrowed(term)).to(i64(region.stock[back])))
-        if (args := get_callable_args(term, terms.Term.reduce)) is not None:
-            primitive, params = region.params[terms.integer(args[3])]
-            extent = region.shape(args[0])
-            length = math.prod(extent[axis] for axis in params["axes"])
-            facts.append(set_(rules.sum_length(term)).to(i64(max(length - 1, 0).bit_length())))
-            if primitive is jax.lax.reduce_sum_p and _counts_exactly(region, args[0], dtype, length):
+        if (summed := reduced(region, term)) is not None:
+            power, counting = summed
+            facts.append(set_(rules.sum_length(term)).to(i64(power)))
+            if counting:
                 facts.append(rules.counting_sum(term))
     # holds where the program's values are: a new intermediate under the narrowest float's largest power of
     # two is finite wherever the program is. A bound over an unbounded operand would bound nothing: the
@@ -1012,7 +1010,33 @@ def stated(graph: EGraph, region: terms.Region, *registered) -> None:
         graph.register(*facts)
 
 
-def _counts_exactly(region: terms.Region, operand: terms.Term, dtype, length: int) -> bool:
+def reduced(region: terms.Region, term: terms.Term) -> tuple[int, bool] | None:
+    """What a reduction states of its length (`stated`): its power (`rules.sum_length`) and whether a sum of
+    it counts exactly (`rules.counting_sum`, `counts_exactly`); None for any other term. The one place each
+    is computed, which a class of sizes reads too (`dew.algebra.derive._shape_of`)."""
+    if (args := get_callable_args(term, terms.Term.reduce)) is None:
+        return None
+    primitive, params = region.params[terms.integer(args[3])]
+    length = math.prod(region.shape(args[0])[axis] for axis in params["axes"])
+    return max(length - 1, 0).bit_length(), (
+        primitive is jax.lax.reduce_sum_p
+        and counts_exactly(region, args[0], region.dtypes.get(terms.key(term)), length))
+
+
+def contracted(region: terms.Region, term: terms.Term) -> tuple[int, bool] | None:
+    """What a product states of its contracted length (`_products`): its power (`rules.contracted_length`'s,
+    its mode's slack beside it) and whether it is at most 256, an exact int8 product's (`|byte| < 256`: its
+    integer partial sums below `2**24`); None for any other term. The one place each is computed, which a
+    class of sizes reads too (`dew.algebra.derive._shape_of`)."""
+    if (args := get_callable_args(term, terms.Term.dot)) is None:
+        return None
+    _, params = region.params[terms.integer(args[2])]
+    (contracting, _), _ = params["dimension_numbers"]
+    length = math.prod(region.shape(args[0])[axis] for axis in contracting)
+    return max(length - 1, 0).bit_length(), 0 < length <= 256
+
+
+def counts_exactly(region: terms.Region, operand: terms.Term, dtype, length: int) -> bool:
     """Two counts of predicate elements fit the unit-spaced integer range of the accumulator."""
     if dtype is None or not jnp.issubdtype(dtype, jnp.floating):
         return False
@@ -1048,9 +1072,8 @@ def _products(region: terms.Region) -> list:
         # Its contracted length's power, the elements each output sums, and its mode's beside it
         # (`rules.contracted_length`): what a product a rule makes in its place, in its mode, adds to its
         # operands' bounds (a split-precision product's one power more, as its own traced bound takes).
-        (contracting, _), _ = params["dimension_numbers"]
-        length = math.prod(region.shape(args[0])[axis] for axis in contracting)
-        facts.append(set_(rules.contracted_length(term)).to(i64(max(length - 1, 0).bit_length() + slack)))
+        power, small = contracted(region, term) or (0, False)
+        facts.append(set_(rules.contracted_length(term)).to(i64(power + slack)))
         wanted = params.get("preferred_element_type")
         operands = {left, right}
         # Plain only of one dtype: a product of two makes neither's (`terms.Product.made`), no plain one a
@@ -1062,7 +1085,7 @@ def _products(region: terms.Region) -> list:
                 if left_axes == (1,) and right_axes in ((0,), (1,)) and batches == ((), ()):
                     facts.append(set_(rules.matrix_product(i64(index))).to(i64(1 - right_axes[0])))
                     # Each |byte| < 256: K <= 256 keeps arbitrary integer partial sums below 2**24.
-                    if (right_axes == (1,) and 0 < length <= 256 and operands == {np.dtype(jnp.float32)}
+                    if (right_axes == (1,) and small and operands == {np.dtype(jnp.float32)}
                             and terms.key(term) in region.unplaced_full_fp32):
                         facts.append(rules.exact_int8_product(term))
     matrices = {extent for _, extent in region.shapes if len(extent) == 2}

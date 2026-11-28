@@ -311,12 +311,12 @@ def test_a_derivation_the_codec_does_not_state_is_counted_unstorable(storing):
     assert storing.stored == {"miss": 1, "unstorable": 1}
     assert not (Path(stored.directory()) / "unstated.json").exists()
     with pytest.raises(stored.Unstated):
-        stored._encoded_value(object())
+        stored.encoded_value(object())
 
 
 WALK = """
 import json, os, sys
-sys.path[:0] = ["tests", "."]
+sys.path[:0] = ["src", "tests", "."]
 import lane_environment
 lane_environment.configure_lane(os.environ)
 import numpy as np
@@ -349,6 +349,51 @@ def test_a_fresh_process_walks_a_template_by_the_forms_an_earlier_one_stored(tmp
     first, second = walked("1"), walked("2")
     assert first["stored"].get("miss") and not first["stored"].get("hit")
     assert second["stored"] == {"hit": first["stored"]["miss"]}
+    assert second["values"] == first["values"]
+
+
+SIBLINGS = """
+import json, os, sys
+sys.path[:0] = ["src", "tests", "."]
+import lane_environment
+lane_environment.configure_lane(os.environ)
+import numpy as np
+from dew.nn.kernels.templates import attention_algebra, report
+values = {}
+with report.recording() as recorded:
+    forms = attention_algebra.derived_forms(True, False, 0.125)
+    for rows, keys in json.loads(sys.argv[1]):
+        rng = np.random.default_rng(rows)
+        tiles = {"logits": rng.standard_normal((rows, keys)).astype(np.float32),
+                 "values": rng.standard_normal((keys, 128)).astype(np.float32)}
+        shapes = {name: (tile.shape, tile.dtype) for name, tile in tiles.items()}
+        state = forms.step(forms.init(shapes), tiles)
+        values[f"{rows}x{keys}"] = [np.asarray(part).tobytes().hex()
+                                    for part in (*state, *forms.finish(state, tiles, shapes=shapes))]
+print(json.dumps({"stored": dict(recorded.stored), "values": values}))
+"""
+
+
+def test_a_class_stored_by_one_process_serves_another_whichever_size_each_takes_first(tmp_path):
+    """Two tiles of one class of sizes (12 by 24 and 13 by 20 logits: canonical 16 by 32), walked in one
+    process in one order and in another, of another hash seed, in the other, each as a run computes (the CPU's
+    wide arithmetic off, whose wide forms key no class of this declaration): the first derives the class's
+    canonical sizes once and stores them, the second reads that entry and derives none, and each tile's walk
+    is the same bit for bit in both."""
+    from dew.nn.precision import WIDE_CPU_ARITHMETIC
+
+    def walked(seed, order):
+        # Outside the test session, the extractor's oracle is off, as in a run.
+        env = {**os.environ, "XDG_CACHE_HOME": str(tmp_path), "PYTHONHASHSEED": seed,
+               WIDE_CPU_ARITHMETIC: "0"}
+        done = subprocess.run([sys.executable, "-c", SIBLINGS, json.dumps(order)], capture_output=True,
+                              text=True, env=env, check=True)
+        return json.loads(done.stdout.strip().splitlines()[-1])
+
+    first = walked("1", [[12, 24], [13, 20]])
+    second = walked("2", [[13, 20], [12, 24]])
+    assert first["stored"] == {"miss": 1}, first["stored"]
+    assert second["stored"] == {"hit": 1}, second["stored"]
     assert second["values"] == first["values"]
 
 
