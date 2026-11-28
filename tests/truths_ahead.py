@@ -40,6 +40,7 @@ import os
 import pickle
 import shutil
 import types
+import weakref
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from pathlib import Path
 from typing import Any
@@ -402,9 +403,48 @@ class CompiledTruths:
             if stored["stamp"] != self.stamp:
                 raise MissingTruth(f"{label}: its programs were compiled at {stored['stamp']}, not this "
                                    f"run's {self.stamp}")
-            self.read[label] = (AheadPrograms.load(site / PROGRAMS).loaded(),
-                                pickle.loads((site / HELD).read_bytes()))
+            programs = AheadPrograms.load(site / PROGRAMS).loaded()
+            held = pickle.loads((site / HELD).read_bytes())
+            for name, record in held.items():
+                # A library arm's executable, the one this run loads, held to its library's call (row 14096).
+                if record.get("library_call") is not None and jax.default_backend() == "gpu":
+                    library_checked(programs[name], record["library_call"], f"{label}: {name}")
+            self.read[label] = (programs, held)
         return self.read[label]
+
+
+_LIBRARY_CALLS: weakref.WeakKeyDictionary[Callable, str] = weakref.WeakKeyDictionary()
+"""Each library arm's call (`library_arm`), by its program."""
+
+
+def library_arm[Fn: Callable](fn: Fn, call: str) -> Fn:
+    """`fn`, a library arm's program (`generation_support.cublas_compiled`), marked as one whose executable
+    calls the library's `call`, which the gate checks it by where it runs (`library_checked`)."""
+    _LIBRARY_CALLS[fn] = call
+    return fn
+
+
+def library_call(fn) -> str | None:
+    """The library call `fn`'s executable makes, where it is a library arm (`library_arm`); None otherwise,
+    a value no weak reference holds (a partial, a builtin) among them, which no arm marks."""
+    return next((call for arm, call in _LIBRARY_CALLS.items() if arm is fn), None)
+
+
+def library_checked(executable: jax.stages.Compiled, call: str, label: str) -> None:
+    """`executable`, a library arm's (`generation_support.cublas_compiled`) as it runs, read by its
+    instructions as XLA's own schema reads them (`dew.telemetry.instrumentation.hlo_instructions`): it calls
+    the library's `call` (cuBLASLt's `__cublas$lt$matmul`) and runs no dot of XLA's own, fused or not, so no
+    lane flag or fusion choice gives it another GEMM; refused otherwise, naming what it calls. Checked on
+    the executable that runs, a prepared one as its run loads it (`CompiledTruths._site`), never on a
+    compile of its own beside it (row 14096)."""
+    from dew.telemetry.instrumentation import hlo_instructions
+
+    instructions = hlo_instructions(executable).values()
+    targets = {each.target for each in instructions} - {""}
+    if call not in targets:
+        raise AssertionError(f"{label}: the library arm calls {sorted(targets)}, no {call}")
+    if any(each.op == "dot" or "dot" in each.fused for each in instructions):
+        raise AssertionError(f"{label}: the library arm runs a dot of XLA's own")
 
 
 def compiled_memory(directory: Path, *, arms: bool = False) -> list[dict[str, int | str]]:
