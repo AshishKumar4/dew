@@ -423,10 +423,15 @@ def test_a_bf16_levels_overflowed_read_leaves_a_later_tokens_decay_gradient_zero
         out = log_linear_attention(queries, unit, unit, g, weights, scale=1.0)
         return out[0, 68, 0, 0].astype(jnp.float32)
 
-    found, gradient = jax.value_and_grad(read)(jnp.zeros((1, 69, 1), jnp.float32).at[0, 67].set(-1.0)
-                                               .at[0, 68].set(-1000.0))
+    g = jnp.zeros((1, 69, 1), jnp.float32).at[0, 67].set(-1.0).at[0, 68].set(-1000.0)
+    found, gradient = jax.value_and_grad(read)(g)
     assert found == 0, found
     np.testing.assert_array_equal(np.asarray(gradient, np.float32), np.zeros((1, 69, 1), np.float32))
+    # Its derivative again by token 67's decay, forward over reverse: zero, the reset's zero cotangent
+    # annihilating the overflowed read at every order (a head review).
+    along = jnp.zeros_like(g).at[0, 67].set(1.0)
+    _, curvature = jax.jvp(jax.grad(read), (g,), (along,))
+    np.testing.assert_array_equal(np.asarray(curvature, np.float32), np.zeros((1, 69, 1), np.float32))
 
 
 def test_a_bf16_levels_nan_key_beside_an_overflow_leaves_a_resets_decay_gradient_finite():

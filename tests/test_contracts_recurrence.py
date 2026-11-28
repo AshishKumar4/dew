@@ -396,6 +396,21 @@ def test_a_decayed_value_times_factors_holds_every_order(edge):
                     plain_fn=lambda exponent, value, a, b: value * jnp.exp(exponent) * a * b)
 
 
+def test_a_decayed_value_times_a_zero_factor_is_zero_and_its_derivative_by_it_finite():
+    """`scan._times_decayed` of an overflowed value (`inf`) under `exp(-1)` times a zero factor and a unit
+    one: zero, its derivative by the exponent zero (the zero factor annihilating the value at every order),
+    and, of a finite value of 3, its derivative by the zero factor the decayed value's, as at a factor of
+    one: the term that differentiates the zero away kept (a head review)."""
+    exponent = jnp.float32(-1.0)
+    assert scan._times_decayed(exponent, jnp.float32(jnp.inf), jnp.float32(0.0), jnp.float32(1.0)) == 0
+    by_exponent = jax.grad(lambda e: scan._times_decayed(e, jnp.float32(jnp.inf), jnp.float32(0.0),
+                                                         jnp.float32(1.0)))(exponent)
+    assert by_exponent == 0, by_exponent
+    by_factor = jax.grad(lambda a: scan._times_decayed(exponent, jnp.float32(3.0), a, jnp.float32(1.0)))
+    # Linear in the factor: its derivative at zero its derivative anywhere, the decayed value.
+    assert by_factor(jnp.float32(0.0)) == by_factor(jnp.float32(1.0)) != 0, by_factor(jnp.float32(0.0))
+
+
 def test_scaled_exps_mixed_second_derivative_decays_before_its_directions_meet():
     """The derivative by `scan.scaled_exp`'s value of a direction of 2^100 times its exponent's pullback of
     a cotangent of 2^100, at a value of 1 under `e^-60`: `2^200 e^-60` (2^113.4) in float64's binade, the

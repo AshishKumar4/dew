@@ -1812,7 +1812,8 @@ def _decayed_terms_value(terms, exponent, *operands):
     product or sum leaves the format's range where the whole is in it: 2^127 by 2^127 under `e^-90`, 2^120
     by 1 under `e^-120`, 2^100 by 2^-120 under `e^-25`, a term past the range beside one it cancels. An
     exponent past the cutoff, -inf or fp32's most negative among them, decays a finite sum to zero (a
-    non-finite one to NaN, no product of the operands formed: 2^127 by 2^127 at -inf is zero)."""
+    non-finite one to NaN, no product of the operands formed: 2^127 by 2^127 at -inf is zero). A term one of
+    whose operands is zero is zero, whatever the others (`_times_decayed_value`'s rule at every order)."""
     used = sorted({index for term in terms for index in term})
     dtype = jnp.result_type(exponent, *operands)
     # The decomposition in at least fp32, each operand widened exactly (a 16-bit subnormal a normal fp32),
@@ -1837,8 +1838,16 @@ def _decayed_terms_value(terms, exponent, *operands):
     remainder = accurate_exp(((high - whole) + low) * np.asarray(math.log(2.0), work))
     decay = scaled.normalized(remainder, jnp.clip(whole, -cutoff, 0).astype(jnp.int32), cutoff + 1)
     parts = {index: scaled.scaled(operands[index]) for index in used}
-    products = [functools.reduce(scaled.mul, [parts[index] for index in term], decay) for term in terms]
-    found = scaled.landed(functools.reduce(scaled.add, products))
+
+    def product(term) -> scaled.Scaled:
+        # A term zero where one of its factors is, whatever the others (an overflowed value times a zero
+        # cotangent, `inf * 0`, at any order of `_times_decayed`'s derivatives; train 1455's review).
+        formed = functools.reduce(scaled.mul, [parts[index] for index in term], decay)
+        zero = functools.reduce(jnp.logical_or, [operands[index] == 0 for index in term])
+        return scaled.Scaled(jnp.where(zero, 0.0, formed.significand), jnp.where(zero, 0, formed.exponent),
+                             formed.reach)
+
+    found = scaled.landed(functools.reduce(scaled.add, map(product, terms)))
     unbounded = functools.reduce(jnp.logical_or, [~jnp.isfinite(operands[index]) for index in used])
     return jnp.where(gone, jnp.where(unbounded, np.asarray(np.nan, work), 0), found).astype(dtype)
 
