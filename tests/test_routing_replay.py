@@ -277,13 +277,17 @@ def test_replaying_a_forwards_own_routing_changes_nothing():
                     truth_fn=natively(objective(dtype=jnp.float64)))
 
 
+@pytest.mark.check1_shards(seeds=128, per_task=32)
 def test_the_gate_keeps_its_gradient_under_replay():
     """Only the selection is fixed: the replayed loss is smooth in the router
     kernel, and its gradient, taken backward, is on par with the one taken
     forward a kernel entry at a time, over drawn models, tokens and records
     (check 1), the truth the stack's forward derivatives in float64. The loss
     is scored from the whole logits, whose head forward mode passes; the tiled
-    head's custom backward is another test's."""
+    head's custom backward is another test's. Its 128 seeds took 139 s in train
+    1460's CI (main a10579a29) and 95 s alone cold on armada, 76 s of it the
+    draws' 256 forward passes a seed each arm: CI draws them in map tasks of 32
+    (row 14099)."""
     obj, wide = objective(layers=(1, 3)), objective(layers=(1, 3), dtype=jnp.float64)
     init = jax.jit(lambda *args: nn.unbox(obj.init(*args)))
 

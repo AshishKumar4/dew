@@ -284,8 +284,8 @@ the packed row as its Dew arm, on armada, ledger 2828): compared with themselves
 and C biases' and norms' gradients within 512."""
 
 
-SHARDED = {"gated_delta_net", "kimi_delta_attention", "kpool_sparse_attention", "mamba", "mamba2", "mamba3",
-           "memory"}
+SHARDED = {"deepseek_v4", "gated_delta_net", "kimi_delta_attention", "kpool_sparse_attention", "mamba",
+           "mamba2", "mamba3", "memory"}
 """The kinds whose packed rows' draws run as armada's map tasks (`check1_shards`), each a test of its own."""
 
 
@@ -293,6 +293,14 @@ SHARDED = {"gated_delta_net", "kimi_delta_attention", "kpool_sparse_attention", 
 def test_a_packed_row_computes_what_its_documents_compute_alone(kind):
     """`assert_packs_as_alone` over every mixer in the registry but the sharded ones (`SHARDED`)."""
     assert_packs_as_alone(kind)
+
+
+@pytest.mark.check1_shards(seeds=256, per_task=64)
+def test_a_packed_row_of_deepseek_v4_computes_what_its_documents_compute_alone():
+    """`assert_packs_as_alone` over DeepSeek V4's attention, whose 256 seeds took 134 s in train 1460's CI
+    (main a10579a29) and 83 s alone cold on armada, 60 s of it the draws' arms and truth computing: CI draws
+    them in map tasks of 64 (row 14100)."""
+    assert_packs_as_alone("deepseek_v4")
 
 
 @pytest.mark.check1_shards(seeds=512, per_task=128)
