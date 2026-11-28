@@ -14,6 +14,7 @@ is `short_conv`'s: the products summed tap by tap from the oldest (`short_conv.p
 the SiLU's sigmoid one quotient, the norm's root and inverse each rounded once.
 """
 
+import functools
 from collections.abc import Callable
 
 import jax
@@ -23,7 +24,7 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.mosaic.gpu import fragmented_array as fa
 from jax.experimental.pallas import mosaic_gpu as plgpu
-from jax.extend.mlir.dialects import vector
+from jax.extend.mlir.dialects import vector as vector_dialect
 
 from dew.nn.kernels import generation, short_conv, tuning
 from dew.nn.kernels.templates import cost, mosaic, outputs, scan
@@ -148,26 +149,28 @@ def _activated(pre, activation: bool):
 def _taps(ref, columns, count: int, lanes_: int, *, interpret: bool) -> tuple:
     """The taps `[lanes, count]` of `columns` (`ref` `[C, K]`, the checkpoint's order, `DepthwiseConv1d`'s), a
     vector `[lanes]` a tap in the scan's layout (`scan.blocked`): each lane's taps read whole once, a thread
-    `width` lanes' `count` taps side by side, and split in its registers (a shuffle a tap). Read a tap at a
-    time down `[K, C]`, the call transposed its weight first, a launch a layer a decode step (row 14174: 12
-    of an LM_HYBRID B8 step's, weight-only work)."""
+    `width` lanes' `count` taps side by side, and split in its registers (`_split_taps`, a shuffle a tap).
+    Read a tap at a time down `[K, C]`, the call transposed its weight first, a launch a layer a decode step
+    (row 14174: 12 of an LM_HYBRID B8 step's, weight-only work)."""
     width = lanes_ // scan.THREADS
-    packed = plgpu.Layout.WG_STRIDED((lanes_, count), vec_size=width * count)
-    weights = plgpu.load(ref.at[columns, :], layout=packed, optimized=False).astype(jnp.float32)
+    side_by_side = plgpu.Layout.WG_STRIDED((lanes_, count), vec_size=width * count)
+    weights = plgpu.load(ref.at[columns, :], layout=side_by_side, optimized=False).astype(jnp.float32)
     if interpret:
         return tuple(weights[:, tap] for tap in range(count))
-    layout = scan.blocked(lanes_)
-    result = plgpu.ShapeDtypeStruct((lanes_,), jnp.dtype(jnp.float32), layout=layout)
+    tap_vector = plgpu.ShapeDtypeStruct((lanes_,), jnp.dtype(jnp.float32), layout=scan.blocked(lanes_))
+    inline = plgpu.inline_mgpu(arg_types=(side_by_side,), return_type=(tap_vector,) * count)
+    return inline(functools.partial(_split_taps, lanes_=lanes_, count=count))(weights)
 
-    @plgpu.inline_mgpu(arg_types=(packed,), return_type=(result,) * count)
-    def split(_, held):
-        (register,) = held.registers.flat
-        lane = fa.WGStridedFragLayout((lanes_,), vec_size=width)
-        return tuple(fa.FragmentedArray(_registers=np.array([vector.shuffle(
-            register, register, list(range(tap, width * count, count)))], dtype=object), _layout=lane,
-            _is_signed=None) for tap in range(count))
 
-    return split(weights)
+def _split_taps(_, held, *, lanes_: int, count: int) -> tuple:
+    """`_taps`' body (`plgpu.inline_mgpu`'s): a thread's register of its lanes' taps side by side, a vector of
+    its lanes a tap (`vector.shuffle` of every `count`-th element from the tap's)."""
+    width = lanes_ // scan.THREADS
+    (register,) = held.registers.flat
+    lane = fa.WGStridedFragLayout((lanes_,), vec_size=width)
+    return tuple(fa.FragmentedArray(_registers=np.array([vector_dialect.shuffle(
+        register, register, list(range(tap, width * count, count)))], dtype=object), _layout=lane,
+        _is_signed=None) for tap in range(count))
 
 
 class _Piece:

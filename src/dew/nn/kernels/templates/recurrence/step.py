@@ -283,7 +283,8 @@ def _program(hooks, inputs, active_ref, moved, out_ref, scratch, *, block: _Bloc
     token = _Token(lax.axis_index("rows"), first, heads, tuple(head // group for head in heads),
                    pl.ds(lax.axis_index("columns") * block.columns, block.columns), block)
     state_ref = inputs['state']
-    conv = (_Conv(inputs, moved, token, hooks.conv, key_heads, *state_ref.shape[2:], group)
+    key_width, value_width = state_ref.shape[2:]
+    conv = (_Conv(inputs, moved, token, hooks.conv, key_heads, key_width, value_width, group)
             if hooks.conv is not None else None)
 
     @pl.when(active_ref[token.row] != 0)
