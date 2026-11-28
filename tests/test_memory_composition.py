@@ -380,7 +380,7 @@ MESHED = {"titans": layer("titans"), "titans committed": layer("titans").clone(c
           "gated_linear_attention": layer("gated_linear_attention"),
           "cms": layer("cms").clone(normalize=True, learning_rate=Gate(scale=STEP))}
 """The memories the mesh check splits: Titans' each token reading its own step or its chunk's start,
-TTT-Linear's and Titans' linear memories on their mini-batched kernels, a linear memory on the
+TTT-Linear's linear memory on its mini-batched kernel and Titans' on its chunked path, a linear memory on the
 recurrence, and a continuum-memory level, an existing gated MLP over the stream committing per chunk,
 its keys and queries normalized as the papers' and at their step (over the raw stream, at the level's
 own hundredth or the papers' step, its weights' gradients do not resolve within 512 seeds)."""

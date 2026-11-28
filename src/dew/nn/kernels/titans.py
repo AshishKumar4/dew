@@ -41,20 +41,22 @@ def layer_normed(x, weight, bias, eps: float):
     memory's general path reads: train 1484's review, `[2^24, 2^24 + 2]` normalized unshifted to `[0, 1.15]`
     where it is `[-1, 1] / 1.41` at an epsilon of one), then the formula over the shifted rows, its
     derivatives autodiff's (the shift a constant, whose term a layer norm's invariance makes zero), so every
-    order is finite wherever the formula's is (docs/design/testing.md, the derivative contract). A row whose
-    root passes one takes its weight into the inverse root first, as flax's layer norm takes its scale, `x
-    (w / root)`, whose every step, the pullback's `g (w / root)` too, is no larger than its result: the plain
-    order `(x / root) w` there rounded a centered `2^-100` under an epsilon of `2^100` to zero before a
-    weight of `2^100` (79g's review), and its pullback's `g w` overflowed at a cotangent of `2^50` (its
-    second). A row whose root is at most one keeps fla's reference's order, `(x / root) w`, whose steps are
-    no larger than its result there, where `w / root` alone would pass the range; each order's operands held
-    at zero in the other's rows, so no derivative meets a range its value does not reach. A quotient by the
-    root, not a product by `rsqrt`, whose derivative `rsqrt(v) / v` passes the range first (2^150 at `eps`
-    2^-100, its product with a zero NaN)."""
+    order is finite wherever the formula's is (docs/design/testing.md, the derivative contract). An entry
+    whose weight and row's root both pass one takes its weight into the inverse root first, as flax's layer
+    norm takes its scale, `x (w / root)`, whose every step, the pullback's `g (w / root)` too, stays within
+    the range its result is in: the plain order `(x / root) w` there rounded a centered `2^-100` under an
+    epsilon of `2^100` to zero before a weight of `2^100` (79g's review), and its pullback's `g w` overflowed
+    at a cotangent of `2^50` (its second). Every other entry keeps fla's reference's order, `(x / root) w`,
+    whose steps stay in range there (`x / root` at most the row width's root, `g w` at most the result where
+    the root is at most one), where `w / root` alone would leave it: a weight of `2^-101` over a root of
+    `2^50` underflows, a weight of `2^100` over a small root overflows (its third). Each order's operands are
+    held at zero in the other's entries, so no derivative meets a range its value does not reach. A quotient
+    by the root, not a product by `rsqrt`, whose derivative `rsqrt(v) / v` passes the range first (2^150 at
+    `eps` 2^-100, its product with a zero NaN)."""
     shifted = x - row_shift(x, -1)
     centered = shifted - jnp.mean(shifted, axis=-1, keepdims=True)
     root = jnp.sqrt(jnp.mean(centered * centered, axis=-1, keepdims=True) + eps)
-    folds = root > 1
+    folds = (root > 1) & (jnp.abs(weight) > 1)
     folded = jnp.where(folds, centered, 0) * (jnp.where(folds, weight, 0) / jnp.where(folds, root, 1))
     plain = (jnp.where(folds, 0, centered) / jnp.where(folds, 1, root)) * jnp.where(folds, 0, weight)
     return jnp.where(folds, folded, plain) + bias

@@ -40,8 +40,9 @@ SEEDS = {"self-generated gradients": 512, "decoded gated_linear_attention": 32, 
          "titans_linear gradients": 256}
 """The sites' declared seeds where `seeds_for` on armada, each reference compared with itself, sizes them
 past `MEMORY_SEEDS`: the self-modifying memory's gradients, every parameter's leaf, at 512, a linear
-memory with retention decoding token by token at 32, and the mini-batched memories' gradients, their gates'
-biases the last to resolve, at 128 (TTT-Linear) and 256 (Titans' linear memory), paired."""
+memory with retention decoding token by token at 32, and the linear memories' gradients over calls of one
+document, their gates' biases the last to resolve, at 128 (TTT-Linear) and 256 (Titans' linear memory),
+paired."""
 
 
 @pytest.mark.parametrize("name", sorted(CONFIGURATIONS))
@@ -118,16 +119,16 @@ def test_a_self_generated_target_carries_the_outer_gradient():
 
 @pytest.mark.parametrize("name", ["titans", "self_modifying", "ttt_linear", "titans_linear"])
 def test_the_chunk_parallel_memory_is_the_token_by_token_one(name):
-    """A row of one document runs chunk by chunk, TTT-Linear's and Titans' linear memories on their
-    mini-batched kernels (`InContextMemory._mini_batch`); the same row as a packed call runs token by
-    token, the definition. The two are on par against float64 (check 1)."""
+    """A row of one document runs chunk by chunk, TTT-Linear's linear memory on its mini-batched kernel
+    (`InContextMemory._mini_batch`); the same row as a packed call runs token by token, the definition. The
+    two are on par against float64 (check 1)."""
     module = layer(name)
     stepped = applied(module, packed(np.ones((ROWS, LENGTH), np.int32)))
     assert_as_exact(applied(module), stepped, drawn(module), f"{name} chunked", seeds=MEMORY_SEEDS,
                     truth_fn=written(module, dtype=jnp.float64))
 
 
-@pytest.mark.parametrize("name", ["ttt_linear", "titans_linear"])
+@pytest.mark.parametrize("name", ["ttt_linear"])
 def test_a_mini_batched_memory_under_a_method_interceptor_reads_the_intercepted_call(name):
     """A Flax method interceptor that stands in for its heads' calls (`nn.intercept_methods`) is honoured by
     a linear residual memory a mini-batched kernel would otherwise take, as the general path honours it:
@@ -147,7 +148,7 @@ def test_a_mini_batched_memory_under_a_method_interceptor_reads_the_intercepted_
     np.testing.assert_array_equal(np.asarray(intercepted), np.asarray(token_path))
 
 
-@pytest.mark.parametrize("name", ["ttt_linear", "titans_linear"])
+@pytest.mark.parametrize("name", ["ttt_linear"])
 def test_a_mini_batched_memory_under_a_direct_qwix_rule_reaches_its_heads_products(name):
     """A direct Qwix provider's rule on a head's `down` products (`qwix.quantize_model`, a module path
     `head_0/down` and its `dot_general`, quantizing nothing) meets them on a call of one document, which a
@@ -170,8 +171,9 @@ PADDED = ((np.arange(LENGTH)[None] >= np.asarray([0, 1, 3, 0, 5, 2, 0, 7])[:, No
 
 @pytest.mark.parametrize("name", ["ttt_linear", "titans_linear"])
 def test_a_mini_batched_memory_reads_padded_rows_as_the_token_path_does(name):
-    """Rows of one document padded left and right (`PADDED`, a `valid` mask) run on the mini-batched
-    kernels, their real tokens compacted and their chunks counted from each row's first real token, and
+    """Rows of one document padded left and right (`PADDED`, a `valid` mask) run on TTT-Linear's
+    mini-batched kernel and Titans' chunked path, their real tokens compacted and their chunks counted from
+    each row's first real token, and
     read every real token as the token path does over the same rows packed (pads a segment of none), on
     par against that path in float64 (check 1); a padding token's readout is no real token's."""
     module = layer(name)
@@ -189,9 +191,10 @@ def test_a_mini_batched_memory_reads_padded_rows_as_the_token_path_does(name):
 
 @pytest.mark.parametrize("name", ["ttt_linear", "titans_linear"])
 def test_a_mini_batched_memorys_gradients_are_the_token_paths(name):
-    """The gradients of a mini-batched memory's stream and of every parameter under a cotangent at its real
-    tokens, over rows padded left and right (`PADDED`), are the token path's over the same rows packed, on
-    par against that path in float64 (check 1): the route differentiates as the general path does."""
+    """The gradients of a linear memory's stream and of every parameter under a cotangent at its real tokens,
+    over rows padded left and right (`PADDED`) of one document (TTT-Linear's on its mini-batched kernel), are
+    the token path's over the same rows packed, on par against that path in float64 (check 1): the route
+    differentiates as the general path does."""
     module = layer(name)
     valid = jnp.asarray(PADDED)
     by_mask = MixerCall(metadata=AttentionMetadata(coordinates=coordinates(valid=valid)))
@@ -214,11 +217,11 @@ def test_a_mini_batched_memorys_gradients_are_the_token_paths(name):
 
 
 def test_titans_linear_rate_takes_its_gradient_at_the_scale_the_token_path_does():
-    """Titans' linear memory's learned rate takes a finite gradient on its mini-batched kernel wherever the
+    """Titans' linear memory's learned rate takes a finite gradient over a call of one document wherever the
     token path's is finite: one float32 token, the memory at zero, the views `q = k = [1, 0]` and
     `v = [3, -2]`, a rate of `2^-20` and an output cotangent `[2^125, -2^125]`, whose rate's cotangent is
-    `2^127`; the l2 objective's coefficient one rides the kernel's write, not the rate halved, whose
-    cotangent `2^128` overflowed (a head review)."""
+    `2^127`; the l2 objective's coefficient one rides the write, not the rate halved, whose cotangent `2^128`
+    overflowed (a head review of its mini-batched kernel)."""
     module = InContextMemory(network=ResidualMemory(hidden=None, norm=True, bias=False, epsilon=1.0),
                              slow=("norm",), project_query=False, project_key=False, output=False,
                              learning_rate=Gate(scale=2.0**-20), chunk=1)
@@ -234,9 +237,10 @@ def test_titans_linear_rate_takes_its_gradient_at_the_scale_the_token_path_does(
 
 @pytest.mark.parametrize("bias", [True, False])
 def test_a_mini_batched_memorys_error_takes_its_residual_first(bias):
-    """A linear residual memory's inner error is `(k + LN(k W + b) w + c) - v`, its residual first, on its
-    mini-batched kernel as on the token path (a head review): one token, the memory at zero, its layer norm's
-    bias `[-2^100, 0]` and epsilon one, `k = [2^100, 1]`, `v = [1, 1]`, `q = [1, 0]` and a rate of `2^-100`
+    """A linear residual memory's inner error is `(k + LN(k W + b) w + c) - v`, its residual first, over a
+    call of one document (TTT-Linear's on its mini-batched kernel) as on the token path (a head review): one
+    token, the memory at zero, its layer norm's bias `[-2^100, 0]` and epsilon one, `k = [2^100, 1]`,
+    `v = [1, 1]`, `q = [1, 0]` and a rate of `2^-100`
     err by `[-1, 0]`, which writes the memory's first row and reads a second coordinate below zero; taken
     against `v - k`, which rounds to `[-2^100, 0]`, the error and the update were zero."""
     module = InContextMemory(network=ResidualMemory(hidden=None, norm=True, bias=bias, epsilon=1.0),
@@ -254,8 +258,8 @@ def test_a_mini_batched_memorys_error_takes_its_residual_first(bias):
 
 def linear_residual_memory(bias: bool, epsilon: float, chunk: int, rate: float) -> InContextMemory:
     """One head's linear residual memory over a width of two, its layer norm slow, unprojected queries and
-    keys beside projected values, at a constant rate: TTT-Linear's form with its `bias`, Titans' without,
-    each of which a call of one document runs on its mini-batched kernel."""
+    keys beside projected values, at a constant rate: TTT-Linear's form with its `bias`, whose call of one
+    document runs on its mini-batched kernel, and Titans' without, whose call runs its chunked path."""
     return InContextMemory(network=ResidualMemory(hidden=None, norm=True, bias=bias, epsilon=epsilon),
                            slow=("norm",), project_query=False, project_key=False, output=False, chunk=chunk,
                            learning_rate=Gate(value=rate))
@@ -275,10 +279,11 @@ def mini_batched_and_general(module: InContextMemory, params, x: jax.Array) -> t
 
 @pytest.mark.parametrize("bias", [True, False])
 def test_a_mini_batched_memorys_layer_norm_reads_its_rows_less_their_mean(bias):
-    """A linear residual memory's layer norm reads its rows less their mean on its mini-batched kernel as on
-    the token path (`norms.row_shift`, Dew's layer norm's): one token whose memory reads `[2^24, 2^24 + 2]`
-    normalizes it, at an epsilon of one, to `[-1, 1] / sqrt(2)` on both, its branch symmetric (train 1484's
-    review: the kernel normalized it unshifted, its mean rounded to 2^24, to `[0, 2] / sqrt(3)`)."""
+    """A linear residual memory's layer norm reads its rows less their mean over a call of one document
+    (TTT-Linear's on its mini-batched kernel) as on the token path (`norms.row_shift`, Dew's layer norm's):
+    one token whose memory reads `[2^24, 2^24 + 2]` normalizes it, at an epsilon of one, to `[-1, 1] /
+    sqrt(2)` on both, its branch symmetric (train 1484's review: the kernel normalized it unshifted, its mean
+    rounded to 2^24, to `[0, 2] / sqrt(3)`)."""
     module = linear_residual_memory(bias, 1.0, chunk=1, rate=0.0)
     x = jnp.asarray([[[1.0, 0.0]]], jnp.float32)
     params = jax.tree.map(jnp.zeros_like, module.init(jax.random.key(0), x))
@@ -326,6 +331,24 @@ def test_a_one_document_memorys_inner_pullback_takes_its_scale_into_its_inverse_
     params["params"]["v_proj"]["kernel"] = jnp.asarray([[-(2.0**50), 2.0**50], [0.0, 0.0]], jnp.float32)
     for route in mini_batched_and_general(module, params, x):
         assert route[0, 0, 1] == np.float32(2.0**51 if bias else 2.0**50), route[0, 0]
+
+
+def test_a_one_document_ttt_memory_sums_its_canceling_steps_as_its_general_path_does():
+    """Four bias steps of one mini-batch, `[u, -u]` for `u` of `2^24`, `0`, `1` and `-2^24` (unit rate and
+    norm scale, epsilon one, zero keys and entering state), summed as TTT-Linear's general path groups a
+    chunk's (one associative scan), keep the `1` the fourth cancels around: the last token's bias is
+    `[1, -1]` and it reads `[1 + 1/sqrt(2), -1/sqrt(2)]` on the mini-batched kernel as on the general path, as
+    in float64 (79g's review: summed left to right, `2^24 + 1` rounded away the `1`, which read `[1, 0]`)."""
+    module = InContextMemory(network=ResidualMemory(hidden=None, norm=True, bias=True, epsilon=1.0),
+                             slow=("norm",), output=False, chunk=4, learning_rate=Gate(value=1.0))
+    steps = np.asarray([2.0**24, 0.0, 1.0, -(2.0**24)], np.float32)
+    x = jnp.asarray(np.stack([np.ones(4, np.float32), steps], -1)[None])
+    params = jax.tree.map(jnp.zeros_like, module.init(jax.random.key(0), x))
+    params["params"]["q_proj"]["kernel"] = jnp.asarray([[1.0, 0.0], [0.0, 0.0]], jnp.float32)
+    params["params"]["v_proj"]["kernel"] = jnp.asarray([[0.0, 0.0], [1.0, -1.0]], jnp.float32)
+    params["params"]["head_0"]["norm"]["scale"] = jnp.ones((2,), jnp.float32)
+    for route in mini_batched_and_general(module, params, x):
+        assert route[0, -1, 0] > 1.7 and route[0, -1, 1] < -0.7, route[0, -1]
 
 
 @pytest.mark.parametrize("bias", [True, False], ids=["ttt", "titans"])

@@ -12,10 +12,11 @@ memory its step leaves through the residual (`titans.read_out`),
 prefix by the reading token's rate and reads `Z + LN(Z)` around its readout: the TTT paper's residual is
 the query's (Sec 2.7), as Dew's memory's. A C-class orchestrator (docs/design/kernel-templates.md: its
 orchestration outside the recurrence tile), as Titans' (`titans.titans`): a mini-batch's gradients at once,
-then its tokens a step at a time, each rated step one exact product rounded once (`aligned_sum`), the rate
-meeting its key and update before they multiply (keys of 2^70 and updates of 2^69 under a rate of 2^-20
-write 2^119: train 1470's review), so no query meets a key. A partial last mini-batch's absent tokens write
-nothing, their readouts zero before the LayerNorm sees them."""
+then its steps, each rated step one exact product rounded once (`aligned_sum`), the rate meeting its key and
+update before they multiply (keys of 2^70 and updates of 2^69 under a rate of 2^-20 write 2^119: train
+1470's review), their prefix sums at once, grouped as the in-context memory's general path groups a chunk's
+(one associative scan), each token reading the entering state plus its prefix, so no query meets a key. A
+partial last mini-batch's absent tokens write nothing, their readouts zero before the LayerNorm sees them."""
 
 from __future__ import annotations
 
@@ -47,27 +48,24 @@ def ttt_linear(query, key, value, weight, bias, eta, state=None, *, chunk: int =
         # Each real token's gradient at the memory entering the mini-batch.
         update = real_gradients(k, v, k @ entering[0] + entering[1], real, weight, bias, eps)
 
-        def token(steps, along):
-            q, k, update, eta, real = along
-            # Its step one exact product of its rate, key and update rounded once, the bias's its rate's.
-            step = (aligned_sum([[eta[..., None, None], k[..., :, None], update[..., None, :]]]),
-                    (eta[..., None] * update)[:, :, None])
-            # The mini-batch's steps summed apart from the entering state, which each read and the outgoing
-            # state alone add, as the memory's general path composes them (`dew.nn.memory`'s chunk): a step
-            # below the entering state's last place is kept rather than rounded away token by token (79g's
-            # review: four steps of 0.98 into a memory of 2^25 left it as it was). An absent token steps
-            # nothing.
-            steps = tuple(jnp.where(real[..., None, None], summed - stepped, summed)
-                          for summed, stepped in zip(steps, step, strict=True))
-            state = tuple(held + summed for held, summed in zip(entering, steps, strict=True))
-            # An absent token's readout zero, not its kept bias, before the LayerNorm reads it (a bias of
-            # 2^127 overflowed its variance, NaN through the absent output's zero cotangent).
-            readout = jnp.einsum('bhk,bhkv->bhv', q, state[0]) + state[1][:, :, 0]
-            return steps, jnp.where(real[..., None], readout, jnp.zeros((), readout.dtype))
-
-        tokens = tuple(jnp.moveaxis(x, 2, 0) for x in (q, k, update, eta, real))
-        steps, reads = jax.lax.scan(token, tuple(jnp.zeros_like(held) for held in entering), tokens)
-        return tuple(held + summed for held, summed in zip(entering, steps, strict=True)), reads
+        # Each real token's step one exact product of its rate, key and update rounded once, the bias's its
+        # rate's; an absent token steps nothing.
+        live = real[..., None, None]
+        rated = aligned_sum([[eta[..., None, None], k[..., :, None], update[..., None, :]]])
+        steps = (jnp.where(live, -rated, 0), jnp.where(live, -(eta[..., None] * update)[..., None, :], 0))
+        # The mini-batch's steps summed apart from the entering state, which each read and the outgoing state
+        # alone add, grouped as the memory's general path groups a chunk's (`dew.nn.memory`'s chunk, one
+        # associative scan over its tokens): a step below the entering state's last place is kept rather than
+        # rounded away token by token, and steps that cancel are summed as that path sums them (79g's review:
+        # four steps of 0.98 into a memory of 2^25 left it as it was; bias steps of 2^24, 0, 1 and -2^24
+        # summed left to right lost the 1).
+        prefixes = tuple(jax.lax.associative_scan(jnp.add, summed, axis=2) for summed in steps)
+        states = tuple(held[:, :, None] + prefix for held, prefix in zip(entering, prefixes, strict=True))
+        # An absent token's readout zero, not its kept bias, before the LayerNorm reads it (a bias of 2^127
+        # overflowed its variance, NaN through the absent output's zero cotangent).
+        readout = jnp.einsum('bhck,bhckv->bhcv', q, states[0]) + states[1][:, :, :, 0]
+        reads = jnp.where(real[..., None], readout, jnp.zeros((), readout.dtype))
+        return tuple(state[:, :, -1] for state in states), jnp.moveaxis(reads, 2, 0)
 
     keys, *rest = mini_batches(chunk, k, q, v, eta, valid=valid)
     final, out = memory_chunks(mini_batch, states, (rest[0], keys, *rest[1:]))
