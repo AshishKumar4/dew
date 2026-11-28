@@ -89,7 +89,6 @@ from flax import linen as nn, traverse_util
 from flax.core import lift
 from flax.linen.transforms import lift_direct_transform
 from flax.typing import Dtype, PrecisionLike
-from jax.ad_checkpoint import checkpoint_name
 
 from dew.batch import Coordinates, prefix_sum, valid_order
 from dew.newton_schulz import NEWTON_SCHULZ, newton_schulz
@@ -100,7 +99,7 @@ from dew.nn.documents import within_documents
 from dew.nn.kernels import recurrence, recurrence_chunk
 from dew.nn.kv_cache import ROUNDING_KEYS, Opened, cache_variables, kept, stated
 from dew.nn.precision import softplus
-from dew.nn.residuals import DELTA_RESIDUALS, MEMORY_RESIDUALS, RECOMPUTED
+from dew.nn.residuals import DELTA_RESIDUALS, MEMORY_RESIDUALS, memory_chunks
 from dew.nn.scatter import gather_positions
 from dew.nn.sharding import LOW_RANK_FACTORS, rows_like
 from dew.quantization import (
@@ -882,18 +881,16 @@ class InContextMemory(LinearProducts):
         # Where the run's remat recomputes the chunks (`CHUNK`), each chunk's work is recomputed from the
         # carry it entered with, the scan stacking that carry alone; elsewhere it stacks every value of a
         # chunk's gradients and steps, as fast as the step that fits them runs (row 6577: recomputed always, a
-        # Titans step that fit ran 31-41% slower).
-        chunk = functools.partial(self._chunk, heads=heads)
-        if CHUNK in RECOMPUTED.get():
-            chunk = jax.checkpoint(chunk, prevent_cse=False)
-        _, reads = jax.lax.scan(chunk, carry, laid)
+        # Titans step that fit ran 31-41% slower): the one driver of every memory's chunks
+        # (`residuals.memory_chunks`), the mini-batched kernels' too.
+        _, reads = memory_chunks(functools.partial(self._chunk, heads=heads), carry, laid)
         return jnp.moveaxis(reads, 0, 1).reshape(batch, count * self.chunk, *reads.shape[3:])[:, :length]
 
     def _chunk(self, carry: tuple, step: _Steps, *, heads: tuple[_Head, ...]) -> tuple:
         """One chunk of every row: its gradients at its start, its states, its readouts `[B, C, H, F]`.
-        The carry holds each head's state and momentum, rows first."""
+        The carry holds each head's state and momentum, rows first; its names are its driver's
+        (`residuals.memory_chunks`)."""
         state, momentum = carry
-        state, momentum = checkpoint_name((state, momentum), CARRY)
         real = step.real[..., None]
         theta, mu, a = (jnp.where(real, field, fill) for field, fill in
                         ((step.theta, 0.0), (step.mu, 1.0), (step.a, 1.0)))
@@ -904,9 +901,7 @@ class InContextMemory(LinearProducts):
         laid = [self._chunk_head(head, state[index], momentum[index], step, theta[:, :, index],
                                  matrices[:, :, index], index) for index, head in enumerate(heads)]
         lasts, moments, reads = zip(*laid, strict=True)
-        # The chunk's readouts and next carry named (`CHUNK`): what a rung keeping the chunks' own values
-        # saves (a policy saving them, `RematPolicy.save`), the rest of the chunk's values recomputed beside.
-        return checkpoint_name(((lasts, moments), jnp.stack(reads, axis=2)), CHUNK)
+        return (lasts, moments), jnp.stack(reads, axis=2)
 
     def _chunk_head(self, head: _Head, state: dict, momentum: dict, step: _Steps, theta: jax.Array,
                     matrices: jax.Array, index: int) -> tuple[dict, dict, jax.Array]:
