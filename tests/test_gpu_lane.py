@@ -111,12 +111,13 @@ def test_a_gpu_lane_given_the_whole_gpu_hands_its_files_jaxs_default_share(ci, t
     assert float(share) == float(ci.WHOLE_GPU)
 
 
-@pytest.mark.parametrize("phase", ["prepare", "run", "cpu lane"])
+@pytest.mark.parametrize("phase", ["prepare", "cpu lane"])
 def test_a_gpu_tier_part_runs_its_files_gpu_marked_tests_alone(tmp_path, phase):
     """The suite's conftest: a GPU tier part (its store named, `tier_wire.TRUTHS`), its prepare and its run
     alike, runs a file's gpu-marked tests alone and skips the rest as the CPU lane's, so a CPU test in a file
     that also holds a GPU one is neither prepared on the tier's compute-nothing device (#4577, train 1448) nor
-    run on a GPU beside the CPU lane's run of it; the CPU lane, naming no store, runs them as ever."""
+    run on a GPU beside the CPU lane's run of it; the CPU lane, naming no store, runs them as ever. Its
+    prepare here, as it runs on a CPU host (its run's conftest reads the host's GPUs first)."""
     site = tmp_path / "test_mixed.py"
     site.write_text("import pytest\n\n\n@pytest.mark.gpu\ndef test_gpu():\n    pass\n\n\n"
                     "def test_cpu():\n    pass\n")
@@ -128,14 +129,17 @@ def test_a_gpu_tier_part_runs_its_files_gpu_marked_tests_alone(tmp_path, phase):
         environ[tier_wire.TRUTHS] = str(tmp_path / "truths")
     if phase == "prepare":
         environ[tier_wire.PREPARE] = "1"
-    # The GPU test deselected: here is no GPU; the CPU test's fate is the conftest's.
     done = subprocess.run([sys.executable, "-m", "pytest", "-q", "-rs", "-p", "conftest", "-p",
-                           "no:cacheprovider", "--deselect", f"{site}::test_gpu", str(site)],
-                          cwd=tmp_path, env=environ, capture_output=True, text=True)
+                           "no:cacheprovider", str(site)], cwd=tmp_path, env=environ, capture_output=True,
+                          text=True)
+    skipped = re.findall(r"SKIPPED \[1\] \S+: (.*)", done.stdout)
     if phase == "cpu lane":
-        assert "1 passed" in done.stdout, done.stdout
+        # Its CPU test runs; its GPU test is the GPU's (here none).
+        assert "1 passed" in done.stdout and not any("the CPU lane's" in why for why in skipped), done.stdout
     else:
-        assert "1 skipped" in done.stdout and "the CPU lane's" in done.stdout, done.stdout
+        why = "the CPU lane's: a GPU tier part runs its files' gpu-marked tests alone"
+        assert why in skipped, done.stdout
+        assert "1 passed" not in done.stdout, done.stdout
 
 
 def test_a_lanes_prepare_runs_on_the_cpu_what_its_run_will_hold_and_records_nothing(
