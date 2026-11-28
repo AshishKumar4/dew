@@ -88,10 +88,15 @@ def test_a_network_lane_runs_the_network_marked_tests_with_the_hub_open_and_reco
     hub, offline = tmp_path / "hub", tmp_path / "offline"
     lane = functools.partial(lane_rows, ci, tmp_path, ["tests/test_hub.py"], [hub, offline])
     assert lane(network=True) == [("3.12:tests/test_hub.py", 0)]
-    # The network lane's tests run under no GPU lane's word (tests/conftest.py would skip them as another's).
     assert hub.read_text() == "-" and not offline.exists()
+    # A lane runs under its caller's word alone (`tier_wire.GPU_TIER`): a submitted job's, none, a tier's, its
+    # word, each a row of its own (a job's run of every test it names no tier's row, nor a tier's a job's).
     assert lane() == [("3.12:tests/test_hub.py", 0)]
-    assert offline.read_text() == "1", "the CUDA lane's run is under its word (`tier_wire.GPU_TIER`)"
+    assert offline.read_text() == "-", "a submitted job's lane runs as named"
+    monkeypatch.setenv(tier_wire.GPU_TIER, "1")
+    assert lane() == [("3.12:tests/test_hub.py", 0)]
+    assert offline.read_text() == "1", "a tier's lane passes its word to its files"
+    monkeypatch.delenv(tier_wire.GPU_TIER)
     assert offline.is_file() and not hub.exists(), "the CUDA lane's run is its own"
     assert lane(network=True) == [("3.12:tests/test_hub.py", 0)]
     assert not hub.exists(), "the network lane reuses its own green run on the same inputs"
@@ -116,8 +121,8 @@ def test_a_gpu_lane_given_the_whole_gpu_hands_its_files_jaxs_default_share(ci, t
 
 @pytest.mark.parametrize("lane", ["gpu", "cpu"])
 def test_the_gpu_lane_runs_a_files_gpu_marked_tests_alone(tmp_path, lane):
-    """The suite's conftest under the GPU lane's word (`tier_wire.GPU_TIER`, which the lane sets for a file
-    it runs or prepares, whoever launched it): a file's test not marked gpu is skipped as another lane's, so
+    """The suite's conftest under a GPU tier's word (`tier_wire.GPU_TIER`, which what runs a tier sets and its
+    lane's processes inherit): a file's test not marked gpu is skipped as another lane's, so
     a CPU test in a file that also holds a GPU one is neither prepared on the tier's compute-nothing device
     (#4577, train 1448) nor run on a GPU beside the CPU lane's run of it, and its gpu-marked test runs; the
     CPU lane, without the word, runs the CPU test. On this CPU host the GPU lane's side is its prepare (its
@@ -202,6 +207,8 @@ def test_a_lanes_prepare_runs_on_the_cpu_what_its_run_will_hold_and_records_noth
     monkeypatch.setenv("ARMADA_RESUME", str(resume))
     # A cap the lane's own environment carries, expired: its prepare clears it.
     monkeypatch.setenv(tier_wire.PREPARE_BY, "1.0")
+    # A tier's prepare, as dew-ops' tier job runs it (`tier_wire.GPU_TIER`): each file's process inherits it.
+    monkeypatch.setenv(tier_wire.GPU_TIER, "1")
     prepared = {}
     for group in ("1/2", "2/2"):
         name = f"tests/test_flows.py#{group}"
@@ -211,7 +218,7 @@ def test_a_lanes_prepare_runs_on_the_cpu_what_its_run_will_hold_and_records_noth
         lines = said("prepared")
         # Each told the unit it prepares, as the lane names it, under which its programs' memory is filed;
         # no time cap, as its run reads every program it prepares (only a dry prepare's is capped).
-        # And each under the GPU lane's word (`tier_wire.GPU_TIER`): it prepares gpu-marked tests alone.
+        # And each under the tier's word (`tier_wire.GPU_TIER`), inherited: gpu-marked tests alone.
         assert {tuple(line[1:]) for line in lines} == {("cpu", str(tmp_path / "truths"), name, "-", "1")}
         prepared[group] = {line[0] for line in lines}
     assert fetched.is_file() and not lane_runs(tmp_path, "test_plain"), "one that prepares nothing is skipped"
