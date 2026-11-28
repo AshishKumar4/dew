@@ -280,14 +280,19 @@ def blocks_quantized(w: jax.Array, *, k_major: bool = False) -> tuple[jax.Array,
     rows = largest_magnitude(read.reshape(groups, depth, width // edge, edge), -1)
     amax = largest_magnitude(rows.reshape(groups, depth // edge, edge, width // edge), 2)
     scale = fake_quant.fp8_block_scale(amax.astype(at_least_fp32(w.dtype)))
+    wide = at_least_fp32(w.dtype)
+    if not k_major:
+        # Each row's scales spread down its block's 128 rows (a bank 1/128th the size), each value over its
+        # own along the contiguous columns alone, as the row maxima were read (row 14171: the codes pass
+        # broadcast over a 5-D tile ran at about half the bandwidth its K-major transpose took).
+        spread = jnp.broadcast_to(scale[:, :, None, :], (groups, depth // edge, edge, width // edge))
+        spread = spread.reshape(groups, depth, width // edge)[..., None]
+        codes = fake_quant.fp8_codes(read.reshape(groups, depth, width // edge, edge).astype(wide) / spread)
+        return codes.reshape(w.shape).astype(jnp.float8_e4m3fn), scale
     tiles = read.reshape(groups, depth // edge, edge, width)
-    tiles = tiles.reshape(groups, depth // edge, edge, width // edge, edge)
-    spread = scale[:, :, None, :, None]
-    if k_major:
-        tiles, spread = tiles.transpose(0, 3, 4, 1, 2), spread.transpose(0, 3, 4, 1, 2)
-    codes = fake_quant.fp8_codes(tiles.astype(at_least_fp32(w.dtype)) / spread)
-    outer, inner = (width, depth) if k_major else (depth, width)
-    codes = codes.reshape(groups, outer // edge, edge, inner).reshape(groups, outer, inner)
+    tiles = tiles.reshape(groups, depth // edge, edge, width // edge, edge).transpose(0, 3, 4, 1, 2)
+    codes = fake_quant.fp8_codes(tiles.astype(wide) / scale[:, :, None, :, None].transpose(0, 3, 4, 1, 2))
+    codes = codes.reshape(groups, width // edge, edge, depth).reshape(groups, width, depth)
     return codes.astype(jnp.float8_e4m3fn), scale
 
 
