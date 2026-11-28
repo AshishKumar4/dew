@@ -296,7 +296,7 @@ def test_a_mini_batched_ttt_memory_keeps_the_steps_below_its_entering_states_las
     mini-batch entered, as its general path holds a chunk's steps, so the last token reads `2^25 -+ 4` and
     its readout's layer norm `[1, -1]` on its mini-batched kernel as on its general path (79g's review: the
     kernel stepped the rounded state token by token, every step rounded away, and read `[1, 0]`)."""
-    module = linear_residual_memory(True, 1e-6, chunk=4, rate=2.0**-10)
+    module = linear_residual_memory(bias=True, epsilon=1e-6, chunk=4, rate=2.0**-10)
     x = jnp.asarray([[[1.0, 0.0]] * 4], jnp.float32)
     params = jax.tree.map(jnp.zeros_like, module.init(jax.random.key(0), x))
     memory = params["params"]["head_0"]
