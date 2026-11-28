@@ -369,7 +369,7 @@ class _Transpose:
                                                                    - self.held))))
         depth = self.shape[-1]
         columns_a_chunk = self.column_chunk(cotangents, factors, gather, matrix, rest)
-        chunk = math.gcd(depth, FACTORED_DEPTH)
+        chunk = self.depth_chunk(matrix)
 
         def pulled_chunk(at, out):
             columns = jax.lax.dynamic_slice_in_dim(matrix, at * chunk, chunk, axis=-2)
@@ -472,12 +472,22 @@ class _Transpose:
         token_grid = _edge(_shared_max(token, tuple(sorted(jax.typeof(token).mat.varying - self.held))))
         return token_grid[gather], token_grid
 
+    def depth_chunk(self, matrix) -> int:
+        """The depth a chunk the rescue pulls back at once, whole on every device an Explicit axis splits the
+        matrix's depth (its axis -2) or the rows' (their last, the gradient's) over: a multiple of their
+        splits' count dividing the depth, at most `FACTORED_DEPTH` where that holds one (train 1455's review:
+        64 of a depth of 768 split over three devices was unplaceable)."""
+        split = math.lcm(_split(explicit_spec(matrix), -2), _split(self.placed, -1))
+        depth = self.shape[-1]
+        most = max(FACTORED_DEPTH // split, 1)
+        return split * max(d for d in range(1, most + 1) if (depth // split) % d == 0)
+
     def column_chunk(self, cotangents, factors, gather, matrix, rest) -> int:
         """The cotangents' columns a chunk the rescue's GEMMs sum at once, whole on every device an Explicit
         axis splits any operand it cuts by its columns over (cotangents, factors, the matrix): a multiple of
         their splits' count, at most `FACTORED_WIDTH`, so its GEMMs' sums stay exact (`bounded` refusing a
         split past it; train 1426's review: 3073 of 6146 columns split over two devices was unplaceable)."""
-        split = math.lcm(*(_column_split(each) for each in (*cotangents, *factors, matrix)))
+        split = math.lcm(*(_split(explicit_spec(each), -1) for each in (*cotangents, *factors, matrix)))
         self.bounded(cotangents, factors, gather, matrix, rest, split)
         width = cotangents[0].shape[-1]
         return split * max(d for d in range(1, FACTORED_WIDTH // split + 1) if (width // split) % d == 0)
@@ -658,13 +668,13 @@ FACTORED_LIMBS = FACTORED_HEADROOM + FACTORED_ROW_SLICES + FACTORED_MATRIX_SLICE
 `FACTORED_HEADROOM` limbs over them that their sums carry into."""
 
 
-def _column_split(cotangent: jax.Array) -> int:
-    """The devices an Explicit axis splits `cotangent`'s columns (its last axis) over: 1 where none does."""
-    placed = explicit_spec(cotangent)
-    if placed is None or placed.spec[-1] is None:
+def _split(placed: jax.sharding.NamedSharding | None, axis: int) -> int:
+    """The devices an Explicit axis splits an array placed at `placed` (`explicit_spec`'s) over along `axis`:
+    1 where none does."""
+    if placed is None or len(placed.spec) < -axis or placed.spec[axis] is None:
         return 1
-    entry = placed.spec[-1]
-    return math.prod(placed.mesh.shape[axis] for axis in ((entry,) if isinstance(entry, str) else entry))
+    entry = placed.spec[axis]
+    return math.prod(placed.mesh.shape[name] for name in ((entry,) if isinstance(entry, str) else entry))
 
 
 def _limbs(count: int, operands: tuple, columns: int, read: tuple) -> jax.Array:

@@ -1226,16 +1226,16 @@ def test_an_nvfp4_products_gathered_gradient_keeps_far_routes_apart_and_routes_n
     np.testing.assert_array_equal(np.asarray(d_none), np.zeros((1, 512), np.float32))
 
 
-def _small_integer_projection(seed: int) -> tuple:
-    """A `[512, 128]` NVFP4 matrix of small integer codes (unit block scales, a tensor scale of 2^-8, its
+def _small_integer_projection(seed: int, depth: int = 512) -> tuple:
+    """A `[depth, 128]` NVFP4 matrix of small integer codes (unit block scales, a tensor scale of 2^-8, its
     values the codes), its values in float64 (`packed_values`), eight rows and their output's cotangent,
     small integers each: every product and sum of them exact."""
     from dew.quantization import packed_values
 
     rng = np.random.default_rng(seed)
-    codes = jnp.asarray(rng.integers(-2, 3, (512, 128)), jnp.float32)
-    matrix = formats.NvFp4.of(codes, jnp.ones((32, 128), jnp.float8_e4m3fn), jnp.float32(2.0 ** -8))
-    rows = rng.integers(-3, 4, (8, 512)).astype(np.float32)
+    codes = jnp.asarray(rng.integers(-2, 3, (depth, 128)), jnp.float32)
+    matrix = formats.NvFp4.of(codes, jnp.ones((depth // 16, 128), jnp.float8_e4m3fn), jnp.float32(2.0 ** -8))
+    rows = rng.integers(-3, 4, (8, depth)).astype(np.float32)
     cotangent = rng.integers(-3, 4, (8, 128)).astype(np.float32)
     return matrix, np.asarray(packed_values(matrix), np.float64), rows, cotangent
 
@@ -1264,6 +1264,33 @@ def test_a_column_split_nvfp4_projections_input_gradient_runs_on_an_explicit_mes
                                jax.device_put(matrix.scale, PartitionSpec()))
         out, grad = pulled(jax.device_put(rows, PartitionSpec()), placed,
                            jax.device_put(cotangent, PartitionSpec(None, "tensor")))
+    np.testing.assert_array_equal(np.asarray(out, np.float64), rows.astype(np.float64) @ values)
+    np.testing.assert_array_equal(np.asarray(grad, np.float64), cotangent.astype(np.float64) @ values.T)
+
+
+@pytest.mark.mesh(devices=3)
+def test_a_depth_split_nvfp4_projections_input_gradient_runs_on_an_explicit_mesh():
+    """A dense NVFP4 projection 768 deep whose matrix an Explicit 'tensor' axis splits three ways by its depth
+    (its words' and scales' last axis), over rows split by the same depth, jitted: its forward and its rows'
+    gradient are the product written plainly over its values (`packed_values`), exactly over small
+    integers. The exact rescue its pullback traces beside the plain one chunks the depth whole on every
+    device (`factored`'s `depth_chunk`; train 1455's review: 64 of a depth split three ways sliced no
+    device's share whole, its trace raised)."""
+    from jax.sharding import AxisType, PartitionSpec
+
+    matrix, values, rows, cotangent = _small_integer_projection(14551, depth=768)
+    mesh = jax.make_mesh((3,), ("tensor",), axis_types=(AxisType.Explicit,))
+
+    @jax.jit
+    def pulled(x, matrix, cotangent):
+        out, pull = jax.vjp(lambda x: gemm.nvfp4_product(x, matrix, out_dtype=jnp.float32), x)
+        return jax.reshard(out, PartitionSpec()), jax.reshard(pull(cotangent)[0], PartitionSpec())
+
+    with jax.set_mesh(mesh):
+        deep = PartitionSpec(None, "tensor")
+        placed = formats.NvFp4(jax.device_put(matrix.words, deep), jax.device_put(matrix.scales, deep),
+                               jax.device_put(matrix.scale, PartitionSpec()))
+        out, grad = pulled(jax.device_put(rows, deep), placed, jax.device_put(cotangent, PartitionSpec()))
     np.testing.assert_array_equal(np.asarray(out, np.float64), rows.astype(np.float64) @ values)
     np.testing.assert_array_equal(np.asarray(grad, np.float64), cotangent.astype(np.float64) @ values.T)
 
