@@ -36,10 +36,12 @@ from dew.batch import coordinates
 from dew.nn.inputs import PLAIN_CALL, AttentionMetadata, MixerCall
 from dew.nn.memory import Gate, InContextMemory, Objective, ResidualMemory
 
-SEEDS = {"self-generated gradients": 512, "decoded gated_linear_attention": 32}
+SEEDS = {"self-generated gradients": 512, "decoded gated_linear_attention": 32, "ttt_linear gradients": 128,
+         "titans_linear gradients": 256}
 """The sites' declared seeds where `seeds_for` on armada, each reference compared with itself, sizes them
-past `MEMORY_SEEDS`: the self-modifying memory's gradients, every parameter's leaf, at 512, and a linear
-memory with retention decoding token by token at 32."""
+past `MEMORY_SEEDS`: the self-modifying memory's gradients, every parameter's leaf, at 512, a linear
+memory with retention decoding token by token at 32, and the mini-batched memories' gradients, their gates'
+biases the last to resolve, at 128 (TTT-Linear) and 256 (Titans' linear memory), paired."""
 
 
 @pytest.mark.parametrize("name", sorted(CONFIGURATIONS))
@@ -172,7 +174,7 @@ def test_a_mini_batched_memorys_gradients_are_the_token_paths(name):
         return jax.jit(with_gradients(real))
 
     assert_as_exact(run(module, by_mask), run(module, by_tokens), draw_with_cotangent, f"{name} gradients",
-                    seeds=MEMORY_SEEDS, truth_fn=run(layer(name, dtype=jnp.float64), by_tokens))
+                    seeds=SEEDS[f"{name} gradients"], truth_fn=run(layer(name, dtype=jnp.float64), by_tokens))
 
 
 def test_titans_linear_rate_takes_its_gradient_at_the_scale_the_token_path_does():
