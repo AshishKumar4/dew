@@ -117,7 +117,7 @@ def test_equal_shares_blockwise_reference_and_truth_hold_check_1_on_this_cpu():
 
     with on_the_host():
         taken = _shares_hold_check_1(grouped_cells.Blockwise(256, 512, 256, 4, 128),
-                                     "blockwise equal shares 256x512x256", arm=lambda fn, inputs: jax.jit(fn))
+                                     "blockwise equal shares 256x512x256", arm=jax.jit)
     assert taken == {"xla"}, taken
 
 
@@ -186,7 +186,7 @@ def _shares_hold_check_1(cell: grouped_cells.Blockwise, label: str, *,
             rows, width)
 
     with generation.routes() as routes:
-        assert_as_exact(jax.jit(unnamed), arm(reference, draw(0)), draw, label, seeds=blockwise_matrix.SEEDS,
+        assert_as_exact(jax.jit(unnamed), arm(reference), draw, label, seeds=blockwise_matrix.SEEDS,
                         truth_fn=jax.jit(truth))
     return {route.kernel for route in routes if route.choice == "blockwise_fp8"}
 
