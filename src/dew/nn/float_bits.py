@@ -220,11 +220,8 @@ def narrowed_float32(x: jax.Array) -> jax.Array:
     narrowing is a linear map (`generation.linear_map`), as `widened_exactly`'s widening is: its tangent
     the tangent narrowed alike, a cast's derivative (an NVFP4 tensor scale's at a float64 truth's width:
     row 14083's review), its transpose the cotangent widened exactly (`_widened_back`, whose transpose is
-    this narrowing)."""
+    this narrowing). It reads `x` in x64 whatever x64 scope it is called in."""
     from dew.nn.kernels.generation import linear_map
-
-    x = jnp.asarray(x, jnp.float64)
-    source = jax.typeof(x)
 
     def apply(_, moving):
         # Traced where JAX evaluates the map, which may lie outside its caller's x64 scope; a reduced or
@@ -233,19 +230,23 @@ def narrowed_float32(x: jax.Array) -> jax.Array:
 
     def pullback(_, cotangent):
         # The cotangent widened from its bits, a subnormal float32 one kept, which a flushing convert zeroes
-        # (train 1455's review), placed as it is, in x64 whatever scope a pullback runs in.
-        with jax.enable_x64(new_val=True):
-            return _widened_back(cotangent)
+        # (train 1455's review), placed as it is.
+        return _widened_back(cotangent)
 
-    narrowed = source.update(dtype=jnp.dtype(jnp.float32), weak_type=False)
-    return linear_map(apply, pullback, (), x, out_aval=narrowed, summed_first=True)
+    # Outside x64 a float64 array asked for as float64 is converted to float32 first, whose bits the
+    # narrowing then reads as a float64's (train 1461's review: 1.0 made in x64 and narrowed after it, 0).
+    with jax.enable_x64(new_val=True):
+        x = jnp.asarray(x, jnp.float64)
+        narrowed = jax.typeof(x).update(dtype=jnp.dtype(jnp.float32), weak_type=False)
+        return linear_map(apply, pullback, (), x, out_aval=narrowed, summed_first=True)
 
 
 def _widened_back(cotangent: jax.Array) -> jax.Array:
     """`narrowed_float32`'s transpose: a float32 `cotangent` widened exactly into float64 on its bits (as
     `widened_exactly` widens), a linear map whose own transpose is `narrowed_float32`, so every order of
     reverse mode rounds on the bits (the review of row 14083: `widened_exactly`'s transpose, a convert, zeroed
-    a subnormal at reverse over reverse)."""
+    a subnormal at reverse over reverse). Its float64 result is typed in x64 whatever scope a pullback runs
+    in; its own pullback, `narrowed_float32`, reads its float64 cotangent in x64 itself."""
     from dew.nn.kernels.generation import linear_map
 
     wide = np.dtype(np.float64)
@@ -253,14 +254,10 @@ def _widened_back(cotangent: jax.Array) -> jax.Array:
     def apply(_, moving):
         return _bitwise(lambda part: _widened_bits(part, wide), moving, wide=True)
 
-    def narrowed(_, back):
-        # In x64 whatever scope its pullback runs in: a float64 cotangent read as float32 first would round
-        # before the narrowing reads its bits.
-        with jax.enable_x64(new_val=True):
-            return narrowed_float32(back)
-
-    widened = jax.typeof(cotangent).update(dtype=wide, weak_type=False)
-    return linear_map(apply, narrowed, (), cotangent, out_aval=widened, summed_first=True)
+    with jax.enable_x64(new_val=True):
+        widened = jax.typeof(cotangent).update(dtype=wide, weak_type=False)
+        return linear_map(apply, lambda _, back: narrowed_float32(back), (), cotangent, out_aval=widened,
+                          summed_first=True)
 
 
 def _narrowed_bits(x: jax.Array) -> jax.Array:
