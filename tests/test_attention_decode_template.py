@@ -690,9 +690,10 @@ def a_verify_block_through_the_route_is_on_par(drafts: int) -> None:
     from dew.nn.documents import CrossDocuments
 
     rows, keys = 2, 4096
-    held = jnp.asarray([keys - drafts, 1000], jnp.int32)
-    documents = CrossDocuments(jnp.ones((rows, drafts), jnp.int32),
-                               (jnp.arange(keys)[None] < (held + drafts)[:, None]).astype(jnp.int32))
+    # Host constants, so its GPU tier part's prepare computes nothing before its site (row 8074).
+    held = np.asarray([keys - drafts, 1000], np.int32)
+    documents = CrossDocuments(np.ones((rows, drafts), np.int32),
+                               (np.arange(keys)[None] < (held + drafts)[:, None]).astype(np.int32))
 
     def attended(implementation):
         def attend(query, key, value):
@@ -720,9 +721,11 @@ def a_paged_decode_step_of_small_pages_is_on_par(page: int) -> None:
     warpgroup's cp.async copies (`gathered.Ring`, row 4772), 32 query heads over 8 key heads over 4096 keys
     in a shuffled table: on par with the reference path over the pool gathered dense (check 1)."""
     keys, kv_heads = 4096, 8
-    spans = template.spans(1, keys, 2, lengths=jnp.asarray([keys, keys - 77], jnp.int32))
     per_row = keys // page
-    table = jnp.asarray(np.random.default_rng(page).permutation(2 * per_row).reshape(2, per_row), jnp.int32)
+    # Host constants and spans formed where its programs trace, so its GPU tier part's prepare computes
+    # nothing before its site (row 8074).
+    lengths = np.asarray([keys, keys - 77], np.int32)
+    table = np.random.default_rng(page).permutation(2 * per_row).reshape(2, per_row).astype(np.int32)
 
     def gathered(pool):
         rows = pool[:, table]
@@ -731,10 +734,12 @@ def a_paged_decode_step_of_small_pages_is_on_par(page: int) -> None:
     draw = functools.partial(_normals, (2, 1, 32, 128), (kv_heads, 2 * per_row, page, 128), jnp.bfloat16)
 
     def ours(query, key_pool, value_pool):
-        return attention_decode.attend(query, key_pool, value_pool, spans, table=table)
+        spans = template.spans(1, keys, 2, lengths=lengths)
+        return attention_decode.attend(query, key_pool, value_pool, spans, table=jnp.asarray(table))
 
     def reference(query, key_pool, value_pool):
-        return template.reference(query, gathered(key_pool), gathered(value_pool), spans)
+        return template.reference(query, gathered(key_pool), gathered(value_pool),
+                                  template.spans(1, keys, 2, lengths=lengths))
 
     assert_as_exact(jax.jit(ours), jax.jit(reference), draw, f"paged decode of {page}-key pages on a GPU",
                     seeds=SEEDS)

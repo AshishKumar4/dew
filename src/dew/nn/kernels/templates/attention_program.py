@@ -35,13 +35,15 @@ def walk(spec: algebra.Forward, lo, hi, keys_at: Callable[[jax.Array], algebra.K
 
 
 def finished(spec: algebra.Forward, walked, rows: Callable[[jax.Array], jax.Array],
-             resumed: tuple[jax.Array, jax.Array, jax.Array] | None, *, training: bool, output_mod=None,
-             output_params: tuple = ()) -> tuple:
-    """A program's outputs from its walk (`walk`): the normalized output, its rows' maximum and denominator
-    (`algebra.finish`), and with `training` its anchor keys and split sums and their rows' shift
+             resumed: tuple[jax.Array, jax.Array, jax.Array] | None, *, training: bool, queries: jax.Array,
+             output_mod=None, output_params: tuple = ()) -> tuple:
+    """A program's outputs from its walk (`walk`) over its block's `queries` (their indices, `[bq]`): the
+    normalized output, its rows' maximum and denominator (`algebra.finish`, an unmasked call's row of no mass
+    NaN, `algebra.nan_massless`), and with `training` its anchor keys and split sums and their rows' shift
     (`algebra.split_residuals`)."""
     state = algebra.joined(walked, rows, spec.units) if training else walked
-    out, m, denominator = algebra.finish(spec, state, initial=resumed is not None, output_mod=output_mod,
+    out, m, denominator = algebra.finish(spec, algebra.nan_massless(spec, state, queries),
+                                         initial=resumed is not None, output_mod=output_mod,
                                          output_params=output_params)
     if not training:
         return out, m, denominator

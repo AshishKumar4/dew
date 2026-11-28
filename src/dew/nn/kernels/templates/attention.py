@@ -1384,12 +1384,13 @@ def reference(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpan
     logits, the softmax from `hooks.initial` in fp32 (or the wider of the inputs' and the state's dtypes),
     the probabilities rounded to the values' dtype for their product, the output normalized in fp32 and
     `output_mod` applied before it rounds to the query's dtype. A query that sees no key and starts from
-    no state gives zeros. With `residuals`, also each query's running maximum `m` and denominator `total`
-    `[B, H, Q]` (natural log, unnormalized), in the softmax's dtype, a query that sees no key and starts
-    from no state holding 0 for both, so every residual is finite; a softmax resumed from them (`Initial`)
-    starts such a query from `m = -inf`. No hooks where `hooks` is None. `rounded_to`, where given, is the
-    dtype the probabilities round to in the values' stead: values a caller widened (its copies' gradients
-    summed wide) weighed as their own dtype's (`attention_products._widely`)."""
+    no state gives zeros; one of a call whose spans hide no key that weighs none of its keys (every logit
+    -inf) gives NaN, as jax.nn's softmax does, its denominator NaN. With `residuals`, also each query's
+    running maximum `m` and denominator `total` `[B, H, Q]` (natural log, unnormalized), in the softmax's
+    dtype, a query that sees no key and starts from no state holding 0 for both; a softmax resumed from them
+    (`Initial`) starts such a query from `m = -inf`. No hooks where `hooks` is None. `rounded_to`, where
+    given, is the dtype the probabilities round to in the values' stead: values a caller widened (its copies'
+    gradients summed wide) weighed as their own dtype's (`attention_products._widely`)."""
     hooks = Hooks() if hooks is None else hooks
     rounded_to = value.dtype if rounded_to is None else jnp.dtype(rounded_to)
     walked_initial(hooks.initial)
@@ -1469,6 +1470,12 @@ def reference(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpan
         normalized = acc0 * (carried * inverse)[..., None] + valued((p * inverse[..., None]) * drawn,
                                                                    bound=drop.bound)
 
+    if spans.form == "full" and spans.keys > 0 and hooks.initial is None:
+        # An unmasked call's row of no mass reads NaN, its value and its derivative, as jax.nn's softmax
+        # reads it (`attention_algebra.Forward.massless_nan`, row 14116).
+        massless = total == 0
+        normalized = jnp.where(massless[..., None], acc * jnp.nan, normalized)
+        total = jnp.where(massless, jnp.nan, total)
     out = output_hooked(normalized, hooks.output.fn, hooks.output.sides)
     out = jnp.swapaxes(out.astype(query.dtype), 1, 2)
     return (out, safe, total) if residuals else out

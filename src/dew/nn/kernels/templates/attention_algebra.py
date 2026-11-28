@@ -199,6 +199,15 @@ class Forward:
         return (self.keys == 0 or self.form == "spans" or self.score_mod is not None
                 or self.queries is not None)
 
+    @property
+    def massless_nan(self) -> bool:
+        """Whether a row that sees keys but weighs none (its every logit -inf: a bias's, a fill's) reads NaN,
+        as jax.nn's softmax reads it: a call whose spans hide no key (form 'full', of keys) and that starts
+        from no state, the reference path's unmasked call (`reference_attention`, none of its rows excluded;
+        row 14116). A masked call's such row reads zero (`guarded`), as the reference path's excluded rows
+        do, and a padding row past the call's `queries` sees no key (`nan_massless`)."""
+        return self.form == "full" and self.keys > 0 and not self.initial
+
     def power(self, x: jax.Array) -> jax.Array:
         """The exponential the logits are in, a key's weight and the factor a softmax state takes from one
         maximum to another `x` below it alike: exp2 folded; natural, `natural_exp` of the raw form's scaled
@@ -509,6 +518,22 @@ def no_keys(total: jax.Array) -> jax.Array:
     subnormal totals on flushing lanes while non-flushing GPU kernels avoid `stop_gradient`, row 10849)."""
     return bodies.subnormals(lambda *, flushing: ~means.holding(total) if flushing else total == 0,
                              total.dtype)
+
+
+def nan_massless(spec: Forward, state: Partial, rows: jax.Array | None = None) -> Partial:
+    """A whole walk's `state` as its finish takes it: where the call reads a row of no mass NaN
+    (`Forward.massless_nan`), each such row's total NaN, so its output, its residual denominator and every
+    weight its backward recomputes over that denominator are NaN as jax.nn's are (`inverse`, `output_of`),
+    a padded call's padding rows (at or past its `queries`, their query `rows`, the last axis' own where
+    None) left as they are. Its walk's rewalk test reads the walk's state before it (`reached`). A split
+    walk's slices are no whole walk: their merge finishes the row."""
+    if not spec.massless_nan:
+        return state
+    empty = no_keys(state.total)
+    if spec.queries is not None:
+        rows = jax.lax.broadcasted_iota(jnp.int32, empty.shape, empty.ndim - 1) if rows is None else rows
+        empty = empty & (rows < spec.queries)
+    return state._replace(total=jnp.where(empty, jnp.nan, state.total))
 
 
 def empty(rows: int, width: int, *, scaled: bool = False) -> Partial:
@@ -1871,13 +1896,14 @@ def merged(spec: Forward, stacked: Partial, axis: int) -> Partial:
 def output_of(acc: jax.Array, denominator: jax.Array, *, guarded: bool, held: DTypeLike | None = None
               ) -> jax.Array:
     """The weighted values `acc` over their denominator, any leading axes: zero for a query that saw nothing
-    where it may (`guarded`: a walk's whose row may see none, or one from a state); a subnormal ratio kept
-    where the arithmetic flushes one, and one past the dtype `held`'s largest held there (`quotient`)."""
+    where it may (`guarded`: a walk's whose row may see none, or one from a state), NaN where its denominator
+    is (`nan_massless`); a subnormal ratio kept where the arithmetic flushes one, and one past the dtype
+    `held`'s largest held there (`quotient`)."""
     if not guarded:
         return quotient(lambda sums: sums / expand(denominator, sums), acc, denominator, held=held)
     safe = jnp.where(denominator > 0, denominator, 1.0)
     out = quotient(lambda sums: sums / expand(safe, sums), acc, safe, held=held)
-    return jnp.where(expand(denominator > 0, acc), out, 0.0)
+    return jnp.where(expand(denominator > 0, acc), out, expand(_unheld(denominator), acc))
 
 
 def quotient(ratio: Callable[[jax.Array], jax.Array], acc: jax.Array, total: jax.Array, *,
@@ -2006,10 +2032,16 @@ def settled_store(spec: Forward, out: jax.Array, acc: jax.Array, divisor: jax.Ar
 
 def inverse(total: jax.Array) -> jax.Array:
     """Each query's `1 / total`, zero where it saw nothing (`means.holding` on flushing lanes, `total > 0`
-    in non-flushing GPU kernels where `stop_gradient` does not lower, row 10849)."""
+    in non-flushing GPU kernels where `stop_gradient` does not lower, row 10849), NaN where its total is
+    (an unmasked call's row of no mass, `nan_massless`)."""
     held = bodies.subnormals(lambda *, flushing: means.holding(total) if flushing else total > 0,
                              total.dtype)
-    return jnp.where(held, 1.0 / jnp.where(held, total, 1.0), 0.0)
+    return jnp.where(held, 1.0 / jnp.where(held, total, 1.0), _unheld(total))
+
+
+def _unheld(total: jax.Array) -> jax.Array:
+    """What a quotient over a `total` of no mass reads: zero, NaN where the total is NaN (`nan_massless`)."""
+    return jnp.where(total != total, total, 0.0)
 
 
 def hooked(score_mod: Callable, logits: jax.Array, q_pos, k_pos, params) -> jax.Array:

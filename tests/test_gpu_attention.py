@@ -79,13 +79,14 @@ def a_shared_bias_step_repeats_bit_for_bit(bias_shape: tuple, kv_heads: int = 8)
     rng = np.random.default_rng(2620)
     batch, length, heads, width = 4, 2048, 8, 64
 
+    # Host arrays, so a GPU tier part's prepare runs no conversion before the step it compiles (row 8074).
     def normal(*shape, scale=1.0):
-        return jnp.asarray(scale * rng.standard_normal(shape, dtype=np.float32), jnp.bfloat16)
+        return (scale * rng.standard_normal(shape, dtype=np.float32)).astype(jnp.bfloat16)
 
     shape, kv_shape = (batch, length, heads, width), (batch, length, kv_heads, width)
     query, key, value, cotangent = (normal(*shape), normal(*kv_shape, scale=0.3), normal(*kv_shape),
                                     normal(*shape))
-    bias = jnp.asarray(0.5 * rng.standard_normal((1, heads, *bias_shape), dtype=np.float32))
+    bias = 0.5 * rng.standard_normal((1, heads, *bias_shape), dtype=np.float32)
 
     @jax.jit
     def step(query, key, value, bias, cotangent):

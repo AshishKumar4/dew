@@ -172,7 +172,8 @@ def forward(spec: algebra.Forward, query: jax.Array, key: jax.Array, value: jax.
         def finished(form: algebra.Forward, carry):
             # A walk's outputs in `form` (`attention_program.finished`), as the Triton mainloop's.
             out, *kept = attention_program.finished(form, carry, anchor_rows, resumed, training=residuals,
-                                                    output_mod=output_mod, output_params=out_params)
+                                                    queries=rows, output_mod=output_mod,
+                                                    output_params=out_params)
             return (out.astype(query.dtype), *kept) if residuals else out.astype(query.dtype)
 
         return algebra.walked(spec, walk, finished)

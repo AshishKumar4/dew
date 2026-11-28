@@ -1573,10 +1573,18 @@ def _stored_walk(program: _Program, spec: algebra.Forward, state: algebra.Partia
     `out_stage`, its finished rows through their stage (`rows`), each view formed where it is written
     (`stored()`, `_written_views`'); a training walk's (`trained`, its anchor's terms) its residual rows and
     anchor keys instead, no output. `place` its batch row, head and first query; with `keep`, each written
-    at those rows alone, every other row of its view as it was (`_kept_rows`)."""
+    at those rows alone, every other row of its view as it was (`_kept_rows`). An unmasked call's row of no
+    mass reads NaN (`algebra.nan_massless`)."""
     family = program.family
     row, head, first = place
     stored, row_smem = rows
+    if program.splits == 1:
+        # A whole walk's rows of no mass NaN where the call reads them so (`algebra.nan_massless`), its
+        # padding rows' queries formed in the rows' layout as its status forms them (`_status_stored`); a split
+        # walk's slices are finished by their merge.
+        queries = (family.as_row(first + family.iota(state.total.shape, 0))
+                   if spec.massless_nan and spec.queries is not None else None)
+        state = algebra.nan_massless(spec, state, queries)
     if not training or trained is None:
         # The output's view formed where it is stored, its block's indices read afresh (`_Block.afresh`), as
         # its rows' are: formed before the walk, its query block's base was held across it (a B200's scaled

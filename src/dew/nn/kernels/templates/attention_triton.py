@@ -310,7 +310,8 @@ def _forward_kernel(*refs, spec: algebra.Forward, score_kinds: tuple[Kind, ...],
         # A walk's outputs in `form` (`program.finished`): the normalized output, its maximum and
         # denominator, and a training walk's (`Kept.SPLIT`) anchors and split sums.
         return program.finished(form, carry, rows=rows, resumed=resumed, training=training,
-                                output_mod=output_mod, output_params=output_params)
+                                queries=first_query + jnp.arange(block_q), output_mod=output_mod,
+                                output_params=output_params)
 
     walked = walk(spec)
     if maxima_ref is not None:

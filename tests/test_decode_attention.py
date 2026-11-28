@@ -297,7 +297,8 @@ def a_decode_call_naming_cudnn_differentiates_under_deterministic_ops():
     lane's deterministic ops: its gradients, cuDNN's own backward's, are on par (check 1) with the reference
     path's. XLA's cuDNN attention backward failed under those ops before Dew's JAX build 0.12.0.1.post74 (a
     cached compile lost its deterministic configuration, openxla/xla#46500)."""
-    lengths = jnp.asarray([512, 300], jnp.int32)
+    # A host constant, so its GPU tier part's prepare computes nothing before its site (row 8074).
+    lengths = np.asarray([512, 300], np.int32)
 
     def gradients(implementation):
         def attend(query, key, value):
