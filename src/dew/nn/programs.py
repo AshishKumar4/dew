@@ -670,15 +670,16 @@ def high_expansion(equation: jcore.JaxprEqn) -> jcore.Jaxpr | None:
 
     if equation.primitive is not hijax.call_hi_primitive_p:
         return None
-    literal = [isinstance(operand, jcore.Literal) for operand in equation.invars]
+    literals = {index: operand.val for index, operand in enumerate(equation.invars)
+                if isinstance(operand, jcore.Literal)}
 
     def expansion(*traced):
         given = iter(traced)
-        operands = [operand.val if held else next(given) for operand, held in zip(equation.invars, literal,
-                                                                                  strict=True)]
+        operands = [literals[index] if index in literals else next(given)
+                    for index in range(len(equation.invars))]
         return equation.primitive.to_lojax(*operands, **equation.params)
 
-    avals = [operand.aval for operand, held in zip(equation.invars, literal, strict=True) if not held]
+    avals = [operand.aval for index, operand in enumerate(equation.invars) if index not in literals]
     with equation.ctx.manager:
         return jax.make_jaxpr(expansion)(*avals).jaxpr
 
