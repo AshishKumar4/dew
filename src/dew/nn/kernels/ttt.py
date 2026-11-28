@@ -47,21 +47,27 @@ def ttt_linear(query, key, value, weight, bias, eta, state=None, *, chunk: int =
         # Each real token's gradient at the memory entering the mini-batch.
         update = real_gradients(k, v, k @ entering[0] + entering[1], real, weight, bias, eps)
 
-        def token(state, along):
+        def token(steps, along):
             q, k, update, eta, real = along
             # Its step one exact product of its rate, key and update rounded once, the bias's its rate's.
             step = (aligned_sum([[eta[..., None, None], k[..., :, None], update[..., None, :]]]),
                     (eta[..., None] * update)[:, :, None])
-            # An absent token leaves the state as it was.
-            state = tuple(jnp.where(real[..., None, None], held - stepped, held)
-                          for held, stepped in zip(state, step, strict=True))
+            # The mini-batch's steps summed apart from the entering state, which each read and the outgoing
+            # state alone add, as the memory's general path composes them (`dew.nn.memory`'s chunk): a step
+            # below the entering state's last place is kept rather than rounded away token by token (79g's
+            # review: four steps of 0.98 into a memory of 2^25 left it as it was). An absent token steps
+            # nothing.
+            steps = tuple(jnp.where(real[..., None, None], summed - stepped, summed)
+                          for summed, stepped in zip(steps, step, strict=True))
+            state = tuple(held + summed for held, summed in zip(entering, steps, strict=True))
             # An absent token's readout zero, not its kept bias, before the LayerNorm reads it (a bias of
             # 2^127 overflowed its variance, NaN through the absent output's zero cotangent).
             readout = jnp.einsum('bhk,bhkv->bhv', q, state[0]) + state[1][:, :, 0]
-            return state, jnp.where(real[..., None], readout, jnp.zeros((), readout.dtype))
+            return steps, jnp.where(real[..., None], readout, jnp.zeros((), readout.dtype))
 
         tokens = tuple(jnp.moveaxis(x, 2, 0) for x in (q, k, update, eta, real))
-        return jax.lax.scan(token, entering, tokens)
+        steps, reads = jax.lax.scan(token, tuple(jnp.zeros_like(held) for held in entering), tokens)
+        return tuple(held + summed for held, summed in zip(entering, steps, strict=True)), reads
 
     keys, *rest = mini_batches(chunk, k, q, v, eta, valid=valid)
     final, out = memory_chunks(mini_batch, states, (rest[0], keys, *rest[1:]))

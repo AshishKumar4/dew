@@ -15,7 +15,8 @@ x sum(g x)) / (D sigma)`, `sigma = sqrt(var + eps)`; fla's Titans reference writ
 
 `titans` takes a mini-batch at a time (docs/design/kernel-templates.md's C class: its orchestration outside
 the recurrence tile): its tokens' gradients at once at the memory entering it, then its tokens a step at a
-time, each writing its own and reading the pair it leaves, so no query meets a key (a live score of 2^70 by
+time, each writing its own and reading the pair it leaves, their steps composed apart from the pair entering
+the mini-batch as the memory's general path composes them (`dew.nn.memory`), so no query meets a key (a live score of 2^70 by
 2^70 overflowed beside a zero write) and no state is weighed after a read (a memory of 2^70 forgotten whole
 read `0 * inf`). Documents are not packed: a mini-batch is the sequence's `chunk` tokens, which a document
 starting within one would split (fla's reference takes none either)."""
@@ -35,28 +36,30 @@ from dew.nn.precision import at_least_fp32
 from dew.nn.residuals import memory_chunks
 
 
-def layer_normed(x, eps: float):
-    """`x`'s LayerNorm over its last axis without an affine, `(x - mean x) / sqrt(var + eps)`, its rows less
-    their shift first (`norms.row_shift`, Dew's layer norm's own, which the memory's general path reads:
-    train 1484's review, `[2^24, 2^24 + 2]` normalized unshifted to `[0, 1.15]` where it is `[-1, 1] / 1.41`
-    at an epsilon of one): the plain formula over the shifted rows, fla's reference's, its derivatives
-    autodiff's (the shift a constant, whose term a layer norm's invariance makes zero), so every order is
-    finite wherever the plain formula's is (docs/design/testing.md, the derivative contract). A quotient by
-    the root, not a product by `rsqrt`, whose derivative `rsqrt(v) / v` passes the range first (2^150 at
-    `eps` 2^-100, its product with a zero NaN)."""
+def layer_normed(x, weight, bias, eps: float):
+    """`x`'s LayerNorm over its last axis under the affine `weight` and `bias`, `(x - mean x) (w / sqrt(var +
+    eps)) + b`: its rows less their shift first (`norms.row_shift`, Dew's layer norm's own, which the
+    memory's general path reads: train 1484's review, `[2^24, 2^24 + 2]` normalized unshifted to `[0, 1.15]`
+    where it is `[-1, 1] / 1.41` at an epsilon of one), the weight folded into the inverse root as flax's
+    layer norm folds its scale (79g's review: a centered `2^-100` under an epsilon of `2^100` normalized
+    first flushed to zero, where the scale of `2^100` read `2^-50`), the plain formula over the shifted rows,
+    fla's reference's, its derivatives autodiff's (the shift a constant, whose term a layer norm's invariance
+    makes zero), so every order is finite wherever the plain formula's is (docs/design/testing.md, the
+    derivative contract). A quotient by the root, not a product by `rsqrt`, whose derivative `rsqrt(v) / v`
+    passes the range first (2^150 at `eps` 2^-100, its product with a zero NaN)."""
     shifted = x - row_shift(x, -1)
     centered = shifted - jnp.mean(shifted, axis=-1, keepdims=True)
-    return centered / jnp.sqrt(jnp.mean(centered * centered, axis=-1, keepdims=True) + eps)
+    return centered * (weight / jnp.sqrt(jnp.mean(centered * centered, axis=-1, keepdims=True) + eps)) + bias
 
 
 def inner_gradient(k, v, km, weight, bias, eps: float):
     """Half the inner loss's gradient at the memory's readout `km` (`k M`), `[..., D]`: the memory's output
     `k + (LN(km) w + b)` (the residual around its key, as `dew.nn.memory`'s `ResidualMemory`) against the
-    value `v`, its error times `w`, through the LayerNorm's pullback (autodiff's, `layer_normed`). The
-    residual first, as the memory computes its output: against `v - k`, a key of 2^100 beside a value of 1
-    rounded the target and erased the error (a head review)."""
-    normed, pullback = jax.vjp(functools.partial(layer_normed, eps=eps), km)
-    (gradient,) = pullback(((k + (normed * weight + bias)) - v) * weight)
+    value `v`, through the affine LayerNorm's pullback (autodiff's, `layer_normed`). The residual first, as
+    the memory computes its output: against `v - k`, a key of 2^100 beside a value of 1 rounded the target and
+    erased the error (a head review)."""
+    normed, pullback = jax.vjp(functools.partial(layer_normed, weight=weight, bias=bias, eps=eps), km)
+    (gradient,) = pullback((k + normed) - v)
     return gradient
 
 
@@ -90,7 +93,7 @@ def read_out(walked, queries, weight, bias, eps: float, dtype):
     out = jnp.moveaxis(walked.reshape(-1, *walked.shape[2:]), 0, 2)[:, :, :queries.shape[2]]
     # The affine whole before the residual, as the memory's norm applies it (`ResidualMemory`): `q + (LN w +
     # c)`, where `(q + LN w) + c` lost the query to an affine its bias cancels.
-    return jnp.moveaxis(queries + (layer_normed(out, eps) * weight + bias), 1, 2).astype(dtype)
+    return jnp.moveaxis(queries + layer_normed(out, weight, bias, eps), 1, 2).astype(dtype)
 
 
 def placed_alike(affine, *operands):
@@ -177,8 +180,9 @@ def titans(query, key, value, weight, bias, theta, alpha, eta, state=None, *, ch
     def mini_batch(pair, at):
         q, k, v, theta, alpha, eta, real = at
         gradient = real_gradients(k, v, k @ pair[0], real, weight, bias, eps)
+        memory0, momentum0 = pair
 
-        def token(pair, along):
+        def token(composed, along):
             q, k, gradient, theta, alpha, eta, real = along
             # The write `2 theta k u` one exact product of the 2, the rate, the key and the gradient, rounded
             # once (`aligned_sum`), its transpose's alike: no partial product leaves the range its value does
@@ -188,15 +192,32 @@ def titans(query, key, value, weight, bias, theta, alpha, eta, state=None, *, ch
             # 2^127 doubled first overflowed, train 1461's).
             write = aligned_sum([[jnp.asarray(coefficient, theta.dtype), theta[..., None, None],
                                   k[..., :, None], gradient[..., None, :]]])
-            momentum = eta[..., None, None] * pair[1] - write
-            memory = (1.0 - alpha)[..., None, None] * pair[0] + momentum
-            # A padded token leaves the pair as it was.
-            pair = tuple(jnp.where(real[..., None, None], new, old)
-                         for new, old in zip((memory, momentum), pair, strict=True))
-            return pair, jnp.einsum('bhk,bhkv->bhv', q, pair[0])
+            # The pair the mini-batch's tokens reach, as the memory's general path composes its steps
+            # (`dew.nn.memory`'s chunk): `S_t = m_t S_0 + o_t` and `M_t = a_t M_0 + c_t S_0 + p_t`, the
+            # entering pair apart from the writes the steps carry, so a write below the entering memory's last
+            # place is kept rather than rounded away token by token (79g's review: four writes of 0.98 into a
+            # memory of 2^25 left it as it was).
+            decay, kept, momentum_scale, momentum_offset, memory_offset = composed
+            forget = (1.0 - alpha)[..., None, None]
+            carry = eta[..., None, None]
+            momentum_offset = carry * momentum_offset - write
+            stepped = (forget * decay, forget * kept + carry * momentum_scale, carry * momentum_scale,
+                       momentum_offset, forget * memory_offset + momentum_offset)
+            # A padded token leaves the composition as it was.
+            composed = tuple(jnp.where(real[..., None, None], new, old)
+                             for new, old in zip(stepped, composed, strict=True))
+            decay, kept, _, _, memory_offset = composed
+            memory = (decay * memory0 + kept * momentum0) + memory_offset
+            return composed, jnp.einsum('bhk,bhkv->bhv', q, memory)
 
+        # The identity composition, typed as the entering pair varies (every operand's axes).
+        ones, zeros = jnp.ones_like(memory0[..., :1, :1]), jnp.zeros_like(memory0)
+        identity = (ones, jnp.zeros_like(ones), ones, zeros, zeros)
         tokens = tuple(jnp.moveaxis(x, 2, 0) for x in (q, k, gradient, theta, alpha, eta, real))
-        return jax.lax.scan(token, pair, tokens)
+        composed, reads = jax.lax.scan(token, identity, tokens)
+        decay, kept, momentum_scale, momentum_offset, memory_offset = composed
+        return ((decay * memory0 + kept * momentum0) + memory_offset,
+                momentum_scale * momentum0 + momentum_offset), reads
 
     keys, *rest = mini_batches(chunk, k, q, v, theta, alpha, eta, valid=valid)
     final, out = memory_chunks(mini_batch, states, (rest[0], keys, *rest[1:]))

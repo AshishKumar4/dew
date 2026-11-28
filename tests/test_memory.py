@@ -252,15 +252,22 @@ def test_a_mini_batched_memorys_error_takes_its_residual_first(bias):
         assert np.asarray(module.apply(params, x, call))[0, 0, 1] < 0
 
 
+def linear_residual_memory(bias: bool, epsilon: float, chunk: int, rate: float) -> InContextMemory:
+    """One head's linear residual memory over a width of two, its layer norm slow, unprojected queries and
+    keys beside projected values, at a constant rate: TTT-Linear's form with its `bias`, Titans' without,
+    each of which a call of one document runs on its mini-batched kernel."""
+    return InContextMemory(network=ResidualMemory(hidden=None, norm=True, bias=bias, epsilon=epsilon),
+                           slow=("norm",), project_query=False, project_key=False, output=False, chunk=chunk,
+                           learning_rate=Gate(value=rate))
+
+
 @pytest.mark.parametrize("bias", [True, False])
 def test_a_mini_batched_memorys_layer_norm_reads_its_rows_less_their_mean(bias):
     """A linear residual memory's layer norm reads its rows less their mean on its mini-batched kernel as on
     the token path (`norms.row_shift`, Dew's layer norm's): one token whose memory reads `[2^24, 2^24 + 2]`
     normalizes it, at an epsilon of one, to `[-1, 1] / sqrt(2)` on both, its branch symmetric (train 1484's
     review: the kernel normalized it unshifted, its mean rounded to 2^24, to `[0, 2] / sqrt(3)`)."""
-    module = InContextMemory(network=ResidualMemory(hidden=None, norm=True, bias=bias, epsilon=1.0),
-                             slow=("norm",), project_query=False, project_key=False, output=False, chunk=1,
-                             learning_rate=Gate(value=0.0))
+    module = linear_residual_memory(bias, 1.0, chunk=1, rate=0.0)
     x = jnp.asarray([[[1.0, 0.0]]], jnp.float32)
     params = jax.tree.map(jnp.zeros_like, module.init(jax.random.key(0), x))
     params["params"]["head_0"]["down"]["kernel"] = jnp.asarray([[2.0**24, 2.0**24 + 2], [0.0, 0.0]],
@@ -269,6 +276,42 @@ def test_a_mini_batched_memorys_layer_norm_reads_its_rows_less_their_mean(bias):
     for call in (PLAIN_CALL, packed(np.ones((1, 1), np.int32))):
         branch = np.asarray(module.apply(params, x, call))[0, 0] - np.asarray(x)[0, 0]
         assert branch[0] == -branch[1] and branch[1] > 0.5, branch
+
+
+@pytest.mark.parametrize("bias", [True, False], ids=["ttt", "titans"])
+def test_a_mini_batched_memory_keeps_the_steps_below_its_entering_states_last_place(bias):
+    """Four tokens of one mini-batch, each stepping a memory whose entries are 2^25 by about 0.98, less than
+    half their last place: the memory, as its general path composes the steps, holds their sum apart from
+    the entering state, so the last token reads `2^25 -+ 4` and its readout's layer norm `[1, -1]` on its
+    mini-batched kernel as on the token path (79g's review: the kernel stepped the rounded state token by
+    token, every step rounded away, and read `[1, 0]`)."""
+    module = linear_residual_memory(bias, 1e-6, chunk=4, rate=2.0**-10)
+    x = jnp.asarray([[[1.0, 0.0]] * 4], jnp.float32)
+    params = jax.tree.map(jnp.zeros_like, module.init(jax.random.key(0), x))
+    memory = params["params"]["head_0"]
+    memory["down"]["kernel"] = jnp.asarray([[2.0**25, 2.0**25], [0.0, 0.0]], jnp.float32)
+    if bias:
+        memory["down"]["bias"] = jnp.asarray([2.0**25, 2.0**25], jnp.float32)
+    memory["norm"]["scale"] = jnp.ones((2,), jnp.float32)
+    params["params"]["v_proj"]["kernel"] = jnp.asarray([[2.0, -1.0], [0.0, 0.0]], jnp.float32)
+    for call in (PLAIN_CALL, packed(np.ones((1, 4), np.int32))):
+        np.testing.assert_allclose(np.asarray(module.apply(params, x, call))[0, -1], [2.0, -1.0], atol=1e-3)
+
+
+@pytest.mark.parametrize("bias", [True, False], ids=["ttt", "titans"])
+def test_a_mini_batched_memorys_layer_norm_takes_its_scale_into_its_inverse_root(bias):
+    """A readout of `[-2^-100, 2^-100]` under an epsilon of 2^100 and a norm scale of 2^100 reads
+    `2^-100 2^100 / 2^50 = 2^-50`, its scale folded into the inverse root as Dew's layer norm (flax's) folds
+    it, on the memory's mini-batched kernel as on the token path (79g's review: the kernel normalized first,
+    `2^-150`, which rounds to zero, and read zero)."""
+    module = linear_residual_memory(bias, 2.0**100, chunk=1, rate=0.0)
+    x = jnp.asarray([[[1.0, 0.0]]], jnp.float32)
+    params = jax.tree.map(jnp.zeros_like, module.init(jax.random.key(0), x))
+    params["params"]["head_0"]["down"]["kernel"] = jnp.asarray([[-(2.0**-100), 2.0**-100], [0.0, 0.0]],
+                                                               jnp.float32)
+    params["params"]["head_0"]["norm"]["scale"] = jnp.full((2,), 2.0**100, jnp.float32)
+    for call in (PLAIN_CALL, packed(np.ones((1, 1), np.int32))):
+        assert np.asarray(module.apply(params, x, call))[0, 0, 1] == np.float32(2.0**-50)
 
 
 def test_a_residual_memory_built_by_position_reads_its_fields_as_given():
