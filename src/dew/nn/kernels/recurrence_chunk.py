@@ -297,9 +297,11 @@ def _prologue_of(hooks: recurrence.Hooks, operands: Chunk, dtype) -> tuple:
     return given, query, key, value, g, beta, scale, dtype, work
 
 
-PADDED = ('query', 'key', 'value', 'gate', 'beta', 'log_decay', 'value_decay')
-"""The operands a token holds of its own (`Chunk`'s `[B, S, ...]` ones) a padded token's are zeroed of
-(`_padded_zero`)."""
+PADDED = ('query', 'key', 'value',
+          *(field.name for field in dataclasses.fields(recurrence.Gated) if field.metadata.get('rows')))
+"""The operands a token holds of its own, a padded token's zeroed (`_padded_zero`): its query, key and value
+and every gate's entry a row's (`recurrence.Gated`'s `ROW` fields: the epilogue's gate among them, whose
+infinity met the norm weight's zero cotangent as NaN; a head review)."""
 
 
 def _padded_zero(given: dict, valid) -> dict:

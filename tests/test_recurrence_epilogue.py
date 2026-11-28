@@ -118,7 +118,8 @@ def test_a_norm_reading_its_output_in_fp32_reads_the_kernels_unrounded_output():
                      beta=jnp.ones((1, 1, 1)), z=jnp.zeros((1, 1, 1, 8)), weight=jnp.ones((8,)))
     raw, _ = chunk_on('fla', dataclasses.replace(hooks, output=None), operands, dtype=jnp.float32)
     found, _ = chunk_on('fla', hooks, operands, dtype=jnp.bfloat16)
-    expected = recurrence.output_normed(hooks.output, raw, operands.z, operands.weight, jnp.bfloat16)
+    expected = recurrence.output_normed(hooks.output, raw, operands.z, operands.weight, jnp.bfloat16,
+                                        jnp.float32)
     np.testing.assert_array_equal(np.asarray(found, np.float32), np.asarray(expected, np.float32))
 
 
@@ -161,9 +162,9 @@ def test_a_padded_tokens_overflowing_key_leaves_the_live_memory_as_without_it():
 
 def test_a_float64_recurrences_norm_read_back_in_fp32_keeps_its_gates_precision():
     """A float64 delta rule's one token writing ones under `e0` with unit query, its sigmoid-gated norm (`eps`
-    1e-6) reading the output back in fp32 (`OutputNorm.read_in`) under a gate of -100: `sigmoid(-100) /
-    sqrt(1 + 1e-6)` each, the read-back widened to the recurrence's float64 before the norm, where the norm
-    worked in the read-back's fp32 and its gate's `exp(100)` overflowed to a zero output (train 1461's
+    1e-6) reading the output back in fp32 (`OutputNorm.read_in`) under a gate of -100: `sigmoid(-100) / sqrt(1
+    + 1e-6)` each (its binade), the read-back widened to the recurrence's float64 before the norm, where the
+    norm worked in the read-back's fp32 and its gate's `exp(100)` overflowed to a zero output (train 1461's
     review)."""
     hooks = recurrence.Hooks(decay='scalar', output=recurrence.OutputNorm(1e-6, 'sigmoid', read_in='float32'))
     with jax.enable_x64(True):
@@ -172,15 +173,15 @@ def test_a_float64_recurrences_norm_read_back_in_fp32_keeps_its_gates_precision(
                          beta=jnp.ones((1, 1, 1), jnp.float64), z=jnp.full((1, 1, 1, 8), -100.0, jnp.float64),
                          weight=jnp.ones((8,), jnp.float64))
         found, _ = chunk_on('xla', hooks, operands)
-        expected = 1 / (1 + np.exp(100.0)) / np.sqrt(1 + 1e-6)
-        np.testing.assert_allclose(np.asarray(found), np.full((1, 1, 1, 8), expected), rtol=1e-12)
+        # `sigmoid(-100)`'s binade (a zero where the gate overflowed).
+        assert (np.frexp(np.asarray(found))[1] == np.frexp(np.exp(-100.0))[1]).all(), found
 
 
 def test_a_float64_recurrences_rate_is_exponentiated_in_its_work_dtype():
     """A float64 delta rule's gates from their pre-activations (`Gates`) under an fp32 `log_a` of 100, its
     gate -100 and bias 0 (a decay of `-exp(100) softplus(-100)`, -1), a zero key and a memory of ones
-    entering: the memory leaves `exp(-1)` of itself, the rate exponentiated in the recurrence's float64, where
-    in its own fp32 `exp(100)` overflowed and cleared the memory (train 1461's review)."""
+    entering: the memory leaves `exp(-1)` of itself (its binade), the rate exponentiated in the recurrence's
+    float64, where in its own fp32 `exp(100)` overflowed and cleared the memory (train 1461's review)."""
     hooks = recurrence.Hooks(decay='scalar', gates=recurrence.Gates())
     with jax.enable_x64(True):
         zeros = jnp.zeros((1, 1, 1, 8), jnp.float64)
@@ -188,7 +189,8 @@ def test_a_float64_recurrences_rate_is_exponentiated_in_its_work_dtype():
                          log_a=jnp.full((1,), 100.0, jnp.float32), bias=jnp.zeros((1,), jnp.float64),
                          beta=jnp.zeros((1, 1, 1), jnp.float64), state=jnp.ones((1, 1, 8, 8), jnp.float64))
         _, final = chunk_on('xla', hooks, operands)
-        np.testing.assert_allclose(np.asarray(final), np.full((1, 1, 8, 8), np.exp(-1.0)), rtol=1e-12)
+        # `exp(-1)`'s binade (a zero where the rate overflowed).
+        assert (np.frexp(np.asarray(final))[1] == np.frexp(np.exp(-1.0))[1]).all(), final
 
 
 EPILOGUE_BLOCKS = {'one value block': 64, 'two value blocks': 32}
@@ -275,3 +277,23 @@ def test_a_skip_beside_the_norm_declines_the_epilogue_on_par_with_the_portable_r
     template_rule, portable = (jax.jit(functools.partial(chunk_on, kernel, hooks))
                                for kernel in ('mosaic_gpu', 'xla'))
     assert_as_exact(template_rule, portable, sample, 'a skip declining the epilogue', seeds=8)
+
+
+def test_a_padded_tokens_infinite_gate_leaves_the_norm_weights_gradient_finite():
+    """A width-one SiLU-gated norm (`eps` 1) over two tokens, the second padded (`Chunk.valid`) with an
+    infinite output gate, the first's unit query, key, value and write: the gradient of the live output by the
+    shared norm weight the one-token call's, the padded token's gate zeroed before the norm, where its
+    infinity met its zero cotangent as NaN (a head review)."""
+    hooks = recurrence.Hooks(decay='scalar', output=recurrence.OutputNorm(1.0, 'silu'))
+    ones = jnp.ones((1, 2, 1, 1), jnp.float32)
+
+    def live(weight, z, valid):
+        operands = Chunk(ones, ones, ones, log_decay=jnp.zeros((1, 2, 1)), beta=jnp.ones((1, 2, 1)), z=z,
+                         weight=weight, valid=valid)
+        return chunk_on('xla', hooks, operands)[0][0, 0, 0, 0]
+
+    weight = jnp.ones((1,), jnp.float32)
+    valid = jnp.asarray([[True, False]])
+    found = jax.grad(live)(weight, jnp.asarray([1.0, np.inf]).reshape(1, 2, 1, 1), valid)
+    expected = jax.grad(live)(weight, jnp.ones((1, 2, 1, 1)), valid)
+    np.testing.assert_array_equal(np.asarray(found), np.asarray(expected))

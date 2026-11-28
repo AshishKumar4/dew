@@ -28,6 +28,7 @@ from dew.nn.precision import (
     accurate_exp,
     activation_and_slope,
     logistic_value,
+    rms_of_total,
     rms_weighted,
     softplus_series,
 )
@@ -616,4 +617,5 @@ def _epilogue(hooks, inputs, token: _Token, out, value, exchanged, *, interpret:
     # As `precision.rms_statistics` takes it, over a head's columns (`rms_of_total`).
     total = scan.summed((out * out).reshape(-1), exchanged, interpret=interpret)
     _, inverse = rms_of_total(total, token.block.columns, hooks.output.epsilon)
-    return rms_weighted(out, inverse, weight=weight, gate=activation_and_slope(gate, hooks.output.activation)[0])
+    activated, _ = activation_and_slope(gate, hooks.output.activation)
+    return rms_weighted(out, inverse, weight=weight, gate=activated)

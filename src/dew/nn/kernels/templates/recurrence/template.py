@@ -30,6 +30,7 @@ from dew.nn import derivatives
 from dew.nn.kernels import chunked_launch, generation, recurrence
 from dew.nn.kernels.templates import base, bundles, cost, mosaic, report, resources, sass
 from dew.nn.kernels.templates.recurrence import chunk_forward, mainloop, mainloop_backward
+from dew.nn.precision import at_least_fp32
 from dew.nn.residuals import Residual
 
 
@@ -267,7 +268,8 @@ def _normed_pullback(normed: recurrence.OutputNorm | None, read, gate, weight, o
         return out_grad, None, None
 
     def norm(out, gate, weight):
-        return recurrence.output_normed(normed, out, gate, weight, dtype)
+        # In at least fp32, the template's own work dtype.
+        return recurrence.output_normed(normed, out, gate, weight, dtype, at_least_fp32(dtype))
 
     _, pulled = jax.vjp(norm, read, gate, weight)
     return pulled(out_grad.astype(dtype))
