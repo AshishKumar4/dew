@@ -42,7 +42,7 @@ from dew.nn.kernels.gemm import (
 from dew.nn.kernels.templates import axes
 from dew.nn.kernels.templates.hooks import Hook, Side
 from dew.nn.kernels.templates.product import MXFP8 as MX_BLOCKS, NVFP4 as NVFP4_BLOCKS, SCALE_DEPTH, declared
-from dew.nn.precision import EXACT_FLOAT32, biased, biased_value
+from dew.nn.precision import EXACT_FLOAT32, at_least_fp32, biased, biased_value
 from dew.nn.sharding import (
     RESIDUAL,
     automatic_axes,
@@ -58,8 +58,8 @@ def blockwise_fp8_projection(x: jax.Array, w: jax.Array, group_blocks: jax.Array
                              interpret_on_cpu: bool = False) -> jax.Array:
     """Each group's rows of `x` (`[rows, depth]`) times its matrix of `w` (`[groups, depth, width]`) in
     DeepSeek-V3's blockwise FP8 recipe (row 2513): `x` quantized to E4M3 a 1 x 128 tile at a time along the
-    depth and `w` a 128 x 128 block at a time (power-of-two scales, `fake_quant.fp8_scaled_blocks`), their
-    product `blockwise_fp8_product`. Its gradients are the recipe's own FP8 products: the input's the
+    depth and `w` a 128 x 128 block at a time (power-of-two scales, `rows_quantized`, `blocks_quantized`),
+    their product `blockwise_fp8_product`. Its gradients are the recipe's own FP8 products: the input's the
     cotangent quantized 1 x 128 along the width times the blocks transposed, the matrices' the rows and the
     cotangent each quantized 1 x 128 along the rows (`blockwise_fp8_kernel_gradient`), a surrogate of the
     quantized product's derivative (straight through each rounding). Group `g` holds `group_blocks[g]` whole
@@ -260,16 +260,17 @@ def rows_quantized(x: jax.Array) -> tuple[jax.Array, jax.Array]:
 
 def blocks_quantized(w: jax.Array) -> tuple[jax.Array, jax.Array]:
     """`w` (`[groups, depth, width]`) as E4M3 codes a 128 x 128 block at a time and each block's power-of-two
-    scale (`[groups, depth / 128, width / 128]` fp32)."""
+    scale (`[groups, depth / 128, width / 128]` fp32): each block's rows and columns axes of their own, its
+    largest magnitude reduced over both where they lie, so no transposed copy of the matrix is made either
+    way (row 4518)."""
     from dew.nn import fake_quant
 
     groups, depth, width = w.shape
     edge = SCALE_DEPTH
-    tiled = w.reshape(groups, depth // edge, edge, width // edge, edge).transpose(0, 1, 3, 2, 4)
-    blocks, scale = fake_quant.fp8_scaled_blocks(tiled.reshape(groups, depth // edge, width // edge, -1),
-                                                 edge * edge)
-    codes = fake_quant.fp8_codes(blocks / scale).reshape(tiled.shape).transpose(0, 1, 3, 2, 4)
-    return codes.reshape(w.shape).astype(jnp.float8_e4m3fn), scale[..., 0, 0]
+    tiles = w.astype(at_least_fp32(w.dtype)).reshape(groups, depth // edge, edge, width // edge, edge)
+    scale = fake_quant.fp8_block_scale(jnp.max(jnp.abs(tiles), axis=(2, 4), keepdims=True))
+    codes = fake_quant.fp8_codes(tiles / scale)
+    return codes.reshape(w.shape).astype(jnp.float8_e4m3fn), scale[:, :, 0, :, 0]
 
 
 def _k_major(w: jax.Array) -> tuple[jax.Array, jax.Array]:
