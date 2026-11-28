@@ -604,18 +604,19 @@ def _opcodes(instructions: Sequence[hlo.Instruction]) -> dict[str, str]:
     """Each instruction's opcode by its name as it runs: a generic async op's (`async-start`, `async-update`
     or `async-done`, over a computation holding the op itself, as XLA wraps some collectives,
     `trace.COLLECTIVES`) its wrapped op's, as `<op>-start` or `<op>-done`: the root of the computation it
-    calls, as XLA reads it first (a done taking a loop-carried handle from a tuple names it so), else, an
-    update's or a done's that names none, the op of the async instruction it reads; so a run of a generic
-    async all-to-all is the transfer it is (`trace.moves_only`). Every other its own."""
-    roots = {each.computation: each.opcode for each in instructions if each.root}
-    named = {each.name: each for each in instructions}
+    calls, as XLA reads it first, else, an update's or a done's that names none, the op of the async
+    instruction whose handle it reads (`_Handles`: through tuples, their elements and a loop's state, a
+    handle a loop carries); so a run of a generic async all-to-all is the transfer it is
+    (`trace.moves_only`). Every other its own."""
+    handles = _Handles(instructions)
 
     def wrapped(each: hlo.Instruction) -> str | None:
         if each.opcode not in _ASYNC:
             return None
+        roots = handles.roots
         if (own := next((roots[called] for called in each.called if called in roots), None)) is not None:
-            return own
-        producer = named.get(each.operands[0]) if each.opcode != "async-start" and each.operands else None
+            return own.opcode
+        producer = handles.made(each.operands[0]) if each.opcode != "async-start" and each.operands else None
         return None if producer is None else wrapped(producer)
 
     found = {}
@@ -625,6 +626,45 @@ def _opcodes(instructions: Sequence[hlo.Instruction]) -> dict[str, str]:
                             else f"{op}-start" if each.opcode == "async-start" else f"{op}-done")
     return found
 
+
+class _Handles:
+    """Where a module's values come from (`made`), read through the instructions that only move them, as
+    XLA's own async-chain reader follows them (`HloAsyncInstruction`'s): a tuple's elements, an element
+    taken from one (`get-tuple-element`), a copy and an optimization barrier of a value (`_FORWARDING`), a
+    while loop's state, its body's parameter its initial state and its result its body's root: the async
+    instruction an `async-done`'s handle is, however a loop carries it there. Each computation's root by its
+    name (`roots`), which a callee's op is read from too (`_opcodes`)."""
+
+    def __init__(self, instructions: Sequence[hlo.Instruction]):
+        self.named = {each.name: each for each in instructions}
+        self.roots = {each.computation: each for each in instructions if each.root}
+        # Each while loop's body by the loop running it (`HloInstruction::while_body`, its first callee).
+        self.loops = {each.called[0]: each for each in instructions if each.opcode == "while" and each.called}
+
+    def made(self, name: str, path: tuple[int, ...] = ()) -> hlo.Instruction | None:
+        """The instruction whose result `name` is, at its tuple elements' `path` (each a tuple index), or
+        None where no instruction that only moves values leads to one."""
+        for _ in range(len(self.named) + 1):
+            each = self.named.get(name)
+            if each is None:
+                return None
+            if each.opcode == "get-tuple-element" and each.operands:
+                name, path = each.operands[0], (each.proto.tuple_index, *path)
+            elif each.opcode == "tuple" and path and path[0] < len(each.operands):
+                name, path = each.operands[path[0]], path[1:]
+            elif each.opcode in _FORWARDING and each.operands:
+                name = each.operands[0]
+            elif each.opcode == "while" and each.called and each.called[0] in self.roots:
+                name = self.roots[each.called[0]].name
+            elif each.opcode == "parameter" and each.computation in self.loops:
+                name = self.loops[each.computation].operands[0]
+            else:
+                return each if not path else None
+        return None
+
+
+_FORWARDING = ("copy", "opt-barrier")
+"""The instructions whose result is their one operand, element for element (`_Handles.made`)."""
 
 _ASYNC = ("async-start", "async-update", "async-done")
 """XLA's generic async ops, each over a computation holding the op it runs (`_opcodes`)."""
