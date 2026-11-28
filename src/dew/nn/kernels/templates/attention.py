@@ -35,6 +35,7 @@ from typing import ClassVar, Literal, NamedTuple, overload
 import jax
 import jax.numpy as jnp
 import numpy as np
+from jax._src import config as jax_config
 from jax.typing import DTypeLike
 from numpy.lib.array_utils import normalize_axis_tuple
 
@@ -1954,9 +1955,27 @@ def hook_program(name: str, hook, kinds: tuple[Kind, ...], dtypes: tuple[str, ..
     (`SITES`, `hooks.laid`), in its dtype in the kernels (`dtypes`); `differentiated`, a score hook's
     pullback too, so a hook whose derivative is its own rule (`jax.custom_vjp`) keys by that rule (a
     prologue's pullback runs past the kernels, `jax.vjp` of `prologued`). None or an already traced key as
-    it is."""
+    it is. Within a kernel call's making (`tuning.one_call`), traced once for each hook at these arguments,
+    whichever of the call's launches reads it: a decode step's slices and merge, each an op of its own, keyed
+    a closure hook five times, its program the same at each (train 1474's K-F1)."""
     if hook is None or isinstance(hook, str):
         return hook
+    if (call := tuning.call_scoped()) is not None:
+        source = hook.source if isinstance(hook, tuning.Prepared) else hook
+        place = ("hook_program", name, id(source), kinds, tuple(map(str, dtypes)), differentiated, width,
+                 str(operand), jax_config.trace_context())
+        if place not in call:
+            # The hook kept beside its key, so its identity names no other hook while the call lasts.
+            call[place] = (hook, _hook_program(name, hook, kinds, dtypes, differentiated=differentiated,
+                                               width=width, operand=operand))
+        return call[place][1]
+    return _hook_program(name, hook, kinds, dtypes, differentiated=differentiated, width=width,
+                         operand=operand)
+
+
+def _hook_program(name: str, hook, kinds: tuple[Kind, ...], dtypes: tuple[str, ...], *, differentiated: bool,
+                  width: int, operand: str) -> str:
+    """`hook_program`'s trace of `hook`."""
     tile = TRACED_TILE
     prologue = name in ("query_mod", "key_mod")
     extents = {"queries": tile, "keys": tile, "width": width}
