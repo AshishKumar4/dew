@@ -298,7 +298,8 @@ def test_an_eager_product_of_no_groups_lands_on_its_operands_mesh(weak):
 
     rows = jax.device_put(filled((8, 4), 1.0), NamedSharding(mesh, PartitionSpec()))
     bank = jax.device_put(filled((0, 4, 128), 1.0), NamedSharding(mesh, PartitionSpec(None, None, "tensor")))
-    sizes = jax.device_put(jnp.zeros((0,), jnp.int32), NamedSharding(mesh, PartitionSpec()))
+    sizes = jax.device_put(jnp.full((0,), 0) if weak else jnp.zeros((0,), jnp.int32),
+                           NamedSharding(mesh, PartitionSpec()))
     out = xla_products.placed_ragged_dot(rows, bank, sizes,
                                          preferred_element_type=None if weak else jnp.float32)
     if weak:
