@@ -85,10 +85,13 @@ class RowHook:
     """The axes a side lays its operand on: the tile's rows, the launch's heads and a head's columns."""
 
     def __post_init__(self):
+        # A side's axes some of `SIDE_AXES` in its order, each once, its columns among them: a launch loads
+        # its tile in the block's own layout, rows before columns.
         for side in self.sides:
-            if not set(side.axes) <= set(self.SIDE_AXES) or 'columns' not in side.axes:
-                raise ValueError(f"a row hook's side lies on its columns and some of {self.SIDE_AXES}, not "
-                                 f"{side.axes}")
+            if tuple(side.axes) != tuple(axis for axis in self.SIDE_AXES if axis in side.axes) \
+                    or 'columns' not in side.axes:
+                raise ValueError(f"a row hook's side lies on its columns and some of {self.SIDE_AXES} in "
+                                 f"that order, each once, not {side.axes}")
 
 
 def laid(tile: Sequence[str], axes: Sequence[str | None], extents: Mapping[str, int]) -> tuple[int, ...]:

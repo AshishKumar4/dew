@@ -16,6 +16,7 @@ from test_recurrence_chunk import CHUNK, KEY_WIDTH, PACKED, chunk_on, draw, host
 
 from dew.nn.kernels import generation, norm_swiglu, recurrence
 from dew.nn.kernels.recurrence_chunk import Chunk, chunk
+from dew.nn.kernels.templates.hooks import RowHook, Side
 from dew.nn.kernels.templates.recurrence import mainloop, template
 from dew.nn.linear import GatedDeltaNet
 from dew.nn.mixers.mamba2 import MambaRMSNormGated
@@ -409,7 +410,8 @@ def test_a_norm_form_the_fused_kernel_lacks_is_xlas_alone():
     with generation.routes() as found:
         jax.eval_shape(normed)
     assert [route.kernel for route in found if route.choice == generation.Choice.RMS_NORM] == ['xla'], found
-    with kernels.use(rms_norm='pallas'), pytest.raises(KernelRefused) as refused:
+    # On an H100's facts, so the form is the kernel's first refusal (off a GPU its capability's is).
+    with generation.assumed('sm90'), kernels.use(rms_norm='pallas'), pytest.raises(KernelRefused) as refused:
         jax.eval_shape(normed)
     assert refused.value.first.code == 'form'
 
@@ -446,3 +448,18 @@ def test_a_rounding_norm_forms_decode_token_is_its_reference_bit_for_bit():
     expected = recurrence.step_reference(hooks, given)[0]
     assert found.dtype == expected.dtype == jnp.bfloat16
     np.testing.assert_array_equal(np.asarray(found, np.float32), np.asarray(expected, np.float32))
+
+
+ROW_HOOK_SIDES = {'columns first': ('columns', 'rows'), 'rows twice': ('rows', 'rows', 'columns'),
+                  'no columns': ('rows',), 'another axis': ('tokens', 'columns')}
+"""Axes no row hook's side lies on (`RowHook.SIDE_AXES`)."""
+
+
+@pytest.mark.parametrize('axes', ROW_HOOK_SIDES.values(), ids=ROW_HOOK_SIDES)
+def test_a_row_hooks_side_lies_on_its_axes_in_the_launchs_order(axes):
+    """A row hook's side on axes a launch does not load as they are given (`RowHook.SIDE_AXES`' order, each
+    once, its columns among them) is refused where the hook is built: a side on its columns before its rows
+    loaded transposed into a Hopper block's layout (a head review)."""
+    side = Side(jnp.zeros((4, 4), jnp.float32), axes)
+    with pytest.raises(ValueError, match='row hook'):
+        RowHook(lambda block: block, lambda block, total, side: block, (side,))

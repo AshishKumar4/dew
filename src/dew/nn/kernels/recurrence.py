@@ -111,6 +111,11 @@ class OutputNorm:
     gate_first: bool = False
     rounded: bool = False
 
+    @property
+    def form(self) -> str:
+        """Its form as the norm's selector names it (`norm_swiglu.GATED_FORMS`)."""
+        return f"gate {'first' if self.gate_first else 'after'}{', rounded' if self.rounded else ''}"
+
 
 def gated_rows(norm: OutputNorm, rows, gate, *, activate):
     """The rows `norm` normalizes: `rows` (wide) times `activate(gate)` (its gate's activation) where the gate
@@ -739,10 +744,9 @@ def output_normed(norm: OutputNorm, out, z, weight, dtype, work, *, axes=None):
         return gated_rms_normalized(out, z, weight, norm.epsilon, dtype, norm.activation, axes=axes)
     # The other forms XLA's alone: the norm's selector refuses its kernel their form (`norm_swiglu.NORM`'s
     # 'form'), a call naming it refused, the route reported (train 1473's head review).
-    form = f"gate {'first' if norm.gate_first else 'after'}{', rounded' if norm.rounded else ''}"
     chosen = norm_swiglu.gated_rms_kernel('auto', out, z, weight, dtype, norm.activation, axes=axes,
-                                          form=form)
-    assert chosen == 'xla', f"the norm's kernel takes no {form!r} form"
+                                          form=norm.form)
+    assert chosen == 'xla', f"the norm's kernel takes no {norm.form!r} form"
     wide = at_least_fp32(out.dtype)
     activate = GATE_ACTIVATIONS[norm.activation]
     rows = gated_rows(norm, out.astype(wide), z.astype(wide), activate=activate)
