@@ -403,29 +403,55 @@ def test_split_over_fsdp_the_frozen_product_is_one_devices():
     assert_products_exact(placed, "the frozen FP8 product split over fsdp")
 
 
+def explicit_tensor_split():
+    """A float64 frozen product's case split over an Explicit `tensor` axis of two devices along its
+    contracted width (`P(None, 'tensor')`), as a tensor-parallel run lays it: the mesh, the split, float64
+    activations whose every row's largest is 1.75 (E4M3's 448 at a scale of 2^-8) and every other a power of
+    two, and a kernel packed alike, so every code, scale, product and partial sum is exact whatever the
+    split. Built under x64."""
+    from jax.sharding import AxisType
+
+    mesh = jax.make_mesh((2,), ("tensor",), axis_types=(AxisType.Explicit,), devices=jax.devices()[:2])
+    x = np.full((4, 8), 0.5, np.float64)
+    x[:, 0] = 1.75
+    kernel = np.full((8, 6), 0.25, np.float32)
+    kernel[0] = 1.75
+    leaves = [jnp.asarray(value) for value in frozen_fp8_leaves(kernel).values()]
+    return mesh, NamedSharding(mesh, PartitionSpec(None, "tensor")), jnp.asarray(x), leaves
+
+
 @pytest.mark.mesh(devices=2)
 def test_a_float64_frozen_product_split_over_an_explicit_tensor_axis_is_its_unsplit_one():
     """Float64 activations and packed rows each split over an Explicit `tensor` axis along their contracted
-    width (`P(None, 'tensor')`), as a tensor-parallel run lays them, take the frozen product's float64
-    truth (`quantization._fp8_rows_exactly`) as they take it whole, exactly: every row's largest value
-    E4M3's largest code at a power-of-two scale and every other a power of two, so each product and partial
-    sum is exact whatever the split (train 1478's review: a bare `jnp.dot` refused the split contraction,
-    which the float32 product's portable route places)."""
-    from jax.sharding import AxisType
-
+    width (`explicit_tensor_split`) take the frozen product's float64 truth
+    (`quantization._fp8_rows_exactly`) as they take it whole, exactly (train 1478's review: a bare `jnp.dot`
+    refused the split contraction, which the float32 product's portable route places)."""
     with jax.enable_x64(new_val=True):
-        mesh = jax.make_mesh((2,), ("tensor",), axis_types=(AxisType.Explicit,), devices=jax.devices()[:2])
-        split = NamedSharding(mesh, PartitionSpec(None, "tensor"))
-        # Each row's largest 1.75, E4M3's 448 at a scale of 2^-8, so every code and scale is dyadic.
-        x = np.full((4, 8), 0.5, np.float64)
-        x[:, 0] = 1.75
-        kernel = np.full((8, 6), 0.25, np.float32)
-        kernel[0] = 1.75
-        leaves = [jnp.asarray(value) for value in frozen_fp8_leaves(kernel).values()]
-        whole = jax.jit(frozen_fp8_product)(jnp.asarray(x), *leaves)
+        mesh, split, x, leaves = explicit_tensor_split()
+        whole = jax.jit(frozen_fp8_product)(x, *leaves)
         with jax.set_mesh(mesh):
             placed = jax.jit(frozen_fp8_product)(jax.device_put(x, split), jax.device_put(leaves[0], split),
                                                  *leaves[1:])
+        assert placed.dtype == whole.dtype == jnp.float64
+        np.testing.assert_array_equal(np.asarray(placed), np.asarray(whole))
+
+
+@pytest.mark.mesh(devices=2)
+def test_a_float64_frozen_products_tangent_split_over_an_explicit_tensor_axis_is_its_unsplit_one():
+    """Forward mode (`jax.jvp`, MeanFlow's target) over the split of `explicit_tensor_split`, a dyadic
+    direction split as its activations are: the tangent, the direction times the decoded rows in float64,
+    is its unsplit one, exactly (train 1484's review P-F6: a bare dot refused the split tangent where the
+    value took it)."""
+    with jax.enable_x64(new_val=True):
+        mesh, split, x, leaves = explicit_tensor_split()
+        direction = jnp.asarray(np.where(np.arange(8) % 2 == 0, 0.5, -0.25) * np.ones((4, 1)), jnp.float64)
+
+        def tangent(x, direction, forward):
+            return jax.jvp(lambda x: frozen_fp8_product(x, forward, *leaves[1:]), (x,), (direction,))[1]
+
+        whole = jax.jit(tangent)(x, direction, leaves[0])
+        with jax.set_mesh(mesh):
+            placed = jax.jit(tangent)(*jax.device_put((x, direction, leaves[0]), split))
         assert placed.dtype == whole.dtype == jnp.float64
         np.testing.assert_array_equal(np.asarray(placed), np.asarray(whole))
 

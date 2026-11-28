@@ -267,8 +267,9 @@ def traced_flops[**Arguments, Result](function: Callable[Arguments, Result], *ar
     mixture's experts on a CPU) counts its rows' products, each against its own group's matrix. An
     operation that does no product (an entrywise or positionwise one, one that moves entries, a reduction,
     a cumulative one, a scatter, one that reads no operand: `dew.nn.programs`' facts, as JAX states them)
-    costs nothing here. Any other is refused by name, never counted as nothing: a while loop's trips, a
-    kernel launch's work (`opaque`), and an operation no fact states does no product (a linear solve, a
+    costs nothing here, as does a while loop whose body and condition do none, whatever its trips. Any other
+    is refused by name, never counted as nothing: a while loop's trips where it does a product, a kernel
+    launch's work (`opaque`), and an operation no fact states does no product (a linear solve, a
     factorization, a primitive of another library's)."""
     from dew.nn.kernels.generation import assumed
 
@@ -307,7 +308,12 @@ def _program_flops(program: jaxpr_core.Jaxpr) -> float:
                 steps = math.prod(_shape(equation.invars[0])[axis] for axis in equation.params["dimensions"])
                 total += max(steps - 1, 0) * math.prod(_shape(equation.outvars[0])) * step_flops
         elif primitive is jax.lax.while_p:
-            raise MissingFlopsCount("a while loop's trips are unknown to a traced count")
+            # A loop doing no product costs nothing whatever its trips (an exact sum's walk of its digits,
+            # `dew.nn.aligned`, in a softmax's derivative: train 1489's suspect run); one doing any is
+            # refused.
+            if (_program_flops(equation.params["cond_jaxpr"].jaxpr)
+                    or _program_flops(equation.params["body_jaxpr"].jaxpr)):
+                raise MissingFlopsCount("a while loop's trips are unknown to a traced count")
         elif (body := called(equation)) is not None:
             total += _program_flops(body)
         elif opaque(equation):

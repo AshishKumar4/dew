@@ -90,7 +90,6 @@ from dew.nn.kernels.generation import linear_map
 from dew.nn.kernels.options import owned_program
 from dew.nn.precision import (
     EXACT_FLOAT32,
-    accumulated,
     at_least_fp32,
     correctly_rounded_divide,
     float32_einsum,
@@ -946,16 +945,20 @@ def _frozen_fp8_tangent(primals, tangents, value):
     transpose is the FP8 input gradient, in `x`'s dtype (`generation.linear_map`). Its residuals are
     the packed leaves and an empty array of `x`'s dtype, all a backward reads, so a staged pullback, a
     remat or a scan keeps no copy of `x`."""
+    from dew.nn.kernels.xla_products import xla_dot
+
     x, forward, forward_scale, dgrad, dgrad_scale = primals
 
     def tangent(residuals, direction):
         rows, row_scales = (jax.lax.stop_gradient(leaf) for leaf in residuals[:2])
-        # In float64 where the direction is (check 1's truth, `_fp8_rows_exactly`), else float32.
+        # In float64 where the direction is (check 1's truth, `_fp8_rows_exactly`), else float32; through
+        # XLA's dense product as the value's float64 product (`xla_dot`), so a contraction Explicit axes split
+        # on both sides is placed (train 1484's review P-F6: a bare dot refused the tangent where the value
+        # took it).
         wide = jnp.promote_types(direction.dtype, jnp.float32)
         decoded = rows.astype(wide) * row_scales.astype(wide)
-        return accumulated(functools.partial(jax.lax.dot_general, dimension_numbers=(((1,), (1,)), ((), ())),
-                                             precision=EXACT_FLOAT32),
-                           direction.astype(wide), decoded, preferred_element_type=wide)
+        return xla_dot(direction.astype(wide), decoded.T, precision=EXACT_FLOAT32,
+                       preferred_element_type=wide)
 
     def transposed(residuals, cotangent):
         _, _, rows, row_scales, like = residuals
