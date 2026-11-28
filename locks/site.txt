@@ -860,15 +860,15 @@ egglog==14.0.0 ; (os_name != 'nt' and sys_platform == 'darwin') or (sys_platform
     # via
     #   -c locks/cpu.txt
     #   dewml (pyproject.toml)
-egglog==14.0.0.post1 ; sys_platform == 'linux' \
-    --hash=sha256:0129dc25301b896a6cc382d4ef8373a986f8b381b95eba4df57cd93e582ca3a0 \
-    --hash=sha256:088fc537cc89cb58f4271e8370c6e6cbb6e42e2c684386940159a42fa898b29c \
-    --hash=sha256:881b94d32154e7016cd40d601e20e7192891e679990cff81864f4916f0bc2053 \
-    --hash=sha256:89d51be6ba7307eb5d2532e2652d48ed942ab880d901e321f9922a9e708f1aeb \
-    --hash=sha256:a5a121412a7a9c1d0ee702789656b5e771c436661f74c7622d786ac582e0917c \
-    --hash=sha256:aedfa75591fabb731a8aca94e184d0ddea512bcbcd36f692c2ea7cacaa006ffa \
-    --hash=sha256:be9e500aa419ff44092c4beafb5e0bb04caacabcd366ce32feb0baf94c1e2683 \
-    --hash=sha256:dff9b6af6d0397eafd32403f1bb386f6518035bb85dc61a9854381a63851fbe2
+egglog==14.0.0.post2 ; sys_platform == 'linux' \
+    --hash=sha256:05f852036999c224c111ef394a0d566a9c8c334facc23ec5cee2a21c251b4923 \
+    --hash=sha256:05fd77bd7b9332f83e539f0f5f34f57d76e6d26696baf5637c5bcc3fa6f7f692 \
+    --hash=sha256:40ddd2ea61399c326e6323d411b9ce62bad0fcb03d2d16e571bf652914b8a999 \
+    --hash=sha256:57398cbd3774a220d752bba0631a8b832c332919dc632aa3a13cca28d7525f96 \
+    --hash=sha256:6410cc0db5a77d513d2a8d04dc10515d1688fb974712a224603657f51e34cd65 \
+    --hash=sha256:b7c29182d231f3d16c3081dd0b6584d1f6fae6b8c4a601c04e7db98a9a5369ff \
+    --hash=sha256:eb74461f04d9b79abbe2dd5918e1fcce81f31beeaedfd1c4fb5956544d336f85 \
+    --hash=sha256:f32c02ba7476672956cc9ccf4b62fd8dc817d916517b4ab8c54c28c6c38016ef
     # via
     #   -c locks/cpu.txt
     #   dewml (pyproject.toml)
