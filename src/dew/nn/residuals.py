@@ -6,6 +6,8 @@ import contextlib
 import contextvars
 import enum
 
+from jax.ad_checkpoint import checkpoint_name
+
 
 class Residual(enum.StrEnum):
     """A value a block names as it runs (`checkpoint_name`), each after the projection that
@@ -76,6 +78,15 @@ inside recomputes its memory in its backward where this names 'delta_memory'
 (`dew.nn.kernels.recurrence_chunk._blocked_rule`), and keeps it otherwise. A block sets it as it traces its
 layers (`recomputing`); held here, beside the names, so a block reads it without importing a recurrence's
 kernels."""
+
+
+def recurrence_output(x):
+    """A recurrence's output `x` under both names a remat policy reads it by: `Residual.SCAN`, the
+    recurrence's own, and `Residual.CONTEXT`, a mixer's output before its out projection, as MaxText's recipes
+    keep it. A mixer whose gated norm the recurrence's kernel runs in its epilogue names the output before
+    and after the norm so (`dew.nn.kernels.recurrence_chunk`): a rung keeping either keeps what the norm's
+    pullback and the out projection read, rather than replaying the launches that formed them."""
+    return checkpoint_name(checkpoint_name(x, Residual.SCAN), Residual.CONTEXT)
 
 
 def recomputed_memory() -> bool:

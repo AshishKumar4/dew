@@ -265,10 +265,14 @@ class KimiDeltaAttention(nn.Module):
         if shards > 1:
             rule = functools.partial(chunk_gated_delta_rule, max_segments=tokens.max_segments,
                                      **self.declared)
+            # Each shard's rule gates and norms its output in its epilogue, as the unsplit op does.
+            epilogue = ({'norm': self._chunk_hooks(projected.dtype, normed).output, 'z': gate,
+                         'weight': self.o_norm.variables['params']['weight'],
+                         'normed_dtype': self.o_norm.dtype or projected.dtype} if normed else {})
             out = sequence_delta_rule(projected, taps, g, beta, tokens, valid, shards=shards,
                                       key_heads=self.num_heads, widths=(self.head_dim,) * 3, parts=heads,
                                       dtype=projected.dtype if ported else wide, rule=rule,
-                                      chunk_size=self.chunk_size)
+                                      chunk_size=self.chunk_size, **epilogue)
         else:
             out = held_scan(self, projected, taps, None, scan,
                             (self.num_heads, self.head_dim, self.head_dim), decode=decode, coordinates=tokens,
@@ -280,7 +284,7 @@ class KimiDeltaAttention(nn.Module):
         if token is not None:
             # The fused step gated and normalized its output (`FUSED`), in its epilogue's dtype.
             return self.o_proj(out.astype(projected.dtype))
-        if not (chunked and normed and shards == 1):
+        if not (chunked and normed):
             # The scan read back in its projections' dtype, as Kimi's delta attention reads it.
             out = self.o_norm(out.astype(projected.dtype), gate)
         return self.o_proj(out.reshape(B, S, self.qkv_features))

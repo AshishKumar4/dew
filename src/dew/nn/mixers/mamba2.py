@@ -56,7 +56,6 @@ import jax
 import jax.numpy as jnp
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
-from jax.ad_checkpoint import checkpoint_name
 
 from dew.algebra.scan import RESET_DECAY
 from dew.mesh import SEQUENCE_AXIS
@@ -85,7 +84,7 @@ from dew.nn.linear import (
 from dew.nn.mixer_base import MixerBase, MixerContext
 from dew.nn.mixers.mamba import inverse_softplus_step, log_index
 from dew.nn.precision import accurate_exp, at_least_fp32, float32_dot_general, rms_statistics, softplus
-from dew.nn.residuals import Residual
+from dew.nn.residuals import Residual, recurrence_output
 
 CHUNK_SIZE = 256
 """The reference's default `chunk_size` (configuration_mamba2.py). The
@@ -520,7 +519,7 @@ def _sequence_mix(xs, B, C, dt, segments, starts, valid, *weights, scan, state_s
                   num_heads=dt.shape[2], n_groups=B.shape[-1] // state_size)
     # The scan's output as `held_scan` names it, a mixer's 'context' and a recurrence's 'scan'
     # (a remat policy's `RESIDUALS`).
-    return checkpoint_name(checkpoint_name(out, Residual.SCAN), Residual.CONTEXT)
+    return recurrence_output(out)
 
 
 @dataclasses.dataclass(frozen=True)

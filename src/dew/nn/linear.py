@@ -45,7 +45,7 @@ from dew.mesh import SEQUENCE_AXIS, LayoutRefused, MeshAxes, logical_spec, mesh_
 from dew.nn.dense import Dense
 from dew.nn.kernels import recurrence, short_conv
 from dew.nn.kv_cache import Opened, cache_variables, compute_dtype, kept, stated
-from dew.nn.residuals import Residual
+from dew.nn.residuals import Residual, recurrence_output
 
 from .activations import silu
 from .attention_masks import repeat_kv_heads
@@ -439,9 +439,9 @@ def held_scan(module: nn.Module, mixed, taps, bias, scan, state_shape: tuple[int
     state its parent leaves, a root from the row's start (`forked_conv`, `forked_scan`), `scan` taking a
     forked call's table (`forked` its `(loads, stores, held)`, `held` its given memories,
     `recurrence_chunk.Chunk.loads`) in a state at least fp32 (`state_dtype` widened); a cached one starts
-    from the cache and leaves it as it was. The scan's output is named as a remat keeps it (`Residual.SCAN`,
-    `CONTEXT`) unless `named` is False: a scan whose op names its own output before an epilogue it fuses
-    (`recurrence_chunk.chunk`'s gated norm), so a remat keeps the recurrence's output once."""
+    from the cache and leaves it as it was. The scan's output is named as a remat keeps it
+    (`residuals.recurrence_output`) unless `named` is False: a scan whose op names its own output, before and
+    after an epilogue it fuses (`recurrence_chunk.chunk`'s gated norm), the scan's output its normed one."""
     batch = mixed.shape[0]
     held = conv_state = None
     if decode:
@@ -462,7 +462,7 @@ def held_scan(module: nn.Module, mixed, taps, bias, scan, state_shape: tuple[int
             # The history and the state kept in the cache's dtypes, as they always were.
             kept(conv_state, history.astype(conv_state.value.dtype), 'conv_state')
             kept(held, final.astype(held.value.dtype), state)
-            return checkpoint_name(checkpoint_name(out, Residual.SCAN), Residual.CONTEXT)
+            return recurrence_output(out)
     valid = coordinates.valid
     mixed, history = held_conv1d(mixed, taps, valid,
                                  None if conv_state is None else conv_state.value.astype(mixed.dtype),
@@ -476,7 +476,7 @@ def held_scan(module: nn.Module, mixed, taps, bias, scan, state_shape: tuple[int
         kept(held, final.astype(held.value.dtype), state)
     # The scan's output under both names a remat policy reads it by (`RESIDUALS`): a mixer's
     # 'context', as MaxText's recipes keep it, and the 'scan' only a recurrence marks.
-    return checkpoint_name(checkpoint_name(out, Residual.SCAN), Residual.CONTEXT) if named else out
+    return recurrence_output(out) if named else out
 
 
 def fork_histories(x, documents, real, forks: Forks, width: int, history=None):
@@ -606,7 +606,7 @@ def forked_scan(convolved, rule, coordinates: Coordinates, start, *, named: bool
     given = jax.tree.map(lambda leaf: leaf[:, None], start)
     out, _ = rule(convolved, valid=real, starts=begins, state=given, loads=loads, stores=stores,
                   held=forks.held)
-    return checkpoint_name(checkpoint_name(out, Residual.SCAN), Residual.CONTEXT) if named else out
+    return recurrence_output(out) if named else out
 
 
 def _forked(mixed, taps, bias, scan, state_shape: tuple[int, ...], *, coordinates: Coordinates, held,
@@ -780,48 +780,62 @@ def sequence_halo(mixed, valid, segments, width: int):
 
 
 def split_delta_rule(mixed, g, beta, segments, starts, valid, taps, *, widths, parts, dtype, rule,
-                     chunk_size: int):
+                     chunk_size: int, epilogue: Mapping | None = None):
     """A delta-rule mixer's conv and rule over this shard's slice of whole training sequences and of its
     heads, inside a `shard_map` that holds the sequence axis manual (`sequence_delta_rule`): the conv with
     its halo (`sequence_conv`, its `parts` the queries', keys' and values' channels and l2-normed widths,
     `mixed` and `taps` each this shard's heads of each part laid in turn), the pieces in heads of their
     `widths`, and `rule(query, key, value, g, beta, state, starts=)` (its chunk `chunk_size`, bound by
     `sequence_delta_rule`) from the memory this shard's slice enters with (`entering_memory`, its transfer at
-    the same `chunk_size`), its output named as `held_scan`'s."""
+    the same `chunk_size`), its output named as `held_scan`'s. Its `epilogue` (the gated norm's `output`, `z`,
+    `weight` and `dtype`, `chunk_gated_delta_rule`'s), where given, the run from that memory takes, its
+    output normed and named by the op (`recurrence_chunk._normed_runs`); the slice's summary from zero
+    reads the final memory alone."""
     query, key, value = (piece.reshape(*piece.shape[:2], -1, width) for piece, width in
                          zip(sequence_conv(mixed, taps, None, segments, valid, parts=parts, dtype=dtype),
                              widths, strict=True))
     state = entering_memory(rule, query, key, value, g, beta, starts, axis=SEQUENCE_AXIS,
                             chunk_size=chunk_size)
-    out, _ = rule(query, key, value, g, beta, state, starts=starts)
-    return checkpoint_name(checkpoint_name(out, Residual.SCAN), Residual.CONTEXT)
+    out, _ = rule(query, key, value, g, beta, state, starts=starts, **(epilogue or {}))
+    return out if epilogue else recurrence_output(out)
 
 
 def sequence_delta_rule(mixed, taps, g, beta, coordinates, valid, *, shards: int, key_heads: int, widths,
-                        parts: Pieces, dtype, rule, chunk_size: int):
+                        parts: Pieces, dtype, rule, chunk_size: int,
+                        norm: recurrence.OutputNorm | None = None, z=None, weight=None, normed_dtype=None):
     """A delta-rule mixer's conv and rule (`split_delta_rule`) on shards that split the rows, the sequence and
     the heads (`over_sequence`, the split dividing its `key_heads`): each of `parts`' channels of `mixed`
     `[B, S, C]` and of the conv's `taps` `[C, K]` an operand split by its heads, the queries', keys' and
     values' laid in turn on each shard, `g` and `beta` by theirs. `rule` takes its chunk here, `chunk_size`
     the layer's, bound once for the rule and its shards' transfers alike. Where a tensor axis held every head
     whole, each of its devices ran the whole mixer's conv and scan (row 1437); each still runs its heads over
-    its slice of the sequence whole."""
+    its slice of the sequence whole. Where the mixer gives its gated `norm` (`recurrence.OutputNorm`), each
+    shard's rule takes it in its epilogue (`chunk_gated_delta_rule`'s `output`), as the unsplit layer's
+    chunked op does: `z` `[B, S, Hv, Dv]` its gate, split as the values are, `weight` `[Dv]` every shard's,
+    its gradient summed over the shards in one rounding (`_shards_summed`), the output normed in
+    `normed_dtype`; each shard's launches are the unsplit layer's over its slice."""
     edges = np.cumsum([width for width, _ in parts])[:-1]
     count = len(parts)
     rule = functools.partial(rule, chunk_size=chunk_size)
 
     def local(*operands):
-        pieces, (g, beta, segments, starts, valid), held = (operands[:count], operands[count:count + 5],
-                                                            operands[count + 5:])
+        pieces, (g, beta, segments, starts, valid, z), (*held, weight) = (
+            operands[:count], operands[count:count + 6], operands[count + 6:])
         # Each shard's heads of each part laid in turn, each part's width its own piece's.
         mine = tuple((piece.shape[-1], head) for piece, (_, head) in zip(pieces, parts, strict=True))
+        epilogue = None if norm is None else {'output': norm, 'z': z, 'weight': _shards_summed(weight),
+                                              'dtype': normed_dtype}
         return split_delta_rule(jnp.concatenate(pieces, axis=-1), g, beta, segments, starts, valid,
                                 jnp.concatenate(held, axis=0), widths=widths, parts=mine, dtype=dtype,
-                                rule=rule, chunk_size=chunk_size)
+                                rule=rule, chunk_size=chunk_size, epilogue=epilogue)
 
-    tokens = (*jnp.split(mixed, edges, axis=-1), g, beta, coordinates.segments, coordinates.starts, valid)
-    at = dict.fromkeys(range(count + 2), 2) | dict.fromkeys(range(len(tokens), len(tokens) + count), 0)
-    return over_sequence(local, shards, tokens, tuple(jnp.split(taps, edges, axis=0)),
+    tokens = (*jnp.split(mixed, edges, axis=-1), g, beta, coordinates.segments, coordinates.starts, valid,
+              None if norm is None else z)
+    # The pieces, `g`, `beta` and the norm's gate hold their heads at 2, the taps at 0.
+    at = (dict.fromkeys((*range(count + 2), len(tokens) - 1), 2)
+          | dict.fromkeys(range(len(tokens), len(tokens) + count), 0))
+    return over_sequence(local, shards, tokens,
+                         (*jnp.split(taps, edges, axis=0), None if norm is None else weight),
                          heads=Heads(beta.shape[2], key_heads, at))
 
 
@@ -1415,10 +1429,14 @@ class GatedDeltaNet(nn.Module):
         if shards > 1:
             rule = functools.partial(chunk_gated_delta_rule, max_segments=tokens.max_segments,
                                      **self.declared)
+            # Each shard's rule gates and norms its output in its epilogue, as the unsplit op does.
+            epilogue = ({'norm': self._fused_hooks(operand).output, 'z': gate,
+                         'weight': self.norm.variables['params']['weight'],
+                         'normed_dtype': self.norm.dtype or operand} if normed else {})
             out = sequence_delta_rule(mixed, self.conv1d()[0], g, beta, tokens, valid, shards=shards,
                                       key_heads=self.num_k_heads, widths=widths, parts=heads,
                                       dtype=operand if ported else wide, rule=rule,
-                                      chunk_size=self.chunk_size)
+                                      chunk_size=self.chunk_size, **epilogue)
         else:
             out = held_scan(self, mixed, self.conv1d()[0], None, scan,
                             (self.num_v_heads, self.head_k_dim, self.head_v_dim), decode=decode,
@@ -1431,7 +1449,7 @@ class GatedDeltaNet(nn.Module):
             # The fused step gated and normalized its output (`_fused_hooks`), in its epilogue's dtype.
             return self.out_proj(out.astype(mixed.dtype))
 
-        if not (chunked and normed and shards == 1):
+        if not (chunked and normed):
             # The scan read back in its projections' dtype, as Qwen3-Next's `.to(initial_dtype)` (the
             # query's); the norm scales, then the activation gates.
             out = self.norm(out.astype(mixed.dtype), gate)

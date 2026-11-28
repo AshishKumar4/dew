@@ -39,7 +39,6 @@ import jax
 import jax.numpy as jnp
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
-from jax.ad_checkpoint import checkpoint_name
 from jax.typing import DTypeLike
 
 from dew.nn.activations import silu
@@ -62,7 +61,7 @@ from dew.nn.linear import (
 from dew.nn.mixer_base import MixerBase, MixerContext
 from dew.nn.norms import RMSNorm
 from dew.nn.precision import accumulated, accurate_exp, at_least_fp32, float32_dot_general, softplus
-from dew.nn.residuals import Residual
+from dew.nn.residuals import Residual, recurrence_output
 from dew.nn.sharding import explicit_spec, rows_like
 from dew.nn.ssm import UNROLLED, affine_states
 
@@ -375,7 +374,7 @@ class Mamba(nn.Module):
                                 (-accurate_exp(jnp.asarray(self.A_log, wide)), jnp.asarray(self.D, wide)),
                                 heads=Heads(channels, channels, {0: 2, 1: 2, 5: 0, 6: 0}))
             # The scan's output as `held_scan` names it, a mixer's 'context' and a recurrence's 'scan'.
-            out = checkpoint_name(checkpoint_name(out, Residual.SCAN), Residual.CONTEXT)
+            out = recurrence_output(out)
         else:
             out = held_scan(self, mixed, taps, bias, self._scan, (self.intermediate_size, self.state_size),
                             decode=decode, coordinates=tokens,

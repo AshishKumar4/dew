@@ -31,7 +31,7 @@ from dew.nn.kernels import chunked_launch, generation, recurrence
 from dew.nn.kernels.templates import base, bundles, cost, mosaic, report, resources, sass
 from dew.nn.kernels.templates.recurrence import chunk_forward, mainloop, mainloop_backward
 from dew.nn.precision import at_least_fp32
-from dew.nn.residuals import Residual
+from dew.nn.residuals import Residual, recurrence_output
 
 
 def _widths(ba: tokamax.BoundArguments, family: mosaic.Family, *, training: bool = True
@@ -253,12 +253,6 @@ _KEYED = ("starts", "firsts", "skip", "forked", "reads", "gate", "weight")
 """`mosaic_rule`'s operands past its first six, as `chunk_forward.kept_forward` takes them by name."""
 
 
-def _named_read(read):
-    """The output a training forward's epilogue read before its norm, the recurrence's own, named as a remat
-    keeps it (`Residual.SCAN`, `Residual.CONTEXT`), as the other routes name theirs (`recurrence_chunk`)."""
-    return checkpoint_name(checkpoint_name(read, Residual.SCAN), Residual.CONTEXT)
-
-
 def _normed_pullback(normed: recurrence.OutputNorm | None, read, gate, weight, out_grad, dtype) -> tuple:
     """The epilogue's gated norm's gradient at the output it `read` (`mosaic_rule`'s kept residual), `(the
     output's, the gate's, the weight's)`: the layers' norm's own (`recurrence.output_normed`), the output's
@@ -363,7 +357,7 @@ def mosaic_rule(query, key, value, g, beta, state=None, *, tiles, starts=None,
         out, read = out if normed is not None else (out, None)
         kept = None if recomputed else checkpoint_name(kept, Residual.DELTA_MEMORY)
         return (out, final), (operands, (checkpoint_name(inverse, Residual.DELTA_INVERSE), kept,
-                                         None if read is None else _named_read(read)))
+                                         None if read is None else recurrence_output(read)))
 
     def backward(saved, grads):
         operands, (inverse, kept, read) = saved

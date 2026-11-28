@@ -30,7 +30,6 @@ from typing import NamedTuple, Protocol
 import jax
 import jax.numpy as jnp
 import numpy as np
-from jax.ad_checkpoint import checkpoint_name
 from jax.sharding import PartitionSpec as P
 
 from dew import _cache
@@ -52,7 +51,7 @@ from dew.nn.precision import (
     l2norm,
     rounds_products,
 )
-from dew.nn.residuals import Residual, recomputed_memory
+from dew.nn.residuals import recomputed_memory, recurrence_output
 from dew.nn.sharding import (
     HEADS,
     grouped_heads,
@@ -92,7 +91,8 @@ def held_chunk(chunk_size: int, key_width: int) -> int:
 def chunk_gated_delta_rule(query, key, value, g, beta, state=None, chunk_size: int = CHUNK_SIZE, *,
                            starts=None, max_segments: int | None = None,
                            write_bound: float | None = None, decay_bound: float | None = None,
-                           unit_queries: bool = False, firsts=None, loads=None, stores=None, held: int = 0):
+                           unit_queries: bool = False, firsts=None, loads=None, stores=None, held: int = 0,
+                           output: recurrence.OutputNorm | None = None, z=None, weight=None, dtype=None):
     """`torch_chunk_gated_delta_rule` (modeling_qwen3_next.py:374-453) with one
     log decay per head, `g` `[B, S, H]`, or `chunk_kimi_delta_attention`
     (modeling_glm5_next.py:482-578) with one per key dimension, `[B, S, H,
@@ -119,12 +119,16 @@ def chunk_gated_delta_rule(query, key, value, g, beta, state=None, chunk_size: i
     `decay_bound` the least log decay a token the layer proves (`recurrence.Hooks.decay_bound`), which a
     decay a key dimension's template prefix reads, and `unit_queries` whether its queries are l2-normalized
     (`recurrence.Hooks.unit_queries`). `loads`, `stores` and `held` are a forked call's (`Chunk.loads`).
+    `output`, where given, is the mixer's gated norm after the rule (`recurrence.Hooks.output`), its gate `z`
+    `[B, S, Hv, Dv]` and `weight` `[Dv]`, the output then normed in `dtype` (`chunk`'s epilogue, the
+    template's output launch where it fuses it): a gated delta net's or Kimi delta attention's own.
     """
     hooks = recurrence.Hooks(decay='vector' if g.ndim == 4 else 'scalar', scale=key.shape[-1] ** -0.5,
-                             write_bound=write_bound, decay_bound=decay_bound, unit_queries=unit_queries)
+                             write_bound=write_bound, decay_bound=decay_bound, unit_queries=unit_queries,
+                             output=output)
     return chunk(hooks, Chunk(query, key, value, log_decay=g, beta=beta, state=state, starts=starts,
-                              firsts=firsts, loads=loads, stores=stores, held=held),
-                 chunk_size=chunk_size, max_segments=max_segments)
+                              firsts=firsts, loads=loads, stores=stores, held=held, z=z, weight=weight),
+                 chunk_size=chunk_size, max_segments=max_segments, dtype=dtype)
 
 
 @jax.tree_util.register_dataclass
@@ -478,9 +482,10 @@ def _normed_runs(hooks: recurrence.Hooks, run, product_kernel, given: dict, work
     launches take the norm in their output launch where the call `fuses` it (no skip, no turn, its output
     in the operands' dtype, read back in it) and their plan for the product holds it (the forward's alone,
     or the training's forward and backward: the norm's residual kept and its gradient the layers' norm's,
-    `template.mosaic_rule`); elsewhere each kernel's output, named as the recurrence's (a remat keeps it and
-    forms the norm again), through the layers' norm (`recurrence.normed`). A plan that does not hold, or a
-    gate or weight varying over a manual axis the recurrence's operands do not, declines the fusion, the
+    `template.mosaic_rule`, the output before and after the norm named as the recurrence's,
+    `residuals.recurrence_output`); elsewhere each kernel's output, named as the recurrence's (a remat keeps
+    it and forms the norm again), through the layers' norm (`recurrence.normed`). A plan that does not hold,
+    or a gate or weight varying over a manual axis the recurrence's operands do not, declines the fusion, the
     selected kernel's own route kept."""
     def fits(product: str, gate, weight) -> bool:
         try:
@@ -496,12 +501,17 @@ def _normed_runs(hooks: recurrence.Hooks, run, product_kernel, given: dict, work
             # norm apart, whose pullback sums back to the recurrence's output as JAX types it.
             alike = varying(gate, weight) <= varying(*head[:5], head[6])
             if fuses and alike and kernel == 'mosaic_gpu' and fits(product, gate, weight):
-                return run(kernel, *head, *walked, normed=hooks.output, gate=gate, weight=weight)
+                out, final = run(kernel, *head, *walked, normed=hooks.output, gate=gate, weight=weight)
+                # The normed output, which the out projection's pullback reads, named as the read before its
+                # norm the launch keeps (`template.mosaic_rule`): a rung keeping the recurrence's output keeps
+                # it rather than replaying every launch of the forward for it (test_lowering's remat rung,
+                # 19 launches where 15 ran unrematted).
+                return recurrence_output(out), final
             out, final = run(kernel, *head, *walked)
             assert hooks.output is not None, "a gate is the epilogue's"
-            # The output the norm reads, the recurrence's own, named as a remat keeps it.
-            read = out.astype(hooks.output.read_in or work)
-            read = checkpoint_name(checkpoint_name(read, Residual.SCAN), Residual.CONTEXT)
+            # The output the norm reads, the recurrence's own, named as a remat keeps it: the norm after it
+            # is the layers' own, formed again from it.
+            read = recurrence_output(out.astype(hooks.output.read_in or work))
             return recurrence.normed(hooks, read, {'z': gate, 'weight': weight}, work, dtype=dtype,
                                      axes=HEADS), final
         return normed_run
