@@ -466,6 +466,7 @@ def test_a_launchs_quantizing_epilogue_scales_a_mixed_nan_block_as_the_quantizer
     with (generation.assumed("sm90"), generation.chosen(grouped_matmul="mosaic"),
           generation.routes() as routes):
         fused = quantized.gemm_quantized(x, w, minifloat=formats.MxFp8, interpret_on_cpu=True)
+    assert isinstance(fused, formats.MxFp8)
     assert ("grouped_matmul", "mosaic") in {(route.choice, route.kernel) for route in routes}, routes
     want = formats.MxFp8.quantized(jnp.dot(x, w, preferred_element_type=jnp.float32))
     np.testing.assert_array_equal(np.asarray(fused.scales).view(np.uint8),
@@ -484,6 +485,7 @@ def test_a_launchs_word_block_maximum_lowers_for_an_h100():
     def fused(x, w):
         with generation.chosen(grouped_matmul="mosaic"):
             out = quantized.gemm_quantized(x, w, minifloat=formats.MxFp8)
+        assert isinstance(out, formats.MxFp8)
         return out.codes, out.scales
 
     specs = (jax.ShapeDtypeStruct((128, 128), jnp.bfloat16), jax.ShapeDtypeStruct((128, 128), jnp.bfloat16))
