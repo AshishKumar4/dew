@@ -267,3 +267,21 @@ def test_a_searchs_places_hold_each_rungs_copy_free_form_beside_it():
     copy_free = rung(tile=(16, 128), narrow=False)
     assert FitSearch.placed(rung(narrow=False), [copy_free]) == [copy_free]
 
+
+def test_a_custom_step_reads_no_narrow_copies():
+    """A narrow rung's step reads narrow copies only where the trainer composes it: a custom step traces no
+    loss to read its casts from, so its narrow rung and its copy-free form are one program, which a
+    frontier reads once (`copies_narrow`; train 1437), as it does a scaled loss's and DiLoCo's."""
+    from types import SimpleNamespace
+
+    from dew.nn.kernels.generation import chosen
+    from dew.training._candidates import copies_narrow
+
+    state = SimpleNamespace(variables={"params": {}})
+    built = SimpleNamespace(step=None, dynamic_scale=False, diloco=None)
+    with chosen(narrow_copies="on"):
+        assert copies_narrow(built, state)
+        custom = SimpleNamespace(**{**vars(built), "step": lambda objective, optimizer: None})
+        assert not copies_narrow(custom, state)
+        assert not copies_narrow(SimpleNamespace(**{**vars(built), "dynamic_scale": True}), state)
+

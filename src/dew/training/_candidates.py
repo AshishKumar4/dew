@@ -248,6 +248,16 @@ def as_placed[LossT, EffectsT](stepping: Stepping[LossT, EffectsT], state: Train
     return placed_shapes(state, shardings)
 
 
+def copies_narrow(settings: StepSettings, state: TrainState) -> bool:
+    """Whether a narrow rung's step over `state` under `settings` reads narrow copies at all: none where its
+    loss is scaled, nor under DiLoCo, whose groups read their own parameters, which no copy shadows, nor in
+    a custom step, which traces no loss to read its casts from (train 1437), nor where the device or the
+    state reads none (`narrow_copies`). The same on every process (its settings, its backend and its
+    state's collections), so a search may read a rung and its copy-free form as one."""
+    return (settings.step is None and not settings.dynamic_scale and settings.diloco is None
+            and narrow_copies(state))
+
+
 def candidate_for[LossT, EffectsT](stepping: Stepping[LossT, EffectsT], state: TrainState, batch: Batch,
                                    schedule: Schedule, placement, replicated, split: int, narrow: bool, *,
                                    mesh: Mesh | AbstractMesh | None = None,
@@ -439,10 +449,9 @@ def prepared_for[LossT, EffectsT](stepping: Stepping[LossT, EffectsT], state: Tr
         stepping.staging.refuse_unpipelined(schedule, settings.objective)
     prepared = windowed(lambda state, rows, *, shape_only: stepping.initialize_accumulation(
         state, rows, shapes, window=window, split=split, shape_only=shape_only), state, batch)
-    # DiLoCo's groups read their own parameters, which no narrow copy shadows.
     # A step the trainer composes narrows, from the loss it traced; a custom step's traces none (`traced`
-    # None), and a scaled loss's copies none.
-    narrows = narrow and not settings.dynamic_scale and settings.diloco is None and narrow_copies(state)
+    # None).
+    narrows = narrow and copies_narrow(settings, state)
     reads = state_reads(state, traced) if traced is not None and narrows else None
     copies = reads.casts if reads is not None else {}
     prepared = dataclasses.replace(prepared, compute=jax.eval_shape(

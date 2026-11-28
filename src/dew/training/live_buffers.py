@@ -175,8 +175,11 @@ class Assignment:
         # Each logical buffer's other positions, as XLA's must-alias analysis states them: a loop state's
         # buffer's among them, at the while's output.
         self.aliases: dict[int, list[Any]] = {}
-        # Each instruction's readers (`used`), built where an interval is read.
-        self.readers: dict[int, list[Any]] | None = None
+        # Each instruction's users with the operand slot each reads it in (`used`), built where an interval
+        # is read.
+        self.uses: dict[int, list[tuple[Any, int]]] | None = None
+        # Each computation's parameter ids by number (`parameter`), built where a fusion is walked into.
+        self.bound: dict[tuple[int, int], int] | None = None
         for alias in self.proto.buffer_aliases:
             self.aliases.setdefault(alias.source_buffer_id, []).append(alias.location)
         self.types = hlo.pool().FindEnumTypeByName("xla.PrimitiveType")
@@ -254,43 +257,112 @@ class Assignment:
     def used(self, buffer_id: int, ran: Mapping[tuple[str, str], int]) -> tuple[tuple[int, str], ...]:
         """Where in a trace (`ran`: each instruction's position in it) the instructions reading logical
         buffer `buffer_id`'s value run, with their `op_name`s: its defining instruction's readers, a tuple
-        element's through the getter of its index; a reader the trace states no event of is none of them. A
-        fusion of no op_name of its own reads as each op its computation names (`_read_as`), and as "" where
-        it names none, a read no phase is told of."""
-        readers = self.readers
-        if readers is None:
-            # Each instruction's readers, built where an interval is read alone.
-            readers = self.readers = {}
+        element's through the getter of its index, a view's through its readers; a reader the trace states
+        no event of is none of them (`UNPLACED`). A fusion of no op_name of its own reads it, at its own
+        position, as the fused ops reading the operand slots it takes the value in: through views, tuple
+        slots and nested fusions, a nested fusion's result its caller's where its root passes the value
+        on; "" where a path reaches no name, a read no phase is told of (trains 1406 and 1427)."""
+        uses = self.uses
+        if uses is None:
+            # Each instruction's users across the module, with the operand slot each reads it in, built
+            # where an interval is read and kept.
+            uses = self.uses = {}
             for instruction in self.instructions.values():
-                for operand in instruction.operand_ids:
-                    readers.setdefault(operand, []).append(instruction)
+                for slot, operand in enumerate(instruction.operand_ids):
+                    uses.setdefault(operand, []).append((instruction, slot))
         buffer = self.buffers[buffer_id]
-        index = tuple(buffer.defined_at.shape_index)
-        found: list[tuple[int, str]] = []
-        seen: set[int] = set()
-        reading = [(reader, index) for reader in readers.get(buffer.defined_at.instruction_id, ())]
+        made = buffer.defined_at.instruction_id
+        found: set[tuple[int, str]] = set()
+        # Each state the value is at: an instruction whose result holds it, the index within that result,
+        # and the fusions (outermost first) whose bodies it is in.
+        reading = [(made, tuple(buffer.defined_at.shape_index), ())]
+        seen: set[tuple[int, tuple[int, ...], tuple[int, ...]]] = set()
         while reading:
-            reader, within = reading.pop()
-            if reader.id in seen:
+            state = reading.pop()
+            if state in seen:
                 continue
-            seen.add(reader.id)
-            if within and reader.opcode == "get-tuple-element":
-                if reader.tuple_index == within[0]:
-                    reading += [(next_, within[1:]) for next_ in readers.get(reader.id, ())]
-                continue
-            key = (self.computation_of[reader.id], reader.name)
-            if key in ran:
-                found += [(ran[key], op_name)
-                          for op_name in _read_as(reader, self.computations)]
-            elif followers := readers.get(reader.id):
-                # A reader the trace places no buffer for (a view of its operand, a bitcast): its readers read
-                # the value through it.
-                reading += [(next_, ()) for next_ in followers]
-            else:
-                # Read where the trace states no position (`UNPLACED`).
-                found.append((UNPLACED, reader.metadata.op_name))
+            seen.add(state)
+            value, within, inside = state
+            users = uses.get(value, ())
+            if not users and value != made:
+                found.update(self.left(value, within, inside, ran, reading))
+            for user, slot in users:
+                found.update(self.read_by(user, slot, within, inside, ran, reading))
         return tuple(sorted(found))
 
+    def read_by(self, user, slot: int, within: tuple[int, ...], inside: tuple[int, ...],
+                ran: Mapping[tuple[str, str], int], reading: list) -> list[tuple[int, str]]:
+        """What `user`, reading the value at its operand `slot` (`within` its index there), reads it as,
+        queuing on `reading` where it passes the value on (`used`)."""
+        if within and user.opcode == "get-tuple-element":
+            # A getter of the value's slot passes it on, of another reads none of it; a named one inside a
+            # fusion a read of its own phase besides, as a named view is (train 1437's review).
+            if user.tuple_index != within[0]:
+                return []
+            reading.append((user.id, within[1:], inside))
+            named = inside and user.metadata.op_name
+            return [(self.position(inside, ran), user.metadata.op_name)] if named else []
+        packed = user.opcode == "tuple"
+        if inside:
+            # A view, a tuple or a nested fusion inside a fusion passes the value on whatever its name, its
+            # readers reading it too: a named one is a read of its own phase besides (a bitcast XLA kept a
+            # forward's name on, which feeds the backward's op; train 1437's P0).
+            named = [(self.position(inside, ran), user.metadata.op_name)] if user.metadata.op_name else []
+            if packed:
+                # Packed at its slot: a getter of another reads none of it.
+                reading.append((user.id, (slot, *within), inside))
+            elif user.opcode in _VIEWS:
+                reading.append((user.id, (), inside))
+            elif user.opcode == "fusion":
+                # Descended whatever its name, which reads nothing of the ops its body names (a forward's
+                # name on a nested fusion returning a view to a backward's op; train 1444's P0).
+                reading.append((self.parameter(user, slot), within, (*inside, user.id)))
+            elif named:
+                return named
+            else:
+                reading.append((user.id, (), inside))
+            return named
+        key = (self.computation_of[user.id], user.name)
+        if key not in ran:
+            # A reader the trace places no buffer for (a view of its operand, a bitcast, a tuple packing it at
+            # its slot): its readers read the value through it.
+            reading.append((user.id, (slot, *within) if packed else (), inside))
+            return []
+        if user.metadata.op_name or user.opcode != "fusion":
+            return [(ran[key], user.metadata.op_name)]
+        reading.append((self.parameter(user, slot), within, (user.id,)))
+        return []
+
+    def left(self, value: int, within: tuple[int, ...], inside: tuple[int, ...],
+             ran: Mapping[tuple[str, str], int], reading: list) -> list[tuple[int, str]]:
+        """Where the value a user of no users holds goes (`used`): out of a nested fusion its root returns
+        it from, to its caller's users; out of a scheduled one's, or into an unnamed leaf, read by no phase
+        told of (""), but for a named view or getter, the read its name already tells (`read_by`; train 1437's
+        review); at the top, read where the trace places none (`UNPLACED`)."""
+        if not inside:
+            return [(UNPLACED, self.instructions[value].metadata.op_name)]
+        caller = self.instructions[inside[-1]]
+        if len(inside) > 1 and value == self.computations[caller.called_computation_ids[0]].root_id:
+            # Returned (its own parameter, or a view of it): read where the caller's result is.
+            reading.append((caller.id, within, inside[:-1]))
+            return []
+        if self.instructions[value].opcode == "parameter" or self.instructions[value].metadata.op_name:
+            return []
+        return [(self.position(inside, ran), "")]
+
+    def position(self, inside: tuple[int, ...], ran: Mapping[tuple[str, str], int]) -> int:
+        """The trace position of the scheduled fusion `inside` begins in."""
+        outer = self.instructions[inside[0]]
+        return ran[(self.computation_of[outer.id], outer.name)]
+
+    def parameter(self, fusion, slot: int) -> int:
+        """The id of `fusion`'s fused computation's parameter its operand `slot` binds, each computation's
+        parameters indexed once and kept (`bound`)."""
+        if self.bound is None:
+            self.bound = {(computation.id, each.parameter_number): each.id
+                          for computation in self.computations.values() for each in computation.instructions
+                          if each.opcode == "parameter"}
+        return self.bound[(fusion.called_computation_ids[0], slot)]
 
     def described(self, buffer_id: int, allocation: int) -> dict | None:
         """`LiveBuffer`'s fields of logical buffer `buffer_id` of `allocation`; None for a constant's or a
@@ -360,23 +432,8 @@ def _charged(events, assigned: dict[int, int], kinds: dict[str, int]) -> set[int
     return charged
 
 
-def _read_as(reader, computations) -> tuple[str, ...]:
-    """The op names `reader` reads a value as: its own, or a fusion's of none (XLA:GPU's own fusions carry
-    none, `_maker`) each op name its fused computation's instructions carry, through any fusion of none
-    within it, which ops of a forward and of a backward both may be (train 1406); ("",) where none carries
-    one."""
-    if reader.metadata.op_name or reader.opcode != "fusion":
-        return (reader.metadata.op_name,)
-    named: set[str] = set()
-    inside = [computations[reader.called_computation_ids[0]]]
-    while inside:
-        for each in inside.pop().instructions:
-            if each.metadata.op_name:
-                named.add(each.metadata.op_name)
-            elif each.opcode == "fusion":
-                # A fusion within it of no name of its own (XLA's nested GEMM fusions): the ops it fuses.
-                inside.append(computations[each.called_computation_ids[0]])
-    return tuple(sorted(named)) or ("",)
+_VIEWS = frozenset({"bitcast", "bitcast-convert", "reshape", "copy", "transpose"})
+"""The ops that pass a value on as it is, laid out or shaped anew: a read through one is its readers' read."""
 
 
 def _maker(instruction, index: tuple[int, ...], instructions,
