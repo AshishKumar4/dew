@@ -74,7 +74,8 @@ class _Place(int):
 def seed(reference, *, signed_inputs: bool = False) -> BitForm:
     """The straight-line form of `reference` (a jax.numpy function of a uint32 array, its result uint32),
     each integer primitive of its jaxpr one step of the vocabulary: shifts, logic, adds, minima, compares and
-    selects; dtype conversions between 32-bit integers and booleans (0 or 1) none."""
+    selects; a conversion between 32-bit integers, or of a boolean (0 or 1) to one, none, of a word to a
+    boolean a compare with 0, and of any other width refused."""
     closed = jax.make_jaxpr(reference)(jax.ShapeDtypeStruct((8,), jnp.uint32))
     form = _Seeded()
     env: dict = {}
@@ -102,9 +103,24 @@ def seed(reference, *, signed_inputs: bool = False) -> BitForm:
     return BitForm(tuple(form.steps), (form.held(result),), tuple(1 << bit for bit in range(bits.WORD)))
 
 
+_WORDS = (np.dtype(np.uint32), np.dtype(np.int32))
+"""The words a step reads and writes, a conversion between which is none."""
+
+
 def _seeded(form: _Seeded, primitive, args, signed: bool, equation):
-    if primitive in (jax.lax.convert_element_type_p, jax.lax.broadcast_in_dim_p, jax.lax.copy_p):
+    if primitive in (jax.lax.broadcast_in_dim_p, jax.lax.copy_p):
         return args[0]
+    if primitive is jax.lax.convert_element_type_p:
+        # Between the words, or a boolean (held as 0 or 1) to one, the value as it is; a word to a boolean,
+        # whether it is not 0; any other width no step of the vocabulary holds.
+        source, target = np.dtype(equation.invars[0].aval.dtype), np.dtype(equation.outvars[0].aval.dtype)
+        if target in _WORDS and (source in _WORDS or source == np.bool_):
+            return args[0]
+        if source in _WORDS and target == np.bool_:
+            if not isinstance(args[0], _Place):
+                return int(args[0] != 0)
+            return _seeded(form, jax.lax.ne_p, [args[0], 0], signed, equation)
+        raise ValueError(f"{primitive.name}: {source} to {target}, no step of the vocabulary")
     constant = [not isinstance(arg, _Place) for arg in args]
     if all(constant):
         raise ValueError(f"{primitive.name}: a step of constants alone (fold it in the reference)")
