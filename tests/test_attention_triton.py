@@ -1428,8 +1428,11 @@ def test_common_triton_forward_lowering_isolates_scaled_op():
 
 
 @pytest.mark.compiles_at_run(reason="runs the Triton forward on its GPU, judged bit for bit, no check-1 site")
-def test_triton_forward_settles_interior_and_overflow_midpoints():
-    """`attention_triton.forward` retains full single-rounding (`narrowing_settled`) on 16-bit outputs:
+@pytest.mark.parametrize("interpret", [True, pytest.param(False, marks=pytest.mark.gpu)],
+                         ids=["interpreted", "native"])
+def test_triton_forward_settles_interior_and_overflow_midpoints(interpret):
+    """`attention_triton.forward` retains full single-rounding (`narrowing_settled`) on 16-bit outputs,
+    interpreted on the CPU lane and natively on a GPU (its BF16/FP16 conversions the device's own):
     settling both finite interior BF16 midpoints (`denom = 1 + 2^-23`, `acc = 1 + 3/256 + 2^-23` ->
     `1 + 1/128`, not double-rounded `1 + 2/128`) and BF16/FP16 overflow midpoints whose fp32 quotient lands
     on the midpoint while the exact quotient lies below it (`max`, not `inf`)."""
@@ -1463,7 +1466,7 @@ def test_triton_forward_settles_interior_and_overflow_midpoints():
                                    jnp.full((1, 1, 1, 16), acc_scalar, jnp.float32))
         hooks = template.Hooks(initial=initial)
         with tuning.pinned({attention_triton.TritonForward: PINNED[0]}):
-            got = attention_triton.forward(zeros, zeros, zeros, spans, hooks, interpret=not ON_GPU)
+            got = attention_triton.forward(zeros, zeros, zeros, spans, hooks, interpret=interpret)
         ref = template.reference(zeros, zeros, zeros, spans, hooks)
         np.testing.assert_array_equal(np.asarray(got), np.asarray(ref))
         assert float(np.asarray(got, np.float32)[0, 0, 0, 0]) == float(expected), (dtype, got)
