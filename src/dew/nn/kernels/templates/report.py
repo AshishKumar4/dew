@@ -2046,10 +2046,11 @@ def settled(lowered: jax.stages.Lowered, options: jax.stages.CompilerOptions | N
     so a later process derives the program kept here. A program loaded from the persistent compilation
     cache carries its kernels' binaries as one compiled here does. A program whose block XLA refuses steps
     its asking Triton launches down (`_unblocked`). A relowering that launches every refused config again
-    is the program just compiled: it is kept as compiled, its spills misses not stepped, each refusal that
-    did not take named (`_untaken`). `kept_from` given, the lowering the kept executable was compiled from
-    is appended to it: `lowered`, or the relowering it kept (a caller keys the executable by what that one
-    traced, row 12165)."""
+    is the program just compiled: it is kept as compiled, its spills misses not stepped and its refusals
+    its launches' stored verdicts for a later start (`_held`), each refusal that did not take named
+    (`_untaken`). `kept_from` given, the lowering the kept executable was compiled from is appended to it:
+    `lowered`, or the relowering it kept (a caller keys the executable by what that one traced, row
+    12165)."""
     if first.error is not None:
         asked = shared_asked(first.error)
         if asked is None:
@@ -2083,6 +2084,10 @@ def settled(lowered: jax.stages.Lowered, options: jax.stages.CompilerOptions | N
             raise Exhausted(f"kernels {kernels} are refused (a spill, or warpgroup MMAs serialized) and "
                             f"their launches have no config left: {failed}") from failed
         if replacement is None:
+            # Kept as compiled, its refusals no step of this run's (a process seeded with them would
+            # derive another program than this one runs) but the launches' stored verdicts, the program's
+            # compile their authority, so a later start refuses them at trace (row 14178).
+            _held(found, compiled_from)
             break
         _commit(proposal)
         for refusal, kernel in [*refusals, *((refusal, (report.kernel, report.spilled_in))

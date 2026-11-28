@@ -1372,11 +1372,13 @@ def test_a_refused_forward_config_is_derived_no_more(residuals):
 
 
 @COMPILES_ON_CPU
-def test_a_relowering_that_launches_its_refused_config_again_keeps_the_program():
+def test_a_relowering_that_launches_its_refused_config_again_keeps_the_program(tmp_path):
     """A run's compile (`report.kept`) whose kernel spills, and whose relowering launches the refused config
     again (a derivation that does not read its refusal), keeps the program it compiled, as its kept lowering
     (`kept_from`): no second compile of the same program, the spill a miss not stepped down and no refusal
-    committed (PF03: a B200's 4B step compiled the same program twice, 150 s)."""
+    committed in the run (PF03: a B200's 4B step compiled the same program twice, 150 s), but each refused
+    launch's stored verdict, the program's compile its authority, so a later start refuses it at trace (row
+    14178: the kept spill was stored nowhere, and every start derived it again)."""
     import kernel_compile
     from jax.sharding import NamedSharding, PartitionSpec
 
@@ -1398,11 +1400,19 @@ def test_a_relowering_that_launches_its_refused_config_again_keeps_the_program()
     # Every compile's kernels read as spilling, as a B200's ptxas read the 4B forward's.
     spilled = [assembled.Binary(assembled.kernel_of(call.name)[0], call.launch, 255, 8, kind="mosaic_gpu",
                              caller=call.caller) for call in calls]
-    with generation.assumed("sm100"), report.refusals():
+    device = generation.compile_only_gpus("sm100")[0]
+    with (generation.assumed("sm100"), report.refusals(), report.certifying(device),
+          tuning.verdicts_kept_in(str(tmp_path))):
         report.kept(first, relower=lambda: again, read=lambda _: spilled, kept_from=(kept_from := []))
         misses = report.misses()
         assert misses and not any(miss.stepped for miss in misses), misses
         assert report.refused_launches() == () and len(kept_from) == 1 and kept_from[0] is first
+        target = report.verdict_target(device)
+        launches = {(launch.identity, launch.config, launch.reverse, launch.provenance)
+                    for call in calls if (launch := report.called(call)) is not None}
+        verdicts = [tuning.stored_verdict(target, report._verdict_key(*launch, target))
+                    for launch in launches]
+        assert verdicts and all(isinstance(verdict, dict) and verdict for verdict in verdicts), verdicts
 
 
 @COMPILES_ON_CPU
