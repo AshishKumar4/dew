@@ -311,10 +311,10 @@ def test_an_eager_product_of_no_groups_lands_on_its_operands_mesh(weak):
 
 @pytest.mark.mesh(devices=2)
 def test_a_jitted_product_of_no_groups_over_a_closed_over_bank_keeps_its_placement():
-    """A ragged product of no groups jitted over its rows, its bank and sizes a closure's concrete arrays
-    its two Explicit devices split by width, outside any mesh context: its zeros placed as the bank's
+    """A ragged product of no groups jitted over its rows in the mesh's context, its bank and sizes a
+    closure's concrete arrays its two Explicit devices split by width: its zeros placed as the bank's
     columns, no mesh entered while JAX traces (train 1490's review K-F1: `jax.set_mesh` inside the trace
-    was refused)."""
+    was refused, the mesh already in scope)."""
     from jax.sharding import AxisType, NamedSharding, PartitionSpec
 
     from dew.nn.kernels import xla_products
@@ -324,10 +324,29 @@ def test_a_jitted_product_of_no_groups_over_a_closed_over_bank_keeps_its_placeme
                                                                                                 "tensor")))
     sizes = jax.device_put(jnp.zeros((0,), jnp.int32), NamedSharding(mesh, PartitionSpec()))
     rows = jax.device_put(jnp.ones((8, 4), jnp.float32), NamedSharding(mesh, PartitionSpec()))
-    out = jax.jit(lambda rows: xla_products.placed_ragged_dot(rows, bank, sizes,
-                                                              preferred_element_type=jnp.float32))(rows)
+    with jax.set_mesh(mesh):
+        out = jax.jit(lambda rows: xla_products.placed_ragged_dot(rows, bank, sizes,
+                                                                  preferred_element_type=jnp.float32))(rows)
     placed = out.sharding
     assert isinstance(placed, NamedSharding) and placed.spec[-1] == "tensor"
+    np.testing.assert_array_equal(np.asarray(out), np.zeros((8, 128), np.float32))
+
+
+@pytest.mark.mesh(devices=2)
+def test_an_eager_product_of_no_groups_on_an_auto_mesh_lands_on_its_devices():
+    """A ragged product of no groups called eagerly outside any mesh context over operands placed on a mesh
+    of two Auto devices: its zeros made on both, as a product of them would be (`sharding.placed_zeros`'s
+    review: an Auto mesh's operands' zeros were made on the default device alone)."""
+    from jax.sharding import AxisType, NamedSharding, PartitionSpec
+
+    from dew.nn.kernels import xla_products
+
+    mesh = jax.make_mesh((2,), ("tensor",), (AxisType.Auto,), devices=jax.devices()[:2])
+    rows, bank, sizes = (jax.device_put(operand, NamedSharding(mesh, PartitionSpec()))
+                         for operand in (jnp.ones((8, 4), jnp.float32), jnp.ones((0, 4, 128), jnp.float32),
+                                         jnp.zeros((0,), jnp.int32)))
+    out = xla_products.placed_ragged_dot(rows, bank, sizes, preferred_element_type=jnp.float32)
+    assert out.devices() == set(mesh.devices.flat)
     np.testing.assert_array_equal(np.asarray(out), np.zeros((8, 128), np.float32))
 
 

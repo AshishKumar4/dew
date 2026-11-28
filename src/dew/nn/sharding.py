@@ -764,21 +764,22 @@ def placed_zeros(shape: tuple, dtype, sharding: jax.sharding.NamedSharding | Non
     `sharding`'s Explicit axes (a type's, or None) and made where they are read: Dew's one allocation of a
     type's zeros (`precision._no_groups`, `factored`'s rescue; train 1490's review K-F2). Traced (JAX tracing,
     or a tracer among `anchors`), under the placement's own abstract mesh, so it holds outside any mesh
-    context. Run eagerly, on the devices of `anchors`' named mesh (the anchors of one product share it), that
-    concrete mesh entered for the allocation alone (an abstract mesh allocates on none; JAX refuses one
-    entered while tracing, where a jit's closure holds concrete anchors beside its tracers: K-F1); else on the
-    one device committed `anchors` lie on, committed there, as a product of them would be; else JAX's
-    default."""
+    context. Run eagerly, on the devices of `anchors`' named mesh, Explicit or Auto (the anchors of one
+    product share it), that concrete mesh entered for the allocation alone (an abstract mesh allocates on
+    none; JAX refuses one entered while tracing, where a jit's closure holds concrete anchors beside its
+    tracers: K-F1); else on the one device committed `anchors` lie on, committed there, as a product of them
+    would be; else JAX's default."""
     leaves = jax.tree.leaves(anchors)
     eager = jax_core.trace_state_clean() and not any(isinstance(leaf, jax_core.Tracer) for leaf in leaves)
-    explicit = sharding is not None and bool(sharding.mesh.explicit_axes)
     meshes = [held for leaf in leaves if (held := concrete_mesh(leaf)) is not None] if eager else []
     devices = {device for leaf in leaves if eager and isinstance(leaf, jax.Array) and leaf.committed
                for device in leaf.devices()}
-    if explicit and meshes:
-        placed = jax.set_mesh(meshes[0])
-    elif explicit:
-        placed = jax.sharding.use_abstract_mesh(sharding.mesh.abstract_mesh)
+    spec = None
+    if meshes:
+        # Its devices the mesh's, Explicit or Auto (its review); its placement `sharding`'s, any.
+        placed, spec = jax.set_mesh(meshes[0]), None if sharding is None else sharding.spec
+    elif sharding is not None and sharding.mesh.explicit_axes:
+        placed, spec = jax.sharding.use_abstract_mesh(sharding.mesh.abstract_mesh), sharding.spec
     elif len(devices) == 1:
         placed = jax.default_device(next(iter(devices)))
     else:
@@ -786,9 +787,11 @@ def placed_zeros(shape: tuple, dtype, sharding: jax.sharding.NamedSharding | Non
     narrowed = jax.dtypes.canonicalize_dtype(dtype) != jnp.dtype(dtype)
     with jax.enable_x64(new_val=True) if narrowed else contextlib.nullcontext(), placed:
         zero = ad_util.zeros_like_aval(ShapedArray((), jnp.dtype(dtype), weak_type=weak_type))
-        zeros = jax.lax.broadcast(zero, tuple(shape), out_sharding=sharding.spec if explicit else None)
-    # The default device's allocation, committed there without a copy.
-    return jax.device_put(zeros, devices.pop()) if not explicit and len(devices) == 1 else zeros
+        zeros = jax.lax.broadcast(zero, tuple(shape), out_sharding=spec)
+    if meshes or spec is not None or len(devices) != 1:
+        return zeros
+    # The one device's allocation, committed there without a copy.
+    return jax.device_put(zeros, devices.pop())
 
 
 def explicit_placement(aval: ShapedArray) -> jax.sharding.NamedSharding | None:
