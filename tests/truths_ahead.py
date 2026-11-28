@@ -40,6 +40,7 @@ import os
 import pickle
 import shutil
 import types
+import weakref
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from pathlib import Path
 from typing import Any
@@ -410,6 +411,26 @@ class CompiledTruths:
                     library_checked(programs[name], record["library_call"], f"{label}: {name}")
             self.read[label] = (programs, held)
         return self.read[label]
+
+
+_LIBRARY_CALLS: "weakref.WeakKeyDictionary[Callable, str]" = weakref.WeakKeyDictionary()
+"""Each library arm's call (`library_arm`), by its program."""
+
+
+def library_arm[Fn: Callable](fn: Fn, call: str) -> Fn:
+    """`fn`, a library arm's program (`generation_support.cublas_compiled`), marked as one whose executable
+    calls the library's `call`, which the gate checks it by where it runs (`library_checked`)."""
+    _LIBRARY_CALLS[fn] = call
+    return fn
+
+
+def library_call(fn) -> str | None:
+    """The library call `fn`'s executable makes, where it is a library arm (`library_arm`); None otherwise."""
+    try:
+        return _LIBRARY_CALLS.get(fn)
+    except TypeError:
+        # A callable no weak reference holds is no library arm.
+        return None
 
 
 def library_checked(executable: jax.stages.Compiled, call: str, label: str) -> None:

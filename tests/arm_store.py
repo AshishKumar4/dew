@@ -33,7 +33,7 @@ from float64_terms import POWER, evaluated, evaluated_on, static, traced
 from reference_error import _of_float64, _site, _SiteTerms, _sizing_seeds, _truth_program
 from store_wire import COMPILED
 from tier_wire import stop_past_cap
-from truths_ahead import AT_RUN, CompiledTruths, arm_role, library_checked, named
+from truths_ahead import AT_RUN, CompiledTruths, arm_role, library_call, library_checked, named
 
 from dew.parity_stages import staged_units
 
@@ -238,7 +238,7 @@ def _arm_program(programs: dict, held: dict, role: str, fn, inputs, *, reference
         with generation.routes() as reported, tuning.seen() as launched:
             out = traced_fn.trace(*inputs).out_info
         held[name] = {"constants": [], "tree": jax.tree.structure(out), "routes": list(reported),
-                      "launches": launched.held(), "library_call": getattr(fn, "library_call", None)}
+                      "launches": launched.held(), "library_call": library_call(fn)}
         programs[name] = (Whole(traced_fn, held[name]), [*map(jax.typeof, leaves)])
         return out
     with generation.routes() as reported, tuning.seen() as launched:
@@ -352,10 +352,10 @@ def _stored_arm(store: CompiledTruths, label: str, given_fn, arm, role: str, *, 
 
 def _library_checked(arm, given_fn, label: str):
     """`arm`, a site's arm its run compiles on its GPU (unprepared, or at run), its executable held to its
-    library's call where `given_fn` is a library arm (`generation_support.cublas_compiled`'s `library_call`)
+    library's call where `given_fn` is a library arm (`truths_ahead.library_arm`)
     and it runs on a GPU (`truths_ahead.library_checked`), checked once a draw's shapes on its own compile,
     which no prepare made; `arm` as it is otherwise (row 14096)."""
-    call = getattr(given_fn, "library_call", None)
+    call = library_call(given_fn)
     if call is None or jax.default_backend() != "gpu":
         return arm
     return _LibraryChecked(arm, given_fn, call, label)

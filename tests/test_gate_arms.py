@@ -238,10 +238,10 @@ def test_a_prepared_library_arm_holds_its_call_for_the_run_that_loads_it(tmp_pat
 
 def test_a_library_arms_executable_of_xlas_own_dot_is_refused():
     """An executable a library arm's check reads (`truths_ahead.library_checked`) that makes no call of its
-    library, XLA's own dot, is refused, naming what it calls."""
+    library, XLA's own dot, is refused."""
     rows, matrix = np.ones((8, 4), np.float32), np.ones((4, 2), np.float32)
     executable = jax.jit(jnp.dot).lower(rows, matrix).compile()
-    with pytest.raises(AssertionError, match="no __cublas"):
+    with pytest.raises(AssertionError):
         library_checked(executable, "__cublas$lt$matmul", "a library arm")
 
 

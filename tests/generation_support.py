@@ -183,10 +183,9 @@ def cublas_compiled(fn, inputs, call: str):
     one, its program compiled here at `inputs`. On a CPU its dots are XLA's own."""
     from reference_error import without_ynn
     from store_wire import COMPILED
-    from truths_ahead import library_checked
+    from truths_ahead import library_arm, library_checked
 
-    compiled = without_ynn(fn, compiler_options=CUBLAS)
-    compiled.library_call = call
+    compiled = library_arm(without_ynn(fn, compiler_options=CUBLAS), call)
     if jax.default_backend() == "gpu" and COMPILED.get() is None:
         library_checked(compiled.lower(*inputs).compile(), call, "the library arm")
     return compiled
