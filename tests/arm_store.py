@@ -22,6 +22,7 @@ from arm_forms import (
     _own_function,
     _refuse_numpy_arms,
     _RunToRun,
+    _signature,
     _Windowed,
     _written_references,
     _written_role,
@@ -223,6 +224,8 @@ def _arm_program(programs: dict, held: dict, role: str, fn, inputs, *, reference
         return _arm_program(programs, held, role, fn.fn, jax.tree.map(lambda leaf: leaf[0], inputs),
                             reference=reference, written=written)
     own = own_options(fn) if written else None
+    # Its library's call, its twin's too (`truths_ahead.library_arm`), read before a twin's own function.
+    call = library_call(fn)
     fn = _own_function(fn) if written else fn
     name = named(role, inputs)
     traced_fn = unrewritten(fn) if reference and not _declared(fn) else fn
@@ -238,7 +241,7 @@ def _arm_program(programs: dict, held: dict, role: str, fn, inputs, *, reference
         with generation.routes() as reported, tuning.seen() as launched:
             out = traced_fn.trace(*inputs).out_info
         held[name] = {"constants": [], "tree": jax.tree.structure(out), "routes": list(reported),
-                      "launches": launched.held(), "library_call": library_call(fn)}
+                      "launches": launched.held(), "library_call": call}
         programs[name] = (Whole(traced_fn, held[name]), [*map(jax.typeof, leaves)])
         return out
     with generation.routes() as reported, tuning.seen() as launched:
@@ -264,7 +267,7 @@ def _arm_program(programs: dict, held: dict, role: str, fn, inputs, *, reference
     # The routes its trace reported and the launches it took, which its run, calling the program and tracing
     # none, reports at each call (`truths_ahead.CompiledTruths.ran`), until a lowering of it takes its own
     # (`again`).
-    held_now = {"routes": list(reported), "launches": launched.held()}
+    held_now = {"routes": list(reported), "launches": launched.held(), "library_call": call}
     _hold(programs, held, name, closed, jax.tree.structure(shapes), inputs, again)
     with_own_options(programs[name][0], own)
     held[name].update(held_now)
@@ -336,7 +339,7 @@ def _stored_arm(store: CompiledTruths, label: str, given_fn, arm, role: str, *, 
     named_role = arm_role(role, given_fn, label)
     if named_role is None:
         store.unprepared(f"{label}: its {role} arm has no statement of what it computes")
-        return arm
+        return _library_checked(arm, given_fn, f"{label}: its {role} arm")
     at_run = store.at_run(_unlowered_arm(armed(label, written), named_role)) or store.at_run(
         armed(label, written))
     if at_run is not None:
@@ -351,29 +354,32 @@ def _stored_arm(store: CompiledTruths, label: str, given_fn, arm, role: str, *, 
 
 
 def _library_checked(arm, given_fn, label: str):
-    """`arm`, a site's arm its run compiles on its GPU (unprepared, or at run), its executable held to its
-    library's call where `given_fn` is a library arm (`truths_ahead.library_arm`)
-    and it runs on a GPU (`truths_ahead.library_checked`), checked once a draw's shapes on its own compile,
-    which no prepare made; `arm` as it is otherwise (row 14096)."""
+    """`arm`, a site's arm its run compiles on its GPU (unprepared, unnamed, or at run), held to its library's
+    call where `given_fn` is a library arm (`truths_ahead.library_arm`) and it runs on a GPU
+    (`truths_ahead.library_checked`): each call's program compiled as the arm runs it (its `lower`, under its
+    switches: `Unrewritten`'s, a twin's as written), checked, and run, one compile a call's signature, no
+    prepare having made one (row 14096); `arm` as it is otherwise."""
     call = library_call(given_fn)
     if call is None or jax.default_backend() != "gpu":
         return arm
-    return _LibraryChecked(arm, given_fn, call, label)
+    return _LibraryChecked(arm, call, label)
 
 
 class _LibraryChecked:
-    """A library arm (`arm`, as the gate runs it) whose each call's program (`given_fn`'s, at the call's
-    shapes) is checked to call `call` before it runs (`_library_checked`), its other attributes the arm's."""
+    """A library arm (`arm`, as the gate runs it) whose each call's executable, the arm's own program at the
+    call's signature (`arm_forms._signature`), is checked to call `call` and then run (`_library_checked`),
+    its other attributes the arm's."""
 
-    def __init__(self, arm, given_fn, call: str, label: str):
-        self.arm, self.given_fn, self.call, self.label, self.checked = arm, given_fn, call, label, set()
+    def __init__(self, arm, call: str, label: str):
+        self.arm, self.call, self.label, self.executables = arm, call, label, {}
 
     def __call__(self, *inputs):
-        shapes = tuple((np.shape(leaf), str(np.result_type(leaf))) for leaf in jax.tree.leaves(inputs))
-        if shapes not in self.checked:
-            library_checked(self.given_fn.lower(*inputs).compile(), self.call, self.label)
-            self.checked.add(shapes)
-        return self.arm(*inputs)
+        key = _signature(inputs)
+        if key not in self.executables:
+            executable = self.arm.lower(*inputs).compile()
+            library_checked(executable, self.call, self.label)
+            self.executables[key] = executable
+        return self.executables[key](*inputs)
 
     def __getattr__(self, name):
         return getattr(self.arm, name)
