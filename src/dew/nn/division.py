@@ -173,9 +173,9 @@ mlir.register_lowering(correctly_rounded_divide_p,
 
 
 def _float64_quotient(numerator: jax.Array, denominator: jax.Array) -> jax.Array:
-    """`correctly_rounded_divide`'s quotient on a CPU, `software_divide`'s bit for bit in a third of its
-    operations (row 14078: a program of 64 divisions 34,178 StableHLO operations against 7,106, compiled in
-    3.1 s against 1.4 s on armada's CPUs), its NaNs' payloads included: each fp32 operand widened into float64
+    """`correctly_rounded_divide`'s quotient on a CPU, `software_divide`'s correctly rounded result and NaN
+    class in a fifth of its operations (row 14078: a program of 64 divisions 34,178 StableHLO operations
+    against 7,106; a NaN's payload is the CPU's float64 division's): each fp32 operand widened into float64
     exactly (`float_bits._widened_bits`, a subnormal from its fraction, which XLA:CPU's conversion flushes),
     divided once, and the quotient rounded once into fp32. Float64's 53 bits round a quotient of 24-bit
     operands as once (53 >= 2 x 24 + 2), its zeros, infinities and NaNs IEEE division's; the quotient of two
