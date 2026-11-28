@@ -1907,7 +1907,7 @@ def test_a_portable_per_key_transpose_sums_opposite_cotangents_before_they_land(
 
     @jax.jit
     def pull(q, k, factors, ct):
-        _, back = jax.vjp(lambda x: scan._portable_pairs(x, k, factors, None), q)
+        _, back = jax.vjp(lambda x: scan._portable_pairs(x, k, factors, None)[0], q)
         return back(ct)[0]
 
     np.testing.assert_array_equal(pull(row, keys, decay, cotangent), np.zeros_like(row))
