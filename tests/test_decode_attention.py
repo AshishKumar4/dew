@@ -676,18 +676,18 @@ DECODE_DERIVATIVE_SEEDS = 8
 
 
 def a_decode_steps_value_tangent_is_finite_past_its_raw_products():
-    """A decode step through the decode kernel (`chosen(decode="decode")`) over a query and two keys of 2^64
-    in their first entry, width 64: the kernel's logits, its query prescaled before its products
-    (`decode_attention`'s `prescaled`), are 2^125 and finite, so the step's tangent along its values alone
-    is each row's mean of their tangents, its derivative's reference forming the logits as the kernel does
-    (`attention.range_safe`), where raw products took them to +inf and the tangent to NaN (train 1473's
+    """A decode step through the decode kernel (`chosen(decode="decode")`) over a cache of one block
+    (`decode_attention.BLOCK` keys) of which its length reads two, a query and those two keys of 2^64 in
+    their first entry, width 64: the kernel's logits, its query prescaled before its products
+    (`decode_attention`'s `prescaled`), are 2^125 and finite, so the step's tangent along its values alone is
+    the mean of the two keys' value tangents, its derivative's reference forming the logits as the kernel
+    does (`attention.range_safe`), where raw products took them to +inf and the tangent to NaN (train 1473's
     review of 0d5ebab6a3)."""
-    width, keys = 64, 2
+    width, keys = 64, decode_attention.BLOCK
     query = jnp.zeros((1, 1, 1, width), jnp.float32).at[..., 0].set(2.0 ** 64)
-    key = jnp.zeros((1, keys, 1, width), jnp.float32).at[..., 0].set(2.0 ** 64)
-    along = jnp.concatenate([jnp.ones((1, 1, 1, width), jnp.float32), jnp.full((1, 1, 1, width), 3.0)],
-                            axis=1)
-    lengths = jnp.asarray([keys], jnp.int32)
+    key = jnp.zeros((1, keys, 1, width), jnp.float32).at[:, :2, :, 0].set(2.0 ** 64)
+    along = jnp.zeros((1, keys, 1, width), jnp.float32).at[:, 0].set(1.0).at[:, 1].set(3.0)
+    lengths = jnp.asarray([2], jnp.int32)
 
     def step(value):
         with chosen(decode="decode"):
