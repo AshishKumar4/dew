@@ -322,7 +322,7 @@ def test_a_dense_gemm_mainloop_keeps_each_steps_products_running_past_it():
     serializes none (its note C7514, a wait for each HGMMA). A guard on every step of a rotation, a cond
     between a warpgroup's products, had it serialize the walk (K40's SASS: 16 waits for 16 HGMMAs), a loop
     the gate's registers and spills called clean."""
-    from kernel_compile import _compiled, ptxas_notes, ptxas_read
+    from kernel_compile import PTX, _compiled, _read_printed, ptxas_notes, ptxas_read
 
     from dew.nn.kernels.templates.gemm import mosaic_gpu
 
@@ -341,8 +341,11 @@ def test_a_dense_gemm_mainloop_keeps_each_steps_products_running_past_it():
     with tempfile.TemporaryDirectory(prefix="dew-dense-gemm-") as directory:
         _compiled(support.KernelCase("dense gmm", call), "sm90", record, directory)
         assert "error" not in record, record["error"]
-        (ptx,) = Path(directory).glob("*.ptx")
-        notes = ptxas_notes(ptx.read_text(), "sm90")
+        # Its certification's PTX as it lowered, or its program's as it compiled.
+        _read_printed(Path(directory, "lowering").glob("*.ptx"), record["certified"])
+        _read_printed(Path(directory, "compiling").glob("*.ptx"), record["modules"])
+        (module,) = record["modules"].values()
+        notes = ptxas_notes(PTX[module], "sm90")
     read = ptxas_read(notes)
     # A report that states the kernel's registers was read; none of its serialization codes is there.
     assert read.registers > 0 and read.losses == (), notes
@@ -1358,8 +1361,8 @@ def test_an_amperes_gpt_oss_projection_runs_the_template_named_for_it():
 def test_a_route_whose_launch_runs_no_trip_does_not_take_it():
     """A route's launches are those its run reaches: the template's grouped product named inside a loop of no
     trips lowers all the same, and its route evidence (`kernel_compile.Expected`) states no launch of it,
-    so a case expecting one fails (`route_failures`)."""
-    from kernel_compile import Expected, compile_mosaic_kernels, route_failures
+    so a case expecting one fails (`route_failures`), under every build its GPUs run."""
+    from kernel_compile import Expected, compile_mosaic_kernels, judged_builds, route_failures
 
     from dew.nn.kernels import gemm
 
@@ -1375,8 +1378,10 @@ def test_a_route_whose_launch_runs_no_trip_does_not_take_it():
     expected = Expected(axes=(("data", 1),), specs=(None, None, None), launches=frozenset({"dew_gmm"}))
     cases = [support.KernelCase("a projection of no trips", lambda: (step, operands), expected=expected)]
     found = compile_mosaic_kernels(cases, "sm80")
-    assert [failure.startswith("a projection of no trips: no launch of dew_gmm")
-            for failure in route_failures(cases, found)] == [True]
+    failed = route_failures(cases, found)
+    assert len(failed) == len(judged_builds("sm80")), failed
+    assert all(failure.startswith("a projection of no trips") and "no launch of dew_gmm" in failure
+               for failure in failed), failed
 
 
 def _blockwise_projected():
@@ -1427,12 +1432,12 @@ def _nvfp4_projected(rows: int, named: str | None):
 @pytest.mark.parametrize(("rows", "named"), [(64, "packed"), (16, None)], ids=["named", "decode-cell"])
 def test_an_amperes_nvfp4_product_compiles_and_runs_its_packed_kernel(rows, named):
     """An NVFP4 projection on a compile-only A100, its packed kernel named, or at a decode step's rows with no
-    kernel named (`gemm.NVFP4_CELLS`' A100 decode cell, receipt W13-a100-4-M-NS-8b-a100: 2.6-3.6x the matrix
-    decoded once a call): its program launches the template's packed product (`kernel_compile.Expected`, its
-    route evidence), which ptxas compiles, its E2M1 codes decoded by their form's traced reading
-    (`BitForm.traced`, row 3733), its E4M3 block scales by integer arithmetic
-    (`bits.scales_decoded`) where their FP8 conversion took sm89's `cvt .e4m3x2` and an A100's ptxas
-    refused the kernel (W8-a100, M-NS-8; row 3621)."""
+    kernel named (`grouped_cells.NVFP4_CELLS`' A100 decode cell, receipt W13-a100-4-M-NS-8b-a100: 2.6-3.6x the
+    matrix decoded once a call): its program launches the template's packed product
+    (`kernel_compile.Expected`, its route evidence), which ptxas compiles, its E2M1 codes decoded by their
+    form's traced reading (`BitForm.traced`, row 3733), its E4M3 block scales by integer arithmetic
+    (`bits.scales_decoded`) where their FP8 conversion took sm89's `cvt .e4m3x2` and an A100's ptxas refused
+    the kernel (W8-a100, M-NS-8; row 3621)."""
     from kernel_compile import Expected, compile_mosaic_kernels, route_failures
 
     expected = Expected(axes=(("data", 1),), specs=(None,), launches=frozenset({"dew_gmm"}))
@@ -1500,9 +1505,9 @@ def test_a_bands_columns_are_its_clusters_and_its_rows_the_walked_ones(generatio
 
 def test_a_hoppers_nvfp4_decode_runs_its_packed_kernel():
     """An NVFP4 projection at a decode step's 16 rows on a compile-only H100, no kernel named
-    (`gemm.NVFP4_CELLS`' H100 decode cell, receipt W7-gh200-8-M-NS-8-h100: 2.4-4.5x the matrix decoded once a
-    call): its program launches the template's packed product (`kernel_compile.Expected`, its route
-    evidence)."""
+    (`grouped_cells.NVFP4_CELLS`' H100 decode cell, receipt W7-gh200-8-M-NS-8-h100: 2.4-4.5x the matrix
+    decoded once a call): its program launches the template's packed product (`kernel_compile.Expected`, its
+    route evidence)."""
     _assert_launches("sm90", "nvfp4 16 rows", functools.partial(_nvfp4_projected, 16, None), 1, "dew_gmm")
 
 
@@ -1836,8 +1841,8 @@ def test_a_kernel_no_ptx_covers_takes_its_binarys_figures_only_under_every_build
 
 def test_the_resource_gate_refuses_two_kernels_of_one_name_and_launch():
     """Evidence of one kernel's name and launch from two kernels is one kernel's at most: two modules
-    (`report.kernel_modules`), two binaries (`reports`) or two PTX modules (`write_modules`) of one raise."""
-    from kernel_compile import PTX_MODULE, reports, write_modules
+    (`report.kernel_modules`) or two binaries (`reports`) of one raise."""
+    from kernel_compile import reports
 
     from dew.nn.kernels.lowered import KernelCall
 
@@ -1849,29 +1854,6 @@ def test_the_resource_gate_refuses_two_kernels_of_one_name_and_launch():
     assert len(reports({}, binaries[:1])) == 1
     with pytest.raises(ValueError):
         reports({}, binaries)
-    module = f"//\n{PTX_MODULE}\n.visible .entry k__l0123456789_mosaic_gpu_kernel(\n)\n{{\n}}\n"
-    with tempfile.TemporaryDirectory() as directory:
-        write_modules(module, "", directory, {"k__l0123456789"})
-        assert [path.name for path in Path(directory).iterdir()] == ["k__l0123456789.ptx"]
-    with tempfile.TemporaryDirectory() as directory, pytest.raises(ValueError):
-        write_modules(module * 2, "", directory, {"k__l0123456789"})
-
-
-def test_the_resource_gate_reads_the_ptx_its_program_runs():
-    """A kernel certification assembled as its program lowered (`report.certified`) and its program's compile
-    assembled again (a gradient's forward, another kernel of its name and launch) has the compile's PTX as its
-    evidence; a module of no kernel of the program (a config certification refused) is none."""
-    from kernel_compile import PTX_MODULE, write_modules
-
-    def module(entry: str, body: str) -> str:
-        return f"//\n{PTX_MODULE}\n.visible .entry {entry}_mosaic_gpu_kernel(\n)\n{{\n{body}\n}}\n"
-
-    lowering = module("k__l0123456789", "certified") + module("r__l0123456789", "refused")
-    with tempfile.TemporaryDirectory() as directory:
-        write_modules(lowering, module("k__l0123456789", "ran"), directory, {"k__l0123456789"})
-        written = {path.name: path.read_text() for path in Path(directory).iterdir()}
-    assert list(written) == ["k__l0123456789.ptx"]
-    assert "ran" in written["k__l0123456789.ptx"] and "certified" not in written["k__l0123456789.ptx"]
 
 
 @COMPILES_FOR_TPU

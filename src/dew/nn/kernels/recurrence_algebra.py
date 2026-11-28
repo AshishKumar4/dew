@@ -29,7 +29,7 @@ import numpy as np
 
 from dew.nn import derivatives
 from dew.nn.float_bits import TWO_FACTOR_REACH, exact_power2, raised_exactly
-from dew.nn.kernels.generation import linear_map, unbroadcast
+from dew.nn.kernels.generation import linear_map
 from dew.nn.kernels.options import program
 from dew.nn.kernels.templates.product import Blocks, Exact, Support, Transposed
 from dew.nn.precision import (
@@ -46,6 +46,7 @@ from dew.nn.precision import (
     two_sum,
     uncontracted,
 )
+from dew.nn.sharding import unbroadcast
 
 Issue = Callable[[str, "Operand", "Operand"], jax.Array]
 """A mainloop's product: `issue(name, left, right)` is `left @ right` over the last two axes, in the

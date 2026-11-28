@@ -285,15 +285,18 @@ def _template_forward(absorbed, query_rot, latent, rot, indices, *, scale: float
     first, in order, and its keys spanning them; a query naming none reads its first slot, an output
     nothing reads. Sharded per device over batch, length and head axes (`_template_specs`), never gathering
     the global batch. Interpreted where the arrays lie off a GPU, whatever GPU the call is chosen for."""
-    from dew.nn.kernels.templates import attention as template, attention_decode
+    from dew.nn.kernels.templates import attention as template, attention_decode, attention_products
 
     def local(local_absorbed, local_query_rot, local_latent, local_rot, local_indices):
         batch, length, heads, rank = local_absorbed.shape
         keys = local_latent.shape[1]
-        query = jnp.concatenate(
-            [local_absorbed.astype(local_latent.dtype), local_query_rot.astype(local_latent.dtype)], axis=-1)
-        pool = jnp.concatenate([local_latent, local_rot.astype(local_latent.dtype)], axis=-1).reshape(
-            1, batch * keys, 1, -1)
+        # Its content and rope products summed (`attention_products.summed`, §A row 25), in the latents'
+        # dtype: the query and key of their one product side by side.
+        dtype = local_latent.dtype
+        query, laid = attention_products.summed(
+            (local_absorbed.astype(dtype), local_query_rot.astype(dtype)),
+            (local_latent[:, :, None], local_rot.astype(dtype)[:, :, None]))
+        pool = laid.reshape(1, batch * keys, 1, -1)
         named = local_indices >= 0
         taken = jnp.take_along_axis(local_indices, jnp.argsort(~named, axis=-1, stable=True), axis=-1)
         table = (jnp.maximum(taken, 0) + keys * jnp.arange(batch)[:, None, None]).astype(jnp.int32)

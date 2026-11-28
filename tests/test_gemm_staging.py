@@ -95,11 +95,7 @@ def test_sm120_output_staging_admits_three_stage_128x256_and_compiles():
         specs = (bf16((256, 128)), bf16((128, 256)))
         cases = []
         for tag, arm in (("sm120_staging_64x1", arm_64x1), ("sm120_staging_32x2", arm_32x2)):
-            def compiled(x, w, arm=arm):
-                with generation.chosen(grouped_matmul="mosaic"), tuning.pinned(
-                        {grouped_matmul.MosaicGmm: arm}):
-                    return gemm.gemm(x, w, None, out_dtype=jnp.bfloat16)
-            cases.append(KernelCase(tag, lambda c=compiled: (c, specs)))
+            cases.append(KernelCase(tag, lambda arm=arm: (functools.partial(_pinned_product, arm), specs)))
         with generation.assumed("sm120"):
             records = compile_mosaic_kernels(cases, "sm120")
         for rec in records:
@@ -198,3 +194,41 @@ def test_a_refusal_at_a_fed_rings_least_depth_leaves_its_deeper_restaging_derive
         report.refuse([(report._identity(gmm, ba, sm120), shallow, frozenset({gmm.KERNEL}))])
         assert report.refused(gmm, ba, shallow, sm120) and not gmm.legal(ba, shallow, sm120)
         assert gmm.derived(ba, sm120) == tile, tile
+
+
+def test_a_partials_merge_slices_whole_atoms_of_its_family():
+    """`across.merge_spans` cuts a partial's widest leaf into spans of whole slices of its family
+    (`mosaic.Issuer.sliced_columns`, row 14073): 160 columns at mma.sync's 32 in five spans of 32 (not two of
+    80, which its layout casts to no tile); 96 columns at 64, which no whole split holds, in one span; 120
+    at a fragment's 8 in three of 40."""
+    from dew.nn.kernels.templates import across
+
+    def spans(columns, held, unit):
+        return across.merge_spans(np.zeros((64, columns), np.float32), held, unit)
+
+    over = 2 * across.MERGED_REGISTERS
+    assert spans(160, over, 32) == (0, [(start, 32) for start in range(0, 160, 32)])
+    assert spans(96, over, 64) == (None, [(0, None)])
+    # At whole 8-column fragments 120 columns split in three, not two of 60.
+    assert spans(120, over, 8) == (0, [(0, 40), (40, 40), (80, 40)])
+
+
+def test_a_pinned_sm120_tile_whose_balanced_tail_merges_its_partials_lowers():
+    """The 128 x 160 x 64 two-stage mma.sync tile pinned at Qwen3.5-4B's down projection (8192 x 9216 ->
+    2560) lowers on a compile-only RTX PRO 6000: its balanced tail merges each consumer's 64 x 160 partial
+    in spans of whole 32-column atoms of mma.sync's one-row-warp layout, where spans of 80 cast to no
+    layout (row 14073, M-NG-34b's down forward: 'Cannot cast to layout ... (64, 80)')."""
+    from jax.sharding import Mesh
+
+    bf16 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
+    arm = tiling.Tiles(128, 160, 64, 2, 8, warpgroups=2, family="mma.sync.fed")
+    mesh = generation.gpu_mesh(Mesh(np.array(jax.devices()[:1]), ("data",)), "sm120")
+    with generation.assumed("sm120"), jax.sharding.use_abstract_mesh(mesh):
+        jax.jit(functools.partial(_pinned_product, arm)).trace(bf16((8192, 9216)), bf16((9216, 2560))).lower(
+            lowering_platforms=("cuda",))
+
+
+def _pinned_product(arm: tiling.Tiles, x, w):
+    """`x @ w` in bf16 through the template's dense launch pinned at `arm`."""
+    with generation.chosen(grouped_matmul="mosaic"), tuning.pinned({grouped_matmul.MosaicGmm: arm}):
+        return gemm.gemm(x, w, None, out_dtype=jnp.bfloat16)

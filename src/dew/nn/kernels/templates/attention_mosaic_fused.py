@@ -278,7 +278,7 @@ def _fused_step(walk: _Backward, resident: tuple, rows_of, staged, coords_of, wh
     coordinates (`coords_of(first query)`), a tile every query sees whole (`whole(index)`) unmasked, or
     each tile `masked` or not where the walk's segment says (a run of whole tiles, `whole_run`). Its
     weights and score cotangents staged in `staged`, whose transposes are dV's and dK's left operands
-    (`algebra.value_operands`, `cotangent_product`'s `aᵀ @ b`) issued into `accumulators` in place, and the
+    (`algebra.value_weights`, `cotangent_product`'s `aᵀ @ b`) issued into `accumulators` in place, and the
     cotangents times the resident keys the tile's dQ, added into dQ (`add_dq(first query, dQ)`)."""
     k_smem = resident[0]
     family, tiles = walk.program.family, walk.program.tiles
@@ -528,6 +528,10 @@ def _walked_run(program, consumers: int, firsts: tuple, q_steps: int, spans_of):
     pair_first, k_first = firsts
     if not dq_summed(family, consumers):
         return program.whole_run(k_first, q_steps, spans_of)
+    if not program.causal:
+        # A padded full call's paired holders choose each tile's mask at run time, each its own (their runs'
+        # intersection masked a holder's valid tiles where its partner's block held padding).
+        return None
     runs = [program.whole_run(pair_first + index * block_k, q_steps, spans_of) for index in range(consumers)]
     if any(run is None for run in runs):
         return None

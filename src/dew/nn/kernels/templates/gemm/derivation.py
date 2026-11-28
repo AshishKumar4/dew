@@ -25,7 +25,7 @@ from jax import numpy as jnp
 
 from dew.nn.kernels.templates import axes, mosaic, resources, stores, swizzling
 from dew.nn.kernels.templates.gemm import pricing
-from dew.nn.kernels.templates.gemm.tiling import ACCUMULATOR_COLUMNS, CONSUMERS, Tiles
+from dew.nn.kernels.templates.gemm.tiling import CONSUMERS, Tiles
 
 
 def derived(layouts: tuple, *, rows: int, depth: int | None, width: int, dtype, multiprocessors: int, target,
@@ -239,9 +239,9 @@ def _held_tile(block_n: int, held_rows: int, *, role: int, steps: list[int], sha
                 # 128 x 128 staged (64, 1), spilled 64 bytes at 168 registers); nor a fed ring whose products
                 # stay in flight (warpgroup MMA's: a swapped NVFP4 decode at 128 x 64 x 256 ran 1.65x slower
                 # at four stages staged (32, 1) than at three unstaged on a GH200, M-FS-89c/d, row 5874).
+                least = mosaic.HOOK_COLUMNS if tile.stages < busy else mosaic.ACCUMULATOR_COLUMNS
                 tile = _ring_staged(tile, layout, outputs, candidate=candidate, launch_of=launch_of,
-                                    target=target, programs=programs,
-                                    least=mosaic.HOOK_COLUMNS if tile.stages < busy else ACCUMULATOR_COLUMNS)
+                                    target=target, programs=programs, least=least)
             if tile.stages >= busy:
                 price = price_of(tile)
                 if price is None:
@@ -256,7 +256,8 @@ def _held_tile(block_n: int, held_rows: int, *, role: int, steps: list[int], sha
 
 
 def _ring_staged(tile: Tiles, layout: mosaic.Family, outputs: tuple, *, candidate: Callable,
-                 launch_of: Callable, target, programs: int, least: int = ACCUMULATOR_COLUMNS) -> Tiles:
+                 launch_of: Callable, target, programs: int,
+                 least: int = mosaic.ACCUMULATOR_COLUMNS) -> Tiles:
     """`tile`, whose ring is short of busy or its consumers feed (`mosaic.Transport.feeds_itself`) at its
     least busy depth, with its outputs (`outputs`, their dtypes) staged in smaller buffers where that leaves
     the ring deeper: of

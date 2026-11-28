@@ -7,7 +7,6 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from generation_support import COMPILES_ON_CPU, INTERPRETS
-from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 from jax.extend.mlir import ir
 from jax.sharding import Mesh
@@ -54,8 +53,10 @@ def _together(a, b, c, d, issued, *, interpret, guard: str = "predicated"):
                                   copy=swizzling.coalesced, widest=widest)
 
         swizzle = resources.widest_swizzle(jnp.bfloat16, TILE)
-        pl.run_scoped(scoped, *(swizzling.staged((TILE, TILE), jnp.bfloat16, swizzle) for _ in range(4)),
-                      *(swizzling.plain((TILE, TILE), jnp.float32) for _ in range(2)), collective_axes="wg")
+        swizzling.run_scoped(scoped, *(swizzling.staged((TILE, TILE), jnp.bfloat16, swizzle)
+                                       for _ in range(4)),
+                             *(swizzling.plain((TILE, TILE), jnp.float32) for _ in range(2)),
+                             collective_axes="wg")
 
     out = jax.ShapeDtypeStruct((2, TILE, TILE), jnp.float32)
     return family.kernel(body, out_type=out, grid=(1,), grid_names=("programs",), consumers=1,

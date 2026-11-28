@@ -165,7 +165,13 @@ def with_banks(variables: Variables, layouts: tuple[WeightLayout, ...], banks: M
     bound = {layout.name: layout for layout in layouts}
     for name, bank in banks.items():
         layout = bound.get(name)
-        dense = len(bank.scale.shape) == 0
+        # A Linear's kernel by its rank (`[in, out]`) beside a bank's (`[experts, in, out]`): a tensor scale
+        # one a column (`NvFp4.columned`, row 13743) holds a dense matrix's width as a bank's holds its
+        # experts.
+        if len(bank.shape) not in (2, 3):
+            raise ValueError(f"{name} is a packed matrix of shape {bank.shape}: a Linear's kernel [in, out] "
+                             "or a bank [experts, in, out]; load it without packed_weights")
+        dense = len(bank.shape) == 2
         if layout is None or len(layout.paths) != 1 or layout.paths[0][0] != "params" or (
                 layout.concatenate is not None or layout.expert_index is not None or layout.padded
                 or layout.chunks) or (

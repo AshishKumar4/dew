@@ -29,6 +29,24 @@ backwards {
   ROOT put = f32[4,2]{1,0} dynamic-update-slice(stack, row, at, zero)
 }
 
+lifted {
+  flat = f32[4,2]{1,0} parameter(0)
+  stack = f32[4,1,2]{2,1,0} bitcast(flat)
+  row = f32[1,1,2]{2,1,0} parameter(1)
+  at = s32[] parameter(2)
+  zero = s32[] constant(0)
+  ROOT put = f32[4,1,2]{2,1,0} dynamic-update-slice(stack, row, at, zero, zero)
+}
+
+producing {
+  ROOT made = f32[2]{0} constant({11, 12}), frontend_attributes={checkpoint_name="fused"}
+}
+
+calling {
+  value = f32[2]{0} constant({13, 14}), frontend_attributes={checkpoint_name="called"}
+  ROOT both = (f32[2]{0}) tuple(value)
+}
+
 wrapped {
   stack = f32[4,2]{1,0} parameter(0)
   row = f32[2]{0} parameter(1)
@@ -37,7 +55,7 @@ wrapped {
 }
 
 body {
-  state = (f32[4,2]{1,0}, f32[4,2]{1,0}, f32[4,2]{1,0}, f32[4,2]{1,0}, f32[4,4]{1,0}, f32[4,2]{1,0}, f32[4,2]{1,0}, s32[]) parameter(0)
+  state = (f32[4,2]{1,0}, f32[4,2]{1,0}, f32[4,2]{1,0}, f32[4,2]{1,0}, f32[4,4]{1,0}, f32[4,2]{1,0}, f32[4,2]{1,0}, s32[], f32[4,2]{1,0}, f32[4,2]{1,0}, f32[4,2]{1,0}) parameter(0)
   stack = f32[4,2]{1,0} get-tuple-element(state), index=0
   back = f32[4,2]{1,0} get-tuple-element(state), index=1
   matrix = f32[4,2]{1,0} get-tuple-element(state), index=2
@@ -46,7 +64,10 @@ body {
   cast = f32[4,2]{1,0} get-tuple-element(state), index=5
   deferred = f32[4,2]{1,0} get-tuple-element(state), index=6
   i = s32[] get-tuple-element(state), index=7
-  hidden = f32[2]{0} constant({1, 2}), frontend_attributes={checkpoint_name="hidden"}
+  flat = f32[4,2]{1,0} get-tuple-element(state), index=8
+  kept = f32[4,2]{1,0} get-tuple-element(state), index=9
+  calls = f32[4,2]{1,0} get-tuple-element(state), index=10
+  hidden = f32[2]{0} constant({1, 2}), frontend_attributes={checkpoint_name="hidden"}, metadata={op_name="jit(f)/jvp(g)/dew_rung/hidden"}
   written = f32[4,2]{1,0} fusion(stack, hidden, i), kind=kLoop, calls=forwards
   late = f32[1,2]{1,0} constant({{3, 4}}), frontend_attributes={checkpoint_name="late"}
   reversed = f32[4,2]{1,0} fusion(back, late, i), kind=kLoop, calls=backwards
@@ -61,13 +82,21 @@ body {
   deep = f32[2]{0} constant({7, 8}), frontend_attributes={checkpoint_name="deep"}
   begun = ((f32[4,2]{1,0}, f32[2]{0}, s32[]), f32[4,2]{1,0}, u32[]) async-start(deferred, deep, i), calls=wrapped
   ended = f32[4,2]{1,0} async-done(begun)
+  seen = f32[1,1,2]{2,1,0} constant({{{9, 10}}}), frontend_attributes={checkpoint_name="viewed"}
+  stacked = f32[4,1,2]{2,1,0} fusion(flat, seen, i), kind=kLoop, calls=lifted
+  narrowed = f32[4,2]{1,0} bitcast(stacked)
+  produced = f32[2]{0} fusion(), kind=kLoop, calls=producing
+  stored = f32[4,2]{1,0} fusion(kept, produced, i), kind=kLoop, calls=forwards
+  invoked = (f32[2]{0}) call(), to_apply=calling
+  returned = f32[2]{0} get-tuple-element(invoked), index=0
+  recorded = f32[4,2]{1,0} fusion(calls, returned, i), kind=kLoop, calls=forwards
   one = s32[] constant(1)
   next = s32[] add(i, one)
-  ROOT out = (f32[4,2]{1,0}, f32[4,2]{1,0}, f32[4,2]{1,0}, f32[4,2]{1,0}, f32[4,4]{1,0}, f32[4,2]{1,0}, f32[4,2]{1,0}, s32[]) tuple(written, reversed, over, pinned, turned, through, ended, next)
+  ROOT out = (f32[4,2]{1,0}, f32[4,2]{1,0}, f32[4,2]{1,0}, f32[4,2]{1,0}, f32[4,4]{1,0}, f32[4,2]{1,0}, f32[4,2]{1,0}, s32[], f32[4,2]{1,0}, f32[4,2]{1,0}, f32[4,2]{1,0}) tuple(written, reversed, over, pinned, turned, through, ended, next, narrowed, stored, recorded)
 }
 
 condition {
-  state = (f32[4,2]{1,0}, f32[4,2]{1,0}, f32[4,2]{1,0}, f32[4,2]{1,0}, f32[4,4]{1,0}, f32[4,2]{1,0}, f32[4,2]{1,0}, s32[]) parameter(0)
+  state = (f32[4,2]{1,0}, f32[4,2]{1,0}, f32[4,2]{1,0}, f32[4,2]{1,0}, f32[4,4]{1,0}, f32[4,2]{1,0}, f32[4,2]{1,0}, s32[], f32[4,2]{1,0}, f32[4,2]{1,0}, f32[4,2]{1,0}) parameter(0)
   i = s32[] get-tuple-element(state), index=7
   bound = s32[] constant(STEPS)
   ROOT less = pred[] compare(i, bound), direction=LT
@@ -83,8 +112,11 @@ ENTRY e {
   spread = f32[4,4]{1,0} broadcast(a), dimensions={}
   blank = f32[4,2]{1,0} broadcast(a), dimensions={}
   tardy = f32[4,2]{1,0} broadcast(a), dimensions={}
+  viewed = f32[4,2]{1,0} broadcast(a), dimensions={}
+  fused = f32[4,2]{1,0} broadcast(a), dimensions={}
+  called = f32[4,2]{1,0} broadcast(a), dimensions={}
   start = s32[] constant(0)
-  init = (f32[4,2]{1,0}, f32[4,2]{1,0}, f32[4,2]{1,0}, f32[4,2]{1,0}, f32[4,4]{1,0}, f32[4,2]{1,0}, f32[4,2]{1,0}, s32[]) tuple(zeros, ones, populated, filled, spread, blank, tardy, start)
-  loop = (f32[4,2]{1,0}, f32[4,2]{1,0}, f32[4,2]{1,0}, f32[4,2]{1,0}, f32[4,4]{1,0}, f32[4,2]{1,0}, f32[4,2]{1,0}, s32[]) while(init), condition=condition, body=body, backend_config={"known_trip_count":{"n":"STEPS"},"known_init_step":{"init":"0","step":"1"},"known_induction_variable":{"tuple_index":"7"}}
+  init = (f32[4,2]{1,0}, f32[4,2]{1,0}, f32[4,2]{1,0}, f32[4,2]{1,0}, f32[4,4]{1,0}, f32[4,2]{1,0}, f32[4,2]{1,0}, s32[], f32[4,2]{1,0}, f32[4,2]{1,0}, f32[4,2]{1,0}) tuple(zeros, ones, populated, filled, spread, blank, tardy, start, viewed, fused, called)
+  loop = (f32[4,2]{1,0}, f32[4,2]{1,0}, f32[4,2]{1,0}, f32[4,2]{1,0}, f32[4,4]{1,0}, f32[4,2]{1,0}, f32[4,2]{1,0}, s32[], f32[4,2]{1,0}, f32[4,2]{1,0}, f32[4,2]{1,0}) while(init), condition=condition, body=body, backend_config={"known_trip_count":{"n":"STEPS"},"known_init_step":{"init":"0","step":"1"},"known_induction_variable":{"tuple_index":"7"}}, metadata={op_name="jit(f)/jvp(g)/while"}
   ROOT x = f32[4,2]{1,0} get-tuple-element(loop), index=0
 }

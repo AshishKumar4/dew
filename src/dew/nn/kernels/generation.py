@@ -1874,17 +1874,6 @@ def linear_tangent(forward: Callable, backward: Callable, portable: Callable, *,
         declared_tangent(kind, bounding, bounded_jvp, symbolic_zeros=True))
 
 
-def unbroadcast(cotangent, shape: tuple[int, ...]):
-    """`cotangent`, of the shape an operand of `shape` was broadcast to, summed back to `shape`, as JAX pulls
-    a broadcast back."""
-    import jax
-    import jax.numpy as jnp
-
-    _, pulled = jax.vjp(lambda wide: jnp.broadcast_to(wide, cotangent.shape),
-                        jnp.zeros(shape, cotangent.dtype))
-    return pulled(cotangent)[0]
-
-
 def linear_map(apply: Callable, pullback: Callable, residuals, moving, *, out_aval=None,
                zero_cotangents: bool = False, traced_tangent: bool = False, summed_first: bool = False):
     """`apply(residuals, moving)`, linear in `moving`, whose transpose is `pullback(residuals, cotangent)`
