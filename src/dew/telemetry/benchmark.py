@@ -417,7 +417,7 @@ def tpu_ops(directory: str | Path, devices: Iterable[int], module: str, *, annot
     every op within that run's span on the device's `XLA Ops` line, each its device milliseconds. A TPU core
     runs one program at a time, so the ops inside a run's span are its own: a v5e's XProf names a run's
     program in its name alone and its ops state none (M-FS-90); a run stating its program by stat takes the
-    ops stating it, no host transfer. Where its ops state none, each is read as the instruction of the
+    ops stating it, no host transfer. Either way, each op inside the run is read as the instruction of the
     call's module it names (`instructions`, each instruction's opcode by name as it runs, `_opcodes`: a
     generic async op's its wrapped op's; an op's name the instruction's, or its HLO text, `%name = ...`,
     `_opcode_of`): one no instruction of the module names is

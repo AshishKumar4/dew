@@ -854,7 +854,7 @@ def test_a_launch_measured_for_some_calls_keeps_the_timings_its_other_calls_take
         picks.pop(key, None)
 
 
-def test_a_launch_an_assumed_device_chose_is_timed_on_no_other_gpu():
+def test_a_launch_an_assumed_device_chose_is_timed_on_no_other_gpu(monkeypatch):
     """A launch traced under an assumed device and no mesh naming it (an RTX 4080's tiles traced on this
     host, `generation.assumed` alone) keys its picks by the attached device's model (`_mesh_kind`), and so
     reaches the attached GPU's measurer, but was chosen for the assumed GPU: it is timed on none other
@@ -875,6 +875,17 @@ def test_a_launch_an_assumed_device_chose_is_timed_on_no_other_gpu():
     assert tuning._settle([call], measurer=measurer) == 1
     assert (measured, stored) == ([], [])
     assert tuning._chosen_for(attached, here) and not tuning._chosen_for(assumed, here)
+    # A process's measurer is the device that runs the timing, whatever GPU the caller's mesh names: under an
+    # RTX 4080's abstract mesh, this host's own device's facts, which that mesh's launches were not chosen
+    # for (the k01-69 review: the mesh's catalog facts were read as the attached GPU's).
+    catalog, _ = _rtx_4080_placements()
+    # The measuring arm's flags: picks kept (no deterministic ops) and the GPU its own (no read-only cache).
+    monkeypatch.setenv("XLA_FLAGS", without_flags(keeping_picks(), READ_ONLY.split("=")[0]))
+    with tuning._placed_in(catalog):
+        measurer = tuning._measurer(measure=True)
+    device = jax.devices()[0]
+    assert measurer is not None and measurer.target == generation.device_target(device)
+    assert not tuning._chosen_for(catalog, measurer.target)
 
 def test_a_launchs_candidates_are_read_taken_and_compiled_at_its_placement():
     """A launch measured at its call's placement (`tuning._candidate_compiles`, `_measured`'s): its space is

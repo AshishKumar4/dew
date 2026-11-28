@@ -2154,10 +2154,9 @@ def _measurer(measure: bool) -> Measurer | None:
     none."""
     if not (measure and _cache.measures_picks()):
         return None
-    # The attached GPU's facts, whatever the caller assumes (`generation.reassumed`).
-    with generation.reassumed(None):
-        attached = generation.gpu_target()
-    return Measurer(get_default_device().device_kind, attached, _measured, _store)
+    # The device that runs the timing, its own facts whatever the caller assumes or its mesh names.
+    device = get_default_device()
+    return Measurer(device.device_kind, generation.device_target(device), _measured, _store)
 
 
 def _chosen_for(placed: Placement, target: generation.GpuTarget) -> bool:
