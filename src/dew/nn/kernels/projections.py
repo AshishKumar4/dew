@@ -274,10 +274,14 @@ def blocks_quantized(w: jax.Array, *, k_major: bool = False) -> tuple[jax.Array,
 
     groups, depth, width = w.shape
     edge = SCALE_DEPTH
-    rows = largest_magnitude(w.reshape(groups, depth, width // edge, edge), -1)
+    # A format with no word of its own (an integer's, FP6's) read widened, exactly, as its codes are.
+    read = w if jnp.issubdtype(w.dtype, jnp.floating) and jnp.finfo(w.dtype).bits >= 8 else (
+        w.astype(at_least_fp32(w.dtype)))
+    rows = largest_magnitude(read.reshape(groups, depth, width // edge, edge), -1)
     amax = largest_magnitude(rows.reshape(groups, depth // edge, edge, width // edge), 2)
     scale = fake_quant.fp8_block_scale(amax.astype(at_least_fp32(w.dtype)))
-    tiles = w.reshape(groups, depth // edge, edge, width).reshape(groups, depth // edge, edge, width // edge, edge)
+    tiles = w.reshape(groups, depth // edge, edge, width)
+    tiles = tiles.reshape(groups, depth // edge, edge, width // edge, edge)
     spread = scale[:, :, None, :, None]
     if k_major:
         tiles, spread = tiles.transpose(0, 3, 4, 1, 2), spread.transpose(0, 3, 4, 1, 2)

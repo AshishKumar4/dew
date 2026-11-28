@@ -628,6 +628,21 @@ def test_a_bank_split_by_whole_depth_blocks_quantizes_on_an_explicit_mesh(k_majo
         split = quantized(placed)
     for got, want in zip(split, whole, strict=True):
         np.testing.assert_array_equal(np.asarray(got).view(np.uint8), np.asarray(want).view(np.uint8))
+    # The split kept on the codes' depth and the scales' depth blocks.
+    codes, scales = (tuple(array.sharding.spec) + (None,) * (3 - len(array.sharding.spec)) for array in split)
+    assert codes == ((None, None, "i") if k_major else (None, "i", None))
+    assert scales == (None, "i", None)
+
+
+@pytest.mark.parametrize("k_major", [False, True])
+def test_an_integer_bank_quantizes_as_its_widened_values(k_major):
+    """`projections.blocks_quantized` of an int8 bank, which has no float word to reduce: its codes and
+    scales bitwise those of its values widened to fp32, an exact widening (theme 22's review)."""
+    w = np.random.default_rng(4518).integers(-127, 128, size=(2, 256, 256)).astype(np.int8)
+    got = projections.blocks_quantized(jnp.asarray(w), k_major=k_major)
+    want = projections.blocks_quantized(jnp.asarray(w, jnp.float32), k_major=k_major)
+    for got, want in zip(got, want, strict=True):
+        np.testing.assert_array_equal(np.asarray(got).view(np.uint8), np.asarray(want).view(np.uint8))
 
 
 @pytest.mark.parametrize("rows", [200, 256])
