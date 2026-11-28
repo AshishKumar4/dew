@@ -4,6 +4,8 @@ objective's gradient by check 1 (`moved_weights`, `applied`, `objective_gradient
 
 
 import dataclasses
+from collections.abc import Mapping
+from typing import NamedTuple
 
 import jax
 import jax.numpy as jnp
@@ -12,6 +14,7 @@ import optax
 from flax import linen as nn
 from interop_support import scaled_gap
 from model_support import moved
+from recorded_inputs import normals
 from reference_error import as_given
 
 from dew.artifacts import Representations
@@ -100,21 +103,168 @@ def source_final(schedule, process, times, rescale, label, scale):
     return final
 
 
-def walk(solver, process, model, x_T, times, key=0):
+def source_walked(schedule, process, times, rescale, label, scale, *, gradient: bool = True):
+    """Dew's arm of a published scheduler's seeded walk (`tools/diffusers_source_reference.py seeds`), a
+    function of a draw's `x_T` and `cotangent`: the latent at each grid interval's end (`after <i>`), or a
+    guided walk's last alone (`final`, `source_final`), and with `gradient` the VJP of the last latent
+    against the cotangent (`grad`)."""
+    final = source_final(schedule, process, times, rescale, label, scale)
+    model = SourceOracle()
+
+    def walked(inputs):
+        x_T, cotangent = inputs["x_T"], inputs["cotangent"]
+        if rescale is None:
+            latents, pullback = jax.vjp(lambda value: walk(schedule.solver, process, model, value, times),
+                                        x_T)
+            leaves = {f"after {index}": latent for index, latent in enumerate(latents)}
+            last = jnp.zeros_like(latents).at[-1].set(cotangent)
+        else:
+            latent, pullback = jax.vjp(final, x_T)
+            leaves, last = {"final": latent}, cotangent
+        return {**leaves, "grad": pullback(last)[0]} if gradient else leaves
+
+    return walked
+
+
+def walk(solver, process, model, x_T, times, key=0, initial=None):
     """Each solver interval's new state, without the closing denoise, through `sample`'s own walk with
-    its folded per-step keys (`sample(record=...)`)."""
+    its folded per-step keys (`sample(record=...)`); over traced `times`, from the solver's state `initial`
+    its caller built on the concrete grid (`sample`'s `initial`)."""
     params = nn.unbox(model.init(jax.random.PRNGKey(1), jnp.ones((1, *x_T.shape[1:])), jnp.ones((1,))))
     denoise = process.denoiser(model, params, {})
     with jax.ensure_compile_time_eval():
         times = jnp.asarray(times, jnp.float32)
     _, latents = sample(denoise, x_T, solver=solver, key=key, times=times, final_denoise=False,
-                        record=lambda x, state, denoised: x)
+                        record=lambda x, state, denoised: x, initial=initial)
     return latents
+
+
+SCHEDULER_SHAPE = (2, 3, 16)
+"""A Diffusers solver walk's seeded latent (`scheduler_draw`): 96 entries, its recording keeping every
+latent of each seed's walk and its float64 truth."""
+
+
+DATA_STD = 0.3
+"""The data's deviation the solver walks' oracles are optimal for: x0 ~ N(0, DATA_STD^2)."""
+
+
+def vp_epsilon(x, alpha, sigma):
+    """E[eps | x_t] for x0 ~ N(0, DATA_STD^2) at the rates `(alpha, sigma)`, in whatever library its
+    arrays are (both arms of tests/test_samplers.py's Diffusers walks read these)."""
+    return x * sigma / (alpha**2 * DATA_STD**2 + sigma**2)
+
+
+def ve_epsilon(x, sigma):
+    """The same on the variance-exploding latent x = x_0 + sigma eps."""
+    return x * sigma / (DATA_STD**2 + sigma**2)
+
+
+def karras_raw(x_scaled, sigma, sigma_data):
+    """The raw F whose Karras preconditioning c_skip x + c_out F is E[x0 | x] = s^2/(s^2 + sigma^2) x,
+    from the input scaled by c_in."""
+    root = (sigma**2 + sigma_data**2) ** 0.5
+    x = x_scaled * root
+    c_skip = sigma_data**2 / (sigma_data**2 + sigma**2)
+    c_out = sigma * sigma_data / root
+    return (DATA_STD**2 / (DATA_STD**2 + sigma**2) * x - c_skip * x) / c_out
 
 
 def relative_gap(actual, expected) -> float:
     """The largest per leading index of `scaled_gap`, so a small row is held to its own magnitude."""
     return max(scaled_gap(a, e) for a, e in zip(np.asarray(actual), np.asarray(expected), strict=True))
+
+
+SCHEDULE_JITTER = 64
+"""The uniform draws in [-1, 1] a Diffusers solver walk's seed moves its schedule by (`seeded_schedule`), at
+least one a grid point."""
+
+
+def scheduler_draw(seed: int, scale) -> dict[str, np.ndarray]:
+    """A Diffusers solver walk's seeded inputs (tools/diffusers_reference.py seeds): x_T, standard normals
+    of SCHEDULER_SHAPE times `scale`, the walk's top marginal deviation, rounded to float32 as both walks
+    read it, the cotangent its last latent is pulled back by, and the draws its schedule moves by
+    (`seeded_schedule`); the normals the portable recorded-input generator's (`recorded_inputs.normals`,
+    testing.md), each of its own stream, the uniforms NumPy's, whose bits every host shares (row 13745)."""
+    return {"x_T": normals([0xD1F, seed, 0], SCHEDULER_SHAPE) * np.float32(scale),
+            "cotangent": normals([0xD1F, seed, 1], SCHEDULER_SHAPE),
+            "jitter": np.random.default_rng([0xD1F, seed, 2]).uniform(-1.0, 1.0, SCHEDULE_JITTER)}
+
+
+INDEX_JITTER = 2
+"""How far a seed moves each timestep of a tabled grid, in the table's indices (a grid's spacing is about
+fifty)."""
+RANGE_JITTER = 0.01
+"""How far a seed narrows a Karras grid's range, as a share of its ends."""
+INDEXED = ("DPMSolverMultistepScheduler", "DPMSolverSinglestepScheduler")
+"""The tabled schedulers whose walk a seed moves: the ones whose timesteps a walk sets through their public
+`set_timesteps(timesteps=...)`. DEIS's and UniPC's walks take their published spacing, which no public
+input moves (testing.md: a generator uses its reference's public interface)."""
+
+
+class SeededSchedule(NamedTuple):
+    """One seed's schedule of a Diffusers solver walk (`seeded_schedule`): the times Dew's walk takes; the
+    timesteps the scheduler is set to, where a seed moves them; its trained beta table, where a seed moves
+    it; and its config's moved settings (EDM's ends, PNDM's `steps_offset`), all inputs its public setup
+    takes."""
+
+    times: np.ndarray
+    timesteps: np.ndarray | None
+    betas: np.ndarray | None
+    config: dict
+
+
+def _karras(top: float, bottom: float, rho: float, points: int) -> np.ndarray:
+    """The rho-spaced Karras grid of `points` from `top` to `bottom`, in float64."""
+    ramp = np.linspace(0.0, 1.0, points)
+    return (top ** (1 / rho) + ramp * (bottom ** (1 / rho) - top ** (1 / rho))) ** rho
+
+
+def _karras_times(levels: np.ndarray, low: float, high: float, rho: float) -> np.ndarray:
+    """The times of Dew's Karras schedule between `low` and `high` (`KarrasVENoiseScheduler`, t = 1 at the
+    top) at which it reaches `levels`, in float64, rounded to float32 as its walk is handed them."""
+    ramp = (levels ** (1 / rho) - high ** (1 / rho)) / (low ** (1 / rho) - high ** (1 / rho))
+    return np.clip(1.0 - ramp, 0.0, 1.0).astype(np.float32)
+
+
+def seeded_schedule(scheduler: str, convention: str, grid: np.ndarray, jitter: np.ndarray, *,
+                    betas: np.ndarray, karras: Mapping, edm: Mapping) -> SeededSchedule:
+    """The schedule a Diffusers solver walk's seed takes (`scheduler_draw`'s `jitter`), each seed's its
+    own: a walk whose oracle is linear in x_T rounds the same scalars, its schedule's, for every x_T, so
+    one schedule over any count of seeds is one coin flip of their roundings, which check 1 cannot pool
+    (rows 13653, 13662; tools/flaxdiff_solver_reference.py's JITTER, the same remedy). A tabled grid's
+    timesteps each move by up to INDEX_JITTER, its top down and its terminal kept, where its scheduler takes
+    timesteps (`INDEXED`); PNDM's fixed stride takes a `steps_offset` within it, the whole grid moved; a
+    Karras grid's range narrows by up to RANGE_JITTER at its top, by the beta table's tail where the
+    scheduler reads its ends from it (`convention` "ve") and by its config at each end otherwise ("edm");
+    Dew's walk takes the times its own schedule reaches those levels at. Every move is an input the
+    scheduler's public setup takes (testing.md). The other grids (DEIS's, UniPC's, the distilled
+    schedulers') are kept."""
+    grid = np.asarray(grid)
+    if convention == "vp":
+        if scheduler == "PNDMScheduler":
+            stride = int(grid[0] - grid[1])
+            offset = min(int((jitter[0] + 1) / 2 * stride), stride - 1)
+            return SeededSchedule((grid + offset).astype(np.float32), None, None, {"steps_offset": offset})
+        if scheduler not in INDEXED:
+            return SeededSchedule(grid.astype(np.float32), None, None, {})
+        steps = np.rint(jitter[:grid.shape[0] - 1] * INDEX_JITTER).astype(np.int64)
+        steps[0] = -abs(steps[0])
+        timesteps = grid[:-1].astype(np.int64) + steps
+        return SeededSchedule(np.append(timesteps, grid[-1]).astype(np.float32), timesteps, None, {})
+    points = grid.shape[0]
+    narrowed = 1 - RANGE_JITTER * abs(jitter[0])
+    if convention == "ve":
+        moved = np.asarray(betas, np.float64).copy()
+        moved[1:] *= narrowed
+        cumulative = np.cumprod(1 - moved)
+        top = float(np.sqrt((1 - cumulative[-1]) / cumulative[-1]))
+        levels = _karras(top, karras["sigma_min"], karras["rho"], points)
+        return SeededSchedule(_karras_times(levels, karras["sigma_min"], karras["sigma_max"], karras["rho"]),
+                              None, moved, {})
+    top, bottom = edm["sigma_max"] * narrowed, edm["sigma_min"] * (1 + RANGE_JITTER * abs(jitter[1]))
+    levels = _karras(top, bottom, edm["rho"], points)
+    return SeededSchedule(_karras_times(levels, edm["sigma_min"], edm["sigma_max"], edm["rho"]), None, None,
+                          {"sigma_max": top, "sigma_min": bottom})
 
 
 def images_of(url: str, size: int, batch: int = 32):

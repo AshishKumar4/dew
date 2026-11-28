@@ -199,21 +199,17 @@ def streamed(walk):
 
 @pytest.fixture(scope="module")
 def sources(walk):
-    """The saved pipeline Diffusers loads in float32, and read back in float64 inside `float64` with its
-    UniPC tables widened (the recorder's `float64_scheduler`), with the context that widens a call into it."""
+    """The saved pipeline Diffusers loads in float32, and read back in float64 inside `float64`, its UniPC
+    scheduler the class's independent float64 oracle (tools/float64_schedulers.py), with the context that
+    widens a call into it."""
     import torch
     from diffusers import WanPipeline
-    from diffusers.schedulers import scheduling_unipc_multistep
 
     from _dew_torch.precision import float64
 
-    with pytest.MonkeyPatch.context() as patched:
-        patched.syspath_prepend(str(ROOT / "tools"))
-        tool = tool_support.load("diffusers_wan_reference")
-
     @contextlib.contextmanager
     def widening():
-        with float64(), tool.float64_scheduler(scheduling_unipc_multistep):
+        with float64():
             yield
 
     def read(dtype):
@@ -222,6 +218,7 @@ def sources(walk):
     narrow = read(torch.float32)
     with widening():
         wide = read(torch.float64)
+    wide.scheduler = tool_support.scheduler_oracles().oracle_of(wide.scheduler)
     for pipe in (narrow, wide):
         pipe.set_progress_bar_config(disable=True)
     return narrow, wide, widening
@@ -397,9 +394,9 @@ class Replay(nn.Module):
 def test_the_scheduler_steps_as_the_source_on_the_same_model_outputs(pipeline, walk, sources, steps):
     """The grid and solver `text_to_image()` walks, stepped on drawn model outputs as the source's own UniPC
     scheduler steps on them: the same timesteps, and every step's sample on par with the scheduler's float32
-    run over the draws (check 1), its float64 run (its tables widened) the truth. No sample feeds back into a
-    model, so this isolates the flow-shifted sigmas, the timesteps and the bh2 update arithmetic. UniPC of
-    order 1, or bh1, lands 1e4 to 1e5 times further."""
+    run over the draws (check 1), its class's independent float64 oracle's run the truth. No sample feeds
+    back into a model, so this isolates the flow-shifted sigmas, the timesteps and the bh2 update
+    arithmetic. UniPC of order 1, or bh1, lands 1e4 to 1e5 times further."""
     import torch
     from diffusers import UniPCMultistepScheduler
     from diffusion_support import walk as step_by_step
@@ -423,7 +420,9 @@ def test_the_scheduler_steps_as_the_source_on_the_same_model_outputs(pipeline, w
         return np.asarray(step_by_step(pipeline.solver, process, model, jnp.asarray(x_T), times))
 
     def scheduled(pipe, dtype, x_T, outputs):
-        scheduler = UniPCMultistepScheduler.from_config(config)
+        library = UniPCMultistepScheduler.from_config(config)
+        scheduler = (tool_support.scheduler_oracles().oracle_of(library) if dtype == torch.float64
+                     else library)
         scheduler.set_timesteps(steps)
         x, latents = torch.from_numpy(x_T).to(dtype), []
         for index, time in enumerate(scheduler.timesteps):

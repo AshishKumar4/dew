@@ -369,6 +369,56 @@ def test_a_unit_scale_guides_to_the_conditional_prediction_exactly():
     np.testing.assert_array_equal(np.asarray(moved), [[2.0 ** -125]])
 
 
+def _guided_step(guidance, conditional, index: int = 0, steps: int = 1):
+    """`guidance`'s prediction at step `index` of a walk of `steps` steps over a rectified flow whose model
+    returns `conditional` and, unconditioned, zeros, from x 0 at time 1."""
+    process = Process(FlowMatchingScheduler(), DirectPredictionTransform())
+    denoise = process.denoiser(RawPrediction(), {}, {"prediction": conditional},
+                               {"prediction": jnp.zeros_like(conditional)})
+    walk = guidance.walk(denoise, steps)
+    x = jnp.zeros_like(conditional)
+    return walk.step(x, jnp.ones(1), index, walk.init(x))[0][0]
+
+
+def test_a_rescaled_cfg_step_outside_its_interval_is_the_conditional_prediction():
+    """A rescaled CFG's step outside its guidance interval predicts the conditional output as it is, a
+    constant [1, 1] finite and its pullback the identity's, where rescaling it divided its zero deviations,
+    0 / 0 (row 14128); a step inside rescales at any scale, its derivative in a unit scale the blend's,
+    rescale times the conditional output: [0, 0.5, 1] of [0, 1, 2], whose deviation, 1, rounds nothing
+    (review)."""
+    outside = CFG(3.0, interval=(0.5, 1.0), rescale=0.7)
+    constant = jnp.ones((1, 2))
+    np.testing.assert_array_equal(np.asarray(_guided_step(outside, constant, 0, 2)), np.ones((1, 2)))
+    pulled = jax.grad(lambda held: jnp.sum(_guided_step(outside, held, 0, 2)))(constant)
+    np.testing.assert_array_equal(np.asarray(pulled), np.ones((1, 2)))
+    varying = jnp.asarray([[0.0, 1.0, 2.0]])
+    _, moved = jax.jvp(lambda scale: _guided_step(CFG(scale, rescale=0.5), varying), (jnp.asarray(1.0),),
+                       (jnp.asarray(1.0),))
+    np.testing.assert_array_equal(np.asarray(moved), np.asarray([[0.0, 0.5, 1.0]], np.float32))
+
+
+def test_a_heun_step_of_no_length_under_apg_momentum_differentiates_as_both_its_slopes():
+    """A Heun walk of a rectified flow from time 0.5 to itself at x 1, under APG at scale 2 with momentum
+    1/2 (its conditional output 1, its unconditional 0), predicts 2 at its source and 3 at its corrector,
+    its momentum moved between them: its derivative in its target time is the mean of the two slopes,
+    (-2 - 4) / 2 = -3, where the source's alone is -2 (review of train 1474's P0)."""
+    process = Process(FlowMatchingScheduler(), DirectPredictionTransform())
+    conditional = jnp.ones((1, 2))
+    denoise = process.denoiser(RawPrediction(), {}, {"prediction": conditional},
+                               {"prediction": jnp.zeros_like(conditional)})
+
+    x = jnp.ones((1, 2))
+    # A traced grid walks from the state its concrete grid builds.
+    initial = Heun().init(x, np.asarray([0.5, 0.5], np.float32), process, key=jax.random.key(0))
+
+    def walked(target):
+        return sample(denoise, x, solver=Heun(), guidance=APG(2.0, momentum=0.5), key=jax.random.key(0),
+                      times=jnp.stack([jnp.asarray(0.5), target]), initial=initial, final_denoise=False)
+
+    _, moved = jax.jvp(walked, (jnp.asarray(0.5),), (jnp.asarray(1.0),))
+    np.testing.assert_array_equal(np.asarray(moved), np.full((1, 2), -3.0, np.float32))
+
+
 def test_an_integer_scale_guides_and_differentiates():
     """An integer scale, CFG++'s 1 among them, guides as its float does and carries a tangent: the
     gradient through it in the predictions is finite (ledger 1917)."""

@@ -1,0 +1,10 @@
+{
+ "bytes": 117890412,
+ "license": "Apache-2.0",
+ "origin": "github",
+ "path": "b59b368c189aacf8cc4bcd15e8e8531e5bc1a8f3c01a72faf7f72d9396e0030f.npz",
+ "reference": "huggingface/diffusers 0.34.0",
+ "repo": "AshishKumar4/dew-fixtures",
+ "revision": "store-1",
+ "sha256": "b59b368c189aacf8cc4bcd15e8e8531e5bc1a8f3c01a72faf7f72d9396e0030f"
+}

@@ -7,7 +7,7 @@ file) runs "cat" against "dog" at guidance 3 for four steps with `denoising_end=
 returns its latents. The StableDiffusionXLImg2ImgPipeline refiner takes those latents as `image` with
 `denoising_start=0.5`, which adds no noise and walks the steps below the same cutoff, and returns its latents
 and its decoded images. Both run in float32 or in float64 (`_dew_torch.precision.float64` for the models,
-`diffusers_wan_reference.float64_scheduler` for the DDIM tables, built in float64).
+the DDIM scheduler its class's independent float64 oracle, tools/float64_schedulers.py).
 """
 
 from __future__ import annotations
@@ -21,11 +21,15 @@ from typing import Any
 import numpy as np
 import torch
 
+# The checkout's root for `_dew_torch`, and this directory for its sibling tools, each imported by its bare
+# name as every tool imports another (tools/float64_schedulers.py's families among them).
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from diffusers_reference_helpers import restore_transformers_names, returned
+from float64_schedulers import oracle_of
 
 from _dew_torch.precision import float64
-from tools.diffusers_reference_helpers import restore_transformers_names, returned
-from tools.diffusers_wan_reference import float64_scheduler
 
 restore_transformers_names()
 
@@ -64,24 +68,23 @@ def pipelines(root: Path, dtype: torch.dtype):
 
 @functools.cache
 def built(root: Path, wide: bool):
-    """The base and refiner pipelines under `root`, at float64 where `wide`, built once."""
-    from diffusers.schedulers import scheduling_ddim
-
-    with float64() if wide else contextlib.nullcontext(), \
-            float64_scheduler(scheduling_ddim) if wide else contextlib.nullcontext():
-        return pipelines(root, torch.float64 if wide else torch.float32)
+    """The base and refiner pipelines under `root`, at float64 where `wide`, built once, each scheduler then
+    its class's independent float64 oracle."""
+    with float64() if wide else contextlib.nullcontext():
+        first, second = pipelines(root, torch.float64 if wide else torch.float32)
+    if wide:
+        first.scheduler, second.scheduler = oracle_of(first.scheduler), oracle_of(second.scheduler)
+    return first, second
 
 
 def handed(root: Path, noise: np.ndarray, *, wide: bool) -> dict[str, np.ndarray]:
     """The base's latents (`prefix`), the refiner's (`final`) and its decoded `images`, channels last, from
     `noise` (channels last), in float32 or (`wide`) float64."""
     from diffusers.pipelines.stable_diffusion_xl.pipeline_output import StableDiffusionXLPipelineOutput
-    from diffusers.schedulers import scheduling_ddim
 
     dtype = torch.float64 if wide else torch.float32
     base, refiner = built(Path(root), wide)
-    with float64() if wide else contextlib.nullcontext(), \
-            float64_scheduler(scheduling_ddim) if wide else contextlib.nullcontext(), torch.no_grad():
+    with float64() if wide else contextlib.nullcontext(), torch.no_grad():
         latents = torch.from_numpy(np.ascontiguousarray(np.moveaxis(np.asarray(noise), -1, 1))).to(dtype)
         common = {"prompt": PROMPT, "negative_prompt": NEGATIVE, "num_inference_steps": STEPS,
                   "guidance_scale": GUIDANCE}

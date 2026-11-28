@@ -93,7 +93,7 @@ CASES: dict[str, Case] = {
 
 class Float64Library:
     """A library (numpy, torch) with its float32 read as float64, for a
-    scheduler module whose tables round through an explicit float32."""
+    pipeline module whose call pins an explicit float32 (`float64_module`)."""
 
     def __init__(self, library):
         self.library = library
@@ -103,15 +103,11 @@ class Float64Library:
 
 
 @contextlib.contextmanager
-def float64_scheduler(module: ModuleType):
-    """Evaluate the published formulas in float64, including table creation.
-
-    Casting already-built tables would retain their float32 cumprod and
-    interpolation errors. Some step methods also explicitly upcast a sample
-    to float32; that minimum precision must become float64 for this oracle.
-    Only this scheduler module sees the widened libraries, and the default
-    dtype is restored before the native float32 reference runs.
-    """
+def float64_module(module: ModuleType):
+    """A pipeline module's explicit float32 pins read as float64 while held (Z-Image's call casts its latents
+    to float32 in its own module), the default dtype float64. Never a scheduler's: a scheduler's float64
+    walk is its class's independent oracle (tools/float64_schedulers.py, row 13738). Only this module sees
+    the widened libraries, and the default dtype is restored after."""
     from unittest.mock import patch
 
     with default_dtype(torch.float64), contextlib.ExitStack() as scope:
@@ -249,10 +245,9 @@ REPLAY_STEPS = (10, 50)
 def scheduler_replay() -> dict[str, np.ndarray]:
     """The published scheduler stepped on recorded model outputs, the one
     model evaluation per step a guided Wan walk makes, from a fixed latent:
-    its timesteps and every step's sample, in float32 and widened."""
-    from diffusers.schedulers import scheduling_unipc_multistep
+    its timesteps and every step's sample, in float32 and on its float64 oracle."""
     from diffusers.schedulers.scheduling_unipc_multistep import UniPCMultistepScheduler
-    from diffusers.schedulers.scheduling_utils import SchedulerOutput
+    from float64_schedulers import oracle_of
 
     config = json.loads((SOURCE / "scheduler" / "scheduler_config.json").read_text())
     arrays: dict[str, np.ndarray] = {}
@@ -262,18 +257,14 @@ def scheduler_replay() -> dict[str, np.ndarray]:
         outputs = torch.randn((steps, *x_T.shape), generator=generator)
         arrays[f"replay.{steps}.x_T"], arrays[f"replay.{steps}.outputs"] = x_T.numpy(), outputs.numpy()
         for precision, dtype in (("fp32", torch.float32), ("fp64", torch.float64)):
-            with contextlib.ExitStack() as scope:
-                if dtype == torch.float64:
-                    # The model's pins and the scheduler module's tables, widened through every step.
-                    scope.enter_context(widened())
-                    scope.enter_context(float64_scheduler(scheduling_unipc_multistep))
-                scheduler = returned(UniPCMultistepScheduler.from_config(config), UniPCMultistepScheduler)
-                scheduler.set_timesteps(steps)
-                x, latents = x_T.to(dtype), []
-                for index, time in enumerate(scheduler.timesteps):
-                    stepped = scheduler.step(outputs[index].to(dtype), time, x)
-                    x = returned(stepped, SchedulerOutput).prev_sample
-                    latents.append(x)
+            library = returned(UniPCMultistepScheduler.from_config(config), UniPCMultistepScheduler)
+            # At float64 the class's independent oracle (tools/float64_schedulers.py), its tables its own.
+            scheduler = oracle_of(library) if dtype == torch.float64 else library
+            scheduler.set_timesteps(steps)
+            x, latents = x_T.to(dtype), []
+            for index, time in enumerate(scheduler.timesteps):
+                x = scheduler.step(outputs[index].to(dtype), time, x, return_dict=False)[0]
+                latents.append(x)
             arrays[f"replay.{steps}.{precision}.latents"] = torch.stack(latents).numpy()
             arrays[f"replay.{steps}.{precision}.timesteps"] = scheduler.timesteps.numpy()
             arrays[f"replay.{steps}.{precision}.sigmas"] = scheduler.sigmas.numpy()
@@ -305,22 +296,23 @@ def encoded_and_walked(pipe, latents: torch.Tensor, suffix: str = "") -> dict[st
 
 def pipeline(destination: str) -> None:
     """`encoded_and_walked` as the pipeline runs, in float32, and its truth,
-    the whole pipeline in float64 (`float64`: the Wan modules' float32 pins,
-    the call's float32 latents and the UniPC tables widened with it), under
-    `_f64` names."""
+    the whole pipeline in float64 (`float64`: the Wan modules' float32 pins
+    and the call's float32 latents widened with it, the UniPC scheduler its
+    class's float64 oracle), under `_f64` names."""
     root = recording(destination, COHORT)
     pipe = build_pipeline(root)
     generator = torch.Generator().manual_seed(SEED + 9)
     shape = (len(PROMPTS), PIPELINE_VAE["z_dim"], (FRAMES - 1) // 4 + 1, HEIGHT // 8, WIDTH // 8)
     latents = torch.randn(shape, generator=generator)
     arrays: dict[str, np.ndarray] = {"x_T": latents.numpy(), **encoded_and_walked(pipe, latents)}
-    # The scheduler's tables are its module's own, widened around every call the walk makes into it.
     from diffusers.pipelines.wan.pipeline_wan import WanPipeline
-    from diffusers.schedulers import scheduling_unipc_multistep
+    from float64_schedulers import oracle_of
 
-    # Read back from what it saved, inside `float64`, so every module's constructor computes in float64.
-    with float64(), float64_scheduler(scheduling_unipc_multistep):
+    # Read back from what it saved, inside `float64`, so every module's constructor computes in float64; its
+    # scheduler the class's independent float64 oracle (tools/float64_schedulers.py).
+    with float64():
         wide = WanPipeline.from_pretrained(root / "pipeline", torch_dtype=torch.float64)
+        wide.scheduler = oracle_of(wide.scheduler)
         arrays.update(encoded_and_walked(wide, latents.double(), "_f64"))
     arrays.update(scheduler_replay())
     record = {"diffusers": RELEASES[COHORT]["diffusers"], "torch": torch.__version__, "seed": SEED,

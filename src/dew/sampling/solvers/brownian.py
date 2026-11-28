@@ -9,10 +9,10 @@ import jax.numpy as jnp
 from flax import struct
 from jax import lax
 
+from dew.diffusion.schedules.common import ancestral_step
 from dew.nn.programs import on_host
 
 from .common import _sigma_integrator, given
-from .sigma import _ancestral
 
 
 class _Brownian(NamedTuple):
@@ -173,11 +173,11 @@ class DPMSolverSDE:
 
         def midpoint(_):
             sigma_mid = jnp.exp(0.5 * (jnp.log(sigma_t) + jnp.log(sigma_s)))
-            first_down, first_up = _ancestral(sigma_t, sigma_mid)
+            first_down, first_up = ancestral_step(sigma_t, sigma_mid)
             noise = self._noise(state, jnp.min(sigma_t), jnp.min(sigma_mid), x.shape)
             x_mid = _sde_step(x, denoised, sigma_t, first_down) + noise * first_up
             denoised_mid, _ = denoise(x_mid, schedule.t_of_sigma(sigma_mid.reshape(-1)))
-            down, up = _ancestral(sigma_t, sigma_s)
+            down, up = ancestral_step(sigma_t, sigma_s)
             noise = self._noise(state, jnp.min(sigma_t), jnp.min(sigma_s), x.shape)
             return _sde_step(x, denoised_mid, sigma_t, down) + noise * up
 

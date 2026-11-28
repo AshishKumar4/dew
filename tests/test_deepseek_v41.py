@@ -137,10 +137,10 @@ draw a test of its own, where the two took 298 s in one (train 1003, row 7449)."
 @attending("reference")
 @pytest.mark.parametrize("seed", range(QAT_SEEDS))
 def test_a_quantization_aware_step_is_never_wrong(source, monkeypatch, seed):
-    """The tiny's quantization-aware training step, its activations rounding through the release's
-    quantizers with the straight-through estimator (`fake_quant.straight_through`, docs/design/training.md
-    Quantization-aware training): its loss, its gradient in every parameter and its parameters after one
-    SGD step, over drawn ids, each primitive within its own operation's contract (check 2,
+    """The tiny's quantization-aware training step, its activations rounding through the release's quantizers
+    with the straight-through estimator (`dew.nn.derivatives.straight_through`, docs/design/training.md
+    Quantization-aware training): its loss, its gradient in every parameter and its parameters after one SGD
+    step, over drawn ids, each primitive within its own operation's contract (check 2,
     `certified.assert_certified`), traced as its users run it, without the suite's wide CPU arithmetic. No
     reference trains the release, which is inference code: the step is held to its own contract, element by
     element."""

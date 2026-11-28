@@ -15,7 +15,8 @@ import inspect
 import jax.numpy as jnp
 from flax import linen as nn
 
-from dew.nn.fake_quant import FakeQuantizing, fake_quant_fp4, fake_quant_fp8, straight_through
+from dew.nn.derivatives import straight_through
+from dew.nn.fake_quant import FakeQuantizing, fake_quant_fp4, fake_quant_fp8
 from dew.nn.kernels import generation
 
 _SIGNATURES = {name: inspect.signature(getattr(FakeQuantizing, name)) for name in ("fp8", "fp4")}

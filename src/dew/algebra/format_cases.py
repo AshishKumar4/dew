@@ -22,7 +22,7 @@ from dew.algebra.generate import (
     float32_cases,
     normal_operands,
 )
-from dew.nn import fake_quant, precision
+from dew.nn import derivatives, precision
 from dew.nn.kernels import formats
 from dew.nn.kernels.templates import product
 from dew.nn.kernels.templates.gemm import quantized
@@ -217,7 +217,7 @@ def _ste_truth(x, rounded):
 
 
 def _ste_flat_tangent(x, rounded, dx, dr, value):
-    return fake_quant.rounded_tangent((x, rounded), (dx, dr), value)
+    return derivatives.rounded_tangent((x, rounded), (dx, dr), value)
 
 
 def _ste_tangent_truth(x, rounded, dx, dr, value):
@@ -298,10 +298,10 @@ def _e8m0_truth(codes):
     return jnp.select((codes == 0, codes == 255), (jnp.uint32(0x00400000), jnp.uint32(0x7fc00000)), regular)
 
 
-QUANTIZED_STE = SurrogateBodies(fake_quant._rounded_value, fake_quant.rounded_tangent, (),
+QUANTIZED_STE = SurrogateBodies(derivatives._rounded_value, derivatives.rounded_tangent, (),
                                 symbolic_zeros=False, cases=(
     ((), SurrogateCase("quantized_ste", ComponentForm(
-        fake_quant._rounded_value, _ste_truth, _ste_cases(reverse=False)),
+        derivatives._rounded_value, _ste_truth, _ste_cases(reverse=False)),
                        {(): ComponentForm(_ste_flat_tangent, _ste_tangent_truth, _ste_cases(reverse=True))},
                        output_tree=(jax.tree.structure(0),))),
 )).declared(__name__)

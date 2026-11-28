@@ -1,6 +1,7 @@
 """Source-file loading for tools exercised by several test suites, git in a test's scratch repository, and a
 node session's side of a measurement window."""
 
+import functools
 import os
 import runpy
 import subprocess
@@ -25,6 +26,15 @@ def load(name: str, directory: str = "tools") -> ModuleType:
     """The repository's `directory/name.py` as the module `name_under_test`,
     registered before it runs so its dataclasses resolve their module (`reference_source.loaded`)."""
     return loaded(f"{name}_under_test", REPO_ROOT / directory / f"{name}.py")
+
+
+@functools.cache
+def scheduler_oracles() -> ModuleType:
+    """tools/float64_schedulers.py, the schedulers' independent float64 oracles, loaded once with its family
+    modules beside it (tools/float64_oracle.py and the rest, `run_from`), so every test reads one class of
+    each oracle."""
+    with run_from("float64_schedulers", "tools") as module:
+        return module
 
 
 @contextmanager
