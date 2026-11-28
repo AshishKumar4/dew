@@ -969,12 +969,13 @@ def _packed_epilogues(launched) -> list:
 
 
 @pytest.mark.parametrize("grouped", [False, True], ids=["matrix", "bank"])
-def test_a_packed_nvfp4_call_finishes_its_scale_in_its_launch_where_it_runs_unswapped(grouped):
-    """An NVFP4 product named packed on an H100 whose tensor scale is one a column, as a matrix and as a bank
-    of two experts: a prefill's launch takes the scale and the decode's owed 2^8 in its epilogue
-    (`gemm._packed_finish`, row 13743), no factor's rows formed; a decode's 16 rows (swapped or not) take
-    none, the factor XLA's after it, as its receipts timed it; interpreted on this CPU (whose float32 flushes
-    the subnormals `factored`'s own rounding keeps) no launch takes it either."""
+def test_a_packed_nvfp4_call_finishes_its_scale_in_its_launch_where_it_varies_by_group(grouped):
+    """An NVFP4 product named packed on an H100 whose tensor scale is one a column, as a bank of two experts
+    and as a matrix: a bank's prefill launch takes the scale and the decode's owed 2^8 in its epilogue
+    (`gemm._packed_finish`, row 13743), no row's expert's scales gathered after it; a matrix's takes none,
+    its one scale XLA's in the output's conversion, which the epilogue's finish only slowed (M-NG-68t4,
+    GH200); a decode's 16 rows (swapped or not) take none, as its receipts timed it; interpreted on this CPU
+    (whose float32 flushes the subnormals `factored`'s own rounding keeps) no launch takes it either."""
 
     def epilogues(rows, *, interpret):
         spec, matrix, sizes = _columned_case(rows, grouped=grouped)
@@ -985,7 +986,7 @@ def test_a_packed_nvfp4_call_finishes_its_scale_in_its_launch_where_it_runs_unsw
         assert found, rows
         return found
 
-    assert all(epilogue is not None for epilogue in epilogues(256, interpret=False))
+    assert all((epilogue is not None) == grouped for epilogue in epilogues(256, interpret=False))
     assert all(epilogue is None for epilogue in epilogues(256, interpret=True))
     # A decode's rows (the receipts' decode cells, `NVFP4_DECODE_ROWS`) keep the factor after the launch.
     assert all(epilogue is None for epilogue in epilogues(16, interpret=False))
@@ -1000,13 +1001,13 @@ def test_a_packed_nvfp4_pin_its_finish_cannot_take_keeps_the_plain_launch(interp
     raised (`gemm._packed_finish`: the optional finish bound as its native launch is, row 13743's review)."""
     from dew.nn.kernels.templates import report
 
-    spec, matrix, _ = _columned_case(256, grouped=False)
+    spec, matrix, sizes = _columned_case(256, grouped=True)
     launch = grouped_quantized.MosaicPackedGmm()
     mesh = generation.gpu_mesh(Mesh(np.array(jax.devices()[:1]), ("data",)), "sm90")
 
     def packed(pins):
         with generation.chosen(nvfp4="packed"), tuning.pinned(pins), tuning.seen() as launched:
-            jax.jit(lambda x: gemm.nvfp4_product(x, matrix, out_dtype=jnp.float32,
+            jax.jit(lambda x: gemm.nvfp4_product(x, matrix, sizes, out_dtype=jnp.float32,
                                                  interpret_on_cpu=interpret)).trace(spec)
         return [(observed.config, observed.arguments) for observed in launched.held()
                 if isinstance(observed.arguments.op, grouped_quantized.MosaicPackedGmm)]
@@ -1026,14 +1027,13 @@ def test_a_packed_nvfp4_pin_its_finish_cannot_take_keeps_the_plain_launch(interp
     assert all(taken == launch.completed(plain, config) for taken, _ in after), after
 
 
-@pytest.mark.parametrize("grouped", [False, True], ids=["matrix", "bank"])
 @pytest.mark.parametrize("gpu", [pytest.param("sm80", marks=lowers("sm80")),
                                  pytest.param("sm90", marks=lowers("sm90"))])
-def test_a_packed_nvfp4_prefill_finishing_its_scale_lowers_for_cuda(gpu, grouped):
-    """A prefill-sized NVFP4 product named packed whose tensor scale is one a column (a matrix's, a bank's
-    of two experts) lowers for CUDA on an A100 and an H100 with its launch's epilogue taking the scale, a
-    side each tile reads where it lands (row 13743)."""
-    spec, matrix, sizes = _columned_case(256, grouped=grouped)
+def test_a_packed_nvfp4_prefill_finishing_its_scale_lowers_for_cuda(gpu):
+    """A prefill-sized NVFP4 product named packed whose tensor scale is one a column of each of a bank's
+    two experts lowers for CUDA on an A100 and an H100 with its launch's epilogue taking the scale, a side
+    each tile reads where it lands (row 13743)."""
+    spec, matrix, sizes = _columned_case(256, grouped=True)
     mesh = generation.gpu_mesh(Mesh(np.array(jax.devices()[:1]), ("data",)), gpu)
     with (generation.assumed(gpu), jax.sharding.use_abstract_mesh(mesh), generation.chosen(nvfp4="packed"),
           tuning.seen() as launched):
