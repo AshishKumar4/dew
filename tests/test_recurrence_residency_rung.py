@@ -1,6 +1,6 @@
-"""The recurrence template's residency rung (`template.Mosaic._fewer`, `resources.Residents`): a spilled launch
-a program fewer a multiprocessor, each on its own, where it moves no registers as where its producer's ladder
-ran out."""
+"""The recurrence template's residency rung (`template.Mosaic._fewer`, `resources.Residents`): a spilled
+launch a program fewer a multiprocessor, each on its own, where it moves no registers as where its producer's
+ladder ran out."""
 
 import dataclasses
 
