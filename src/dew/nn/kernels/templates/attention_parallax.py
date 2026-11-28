@@ -80,8 +80,8 @@ from jax.custom_derivatives import zero_from_primal
 
 from dew.algebra import means
 from dew.algebra.windows import Units
-from dew.nn.derivatives import KernelGlue, Protected, contracted, declared_tangent, surrogate
 from dew.nn import sharding
+from dew.nn.derivatives import KernelGlue, Protected, contracted, declared_tangent, surrogate
 from dew.nn.float_bits import raised_exactly
 from dew.nn.kernels import generation
 from dew.nn.kernels.templates.attention import REFERENCE_PRECISION, KeySpans, dense, logit_scale, prescaled
