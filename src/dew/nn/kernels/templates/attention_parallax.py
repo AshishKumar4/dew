@@ -80,6 +80,7 @@ from jax.custom_derivatives import zero_from_primal
 
 from dew.algebra import means
 from dew.algebra.windows import Units
+from dew.nn import sharding
 from dew.nn.derivatives import KernelGlue, Protected, contracted, declared_tangent, surrogate
 from dew.nn.float_bits import raised_exactly
 from dew.nn.kernels import generation
@@ -844,8 +845,10 @@ def derivative(query, second, key, second_key, value, spans: KeySpans, held: Mom
     (dq, dr), per_tile = _tiled(step, (carried(call.query), carried(call.second)), tiles)
 
     def keyed(x):
-        # `[tiles, B, tile, Hk, D]` back to `[B, K, Hk, D]`.
-        return jnp.moveaxis(x, 0, 1).reshape(x.shape[1], -1, *x.shape[3:])[:, :key.shape[1]]
+        # `[tiles, B, tile, Hk, D]` back to `[B, K, Hk, D]`, its key extent stated: a call of no batch rows
+        # inferred none from zero elements (train 1511's K-F3).
+        return jnp.moveaxis(x, 0, 1).reshape(x.shape[1], x.shape[0] * x.shape[2], *x.shape[3:])[
+            :, :key.shape[1]]
 
     dk, dk2, dv = map(keyed, per_tile)
     return (_ungrouped(_scaled(dq[0], scale, -dq[1][..., None])),
@@ -942,8 +945,8 @@ def _dense_tangent(dtype: str, primals, tangents, value) -> jax.Array:
     # contraction, never a mean's and a weighted sum's products apart (`2^128` before `3 · 2^126` met it).
     weights = jnp.where(seen, tile.masses / over, 0.0)
     wide = dseconds.dtype
-    secondly = generation.linear_map(_second_moved, _second_pulled, (weights, values, rows.astype(wide)),
-                                     dseconds)
+    secondly = generation.linear_map(_second_moved, _second_pulled,
+                                     (weights, values, rows.astype(wide), seconds), dseconds)
     return moved + _ungrouped(valued + secondly).astype(dtype)
 
 
@@ -958,7 +961,7 @@ def _second_moved(residuals: tuple, direction: jax.Array) -> jax.Array:
     at their rows' power `2^p` (`_called`): centred (`_centred`), met by the values, then taken back by
     `2^-p`, so a direction the power held meets small values before the power restores it (train 1500's
     review: restored first, `∓2^124` read infinity against values `2^-10`)."""
-    weights, values, rows = residuals
+    weights, values, rows, _ = residuals
     return power2(_weighed(_centred(weights, direction), values), -rows)
 
 
@@ -966,12 +969,15 @@ def _second_pulled(residuals: tuple, cotangent: jax.Array) -> jax.Array:
     """`_second_moved`'s transpose: the cotangent met by the values (`dO · v` a key), weighed before it is
     centred, `w Σ (w c) - w c` (`_centred`'s transpose in the order that shrinks first), then taken back by
     `2^-p`, so a cotangent near fp32's largest cancels before the power doubles it (restored first,
-    `dO · v = 2^127` read `inf - inf`; centred before weighed, `3 · 2^126` overflowed)."""
-    weights, values, rows = residuals
+    `dO · v = 2^127` read `inf - inf`; centred before weighed, `3 · 2^126` overflowed). Typed as the second
+    products vary (`sharding.summed_to`): values split over a checked map's axis and the products held
+    alike on each device, each device's is its partial of theirs (train 1511's K-F2)."""
+    weights, values, rows, seconds = residuals
     met = float32_einsum("bhgqd,bkhd->bhgqk", cotangent, values, precision=REFERENCE_PRECISION,
                          preferred_element_type=cotangent.dtype)
     weighed = weights * met
-    return power2(weights * jnp.sum(weighed, axis=-1, keepdims=True) - weighed, -rows)
+    return sharding.summed_to(power2(weights * jnp.sum(weighed, axis=-1, keepdims=True) - weighed, -rows),
+                              seconds)
 
 
 _dense = contracted("test_parallax_holds_every_order")(

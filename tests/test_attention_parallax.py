@@ -754,15 +754,19 @@ def test_a_decay_past_int32_erases_no_dominant_term():
 
 
 @pytest.mark.mesh(devices=2)
-def test_parallax_runs_under_a_checked_map_with_its_values_split_alone():
+@pytest.mark.parametrize("arm", ["walk", "reference"])
+def test_parallax_runs_under_a_checked_map_with_its_values_split_alone(arm):
     """Parallax and its derivative under a checked `shard_map` whose values and cotangent alone are split by
     batch, its queries and keys replicated: on par with each batch's unsplit call against float64 (check
     1), its scans' carries typed as their steps make them (`attention_parallax._tiled`), where carries
-    seeded from the query alone failed the scan (train 1444's review)."""
+    seeded from the query alone failed the scan (train 1444's review); the dense call's second keys'
+    cotangent each device's partial summed (`_second_pulled`), where it reached the replicated second
+    keys varying and the map's transpose refused it (train 1511's K-F2)."""
     from jax.sharding import AxisType, PartitionSpec as P
 
     mesh = jax.make_mesh((2,), ("data",), axis_types=(AxisType.Auto,), devices=jax.devices()[:2])
     spans = template.spans(8, 8, 1, causal=True)
+    attend = attention_parallax.attend if arm == "walk" else attention_parallax.reference
 
     def per_batch(attend):
         def run(query, second, key, second_key, value, cotangent):
@@ -776,24 +780,27 @@ def test_parallax_runs_under_a_checked_map_with_its_values_split_alone():
         return run
 
     def mapped(query, second, key, second_key, value, cotangent):
-        local = jax.shard_map(lambda *operands: attention_parallax.attend(*operands, spans), mesh=mesh,
+        local = jax.shard_map(lambda *operands: attend(*operands, spans), mesh=mesh,
                               in_specs=(P(), P(), P(), P(), P("data")), out_specs=P("data"))
         out, pull = jax.vjp(local, query, second, key, second_key, value)
         return out, *pull(cotangent)
 
-    assert_as_exact(jax.jit(mapped), jax.jit(per_batch(attention_parallax.attend)), _batches(29, 1, 2),
-                    "parallax with its values split alone", seeds=FEWEST_SEEDS,
+    assert_as_exact(jax.jit(mapped), jax.jit(per_batch(attend)), _batches(29, 1, 2),
+                    f"parallax ({arm}) with its values split alone", seeds=FEWEST_SEEDS,
                     truth_fn=jax.jit(per_batch(_plain)))
 
 
-def test_a_call_of_no_queries_pulls_back_zeros():
-    """No query over one key (`template.spans(0, 1, 1)`): every operand's cotangent zeros of its shape, a
-    key's landing over no query `_NONE` (`attention_parallax._landing`), where its maximum over no query
-    failed (train 1444's review)."""
-    operands = (jnp.zeros((1, 0, 1, 4), jnp.float32), jnp.zeros((1, 0, 1, 1), jnp.float32),
-                jnp.ones((1, 1, 1, 4), jnp.float32), jnp.ones((1, 1, 1, 1), jnp.float32),
-                jnp.ones((1, 1, 1, 4), jnp.float32))
-    spans = template.spans(0, 1, 1)
+@pytest.mark.parametrize(("batch", "queries"), [(1, 0), (0, 1)], ids=["no queries", "no batch rows"])
+def test_a_call_of_no_queries_pulls_back_zeros(batch, queries):
+    """No query over one key (`template.spans(0, 1, 1)`), or no batch row (`template.spans(1, 1, 0)`): every
+    operand's cotangent zeros of its shape, a key's landing over no query `_NONE`
+    (`attention_parallax._landing`), where its maximum over no query failed (train 1444's review), and the
+    keys' cotangents gathered back to their extent stated, where no batch row's inferred none from zero
+    elements (train 1511's K-F3)."""
+    operands = (jnp.zeros((batch, queries, 1, 4), jnp.float32),
+                jnp.zeros((batch, queries, 1, 1), jnp.float32), jnp.ones((batch, 1, 1, 4), jnp.float32),
+                jnp.ones((batch, 1, 1, 1), jnp.float32), jnp.ones((batch, 1, 1, 4), jnp.float32))
+    spans = template.spans(queries, 1, batch)
     out, pull = jax.vjp(lambda *xs: attention_parallax.attend(*xs, spans), *operands)
     for grad, operand in zip(pull(jnp.zeros_like(out)), operands, strict=True):
         np.testing.assert_array_equal(np.asarray(grad), np.zeros(operand.shape, np.float32))
