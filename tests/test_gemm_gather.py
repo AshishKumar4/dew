@@ -129,7 +129,7 @@ def a_gathered_product_is_on_par(interpret: bool = False, *, paired: bool = Fals
 
         return jnp.stack([product(matrices[0]), product(matrices[1])]) if paired else product(matrices[0])
 
-    library = ({'library_fn': cublas_compiled(by_cublas, draw(0), "__cublas$lt$matmul"), 'library_row': 5491,
+    library = ({'library_fn': cublas_compiled(by_cublas, "__cublas$lt$matmul"), 'library_row': 5491,
                 'library_leaves': ("",)} if cublas else {})
     if refused is not None and pinned:
         with pytest.raises(tuning.Unpinnable):

@@ -1614,6 +1614,16 @@ def _site_judged(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth_fn
     if (ahead := reading()) is None:
         _refuse_numpy_arms(draw, dew_fn, reference_fn, *([] if library_fn is None else [library_fn]),
                            *also.values())
+        from arm_store import _library_checked
+
+        # Each arm its run compiles, no prepare having reached the site (no store, or a prepare past its cap),
+        # a library arm held to its call on the executable it runs (row 14096, train 1472's review).
+        compiled = (_library_checked(compiled[0], dew_fn, f"{label}: its Dew arm"),
+                    _library_checked(compiled[1], reference_fn, f"{label}: its reference arm"),
+                    [_library_checked(arm, fn, f"{label}: its {name} arm")
+                     for arm, (name, fn) in zip(compiled[2], also.items(), strict=True)])
+        twins = [_library_checked(twin, reference_fn if name is None else fn, f"{label}: its written twin")
+                 for (name, fn), twin in zip(written, twins, strict=True)]
     else:
         from arm_store import _stored_arm, _stored_arms
 
@@ -1625,9 +1635,13 @@ def _site_judged(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth_fn
     dew_fn, reference_fn, further = compiled
     further = [*further, *twins]
     library = None if library_fn is None else _arms(library_fn, library_fn)[1]
-    # A library arm's draws run by the program its prepare compiled, as the other arms' are (row 8468).
-    library_fn = library if library is None or ahead is None else _stored_arm(ahead[0], label, library_fn,
-                                                                              library, "library")
+    # A library arm's draws run by the program its prepare compiled, as the other arms' are (row 8468); with
+    # none prepared, by its run's own compile, held to its call (row 14096).
+    if library is not None:
+        from arm_store import _library_checked
+
+        library_fn = (_library_checked(library, library_fn, f"{label}: its library arm") if ahead is None
+                      else _stored_arm(ahead[0], label, library_fn, library, "library"))
     truth_fn = truth_program
     # Each range's draws, every reference's, computed once for the stages of them all.
     ranges: dict[tuple[int, int], list[_Draws]] = {}

@@ -101,12 +101,12 @@ xla/stream_executor/cuda/cuda_blas_lt.cc), and a dot stating none takes the lane
 JAX_DEFAULT_MATMUL_PRECISION=highest (tests/lane_environment.py), under which the arm summed in fp32."""
 
 
-def cublaslt_arm(fn, inputs):
+def cublaslt_arm(fn):
     """`fn`, a program whose dots multiply FP8 codes into fp32, compiled as cuBLASLt's FP8 GEMM runs each
     (`generation_support.cublas_compiled`), the reference arm of a block-scaled FP8 form on Hopper
     (docs/design/testing.md, "FP8 products": held at parity with cuBLASLt, the owner's ruling of 2026-11-11);
     on a CPU its dots are XLA's own, exact."""
-    return cublas_compiled(fn, inputs, "__cublas$lt$matmul$f8")
+    return cublas_compiled(fn, "__cublas$lt$matmul$f8")
 
 
 def cublaslt(sizes, out_dtype: str) -> callable:
@@ -195,7 +195,7 @@ def a_blockwise_fp8_product_is_on_par(case: tuple[str, ...]) -> None:
     combination = dict(zip(AXES["blockwise_fp8"], case, strict=True))
     groups, out_dtype = int(combination["groups"]), combination["out_dtype"]
     draw = functools.partial(_operands, combination)
-    reference = cublaslt_arm(cublaslt(_sizes(groups), out_dtype), draw(0))
+    reference = cublaslt_arm(cublaslt(_sizes(groups), out_dtype))
     with generation.routes() as routes:
         assert_as_exact(jax.jit(_product(groups, out_dtype, "mosaic")), reference, draw, "-".join(case),
                         seeds=SEEDS, truth_fn=truth(_sizes(groups)))

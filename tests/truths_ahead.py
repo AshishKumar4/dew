@@ -406,28 +406,34 @@ class CompiledTruths:
             programs = AheadPrograms.load(site / PROGRAMS).loaded()
             held = pickle.loads((site / HELD).read_bytes())
             for name, record in held.items():
-                # A library arm's executable, the one this run loads, held to its library's call (row 14096).
-                if record.get("library_call") is not None and jax.default_backend() == "gpu":
-                    library_checked(programs[name], record["library_call"], f"{label}: {name}")
+                # A library arm's executable, the one this run loads, held to its library's call where it runs
+                # on the backend that makes it (row 14096).
+                marked = record.get("library_call")
+                if marked is not None and marked[1] == jax.default_backend():
+                    library_checked(programs[name], marked[0], f"{label}: {name}")
             self.read[label] = (programs, held)
         return self.read[label]
 
 
-_LIBRARY_CALLS: weakref.WeakKeyDictionary[Callable, str] = weakref.WeakKeyDictionary()
-"""Each library arm's call (`library_arm`), by its program."""
+_LIBRARY_CALLS: weakref.WeakKeyDictionary[Callable, tuple[str, str]] = weakref.WeakKeyDictionary()
+"""Each library arm's call and the backend it makes it on (`library_arm`), by its program."""
 
 
-def library_arm[Fn: Callable](fn: Fn, call: str) -> Fn:
+def library_arm[Fn: Callable](fn: Fn, call: str, backend: str = "gpu") -> Fn:
     """`fn`, a library arm's program (`generation_support.cublas_compiled`), marked as one whose executable
-    calls the library's `call`, which the gate checks it by where it runs (`library_checked`)."""
-    _LIBRARY_CALLS[fn] = call
+    calls the library's `call` where it runs on `backend` (a GPU's cuBLAS; elsewhere its dots are XLA's own),
+    which the gate checks it by where it runs there (`library_checked`): a prepared executable as its run
+    loads it (`CompiledTruths._site`), else the run's own compile (`arm_store._library_checked`)."""
+    _LIBRARY_CALLS[fn] = (call, backend)
     return fn
 
 
-def library_call(fn) -> str | None:
-    """The library call `fn`'s executable makes, where it is a library arm (`library_arm`); None otherwise,
-    a value no weak reference holds (a partial, a builtin) among them, which no arm marks."""
-    return next((call for arm, call in _LIBRARY_CALLS.items() if arm is fn), None)
+def library_call(fn) -> tuple[str, str] | None:
+    """The library call `fn`'s executable makes and the backend it makes it on, where it is a library arm
+    (`library_arm`); None otherwise, a value no weak reference holds (a partial, a builtin) among them, which
+    no arm marks. Read where an arm is prepared, whatever the host, and checked where it runs on that
+    backend (`library_checked`)."""
+    return next((marked for arm, marked in _LIBRARY_CALLS.items() if arm is fn), None)
 
 
 def library_checked(executable: jax.stages.Compiled, call: str, label: str) -> None:

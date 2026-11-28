@@ -354,15 +354,16 @@ def _stored_arm(store: CompiledTruths, label: str, given_fn, arm, role: str, *, 
 
 
 def _library_checked(arm, given_fn, label: str):
-    """`arm`, a site's arm its run compiles on its GPU (unprepared, unnamed, or at run), held to its library's
-    call where `given_fn`'s program (`_adapted`) is a library arm (`truths_ahead.library_arm`) and it runs on
-    a GPU (`truths_ahead.library_checked`), no prepare having compiled it (row 14096); `arm` as it is
-    otherwise."""
+    """`arm`, a site's arm its run compiles (none prepared: no store, a site its prepare did not reach, an
+    unnamed or at-run arm), held to its library's call where `given_fn`'s program (`_adapted`) is a library
+    arm (`truths_ahead.library_arm`) and it runs on the backend that makes the call
+    (`truths_ahead.library_checked`), checked on the executable it runs (row 14096, train 1472's review);
+    `arm` as it is otherwise."""
     def checked(given, compiled):
-        call = library_call(given)
-        if call is None or jax.default_backend() != "gpu":
+        marked = library_call(given)
+        if marked is None or marked[1] != jax.default_backend():
             return compiled
-        return _LibraryChecked(compiled, call, label)
+        return _LibraryChecked(compiled, marked[0], label)
 
     return _adapted(given_fn, arm, checked)
 
