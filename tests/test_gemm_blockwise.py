@@ -591,22 +591,58 @@ def test_a_nan_among_normal_draws_scales_its_block_as_a_nan_maximum():
     np.testing.assert_array_equal(np.asarray(quantized.stored(scales, (128, True))).view(np.uint32), held.T)
 
 
-def test_a_nan_in_a_weight_block_among_normal_draws_scales_that_block_alone():
+@pytest.mark.parametrize("dtype", [jnp.bfloat16, jnp.float8_e4m3fnuz])
+def test_a_nan_in_a_weight_block_among_normal_draws_scales_that_block_alone(dtype):
     """A bank of normal draws holding one NaN in each matrix, quantized 128 x 128 blocks at a time
     (`projections.blocks_quantized`): the block holding it takes a NaN maximum's scale
     (`fake_quant.fp8_block_scale`'s -0.0), every other block a power of two (row 14083's review: a float
-    block maximum, which XLA:CPU's YNNPACK reduction takes over both a block's axes, dropped the NaN)."""
+    block maximum, which XLA:CPU's YNNPACK reduction takes over both a block's axes, dropped the NaN), at
+    bf16 and in an FNUZ format, whose NaN is its sign bit alone."""
     rng = np.random.default_rng(14083)
     w = rng.normal(size=(4, 256, 256)).astype(np.float32)
     at = [(2, 130), (37, 5), (200, 211), (129, 128)]
     for group, (row, column) in enumerate(at):
         w[group, row, column] = np.nan
-    _, scales = projections.blocks_quantized(jnp.asarray(w, jnp.bfloat16))
+    _, scales = projections.blocks_quantized(jnp.asarray(w, dtype))
     held = np.asarray(scales).view(np.uint32)
     holding = np.zeros(held.shape, bool)
     for group, (row, column) in enumerate(at):
         holding[group, row // 128, column // 128] = True
     np.testing.assert_array_equal(held == 0x80000000, holding)
+
+
+@pytest.mark.mesh(devices=2)
+@pytest.mark.parametrize("k_major", [False, True])
+def test_a_bank_split_by_whole_depth_blocks_quantizes_on_an_explicit_mesh(k_major):
+    """`projections.blocks_quantized` of a bank whose depth an Explicit axis splits in whole 128-row blocks,
+    jitted, natural or K-major: its codes and scales bitwise the unsplit bank's (theme 22's review: a scale
+    spread by `jnp.repeat` over the split axis was refused, and main's one reshape splitting both axes)."""
+    from jax.sharding import NamedSharding, PartitionSpec
+
+    w = np.random.default_rng(4518).normal(size=(2, 512, 256)).astype(np.float32)
+    mesh = jax.make_mesh((2,), ("i",), (jax.sharding.AxisType.Explicit,), devices=jax.devices()[:2])
+    quantized = jax.jit(functools.partial(projections.blocks_quantized, k_major=k_major))
+    whole = quantized(jnp.asarray(w, jnp.bfloat16))
+    placed = jax.device_put(jnp.asarray(w, jnp.bfloat16), NamedSharding(mesh, PartitionSpec(None, "i")))
+    with jax.set_mesh(mesh):
+        split = quantized(placed)
+    for got, want in zip(split, whole, strict=True):
+        np.testing.assert_array_equal(np.asarray(got).view(np.uint8), np.asarray(want).view(np.uint8))
+    # The split kept on the codes' depth and the scales' depth blocks.
+    codes, scales = (tuple(array.sharding.spec) + (None,) * (3 - len(array.sharding.spec)) for array in split)
+    assert codes == ((None, None, "i") if k_major else (None, "i", None))
+    assert scales == (None, "i", None)
+
+
+@pytest.mark.parametrize("k_major", [False, True])
+def test_an_integer_bank_quantizes_as_its_widened_values(k_major):
+    """`projections.blocks_quantized` of an int8 bank, which has no float word to reduce: its codes and
+    scales bitwise those of its values widened to fp32, an exact widening (theme 22's review)."""
+    w = np.random.default_rng(4518).integers(-127, 128, size=(2, 256, 256)).astype(np.int8)
+    integers = projections.blocks_quantized(jnp.asarray(w), k_major=k_major)
+    widened = projections.blocks_quantized(jnp.asarray(w, jnp.float32), k_major=k_major)
+    for got, want in zip(integers, widened, strict=True):
+        np.testing.assert_array_equal(np.asarray(got).view(np.uint8), np.asarray(want).view(np.uint8))
 
 
 @pytest.mark.parametrize("rows", [200, 256])

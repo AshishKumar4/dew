@@ -347,18 +347,19 @@ def test_a_nan_among_normal_draws_takes_the_nan_scale_quantized_or_in_the_epilog
 
 
 @pytest.mark.parametrize("dtype", [jnp.bfloat16, jnp.float16, jnp.float32, jnp.float64, jnp.float8_e4m3fn,
-                                   jnp.float8_e5m2])
+                                   jnp.float8_e5m2, jnp.float8_e4m3fnuz, jnp.float8_e5m2fnuz])
 def test_a_largest_magnitude_is_ieees_maximum_of_magnitudes_at_every_width(dtype):
     """`float_bits.largest_magnitude` of each row, eager and jitted, bit for bit, at each width a quantizer
     reads: a NaN among normal draws NaN; an infinity (E4M3FN's largest finite, as it holds none) among them
     that; a negative largest its magnitude; a least subnormal among zeros of both signs that subnormal, which
     a flushing maximum reads as zero; zeros of both signs +0 (row 14083's train 1477). A float64 array made in
-    x64 and reduced eagerly outside it reads its own width (its review)."""
+    x64 and reduced eagerly outside it reads its own width; an FNUZ format's NaN, its sign bit alone, NaN
+    (its review)."""
     from dew.nn.float_bits import largest_magnitude
 
     with jax.enable_x64(new_val=True) if dtype == jnp.float64 else contextlib.nullcontext():
         limits = jnp.finfo(dtype)
-        top = float(limits.max) if dtype == jnp.float8_e4m3fn else np.inf
+        top = np.inf if np.isinf(np.float32(np.inf).astype(dtype)) else float(limits.max)
         least = float(limits.smallest_subnormal)
         rows = np.random.default_rng(14083).normal(size=(5, 32))
         rows[0, 2], rows[1, 7], rows[2, 9] = np.nan, top, -8.0
@@ -444,6 +445,49 @@ def test_a_nan_in_a_quantizing_epilogues_product_takes_the_nan_scale():
     assert (held[2] == 0xFF).all() and (np.delete(held, 2, axis=0) != 0xFF).all()
     expected = formats.MxFp8.quantized(jnp.dot(x, w, preferred_element_type=jnp.float32)).scales
     np.testing.assert_array_equal(held, np.asarray(jax.lax.bitcast_convert_type(expected, jnp.uint8)))
+
+
+def _nan_among_normal_rows():
+    """Rows of normal draws holding one NaN each at its own column, by an identity: a product whose blocks
+    mix a NaN with finite values (row 14083's train 1477 and 1484 reviews)."""
+    rng = np.random.default_rng(14084)
+    x = rng.normal(size=(128, 128)).astype(np.float32)
+    x[np.arange(128), (np.arange(128) * 37) % 128] = np.nan
+    return jnp.asarray(x, jnp.bfloat16), jnp.eye(128, dtype=jnp.bfloat16)
+
+
+def test_a_launchs_quantizing_epilogue_scales_a_mixed_nan_block_as_the_quantizer():
+    """The template's launch (an H100's, interpreted, its epilogue in the accumulator's register layout)
+    quantizing a product to MXFP8 (`quantized.gemm_quantized`): each 32-column block mixing a NaN with
+    finite values takes the NaN scale, as `formats.MxFp8.quantized` of the product does, and every other
+    block's scale and code is the quantizer's (train 1484's review: the launch's arm reduced float
+    magnitudes, apart from the quantizer's words)."""
+    x, w = _nan_among_normal_rows()
+    with (generation.assumed("sm90"), generation.chosen(grouped_matmul="mosaic"),
+          generation.routes() as routes):
+        fused = quantized.gemm_quantized(x, w, minifloat=formats.MxFp8, interpret_on_cpu=True)
+    assert ("grouped_matmul", "mosaic") in {(route.choice, route.kernel) for route in routes}, routes
+    want = formats.MxFp8.quantized(jnp.dot(x, w, preferred_element_type=jnp.float32))
+    np.testing.assert_array_equal(np.asarray(fused.scales).view(np.uint8),
+                                  np.asarray(want.scales).view(np.uint8))
+    assert (np.asarray(want.scales).view(np.uint8) == 0xFF).any()
+    finite = ~np.isnan(np.asarray(jnp.dot(x, w, preferred_element_type=jnp.float32)))
+    np.testing.assert_array_equal(np.asarray(fused.codes).view(np.uint8)[finite],
+                                  np.asarray(want.codes).view(np.uint8)[finite])
+
+
+def test_a_launchs_word_block_maximum_lowers_for_an_h100():
+    """The same quantizing launch lowers for an H100 (Mosaic GPU on the CPU): its block maxima an unsigned
+    row reduction of magnitude words in the accumulator's layout (train 1484's review)."""
+    from kernel_compile import lowered_for
+
+    def fused(x, w):
+        with generation.chosen(grouped_matmul="mosaic"):
+            out = quantized.gemm_quantized(x, w, minifloat=formats.MxFp8)
+        return out.codes, out.scales
+
+    specs = (jax.ShapeDtypeStruct((128, 128), jnp.bfloat16), jax.ShapeDtypeStruct((128, 128), jnp.bfloat16))
+    lowered_for(fused, specs, "sm90")
 
 
 def test_a_float64_truths_block_past_float32s_range_keeps_its_scale():

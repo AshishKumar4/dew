@@ -891,43 +891,44 @@ def ragged(product: Callable[..., jax.Array], *operands, preferred_element_type:
            summed_wide: bool = False) -> jax.Array:
     """`product(*operands, preferred_element_type=...)`, a ragged dot (`jax.lax.ragged_dot_general` bound,
     `_ragged`; its last operand its group sizes, which count its rows and multiply nothing): where its groups
-    are statically none (the sizes' last axis empty) and count its rows (`_grouped`) its zeros
+    are statically none (the sizes' last axis empty) and count its rows (`_counts_groups`) its zeros
     (`_no_groups`), as it multiplies no row; else, `summed_wide` (`accumulated`'s), its products summed as a
-    wide CPU process sums them (`_summed_wide`), or as written. XLA's CUDA backend refuses a ragged dot of no
+    wide CPU process sums them (`_summed_wide`, over the program traced here, none traced twice), or as
+    written. XLA's CUDA backend refuses a ragged dot of no
     groups (row 14112: a forward's legalization left its result unmaterialized, a kernel gradient's
     contraction aborted the process; a bank of no experts on a GH200). Every ragged product Dew forms passes
     here (`accumulated`'s, `xla_products.placed_ragged_dot`'s, the fuser's dot as written)."""
     *multiplied, sizes = operands
-    traced = None if jnp.shape(sizes)[-1] else _grouped(product, operands, preferred_element_type)
-    if traced is not None:
-        return _no_groups(traced, operands)
+    traced = None
+    if not jnp.shape(sizes)[-1]:
+        traced = jax.make_jaxpr(functools.partial(product, preferred_element_type=preferred_element_type))(
+            *operands)
+        if _counts_groups(traced, product):
+            return _no_groups(traced, operands)
     if summed_wide and _sums_in_float64(*multiplied):
-        return _summed_wide(product, preferred_element_type, *operands, counts=1)
+        return _summed_wide(product, preferred_element_type, *operands, counts=1, traced=traced)
     return product(*operands, preferred_element_type=preferred_element_type)
 
 
-def _grouped(product: Callable[..., jax.Array], operands: tuple,
-             preferred_element_type) -> core.Jaxpr | None:
-    """The ragged dot `product` of `operands` traced (`jax.make_jaxpr`), where its group sizes count its
-    rows: its rows' ragged axis one it keeps or contracts (JAX's ragged non-contracting and contracting
-    modes). None where that axis is a batch axis (its ragged-batch mode), a batched dot whatever its sizes,
-    which it reads not at all (`jax.lax.ragged_dot_general`; train 1478's review of row 14112: two [2, 1, 1]
-    operands of 2s and 3s batched on their ragged axis are two 6s at sizes of no groups, not zeros). Its
-    dimension numbers read at any depth of the program (`programs.equations`: a product jitted or wrapped);
-    a product that binds no ragged dot is refused."""
-    bound = functools.partial(product, preferred_element_type=preferred_element_type)
-    traced = jax.make_jaxpr(bound)(*operands)
+def _counts_groups(traced: core.Jaxpr, product: Callable) -> bool:
+    """Whether the ragged dot `traced` (`product`'s program) has its group sizes count its rows: its rows'
+    ragged axis one it keeps or contracts (JAX's ragged non-contracting and contracting modes), not a batch
+    axis (its ragged-batch mode, a batched dot whatever its sizes, which it reads not at all:
+    `jax.lax.ragged_dot_general`; train 1478's review of row 14112: two [2, 1, 1] operands of 2s and 3s
+    batched on their ragged axis are two 6s at sizes of no groups, not zeros). Its dimension numbers read
+    at any depth of the program (`programs.equations`: a product jitted or wrapped); a product that binds
+    no ragged dot is refused."""
     numbers = next((equation.params["ragged_dot_dimension_numbers"] for equation in equations(traced)
                     if "ragged_dot_dimension_numbers" in equation.params), None)
     if numbers is None:
         raise ValueError(f"precision.ragged multiplies a ragged dot, and {product!r} binds none")
     (ragged_axis,) = numbers.lhs_ragged_dimensions
     _, (batch_axes, _) = numbers.dot_dimension_numbers
-    return None if ragged_axis in batch_axes else traced
+    return ragged_axis not in batch_axes
 
 
 def _no_groups(traced: core.Jaxpr, operands: tuple) -> jax.Array:
-    """A ragged dot of no groups' zeros (`traced`, its program, `_grouped`'s), typed as the product is: its
+    """A ragged dot of no groups' zeros (`traced`, its program), typed as the product is: its
     traced aval's zeros as JAX forms a value's (`ad_util.zeros_like_aval`: its dtype, a float64 one's outside
     x64 too, its weakness and its placement each the aval's, an Explicit one a shape's evaluation drops
     beside an Auto axis), varying as its operands vary; an eager call's made on the mesh of devices its
@@ -1025,15 +1026,17 @@ def _traced_once(key: tuple, summed: Callable) -> Callable:
     return nested(functools.partial(summed, product, preferred_element_type))
 
 
-def _summed_wide(product: Callable, preferred_element_type, *operands, counts: int = 0) -> jax.Array:
+def _summed_wide(product: Callable, preferred_element_type, *operands, counts: int = 0,
+                 traced: core.Jaxpr | None = None) -> jax.Array:
     """`accumulated`'s product under Dew's wide CPU arithmetic: its float64 sum where it takes the
     platform's choice (`platform_dependent`), the plain product where its result is wider than float32 or
-    its library states its derivative; its last `counts` operands multiply nothing (`float64_sum`)."""
+    its library states its derivative; its last `counts` operands multiply nothing (`float64_sum`).
+    `traced`, the product's program where its caller traced it (`ragged`'s), else traced here."""
     from dew.nn.kernels.generation import linear_tangent
 
     narrow = functools.partial(product, preferred_element_type=preferred_element_type)
-    traced, shape = jax.make_jaxpr(narrow, return_shape=True)(*operands)
-    dtype = shape.dtype
+    traced = jax.make_jaxpr(narrow)(*operands) if traced is None else traced
+    dtype = next(aval for aval in traced.out_avals if isinstance(aval, ShapedArray)).dtype
     if jnp.promote_types(dtype, jnp.float32) != jnp.float32 or _own_backward(traced.jaxpr):
         # A wider result converts the operands to it, so the products are not float32's; a product
         # with a backward of its own is its library's.

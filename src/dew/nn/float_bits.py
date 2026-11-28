@@ -121,8 +121,29 @@ def largest_magnitude(x: jax.Array, axis: int | tuple[int, ...] | None = None, *
     scale, a quotient of it, declares the maximum's own (`bits._nvfp4_amax`). A float64 one's words read in
     x64 whatever x64 scope it is called in (outside one, a 64-bit word is two 32-bit ones)."""
     with jax.enable_x64(new_val=True) if x.dtype == np.dtype(np.float64) else contextlib.nullcontext():
-        words, sign, _, _ = raw_fields(x)
-        return jax.lax.bitcast_convert_type(jnp.max(words ^ sign, axis=axis, keepdims=keepdims), x.dtype)
+        peak = jnp.max(magnitude_words(x), axis=axis, keepdims=keepdims)
+        return jax.lax.bitcast_convert_type(peak, x.dtype)
+
+
+def magnitude_words(x: jax.Array) -> jax.Array:
+    """Each of `x`'s magnitudes as an unsigned word of its width that orders as the magnitude does
+    (`raw_fields`' bits, the sign cleared): a NaN's above infinity's above every finite one's, -0's +0's; an
+    FNUZ format's NaN, its sign bit alone, kept whole, above every magnitude's. Any reduction of them by
+    integer maximum (`largest_magnitude`'s, a kernel's row reduction, `quantized._block_max`) bitcast back is
+    the largest magnitude; a float64 `x`'s read in x64 (its caller's scope)."""
+    words, sign, _, _ = raw_fields(x)
+    magnitude = words ^ sign
+    if _sign_bit_nan(x.dtype):
+        nan = words.dtype.type(1 << (jnp.finfo(x.dtype).bits - 1))
+        magnitude = jnp.where(words == nan, words, magnitude)
+    return magnitude
+
+
+def _sign_bit_nan(dtype) -> bool:
+    """Whether a float format's word of its sign bit alone is a NaN (the FNUZ formats', which hold no -0),
+    read off its own encoding."""
+    bits = jnp.finfo(dtype).bits
+    return bool(np.isnan(np.asarray(1 << (bits - 1), f"uint{bits}").view(dtype).astype(np.float32)))
 
 
 def split_bits(dtype) -> tuple[type, int, int]:
