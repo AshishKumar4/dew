@@ -287,13 +287,12 @@ def _shifted_tangent(product: Callable, primals, tangents, value) -> jax.Array:
     """`_shifted`'s tangent: the rows' direction met by `by` before the power, as the value forms it (so its
     pullback takes the power on a cotangent first, as autodiff of the value did); `by`'s direction met by
     the rows at their own size, the power's negative part taken by the rows first and its positive part by
-    the direction."""
+    the product (a row's power, which `by`, a key's values among it, cannot take)."""
     del value
     rows, by, shift = primals
     drows, dby, _ = tangents
     low, high = jnp.minimum(shift, 0), jnp.maximum(shift, 0)
-    raised = jax.tree.map(lambda direction: power2(direction, high), dby)
-    return power2(product(drows, by), shift) + product(power2(rows, low), raised)
+    return power2(product(drows, by), shift) + power2(product(power2(rows, low), dby), high)
 
 
 _shifted = contracted("test_parallax_holds_every_order")(

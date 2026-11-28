@@ -604,12 +604,22 @@ def test_a_logits_cancelling_terms_cancel_before_they_land():
     np.testing.assert_array_equal(np.asarray(dquery)[0, 0, 0, :2], [-2.0, 2.0])
 
 
+def _batches(stream: int, queries: int, values: int):
+    """A draw of 8 places: a query, second query, keys and second keys of `queries` batch rows, values and the
+    output's cotangent of `values` rows."""
+    def draw(seed):
+        return normal_draw([54, stream, seed], (queries, 8, 2, 4), (queries, 8, 2, 2), (queries, 8, 1, 4),
+                           (queries, 8, 1, 2), (values, 8, 1, 4), (values, 8, 2, 4))
+
+    return draw
+
+
 @pytest.mark.mesh(devices=2)
 def test_parallax_runs_batch_sharded_on_an_explicit_mesh_and_under_a_checked_map():
     """Parallax and its derivative over two batch rows split across two devices: on an Explicit mesh, its
     operands placed by batch, and under a checked `shard_map` over that batch, each on par with the
     unsplit call against float64 (check 1), its scans' carries seeded from its operands (their placement
-    and manual variance, `attention_parallax._empty`), where replicated seeds failed the scan (train 1423's
+    and manual variance, `attention_parallax._tiled`), where replicated seeds failed the scan (train 1423's
     review)."""
     from jax.sharding import AxisType, NamedSharding, PartitionSpec as P
 
@@ -619,9 +629,7 @@ def test_parallax_runs_batch_sharded_on_an_explicit_mesh_and_under_a_checked_map
     local = _every_cotangent(attention_parallax.attend, template.spans(8, 8, 1, causal=True))
     mapped = jax.jit(jax.shard_map(local, mesh=mesh, in_specs=P("data"), out_specs=P("data")))
 
-    def draw(seed):
-        return normal_draw([54, 23, seed], (2, 8, 2, 4), (2, 8, 2, 2), (2, 8, 1, 4), (2, 8, 1, 2),
-                           (2, 8, 1, 4), (2, 8, 2, 4))
+    draw = _batches(23, 2, 2)
 
     def placed(run):
         def on(*xs):
@@ -769,11 +777,7 @@ def test_parallax_runs_under_a_checked_map_with_its_values_split_alone():
         out, pull = jax.vjp(local, query, second, key, second_key, value)
         return out, *pull(cotangent)
 
-    def draw(seed):
-        return normal_draw([54, 29, seed], (1, 8, 2, 4), (1, 8, 2, 2), (1, 8, 1, 4), (1, 8, 1, 2),
-                           (2, 8, 1, 4), (2, 8, 2, 4))
-
-    assert_as_exact(jax.jit(mapped), jax.jit(per_batch(attention_parallax.attend)), draw,
+    assert_as_exact(jax.jit(mapped), jax.jit(per_batch(attention_parallax.attend)), _batches(29, 1, 2),
                     "parallax with its values split alone", seeds=FEWEST_SEEDS,
                     truth_fn=jax.jit(per_batch(_plain)))
 
