@@ -798,7 +798,8 @@ def test_an_absorbed_mla_forward_of_576_wide_keys_and_512_wide_values_is_on_par_
 def test_an_absorbed_mla_forward_states_its_key_buffer_once_under_jit():
     """A forward whose values are its keys' leading 512 columns (`MosaicForward.in_key`), traced for an H100,
     streams its key buffer once, and each launch that states its bytes states its query and key operands
-    alone, under jit, where the key and the value reach the launch as distinct tracers (row 6642)."""
+    and its outputs, each once, under jit, where the key and the value reach the launch as distinct tracers
+    (rows 6642, 14206)."""
     query = jax.ShapeDtypeStruct((1, 1024, 16, 576), jnp.bfloat16)
     key = jax.ShapeDtypeStruct((1, 1024, 1, 576), jnp.bfloat16)
     spans = template.spans(1024, 1024, 1, causal=True)
@@ -812,8 +813,10 @@ def test_an_absorbed_mla_forward_states_its_key_buffer_once_under_jit():
                    if (cost := equation.params.get("cost_estimate")) is not None and cost.bytes_accessed]
     assert stating
     for equation in stating:
-        operands = sum(int(np.prod(var.aval.shape)) * var.aval.dtype.itemsize for var in equation.invars[:2])
-        assert equation.params["cost_estimate"].bytes_accessed == operands
+        operands, outputs = (sum(int(np.prod(var.aval.shape)) * var.aval.dtype.itemsize for var in variables)
+                             for variables in (equation.invars[:2], equation.outvars))
+        assert outputs and equation.params["cost_estimate"].bytes_accessed == operands + outputs
+
 
 
 @INTERPRETS

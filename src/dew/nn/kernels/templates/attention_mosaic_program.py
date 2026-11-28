@@ -1400,6 +1400,12 @@ def stated(spec: algebra.Forward, batch: int, heads: int, *arrays, tile_walk: Ti
     return None if walked is None else Stated(walked[0] * batch * heads, stored(*arrays), walked[1])
 
 
+def accumulated(*shapes: tuple[int, ...]) -> tuple[jax.ShapeDtypeStruct, ...]:
+    """The fp32 gradients of `shapes` a backward launch adds into in place, which its statement counts
+    beside its declared outputs (`stated`, row 14206): its writes, though its call declares none of them."""
+    return tuple(jax.ShapeDtypeStruct(shape, jnp.float32) for shape in shapes)
+
+
 def modelled(spec: algebra.Forward, batch: int, heads: int, queries: int, widths: int) -> int | None:
     """The model's share of a launch's work (its emission's, `stated`), which its launch declares to Dew's
     FLOP count (`Family.kernel`'s `model_flops`): `widths` product columns of the model's products it owns

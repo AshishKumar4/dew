@@ -32,6 +32,7 @@ from dew.nn.kernels.templates.attention_mosaic_program import (
     _Spans,
     _streamed,
     _views_of,
+    accumulated,
     head_first,
     head_flat,
     head_layout,
@@ -478,23 +479,24 @@ def _fused_launch(query, key, value, dout, peak, total, anchor, delta, key_index
 
     def entry(*refs):
         family.scoped(functools.partial(body, *refs), *scoped, streams=rings, after_walks=tuple(after))
+    out_type = () if grouped else _fused_gradients(family, key, value, width, typed=typed)
+    dq_shape = (*head_slice(family, batch, heads, queries, jnp.float32), width)
     launch = family.kernel(
-        entry, out_type=() if grouped else _fused_gradients(family, key, value, width, typed=typed),
-        grid=(heads, batch, keys_padded // pair),
+        entry, out_type=out_type, grid=(heads, batch, keys_padded // pair),
         grid_names=("heads", "batch", "k_tiles"), consumers=consumers, interpret=walk.interpret,
         approx_math=walk.approx_math, name="attention_dkv_fused", reducing_warpgroups=reduced,
         reduces=fused_reduces(family, reduced), registers=walk.registers(dq=False),
         # (`modelled`): dQ's, dK's, dV's and dP's.
-        cost=stated(walk.spec, batch, heads, query, key, value, dout,
+        cost=stated(walk.spec, batch, heads, query, key, value, dout, *out_type,
+                    *accumulated(dq_shape, *(shapes if grouped else ())),
                     tile_walk=TileWalk((queries, keys_padded), (block_q, block_k), consumers, keyed=True,
                                        common=family.walks_streamed)),
         model_flops=modelled(walk.spec, batch, heads, walk.spec.queries or queries,
                              2 * width + 2 * value.shape[-1]))
     query, key, value, dout = (head_layout(family, arr) for arr in (query, key, value, dout))
     operands = (query, key, value, dout, peak, total, anchor, delta, key_index, *leaves)
-    dq_axes = head_slice(family, batch, heads, queries, jnp.float32)
     dq, dk, dv = _fused_called(launch, operands, (shapes, groups), copies=consumers if walk.interpret else 1,
-                               grouped=grouped, dq_shape=(*dq_axes, width))
+                               grouped=grouped, dq_shape=dq_shape)
     return (head_unlayout(family, dq, heads), head_unlayout(family, dk, kv_heads),
             head_unlayout(family, dv, kv_heads))
 

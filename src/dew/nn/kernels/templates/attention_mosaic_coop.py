@@ -30,6 +30,7 @@ from dew.nn.kernels.templates.attention_mosaic_program import (
     _Spans,
     _streamed,
     _views_of,
+    accumulated,
     modelled,
     reducing,
     stated,
@@ -243,6 +244,8 @@ def _coop_launch(query, key, value, dout, peak, total, anchor, delta, key_index,
         family.scheduled(consumers, consumer, producer)
 
     stages = min(program.tiles.stages, q_steps)
+    # Its dQ the accumulator it adds into in place, the one shape its launch states and its zeros take.
+    dq_shape = (batch, queries, heads, width)
     reduced = reducing(family, consumers, walk.reduces, scaled=staged_parts(query.dtype) > 1)
     stats_streamed = streamed_statistics(family, program.tiles, width, query.dtype, stages, reduced=reduced,
                                          allocations_of=_coop_allocations, anchored=False)
@@ -261,13 +264,13 @@ def _coop_launch(query, key, value, dout, peak, total, anchor, delta, key_index,
         reducing_warpgroups=reduced,
         # Its walk's statement, its work its emission's (`stated`); the model's products it owns
         # (`modelled`): dQ's, dK's, dV's and dP's.
-        cost=stated(walk.spec, batch, heads, query, key, value, dout,
+        cost=stated(walk.spec, batch, heads, query, key, value, dout, *accumulated(dq_shape, *shapes),
                     tile_walk=TileWalk((queries, keys_padded), (block_q, block_k), keyed=True,
                                        sharing=consumers)),
         model_flops=modelled(walk.spec, batch, heads, walk.spec.queries or queries,
                              2 * width + 2 * value.shape[-1]))
     # The accumulators' zeros this launch's own (`launches.filled`): unbound, every layer's were one buffer.
-    dq = jax.new_ref(launches.filled((batch, queries, heads, width), jnp.float32, query, dout))
+    dq = jax.new_ref(launches.filled(dq_shape, jnp.float32, query, dout))
     dkv = stacked.zeros(shapes, groups, query, dout)
     launch(query, key, value, dout, peak, total, anchor, delta, key_index, *leaves, dq, *dkv)
     dk, dv = stacked.read(dkv, groups)

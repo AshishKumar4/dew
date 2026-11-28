@@ -1944,7 +1944,8 @@ def test_forward_registers_charges_prescale_only_when_non_unit(gen):
 
 
 def test_paged_forward_emitted_work_counts_table_bytes():
-    """Row 11737: a public paged forward's emitted `Work.device_bytes` equals `stored` of Q/K/V/table."""
+    """Row 11737: a public paged forward's emitted `Work.device_bytes` equals `stored` of Q/K/V/table and of
+    the outputs it writes (row 14206)."""
     from dew.nn import programs
     from dew.nn.kernels.templates import attention_decode, cost, emission
 
@@ -1960,7 +1961,7 @@ def test_paged_forward_emitted_work_counts_table_bytes():
                     if eq.primitive in programs.NATIVE_KERNELS and (w := emission.work_of(eq)) is not None)
     q_a, k_a, v_a = (var.aval for var in eq.invars[:3])
     t_a = next(var.aval for var in eq.invars[3:] if var.aval.dtype == jnp.int32 and var.aval.ndim == 2)
-    assert work.device_bytes == cost.stored(q_a, k_a, v_a, t_a)
+    assert work.device_bytes == cost.stored(q_a, k_a, v_a, t_a, *(var.aval for var in eq.outvars))
 
 
 def test_step_live_tiles_tracks_hooks_dropout_accuracy_and_nested_subjaxprs():

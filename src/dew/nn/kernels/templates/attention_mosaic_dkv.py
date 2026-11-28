@@ -36,6 +36,7 @@ from dew.nn.kernels.templates.attention_mosaic_program import (
     _Spans,
     _streamed,
     _views_of,
+    accumulated,
     band_paired,
     column_share,
     head_first,
@@ -641,11 +642,12 @@ def _keys_last(arrays, kinds) -> tuple[jax.Array, ...]:
                  for array, kind in zip(arrays, kinds, strict=True))
 
 def _dkv_kernel(walk: _Backward, entry, graded: list[Kind], query, key, value, dout, shares: tuple,
-                name: str):
+                name: str, added: tuple = ()):
     """The dK/dV program `entry`'s launch (`Family.kernel`) over `query` `[B, Qp, H, D]` and `key` and
     `value` `[B, Kp, Hk, D]`: dK and dV `[B, Kp, H, D]` fp32 out, each its share's columns (`shares`), the
-    hook's key and tile gradients added into refs of their own (`_dkv_launched`); a program a query head's
-    key block a consumer, or one its consumers share (`holders`)."""
+    hook's key and tile gradients added into refs of their own (`_dkv_launched`), and a fused walk's dQ, each
+    of those `added` stated beside its outputs (`accumulated`); a program a query head's key block a
+    consumer, or one its consumers share (`holders`)."""
     batch, queries, heads, width = query.shape
     keys_padded, value_width = key.shape[1], value.shape[-1]
     family, consumers, tiles = walk.program.family, walk.consumers, walk.program.tiles
@@ -666,7 +668,7 @@ def _dkv_kernel(walk: _Backward, entry, graded: list[Kind], query, key, value, d
         registers=walk.registers(dq=False),
         # Its walk's statement, its work its emission's (`stated`); the model's products it owns
         # (`modelled`): its shares of dK's and dV's, dP's in the first share's and dQ's where it adds it.
-        cost=stated(walk.spec, batch, heads, query, key, value, dout,
+        cost=stated(walk.spec, batch, heads, query, key, value, dout, dk, dv, *added,
                     tile_walk=TileWalk((queries, keys_padded), (tiles.block_q, tiles.block_k),
                                        holders(family, consumers), keyed=True,
                                        common=family.feeds_itself or tiles.staged_logits)),
@@ -817,11 +819,12 @@ def _dkv_columns(query, key, value, dout, peak, total, anchor, delta, key_index,
             grads = stacked.views(refs[first:first + len(groups)], groups)
             outputs = refs[first + len(groups):first + len(groups) + 2]
             _summed_stored(family, summed, _shared_views(family, outputs, grads, graded, block_k), consumers)
-    launch = _dkv_kernel(walk, entry, graded, query, key, value, dout, shares, name)
+    dq_shape = (query.shape[0], queries, heads, width)
+    launch = _dkv_kernel(walk, entry, graded, query, key, value, dout, shares, name,
+                         accumulated(*buffers, *((dq_shape,) if walk.fused else ())))
     query, key, value, dout = (head_layout(family, arr) for arr in (query, key, value, dout))
     grads = _dkv_launched(walk, launch, (query, key, value, dout, peak, total, anchor, delta, key_index,
-                                         *leaves), graded, buffers, groups,
-                          dq_shape=(query.shape[0], queries, heads, width))
+                                         *leaves), graded, buffers, groups, dq_shape=dq_shape)
     swapped = 3 if walk.fused else 2
     return (*(head_unlayout(family, grad, heads) for grad in grads[:swapped]), *grads[swapped:])
 

@@ -2279,7 +2279,8 @@ def _launched(query, key, value, read: _Read, *, hooks: Hooks, spec: algebra.For
                               queries=queries, walk_rows=walk_rows)
     cost, model = _launch_flops(spec, family, query, key, value, keys_count, value_width, tiles,
                                 peaks=peaks, training=training, counted=counted, shared_by=shared_by,
-                                in_key=value_columns is not None, splits=splits, table=read.table)
+                                in_key=value_columns is not None, splits=splits, table=read.table,
+                                out_type=out_type)
     grid = (heads, batch, queries // pair * splits)
     reduced = reducing(family, consumers, hook_reduces(hooks) or hooks.output.fn is not None,
                        # A decided walk's second, scaled, reads its keys' magnitudes in the kernel too.
@@ -2409,7 +2410,7 @@ def _program_views(program: _Program, refs, read: _Read, *, peaks: bool, kv_head
 
 def _launch_flops(spec: algebra.Forward, family: mosaic.Family, query, key, value, keys_count: int,
                   value_width: int, tiles: Tiles, *, peaks: bool, training: bool, counted: bool,
-                  shared_by: int, in_key: bool, splits: int = 1, table=None) -> tuple:
+                  shared_by: int, in_key: bool, splits: int = 1, table=None, out_type: tuple = ()) -> tuple:
     """A launch's cost and the model's FLOPs it owns (`_launched`'s `cost` and `model_flops`): its walk's
     statement, its work its emission's (`stated`), and the model's products it owns (`modelled`): the
     forward's two, a peak walk's `Q K^T`, a training walk's `P V` beside its `Q K^T` recomputed, a block of
@@ -2419,14 +2420,16 @@ def _launch_flops(spec: algebra.Forward, family: mosaic.Family, query, key, valu
     is the larger, either counting work every step that runs at most rarely. A launch whose values are its
     keys' columns (`in_key`, `MosaicForward.in_key`) reads one stream, the key buffer counted once: a
     statement, as the launch's arrays reach it under `tuning.lowered_once`'s jit as distinct tracers. A
-    paged launch also streams its gather `table` operand once (row 11737)."""
+    paged launch also streams its gather `table` operand once (row 11737), and each launch writes its
+    outputs (`out_type`, `_out_types`') once (row 14206)."""
     batch, queries, heads, width = query.shape
     owned_value = 0 if peaks else value_width
     owned_query = 0 if training and not peaks else width
-    streamed = (query, key) if in_key else (query, key, value)
+    # A peak walk reads no values (`_peak_consumer`), a launch whose values are its keys' columns one stream.
+    streamed = (query, key) if in_key or peaks else (query, key, value)
     if table is not None:
         streamed = (*streamed, table)
-    cost = (stated(spec, batch, heads, *streamed,
+    cost = (stated(spec, batch, heads, *streamed, *out_type,
                    tile_walk=TileWalk((queries, keys_count), (tiles.block_q, tiles.block_k), tiles.consumers,
                                       common=family.feeds_itself, splits=splits)) if counted
             else estimate(0))

@@ -1,14 +1,25 @@
 """The attention template's backward pricing its one launch and its two (`MosaicBackward.price_config`), which
-its derivation takes the cheaper of (`MosaicBackward.derived`, row 12752)."""
+its derivation takes the cheaper of (`MosaicBackward.derived`, row 12752), and the bytes each launch states
+its device memory's (row 14206)."""
 
 import dataclasses
 import math
 
+import jax
+import jax.numpy as jnp
+import numpy as np
 import pytest
-from test_attention_mosaic import _backward_call
+from jax._src.state import types as state_types
+from test_attention_mosaic import FED, FORM_WIDTHS, WGMMA, _backward_call, _pinned
 
+from dew.nn import programs
 from dew.nn.kernels import generation
-from dew.nn.kernels.templates import attention_mosaic_derivation, cost
+from dew.nn.kernels.templates import (
+    attention as template,
+    attention_mosaic,
+    attention_mosaic_derivation,
+    cost,
+)
 
 pytestmark = pytest.mark.kernel
 
@@ -74,6 +85,56 @@ def test_a_launch_past_its_registers_or_at_a_rate_unstated_is_never_priced_whole
     assert blind.memory_rate is None
     _, _, _, candidates, prices, _ = _priced(("sm90", "Qwen3-8B"), target=blind)
     assert candidates and all(unpriced for unpriced, _ in prices), prices
+
+
+@pytest.mark.parametrize("accurate, pin, launches, width", [
+    (True, None, ("attention_dq", "attention_dkv"), 128),
+    (False, attention_mosaic.BackwardTiles(64, 64, 2, 2, fused=True, family="wgmma.fed"),
+     ("attention_dkv_fused",), 128),
+    (False, attention_mosaic.BackwardTiles(128, 64, 2, 1, fused=True, family=WGMMA, **FED),
+     ("attention_dkv_fused",), FORM_WIDTHS["fused-keys-first"]),
+    (False, attention_mosaic.BackwardTiles(64, 64, 2, 2, fused=True, family=FED["dkv_family"],
+                                           shared_keys=True), ("attention_dkv_shared",),
+     FORM_WIDTHS["fused-shared-keys"]),
+], ids=["dq-dkv", "fused", "fused-keys-first", "fused-shared-keys"])
+def test_each_launch_of_a_training_attention_states_its_outputs_beside_its_operands(accurate, pin, launches,
+                                                                                    width):
+    """Every launch of a grouped causal attention's training forward and backward traced for an H100 (the
+    accurate form's dQ and dK/dV launches, or a fused launch pinned: queries first, keys first, or keys
+    shared by its consumers) states its outputs' bytes and the gradients' it adds into in place beside the
+    operands its role reads, each once: a peak walk its query and keys (no values), the training walk its
+    query, keys and values, a backward launch those and the output gradient. What it writes is compulsory
+    traffic its device memory prices, every route alike (row 14206; Train 1513's review)."""
+    shape = jax.ShapeDtypeStruct((1, 1024, 16, width), jnp.bfloat16)
+    shared = jax.ShapeDtypeStruct((1, 1024, 4, width), jnp.bfloat16)
+    spans = template.spans(1024, 1024, 4, causal=True)
+
+    def trained(query, key, value):
+        out, *residuals = attention_mosaic.forward(query, key, value, spans, natural=False,
+                                                   residuals=template.Kept.SPLIT)
+        with _pinned(backward=pin):
+            return attention_mosaic.backward(query, key, value, spans, None, out, residuals=residuals,
+                                             natural=False, accurate=accurate)
+
+    with generation.assumed("sm90"):
+        traced = jax.make_jaxpr(jax.jit(trained))(shape, shared, shared).jaxpr
+        stating = [equation for equation in programs.equations(traced)
+                   if (cost := equation.params.get("cost_estimate")) is not None and cost.bytes_accessed]
+    # Each priced launch by its kernel's name (`name__l<its launch>`): the training forward's two and the
+    # route's own, no other.
+    names = [str(equation.params.get("name")).split("__")[0] for equation in stating]
+    assert sorted(names) == sorted(("attention_peaks", "attention_training", *launches)), names
+
+    def stored(variables) -> int:
+        return sum(int(np.prod(var.aval.shape)) * var.aval.dtype.itemsize for var in variables)
+
+    # The leading operands each launch's role reads.
+    read = {"attention_peaks": 2, "attention_training": 3}
+    for equation, name in zip(stating, names, strict=True):
+        operands = read.get(name, 4)
+        written = [var for var in equation.invars if isinstance(var.aval, state_types.AbstractRef)]
+        stated = stored(equation.invars[:operands]) + stored(equation.outvars) + stored(written)
+        assert equation.params["cost_estimate"].bytes_accessed == stated, name
 
 
 def test_a_portable_choice_reads_no_parts_l2():
