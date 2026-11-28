@@ -1999,9 +1999,10 @@ def test_a_bf16_call_of_wide_logits_scaled_after_keeps_its_bf16_product():
     ambient F16_F16_F32 preset: its logits' product takes jax.nn's bf16 preset for its own bf16 operands
     (`attention.unscaled_scores`' `dtype`), so a query and key of 2^20 give finite logits and a finite
     output, where read off the widened operands it took the ambient fp16 product, whose operands overflow.
-    Compiled in a GPU part's prepare, its operands host arrays, and run in its run alone (bible section 8: no
-    dense math on the node's CPU, whose default device there is a compile-only GPU)."""
-    import tier_wire
+    An arm of no site (`ahead_arm`), its operands host arrays: compiled in a GPU part's prepare and run as
+    that executable in its run (bible section 8: no dense math on the node's CPU, whose default device there
+    is a compile-only GPU)."""
+    from reference_error import ahead_arm
 
     from dew.nn.attention import reference_attention
 
@@ -2015,7 +2016,5 @@ def test_a_bf16_call_of_wide_logits_scaled_after_keeps_its_bf16_product():
             return reference_attention(query, key, value, dtype=jnp.bfloat16, wide_logits=True,
                                        scale_logits=True)
 
-    compiled = jax.jit(attended).lower(query, key, value).compile()
-    if tier_wire.preparing():
-        return
-    assert np.isfinite(np.asarray(compiled(query, key, value), np.float32)).all()
+    out = ahead_arm(jax.jit(attended), "bf16 wide logits scaled after")(query, key, value)
+    assert np.isfinite(np.asarray(out, np.float32)).all()
