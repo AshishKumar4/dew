@@ -1146,13 +1146,14 @@ def run_within(graph: EGraph, ruleset, limits: tuple[int, int], name: str) -> Sa
 
 
 def reported(graph: EGraph, sized: int, saturated: Saturated, began: float,
-             after: float | None = None) -> AlgebraReport:
+             after: float | None = None, *, nodes: int | None = None) -> AlgebraReport:
     """A derivation's own saturation (`run_within`: a scan's token programs', its chunk's) as the report a
     region's rewrite makes, recorded with the kernels' (`kernel_report.record_rewrite`): its size as
-    registered, its limits, its iterations and rows, whether a limit stopped it, and its form's price."""
+    registered, its limits, its iterations and rows (`nodes`, where facts added after it are not its own;
+    `graph`'s now else), whether a limit stopped it, and its form's price."""
     return AlgebraReport(sized, tuple(saturated.fired), saturated.fired, saturated.limits,
-                         saturated.iterations, node_count(graph), saturated.limited, None, after,
-                         time.perf_counter() - began)
+                         saturated.iterations, node_count(graph) if nodes is None else nodes,
+                         saturated.limited, None, after, time.perf_counter() - began)
 
 
 def extracted[Price: Linear](graph: EGraph, bundle: terms.Term, model: DagCostModel[Price], *,

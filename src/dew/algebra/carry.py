@@ -72,7 +72,7 @@ def _carrying():
     one = i64(1)
     marked = []
     for index, constructor in enumerate(terms.LANGUAGE):
-        made, children = terms.pattern(constructor, f"c{index}")
+        made, children = terms.pattern_of(Term, constructor, f"c{index}")
         marked += [rule(eq(t).to(made), eq(reads(child)).to(one)).then(set_(reads(t)).to(one))
                    for child in children]
     return ruleset(*marked, name="carrying")

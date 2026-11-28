@@ -17,7 +17,7 @@ import pytest
 from reference_error import assert_as_exact
 
 from dew.algebra import SATURATION, linear_scan, program, scan
-from dew.nn.kernels import generation
+from dew.nn.kernels import generation, recurrence_chunk
 from dew.nn.precision import float32_matmul
 
 TOKENS, STATE, WIDTH, CHUNK = 128, 16, 32, 32
@@ -98,18 +98,18 @@ def operands(x, dt, B, C) -> dict:
     return {"x": x, "dt": dt, "B": B, "C": C, "rate": jnp.float32(RATE), "skip": jnp.float32(SKIP)}
 
 
-def chunk_of(values: dict, index: int, axes: dict = OPERANDS) -> dict:
-    tokens = slice(index * CHUNK, (index + 1) * CHUNK)
+def chunk_of(values: dict, index: int, axes: dict = OPERANDS, chunk: int = CHUNK) -> dict:
+    tokens = slice(index * chunk, (index + 1) * chunk)
     return {name: value[tokens] if axes[name][:1] == ("time",) else value
             for name, value in values.items()}
 
 
-def walk(forms, values, chunks: range, state, axes: dict = OPERANDS):
+def walk(forms, values, chunks: range, state, axes: dict = OPERANDS, size: int = CHUNK):
     outputs = []
     # A walk that carries its transfer composes each chunk's transition.
     transition = isinstance(state, scan.Walk) and state.transfer is not None
     for index in chunks:
-        chunk = chunk_of(values, index, axes)
+        chunk = chunk_of(values, index, axes, size)
         prepared = forms.prepare(chunk, transition=transition)
         outputs.append(forms.mapped(prepared, state))
         state = forms.step(state, prepared)[0]
@@ -319,7 +319,7 @@ def gated_delta_written_as_error(h, q, k, v, g, beta):
 
 def gated_readout(h, q, k, v, g, beta):
     del k, v, g, beta
-    return (q @ h) * KEY ** -0.5
+    return (q @ h) * q.shape[-1] ** -0.5
 
 
 KEY, VALUE = 16, 32
@@ -327,13 +327,14 @@ GATED = {"q": ("time", "key"), "k": ("time", "key"), "v": ("time", "value"), "g"
          "beta": ("time",)}
 
 
-def gated_draw(seed):
-    """Unit keys (a correction of strength beta < 1 stays a contraction), decays to 1e-3 a token."""
+def gated_draw(seed, *, key: int = KEY, value: int = VALUE):
+    """Unit keys (a correction of strength beta < 1 stays a contraction), decays to 1e-3 a token, `key` keys
+    and `value` values wide."""
     rng = np.random.default_rng(seed)
-    k = rng.standard_normal((TOKENS, KEY))
-    return (jnp.asarray(rng.standard_normal((TOKENS, KEY)), jnp.float32),
+    k = rng.standard_normal((TOKENS, key))
+    return (jnp.asarray(rng.standard_normal((TOKENS, key)), jnp.float32),
             jnp.asarray(k / np.linalg.norm(k, axis=-1, keepdims=True), jnp.float32),
-            jnp.asarray(rng.standard_normal((TOKENS, VALUE)), jnp.float32),
+            jnp.asarray(rng.standard_normal((TOKENS, value)), jnp.float32),
             jnp.asarray(-(10.0 ** rng.uniform(-3, 0, TOKENS)), jnp.float32),
             jnp.asarray(rng.uniform(0.05, 0.95, TOKENS), jnp.float32))
 
@@ -348,7 +349,7 @@ def gated_tokenwise(update_fn, reads: str = "after", readout_fn=gated_readout):
             h = update_fn(h, *token)
             return h, readout_fn(h if reads == "after" else decayed, *token)
 
-        final, outputs = jax.lax.scan(one, jnp.zeros((KEY, VALUE), q.dtype), (q, k, v, g, beta))
+        final, outputs = jax.lax.scan(one, jnp.zeros((k.shape[-1], v.shape[-1]), q.dtype), (q, k, v, g, beta))
         return outputs, final
 
     return run
@@ -477,12 +478,12 @@ def replayed_of(forms, operands: dict):
     return replayed
 
 
-def gated_walk(forms, axes: dict):
-    """`forms`' chunks walked over a gated rule's operands (`axes`, `GATED`'s or `KIMI`'s) from a zero state:
-    the outputs and the final state, as `gated_tokenwise` gives them."""
+def gated_walk(forms, axes: dict, size: int = CHUNK):
+    """`forms`' chunks of `size` tokens walked over a gated rule's operands (`axes`, `GATED`'s or `KIMI`'s)
+    from a zero state: the outputs and the final state, as `gated_tokenwise` gives them."""
     def walked(q, k, v, g, beta):
         values = {"q": q, "k": k, "v": v, "g": g, "beta": beta}
-        outputs, state = walk(forms, values, range(TOKENS // CHUNK), forms.init({}), axes)
+        outputs, state = walk(forms, values, range(TOKENS // size), forms.init({}), axes, size)
         return jnp.concatenate(outputs), forms.finish(state, values)
 
     return walked
@@ -616,6 +617,29 @@ def test_a_chunk_form_any_target_extracts_computes_the_token_scan(update_fn, ope
                                            state=((KEY, VALUE), jnp.float32)), saturation=SATURATION)
         assert_as_exact(jax.jit(gated_walk(forms, operands)), jax.jit(gated_tokenwise(update_fn)), draw_fn,
                         f"{update_fn.__name__} on {target}", seeds=8)
+
+
+WIDE = 128
+"""A production gated delta net's head: its keys' and its values' width (Qwen3.5's)."""
+
+WIDE_CHUNK = recurrence_chunk.held_chunk(recurrence_chunk.CHUNK_SIZE, WIDE)
+"""The chunk the delta rule's portable walk takes at that width (`recurrence_chunk.held_chunk`)."""
+
+
+@pytest.mark.parametrize("target", ["sm75", "sm86", "sm89", "sm103"])
+def test_a_production_heads_chunks_split_on_every_target(target):
+    """The gated delta rule's chunks of its portable walk at a production head's width (`WIDE`, `WIDE_CHUNK`
+    tokens), derived priced for a T4, an A10, an L4 and a B300, whose prices made a forward substitution of
+    the values reading the entering state the cheapest form, which no split takes (its row walk over the
+    state, 'slice: an equation outside the language reads the carried state': lm-hybrid's step lowered for
+    each, the derivation catalogue's): each target's chunks are prepared and walked, on par with the token
+    scan, outputs and final state (check 1)."""
+    with generation.assumed(target):
+        forms = scan.derive_scan(scan.Scan(gated_delta, gated_readout, GATED, walked="time",
+                                           state=((WIDE, WIDE), jnp.float32)), saturation=SATURATION)
+        assert_as_exact(jax.jit(gated_walk(forms, GATED, WIDE_CHUNK)), jax.jit(gated_tokenwise(gated_delta)),
+                        functools.partial(gated_draw, key=WIDE, value=WIDE),
+                        f"a {WIDE}-wide gated delta rule on {target}", seeds=8)
 
 
 def test_a_scans_carry_derived_for_one_target_serves_no_other():
