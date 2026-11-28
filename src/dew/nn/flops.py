@@ -25,6 +25,8 @@ from .programs import (
     branches,
     called,
     cumulative,
+    generated,
+    loop_programs,
     opaque,
     platform_branch,
     positionwise,
@@ -289,9 +291,12 @@ def _program_flops(program: jaxpr_core.Jaxpr) -> float:
             products = math.prod(left[axis] for axis in contracted)
             total += 2 * math.prod(_shape(equation.outvars[0])) * products
         elif primitive is jax.lax.conv_general_dilated_p:
+            # Each output entry's taps: the kernel's entries along every axis but its output features', so
+            # an empty convolution (no output features) costs nothing, never a division by none.
             kernel = _shape(equation.invars[1])
-            outputs = kernel[equation.params["dimension_numbers"].rhs_spec[0]]
-            total += 2 * math.prod(_shape(equation.outvars[0])) * math.prod(kernel) / outputs
+            outputs = equation.params["dimension_numbers"].rhs_spec[0]
+            taps = math.prod(size for axis, size in enumerate(kernel) if axis != outputs)
+            total += 2 * math.prod(_shape(equation.outvars[0])) * taps
         elif primitive is jax.lax.scan_p:
             total += equation.params["length"] * _program_flops(scan_body(equation))
         elif primitive is jax.lax.cond_p:
@@ -311,8 +316,7 @@ def _program_flops(program: jaxpr_core.Jaxpr) -> float:
             # A loop doing no product costs nothing whatever its trips (an exact sum's walk of its digits,
             # `dew.nn.aligned`, in a softmax's derivative: train 1489's suspect run); one doing any is
             # refused.
-            if (_program_flops(equation.params["cond_jaxpr"].jaxpr)
-                    or _program_flops(equation.params["body_jaxpr"].jaxpr)):
+            if any(_program_flops(program) for program in loop_programs(equation)):
                 raise MissingFlopsCount("a while loop's trips are unknown to a traced count")
         elif (body := called(equation)) is not None:
             total += _program_flops(body)
@@ -327,10 +331,11 @@ def _program_flops(program: jaxpr_core.Jaxpr) -> float:
 def _productless(equation: jaxpr_core.JaxprEqn) -> bool:
     """Whether `equation` does no product, by what JAX states of its primitive and values
     (`dew.nn.programs`): an entrywise or positionwise operation, one on PRNG keys (`prng_operation`), one
-    that moves entries, a reduction, a cumulative one, a scatter, or one that reads no operand (an `iota`)."""
+    that moves entries, a reduction, a cumulative one, a scatter, or one that makes its value from no operand
+    (`generated`: an `iota`, never a host callback that reads none, 81f's review)."""
     primitive = equation.primitive
     return (positionwise(primitive) or prng_operation(equation) or rearranges(primitive)
-            or reduction(primitive) or cumulative(primitive) or scatter(primitive) or not equation.invars)
+            or reduction(primitive) or cumulative(primitive) or scatter(primitive) or generated(primitive))
 
 
 def _grouped_flops(equation: jaxpr_core.JaxprEqn) -> float:

@@ -117,8 +117,9 @@ def test_a_traced_program_counts_its_products_convolutions_scans_and_branches():
     """A traced count is two FLOPs a multiply-add of each product and convolution the program runs: a batched
     matrix product's, a strided convolution's of its output's elements by its kernel's taps and inputs, a
     scan's body times its length, a branch's costliest arm, a platform choice's the branch an accelerator
-    runs, a gradient's backward products beside its forward's, a while loop doing no product nothing; a while
-    loop doing one and a linear solve, whose run programs a trace does not tell, are refused."""
+    runs, a gradient's backward products beside its forward's, a while loop doing no product nothing (an
+    empty convolution in it none); a while loop doing one, or drawing one from the host, and a linear solve,
+    whose run programs a trace does not tell, are refused."""
     def shaped(*shape):
         return jax.ShapeDtypeStruct(shape, jnp.float32)
 
@@ -161,6 +162,28 @@ def test_a_traced_program_counts_its_products_convolutions_scans_and_branches():
 
     # A loop doing no product costs nothing, whatever its trips: the product after it alone counts.
     assert traced_flops(halved, shaped(2, 3), shaped(3, 4)) == 2 * 2 * 3 * 4
+
+    from jax.experimental import io_callback
+
+    # A loop whose body draws a product from the host, a callback reading no operand, is refused (81f's
+    # review: an operandless equation was taken for an `iota`).
+    def called_back(x):
+        def body(c):
+            return c + io_callback(lambda: np.ones((2, 2), np.float32) @ np.ones((2, 2), np.float32),
+                                   jax.ShapeDtypeStruct((2, 2), jnp.float32))
+        return jax.lax.while_loop(lambda c: jnp.sum(c) < 9, body, x)
+
+    with pytest.raises(MissingFlopsCount):
+        traced_flops(called_back, shaped(2, 2))
+
+    def empty(x, kernel):
+        def body(c):
+            return c[0] + jax.lax.conv_general_dilated(x, kernel, (1,), "VALID"), c[1] + 1
+
+        return jax.lax.while_loop(lambda c: c[1] < 3, body, (jnp.zeros((1, 0, 3)), 0))[0]
+
+    # A loop's empty convolution, of no output features, costs nothing, never a division by none.
+    assert traced_flops(empty, shaped(1, 1, 3), shaped(0, 1, 1)) == 0
 
     def solved(b):
         return jax.lax.custom_linear_solve(lambda x: jnp.eye(2) @ x, b, solve=lambda mv, b: b, symmetric=True)

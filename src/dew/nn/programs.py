@@ -531,6 +531,9 @@ _KINDS: dict[str, tuple[tuple[ModuleType, tuple[str, ...]], ...]] = {
     "cumulative": ((_LAX, ("cumlogsumexp_p", "cummax_p", "cummin_p", "cumprod_p", "cumsum_p")),),
     "scatter": ((_LAX, ("scatter_add_p", "scatter_max_p", "scatter_min_p", "scatter_mul_p", "scatter_p",
                         "scatter_sub_p")),),
+    # A value made from no operand: a counting sequence, a device's place along a mesh axis, an ordering
+    # token.
+    "generated": ((_LAX, ("axis_index_p", "create_token_p", "iota_p")),),
 }
 """Each kind of operation the analyses of a program read, by the JAX primitives of it, named where JAX's
 public modules export them (`jax.lax`, `jax.extend.core.primitives`), or where JAX defines one it exports
@@ -723,6 +726,12 @@ def scatter(primitive: jcore.Primitive) -> bool:
     """Whether `primitive` writes updates into its first operand at indices, replacing or combining (a
     scatter, and its add, subtract, multiply, minimum and maximum; `_KINDS`)."""
     return _is("scatter", primitive)
+
+
+def generated(primitive: jcore.Primitive) -> bool:
+    """Whether `primitive` makes its value from no operand and nothing outside the program (an `iota`, a
+    device's `axis_index`, an ordering token; `_KINDS`): a host callback reading no operand is none."""
+    return _is("generated", primitive)
 
 
 def cumulative(primitive: jcore.Primitive) -> bool:
