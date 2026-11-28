@@ -835,7 +835,9 @@ def test_a_launch_measured_for_some_calls_keeps_the_timings_its_other_calls_take
     held[key] = tuning.Timings({_Facted.UNSPACED: _timed(1.0), _Facted.REFUSED: _timed(1.5)})
     # A GPU of the launch's model, its measurement timing one config its calls take, its store recorded.
     stored = []
-    measurer = tuning.Measurer(kind, lambda *_: tuning.Timings({others[0]: _timed(2.0)}),
+    with tuning._placed_in(catalog):
+        attached = generation.gpu_target()
+    measurer = tuning.Measurer(kind, attached, lambda *_: tuning.Timings({others[0]: _timed(2.0)}),
                                lambda _, fresh: stored.append(fresh))
     picks = calls[0].op.get_autotuning_cache(kind)
     try:
@@ -850,6 +852,29 @@ def test_a_launch_measured_for_some_calls_keeps_the_timings_its_other_calls_take
     finally:
         held.pop(key, None)
         picks.pop(key, None)
+
+
+def test_a_launch_an_assumed_device_chose_is_timed_on_no_other_gpu():
+    """A launch traced under an assumed device and no mesh naming it (an RTX 4080's tiles traced on this
+    host, `generation.assumed` alone) keys its picks by the attached device's model (`_mesh_kind`), and so
+    reaches the attached GPU's measurer, but was chosen for the assumed GPU: it is timed on none other
+    (`tuning._chosen_for`), nothing measured or stored, its launch left without a pick; the attached GPU's
+    own launches still are (Train 1478's review: an sm80 launch was timed on a Hopper and stored in its
+    picks)."""
+    with generation.assumed(generation.gpu_target("NVIDIA GeForce RTX 4080")):
+        assumed = tuning.Placement.current()
+    attached = tuning.Placement.current()
+    with generation.reassumed(None):
+        here = generation.gpu_target()
+    [call] = _facted_calls(assumed)
+    measured, stored = [], []
+    measurer = tuning.Measurer(tuning._mesh_kind(assumed), here,
+                               lambda *args: measured.append(args) or tuning.Timings(),
+                               lambda _, fresh: stored.append(fresh))
+    assert tuning._mesh_kind(assumed) == tuning._mesh_kind(attached)
+    assert tuning._settle([call], measurer=measurer) == 1
+    assert (measured, stored) == ([], [])
+    assert tuning._chosen_for(attached, here) and not tuning._chosen_for(assumed, here)
 
 def test_a_launchs_candidates_are_read_taken_and_compiled_at_its_placement():
     """A launch measured at its call's placement (`tuning._candidate_compiles`, `_measured`'s): its space is
