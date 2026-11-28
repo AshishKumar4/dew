@@ -23,7 +23,7 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
 from dew import _cache
-from dew.nn import norms
+from dew.nn import norms, sharding
 from dew.nn.kernels import generation, recurrence, recurrence_algebra, short_conv, tuning
 from dew.nn.kernels.templates import cost, mosaic, resources, scan
 from dew.nn.kernels.templates.recurrence.conv import read_taps
@@ -139,14 +139,17 @@ def step(hooks: recurrence.Hooks, operands: recurrence.Step, *, dtype, family: m
     """`recurrence.step`'s launch on Mosaic GPU: `(output [rows, Hv, Dv], the moved history or None,
     state')`, the state as it is held, an idle row's (`Step.active`) as it came and its output zeros, its
     program's warpgroups and residency planned for its grid on the target (`_plan`); the state updated in
-    place where the tracing program donates it (`donated_state`) and it varies over no manual axis (a
-    checked `shard_map`'s state keeps its manual axes' type, which a launch takes in no ref)."""
+    place where the tracing program donates it (`donated_state`) outside a checked map (`sharding.checked`:
+    a ref takes no manual axes' type, and its frozen state keeps its own where the launch's output varies
+    with its other operands)."""
     rows, value_heads, key_width, value_width = operands.state.shape
     block = _block(value_width)
     programs = rows * (value_heads // block.heads) * (value_width // block.columns)
     target = generation.interpreted_target() if interpret else generation.gpu_target()
-    in_place = (_cache.DONATED_STATE.value > 0
-                and jax.typeof(operands.state).manual_axis_type == jax.sharding.ManualAxisType())
+    # Not inside a checked map: there a launch types its next state as varying where its operands do
+    # (`launches`), which a ref frozen from the state's own type does not (a replicated initial state beside
+    # a split `active` came back replicated, and a `psum` of it then refused under `jax_auto_pcast=False`).
+    in_place = _cache.DONATED_STATE.value > 0 and not sharding.checked()
     return _launched(hooks, operands, dtype=dtype, family=family, plan=_plan(key_width, programs, target),
                      interpret=interpret, in_place=in_place)
 
