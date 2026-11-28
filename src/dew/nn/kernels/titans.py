@@ -16,10 +16,10 @@ x sum(g x)) / (D sigma)`, `sigma = sqrt(var + eps)`; fla's Titans reference writ
 `titans` takes a mini-batch at a time (docs/design/kernel-templates.md's C class: its orchestration outside
 the recurrence tile): its tokens' gradients at once at the memory entering it, then its tokens a step at a
 time, each writing its own and reading the pair it leaves, their steps composed apart from the pair entering
-the mini-batch as the memory's general path composes them (`dew.nn.memory`), so no query meets a key (a live score of 2^70 by
-2^70 overflowed beside a zero write) and no state is weighed after a read (a memory of 2^70 forgotten whole
-read `0 * inf`). Documents are not packed: a mini-batch is the sequence's `chunk` tokens, which a document
-starting within one would split (fla's reference takes none either)."""
+the mini-batch as the memory's general path composes them (`dew.nn.memory`), so no query meets a key (a live
+score of 2^70 by 2^70 overflowed beside a zero write) and no state is weighed after a read (a memory of 2^70
+forgotten whole read `0 * inf`). Documents are not packed: a mini-batch is the sequence's `chunk` tokens,
+which a document starting within one would split (fla's reference takes none either)."""
 
 from __future__ import annotations
 
