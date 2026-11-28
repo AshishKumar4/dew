@@ -1,12 +1,28 @@
 """The test lane's settings, and the environment the suite runs under (`configured`), which
 tests/conftest.py sets before any numerical library is imported."""
 
+import importlib.util
 import os
 import subprocess
 import sys
 from collections.abc import Mapping, MutableMapping
+from pathlib import Path
 
 import tier_wire
+
+
+def _dew_xla_flags():
+    """Dew's own XLA flag lexer (src/dew/_xla_flags.py), loaded by its path: `import dew` here would set up
+    Dew's process (its XLA flags, its pool) before the lane's settings, which tests/conftest.py makes
+    first."""
+    spec = importlib.util.spec_from_file_location(
+        "_dew_xla_flags", Path(__file__).resolve().parents[1] / "src" / "dew" / "_xla_flags.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+xla_flags = _dew_xla_flags()
 
 # Enough simulated devices to exercise a 4x2 data/fsdp mesh. A test marked
 # `mesh` needs this many devices, or its `devices=`; a run with fewer, such
@@ -51,9 +67,9 @@ autotuning off as the lane's, so a program compiled ahead for it is the one its 
 
 def without_flags(flags: str, *names: str) -> str:
     """XLA `flags` without each flag of `names` (`--xla_...`), whatever value it carries, each flag read whole
-    as XLA reads it (`_flag_spans`), a quoted value holding spaces one flag: every test that runs XLA without
-    one of the lane's flags filters them here."""
-    return " ".join(span for name, span in _flag_spans(flags) if name not in names)
+    as XLA reads it (`dew._xla_flags`, Dew's own flag readers' lexer), a quoted value holding spaces one flag:
+    every test that runs XLA without one of the lane's flags filters them here."""
+    return xla_flags.without(flags, *names)
 
 
 def without_deterministic_ops(flags: str) -> str:
@@ -112,7 +128,7 @@ def configure_lane(environ: MutableMapping[str, str]) -> None:
             environ["JAX_PLATFORMS"] = ",".join([*platforms, "cpu"])
         cpu_devices = max(1, local[flagged](environ))
     flags.append(f"--xla_force_host_platform_device_count={cpu_devices}")
-    environ["XLA_FLAGS"] = _each_once(" ".join(flags))
+    environ["XLA_FLAGS"] = xla_flags.each_once(" ".join(flags))
     # XLA:CPU runs every device of a launch on one pool of max(cores,
     # devices) threads (PJRT_NPROC overrides the cores), each held until the
     # launch's collectives meet, and dispatches the next launch on the same
@@ -166,53 +182,6 @@ def outside_suite(environ: Mapping[str, str]) -> dict[str, str]:
     2510, 2736)."""
     suite = configured({})
     return {**{name: value for name, value in environ.items() if name not in suite}, "JAX_PLATFORMS": "cpu"}
-
-
-_XLA_SPACE = " \t\r\n"
-"""What XLA reads as space between flags (xla/parse_flags_from_env.cc's `kWS`): these four alone, never
-another character Python counts as whitespace."""
-
-
-def _flag_spans(flags: str) -> list[tuple[str, str]]:
-    """`flags` (an XLA_FLAGS value) as XLA reads it (xla/parse_flags_from_env.cc's `ParseArgvFromString`):
-    each flag its name and its whole span as written, a quoted value (`--name="a b"` or `'a b'`, a backslash
-    escaping within double quotes) whole with its quotes, an unquoted one to the next of XLA's spaces
-    (`_XLA_SPACE`); read up to the first span that is no flag, as XLA gives up there, the rest kept as one
-    span of no name."""
-    spans, at, end = [], 0, len(flags)
-    while at < end and flags[at] in _XLA_SPACE:
-        at += 1
-    while at < end and flags[at] == "-":
-        start = at
-        while at < end and flags[at].isascii() and (flags[at] in "-_" or flags[at].isalnum()):
-            at += 1
-        name = flags[start:at]
-        if at + 1 < end and flags[at] == "=" and flags[at + 1] in "'\"":
-            quote, at = flags[at + 1], at + 2
-            while at < end and flags[at] != quote:
-                at += 2 if quote == '"' and flags[at] == "\\" and at + 1 < end else 1
-            at = min(at + 1, end)
-        else:
-            while at < end and flags[at] not in _XLA_SPACE:
-                at += 1
-        spans.append((name, flags[start:at]))
-        while at < end and flags[at] in _XLA_SPACE:
-            at += 1
-    if at < end:
-        spans.append(("", flags[at:]))
-    return spans
-
-
-def _each_once(flags: str) -> str:
-    """XLA's flags `flags` with each flag named once, its last value: a process configured again (a second
-    `configured`, or a child of a process that was) states each flag it sets once, not again beside the
-    inherited one. Each flag is read whole as XLA reads it (`_flag_spans`), a quoted value holding spaces
-    one flag."""
-    named: dict[str, str] = {}
-    for name, span in _flag_spans(flags):
-        named.pop(name or span, None)
-        named[name or span] = span
-    return " ".join(named.values())
 
 
 def _local_gpus(environ: MutableMapping[str, str]) -> int:

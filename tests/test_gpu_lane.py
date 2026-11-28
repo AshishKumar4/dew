@@ -166,7 +166,7 @@ def test_a_flag_is_stated_once_whole_as_xla_reads_it(flags, once):
     escaping a double quote within it; what follows a span that is no flag left as XLA leaves it, unread."""
     import lane_environment
 
-    assert lane_environment._each_once(flags) == once
+    assert lane_environment.xla_flags.each_once(flags) == once
 
 
 @pytest.mark.parametrize(("flags", "kept"), [
@@ -181,6 +181,23 @@ def test_a_flag_taken_out_is_read_whole_as_xla_reads_it(flags, kept):
     import lane_environment
 
     assert lane_environment.without_flags(flags, "--xla_gpu_deterministic_ops") == kept
+
+
+@pytest.mark.parametrize(("flags", "asked"), [
+    ('--xla_dump_to="/logs/a --xla_gpu_deterministic_ops b"', False),
+    ("--xla_dump_to='/logs/--xla_gpu_deterministic_ops=true'", False),
+    ('--xla_dump_to="/logs/a --xla_gpu_deterministic_ops" --xla_gpu_deterministic_ops', True),
+    ("--xla_gpu_deterministic_ops=true\t--xla_gpu_deterministic_ops=false", False),
+    ('--xla_gpu_deterministic_ops="true"', True)])
+def test_deterministic_ops_are_asked_for_as_xla_reads_its_flags(monkeypatch, flags, asked):
+    """Dew's kernels choose their deterministic schedules where XLA reads the flag set
+    (`dew._devices.deterministic_ops_requested`), by the one lexer the lane filters flags by: a quoted dump
+    path naming the flag is no flag, a tab parts two flags whose last wins, and a quoted value is its
+    content."""
+    from dew._devices import deterministic_ops_requested
+
+    monkeypatch.setenv("XLA_FLAGS", flags)
+    assert deterministic_ops_requested() is asked
 
 
 def test_a_lane_configured_again_states_each_xla_flag_once():
