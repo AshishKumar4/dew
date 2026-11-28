@@ -376,7 +376,11 @@ def chunk(hooks: recurrence.Hooks, operands: Chunk, *, chunk_size: int = CHUNK_S
                                  chunk_size=chunk_size, work=work, dtype=dtype, readout=readout, apart=apart,
                                  normed=hooks.output is not None and stride == 1)
         if hooks.output is not None and stride == 1:
-            return out, final
+            # The normed output, which the out projection's pullback reads, named as the recurrence's as the op
+            # returns it, outside the kernels' custom rules (the read before the norm named within them): a
+            # rung keeping the recurrence's output keeps it rather than replaying every launch of the forward
+            # for it (test_lowering's remat rung: 19 launches where 15 ran unrematted, 18 named within).
+            return recurrence_output(out), final
     # A token's output its last laid token's (`_laid`); the epilogue in work, the output rounded once.
     out = out[:, stride - 1::stride]
     return recurrence.normed(hooks, out, given, work, dtype=dtype, axes=HEADS), final
@@ -482,9 +486,9 @@ def _normed_runs(hooks: recurrence.Hooks, run, product_kernel, given: dict, work
     launches take the norm in their output launch where the call `fuses` it (no skip, no turn, its output
     in the operands' dtype, read back in it) and their plan for the product holds it (the forward's alone,
     or the training's forward and backward: the norm's residual kept and its gradient the layers' norm's,
-    `template.mosaic_rule`, the output before and after the norm named as the recurrence's,
-    `residuals.recurrence_output`); elsewhere each kernel's output, named as the recurrence's (a remat keeps
-    it and forms the norm again), through the layers' norm (`recurrence.normed`). A plan that does not hold,
+    `template.mosaic_rule`, the output it read named as the recurrence's); elsewhere each kernel's output,
+    named as the recurrence's (a remat keeps it and forms the norm again), through the layers' norm
+    (`recurrence.normed`); `chunk` names the normed output it returns either way. A plan that does not hold,
     or a gate or weight varying over a manual axis the recurrence's operands do not, declines the fusion, the
     selected kernel's own route kept."""
     def fits(product: str, gate, weight) -> bool:
@@ -501,12 +505,7 @@ def _normed_runs(hooks: recurrence.Hooks, run, product_kernel, given: dict, work
             # norm apart, whose pullback sums back to the recurrence's output as JAX types it.
             alike = varying(gate, weight) <= varying(*head[:5], head[6])
             if fuses and alike and kernel == 'mosaic_gpu' and fits(product, gate, weight):
-                out, final = run(kernel, *head, *walked, normed=hooks.output, gate=gate, weight=weight)
-                # The normed output, which the out projection's pullback reads, named as the read before its
-                # norm the launch keeps (`template.mosaic_rule`): a rung keeping the recurrence's output keeps
-                # it rather than replaying every launch of the forward for it (test_lowering's remat rung,
-                # 19 launches where 15 ran unrematted).
-                return recurrence_output(out), final
+                return run(kernel, *head, *walked, normed=hooks.output, gate=gate, weight=weight)
             out, final = run(kernel, *head, *walked)
             assert hooks.output is not None, "a gate is the epilogue's"
             # The output the norm reads, the recurrence's own, named as a remat keeps it: the norm after it
