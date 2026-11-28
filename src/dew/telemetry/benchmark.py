@@ -25,6 +25,7 @@ import html
 import math
 import os
 import re
+import runpy
 import select
 import statistics
 import threading
@@ -280,18 +281,11 @@ program's options read too (`options_of`)."""
 
 
 @functools.cache
-def _lexer():
-    """Dew's XLA flag lexer (src/dew/_xla_flags.py), loaded by its path beside this file: the instrument loads
-    by its path into an arm's process, whose Dew may be a checkout that states none (row 12063)."""
-    import importlib.util
-
-    spec = importlib.util.spec_from_file_location("_dew_xla_flags",
-                                                  Path(__file__).resolve().parents[1] / "_xla_flags.py")
-    if spec is None or spec.loader is None:
-        raise ImportError("dew/_xla_flags.py beside the instrument cannot be loaded")
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
+def _lexer() -> dict:
+    """Dew's XLA flag lexer (src/dew/_xla_flags.py) beside this file, its names as running it leaves them
+    (`runpy.run_path`): the instrument loads by its path into an arm's process, whose Dew may be a checkout
+    that states none (row 12063)."""
+    return runpy.run_path(str(Path(__file__).resolve().parents[1] / "_xla_flags.py"))
 
 
 def options_of(flags: str) -> dict[str, str]:
@@ -308,10 +302,10 @@ def graphs() -> bool:
     a checkout that states none of its own reader (row 12063: an older baseline raised ImportError)."""
     name = UNGRAPHED_FLAG.removesuffix("=")
     kinds: set[str] | None = None
-    for named, span in _lexer().spans(os.environ.get("XLA_FLAGS", "")):
+    for named, span in _lexer()["spans"](os.environ.get("XLA_FLAGS", "")):
         if named != name:
             continue
-        value = _lexer().value(named, span)
+        value = _lexer()["value"](named, span)
         listed = [kind.strip().upper() for kind in value.split(",") if kind.strip()]
         if not (listed and all(kind[0] in "+-" for kind in listed)):
             kinds = set(listed)

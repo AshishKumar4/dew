@@ -1,30 +1,18 @@
 """The test lane's settings, and the environment the suite runs under (`configured`), which
 tests/conftest.py sets before any numerical library is imported."""
 
-import importlib.util
 import os
 import subprocess
 import sys
 from collections.abc import Mapping, MutableMapping
-from pathlib import Path
 
 import tier_wire
+from tool_support import REPO_ROOT, loaded
 
-
-def _dew_xla_flags():
-    """Dew's own XLA flag lexer (src/dew/_xla_flags.py), loaded by its path: `import dew` here would set up
-    Dew's process (its XLA flags, its pool) before the lane's settings, which tests/conftest.py makes
-    first."""
-    spec = importlib.util.spec_from_file_location(
-        "_dew_xla_flags", Path(__file__).resolve().parents[1] / "src" / "dew" / "_xla_flags.py")
-    if spec is None or spec.loader is None:
-        raise ImportError("src/dew/_xla_flags.py of this checkout cannot be loaded")
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
-
-
-xla_flags = _dew_xla_flags()
+xla_flags = loaded("_dew_xla_flags", REPO_ROOT / "src" / "dew" / "_xla_flags.py")
+"""Dew's own XLA flag lexer (src/dew/_xla_flags.py), loaded by its path (`tool_support.loaded`): `import dew`
+here would set up Dew's process (its XLA flags, its pool) before the lane's settings, which tests/conftest.py
+makes first."""
 
 # Enough simulated devices to exercise a 4x2 data/fsdp mesh. A test marked
 # `mesh` needs this many devices, or its `devices=`; a run with fewer, such

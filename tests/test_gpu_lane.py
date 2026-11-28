@@ -466,27 +466,36 @@ def test_a_dry_prepares_row_is_red_for_each_cell_it_left_unprepared_that_mains_r
 
 
 def test_a_cell_moved_by_an_edit_above_it_is_main_s_cell_and_a_new_one_beside_it_is_new(ci):
-    """An unprepared cell is its test, its file and its label, at whatever line an edit above it moves it to
-    (prepares.py's `knowing`): three lines added above a test's cells move them from :83 to :86 and the row
-    stays green (train 1489 read them as new); a second cell of that test and file beside it is new, main's
-    one cell answering one of the run's alone; and a cell left twice at one where is one."""
+    """An unprepared cell is its test, its file, its label and its site, the source text of its line, at
+    whatever line an edit above it moves it to (prepares.py's `knowing`): three lines added above a test's
+    cell move it from :83 to :86 and the row stays green (train 1489 read it as new); a run that fixed main's
+    site of a test and broke another of it is red for the other (train 1493's P-F7); a second cell of one
+    site beside it is new, main's one cell answering one of the run's alone; a cell left twice at one where is
+    one; and against a baseline that kept no sites, a cell of the place counts as main's (its count alone)."""
     name = "3.12:tests/test_gpu_attention.py#5/25@prepare-sm90"
     test = "tests/test_gpu_attention.py::test_merged"
+    file = "tests/test_gpu_attention.py"
 
-    def graded(wheres, before):
-        records = [{"test": test, "where": where, "error": "lowered", "kind": "site"} for where in wheres]
+    def graded(cells, before):
+        records = [{"test": test, "where": where, "error": "lowered", "kind": "site", "site": site}
+                   for where, site in cells]
         found = {"name": name, "exitCode": 0, "output": ""}
-        [row] = ci.prepares.graded([found], {"tests/test_gpu_attention.py": records}, before, "sm90",
+        [row] = ci.prepares.graded([found], {file: records}, before, "sm90",
                                    lambda named: ci.grading.owning(ci.parsed_row(named)[1]),
                                    ci.grading.STALE, ci.tier_wire().CAPPED)
         return row
-    main = {(test, "tests/test_gpu_attention.py:83", None, "site")}
-    assert graded(["tests/test_gpu_attention.py:86"], main)["exitCode"] == 0
-    assert graded(["tests/test_gpu_attention.py:86"] * 2, main)["exitCode"] == 0
-    beside = graded(["tests/test_gpu_attention.py:86", "tests/test_gpu_attention.py:120"], main)
-    assert beside["exitCode"] == 1
-    assert beside["new_unprepared"] == [f"{test} @ tests/test_gpu_attention.py:120"]
-    elsewhere = graded(["src/dew/nn/attention.py:86"], main)
+    main = {(test, f"{file}:83", None, "site", "out = merged(a)")}
+    assert graded([(f"{file}:86", "out = merged(a)")], main)["exitCode"] == 0
+    assert graded([(f"{file}:86", "out = merged(a)")] * 2, main)["exitCode"] == 0
+    swapped = graded([(f"{file}:90", "out = merged(b)")], main)
+    assert swapped["new_unprepared"] == [f"{test} @ {file}:90"]
+    beside = graded([(f"{file}:86", "out = merged(a)"), (f"{file}:120", "out = merged(a)")], main)
+    assert beside["new_unprepared"] == [f"{test} @ {file}:120"]
+    unsited = {(test, f"{file}:83", None, "site")}
+    assert graded([(f"{file}:90", "out = merged(b)")], unsited)["exitCode"] == 0
+    two = graded([(f"{file}:90", "x"), (f"{file}:91", "y")], unsited)
+    assert two["new_unprepared"] == [f"{test} @ {file}:91"]
+    elsewhere = graded([("src/dew/nn/attention.py:86", "out = merged(a)")], main)
     assert elsewhere["new_unprepared"] == [f"{test} @ src/dew/nn/attention.py:86"]
 
 
