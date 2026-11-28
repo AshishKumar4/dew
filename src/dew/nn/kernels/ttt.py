@@ -1,8 +1,8 @@
 """TTT-Linear (row 1448), as Dew's in-context memory computes it (`dew.nn.memory.InContextMemory`, a
 `ResidualMemory` whose norm is slow, on the l2 objective): a memory `W` `[D, D]` and its bias `b` `[D]`
 learned at test time, a mini-batch of `chunk` tokens at a time, each mini-batch's inner gradients `u_s` taken
-at the memory entering it (`titans.inner_gradient`, the LayerNorm reconstruction loss's, `|k + (LN(k W + b) w + c)
-- v|^2`), each token stepping the memory by its own gradient at its own learning rate and reading the
+at the memory entering it (`titans.inner_gradient`, the LayerNorm reconstruction loss's, `|k + (LN(k W + b) w
++ c) - v|^2`), each token stepping the memory by its own gradient at its own learning rate and reading the
 memory its step leaves through the residual (`titans.read_out`),
 
     W_t = W_0 - sum_{s <= t} eta_s k_s^T u_s,    b_t = b_0 - sum_{s <= t} eta_s u_s,
