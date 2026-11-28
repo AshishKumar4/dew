@@ -1009,3 +1009,21 @@ def test_a_float64_second_product_keeps_its_keys_apart():
         out = attention_parallax.attend(query, second, key, second_key, value, spans)
     assert out.dtype == jnp.float32
     np.testing.assert_array_equal(np.asarray(out), np.full((1, 1, 1, width), 0.5, np.float32))
+
+
+def test_a_terms_derivatives_keep_their_range():
+    """`attention_parallax.exp_scaled`'s declared derivative at `z = 0`, undecayed and unraised: a direction
+    of `2^100` moves it by `2^100` and a cotangent of `2^-100` pulls back `2^-100`, its direction taken by
+    the decay and every power at once, where raising a tiny `z` by `2^64` before them sent the direction to
+    infinity and the cotangent to 0 (the confirm review of 502c938474); and along its exponent, its own
+    value, `3 · 2^-148 · 2^148 = 3` times the direction."""
+    def scaled(z):
+        return attention_parallax.exp_scaled(z, jnp.float32(0.0), 0)
+
+    _, tangent = jax.jvp(scaled, (jnp.float32(0.0),), (jnp.float32(2.0 ** 100),))
+    assert float(tangent) == 2.0 ** 100
+    _, pull = jax.vjp(scaled, jnp.float32(0.0))
+    assert float(pull(jnp.float32(2.0 ** -100))[0]) == 2.0 ** -100
+    _, along = jax.jvp(lambda e: attention_parallax.exp_scaled(jnp.float32(3 * 2.0 ** -148), e, 148),
+                       (jnp.float32(0.0),), (jnp.float32(1.0),))
+    assert float(along) == 3.0
