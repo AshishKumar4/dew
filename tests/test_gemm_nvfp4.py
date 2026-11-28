@@ -914,6 +914,23 @@ def _columned_case(rows: int, *, grouped: bool):
     return jax.ShapeDtypeStruct((rows, 512), jnp.bfloat16), matrix, sizes
 
 
+def a_packed_nvfp4_call_placed_on_its_hosts_cpu_keeps_a_subnormal_scale():
+    """On a GPU process, a packed NVFP4 prefill (named packed, its tensor scale one a column) whose operands
+    are committed to the host's CPU, interpretation asked: it runs on the CPU as the plain launch
+    interpreted, `factored`'s exact finish after it, never the GPU's hooked launch interpreted there, whose
+    epilogue's product by 2^8 flushed a column scale of 2^-127 to zero (the review of row 13743's restack):
+    two experts of 256-deep ones over 256 rows of ones, each value 2^-119. Run by tests/test_gpu_gemm.py's
+    cells: a CPU process plans no hooked launch."""
+    cpu = jax.devices("cpu")[0]
+    bank = formats.NvFp4.of(jnp.ones((2, 256, 128), jnp.float32), jnp.ones((2, 16, 128), jnp.float8_e4m3fn),
+                            jnp.full((2, 128), 2.0 ** -127, jnp.float32))
+    rows, sizes = jnp.ones((256, 256), jnp.bfloat16), jnp.asarray([128, 128], jnp.int32)
+    rows, bank, sizes = jax.device_put((rows, bank, sizes), cpu)
+    with generation.chosen(nvfp4="packed"):
+        out = gemm.nvfp4_product(rows, bank, sizes, out_dtype=jnp.float32, interpret_on_cpu=True)
+    np.testing.assert_array_equal(np.asarray(out), np.full((256, 128), 2.0 ** -119, np.float32))
+
+
 def _packed_epilogues(launched) -> list:
     """The epilogue of each packed NVFP4 launch a trace took (`tuning.seen`)."""
     return [observed.keyed.arguments["hooks"].epilogue for observed in launched

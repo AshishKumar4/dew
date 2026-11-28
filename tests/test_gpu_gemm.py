@@ -260,6 +260,9 @@ def _scale_edge_cells() -> tuple[Cell, ...]:
         Cell("an owed product's native fold rounds once below the normals",
              gemm_nvfp4.an_owed_products_native_fold_rounds_once_below_the_normals, "sm90",
              at_run=EXACT_OVERFLOW, native={"launch": "owed fold", "pass": "subnormal product"}),
+        Cell("a packed NVFP4 call placed on its host's CPU keeps a subnormal column scale",
+             gemm_nvfp4.a_packed_nvfp4_call_placed_on_its_hosts_cpu_keeps_a_subnormal_scale, "sm90",
+             at_run=EXACT_OVERFLOW, native={"launch": "nvfp4 packed", "pass": "host-placed finish"}),
     )
 
 
