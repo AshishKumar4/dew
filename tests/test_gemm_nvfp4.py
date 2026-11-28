@@ -1975,5 +1975,6 @@ def test_a_packed_steps_price_counts_its_decodes_integer_pipes():
     assert priced(pricing.Decoded(0, 1, cost.repeated(work, 4))) > priced(pricing.Decoded(0, 1))
     rates, square = cost.rates(h100, device=False), tiling.Tiles(64, 64, 256, 2, 1, family="wgmma")
     one = pricing.Decoded(2, 1, work)
-    alone = [pricing.decode_seconds(square, forms, rates) for forms in ((one, None), (None, one))]
-    assert pricing.decode_seconds(square, (one, one), rates) == pytest.approx(sum(alone))
+    # The square tile's two operands alike, each decode's seconds the other's; doubled exactly.
+    left, right = (pricing.decode_seconds(square, forms, rates) for forms in ((one, None), (None, one)))
+    assert left == right and pricing.decode_seconds(square, (one, one), rates) == 2 * left
