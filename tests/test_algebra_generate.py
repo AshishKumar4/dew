@@ -106,16 +106,47 @@ def test_the_command_refuses_a_stale_module_and_generation_repairs_it(tmp_path, 
     assert command().returncode == 0 and command("--check").returncode == 0
 
 
+def exponentials(x):
+    """`exp(x)`, a stable form's declaration in miniature."""
+    return jnp.exp(x)
+
+
+def off_far_out(x):
+    """`exponentials` as exact as it near zero and a thousandth off past fifty: a candidate one family of
+    draws tells from it and the other does not."""
+    return jnp.exp(x) * jnp.where(jnp.abs(x) > 50.0, np.float32(1.001), np.float32(1.0))
+
+
+def test_a_candidate_is_admitted_only_where_every_family_admits_it():
+    """`off_far_out` against `exponentials` (`generate.admits`): admitted on draws near zero alone, where it
+    is exact, and refused once a family of draws past fifty is judged beside them, each family apart; so a
+    form generation admits holds on every family it states, not on its declaration's own draw alone."""
+    operands = (jax.ShapeDtypeStruct((64,), jnp.float32),)
+
+    def near_zero(seed, operands):
+        return (np.random.default_rng(seed).uniform(-4.0, 4.0, operands[0].shape).astype(np.float32),)
+
+    def far_out(seed, operands):
+        return (np.random.default_rng(seed).uniform(55.0, 80.0, operands[0].shape).astype(np.float32),)
+
+    alone = generate.Cases((operands,), near_zero, seeds=8)
+    with_family = generate.Cases((operands,), near_zero, seeds=8, families={"wide ranges": far_out})
+    assert generate.admits(exponentials, operands, alone, "near zero")(off_far_out, exponentials)
+    assert not generate.admits(exponentials, operands, with_family, "with far out")(off_far_out, exponentials)
+
+
 @pytest.mark.parametrize(("name", "policy"), FORMS, ids=[f"{name}-{policy}" for name, policy in FORMS])
 def test_each_generated_form_is_on_par_with_its_declaration(name, policy):
     """Each generated form at each of its declaration's cases is on par with the declaration as written
-    against its float64 truth (check 1), on the declaration's own draws."""
+    against its float64 truth (check 1), on the declaration's own draws and each adversarial family it states
+    (`Cases.judged`), each judged apart, as its admission judged it."""
     form = generate.DECLARATIONS[name]
     truth = form.truth if isinstance(form, generate.ComponentForm) else form.function
     for operands in form.cases.operands:
-        assert_as_exact(jax.jit(functools.partial(_derived(name), policy=policy)), jax.jit(form.function),
-                        lambda seed, operands=operands: form.cases.draw(seed, operands), f"{name} ({policy})",
-                        seeds=form.cases.seeds, truth_fn=truth)
+        for family, drawn in form.cases.judged():
+            assert_as_exact(jax.jit(functools.partial(_derived(name), policy=policy)), jax.jit(form.function),
+                            lambda seed, operands=operands, drawn=drawn: drawn(seed, operands),
+                            f"{name} ({policy}), {family}", seeds=form.cases.seeds, truth_fn=truth)
 
 
 @pytest.mark.parametrize("name", ["query_weights", "key_weights", "query_dropped_cotangents",

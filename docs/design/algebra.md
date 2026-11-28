@@ -233,12 +233,14 @@ as Herbie weighs error against cost for floating-point expressions:
   in error, and a form's error depends on which form of each operand it reads, so the estimate belongs to a
   concrete candidate: an extracted DAG, every child chosen. Extraction proposes candidates in order of price,
   every uncompensated candidate before every compensated one, and each is measured before it is admitted
-  (§6.5). Each program is proposed once: an extraction that prints as
+  (§6.5), the form as written the reference each is measured against, admitted as it
+  stands. Each program is proposed once: an extraction that prints as
   an earlier candidate does (a variant that is the form as written) is the same measurement. Error is never an
   e-class fact.
 - **Dev time measures each candidate** by sampling: the candidate evaluated in its dtype against the declaration
-  at float64 on the gate's drawn and adversarial families (cancellation, wide ranges, near-equal operands, one-key
-  rows), as check 1 measures error.
+  at float64 on its declaration's draws and the adversarial families it states as its domain holds them
+  (`generate.Cases.families`: cancellation, wide ranges, near-equal operands, one-key rows), each judged
+  apart, as check 1 measures error; the generated form is held on each again (tests/test_algebra_generate.py).
 - **The declared accuracy** is the precision policy's (`dew.nn.precision`), read once:
   - default numerics: check 1 at the gate's parity (§3) against the form as written;
   - the accurate numerics (`precision="accurate"`): check 1 at the gate's parity against the form as written
@@ -326,8 +328,9 @@ fitted to them, and a rule set ships only with measured receipts.
   inside a launch is rewritten where the fuser takes it, and a derivative's XLA glue by the outer pass, as
   `KernelGlue` (§1.3): the GEMM's producer and consumer each traced once rewritten
   (`fused_gemm._split`, `_rewritten_consumer`), its prologue's JVP and epilogue's VJP the glue.
-- **Template algebra (dev time):** a template's online, tiled and combine forms, forward and backward, are
-  generated from a declaration (§6.9):
+- **Template algebra (trace time):** a template's online, tiled and combine forms, forward and backward, are
+  derived from a declaration as a program traces it (§6.9; a reduction's tile derivations stored and shipped,
+  §6.8):
   - attention's score function, mask and reduction;
   - a recurrence's state update.
 
@@ -421,7 +424,10 @@ All accuracy checks are the [accuracy gate](testing.md)'s, with no tolerance of 
   candidate; `assert_certified` is added where a bound applies. Each rule's check 1 site names the rule.
   Each rule of the registered sets and of the carried set, every layout and direction a rule of its own, is
   held to check 1 at the first instantiation its conditions admit over shapes taken largest first, its two
-  sides computed from the rule as egglog holds it, and is proven an identity over the reals, its stated magnitudes at least the true ones
+  sides computed from the rule as egglog holds it, and is proven an identity over the reals at every
+  instantiation its conditions admit over a universe of shapes, its stated magnitudes at least the bound the
+  magnitude table proves (itself proven, tests/test_algebra_bounds.py) at its first 64 instantiations and
+  each assignment of its operands' stated powers 2^3, 2^5 and 2^0
   (tests/test_algebra_rules_sound.py). A registered rewrite's adversarial families and its check 2 are its
   family's instance's (`rules.instances`), one a family. (Today the decoupled set's rules, a derivation's
   own, are held through the forms they derive (tests/algebra_laws.py), not rule by rule.)
@@ -546,7 +552,8 @@ because its Python API is still marked as subject to change.
 
 `Term` is one egglog sort, `class Term(Expr)`. Each kind of operation of the language in §1.2 is one
 constructor (`terms.WRITTEN`: a binary, a comparison, a unary and a layout operation each hold their
-primitive's symbol; a reduction its monoid; a cast, a selection and a product have one operation each), beside
+primitive's symbol; a reduction its monoid; a cast, a selection, a clamp and a product have one operation
+each), beside
 the constructors that write no operation (a leaf, a literal, a bundle of roots, a derivation's state):
 
 - a reduction's axes as `Vec[i64]`;
@@ -591,7 +598,8 @@ class Term(Expr):
   not a prefix term.
 - The language's operations are declared, one declaration an operation, on JAX's primitive objects
   (`terms.OPERATIONS`, an `Operation` each): its symbol in the language, the term it is written as,
-  what its value proves of its operand's magnitude and sign (§6.3), and its cost (§6.5). An equation is
+  and what its value proves of its operand's magnitude and sign (§6.3); its cost is the kernels' counter's
+  (`emission`, `cost.work`, §6.5). An equation is
   of the language by its primitive object, never its name. A foreign primitive is opaque. A JAX tangent
   sum (`add_any`) is written as `add` for equal-shape float16, bfloat16, float32 and float64 arrays
   without explicit placement or manual mesh variation. Replay keeps JAX's original primitive. On
@@ -774,7 +782,8 @@ class Rules:
     ruleset: egglog.Ruleset                  # its families' rules (`Rules.declared`)
     receipt: str                             # the measurement it ships with: a ledger row and its receipts
     families: tuple[RuleFamily, ...] = ()
-    dev: bool = False                        # dev time alone (stable): each candidate's error measured first
+    dev: bool = False                        # dev time alone (stable: each candidate's error measured first;
+                                             # reuse: buys no speed), unless a scope enables it
     aid: bool = False                        # only aids saturation (identities, contracted)
 
 RULES: Mapping[str, Rules]                   # every registered set, by name
@@ -1031,6 +1040,7 @@ class Passes:                         # dew._cache
     target: str | None = None         # the GpuTarget whose facts it prices for; None: the process's own
     checked: bool = False             # each derivation's greedy extraction held to the exact optimum
     without: frozenset[str] = frozenset()   # the sets a receipt's arm leaves out (rules.nameable, §6.4)
+    dev: frozenset[str] = frozenset()       # cost-qualified dev-time sets enabled (rules.enabling_dev)
 
 ALGEBRA = jax.make_user_context(default_value=Passes())   # dew._cache, in JAX's trace context
 
@@ -1059,8 +1069,9 @@ class Rewrite:                        # one region's
   `CLUSTER` equations, each saturated and extracted in an e-graph of its own (§6.5), its cheaper roots' forms
   spliced where their equations stood. A region whose only bounded terms are its literals builds no e-graph
   (`rules.reorderable`): every reordering makes its new intermediate of an operand the program bounds (§6.3),
-  and commutativity alone leaves every price as it was. One such region does build one: a value a literal
-  scales under a maximum or a minimum, whose scale moves out making no new magnitude. Most of a training step's regions are its own math
+  and commutativity alone leaves every price as it was (a positive literal scale's fact, `positive_scale`,
+  serves a derivation's own rules, §6.9, not a region of the pass). Most of a training step's regions are
+  its own math
   over unbounded values: a gemma3n step's 2879 each fired commutativity alone.
 - A region's rewrite is derived once per structure in a process while its entry is held (`program._derived`,
   bounded by `WINDOWS_HELD`; two traces that miss together each derive it): keyed by what its derivation reads (`program.structure`: its values' avals, their
@@ -1626,13 +1637,16 @@ its output, a mean over its channels, its anchor and its total there. States of 
 
     merged((o_k, m_k, l_k)_k) = (sum_k w_k o_k / W, M, W),   w_k = l_k f_k,   W = sum_k w_k,
 
-`M` the largest anchor and `f_k = exp(s (m_k - M))` the walk's own factor from `m_k` to it in its units
+`M` the largest anchor of a state holding mass (of a row none holds mass in, the largest finite anchor,
+`means._joined_anchor`; a landing may move it after) and `f_k = exp(s (m_k - M))` the walk's own
+factor from `m_k` to it in its units
 (`means.Units`), a scaled value aligned once: its base-2 exponent, the anchors' difference taken exactly and
 converted in two words in the accurate form (a fold's rounded as its kernels round it; a difference past
 the format whose scaled value fits is taken at half each and doubled after). In the top binade the
 conversion doubles its two result words, not the input, to avoid intermediate overflow. The exponent's
 nearest integer gives the power of two; its remainder in [-1/2, 1/2] through exp2 gives the significand. A
-factor is held exactly to `2^-65536` and is zero below it (`means.FLOOR`). The law is one **ratio of sums of
+factor is held exactly above `2^-65536` and is zero at and below it (`windows.FLOOR`, a strict comparison of
+its exponent's high word). The law is one **ratio of sums of
 products** of its float operands (`ratios.ratio_p`, its form `ratios.Ratio`):
 `sum_k o_k l_k f_k / sum_k l_k f_k`. A term is a double float at a power of two: each factor's
 significand times the running product by an exact product (`two_product`), its residual carried.
@@ -1737,12 +1751,14 @@ any arithmetic that rounds its terms does. Each order of the derivative is exact
 operands, its factors as formed, and the order beneath it as landed) to within `u^2` of its terms before its
 one landing: so within `u |d| + gamma_n u sum |terms| / |W|` of that, plus `u |R| |dW / W|` an order where the
 order beneath it is read as landed (`R`). A landing below the least normal is read as zero where XLA:CPU
-flushes it, op by op: within `K 2^-126` of the bound. tests/test_algebra_scaled.py holds every case of the
-merge's five review rounds (V1-V8, D1-D13) against the law in float64, jitted and op by op, forward and
-reverse, and any drawn merge to its hull and value bound; tests/test_algebra_scaled_edges.py holds each of
-the law's operations at its degenerate inputs (zero, minus zero, a subnormal, the least normal, the format's
-largest, past its range, zero and subnormal totals, mixed scales, outputs an ulp apart, an inexact scale's
-products feeding a compensated sum under a jit), value and first two derivatives, to its contract bit for bit;
+flushes it, op by op: within `K 2^-126` of the bound. tests/test_algebra_scaled.py holds the
+merge's review cases (V1-V8, D1-D13), jitted and op by op, forward and reverse: each finite and within its
+outputs' hull, and the cases with an exact law (a finished or resumed state past the range, a cancelling
+compensated sum) to it; any drawn merge finite and within its hull. tests/test_algebra_scaled_edges.py holds
+each of the law's operations at its degenerate inputs (zero, minus zero, a subnormal, the least normal, the
+format's largest, past its range, zero and subnormal totals, mixed scales, outputs an ulp apart, an inexact
+scale's products feeding a compensated sum under a jit), value and first two derivatives, certified against
+its contract (`assert_certified`), and the construct's listed operations against their truth bit for bit;
 the template's check-1 cells hold them through the gate.
 
 ## 7. Bit-level forms
