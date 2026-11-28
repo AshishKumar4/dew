@@ -1907,7 +1907,7 @@ def test_a_portable_per_key_transpose_sums_opposite_cotangents_before_they_land(
 
     @jax.jit
     def pull(q, k, factors, ct):
-        _, back = jax.vjp(lambda x: scan._portable_pairs(x, k, factors, None)[0], q)
+        _, back = jax.vjp(lambda x: scan._portable_pairs((x, k, factors, None))[0], q)
         return back(ct)[0]
 
     np.testing.assert_array_equal(pull(row, keys, decay, cotangent), np.zeros_like(row))
@@ -1916,31 +1916,57 @@ def test_a_portable_per_key_transpose_sums_opposite_cotangents_before_they_land(
 def test_portable_pair_groups_in_one_call_are_each_groups_own_pairs():
     """Two groups of pairs in one call (`scan._portable_pairs`: `_factored`'s own blocks, one decay a pair,
     and its earlier ones, the row's and the key's apart), one repair decision and one exact sum for both (row
-    14108): where neither group's decayed factor flushes, each group's pairs are its own call's, bit for bit;
-    where the earlier blocks' key decayed to 2^-140 flushes, both groups' pairs are their exact sums, the
-    earlier blocks' 2^-40 kept, each as its own call's exact sum (`_exact_pairs`) takes it."""
-    own = (jnp.asarray([[[1.0, 2.0], [3.0, -1.0]]], jnp.float32),
-           jnp.asarray([[[0.5, 1.0], [2.0, 4.0]]], jnp.float32),
-           jnp.asarray([[[[1.0, 0.5], [-0.0, -0.0]], [[0.25, 1.0], [1.0, 0.75]]]], jnp.float32), None)
+    14108): where neither group's decayed factor flushes, each group's pairs are its own call's; where the
+    earlier blocks' key decayed to 2^-140 flushes, both groups' pairs are their exact sums, the earlier
+    blocks' 2^-40 kept and the own blocks' `(1 - 2^-24)^2 (1 + 2^-23)` rounded once to one, where their dot
+    rounds the decayed key to one first and leaves `1 - 2^-24`."""
+    near = 1 - 2.0 ** -24
+    own = (jnp.asarray([[[near, 0.0], [0.0, 0.0]]], jnp.float32),
+           jnp.asarray([[[1 + 2.0 ** -23, 0.0], [0.0, 0.0]]], jnp.float32),
+           jnp.asarray([[[[near, 1.0], [-0.0, -0.0]], [[1.0, 1.0], [1.0, 1.0]]]], jnp.float32), None)
 
     def earlier(key: float):
         return (jnp.asarray([[[2.0 ** 100, 0.0], [1.0, 0.0]]], jnp.float32),
                 jnp.asarray([[[key, 0.0], [1.0, 0.0]]], jnp.float32),
                 jnp.ones((1, 2, 2), jnp.float32), jnp.asarray([[[key, 1.0], [1.0, 1.0]]], jnp.float32))
 
-    for key in (1.0, 2.0 ** -70):
-        groups = (own, earlier(key))
-        together = jax.jit(lambda *x: scan._portable_pairs(*x))(*own, *groups[1])
-        alone = [jax.jit(lambda *x: scan._portable_pairs(*x))(*group)[0] for group in groups]
-        if key == 1.0:
-            for joined, single in zip(together, alone, strict=True):
-                np.testing.assert_array_equal(joined, single)
-            continue
-        exact = [scan._exact_pairs((group,))[0] for group in groups]
-        for joined, sum_ in zip(together, exact, strict=True):
-            np.testing.assert_array_equal(joined, sum_)
-        np.testing.assert_array_equal(together[1], alone[1])
-        assert float(together[1][0, 0, 0]) == 2.0 ** -40
+    pairs = jax.jit(lambda *groups: scan._portable_pairs(*groups))
+    together = pairs(own, earlier(1.0))
+    np.testing.assert_array_equal(together[0], pairs(own)[0])
+    np.testing.assert_array_equal(together[1], pairs(earlier(1.0))[0])
+    assert float(together[0][0, 0, 0]) == near
+    repaired = pairs(own, earlier(2.0 ** -70))
+    assert float(repaired[0][0, 0, 0]) == 1.0
+    assert float(repaired[1][0, 0, 0]) == 2.0 ** -40
+    np.testing.assert_array_equal(repaired[1], pairs(earlier(2.0 ** -70))[0])
+
+
+def test_portable_pair_groups_take_each_groups_own_derivative():
+    """A call of two groups differentiates each at its own factors (`scan._portable_pair_jvp`): the earlier
+    blocks' row decay's cotangent sums two keys' products of 2^130 that cancel before it lands (zero, as one
+    group's call gives it, not two infinities), and a held group's tangent is zero beside an infinite key
+    (head review of row 14108)."""
+    own = (jnp.ones((1, 2, 1), jnp.float32), jnp.asarray([[[np.inf], [1.0]]], jnp.float32),
+           jnp.asarray([[[[1.0], [-0.0]], [[1.0], [1.0]]]], jnp.float32), None)
+    rows = jnp.asarray([[[2.0 ** 100], [0.0]]], jnp.float32)
+    keys = jnp.asarray([[[2.0 ** 30], [-(2.0 ** 30)]]], jnp.float32)
+    before = jnp.asarray([[[2.0 ** -10], [1.0]]], jnp.float32)
+    after = jnp.ones((1, 2, 1), jnp.float32)
+    cotangent = jnp.asarray([[[1.0, 1.0], [0.0, 0.0]]], jnp.float32)
+
+    @jax.jit
+    def pulled(before):
+        _, back = jax.vjp(lambda b: scan._portable_pairs(own, (rows, keys, b, after))[1], before)
+        return back(cotangent)[0]
+
+    np.testing.assert_array_equal(pulled(before), np.zeros((1, 2, 1), np.float32))
+
+    @jax.jit
+    def moved(direction):
+        return jax.jvp(lambda r: scan._portable_pairs(own, (r, keys, before, after))[0], (rows,),
+                       (direction,))[1]
+
+    np.testing.assert_array_equal(moved(jnp.ones_like(rows)), np.zeros((1, 2, 2), np.float32))
 
 
 @pytest.mark.parametrize("side", ["reader", "state"])

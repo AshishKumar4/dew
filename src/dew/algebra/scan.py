@@ -1261,15 +1261,12 @@ def _pair_factors(left, right, decay, after):
 def _laid_factors(left, right, decay, after):
     """One group's factors (`_pair_factors`) laid as every group's of a call of several (`_exact_pairs`):
     its first decay whole `[K, ..., i, j]` and its second `[K, ..., 1, j]`, one where the group's pairs
-    decay by one factor alone (exactly: the sum holds every factor's product until it lands)."""
+    decay by one factor alone (exactly: the sum holds every factor's product until it lands). A value's
+    layout alone: a derivative takes each group's own factors (`_portable_pair_jvp`), whose broadcast axes
+    the ratio's transpose reduces before landing."""
     left, right, *factors, active = _pair_factors(left, right, decay, after)
     second = factors[1] if after is not None else jnp.ones_like(right)
     return left, right, jnp.broadcast_to(factors[0], active.shape), second, active
-
-
-def _pair_groups(operands: Sequence) -> tuple[tuple, ...]:
-    """`_portable_pairs`' operands as its groups, each `(left, right, decay, after)`."""
-    return tuple(tuple(operands[start:start + 4]) for start in range(0, len(operands), 4))
 
 
 def _exact_pairs(groups: tuple[tuple, ...]) -> tuple[jax.Array, ...]:
@@ -1297,23 +1294,35 @@ def _ordinary_pairs(left, right, decay, after) -> tuple[jax.Array, jax.Array]:
     return _portable_einsum("...ik,...jk->...ij", leading, trailing), tiny
 
 
+def _live(direction) -> bool:
+    return direction is not None and not isinstance(direction, SymbolicZero)
+
+
 def _portable_pair_jvp(primals, tangents):
-    live = tuple(t is not None and not isinstance(t, SymbolicZero) for t in tangents)
+    """Each group's tangent its own exact sum's at its own factors (`_pair_factors`), whose transpose reduces
+    their broadcast axes before landing, a group none of whose operands moves a symbolic zero: laid with the
+    others' (`_laid_factors`), the earlier blocks' key decay landed a cotangent a key in fp32 before its sum
+    (two of 2^130 that cancel, landed apart, infinite), and a held group's zero tangent met an infinite
+    factor as NaN (head review of row 14108)."""
     value = _portable_pairs(*primals)
-    if not any(live):
-        return value, tuple(SymbolicZero(jax.typeof(each).to_tangent_aval()) for each in value)
-    operands, fill = holes(primals, live, is_leaf=lambda arg: arg is None)
+    moved = []
+    for group, directions, pairs in zip(primals, tangents, value, strict=True):
+        live = tuple(map(_live, directions))
+        if not any(live):
+            moved.append(SymbolicZero(jax.typeof(pairs).to_tangent_aval()))
+            continue
+        operands, fill = holes(group, live, is_leaf=lambda arg: arg is None)
 
-    def exact(*active):
-        return _exact_pairs(_pair_groups(fill(active)))
+        def exact(*active, fill=fill):
+            return _pair_sum(_pair_factors(*fill(active)))
 
-    directions = tuple(t for t, take in zip(tangents, live, strict=True) if take)
-    return value, jax.jvp(exact, tuple(operands), directions)[1]
+        moving = tuple(direction for direction, take in zip(directions, live, strict=True) if take)
+        moved.append(jax.jvp(exact, tuple(operands), moving)[1])
+    return value, tuple(moved)
 
 
 @custom_vmap
-def _pair_dispatch(*operands):
-    groups = _pair_groups(operands)
+def _pair_dispatch(*groups):
     ordinary, flushed = zip(*(_ordinary_pairs(*group) for group in groups), strict=True)
     # A dot can overflow one channel before another cancels it. Keep the ordinary finite path, but let the
     # existing scaled sum decide any group's nonfinite result or flushed pre-product, every group's at once.
@@ -1328,9 +1337,9 @@ _pair_dispatch.def_vmap(functools.partial(scalar_case_batch, _pair_dispatch))
 _portable_pairs = contracted("test_a_decayed_pair_holds_its_derivatives")(
     declared_tangent(Protected(), _pair_dispatch, _portable_pair_jvp, symbolic_zeros=True))
 """Pairs `sum_k left_ik right_jk decay_ijk` (or `left_ik decay_ik right_jk after_jk` where `after` is
-given) of each group `(left, right, decay, after)` its operands lay in turn, a tuple of each group's: a dot
-of the decayed factors, or where any group's flushes a decayed factor or ends nonfinite, every group's
-exact sum (`_exact_pairs`), its derivative the exact sum's."""
+given) of each of its groups `(left, right, decay, after)`, a tuple of each group's: a dot of the decayed
+factors, or where any group's flushes a decayed factor or ends nonfinite, every group's exact sum in one
+(`_exact_pairs`); each group's tangent its own exact sum's (`_portable_pair_jvp`)."""
 
 
 def _factored(left, right, between, joined, issue: Callable, role: str, *, back: bool = False):
@@ -1382,8 +1391,8 @@ def _factored(left, right, between, joined, issue: Callable, role: str, *, back:
         groups.append((rows, keys, before, after))
     if issue is _issued:
         # The own blocks and the earlier ones in one call: one repair decision and one exact sum (row 14108).
-        diagonal, *off = _portable_pairs(*(None if x is None else x.astype(work) for group in groups
-                                           for x in group))
+        diagonal, *off = _portable_pairs(*(tuple(None if x is None else x.astype(work) for x in group)
+                                           for group in groups))
         off = off[0] if earlier else []
     else:
         diagonal = _portable_einsum("...ik,...ijk->...ij", own_left, own_right[:, None] * decay)
