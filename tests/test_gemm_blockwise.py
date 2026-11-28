@@ -292,6 +292,13 @@ def test_a_bank_quantized_by_blocks_is_each_blocks_codes_under_its_power_of_two_
     for found_codes, found_scales in found:
         np.testing.assert_array_equal(np.asarray(found_codes).view(np.uint8), codes.view(np.uint8))
         np.testing.assert_array_equal(np.asarray(found_scales), scale[:, :, 0, :, 0])
+    # A float64 truth's bank rounds at its own width: 1.0625 + 2^-26 under a scale of 1 (its block's largest
+    # 400) is past E4M3's midpoint, 1.125, where its float32 narrowing, 1.0625, ties to 1.0; its scale fp32.
+    with jax.enable_x64(new_val=True):
+        wide = np.zeros((1, 128, 128), np.float64)
+        wide[0, 0, :2] = 400.0, 1.0625 + 2.0 ** -26
+        wide_codes, wide_scales = jax.jit(projections.blocks_quantized)(jnp.asarray(wide))
+        assert np.asarray(wide_codes, np.float32)[0, 0, 1] == 1.125 and wide_scales.dtype == jnp.float32
 
 
 def test_a_blockwise_fp8_projections_training_step_is_on_par():

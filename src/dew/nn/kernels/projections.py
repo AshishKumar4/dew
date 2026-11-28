@@ -58,8 +58,8 @@ def blockwise_fp8_projection(x: jax.Array, w: jax.Array, group_blocks: jax.Array
                              interpret_on_cpu: bool = False) -> jax.Array:
     """Each group's rows of `x` (`[rows, depth]`) times its matrix of `w` (`[groups, depth, width]`) in
     DeepSeek-V3's blockwise FP8 recipe (row 2513): `x` quantized to E4M3 a 1 x 128 tile at a time along the
-    depth and `w` a 128 x 128 block at a time (power-of-two scales, `fake_quant.fp8_scaled_blocks`), their
-    product `blockwise_fp8_product`. Its gradients are the recipe's own FP8 products: the input's the
+    depth and `w` a 128 x 128 block at a time (power-of-two scales, `rows_quantized`, `blocks_quantized`),
+    their product `blockwise_fp8_product`. Its gradients are the recipe's own FP8 products: the input's the
     cotangent quantized 1 x 128 along the width times the blocks transposed, the matrices' the rows and the
     cotangent each quantized 1 x 128 along the rows (`blockwise_fp8_kernel_gradient`), a surrogate of the
     quantized product's derivative (straight through each rounding). Group `g` holds `group_blocks[g]` whole
@@ -262,8 +262,7 @@ def blocks_quantized(w: jax.Array) -> tuple[jax.Array, jax.Array]:
     """`w` (`[groups, depth, width]`) as E4M3 codes a 128 x 128 block at a time and each block's power-of-two
     scale (`[groups, depth / 128, width / 128]` fp32): each block's rows and columns axes of their own, its
     largest magnitude reduced over both where they lie, so no transposed copy of the matrix is made either
-    way (row 4518: the recipe's per-call weight quantization, ~9 ms of a DeepSeek-V3 routed projection's
-    15-17 ms on a GH200, M-NG-64)."""
+    way (row 4518)."""
     from dew.nn import fake_quant
 
     groups, depth, width = w.shape
