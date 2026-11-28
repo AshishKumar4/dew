@@ -11,7 +11,10 @@ import jax
 import numpy as np
 import pytest
 from attention_witness import (
+    BACKWARD_FAULTS,
+    FAULTS,
     FORMS,
+    TWO_LAUNCH_FAULTS,
     assert_backward_faults_refused,
     assert_backward_witnessed,
     assert_equal_totals_held,
@@ -29,8 +32,9 @@ def test_each_stored_state_and_the_output_lie_in_their_step_enclosures(form, see
     assert_witnessed(seed, form, interpret=True)
 
 
-def test_each_fault_is_refused_at_its_elements():
-    assert_faults_refused(interpret=True)
+@pytest.mark.parametrize("fault", FAULTS)
+def test_each_fault_is_refused_at_its_elements(fault):
+    assert_faults_refused(interpret=True, faults=(fault,))
 
 
 def test_the_certify_launch_writes_every_record_it_declares():
@@ -94,9 +98,12 @@ def test_each_gradient_of_the_two_launch_backward_lies_in_its_enclosure(form, wi
     assert_backward_witnessed(0, form, interpret=True)
 
 
-def test_two_launches_are_held_to_their_own_refined_d(with_deterministic_ops):
-    """Two launches' gradients held as the fused launch's (its D and denominator) refused at dK."""
-    assert_two_launches_held_to_their_own_d(interpret=True)
+@pytest.mark.parametrize("fault", [None, *TWO_LAUNCH_FAULTS], ids=["held", *TWO_LAUNCH_FAULTS])
+def test_two_launches_are_held_to_their_own_refined_d(fault, with_deterministic_ops):
+    """Two launches' gradients held to their own schedule, and each fault of them refused, as the fused
+    launch's (its D and denominator) at dK, apart (`attention_witness.TWO_LAUNCH_FAULTS`)."""
+    assert_two_launches_held_to_their_own_d(interpret=True, held=fault is None,
+                                            faults=() if fault is None else (fault,))
 
 
 def test_two_launches_of_the_forwards_own_denominator_are_held_by_their_schedule(with_deterministic_ops):
@@ -104,5 +111,6 @@ def test_two_launches_of_the_forwards_own_denominator_are_held_by_their_schedule
     assert_equal_totals_held(interpret=True)
 
 
-def test_each_backward_fault_is_refused_at_its_elements():
-    assert_backward_faults_refused(interpret=True)
+@pytest.mark.parametrize("fault", BACKWARD_FAULTS)
+def test_each_backward_fault_is_refused_at_its_elements(fault):
+    assert_backward_faults_refused(interpret=True, faults=(fault,))

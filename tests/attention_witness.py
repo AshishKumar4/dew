@@ -302,44 +302,81 @@ def assert_witnessed(seed: int, form: str, *, interpret: bool, lane: Lane | None
         assert inside[rows].all(), f"{name}: {refused(found, name)} of {int(rows.sum())} held entries outside"
 
 
-def assert_faults_refused(*, interpret: bool, lane: Lane | None = None) -> None:
-    """Each fault the witness exists for, refused at its elements: a dropped rescale, a maximum from the
-    wrong tile, sums rounded to bf16 where the walk holds fp32, a causal launch's records held under a mask
-    one key short of its own, a window's and the documents' records held as one undivided causal call's, and a
-    capped call's records held as an uncapped one's, and the reverse.
-    Every native program launches before any check so GPU-tier prepare compiles them all (row 9546)."""
+def assert_faults_refused(*, interpret: bool, lane: Lane | None = None,
+                          faults: tuple[str, ...] | None = None) -> None:
+    """Each fault the witness exists for among `faults` (`FAULTS`' names, every one by default), refused at
+    its elements: a dropped rescale ('rescale'), a maximum from the wrong tile ('maximum'), sums rounded to
+    bf16 where the walk holds fp32 ('narrowed'), a causal launch's records held under a mask one key short of
+    its own ('shifted'), a window's and the documents' records held as one undivided causal call's
+    ('bounded'), and a capped call's records held as an uncapped one's, and the reverse ('capped').
+    Every native program its faults read launches before any check so GPU-tier prepare compiles them all (row
+    9546)."""
     import tier_wire
 
+    faults = tuple(FAULTS) if faults is None else faults
     q, k, v = operands(2)
-    mask, causal = mask_of("full"), mask_of("causal")
-    truth = launched(q, k, v, "full", interpret=interpret, site="faults")
-    claimed = launched(q, k, v, "causal", interpret=interpret, site="faults")
-    bounded = {form: launched(q, k, v, form, interpret=interpret, site="faults")
-               for form in ("window", "documents")}
-    capped = launched(q, k, v, "capped", interpret=interpret, site="faults")
+    forms = dict.fromkeys(form for fault in faults for form in FAULTS[fault][0])
+    runs = {form: launched(q, k, v, form, interpret=interpret, site="faults") for form in forms}
     if not interpret and tier_wire.preparing():
         return
+    for fault in faults:
+        FAULTS[fault][1](q, k, v, runs, lane)
+
+
+def _rescale_refused(q, k, v, runs: dict, lane) -> None:
+    """A dropped rescale, refused at the sums."""
+    truth = runs["full"]
     m, acc = truth["m"], truth["acc"]
     alpha = np.exp2(np.where(np.isfinite(m[:, :, :-1]), m[:, :, :-1] - m[:, :, 1:], 0.0))
     dropped = dict(truth, acc=np.concatenate(
         [acc[:, :, :1], acc[:, :, 1:] + acc[:, :, :-1] * (1 - alpha)[..., None]], 2))
-    assert refused(witnessed(q, k, v, mask, dropped, lane=lane), "acc")
-    wrong = dict(truth, m=np.concatenate([m[:, :, :1], m[:, :, :-1]], 2))
-    assert refused(witnessed(q, k, v, mask, wrong, lane=lane), "m")
-    narrowed = dict(truth, acc=np.asarray(nearest(acc, BFLOAT16)))
-    assert refused(witnessed(q, k, v, mask, narrowed, lane=lane), "acc")
-    shifted = causal & ~np.eye(SHAPE[1], dtype=bool)[None, None]
-    held = witnessed(q, k, v, shifted, claimed, lane=lane)
+    assert refused(witnessed(q, k, v, mask_of("full"), dropped, lane=lane), "acc")
+
+
+def _maximum_refused(q, k, v, runs: dict, lane) -> None:
+    """A maximum from the wrong tile, refused at the maxima."""
+    truth = runs["full"]
+    wrong = dict(truth, m=np.concatenate([truth["m"][:, :, :1], truth["m"][:, :, :-1]], 2))
+    assert refused(witnessed(q, k, v, mask_of("full"), wrong, lane=lane), "m")
+
+
+def _narrowed_refused(q, k, v, runs: dict, lane) -> None:
+    """Sums rounded to bf16 where the walk holds fp32, refused at the sums."""
+    narrowed = dict(runs["full"], acc=np.asarray(nearest(runs["full"]["acc"], BFLOAT16)))
+    assert refused(witnessed(q, k, v, mask_of("full"), narrowed, lane=lane), "acc")
+
+
+def _shifted_refused(q, k, v, runs: dict, lane) -> None:
+    """A causal launch's records held under a mask one key short of its own."""
+    shifted = mask_of("causal") & ~np.eye(SHAPE[1], dtype=bool)[None, None]
+    held = witnessed(q, k, v, shifted, runs["causal"], lane=lane)
     assert sum(refused(held, name) for name in ("m", "l", "acc"))
-    for form, records in bounded.items():
-        # A window's or the documents' launch held as one undivided causal call: its bounds read.
-        held = witnessed(q, k, v, causal, records, lane=lane)
+
+
+def _bounded_refused(q, k, v, runs: dict, lane) -> None:
+    """A window's or the documents' launch held as one undivided causal call: its bounds read."""
+    for form in ("window", "documents"):
+        held = witnessed(q, k, v, mask_of("causal"), runs[form], lane=lane)
         assert sum(refused(held, name) for name in ("m", "l", "acc")), form
-    # A capped launch held as an uncapped call's, and an uncapped one as a capped call's: its cap read.
-    assert sum(refused(witnessed(q, k, v, causal, capped, lane=lane), name) for name in ("m", "l", "acc"))
-    constants = capped_constants("capped", SHAPE[3])
-    assert sum(refused(witnessed(q, k, v, causal, claimed, lane=lane, capped=constants), name)
+
+
+def _capped_refused(q, k, v, runs: dict, lane) -> None:
+    """A capped launch held as an uncapped call's, and an uncapped one as a capped call's: its cap read."""
+    causal = mask_of("causal")
+    assert sum(refused(witnessed(q, k, v, causal, runs["capped"], lane=lane), name)
                for name in ("m", "l", "acc"))
+    constants = capped_constants("capped", SHAPE[3])
+    assert sum(refused(witnessed(q, k, v, causal, runs["causal"], lane=lane, capped=constants), name)
+               for name in ("m", "l", "acc"))
+
+
+FAULTS = {"rescale": (("full",), _rescale_refused), "maximum": (("full",), _maximum_refused),
+          "narrowed": (("full",), _narrowed_refused), "shifted": (("causal",), _shifted_refused),
+          "bounded": (("window", "documents"), _bounded_refused),
+          "capped": (("causal", "capped"), _capped_refused)}
+"""The forward's faults (`assert_faults_refused`), each the forms whose launches it reads and its check of
+them, a part a test may hold alone."""
+
 
 def backward_launched(query, key, value, dout, form: str, *, interpret: bool, site: str = "backward",
                       accurate: bool = False) -> dict:
@@ -674,39 +711,52 @@ def assert_backward_witnessed(seed: int, form: str, *, interpret: bool, lane: La
         assert inside[rows].all(), f"{name}: {int((rows & ~inside).sum())} of {int(rows.sum())} outside"
 
 
-def assert_two_launches_held_to_their_own_d(*, interpret: bool, lane: Lane | None = None) -> None:
+def assert_two_launches_held_to_their_own_d(*, interpret: bool, lane: Lane | None = None, held: bool = True,
+                                            faults: tuple[str, ...] | None = None) -> None:
     """The backward's two launches (deterministic ops, under which `MosaicBackward.legal` refuses the fused
-    one: the GPU tier's, row 13697) held to their own schedule: their gradients about the D they refined and
-    over the dQ launch's own denominator held, the same gradients held as the fused launch's (the D
-    `split_delta` took, nothing lost, the forward's denominator) refused at dK; a D off, a `lost` its launch
-    never reads widening dK, and an anchor where it took none each refused."""
+    one: the GPU tier's, row 13697) held to their own schedule: with `held`, their gradients about the D they
+    refined and over the dQ launch's own denominator held; and each of `faults` (`TWO_LAUNCH_FAULTS`' names,
+    every one by default) refused at its record: the same gradients held as the fused launch's (the D
+    `split_delta` took, nothing lost, the forward's denominator, 'fused'), a D off ('delta'), a `lost` its
+    launch never reads widening dK ('lost'), and an anchor where it took none ('anchor')."""
     import tier_wire
 
+    faults = tuple(TWO_LAUNCH_FAULTS) if faults is None else faults
     q, k, v, do = backward_operands(3)
     records = backward_launched(q, k, v, do, "causal", interpret=interpret, site="two launches")
     if not interpret and tier_wire.preparing():
         return
     assert (records["denominator"] != records["l"]).any(), "two launches ran: the dQ launch's own denominator"
     mask = mask_of("causal")
-    assert not sum(refused(backward_witnessed(q, k, v, do, mask, records, lane=lane), name)
-                   for name in ("dq", "dk", "dv"))
-    fused = dict(records, delta=records["prior"], lost=np.zeros_like(records["lost"]),
-                 denominator=records["l"])
-    assert refused(backward_witnessed(q, k, v, do, mask, fused, lane=lane), "dk")
+    if held:
+        found = backward_witnessed(q, k, v, do, mask, records, lane=lane)
+        assert not sum(refused(found, name) for name in ("dq", "dk", "dv"))
+    for fault in faults:
+        faulty, at = TWO_LAUNCH_FAULTS[fault]
+        assert refused(backward_witnessed(q, k, v, do, mask, faulty(records), lane=lane), at), fault
+
+
+def _anchored(records: dict) -> dict:
+    """The fast form's output residuals take no anchor key (`chosen` -1, `attention.output_split`): an anchor
+    of 1 there, refused at its row, where `chosen < 0` passed any."""
+    assert (records["chosen"] < 0).all(), "the fast form's output residuals take no anchor key"
+    return dict(records, anchor=records["anchor"] + 1.0)
+
+
+TWO_LAUNCH_FAULTS = {
+    "fused": (lambda records: dict(records, delta=records["prior"], lost=np.zeros_like(records["lost"]),
+                                   denominator=records["l"]), "dk"),
     # A refined D taken and stated a sixty-fourth off, refused at the row whatever the gradients.
-    off = dict(records, delta=records["delta"] * (1 + 2.0 ** -6) + 2.0 ** -6)
-    assert refused(backward_witnessed(q, k, v, do, mask, off, lane=lane), "delta")
+    "delta": (lambda records: dict(records, delta=records["delta"] * (1 + 2.0 ** -6) + 2.0 ** -6), "delta"),
     # A `lost` its dK/dV launch never reads (it receives the rounded D alone) widens nothing: dK a sixteenth
     # off beside a `lost` of a thousand times each row's D refused at dK, where D between `delta` and
     # `delta + lost` admitted it (train 1394's P1).
-    widened = dict(records, lost=1e3 * (np.abs(records["delta"]) + 1.0),
-                   dk=records["dk"] * (1 + 2.0 ** -4) + 2.0 ** -4)
-    assert refused(backward_witnessed(q, k, v, do, mask, widened, lane=lane), "dk")
-    # The fast form's output residuals take no anchor key (`chosen` -1, `attention.output_split`): an anchor
-    # of 1 there refused at its row, where `chosen < 0` passed any.
-    assert (records["chosen"] < 0).all(), "the fast form's output residuals take no anchor key"
-    anchored = dict(records, anchor=records["anchor"] + 1.0)
-    assert refused(backward_witnessed(q, k, v, do, mask, anchored, lane=lane), "anchor")
+    "lost": (lambda records: dict(records, lost=1e3 * (np.abs(records["delta"]) + 1.0),
+                                  dk=records["dk"] * (1 + 2.0 ** -4) + 2.0 ** -4), "dk"),
+    "anchor": (_anchored, "anchor"),
+}
+"""Each two-launch fault (`assert_two_launches_held_to_their_own_d`): its records from the launches' own and
+the record it is refused at, a part a test may hold alone."""
 
 
 def assert_equal_totals_held(*, interpret: bool, lane: Lane | None = None) -> None:
@@ -759,48 +809,86 @@ def _exact_dk(query, key, scores: np.ndarray) -> np.ndarray:
     return np.asarray(nearest(dk.reshape(*dk.shape[:2], k.shape[2], group, -1).sum(3), BFLOAT16), np.float64)
 
 
-def assert_backward_faults_refused(*, interpret: bool, lane: Lane | None = None) -> None:
-    """Each fault the backward's witness exists for, refused at its elements: dK at twice its scale, dQ and
-    dV a sixty-fourth off, a causal call's gradients held as a full call's, and a capped call's dQ and dK
-    held without the cap's slope (`sloped`; its dV held); the accurate form's at
-    twice its scale and a sixty-fourth off alike, a dK of the exact score cotangents cast to one bf16 part
-    where the accurate form takes three (the same cotangents whole held), and the fast form's dQ and dK
-    held as the accurate form's (one part, about the first pass's D), and the fast form's D taken and
-    stated a sixty-fourth off (refused at its row). Every native program launches before any check (row
-    9546)."""
+def assert_backward_faults_refused(*, interpret: bool, lane: Lane | None = None,
+                                   faults: tuple[str, ...] | None = None) -> None:
+    """Each fault the backward's witness exists for among `faults` (`BACKWARD_FAULTS`' names, every one by
+    default), refused at its
+    elements: dK at twice its scale, dQ and dV a sixty-fourth off ('scaled'), a causal call's gradients held
+    as a full call's ('masked'), the fast form's D taken and stated a sixty-fourth off, refused at its row
+    ('delta'), a capped call's dQ and dK held without the cap's slope (`sloped`; its dV held, 'capped'); the
+    accurate form's at twice its scale and a sixty-fourth off alike ('accurate'), and a dK of the exact score
+    cotangents cast to one bf16 part where the accurate form takes three (the same cotangents whole held),
+    and the fast form's dQ and dK held as the accurate form's (one part, about the first pass's D,
+    'parts'). Every native program a part reads launches before any check (row 9546)."""
     import tier_wire
 
+    faults = tuple(BACKWARD_FAULTS) if faults is None else faults
     q, k, v, do = backward_operands(3)
-    causal = backward_launched(q, k, v, do, "causal", interpret=interpret, site="faults")
-    capped = backward_launched(q, k, v, do, "capped", interpret=interpret, site="faults")
-    accurate = backward_launched(q, k, v, do, "causal", interpret=interpret, site="faults", accurate=True)
+    names = dict.fromkeys(name for fault in faults for name in BACKWARD_FAULTS[fault][0])
+    # The accurate form's run is the causal call's in that form.
+    runs = {name: backward_launched(q, k, v, do, "causal" if name == "accurate" else name,
+                                    interpret=interpret, site="faults", accurate=name == "accurate")
+            for name in names}
     if not interpret and tier_wire.preparing():
         return
     mask = mask_of("causal")
+    for fault in faults:
+        BACKWARD_FAULTS[fault][1](q, k, v, do, mask, runs, lane)
+
+
+def _bent_refused(q, k, v, do, mask, runs: dict, lane, *, run: str) -> None:
+    """Run `run`'s dK at twice its scale, dQ and dV a sixty-fourth off, each refused at its gradient."""
+    records = runs[run]
     for name, bent in (("dk", 2.0), ("dq", 1.0 + 2.0 ** -6), ("dv", 1.0 - 2.0 ** -6)):
-        held = backward_witnessed(q, k, v, do, mask, dict(causal, **{name: causal[name] * bent}), lane=lane)
+        held = backward_witnessed(q, k, v, do, mask, dict(records, **{name: records[name] * bent}), lane=lane)
         assert refused(held, name), name
-    held = backward_witnessed(q, k, v, do, mask_of("full"), causal, lane=lane)
+
+
+def _masked_refused(q, k, v, do, mask, runs: dict, lane) -> None:
+    """A causal call's gradients held as a full call's."""
+    held = backward_witnessed(q, k, v, do, mask_of("full"), runs["causal"], lane=lane)
     assert sum(refused(held, name) for name in ("dq", "dk", "dv"))
-    # The fast form's D taken and stated a sixty-fourth off (its prior and the D its launch read alike),
-    # refused at the row whatever the gradients.
+
+
+def _delta_refused(q, k, v, do, mask, runs: dict, lane) -> None:
+    """The fast form's D taken and stated a sixty-fourth off (its prior and the D its launch read alike),
+    refused at the row whatever the gradients."""
+    causal = runs["causal"]
     off = dict(causal, prior=causal["prior"] * (1 + 2.0 ** -6) + 2.0 ** -6,
                delta=causal["delta"] * (1 + 2.0 ** -6) + 2.0 ** -6)
     assert refused(backward_witnessed(q, k, v, do, mask, off, lane=lane), "prior")
-    # The cap's slope read: a capped call's gradients held with it, and without it, its logits and weights
-    # capped (`sloped`), its dQ and dK refused and its dV (no slope in it) held.
+
+
+def _cap_refused(q, k, v, do, mask, runs: dict, lane) -> None:
+    """The cap's slope read: a capped call's gradients held with it, and without it, its logits and weights
+    capped (`sloped`), its dQ and dK refused and its dV (no slope in it) held."""
     for sloped in (True, False):
-        held = backward_witnessed(q, k, v, do, mask, capped, lane=lane, softcap=CAPS["capped"], sloped=sloped)
+        held = backward_witnessed(q, k, v, do, mask, runs["capped"], lane=lane, softcap=CAPS["capped"],
+                                  sloped=sloped)
         assert [bool(refused(held, name)) for name in ("dq", "dk", "dv")] == [not sloped, not sloped, False]
-    for name, bent in (("dk", 2.0), ("dq", 1.0 + 2.0 ** -6), ("dv", 1.0 - 2.0 ** -6)):
-        faulty = dict(accurate, **{name: accurate[name] * bent})
-        held = backward_witnessed(q, k, v, do, mask, faulty, lane=lane)
-        assert refused(held, name), name
-    # The accurate dK of the exact cotangents whole held, cast to one bf16 part first refused.
+
+
+def _parts_refused(q, k, v, do, mask, runs: dict, lane) -> None:
+    """The accurate dK of the exact cotangents whole held, cast to one bf16 part first refused; the fast
+    form's dQ and dK held as the accurate form's refused."""
+    accurate = runs["accurate"]
     scores = _exact_scores(q, k, v, do, mask)
     one_part = nearest(nearest(scores, FLOAT32), BFLOAT16)
     for cotangents, wrong in ((scores, False), (one_part, True)):
         exact = dict(accurate, dk=_exact_dk(q, k, cotangents))
         assert bool(refused(backward_witnessed(q, k, v, do, mask, exact, lane=lane), "dk")) == wrong
+    causal = runs["causal"]
     held = backward_witnessed(q, k, v, do, mask, dict(accurate, dq=causal["dq"], dk=causal["dk"]), lane=lane)
     assert refused(held, "dq") and refused(held, "dk")
+
+
+BACKWARD_FAULTS = {
+    "scaled": (("causal",), functools.partial(_bent_refused, run="causal")),
+    "masked": (("causal",), _masked_refused),
+    "delta": (("causal",), _delta_refused),
+    "capped": (("capped",), _cap_refused),
+    "accurate": (("accurate",), functools.partial(_bent_refused, run="accurate")),
+    "parts": (("causal", "accurate"), _parts_refused),
+}
+"""The backward's faults (`assert_backward_faults_refused`), each the runs it reads and its check of them
+from the operands, the causal mask and the runs, a part a test may hold alone."""
