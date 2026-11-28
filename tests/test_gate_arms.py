@@ -267,7 +267,7 @@ named by jaxlib for float32) and its truth: one whose executable makes the call,
 
 
 @pytest.mark.skipif(jax.default_backend() != "cpu",
-                    reason="a store prepares on the process's default devices, and these arms' marks are a CPU's")
+                    reason="a store prepares on the process's default devices; these arms' marks are a CPU's")
 @pytest.mark.parametrize("reached", [True, False])
 @pytest.mark.parametrize("case", LIBRARY_ARMS)
 def test_a_library_arm_is_held_to_its_call_on_the_executable_its_run_runs(tmp_path, monkeypatch, case,
