@@ -128,35 +128,32 @@ def test_the_chunk_parallel_memory_is_the_token_by_token_one(name):
                     truth_fn=written(module, dtype=jnp.float64))
 
 
-def test_a_one_document_ttt_memory_alone_runs_the_mini_batched_kernel(monkeypatch):
-    """A TTT-Linear memory's call of rows of one document runs its mini-batched kernel
-    (`dew.nn.kernels.ttt.ttt_linear`) once, and a packed call, a call under a method interceptor and a Titans
-    memory's call take the general path, never it (train 1495's review: the route's tests held its numbers,
-    which the general path meets too)."""
-    from dew.nn.kernels import ttt
+def test_a_one_document_ttt_memory_alone_runs_the_mini_batched_kernel():
+    """A TTT-Linear memory's call of rows of one document runs its mini-batched kernel (its program holds the
+    kernel's scope, `memory.MINI_BATCHED`), and a packed call, a call under a method interceptor and a Titans
+    memory's call take the general path, whose programs hold none (train 1495's review: the route's tests
+    held its numbers, which the general path meets too)."""
+    from dew.nn.memory import MINI_BATCHED
+    from dew.nn.programs import equations
 
-    calls = []
-    kernel = ttt.ttt_linear
+    def routed(module, *call, intercepted=False):
+        x, params = drawn(module)(0)
 
-    def counted(*args, **kwargs):
-        calls.append(args[0].shape)
-        return kernel(*args, **kwargs)
+        def run(params, x):
+            if not intercepted:
+                return module.apply(params, x, *call)
+            with nn.intercept_methods(lambda next_fun, args, kwargs, context: next_fun(*args, **kwargs)):
+                return module.apply(params, x, *call)
 
-    monkeypatch.setattr(ttt, "ttt_linear", counted)
-    module = layer("ttt_linear")
-    x, params = drawn(module)(0)
-    module.apply(params, x)
-    assert len(calls) == 1
+        program = jax.make_jaxpr(run)(params, x).jaxpr
+        return any(getattr(scope, "name", None) == MINI_BATCHED for equation in equations(program)
+                   for scope in equation.source_info.name_stack.stack)
 
-    def passing(next_fun, args, kwargs, context):
-        return next_fun(*args, **kwargs)
-
-    module.apply(params, x, packed(np.ones((ROWS, LENGTH), np.int32)))
-    with nn.intercept_methods(passing):
-        module.apply(params, x)
-    titans = layer("titans_linear")
-    titans.apply(drawn(titans)(0)[1], drawn(titans)(0)[0])
-    assert len(calls) == 1
+    ttt = layer("ttt_linear")
+    assert routed(ttt)
+    assert not routed(ttt, packed(np.ones((ROWS, LENGTH), np.int32)))
+    assert not routed(ttt, intercepted=True)
+    assert not routed(layer("titans_linear"))
 
 
 @pytest.mark.parametrize("name", ["ttt_linear"])
