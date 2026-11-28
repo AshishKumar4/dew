@@ -242,7 +242,8 @@ def moments(logits: jax.Array, seconds: jax.Array, value: jax.Array, powers: jax
     tail_pairs = jnp.where(seen & tail, _reach(below) + valued, _NONE)
     raised = jnp.clip(126 - width - jnp.max(tail_pairs, axis=-1), 0, 241)[..., None]
     lifted = jnp.where(tail, exp_scaled(jnp.broadcast_to(1.0 / over, below.shape), below, raised), 0.0)
-    mean = weighed(jnp.where(tail, 0.0, weights), value) + _shifted(weighed, lifted, value, -raised, 0)
+    mean = (weighed(jnp.where(tail, 0.0, weights), value)
+            + _shifted(weighed, lifted, value, -raised, 0, (0, 0)))
     # The centre's terms each a second product decayed with its weight before either rounds (`exp_scaled`):
     # a tail's `2^200 e^-128` kept where its weight alone underflowed (train 1444's review).
     hi = jax.lax.stop_gradient(jnp.sum(exp_scaled(seconds / over, below, 0), axis=-1))
@@ -273,7 +274,7 @@ def moments(logits: jax.Array, seconds: jax.Array, value: jax.Array, powers: jax
     # Its power from the covariance at the lifted units, the covariance then taken to it whole (`_shifted`).
     lift = (units - before)[..., None]
     spread_power = _spread_power(jax.lax.stop_gradient(covariance(taken, halves)), lift + rows)
-    spread = _shifted(covariance, taken, halves, lift, rows - spread_power)
+    spread = _shifted(covariance, taken, halves, lift, rows - spread_power, ((channels, rows), rows))
     return Moments(jnp.max(logits, axis=-1), total, mean, (hi, lo), spread, spread_power)
 
 
@@ -292,8 +293,9 @@ def _spread_power(covariance: jax.Array, power) -> jax.Array:
     return jnp.where(covariance != 0, jnp.maximum(_exponent(covariance) + power, 0), 0)
 
 
-def _shifted_value(product: Callable, rows: jax.Array, by, lift, scale) -> jax.Array:
+def _shifted_value(product: Callable, rows: jax.Array, by, lift, scale, restored) -> jax.Array:
     """`product(rows, by) 2^(lift + scale)`, its product formed before the power (`_shifted`)."""
+    del restored
     return power2(product(rows, by), lift + scale)
 
 
@@ -303,13 +305,16 @@ def _shifted_tangent(product: Callable, primals, tangents, value) -> jax.Array:
     the rows taken toward their own size first, by as much of the row's `lift` as keeps their largest within
     `2^125` (all of it where it is negative), the rest of the power after: a lift of `2^60` taken off before
     a direction of `2^125` meets them, and a positive one put back before a direction of `2^-124` does (its
-    products `2^-165` otherwise, train 1444's review)."""
+    products `2^-165` otherwise, train 1444's review). The rows' direction meets `by` with the channels'
+    powers `restored` put back (`(by's, the output's)`: `by` taken down by them before the value's
+    product), so its pullback takes no channel's power on a cotangent before `by` meets it."""
     del value
-    rows, by, lift, scale = primals
-    drows, dby, _, _ = tangents
+    rows, by, lift, scale, (by_powers, out_power) = primals
+    drows, dby, _, _, _ = tangents
     largest = jnp.max(_exponent(jax.lax.stop_gradient(rows)), axis=-1, keepdims=True)
     take = jnp.minimum(lift, 125 - largest)
-    return (power2(product(drows, by), lift + scale)
+    whole = jax.tree.map(power2, by, by_powers)
+    return (power2(product(drows, whole), lift + scale - out_power)
             + power2(product(power2(rows, take), dby), lift - take + scale))
 
 
@@ -317,7 +322,8 @@ _shifted = contracted("test_parallax_holds_every_order")(
     surrogate(_shifted_value, _shifted_tangent, nondiff_argnums=(0,)))
 """`product(rows, by) 2^(lift + scale)` (`_shifted_value`), `product` bilinear in a row's terms `rows`
 `[..., K]` lifted for their products and what they meet, `by` (an array or a tuple of them), `lift` the
-rows' integral power back `[..., 1]` and `scale` each channel's own `[..., Dv]` (or 0): its value the
+rows' integral power back `[..., 1]`, `scale` each channel's own `[..., Dv]` (or 0) and `restored` the
+channels' powers `by` was taken down by (`_shifted_tangent`): its value the
 product's before the power, so a lifted term keeps its product with a small value and terms that cancel
 do so before the power; a direction along `by` meets the terms at their
 own size (`_shifted_tangent`): equal logits, second products `[1, -1]`, values 0 along `[2^126, -2^126]`
