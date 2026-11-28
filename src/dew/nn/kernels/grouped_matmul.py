@@ -658,10 +658,13 @@ class _Mosaic(tiling.TilesTemplate, _GroupedLaunch[tiling.Tiles]):
             return False
         hooks = ba.arguments['hooks']
         stored = _stored_dtypes(ba)
+        # A grouped call's tile stores each group's rows from its first, known only as it runs (`gmm`'s
+        # `_stored_rows`): every staged row whole 128-byte units (row 14182).
         if not self._granular(ba, config, family, target) or config.staging_refusal(
                 quantized.outputs((config.share, pricing.tile_columns(config, family)), stored,
                                   quantized.forms_of(hooks.out_forms, stored)),
-                family.specialized(config.share, pricing.tile_columns(config, family))) is not None:
+                family.specialized(config.share, pricing.tile_columns(config, family)),
+                first=None if self._stores_group_rows(ba) else 0) is not None:
             return False
         if hooks.out_forms and (not self.STORES_FORMS or quantized.forms_refusal(
                 hooks.out_forms, config, dense=bool(ba.arguments.get('dense')))):
@@ -682,6 +685,11 @@ class _Mosaic(tiling.TilesTemplate, _GroupedLaunch[tiling.Tiles]):
         """Whether the launch's call carries scales beside its matrix (a packed matrix's, step or block
         scales), its layout its own: none of `_Mosaic`'s."""
         return False
+
+    def _stores_group_rows(self, ba) -> bool:
+        """Whether the call's tile stores each group's rows from its group's first, a row known only as it
+        runs (`mosaic_gpu._stored_rows`): a grouped product's, not a dense one's (from row 0)."""
+        return not ba.arguments.get('dense')
 
     def _pingpong_refuses(self, config: tiling.Tiles, family: mosaic.Family) -> bool:
         """Whether a ping-pong tile (`Tiles.pingpong`) is one the launch does not run: on a family that takes
@@ -1471,6 +1479,11 @@ class MosaicTgmm(_Mosaic):
 
     EXACT_SUMS: ClassVar[bool] = True
     STAGED_ROWS: ClassVar[bool] = True
+
+    def _stores_group_rows(self, ba) -> bool:
+        """A kernel gradient's tile stores its group's gradient whole, from row 0: no group's row."""
+        del ba
+        return False
 
     def _allocations(self, ba, config: tiling.Tiles, family: mosaic.Family) -> mosaic_gpu.Allocations:
         from .templates.gemm import mosaic_gpu

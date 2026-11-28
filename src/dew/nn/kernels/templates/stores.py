@@ -135,7 +135,8 @@ def output_staging(columns: int, dtypes, staging: tuple[int, int] | None = None,
 
 
 def staging_refusal(columns: int, dtypes, staging: tuple[int, int] | None = None, *,
-                    piece: int | None = None, packed: tuple[Output, ...] = ()) -> str | None:
+                    piece: int | None = None, packed: tuple[Output, ...] = (), first: int | None = 0
+                    ) -> str | None:
     """Why a `columns`-wide output tile of `dtypes` stages in no chunks of `staging`'s (chunk columns,
     buffers), its derived ones where none is stated (`output_staging`), None where it does: what a launch's
     candidate asks of a pin before it takes it (a GEMM's tile's). A chunk divides the tile and the `piece`
@@ -144,7 +145,10 @@ def staging_refusal(columns: int, dtypes, staging: tuple[int, int] | None = None
     TMA rows in each of `dtypes` (`copies.ROW_BYTES`), by each dtype's bits (a packed fp4's half byte): a bf16
     output's chunk of 4 columns, 8 bytes a row, is refused here rather than by the tensor map it lowers
     to. Outputs stored packed (`packed`, whose dtypes `dtypes` are) are refused where a chunk, stated or
-    derived, stores no whole rows of them (`_packed_refusal`): a 128-column tile's NVFP4 scales."""
+    derived, stores no whole rows of them (`_packed_refusal`): a 128-column tile's NVFP4 scales. Stored from
+    a first row known only as it runs (`first` None: a grouped tile's group), a chunk whose rows of any
+    output are no whole 128-byte units is refused (`row_starts_aligned`): its copies would start its shared
+    rows off a tensor copy's address (row 14182: an RTX PRO 6000 faults, M-FS-115)."""
     chunk, buffers = ((staged_columns(columns, dtypes, packed=packed, piece=piece), OUTPUT_BUFFERS)
                       if staging is None else staging)
     if chunk < 1 or columns % chunk or (piece or columns) % chunk or buffers < 1:
@@ -154,6 +158,16 @@ def staging_refusal(columns: int, dtypes, staging: tuple[int, int] | None = None
     if staging is not None and not packed and partial:
         return (f"a stated chunk of {chunk} columns stores no whole {copies.ROW_BYTES}-byte TMA rows in "
                 f"{', '.join(partial)}")
+    if first is None:
+        # Each output's staged row: a packed one's its divisor's columns of its dtype, a transposed one's
+        # stored whole (`_whole_shares`).
+        rows = [*((chunk, dtype) for dtype in dtypes if not packed),
+                *((chunk // output.divisor, output.dtype) for output in packed if not output.transposed)]
+        unaligned = sorted({jnp.dtype(dtype).name for width, dtype in rows
+                            if not row_starts_aligned(width * jax.dtypes.itemsize_bits(dtype) // 8, None)})
+        if unaligned:
+            return (f"a chunk of {chunk} columns stored from a group's first row stores rows of "
+                    f"{', '.join(unaligned)} no whole {copies.SHARED_ALIGNMENT}-byte units")
     return _packed_refusal(chunk, packed)
 
 
