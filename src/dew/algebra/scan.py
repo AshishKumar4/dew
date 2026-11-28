@@ -1301,42 +1301,60 @@ def _factored(left, right, between, joined, issue: Callable, role: str, *, back:
     """A per-key decay's pairs `sum_k left_ik right_jk between_ijk` over sub-chunks of `SUB` rows
     (`recurrence_algebra.SUB`, fla's BC): a pair of an earlier sub-chunk's key `j` and a later one's row `i`
     is the product of the row decayed to the reference `p` before its sub-chunk and the key decayed from it,
-    with a dot unless a factor underflows; then the portable contraction holds all factors until the sum
-    lands (row 12888). A sub-chunk's own pairs are elementwise over its keys (at most SUB^2 K a sub-chunk,
-    not C^2 K), by the pairing's own decays (joined less a strict pairing's diagonal). Decays a token back
-    (between_before, row i
-    `between`'s row `i - 1`) factor as `between_back_ip between_back_(p+1)j`, the key's factor read at the
-    reference's next row, its own sub-chunk's first: `between_back_pj` is a token short of `p`, which the
-    pair's whole decay spans (`exp(G_{i-1} - G_p) exp(G_p - G_j)`)."""
+    with a dot unless a factor underflows; then the portable contraction holds all factors until the sum lands
+    (row 12888). A sub-chunk's own pairs are elementwise over its keys (at most SUB^2 K a sub-chunk, not C^2
+    K), by the pairing's own decays (joined less a strict pairing's diagonal). Decays a token back
+    (between_before, row i `between`'s row `i - 1`) factor as `between_back_ip between_back_(p+1)j`, the key's
+    factor read at the reference's next row, its own sub-chunk's first: `between_back_pj` is a token short of
+    `p`, which the pair's whole decay spans (`exp(G_{i-1} - G_p) exp(G_p - G_j)`). The sub-chunks' blocks are
+    taken by static slices (the chunk padded to whole sub-chunks with crossed keys, which pair nothing) and
+    the portable pairs taken in two batched calls, the diagonal blocks' and every earlier sub-chunk's, one
+    repair decision each: a call a block traced the pairs' arithmetic again for each of a chunk's `S (S + 1) /
+    2`, 84% of a GLM-5 tiny forward's 85k StableHLO ops (two walks of 36k ops, 71k of them these calls)."""
     from dew.nn.kernels import recurrence_algebra
 
     count = left.shape[0]
     sub = recurrence_algebra.SUB
     work = at_least_fp32(jnp.result_type(left, right, joined))
-    starts = range(0, count, sub)
-    rows = []
-    for first in starts:
-        own = slice(first, min(first + sub, count))
-        blocks = []
-        for start in starts:
-            keys = slice(start, min(start + sub, count))
-            if start > first:
-                blocks.append(jnp.zeros((own.stop - own.start, keys.stop - keys.start), work))
-            elif start == first:
-                decay = joined[own, keys]
-                blocks.append(_portable_pairs(left[own].astype(work), right[keys].astype(work),
-                                              decay.astype(work), None) if issue is _issued else
-                              _portable_einsum("ik,ijk->ij", left[own], right[None, keys] * decay))
-            else:
-                reference = first - 1
-                before, after = between[own, reference], between[reference + back, keys]
-                if issue is _issued:
-                    blocks.append(_portable_pairs(left[own].astype(work), right[keys].astype(work),
-                                                  before.astype(work), after.astype(work)))
-                else:
-                    blocks.append(issue(role, left[own] * before, (right[keys] * after).T))
-        rows.append(jnp.concatenate(blocks, axis=1))
-    return jnp.concatenate(rows, axis=0)
+    blocks = -(-count // sub)
+    if pad := blocks * sub - count:
+        left, right = (jnp.pad(x, ((0, pad), (0, 0))) for x in (left, right))
+        between, joined = (jnp.pad(x, ((0, pad), (0, pad), (0, 0)), constant_values=-0.0)
+                           for x in (between, joined))
+    earlier = [(first, start) for first in range(blocks) for start in range(first)]
+
+    def block(x, rows, columns=None):
+        """Sub-chunk `rows`' block of `x` (and `columns`' where given), a static slice: no gather, which a
+        checked `shard_map`'s replay (`forms.leaf`) bound with invariant indices beside varying operands,
+        refused."""
+        cut = x[rows * sub:(rows + 1) * sub]
+        return cut if columns is None else cut[:, columns * sub:(columns + 1) * sub]
+
+    # The diagonal blocks' rows and keys are contiguous: reshaped (a reshape's transpose).
+    own_left, own_right = (x.reshape(blocks, sub, x.shape[-1]) for x in (left, right))
+    decay = jnp.stack([block(joined, first, first) for first in range(blocks)])
+    if issue is _issued:
+        diagonal = _portable_pairs(own_left.astype(work), own_right.astype(work), decay.astype(work), None)
+    else:
+        diagonal = _portable_einsum("...ik,...ijk->...ij", own_left, own_right[:, None] * decay)
+    off = []
+    if earlier:
+        rows = jnp.stack([own_left[first] for first, _ in earlier])
+        keys = jnp.stack([own_right[start] for _, start in earlier])
+        # The reference a token before the row's sub-chunk: the row's decay to it, the key's from it (its
+        # next row a token back, `back`).
+        before = jnp.stack([block(between, first)[:, first * sub - 1] for first, _ in earlier])
+        after = jnp.stack([block(between[first * sub - 1 + back], start) for first, start in earlier])
+        off = (_portable_pairs(rows.astype(work), keys.astype(work), before.astype(work), after.astype(work))
+               if issue is _issued else
+               [issue(role, rows[place] * before[place], (keys[place] * after[place]).T)
+                for place in range(len(earlier))])
+    placed = {pair: place for place, pair in enumerate(earlier)}
+    zeros = jnp.zeros((sub, sub), work)
+    rows = [jnp.concatenate([off[placed[first, start]] if start < first else
+                             diagonal[first] if start == first else zeros for start in range(blocks)], axis=1)
+            for first in range(blocks)]
+    return jnp.concatenate(rows, axis=0)[:count, :count]
 
 
 def spread(readers, values, keys, between, *, weights=None, issue: Callable | None = None):
