@@ -1,3 +1,5 @@
+import re
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -52,19 +54,56 @@ def _blocked(step, start, count):
     return carry, jax.tree.map(lambda a, b: jnp.concatenate((a[None], b)), first, rest)
 
 
+def _show_dk2_program(dew):
+    executable = next(iter(dew.ahead.values()))
+    text = executable.as_text()
+    lines = text.splitlines()
+    blocks = {}
+    for line in lines:
+        if line and not line[0].isspace() and line.endswith('{'):
+            block = re.search(r'%[-.\w]+', line)
+            if block:
+                current = blocks.setdefault(block.group(), [])
+        elif line.startswith('  '):
+            current.append(line)
+    entry = [line for line in lines if line.startswith('ENTRY ')][0]
+    main = blocks[re.search(r'%[-.\w]+', entry).group()]
+    definitions = {re.search(r'%[-.\w]+', line).group(): line for line in main}
+    root = next(line for line in main if line.startswith('  ROOT '))
+    result = re.findall(r'%[-.\w]+', root.split(' tuple(', 1)[1])[4]
+    queue = [result]
+    seen = set()
+    while queue and len(seen) < 9:
+        value = queue.pop(0)
+        if value not in definitions or value in seen:
+            continue
+        seen.add(value)
+        line = definitions[value].split(', metadata=')[0]
+        print('PLX-HLO', line, flush=True)
+        fusion = re.search(r'calls=(%[-.\w]+)', line)
+        if fusion:
+            for inside in blocks[fusion.group(1)]:
+                if any(key in inside for key in ('ROOT ', 'concatenate(', 'slice(', 'dynamic-update-slice(')):
+                    print('PLX-HLO', inside.split(', metadata=')[0], flush=True)
+        queue.extend(re.findall(r'%[-.\w]+', line.split('=', 1)[1]))
+
+
 @pytest.mark.parametrize('variant', [
     'peeled', 'unpeeled', 'derivative_scan', 'two_steps', 'barrier', 'no_cpu_fusion', 'no_fusion', 'ynn',
     'ordered', 'sentinel', 'no_while_simplifier',
+    'hlo_peeled', 'hlo_unpeeled',
 ])
 def test_check_arm_repeats(monkeypatch, variant):
     tiling = {'unpeeled': _scan, 'derivative_scan': _derivative_scan, 'two_steps': _two_steps,
-              'barrier': _blocked}
+              'barrier': _blocked, 'hlo_unpeeled': _derivative_scan}
     if variant in tiling:
         monkeypatch.setattr(attention_parallax, '_tiled', tiling[variant])
     if variant == 'sentinel':
         monkeypatch.setattr(attention_parallax, '_NONE', -1537)
     failures = []
     for make in (_covariance, _far):
+        if variant.startswith('hlo_') and make is not _far:
+            continue
         operands, spans = make()
         ops = (*operands, jnp.ones((1, 1, 1, 1), jnp.float32))
         run = jax.jit(tp._every_cotangent(attention_parallax.attend, spans))
@@ -80,6 +119,9 @@ def test_check_arm_repeats(monkeypatch, variant):
         with summed_as_run():
             if variant != 'ynn':
                 _ynn_decided(make.__name__, (dew, ref), ops)
+                if variant.startswith('hlo_'):
+                    _show_dk2_program(dew)
+                    continue
             print('PLX-MODE', make.__name__, variant, flush=True)
             previous = np.asarray(dew(*ops)[4]).ravel().view(np.uint32).copy()
             for attempt in range(160):
