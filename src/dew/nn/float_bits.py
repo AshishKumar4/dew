@@ -253,9 +253,14 @@ def _widened_back(cotangent: jax.Array) -> jax.Array:
     def apply(_, moving):
         return _bitwise(lambda part: _widened_bits(part, wide), moving, wide=True)
 
+    def narrowed(_, back):
+        # In x64 whatever scope its pullback runs in: a float64 cotangent read as float32 first would round
+        # before the narrowing reads its bits.
+        with jax.enable_x64(new_val=True):
+            return narrowed_float32(back)
+
     widened = jax.typeof(cotangent).update(dtype=wide, weak_type=False)
-    return linear_map(apply, lambda _, back: narrowed_float32(back), (), cotangent, out_aval=widened,
-                      summed_first=True)
+    return linear_map(apply, narrowed, (), cotangent, out_aval=widened, summed_first=True)
 
 
 def _narrowed_bits(x: jax.Array) -> jax.Array:
