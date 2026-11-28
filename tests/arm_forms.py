@@ -464,9 +464,13 @@ class _Paired:
         return not self.pairing.with_ynn
 
     def __call__(self, *inputs, **options):
-        ahead = self.ahead and not options and not self.pairing.with_ynn
-        compiled = self.ahead.get(_signature(inputs)) if ahead else None
-        return (compiled or self.selected)(*inputs, **options)
+        # Keyword options a call passes its program take no compile ahead, whose signature held none.
+        return ((None if options else self._ahead(inputs)) or self.selected)(*inputs, **options)
+
+    def _ahead(self, inputs) -> jax.stages.Compiled | None:
+        """The arm's compile ahead at `inputs`' signature (`ahead`, `_ynn_decided`) where its pairing runs
+        without the fusions and holds one; None otherwise: the one choice of its call and its executable."""
+        return None if self.pairing.with_ynn else self.ahead.get(_signature(inputs))
 
     @property
     def selected(self) -> Callable:
@@ -475,9 +479,9 @@ class _Paired:
         return self.plain if self.pairing.with_ynn else self.without
 
     def executable(self, inputs) -> jax.stages.Compiled:
-        """The executable the arm runs at `inputs`: its compile ahead where its pairing holds one
-        (`ahead`, `_ynn_decided`), else its selected program's (`selected`)."""
-        held = None if self.pairing.with_ynn else self.ahead.get(_signature(inputs))
+        """The executable the arm runs at `inputs`: its compile ahead (`_ahead`), else its selected program's
+        (`selected`)."""
+        held = self._ahead(inputs)
         return held if held is not None else self.selected.lower(*inputs).compile()
 
     @property

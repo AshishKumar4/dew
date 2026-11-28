@@ -1571,7 +1571,12 @@ def _written_pair(store, label: str, dew_fn, reference_fn, draw, arms):
 
         return arms[0], _routed_arm(store, label, reference_fn, twin, _written_role(None), written=True), arms
     _refuse_numpy_arms(draw, dew_fn, reference_fn)
-    alike = _arms_with(dew_fn, reference_fn, [], label)[:2]
+    from arm_store import _routed_arm, _routed_arms
+
+    # Each its sizing's own compile, a library arm held to its call (`arm_store._routed_arm`, row 14096).
+    compiled = _arms_with(dew_fn, reference_fn, [], label)
+    alike = _routed_arms(None, label, dew_fn, reference_fn, {}, compiled)[:2]
+    twin = _routed_arm(None, label, reference_fn, twin, _written_role(None), written=True)
     with summed_as_run():
         _ynn_decided(label, [*alike, twin], draw(SIZING_FROM))
     return alike[0], twin, alike
@@ -1791,8 +1796,17 @@ def seeds_for(reference_fn, draw, label: str, *, start: int = FEWEST_SEEDS, most
     # elements classed over its first stages' draws.
     weighing = (_conditioning(reference_fn, truth_fn, draw, range(staged_units(max(start, FEWEST_SEEDS))),
                               scale=conditioning_scale) if conditioning else None)
-    dew_fn, reference_fn = (arms if arms is not None
-                            else _arms(dew_fn if paired else reference_fn, reference_fn))
+    if arms is None:
+        from arm_store import _routed_arm
+
+        # The pair its sizing compiles, a library arm held to its call on the executable it runs, as the
+        # verdict's are (`arm_store._routed_arm`, row 14096).
+        given = dew_fn if paired else reference_fn
+        compiled = _arms(given, reference_fn)
+        arms = (_routed_arm(None, label, given, compiled[0], "dew"),
+                _routed_arm(None, label, reference_fn, compiled[1], "reference"))
+        twin = twin and _routed_arm(None, label, reference_fn, twin, _written_role(None), written=True)
+    dew_fn, reference_fn = arms
     reference_fn = twin or reference_fn
     dew_fn = dew_fn if paired else None
     truth_fn = _truth_program(truth_fn)

@@ -2,6 +2,7 @@
 upstream rounding, each one's error heavy-tailed across draws, resolve paired where the reference
 compared with itself does not, and a fault still fails at the count they declare."""
 
+import jax
 import numpy as np
 import pytest
 from reference_error import GateFailure, Inconclusive, as_given, as_recorded, assert_as_exact, seeds_for
@@ -94,3 +95,24 @@ def test_a_recorded_dew_arm_is_refused_a_paired_sizing(heavy):
 
     with pytest.raises(ValueError):
         seeds_for(_summed(0), heavy, "recorded Dew sums", truth_fn=_truth, dew_fn=recorded)
+
+
+@pytest.mark.skipif(jax.default_backend() != "cpu", reason="the arm's mark is a CPU's")
+def test_a_sizing_holds_a_library_reference_to_its_call_on_the_executable_it_runs():
+    """A qualification run's sizing (`seeds_for`) of a site no prepare reached holds a library reference
+    (`truths_ahead.library_arm`, marked for a CPU) to its call on the executable it runs, as the verdict
+    does, before any count is drawn: XLA's own dot marked as a library's call is refused (`NotTheLibrary`;
+    train 1472's review: the sizing ran it unchecked, and could decide its count before the verdict's
+    check)."""
+    import jax.numpy as jnp
+    from contract_support import normal_drawn
+    from truths_ahead import NotTheLibrary, library_arm
+
+    def product(rows, matrix):
+        return jnp.dot(rows, matrix)
+
+    truth = as_given(lambda rows, matrix: np.asarray(rows, np.float64) @ np.asarray(matrix, np.float64))
+    reference = library_arm(jax.jit(product), "__a_library_call", platform="cpu")
+    with pytest.raises(NotTheLibrary):
+        seeds_for(reference, normal_drawn(0x14096, (16, 8), (8, 4)), "a library reference sized",
+                  truth_fn=truth, dew_fn=jax.jit(product))
