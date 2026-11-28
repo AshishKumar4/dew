@@ -747,6 +747,17 @@ def auto_part(spec: jax.sharding.PartitionSpec,
     return kept_axes(spec, auto.__contains__)
 
 
+def concrete_mesh(value) -> jax.sharding.Mesh | None:
+    """The named mesh of devices placing `value` where it is an array this process holds, run eagerly; None
+    for a tracer, None, or an array placed otherwise: the devices an eager allocation beside it is made on,
+    which an abstract mesh (a type's, outside any mesh context) cannot allocate on."""
+    if value is None or isinstance(value, jax_core.Tracer):
+        return None
+    sharding = getattr(value, "sharding", None)
+    held = sharding.mesh if isinstance(sharding, jax.sharding.NamedSharding) else None
+    return held if isinstance(held, jax.sharding.Mesh) else None
+
+
 def explicit_placement(aval: ShapedArray) -> jax.sharding.NamedSharding | None:
     """Where the type `aval` (`jax.typeof`'s) places its value where its mesh has an Explicit axis, None
     otherwise. A value no Explicit axis splits on such a mesh (a replicated one) still has its placement:

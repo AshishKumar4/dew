@@ -19,7 +19,14 @@ from dew.nn import float_bits, precision
 from dew.nn.derivatives import KernelGlue, contracted, declared_tangent
 from dew.nn.kernels import generation
 from dew.nn.kernels.templates import axes as side_axes
-from dew.nn.sharding import explicit_placement, explicit_spec, summed_to, unbroadcast, varying_like
+from dew.nn.sharding import (
+    concrete_mesh,
+    explicit_placement,
+    explicit_spec,
+    summed_to,
+    unbroadcast,
+    varying_like,
+)
 
 
 def factored(run: Callable, operands: tuple, factor: jax.Array, rows: jax.Array, *, wide: Callable,
@@ -605,7 +612,7 @@ def _placed(value: jax.Array, sharding: jax.sharding.NamedSharding, anchor=None)
         if held == sharding:
             return value
         # A concrete value (an uncommitted one's single device too) beside a concrete anchor: run eagerly.
-        mesh = _concrete_mesh(anchor)
+        mesh = concrete_mesh(anchor)
         if not isinstance(value, Tracer) and mesh is not None:
             return jax.device_put(value, jax.sharding.NamedSharding(mesh, sharding.spec))
         with jax.sharding.use_abstract_mesh(sharding.mesh.abstract_mesh):
@@ -617,23 +624,13 @@ def _placed(value: jax.Array, sharding: jax.sharding.NamedSharding, anchor=None)
 
 
 
-def _concrete_mesh(value) -> jax.sharding.Mesh | None:
-    """The named mesh of devices placing `value` where it is an array this process holds, run eagerly; None
-    for a tracer, None, or an array placed otherwise."""
-    if value is None or isinstance(value, Tracer):
-        return None
-    sharding = value.sharding
-    held = sharding.mesh if isinstance(sharding, jax.sharding.NamedSharding) else None
-    return held if isinstance(held, jax.sharding.Mesh) else None
-
-
 def _zeros(shape: tuple, dtype, sharding: jax.sharding.NamedSharding | None, anchor=None) -> jax.Array:
     """Zeros of `shape` placed at `sharding` (a type's, or None), made under its own abstract mesh, so their
     placement holds outside any mesh context (`_placed`); run eagerly (`anchor` a concrete array), made on
     the devices of `anchor`'s own mesh, which an eager allocation needs (train 1426's review)."""
     if sharding is None or not sharding.mesh.explicit_axes:
         return jnp.zeros(shape, dtype)
-    if (mesh := _concrete_mesh(anchor)) is not None:
+    if (mesh := concrete_mesh(anchor)) is not None:
         return jnp.zeros(shape, dtype, device=jax.sharding.NamedSharding(mesh, sharding.spec))
     with jax.sharding.use_abstract_mesh(sharding.mesh.abstract_mesh):
         return jnp.zeros(shape, dtype, out_sharding=sharding.spec)
