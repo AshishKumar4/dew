@@ -14,7 +14,7 @@ from jax.core import Tracer
 from reference_error import assert_as_exact
 
 from dew.nn.kernels import generation, tuning
-from dew.nn.kernels.templates import attention as template, attention_mosaic
+from dew.nn.kernels.templates import attention as template, attention_mosaic, attention_mosaic_program
 from dew.nn.kernels.templates.hooks import Hook, Side
 
 pytestmark = pytest.mark.kernel
@@ -148,7 +148,6 @@ def test_an_output_hooks_epilogue_program_is_the_one_its_runs_numerics_trace():
     ones: each run's program its own, held by the context it was traced in, where a cache keyed by the hook
     and tile alone replayed the first under the second (train 1375's F4)."""
     from dew.nn.kernels.generation import run_precision
-    from dew.nn.kernels.templates import attention_mosaic_program
     from dew.nn.precision import ACCURATE
 
     def hook(out):
@@ -169,8 +168,6 @@ def test_two_output_hooks_equal_by_their_fields_keep_their_own_epilogue_programs
     and of one hash: each one's epilogue program (`attention_mosaic_program.entrywise_hook`) is its own, held
     by its identity, where a cache keyed by equality replayed the first's for the second (train 1379's
     K-F5)."""
-    from dew.nn.kernels.templates import attention_mosaic_program
-
     @dataclasses.dataclass(frozen=True)
     class Scaled:
         factor: float = dataclasses.field(compare=False)
@@ -201,8 +198,6 @@ def test_an_epilogue_program_holds_no_tracer_of_its_callers_trace(held):
     holds (`_ENTRYWISE`) closes over a tracer once the trace ends, a hook so captured never held
     (`tuning.holdable` reads keyword defaults, train 1389's P1; a program capturing a tracer is never held,
     `attention_mosaic_program.output_program`, train 1427's)."""
-    from dew.nn.kernels.templates import attention_mosaic_program
-
     tile = (64, 128)
 
     @jax.jit
@@ -230,8 +225,6 @@ def test_an_epilogue_program_holds_no_device_array_its_hook_captured():
     """An output hook of an ordinary object holding a concrete device array (`box=_Box(bias)`, traced
     outside any jit, which `tuning.holdable` holds): its program, which closes over the array, is never
     held (`_ENTRYWISE`), where held it kept the array resident until evicted (train 1444's review)."""
-    from dew.nn.kernels.templates import attention_mosaic_program
-
     tile = (64, 128)
     holder = _Box(jnp.full((), 3.0, jnp.float32))
 
@@ -275,30 +268,45 @@ class _Derived:
         return doubled(out)
 
 
+CONTEXTS = {("sm90", False): 10.0, ("sm80", False): 15.0, ("sm90", True): 14.0}
+"""What `_read_context`'s hook multiplies an output by in each context: 2 on an sm90, 3 elsewhere, times 5
+where its code is chosen for a GPU, 7 where it is interpreted on this CPU."""
+
+
+def _read_context(out):
+    """An output hook that reads what it is traced for (the GPU, `generation.gpu_target`, and the platform
+    its code is chosen for, `generation.backend`): `out` times its context's factor (`CONTEXTS`)."""
+    sm90 = generation.gpu_target().generation == "sm90"
+    return out * (2.0 if sm90 else 3.0) * (5.0 if generation.backend() == "gpu" else 7.0)
+
+
 @pytest.mark.parametrize(("first", "second"), [(("sm90", False), ("sm80", False)),
                                                (("sm90", True), ("sm90", False))],
                          ids=["two targets", "interpreted and native"])
-def test_a_hooks_key_in_one_call_is_each_contexts_own(first, second):
-    """A hook that reads what it is traced for (the GPU, `generation.gpu_target`, and the platform its code is
-    chosen for, `generation.backend`), keyed twice within one kernel call (`tuning.one_call`) under two
-    assumptions, two GPUs or one GPU interpreted and native: each its own program's key
-    (`attention.hook_program`), where a call's table held by the hook's arguments alone gave the second the
-    first's (reviews of b949a0077a and a1e87e70dd: a GH200's forward priced as the canonical H100, natively,
-    beside its interpreted launch)."""
-    def scaled(out):
-        sm90 = generation.gpu_target().generation == "sm90"
-        return out * (2.0 if sm90 else 3.0) * (5.0 if generation.backend() == "gpu" else 7.0)
+def test_a_hooks_programs_in_one_call_are_each_contexts_own(first, second):
+    """A hook that reads what it is traced for, built within one kernel call (`tuning.one_call`) under two
+    assumptions, two GPUs or one GPU interpreted and native, then under the first again: its launch's key
+    (`attention.hook_program`) and its epilogue's program (`attention_mosaic_program.output_program`) each
+    its context's own, the program computing as that context reads the hook, and the first context's again
+    the first's (`tuning.once_a_call`), where a call's table held by the hook's arguments alone gave the
+    second the first's (K-F1: a GH200's forward priced as the canonical H100; K-F5: the epilogue's program,
+    which `BlockPlan.whole` replays)."""
+    tile = (8, 16)
 
     @tuning.one_call
-    def keyed():
-        keys = []
-        for target, interpreted in (first, second):
+    def built():
+        found = []
+        for target, interpreted in (first, second, first):
             with generation.assumed(target, interpreted=interpreted):
-                keys.append(template.hook_program("output_mod", scaled, (), ()))
-        return keys
+                found.append((template.hook_program("output_mod", _read_context, (), ()),
+                              attention_mosaic_program.output_program(_read_context, (), (), tile)))
+        return found
 
-    one, other = keyed()
-    assert one != other
+    (key, program), (other_key, other_program), (again_key, again_program) = built()
+    assert key != other_key and again_key == key and again_program is program
+    for (target, interpreted), made in ((first, program), (second, other_program)):
+        (out,) = jax.extend.core.jaxpr_as_fun(made)(jnp.ones(tile, jnp.float32))
+        assert (out == CONTEXTS[target, interpreted]).all(), (target, interpreted)
 
 
 def test_an_epilogue_program_with_a_deferred_rule_is_never_held():
@@ -306,8 +314,6 @@ def test_an_epilogue_program_with_a_deferred_rule_is_never_held():
     device array its primal does not read: its program, whose deferred rule no capture check sees, is
     never held (`attention_mosaic_program._deferred`), where it was, keeping the array resident (train
     1444's re-review)."""
-    from dew.nn.kernels.templates import attention_mosaic_program
-
     before = len(list(attention_mosaic_program._ENTRYWISE.values()))
     program = attention_mosaic_program.entrywise_hook(_Derived(_Box(jnp.full((), 3.0, jnp.float32))), (), (),
                                                       (64, 128))
@@ -320,8 +326,6 @@ def test_a_launchs_hook_programs_key_no_trace():
     kept past the call is held by unchanged (`options.trace_context`), so no such key holds a hook or its
     program past the call (train 1452's re-review)."""
     from dew.nn.kernels import options
-    from dew.nn.kernels.templates import attention_mosaic_program
-
     before = options.trace_context()
 
     @tuning.one_call
@@ -371,8 +375,6 @@ def test_an_output_hooks_literal_array_is_no_entrywise_program():
     none), its literal read whole where a chunk's replay takes a block of its columns, where its shape
     passed as the tile's and the replay failed (train 1427's review)."""
     import numpy as np
-
-    from dew.nn.kernels.templates import attention_mosaic_program
 
     tile = (64, 256)
     bias = np.arange(64 * 256, dtype=np.float32).reshape(tile)

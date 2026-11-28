@@ -2076,17 +2076,12 @@ def output_program(hook: Callable | None, kinds: tuple[Kind, ...], dtypes: tuple
     1444's reviews); any other traced each call."""
     if hook is None or not callable(hook):
         return None
-    launch = tuning.call_scoped()
-    if launch is None:
-        return _held_program(hook, kinds, dtypes, tile)
-    # Within a call (`tuning.one_call`), one program a hook's source and tile: its pricing and its emission
-    # take a prepared hook (`tuning.Prepared`) apart, one wrapper each, its dtypes each as it names them.
+    # Within a call (`tuning.one_call`), one program a hook's source, tile and trace context: its pricing and
+    # its emission take a prepared hook (`tuning.Prepared`) apart, one wrapper each, its dtypes each as it
+    # names them.
     source = hook.source if isinstance(hook, tuning.Prepared) else hook
-    key = (id(source), kinds, tuple(jnp.dtype(dtype).name for dtype in dtypes), tile)
-    if key not in launch:
-        # The hook kept beside its program, so its identity names no other hook while the launch lasts.
-        launch[key] = (hook, _held_program(hook, kinds, dtypes, tile))
-    return launch[key][1]
+    return tuning.once_a_call(source, ("output_program", kinds, tuple(jnp.dtype(dtype).name for dtype in dtypes),
+                                       tile), lambda: _held_program(hook, kinds, dtypes, tile))
 
 
 def _held_program(hook: Callable, kinds: tuple[Kind, ...], dtypes: tuple[str, ...], tile: tuple[int, int]):

@@ -35,7 +35,6 @@ from typing import ClassVar, Literal, NamedTuple, overload
 import jax
 import jax.numpy as jnp
 import numpy as np
-from jax._src import config as jax_config
 from jax.typing import DTypeLike
 from numpy.lib.array_utils import normalize_axis_tuple
 
@@ -1962,28 +1961,24 @@ def hook_program(name: str, hook, kinds: tuple[Kind, ...], dtypes: tuple[str, ..
     (`SITES`, `hooks.laid`), in its dtype in the kernels (`dtypes`); `differentiated`, a score hook's
     pullback too, so a hook whose derivative is its own rule (`jax.custom_vjp`) keys by that rule (a
     prologue's pullback runs past the kernels, `jax.vjp` of `prologued`). None or a traced key as it is. One
-    trace a kernel call (`tuning.one_call`) by its arguments and the trace's context, its target's (K-F1)."""
+    trace a kernel call by its arguments and the trace's context (`tuning.once_a_call`; K-F1, K-F5)."""
     if hook is None or isinstance(hook, str):
         return hook
-    call = tuning.call_scoped()
-    place = ("hook_program", name, id(hook.source if isinstance(hook, tuning.Prepared) else hook), kinds,
-             tuple(map(str, dtypes)), differentiated, width, str(operand), jax_config.trace_context())
-    if call is not None and place in call:
-        return call[place][1]
-    tile = TRACED_TILE
-    extents = {"queries": tile, "keys": tile, "width": width}
-    params = [jax.ShapeDtypeStruct(laid(SITES[name], tiled(kind), extents), dtype)
-              for kind, dtype in zip(kinds, dtypes, strict=True)]
-    positions = (jax.ShapeDtypeStruct((tile, 1), jnp.int32), jax.ShapeDtypeStruct((1, tile), jnp.int32))
-    square = jax.ShapeDtypeStruct((tile, tile), jnp.float32)
-    if name == "output_mod":
-        key = tuning.program(hook, jax.ShapeDtypeStruct((tile, width), jnp.float32), *params)
-    elif name in ("query_mod", "key_mod"):
-        key = tuning.program(hook, jax.ShapeDtypeStruct((tile, width), operand),
-                             jax.ShapeDtypeStruct((tile, 1), jnp.int32), *params)
-    elif not differentiated:
-        key = tuning.program(hook, square, *positions, *params)
-    else:
+
+    def traced() -> str | None:
+        tile = TRACED_TILE
+        extents = {"queries": tile, "keys": tile, "width": width}
+        params = [jax.ShapeDtypeStruct(laid(SITES[name], tiled(kind), extents), dtype)
+                  for kind, dtype in zip(kinds, dtypes, strict=True)]
+        positions = (jax.ShapeDtypeStruct((tile, 1), jnp.int32), jax.ShapeDtypeStruct((1, tile), jnp.int32))
+        square = jax.ShapeDtypeStruct((tile, tile), jnp.float32)
+        if name == "output_mod":
+            return tuning.program(hook, jax.ShapeDtypeStruct((tile, width), jnp.float32), *params)
+        if name in ("query_mod", "key_mod"):
+            return tuning.program(hook, jax.ShapeDtypeStruct((tile, width), operand),
+                                  jax.ShapeDtypeStruct((tile, 1), jnp.int32), *params)
+        if not differentiated:
+            return tuning.program(hook, square, *positions, *params)
         floating = floating_params(params)
 
         def pulled(s, q_pos, k_pos, *values):
@@ -1991,8 +1986,11 @@ def hook_program(name: str, hook, kinds: tuple[Kind, ...], dtypes: tuple[str, ..
             out, pull = jax.vjp(hooked, s, *(values[index] for index in floating))
             return out, pull(jnp.ones_like(out))
 
-        key = tuning.program(pulled, square, *positions, *params)
-    return key if call is None else call.setdefault(place, (hook, key))[1]  # the hook kept beside its key
+        return tuning.program(pulled, square, *positions, *params)
+
+    source = hook.source if isinstance(hook, tuning.Prepared) else hook
+    return tuning.once_a_call(source, ("hook_program", name, kinds, tuple(map(str, dtypes)), differentiated,
+                                       width, str(operand)), traced)
 
 
 class AttentionLaunch(tuning.KernelOp):
