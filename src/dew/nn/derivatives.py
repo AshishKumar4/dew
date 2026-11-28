@@ -269,8 +269,8 @@ def declared_derivative[Value](kind: Kind, primal: Callable[..., Value], forward
     fixed = tuple(nondiff_argnums)
     rule = contracted("test_a_declared_derivative_holds_every_order")(
         jax.custom_vjp(bound_span(kind, primal, static=fixed), nondiff_argnums=fixed))
-    rule.defvjp(bound_span(kind, forward, static=fixed), bound_span(kind, backward, static=range(len(fixed))),
-                symbolic_zeros=symbolic_zeros)
+    rule.defvjp(bound_span(kind, forward, static=fixed, saving=True),
+                bound_span(kind, backward, static=range(len(fixed))), symbolic_zeros=symbolic_zeros)
     return rule
 
 
@@ -315,11 +315,12 @@ def custom_rule(value) -> tuple[str, dict] | None:
 
 
 def bound_span[Result](kind: Kind, function: Callable[..., Result], *,
-                       static: Sequence[int] = ()) -> Callable[..., Result]:
+                       static: Sequence[int] = (), saving: bool = False) -> Callable[..., Result]:
     """`function` as one marked call of `kind` (`marked`) over its arrays, passed by position or by name: its
     other arguments (a static factor, a dtype, a Python number, an option) and those at its `static` positions
     (a custom derivative's `nondiff_argnums`, arrays among them, which its rule takes as constants) bound in,
-    so a constant still splits where it is known; a call of no array, `function` itself."""
+    so a constant still splits where it is known; a call of no array, `function` itself. A rule `saving`
+    residuals is marked so (`marked`)."""
     signature = inspect.signature(function)
     fixed = frozenset(static)
 
@@ -343,7 +344,7 @@ def bound_span[Result](kind: Kind, function: Callable[..., Result], *,
             tuple(leaf.perturbed if isinstance(leaf, CustomVJPPrimal) else None for leaf in held),
             tuple((position, arg) for position, arg in enumerate(bound.args) if position in fixed),
             len(bound.args))
-        return marked(kind, span)(*map(_array, held))
+        return marked(kind, span, saving=saving)(*map(_array, held))
     return call
 
 
@@ -600,9 +601,12 @@ def unheld_while(variable: contextvars.ContextVar) -> contextvars.ContextVar:
     return variable
 
 
-def marked[Result](kind: Kind, function: Callable[..., Result]) -> Callable[..., Result]:
+def marked[Result](kind: Kind, function: Callable[..., Result], *,
+                   saving: bool = False) -> Callable[..., Result]:
     """`function` as one marked call of `kind` (`marked_call_p`) over its arguments, a tree of arrays: it
-    computes what `function` does, and every transform of it keeps a marked call of `kind`. An eager call
+    computes what `function` does, and every transform of it keeps a marked call of `kind`. A rule `saving`
+    residuals (`declared_derivative`'s forward) returns each output that is one of its operands, a residual
+    its backward reads as given, as that operand beside the call (`_forwarded`). An eager call
     (`_evaluating`), which no program records, is `function`'s own: traced, every such call traced a program
     a step's steady state paid each step (a decision task's eager scores, train 586). A traced call takes
     the program a call in the same state traced (`_SPANS`, `_span_key`)."""
@@ -635,13 +639,38 @@ def marked[Result](kind: Kind, function: Callable[..., Result]) -> Callable[...,
                         *closed.invars],
                 consts=[const for const, is_held in zip(closed.consts, held, strict=True) if not is_held])
             flat = [*lifted, *flat]
-        outputs = iter(marked_call_p.bind(*flat, call_jaxpr=closed, kind=kind))
+        plan = _forwarded(closed) if saving else None
+        if plan is None:
+            outputs = iter(marked_call_p.bind(*flat, call_jaxpr=closed, kind=kind))
+        else:
+            pruned, forwarded = plan
+            made = iter(marked_call_p.bind(*flat, call_jaxpr=pruned, kind=kind))
+            outputs = iter([flat[forwarded[index]] if index in forwarded else next(made)
+                            for index in range(len(closed.outvars))])
         zeros = returned["zeros"]
         return jax.tree.unflatten(returned["structure"], [
             zeros[index] if index in zeros else next(outputs)
             for index in range(returned["structure"].num_leaves)])
     return call
 
+
+@jax_util.weakref_lru_cache
+def _forwarded(closed: jax_core.Jaxpr) -> tuple[jax_core.Jaxpr, dict[int, int]] | None:
+    """A saving rule's span (`marked`'s `saving`) without the outputs that are its own operands, and where
+    each was (its output's position, its operand's), None where none is: such an output, a residual the rule
+    saves as given (a layer's weight its backward reads), is that operand, as a call's output is a value it
+    makes, so a scan over layers took it for a step's own and stacked a copy of every layer's where it
+    forwards the scanned operand itself (row 14222). Held weakly by the span's program, so a span taken
+    again takes the same program and JAX's transforms of it hold theirs; no result holds the program it is
+    held by, so a program no held span keeps (`_holdable`) goes with its trace."""
+    operands = {var: index for index, var in enumerate(closed.invars)}
+    forwarded = {index: operands[var] for index, var in enumerate(closed.outvars)
+                 if isinstance(var, jax_core.Var) and var in operands}
+    if not forwarded:
+        return None
+    debug = closed.debug_info._replace(result_paths=None) if closed.debug_info is not None else None
+    return closed.replace(outvars=[var for index, var in enumerate(closed.outvars) if index not in forwarded],
+                          debug_info=debug), forwarded
 
 def _together_value[Input, Parameters](value: Input, parameters: Parameters) -> tuple[Input, Parameters]:
     """`formed_together`'s value: its operands as they are."""
