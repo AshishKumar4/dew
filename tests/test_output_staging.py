@@ -8,7 +8,7 @@ import pytest
 from generation_support import INTERPRETS, on_the_host
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
-from dew.nn.kernels.templates import bundles, stores, swizzling
+from dew.nn.kernels.templates import bundles, copies, stores, swizzling
 
 NVFP4 = (stores.Output((64, 256), jnp.uint8, 2), stores.Output((64, 256), jnp.float8_e4m3fn, 16))
 """A 64-row share of a 256-column NVFP4 tile's codes (two to a byte) and scales (one a 16-column block)."""
@@ -169,6 +169,33 @@ def test_a_packed_row_ladder_starting_unaligned_is_refused(first, least):
         _packed_store(8, 64, 4, 16, transposed=False, first=first, least=least)()
 
 
+
+
+def test_a_ladder_is_aligned_exactly_where_every_copy_it_takes_starts_on_a_shared_unit():
+    """`stores.row_starts_aligned` against the copies `store_rows` takes, each power-of-two rung from its
+    largest down to its smallest once, by its bit of the rows stored, for every row count it stores (a
+    multiple of its smallest below twice its largest): from a static first row 0, aligned exactly where
+    every copy starts at a whole number of 128-byte units; from a first row known only as it runs, exactly
+    where a row is whole units (the derivation and the trace read one rule, row 14182)."""
+    def starts(rows: int, least: int, most: int) -> list[int]:
+        at, found, rung = 0, [], most
+        while rung >= least:
+            if rows & rung:
+                found.append(at)
+                at += rung
+            rung //= 2
+        return found
+
+    unit = copies.SHARED_ALIGNMENT
+    for row_bytes in (16, 32, 64, 128, 192, 256):
+        for least, most in ((1, 1), (1, 8), (2, 8), (4, 8), (8, 8), (1, 64), (8, 64)):
+            every = all(start * row_bytes % unit == 0
+                        for rows in range(least, 2 * most, least)
+                        for start in starts(rows, least, most))
+            aligned = {static: stores.row_starts_aligned(row_bytes, first_static=static, least=least,
+                                                         most=most) for static in (True, False)}
+            assert aligned[True] == every, (row_bytes, least, most)
+            assert aligned[False] == (row_bytes % unit == 0)
 
 @INTERPRETS
 @pytest.mark.parametrize("chunk, first, refused", [(16, 0, False), (16, jnp.int32(0), True), (8, 0, True)],

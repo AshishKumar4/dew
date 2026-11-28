@@ -290,25 +290,35 @@ def _static(value, expected: int) -> bool:
     return isinstance(value, int) and value == expected
 
 
-def _aligned_ladder(row_bytes: int, first, ladder: list) -> None:
-    """Refuse a chunk's row ladder (`store_rows`: copies of a power of two of rows from `first`, the largest
-    `most`'s and the smallest `least`, `ladder`'s first two) whose copies may start a shared row at no
-    `copies.SHARED_ALIGNMENT` bytes, a bulk tensor copy's shared address (the CUDA Programming Guide's
-    asynchronous copies: "should be 128 byte aligned"). A rung of r rows starts at `first` plus the larger
-    rungs taken, each a multiple of 2r rows, so from a static first row 0 every copy starts at a multiple of
-    twice the ladder's smallest rung (at 0 where it has one rung): a dense tile's 64-byte rows in rungs down
-    to one row start aligned; a first row known only as it runs (a grouped tile's group) starts aligned only
-    where its rows are whole aligned units (row 14182: a grouped tile's 32-column bf16 chunk started its copy
-    64 bytes into a row)."""
-    most = ladder[0] if ladder else 1
-    least = ladder[1] if len(ladder) > 1 else 1
+def row_starts_aligned(row_bytes: int, *, first_static: bool, least: int = 1, most: int = 1) -> bool:
+    """Whether a chunk's row ladder (`store_rows`: copies of a power of two of rows, the largest `most`'s and
+    the smallest `least`'s) starts every copy at a `copies.SHARED_ALIGNMENT`-byte shared address, a bulk
+    tensor copy's (the CUDA Programming Guide's asynchronous copies: "should be 128 byte aligned"; a store
+    from another faults on an RTX PRO 6000, M-FS-115). A rung of r rows starts at its first row plus the
+    larger rungs taken, each a multiple of 2r rows (each rung taken once, by its bit of the rows stored), so
+    from a static first row 0 (`first_static`) every copy starts at a multiple of twice the ladder's
+    smallest rung, or at 0 where it has one rung: a dense tile's 64-byte rows in rungs down to one row start
+    aligned. A first row known only as it runs (a grouped tile's
+    group) starts aligned only where its rows are whole aligned units (row 14182: a grouped tile's 32-column
+    bf16 chunk started its copy 64 bytes into a row). A derivation reads it to derive no tile whose store a
+    trace refuses (`_aligned_ladder`)."""
+    if row_bytes % copies.SHARED_ALIGNMENT == 0:
+        return True
+    if not first_static:
+        return False
     rungs, size = [], most
     while size >= least:
         rungs.append(1 << int(math.log2(size)))
         size //= 2
-    step = 2 * rungs[-1] if len(rungs) > 1 else most
-    if row_bytes % copies.SHARED_ALIGNMENT and not (_static(first, 0)
-                                                    and step * row_bytes % copies.SHARED_ALIGNMENT == 0):
+    return len(rungs) < 2 or 2 * rungs[-1] * row_bytes % copies.SHARED_ALIGNMENT == 0
+
+
+def _aligned_ladder(row_bytes: int, first, ladder: list) -> None:
+    """Refuse a chunk's row ladder (`store_rows`, its rungs `ladder`'s first two) whose copies may start a
+    shared row at no aligned address (`row_starts_aligned`), from `first`."""
+    most = ladder[0] if ladder else 1
+    least = ladder[1] if len(ladder) > 1 else 1
+    if not row_starts_aligned(row_bytes, first_static=_static(first, 0), least=least, most=most):
         raise ValueError(f"a chunk's {row_bytes}-byte rows copied from row {first} in rungs of {least} to "
                          f"{most} start a tensor copy at no {copies.SHARED_ALIGNMENT}-byte shared address")
 
