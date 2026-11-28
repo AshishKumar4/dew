@@ -76,8 +76,14 @@ def _raw_word(x: jax.Array) -> jax.Array:
 
 
 def stored_zero(x: jax.Array) -> jax.Array:
-    """Whether an IEEE value stores either zero, rather than a subnormal a comparison may flush."""
-    words = _raw_word(x)
+    """Whether an IEEE value stores either zero, rather than a subnormal a comparison may flush: its word read
+    past an optimization barrier, so no compiler sees the integer test of a float's bits it folds back to a
+    float compare, which a flushing CPU reads a subnormal as zero by (in one fused computation the masked
+    word's test, and the exponent and fraction fields' apart, read `2^-127` as zero: train 1466's head
+    review). A complex value's both parts."""
+    if jnp.iscomplexobj(x):
+        return stored_zero(jnp.real(x)) & stored_zero(jnp.imag(x))
+    words = jax.lax.optimization_barrier(_raw_word(x))
     magnitude = (1 << (jnp.finfo(x.dtype).bits - 1)) - 1
     return (words & words.dtype.type(magnitude)) == 0
 
