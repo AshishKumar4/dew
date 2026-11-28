@@ -52,7 +52,11 @@ def test_a_donated_decode_reads_each_conv_weight_as_stored(delta_decode):
     kernels read their taps in the checkpoint's `[C, 1, K]` order (`conv.read_taps`), where read down
     `[K, C]` the step transposed each layer's weight first, weight-only work a layer a step (row 14174: 12 of
     an LM_HYBRID B8 step's), and a repack of it, a copy or a transpose of its own, would read it twice."""
-    instructions = [op for op in hlo.instructions(_decode_module('sm90', delta_decode)) if op.entry]
+    every = list(hlo.instructions(_decode_module('sm90', delta_decode)))
+    # A fusion wrapping a kernel (XLA's dynamic-slice fusion around the fused step's custom call) is that
+    # kernel's launch.
+    launching = {op.computation for op in every if op.opcode == 'custom-call'}
+    instructions = [op for op in every if op.entry]
     users: dict[str, list] = {op.name: [] for op in instructions}
     for op in instructions:
         for operand in op.operands:
@@ -66,8 +70,8 @@ def test_a_donated_decode_reads_each_conv_weight_as_stored(delta_decode):
             for op in users[frontier.pop()]:
                 if op.opcode == 'bitcast':
                     frontier.append(op.name)
-                elif op.opcode == 'custom-call':
-                    kernels.add(op.custom_call_target)
+                elif op.opcode == 'custom-call' or (op.opcode == 'fusion' and launching & set(op.called)):
+                    kernels.add(op.name)
                 else:
                     others.add(f'{op.opcode} {op.name}')
         return kernels, others
