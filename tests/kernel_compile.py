@@ -315,6 +315,18 @@ def lowered_for(fn, args, generation: str, expected: Expected | None = None, *, 
 
     placed = tuple(placed_on(arg, NamedSharding(mesh, spec or PartitionSpec()))
                    for arg, spec in zip(args, specs, strict=True))
+    with compiling_for(generation, mesh):
+        traced = jax.jit(fn).trace(*placed)
+        if kept is not None:
+            kept.append(traced)
+        return traced.lower()
+
+
+@contextlib.contextmanager
+def compiling_for(generation: str, mesh: Mesh) -> Iterator[None]:
+    """Within the block, a program traces and lowers as on a compile-only GPU of the CUDA `generation`
+    (`assumed`) over `mesh` (`_device`'s), within that GPU's block of shared memory: what `lowered_for`
+    lowers a function in, and a program of Dew's compile point (`OuterProgram`) compiles in."""
     # Deviceless Mosaic lowering defaults to Hopper's limit, not this target's.
     # Its bound checks the total allocation, including barriers outside the scratch estimate.
     # On one GPU, on the mesh's concrete device, as a run's start lowers on its compile-only GPU
@@ -326,10 +338,7 @@ def lowered_for(fn, args, generation: str, expected: Expected | None = None, *, 
     placing = jax.set_mesh(mesh) if mesh.size == 1 else jax.sharding.use_abstract_mesh(mesh.abstract_mesh)
     with (assumed(generation), placing,
           mgpu_core.artificial_shared_memory_limit(gpu_target(generation).shared_limit)):
-        traced = jax.jit(fn).trace(*placed)
-        if kept is not None:
-            kept.append(traced)
-        return traced.lower()
+        yield
 
 
 def refused(record: dict) -> bool:

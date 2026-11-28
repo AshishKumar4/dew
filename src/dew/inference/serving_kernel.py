@@ -38,6 +38,7 @@ from dew.nn.kernels.options import (
     compiler_options,
     program as outer_program,
 )
+from dew.nn.kernels.templates.recurrence.step import donated_state
 from dew.nn.kernels.tuning import tune
 from dew.nn.kv_cache import (
     PER_TOKEN_HEAD,
@@ -467,7 +468,11 @@ def _advanced(model: nn.Module, params: Variables, pad_id: int, placement: Place
         decoder = _mixed_step(model, params, pad_id, placement, state.decoder, last, fed, admission, progress)
     else:
         ops = decode_ops(model, params, pad_id, None, progress)
-        decoder = ops.advance(state.decoder, last, fed)
+        # The step owns the resident state and donates it (`_compiled`), and the token's next state replaces
+        # it: each recurrent state steps in place (`donated_state`), where written apart the donated cache
+        # copied it back, 4 MiB a gated delta layer a step at Qwen3.5's widths (row 14174).
+        with donated_state():
+            decoder = ops.advance(state.decoder, last, fed)
     if admission is not None and not mixed:
         # Only a row seated this step draws without feeding; with no admission
         # every drawing row fed, and the step's logits replace the held ones
