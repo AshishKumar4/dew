@@ -276,6 +276,24 @@ def test_a_ternary_product_at_its_ranges_edges_keeps_ieees_value(quantize, entri
                                       expected.view(np.uint32), err_msg=f"interpret={interpret}")
 
 
+def an_int8_rows_finish_rounds_once_below_the_normals():
+    """An int8-row ternary product's finish (`factored.int8_epilogue`) at a product of 1, a raised peak of
+    `(1 + 2^-23) 2^-87`, a scale of `(1 + 4 2^-23) 2^-8` and a shift of 32: the subnormal result rounded once,
+    `0x00400003`, where a multiply rounded before its lowering gave `0x00400002` (row 14172's review). Run by
+    tests/test_gpu_gemm.py's cells too, where a GPU's multiply had finished it."""
+    from dew.nn.kernels.templates.gemm import factored
+
+    product = jnp.float32(1.0)
+    peak = jnp.asarray(np.float32(1 + 2.0 ** -23) * np.float32(2.0 ** -87))
+    factor = jnp.asarray(np.float32(1 + 4 * 2.0 ** -23) * np.float32(2.0 ** -8))
+    got = jax.jit(factored.int8_epilogue)(product, peak, factor, jnp.int32(32))
+    assert np.asarray(got).view(np.uint32) == np.uint32(0x00400003), hex(int(np.asarray(got).view(np.uint32)))
+
+
+def test_an_int8_rows_finish_rounds_once_below_the_normals():
+    an_int8_rows_finish_rounds_once_below_the_normals()
+
+
 @pytest.mark.parametrize("quantize", [True, False], ids=["int8 rows", "bf16 rows"])
 def test_a_subnormal_scale_survives_a_program_traced_for_a_gpu_and_lowered_for_a_cpu(quantize, monkeypatch):
     """A ternary product at a subnormal scale (`2**-127`, a row of one) traced where its scale's module reads
