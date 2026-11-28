@@ -50,6 +50,7 @@ from pathlib import Path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from benchmark_cases import DIT_B, FINETUNE_1_7B, FINETUNE_4B, FORWARD, LM_DENSE, LM_HYBRID, LM_MOE
 from environments import CACHE, Unlocked, environment, machine_lock
+import xla_flags
 
 FLOOR = 0.02
 """The least change of a row the gate acts on, as a fraction of the base's: a change the judgment finds
@@ -710,7 +711,7 @@ def compile_battery(args: argparse.Namespace) -> int:
     come from. A step holding a kernel this host cannot lower is refused at its compile, a round it did not
     run; each sample's selected plan is kept (`plans`), so a head that plans otherwise shows it beside its
     time, which is judged all the same: the planner's own work is what a run spends."""
-    if "xla_gpu_autotune_level" in os.environ.get("XLA_FLAGS", ""):
+    if xla_flags.flag(os.environ.get("XLA_FLAGS", ""), "xla_gpu_autotune_level") is not None:
         raise SystemExit("compile: XLA_FLAGS sets the autotuning level, which planning ahead keeps off; a "
                          "gate compiles as a run does with no GPU attached, so unset it")
     generation, gib, device = COMPILE_TARGETS[args.kind]

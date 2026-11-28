@@ -97,7 +97,7 @@ def configure_lane(environ: MutableMapping[str, str]) -> None:
     environ.setdefault("JAX_PLATFORMS", "cpu")
     platforms = environ["JAX_PLATFORMS"].split(",")
     flags = [environ.get("XLA_FLAGS", "")]
-    if "--xla_allow_excess_precision" not in flags[0]:
+    if xla_flags.flag(flags[0], "xla_allow_excess_precision") is None:
         # Every rounding the program states, as a run keeps them
         # (`dew._devices.keep_roundings`).
         flags.append("--xla_allow_excess_precision=false")
