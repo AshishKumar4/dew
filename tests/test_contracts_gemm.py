@@ -871,9 +871,9 @@ def test_a_softmaxs_tangent_of_a_replicated_direction_beside_split_probabilities
         return jax.grad(both)(direction)
 
     def wide(probability, weights, direction):
+        # The truth over the gate's float64 widening of the draw.
         with jax.enable_x64(new_val=True):
-            return halves(*(jnp.asarray(np.asarray(value, np.float64)) for value in (probability, weights,
-                                                                                    direction)))
+            return halves(probability, weights, direction)
 
     def draw(seed):
         logits, weights, direction = normal_draw(14088 + seed, (4, 3), (4, 3), (2, 3))

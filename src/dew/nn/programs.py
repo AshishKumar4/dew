@@ -659,7 +659,7 @@ def _of(equation: jcore.JaxprEqn, primitive: jcore.Primitive) -> Mapping:
     return equation.params
 
 
-def high_expansion(equation: jcore.JaxprEqn) -> jcore.ClosedJaxpr | None:
+def high_expansion(equation: jcore.JaxprEqn) -> jcore.Jaxpr | None:
     """The program a high-level operation (`jax.experimental.hijax.HiPrim`, bound as JAX's
     `call_hi_primitive`) runs as it lowers, its expansion (`HiPrim.expand`, JAX's `to_lojax`) traced over its
     operands' types; None for any other equation. Its own derivatives and transpose are the operation's
@@ -669,7 +669,7 @@ def high_expansion(equation: jcore.JaxprEqn) -> jcore.ClosedJaxpr | None:
     if equation.primitive is not hijax.call_hi_primitive_p:
         return None
     expansion = functools.partial(equation.primitive.to_lojax, **equation.params)
-    return jax.make_jaxpr(expansion)(*(variable.aval for variable in equation.invars))
+    return jax.make_jaxpr(expansion)(*(variable.aval for variable in equation.invars)).jaxpr
 
 
 def scan_body(equation: jcore.JaxprEqn) -> jcore.Jaxpr:

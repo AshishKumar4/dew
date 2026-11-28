@@ -327,7 +327,7 @@ def _program_flops(program: jaxpr_core.Jaxpr) -> float:
         elif (expansion := high_expansion(equation)) is not None:
             # A high-level operation's work its expansion's, as it lowers (`linear_map`'s, a softmax's
             # tangent: train 1493's review).
-            total += _program_flops(expansion.jaxpr)
+            total += _program_flops(expansion)
         elif opaque(equation):
             raise MissingFlopsCount(f"{primitive.name} launches a kernel whose work its trace does not show")
         elif not _productless(equation):
