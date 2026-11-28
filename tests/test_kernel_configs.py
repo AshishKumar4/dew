@@ -2064,7 +2064,7 @@ def test_a_balanced_tail_of_two_by_two_warps_lowers_its_partials_for_an_a100():
     it lowers, each partial read in the accumulator's layout (`Family.fixed_up`), and spills no register (no
     layout of the loaded partial satisfied the two-by-two accumulator's combine before)."""
     from fla_gdn_support import KernelCase
-    from kernel_compile import compile_mosaic_kernels
+    from kernel_compile import compile_mosaic_kernels, runs, spills
 
     [(name, launch, args, options)] = [call for call in _gemm_forms(*GEMM_SHAPES["qwen3.5-4b up"])
                                        if call[0] == "dense kernel gradient"]
@@ -2073,9 +2073,10 @@ def test_a_balanced_tail_of_two_by_two_warps_lowers_its_partials_for_an_a100():
         tile = dataclasses.replace(launch.derived(ba, generation.gpu_target()), block_m=128, block_n=128,
                                    stages=3, programs=1)
         assert pricing.family_of(tile, jnp.bfloat16).specialized(128, 128).m_warps == 2
-        (record,) = compile_mosaic_kernels([KernelCase(name, lambda: launch.lowering(ba, tile))], "sm80")
-    assert not record.get("error"), record.get("error")
-    assert [kernel.get("spilled") for kernel in record["kernels"]] == [0]
+        found = compile_mosaic_kernels([KernelCase(name, lambda: launch.lowering(ba, tile))], "sm80")
+    # Every build's run (`runs`): a spill one build's alone is the tile's.
+    assert not [run.get("error") for run in runs(found) if run.get("error")]
+    assert [len(run["kernels"]) for run in runs(found)] == [1] * len(runs(found)) and spills(found) == {}
 
 
 @pytest.mark.parametrize("shape", [(64, 128), (64, 64), (32, 64)], ids=lambda shape: f"{shape[0]}x{shape[1]}")
