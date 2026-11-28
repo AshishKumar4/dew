@@ -279,21 +279,30 @@ def test_a_weakly_typed_product_of_no_groups_stays_weak():
 
 
 @pytest.mark.mesh(devices=2)
-def test_an_eager_product_of_no_groups_lands_on_its_operands_mesh():
+@pytest.mark.parametrize("weak", [False, True], ids=["strong", "weak"])
+def test_an_eager_product_of_no_groups_lands_on_its_operands_mesh(weak):
     """A ragged product of no groups called eagerly outside any mesh context over a bank its two Explicit
     devices split by its width, the rows and sizes committed to the same mesh
     (`xla_products.placed_ragged_dot`): its zeros made on those devices at the product's placement, its
-    columns split as the bank's (train 1484's review: zeros allocated at the abstract mesh were refused)."""
+    columns split as the bank's (train 1484's review: zeros allocated at the abstract mesh were refused);
+    over weakly typed operands, weak as JAX types the product, so beside bfloat16 the sum stays bfloat16
+    (its confirm)."""
     from jax.sharding import AxisType, NamedSharding, PartitionSpec
 
     from dew.nn.kernels import xla_products
 
     mesh = jax.make_mesh((2,), ("tensor",), (AxisType.Explicit,), devices=jax.devices()[:2])
-    rows = jax.device_put(jnp.ones((8, 4), jnp.float32), NamedSharding(mesh, PartitionSpec()))
-    bank = jax.device_put(jnp.ones((0, 4, 128), jnp.float32), NamedSharding(mesh, PartitionSpec(None, None,
-                                                                                                "tensor")))
+
+    def filled(shape, value):
+        return jnp.full(shape, value) if weak else jnp.full(shape, value, jnp.float32)
+
+    rows = jax.device_put(filled((8, 4), 1.0), NamedSharding(mesh, PartitionSpec()))
+    bank = jax.device_put(filled((0, 4, 128), 1.0), NamedSharding(mesh, PartitionSpec(None, None, "tensor")))
     sizes = jax.device_put(jnp.zeros((0,), jnp.int32), NamedSharding(mesh, PartitionSpec()))
-    out = xla_products.placed_ragged_dot(rows, bank, sizes, preferred_element_type=jnp.float32)
+    out = xla_products.placed_ragged_dot(rows, bank, sizes,
+                                         preferred_element_type=None if weak else jnp.float32)
+    if weak:
+        assert out.weak_type and (out + jnp.ones((8, 128), jnp.bfloat16)).dtype == jnp.bfloat16
     placed = out.sharding
     assert isinstance(placed, NamedSharding) and placed.mesh == mesh and placed.spec[-1] == "tensor"
     np.testing.assert_array_equal(np.asarray(out), np.zeros((8, 128), np.float32))
