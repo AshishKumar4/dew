@@ -49,7 +49,7 @@ import jax.numpy as jnp
 import optax
 from flax import linen as nn
 from flax.typing import Initializer
-from jax._src import config as jax_config, core as jax_core
+from jax._src import ad_util, config as jax_config, core as jax_core
 from jax.core import ShapedArray
 
 from dew import _cache
@@ -756,6 +756,38 @@ def concrete_mesh(value) -> jax.sharding.Mesh | None:
     sharding = getattr(value, "sharding", None)
     held = sharding.mesh if isinstance(sharding, jax.sharding.NamedSharding) else None
     return held if isinstance(held, jax.sharding.Mesh) else None
+
+
+def placed_zeros(shape: tuple, dtype, sharding: jax.sharding.NamedSharding | None = None, *anchors,
+                 weak_type: bool = False) -> jax.Array:
+    """Zeros of `shape` and `dtype` (a float64 one's outside x64 too; weak where `weak_type`), placed at
+    `sharding`'s Explicit axes (a type's, or None) and made where they are read: Dew's one allocation of a
+    type's zeros (`precision._no_groups`, `factored`'s rescue; train 1490's review K-F2). Traced (JAX
+    tracing, or a tracer among `anchors`), under the placement's own abstract mesh, so it holds outside any
+    mesh context. Run eagerly, on the devices of `anchors`' named mesh, that concrete mesh entered for the
+    allocation alone (an abstract mesh allocates on none; JAX refuses one entered while tracing, where a
+    jit's closure holds concrete anchors beside its tracers: K-F1); else on the one device committed
+    `anchors` lie on, committed there, as a product of them would be; else JAX's default."""
+    leaves = jax.tree.leaves(anchors)
+    eager = jax_core.trace_state_clean() and not any(isinstance(leaf, jax_core.Tracer) for leaf in leaves)
+    explicit = sharding is not None and bool(sharding.mesh.explicit_axes)
+    meshes = [held for leaf in leaves if (held := concrete_mesh(leaf)) is not None] if eager else []
+    devices = {device for leaf in leaves if eager and isinstance(leaf, jax.Array) and leaf.committed
+               for device in leaf.devices()}
+    if explicit and meshes:
+        placed = jax.set_mesh(meshes[0])
+    elif explicit:
+        placed = jax.sharding.use_abstract_mesh(sharding.mesh.abstract_mesh)
+    elif len(devices) == 1:
+        placed = jax.default_device(next(iter(devices)))
+    else:
+        placed = contextlib.nullcontext()
+    narrowed = jax.dtypes.canonicalize_dtype(dtype) != jnp.dtype(dtype)
+    with jax.enable_x64(new_val=True) if narrowed else contextlib.nullcontext(), placed:
+        zero = ad_util.zeros_like_aval(ShapedArray((), jnp.dtype(dtype), weak_type=weak_type))
+        zeros = jax.lax.broadcast(zero, tuple(shape), out_sharding=sharding.spec if explicit else None)
+    # The default device's allocation, committed there without a copy.
+    return jax.device_put(zeros, devices.pop()) if not explicit and len(devices) == 1 else zeros
 
 
 def explicit_placement(aval: ShapedArray) -> jax.sharding.NamedSharding | None:

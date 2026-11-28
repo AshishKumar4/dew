@@ -40,7 +40,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from flax.typing import Dtype, PrecisionLike
-from jax.core import ShapedArray, Tracer
+from jax.core import ShapedArray
 from jax.extend import core
 from jax.typing import DTypeLike
 from numpy.lib.array_utils import normalize_axis_tuple
@@ -928,34 +928,17 @@ def _grouped(product: Callable[..., jax.Array], operands: tuple,
 
 def _no_groups(traced: core.Jaxpr, operands: tuple) -> jax.Array:
     """A ragged dot of no groups' zeros (`traced`, its program, `_grouped`'s), typed as the product is: its
-    traced aval's zeros as JAX forms a value's (`ad_util.zeros_like_aval`: its dtype, a float64 one's outside
-    x64 too, its weakness and its placement each the aval's, an Explicit one a shape's evaluation drops beside
-    an Auto axis), varying as its operands vary; an eager call's made on the mesh of devices its operands lie
-    on (every operand of one product shares it) at the product's placement (train 1484's review: allocated at
-    the abstract mesh outside any mesh context, a two-device product's zeros were refused), else committed to
-    the one device its committed operands lie on, as their product would be. A constant, its derivative zero
-    at every order (row 14112's reviews)."""
-    from jax._src import ad_util
-
-    from dew.nn.sharding import concrete_mesh, varying_like
+    traced aval's dtype (a float64 one's outside x64 too), weakness and Explicit placement, made where a
+    product of its operands would be (`sharding.placed_zeros`: traced, at that placement; eagerly, on its
+    operands' mesh of devices or the one device they are committed to), varying as its operands vary. A
+    constant, its derivative zero at every order (row 14112's reviews; train 1490's K-F1: a mesh entered
+    while a jit traced a closure's concrete bank)."""
+    from dew.nn.sharding import placed_zeros, varying_like
 
     # The one array a ragged dot returns.
     typed = next(aval for aval in traced.out_avals if isinstance(aval, ShapedArray))
-    narrowed = jax.dtypes.canonicalize_dtype(typed.dtype) != typed.dtype
-    meshes = [mesh for leaf in jax.tree.leaves(operands) if (mesh := concrete_mesh(leaf)) is not None]
-    mesh = meshes[0] if meshes else None
-    # On the operands' mesh of devices, where one runs eagerly outside any mesh context: the traced aval's
-    # zeros (its weakness kept, its review) made on those devices.
-    placed = jax.set_mesh(mesh) if mesh is not None else contextlib.nullcontext()
-    with jax.enable_x64(new_val=True) if narrowed else contextlib.nullcontext(), placed:
-        zeros = ad_util.zeros_like_aval(typed)
-    if mesh is not None:
-        return varying_like(zeros, *operands)
-    devices = {device for leaf in jax.tree.leaves(operands)
-               if isinstance(leaf, jax.Array) and not isinstance(leaf, Tracer) and leaf.committed
-               for device in leaf.devices()}
-    if len(devices) == 1:
-        zeros = jax.device_put(zeros, devices.pop())
+    placement = typed.sharding if isinstance(typed.sharding, jax.sharding.NamedSharding) else None
+    zeros = placed_zeros(typed.shape, typed.dtype, placement, *operands, weak_type=typed.weak_type)
     return varying_like(zeros, *operands)
 
 

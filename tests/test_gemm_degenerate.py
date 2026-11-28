@@ -310,6 +310,28 @@ def test_an_eager_product_of_no_groups_lands_on_its_operands_mesh(weak):
 
 
 @pytest.mark.mesh(devices=2)
+def test_a_jitted_product_of_no_groups_over_a_closed_over_bank_keeps_its_placement():
+    """A ragged product of no groups jitted over its rows, its bank and sizes a closure's concrete arrays
+    its two Explicit devices split by width, outside any mesh context: its zeros placed as the bank's
+    columns, no mesh entered while JAX traces (train 1490's review K-F1: `jax.set_mesh` inside the trace
+    was refused)."""
+    from jax.sharding import AxisType, NamedSharding, PartitionSpec
+
+    from dew.nn.kernels import xla_products
+
+    mesh = jax.make_mesh((2,), ("tensor",), (AxisType.Explicit,), devices=jax.devices()[:2])
+    bank = jax.device_put(jnp.ones((0, 4, 128), jnp.float32), NamedSharding(mesh, PartitionSpec(None, None,
+                                                                                                "tensor")))
+    sizes = jax.device_put(jnp.zeros((0,), jnp.int32), NamedSharding(mesh, PartitionSpec()))
+    rows = jax.device_put(jnp.ones((8, 4), jnp.float32), NamedSharding(mesh, PartitionSpec()))
+    out = jax.jit(lambda rows: xla_products.placed_ragged_dot(rows, bank, sizes,
+                                                              preferred_element_type=jnp.float32))(rows)
+    placed = out.sharding
+    assert isinstance(placed, NamedSharding) and placed.spec[-1] == "tensor"
+    np.testing.assert_array_equal(np.asarray(out), np.zeros((8, 128), np.float32))
+
+
+@pytest.mark.mesh(devices=2)
 def test_an_eager_product_of_no_groups_lands_on_its_operands_device():
     """A ragged product of no groups called eagerly over operands committed to the second of two devices,
     the first the default (`xla_products.placed_ragged_dot`): its zeros committed to its operands' device,
