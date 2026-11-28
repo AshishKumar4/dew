@@ -819,19 +819,33 @@ def test_a_softmaxs_derivative_of_a_constant_is_zero_whatever_its_probabilities_
     np.testing.assert_array_equal(np.asarray(pulled, np.float32), np.zeros(2, np.float32))
 
 
+def test_a_softmaxs_tangent_keeps_a_mean_whose_weighed_terms_fall_below_the_normal_range():
+    """`categorical.softmax_tangent` of probabilities `[1/4, 1/4]` beside 128 of `1/256` along a direction of
+    `2^-121` on the first two classes: the mean is `2^-122`, each of its 128 weighed terms `-2^-129` below the
+    normal range, and the second class's tangent `1/4 (2^-121 - 2^-122) = 2^-124`, a normal float32 the map
+    computes exactly, on a CPU that flushes subnormals too (train 1493's review: the terms flushed and it
+    read zero)."""
+    from dew.nn import categorical
+
+    probability = jnp.asarray([[0.25, 0.25] + [1 / 256] * 128], jnp.float32)
+    direction = jnp.asarray([[2.0**-121, 2.0**-121] + [0.0] * 128], jnp.float32)
+    tangent = np.asarray(jax.jit(categorical.softmax_tangent)(probability, direction))
+    assert tangent[0, 1] == np.float32(2.0**-124), tangent[0, :2]
+
+
 @pytest.mark.mesh
 def test_a_softmaxs_tangent_of_a_replicated_direction_beside_split_probabilities_sums_back_in_a_checked_map():
     """`categorical.softmax_tangent` in a checked `shard_map` over two devices, its probabilities' rows split
     across them and its direction held whole: the direction's gradient each shard's partial summed over the
-    axis, the unsharded call's sum of both halves', where its unsummed pullback reached JAX's replicated
+    axis, on par with the unsharded call's sum of both halves' from float64 (check 1: two programs, which
+    XLA promises no common bits; train 1493's review), where its unsummed pullback reached JAX's replicated
     accumulator (train 1455's review)."""
     from jax.sharding import NamedSharding, PartitionSpec
 
     from dew.nn import categorical
 
     mesh = jax.make_mesh((2,), ("data",), devices=jax.devices()[:2])
-    probability = jax.nn.softmax(jnp.asarray(normal_draw(14088, (4, 3))[0]), axis=-1)
-    (weights, direction) = normal_draw(14089, (4, 3), (2, 3))
+    rows, held = (NamedSharding(mesh, spec) for spec in (PartitionSpec("data"), PartitionSpec()))
 
     def summed(probability, weights, direction):
         return jnp.sum(categorical.softmax_tangent(probability, direction) * weights)
@@ -842,15 +856,31 @@ def test_a_softmaxs_tangent_of_a_replicated_direction_beside_split_probabilities
     split = jax.shard_map(local, mesh=mesh, in_specs=(PartitionSpec("data"), PartitionSpec("data"),
                                                       PartitionSpec()), out_specs=PartitionSpec(),
                           check_vma=True)
-    def halves(direction):
-        return sum(summed(probability[half], weights[half], direction) for half in (slice(0, 2), slice(2, 4)))
 
-    whole = jax.grad(halves)(direction)
-    rows, held = (NamedSharding(mesh, spec) for spec in (PartitionSpec("data"), PartitionSpec()))
-    with jax.set_mesh(mesh):
-        found = jax.grad(split, argnums=2)(jax.device_put(probability, rows), jax.device_put(weights, rows),
-                                           jax.device_put(direction, held))
-    np.testing.assert_array_equal(np.asarray(found), np.asarray(whole))
+    def sharded(probability, weights, direction):
+        placed = (jax.device_put(probability, rows), jax.device_put(weights, rows),
+                  jax.device_put(direction, held))
+        with jax.set_mesh(mesh):
+            return jax.grad(split, argnums=2)(*placed)
+
+    def halves(probability, weights, direction):
+        def both(direction):
+            halves = (slice(0, 2), slice(2, 4))
+            return sum(summed(probability[half], weights[half], direction) for half in halves)
+
+        return jax.grad(both)(direction)
+
+    def wide(probability, weights, direction):
+        with jax.enable_x64(new_val=True):
+            return halves(*(jnp.asarray(np.asarray(value, np.float64)) for value in (probability, weights,
+                                                                                    direction)))
+
+    def draw(seed):
+        logits, weights, direction = normal_draw(14088 + seed, (4, 3), (4, 3), (2, 3))
+        return np.asarray(jax.nn.softmax(logits, axis=-1)), np.asarray(weights), np.asarray(direction)
+
+    assert_as_exact(sharded, jax.jit(halves), draw, "a softmax tangent's split pullback", seeds=16,
+                    truth_fn=wide)
 
 
 @pytest.mark.mesh

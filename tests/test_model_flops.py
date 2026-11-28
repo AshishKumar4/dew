@@ -117,8 +117,9 @@ def test_a_traced_program_counts_its_products_convolutions_scans_and_branches():
     """A traced count is two FLOPs a multiply-add of each product and convolution the program runs: a batched
     matrix product's, a strided convolution's of its output's elements by its kernel's taps and inputs, a
     scan's body times its length, a branch's costliest arm, a platform choice's the branch an accelerator
-    runs, a gradient's backward products beside its forward's; a while loop doing one and a linear solve,
-    whose run programs a trace does not tell, are refused."""
+    runs, a gradient's backward products beside its forward's, a high-level operation's its expansion's, a
+    gamma draw none; a while loop doing one and a linear solve, whose run programs a trace does not tell, are
+    refused."""
     def shaped(*shape):
         return jax.ShapeDtypeStruct(shape, jnp.float32)
 
@@ -154,6 +155,18 @@ def test_a_traced_program_counts_its_products_convolutions_scans_and_branches():
 
     gradient = jax.grad(lambda w, x: jnp.sum(jax.nn.relu(x @ w)))
     assert traced_flops(gradient, shaped(5, 7), shaped(3, 5)) == 2 * (2 * 3 * 5 * 7)
+
+    from dew.nn import categorical
+
+    # A softmax's tangent, a high-level operation (`generation.linear_map`), counted by its expansion, and a
+    # gamma draw, a key's operation, as no product: the products beside them alone count (train 1493's
+    # review: each was refused).
+    def tangent(x, w, direction):
+        return jax.jvp(categorical.probabilities, (x @ w,), (direction,))[1]
+
+    assert traced_flops(tangent, shaped(4, 5), shaped(5, 8), shaped(4, 8)) == 2 * 4 * 5 * 8
+    assert traced_flops(lambda a, w: jax.random.gamma(jax.random.key(0), a) @ w, shaped(2, 3),
+                        shaped(3, 4)) == 2 * 2 * 3 * 4
     with pytest.raises(MissingFlopsCount):
         traced_flops(lambda x: jax.lax.while_loop(lambda c: c.sum() < 9, lambda c: c @ c, x), shaped(2, 2))
     def solved(b):

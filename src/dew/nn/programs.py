@@ -519,8 +519,8 @@ _KINDS: dict[str, tuple[tuple[ModuleType, tuple[str, ...]], ...]] = {
     # shape), a bitcast between widths, a polynomial over its coefficients, a staged value.
     "positionwise": (
         (_LAX, ("bitcast_convert_type_p", "polynomial_p", "stage_p")),
-        (_EXTENDED, ("random_bits_p", "random_clone_p", "random_fold_in_p", "random_seed_p", "random_split_p",
-                     "random_unwrap_p", "random_wrap_p")),
+        (_EXTENDED, ("random_bits_p", "random_clone_p", "random_fold_in_p", "random_gamma_p", "random_seed_p",
+                     "random_split_p", "random_unwrap_p", "random_wrap_p")),
         # The identity `jax.experimental.xla_metadata.set_xla_metadata` tags a value with, which JAX
         # defines in its private module alone and batches as a vectorized operation (train 1368's review).
         (_XLA_METADATA, ("xla_metadata_value_p",))),
@@ -657,6 +657,19 @@ def _of(equation: jcore.JaxprEqn, primitive: jcore.Primitive) -> Mapping:
     if equation.primitive is not primitive:
         raise TypeError(f"{equation.primitive.name} is not {primitive.name}, whose programs were asked of it")
     return equation.params
+
+
+def high_expansion(equation: jcore.JaxprEqn) -> jcore.ClosedJaxpr | None:
+    """The program a high-level operation (`jax.experimental.hijax.HiPrim`, bound as JAX's
+    `call_hi_primitive`) runs as it lowers, its expansion (`HiPrim.expand`, JAX's `to_lojax`) traced over its
+    operands' types; None for any other equation. Its own derivatives and transpose are the operation's
+    rules, not its expansion's: a reader of the work it does reads this (`flops.traced_flops`)."""
+    from jax._src import hijax
+
+    if equation.primitive is not hijax.call_hi_primitive_p:
+        return None
+    expansion = functools.partial(equation.primitive.to_lojax, **equation.params)
+    return jax.make_jaxpr(expansion)(*(variable.aval for variable in equation.invars))
 
 
 def scan_body(equation: jcore.JaxprEqn) -> jcore.Jaxpr:
