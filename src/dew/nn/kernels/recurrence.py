@@ -369,31 +369,33 @@ def _held(updated, key, value, dtype):
     return round_to_bf16(updated, key, value) if dtype == jnp.bfloat16 else updated.astype(dtype)
 
 
-def _gated_decay(gate, log_a, bias):
-    """The gates' log decay `-exp(log_a) softplus(gate + bias)`, in the operands' dtype."""
-    return -accurate_exp(log_a) * softplus(gate + bias)
-
-
-def bounded_decay(bound: float, gate, log_a, bias):
-    """A bounded log decay `bound sigmoid(exp(log_a) (gate + bias))`, in the operands' dtype: Kimi delta
-    attention's forget gate under its `lower_bound` (`Glm5NextTextForgetGate`, modeling_glm5_next.py:319-335),
-    each value in `(bound, 0)`."""
-    return bound * logistic(accurate_exp(log_a) * (gate + bias))
+def gate_law(gates: Gates, gate, log_a, bias, beta, *, exp, softplus_of, logistic_of):
+    """The log decay and the write gate `gates` forms from its pre-activations, the one law every form takes
+    (`gated`'s in XLA, a decode token's launch's in its registers, `templates.recurrence.step`), given its
+    `exp`, softplus and logistic: the gated delta rule's `-exp(log_a) softplus(gate + bias)` and
+    `sigmoid(beta)`, a bounded decay's `bound sigmoid(exp(log_a) (gate + bias))` (Kimi's), the step's
+    (Mamba2's) `-exp(log_a)` times the step clipped to `limit` where given, its write the step itself.
+    `beta` is read where the write gate is a sigmoid's alone; None where it is not given (a layer forming its
+    decay alone, Kimi delta attention's)."""
+    rate = exp(log_a)
+    if gates.bound is not None:
+        decay, step = gates.bound * logistic_of(rate * (gate + bias)), None
+    else:
+        step = softplus_of(gate + bias)
+        if gates.limit is not None:
+            step = jnp.clip(step, *gates.limit)
+        decay = -rate * step
+    if gates.write == 'step':
+        return decay, step
+    return decay, None if beta is None else logistic_of(beta)
 
 
 def gated(gates: Gates, gate, log_a, bias, beta):
-    """The log decay and the write gate `gates` forms from its pre-activations, in their dtype: with a
-    sigmoid write gate the gated delta rule's (`_gated_decay`, `sigmoid(beta)`), a bounded decay's
-    (`bounded_decay`, Kimi's), with the step's Mamba2's (`-exp(log_a)` times the clipped step, and the
-    step). `log_a` broadcasts against `gate` as it is given (a decay a key dimension's `[Hv, 1]`)."""
-    if gates.bound is not None:
-        return bounded_decay(gates.bound, gate, log_a, bias), logistic(beta)
-    if gates.write == 'sigmoid' and gates.limit is None:
-        return _gated_decay(gate, log_a, bias), logistic(beta)
-    step = softplus(gate + bias)
-    if gates.limit is not None:
-        step = jnp.clip(step, *gates.limit)
-    return -accurate_exp(log_a) * step, step if gates.write == 'step' else logistic(beta)
+    """The log decay and the write gate `gates` forms from its pre-activations, in their dtype (`gate_law`
+    in XLA: its exp accurate, torch's softplus Dew's one). `log_a` broadcasts against `gate` as it is given
+    (a decay a key dimension's `[Hv, 1]`)."""
+    return gate_law(gates, gate, log_a, bias, beta, exp=accurate_exp, softplus_of=softplus,
+                    logistic_of=logistic)
 
 
 ROW = {"rows": True}
@@ -565,9 +567,8 @@ def log_gates(hooks: Hooks, given: dict, work):
     or a write gate the hooks have not."""
     if hooks.gates is not None:
         beta = given['beta'].astype(work) if hooks.gates.write == 'sigmoid' else None
-        # The rate exponentiated in its own dtype (at least fp32), as the layers take their `A_log`; a head's
-        # rate over each of its key dimensions' gates.
-        log_a = given['log_a'].astype(at_least_fp32(given['log_a'].dtype))
+        # A head's rate over each of its key dimensions' gates, in `work` as every gate operand.
+        log_a = given['log_a'].astype(work)
         log_a = log_a[..., None] if hooks.decay == 'vector' else log_a
         return gated(hooks.gates, given['gate'].astype(work), log_a, given['bias'].astype(work), beta)
     if hooks.rated:
@@ -625,17 +626,20 @@ recurrence's distance from float64 (Mamba2's rated decay, test_recurrence_stabil
 both arms without them). A custom VJP alone refused `jax.jvp` through a decode step's reference."""
 
 
-def output_normed(norm: OutputNorm, out, z, weight, dtype, *, axes=None):
+def output_normed(norm: OutputNorm, out, z, weight, dtype, work, *, axes=None):
     """An output `[..., Hv, Dv]` through the epilogue's gated RMS norm `norm`, in `dtype`: the layers' one
     gated norm (`dew.nn.norms.gated_rms_normalized`, its fused kernel where its selector gives it, else its
     arithmetic in XLA), the output first read back in `OutputNorm.read_in`, `axes` its logical axes where a
     mesh places the kernel's rows (a chunked call's `[B, S, Hv, Dv]`, `dew.nn.sharding.HEADS`). The template's
     output launch computes it in its epilogue, and takes its gradient here (`templates.recurrence.template
-    .mosaic_rule`)."""
+    .mosaic_rule`). Its statistics and gate at least in the recurrence's `work`: a read-back narrower than it
+    (a float64 recurrence's fp32 `read_in`) is the read-back's rounding alone, widened again before the norm,
+    where the norm's own working dtype from it took a sigmoid gate of -100 to zero (train 1461's review)."""
     from dew.nn.norms import gated_rms_normalized
 
     if norm.read_in is not None:
         out = out.astype(norm.read_in)
+        out = out if at_least_fp32(out.dtype) == jnp.dtype(work) else out.astype(work)
     return gated_rms_normalized(out, z, weight, norm.epsilon, dtype, norm.activation, axes=axes)
 
 
@@ -645,7 +649,7 @@ def normed(hooks: Hooks, out, given: dict, work, *, dtype=None, axes=None):
     dtype = work if dtype is None else dtype
     if hooks.output is None:
         return out.astype(dtype)
-    return output_normed(hooks.output, out, given['z'], given['weight'], dtype, axes=axes)
+    return output_normed(hooks.output, out, given['z'], given['weight'], dtype, work, axes=axes)
 
 
 def _gates(hooks: Hooks, given: dict, work, key_width: int):

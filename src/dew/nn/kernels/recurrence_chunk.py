@@ -270,6 +270,11 @@ def _prologue_of(hooks: recurrence.Hooks, operands: Chunk, dtype) -> tuple:
     where `hooks` norm them, the log decay and the write gate in `work` (zero and one where `hooks` form
     none), the output's `dtype` (the operands' where None) and `work` at least fp32."""
     given = _read_checked(hooks, operands)
+    if operands.valid is not None:
+        if hooks.erase != 'tied' or hooks.turns or hooks.coupled is not None or hooks.substeps > 1:
+            raise ValueError(f"a padded token keeps the memory through its decay, write gate and value decay "
+                             f"alone (`Chunk.valid`): {hooks}'s transition has more")
+        given = _padded_zero(given, jnp.asarray(operands.valid, bool))
     query, key, value = given['query'], given['key'], given['value']
     dtype = jnp.result_type(query, key, value) if dtype is None else jnp.dtype(dtype)
     work = at_least_fp32(jnp.result_type(query, key, value))
@@ -285,17 +290,26 @@ def _prologue_of(hooks: recurrence.Hooks, operands: Chunk, dtype) -> tuple:
     g = jnp.zeros((*query.shape[:2], value.shape[2]), work) if g is None else g
     beta = jnp.ones(value.shape[:3], work) if beta is None else beta
     if operands.valid is not None:
-        if hooks.erase != 'tied' or hooks.turns or hooks.coupled is not None or hooks.substeps > 1:
-            raise ValueError(f"a padded token keeps the memory through its decay, write gate and value decay "
-                             f"alone (`Chunk.valid`): {hooks}'s transition has more")
-        # A padded token's decays and its updates' write gates none: exp(0) = 1 and beta = 0 keep the memory.
+        # A padded token's decays and its write gate none: exp(0) = 1 and beta = 0 keep the memory.
         valid = jnp.asarray(operands.valid, bool)
         g = jnp.where(valid.reshape(*valid.shape, *(1,) * (g.ndim - 2)), g, 0.0)
-        updates = jnp.repeat(valid, beta.shape[1] // valid.shape[1], axis=1)
-        beta = jnp.where(updates[..., None], beta, 0.0)
-        if hooks.value_decay:
-            given['value_decay'] = jnp.where(valid[..., None, None], given['value_decay'], 0.0)
+        beta = jnp.where(valid[..., None], beta, 0.0)
     return given, query, key, value, g, beta, scale, dtype, work
+
+
+PADDED = ('query', 'key', 'value', 'gate', 'beta', 'log_decay', 'value_decay')
+"""The operands a token holds of its own (`Chunk`'s `[B, S, ...]` ones) a padded token's are zeroed of
+(`_padded_zero`)."""
+
+
+def _padded_zero(given: dict, valid) -> dict:
+    """`given` with every token operand (`PADDED`) of a padded token (`valid` `[B, S]` False) zero, before
+    any gate is formed or product taken: a padded key of `2^70` overflowed its pair's product, `inf * 0` NaN
+    through the chunk's inverse into the live memory (train 1461's review)."""
+    def kept(x):
+        return jnp.where(valid.reshape(*valid.shape, *(1,) * (x.ndim - 2)), x, jnp.zeros((), x.dtype))
+
+    return {name: kept(x) if name in PADDED else x for name, x in given.items()}
 
 
 def chunk(hooks: recurrence.Hooks, operands: Chunk, *, chunk_size: int = CHUNK_SIZE,

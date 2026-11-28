@@ -367,7 +367,6 @@ def mosaic_rule(query, key, value, g, beta, state=None, *, tiles, starts=None,
         operands, (inverse, kept, read) = saved
         out_grad, final_grad = grads
         query, key, value, g, beta, state, starts, firsts, skip, table, reads, gate, weight = operands
-        out_grad, *sides = _normed_pullback(normed, read, gate, weight, out_grad, dtype)
         if not fast:
             form = (f"{dtype.name}, {'the delta rule' if delta else 'no delta rule'}, a decay a "
                     f"{'head' if g.ndim == 3 else 'key dimension'}")
@@ -375,6 +374,7 @@ def mosaic_rule(query, key, value, g, beta, state=None, *, tiles, starts=None,
                 f"the recurrence template's fast backward takes no gradient of this call ({form}, or its "
                 "launches past the device's at these tiles): the delta rule's selector gives a training call "
                 "it refuses the port or the portable math (`MOSAIC_SUPPORTS`' 'backward')")
+        out_grad, *sides = _normed_pullback(normed, read, gate, weight, out_grad, dtype)
         with report.relaunched(launch):
             *grads, dh0, dskip, dentries, dreads = mainloop_backward.gradients(
                 query, key, value, g, beta, state, out_grad, final_grad, starts=starts, firsts=firsts,

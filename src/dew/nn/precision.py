@@ -195,8 +195,17 @@ def rms_statistics(x: jax.Array, epsilon: float, *, axis=-1, keepdims: bool = Tr
     learned scale round. The count's reciprocal is a Python float, where `jnp.reciprocal` of the count's
     array is an integer power, which a Pallas Triton kernel cannot lower on a folded constant."""
     square = jnp.square(x.astype(at_least_fp32(x.dtype)))
-    mean = (jnp.mean(square, axis=axis, keepdims=keepdims) if count is None
-            else jnp.sum(square, axis=axis, keepdims=keepdims) * (1.0 / count))
+    if count is None:
+        mean = jnp.mean(square, axis=axis, keepdims=keepdims)
+        return mean, jax.lax.rsqrt(mean + epsilon)
+    return rms_of_total(jnp.sum(square, axis=axis, keepdims=keepdims), count, epsilon)
+
+
+def rms_of_total(total: jax.Array, count: int, epsilon: float) -> tuple[jax.Array, jax.Array]:
+    """`rms_statistics`' mean square and inverse RMS from its squares' `total` over `count` entries: the
+    total times the count's reciprocal (a Python float), as a kernel summing its rows' squares across its
+    steps or lanes takes them (the recurrence's output launch, its decode step)."""
+    mean = total * (1.0 / count)
     return mean, jax.lax.rsqrt(mean + epsilon)
 
 

@@ -448,20 +448,17 @@ def _gates(hooks, inputs, row, head, layout):
 
     one = jnp.float32(1.0)
     if hooks.gates is not None:
-        # The gates' law (`recurrence.gated`): a head's gate, or each key dimension's over the head's rate.
+        # The gates' one law (`recurrence.gate_law`) in registers: a head's gate, or each key dimension's
+        # over the head's rate.
         if hooks.decay == 'vector':
-            given = keyed(inputs['gate'].at[row, head]) + keyed(inputs['bias'].at[head])
+            gate, bias = keyed(inputs['gate'].at[row, head]), keyed(inputs['bias'].at[head])
         else:
-            given = scalar('gate') + headed('bias')
-        rate = accurate_exp(headed('log_a'))
-        if hooks.gates.bound is not None:
-            bounded = hooks.gates.bound * logistic_value(rate * given)
-            return accurate_exp(bounded), logistic_value(scalar('beta'))
-        step = softplus_series(given)
-        if hooks.gates.limit is not None:
-            step = jnp.clip(step, *hooks.gates.limit)
-        decay = accurate_exp(-rate * step)
-        return decay, step if hooks.gates.write == 'step' else logistic_value(scalar('beta'))
+            gate, bias = scalar('gate'), headed('bias')
+        beta = scalar('beta') if hooks.gates.write == 'sigmoid' else None
+        log_decay, write = recurrence.gate_law(hooks.gates, gate, headed('log_a'), bias, beta,
+                                               exp=accurate_exp, softplus_of=softplus_series,
+                                               logistic_of=logistic_value)
+        return accurate_exp(log_decay), write
     if hooks.rated:
         write = scalar('beta')
         return jnp.exp(headed('rate') * write), write
@@ -616,8 +613,7 @@ def _epilogue(hooks, inputs, token: _Token, out, value, exchanged, *, interpret:
     gate = token.tile(inputs['z'])
     weight = plgpu.load(inputs['weight'].at[pl.ds(0, 1), token.columns], layout=token.block.layout,
                         optimized=False).astype(jnp.float32)
-    # As `precision.rms_statistics` takes it: the sum times the count's reciprocal, over a head's columns.
+    # As `precision.rms_statistics` takes it, over a head's columns (`rms_of_total`).
     total = scan.summed((out * out).reshape(-1), exchanged, interpret=interpret)
-    mean = total * (1.0 / token.block.columns)
-    return rms_weighted(out, lax.rsqrt(mean + hooks.output.epsilon), weight=weight,
-                        gate=activation_and_slope(gate, hooks.output.activation)[0])
+    _, inverse = rms_of_total(total, token.block.columns, hooks.output.epsilon)
+    return rms_weighted(out, inverse, weight=weight, gate=activation_and_slope(gate, hooks.output.activation)[0])
