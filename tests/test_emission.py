@@ -1659,20 +1659,21 @@ def test_an_atomic_add_counts_its_bytes_reduced_where_global_and_an_a100_prices_
     assert work.global_reductions in cost.units(work, cost.rates(hopper, device=False))[1]
 
 
-def test_a_launchs_copies_past_its_buffers_whole_are_its_l2_traffic_priced_at_the_l2():
-    """A launch reading its 512-byte row twice and writing it once copies 1536 bytes, 512 past its row and
-    its output whole: its L2 traffic (`Work.l2_bytes`), whatever bytes it states its compulsory ones
-    (`Work.device_bytes`); reading it once copies none past them, though it states its row's bytes alone (a
-    write a statement omits is no reread). Its rereads price at the part's measured L2 read plateau (an RTX
+def test_a_launchs_reads_past_its_operands_whole_are_its_l2_traffic_priced_at_the_l2():
+    """A launch reading its 512-byte row twice reads 512 bytes past it: its L2 traffic (`Work.l2_bytes`),
+    whatever bytes it states its compulsory ones (`Work.device_bytes`); reading it once reads none past it,
+    though it states its row's bytes alone (an output a statement omits is no reread), and nor does storing
+    its output twice (a store is no read). Its rereads price at the part's measured L2 read plateau (an RTX
     PRO 6000's, M-FS-113) beside its stated bytes at its stream, one memory's two levels, and at none where
     the part measured no L2 (row 14180)."""
-    def launched(reads: int):
+    def launched(reads: int, stores: int = 1):
         def body(row, out, staged, barrier):
             for _ in range(reads):
                 plgpu.copy_gmem_to_smem(row, staged, barrier)
                 plgpu.barrier_wait(barrier)
-            plgpu.copy_smem_to_gmem(staged, out)
-            plgpu.wait_smem_to_gmem(0)
+            for _ in range(stores):
+                plgpu.copy_smem_to_gmem(staged, out)
+                plgpu.wait_smem_to_gmem(0)
 
         launch = plgpu.kernel(body, out_type=_ROW, num_threads=1, thread_name="wg",
                               scratch_types=[plgpu.SMEM((128,), jnp.float32), plgpu.Barrier()])
@@ -1686,6 +1687,7 @@ def test_a_launchs_copies_past_its_buffers_whole_are_its_l2_traffic_priced_at_th
         work = emission.launch_work(twice, Stated(steps=0, bytes_accessed=stated))
         assert (work.device_bytes, work.l2_bytes) == (stated, row)
     assert emission.launch_work(once, Stated(steps=0, bytes_accessed=row)).l2_bytes == 0
+    assert emission.launch_work(launched(1, stores=2), Stated(steps=0, bytes_accessed=row)).l2_bytes == 0
     g4, h100 = (generation.gpu_target(kind) for kind in ("NVIDIA RTX PRO 6000 Blackwell Server Edition",
                                                        "NVIDIA H100 80GB HBM3"))
     work = emission.launch_work(twice, Stated(steps=0, bytes_accessed=2 * row))

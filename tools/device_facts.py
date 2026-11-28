@@ -123,8 +123,8 @@ def main() -> None:
         print(json.dumps(row), flush=True)
     # Each array read once to bring it into the L2, then timed warm (no eviction): its reads hit the L2.
     held = []
-    l2_bytes = generation.gpu_facts().l2_bytes or 0
-    for size in (2 ** power for power in range(18, 64) if 2 ** power <= l2_bytes // 2):
+    l2_bytes = generation.gpu_facts().l2_bytes
+    for size in (2 ** power for power in range(18, 64) if 2 ** power <= (l2_bytes or 0) // 2):
         x = jnp.ones((size // 2,), jnp.bfloat16)
         held.append({"bytes": size, "seconds": timed(read, (x,), warmup=args.warmup, repeats=args.repeats)})
         print(json.dumps({"l2_read": held[-1]}), flush=True)
