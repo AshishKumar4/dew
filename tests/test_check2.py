@@ -27,15 +27,42 @@ def _named(value):
     return value.name if isinstance(value, jcore.Primitive) else None
 
 
+def test_an_unflushed_exp_keeps_a_subnormal_weight():
+    """An accurate exponential's enclosure (`interval_certificates.exp`) on a lane whose `exp` keeps
+    subnormals (`Lane.exp_flushes`, measured by `exp_flushes`): e^-88, a subnormal, holds its correct rounding
+    and refuses zero; where the lane's `exp` flushes, zero held beside it. A lane rounding correctly keeps
+    them, and one zeroing every subnormal flushes, its reach refused where it may not flush."""
+    x = np.asarray([-88.0])
+    exact = oc.exp_rounded(x, oc.FLOAT32)
+    for flushes in (False, True):
+        held = ic.exp(ic.point(x), ic.Lane(0, flushes=False, block=0, exp_reach=1, exp_flushes=flushes))
+        assert ic.within(exact, held).all() and bool(ic.within(np.zeros(1), held).all()) == flushes
+    def zeroed(x):
+        return np.where(_wide_exp(x) < 2.0 ** -126, 0.0, _wide_exp(x)).astype(np.float32)
+
+    assert not ic.exp_flushes(lambda x: _wide_exp(x).astype(np.float32)) and ic.exp_flushes(zeroed)
+    # A lane that may not flush (a native unapproximated exp): its zero at a subnormal refused, not measured.
+    ic.exp_reach(zeroed)
+    with pytest.raises(ArithmeticError):
+        ic.exp_reach(zeroed, flushes=False)
+
+
+def _wide_exp(x):
+    """`exp` of fp32 operands in float64, an fp32 cast of it rounding once more (NumPy's own float32 `exp`
+    lies two steps off)."""
+    return np.exp(np.asarray(x, np.float64))
+
+
 @pytest.mark.parametrize(("probe", "rounded", "wrong"), [
     (ic.tanh_reach, np.tanh, np.float32(np.nan)), (ic.tanh_reach, np.tanh, np.float32(1.5)),
     (ic.exp2_reach, np.exp2, np.float32(np.nan)), (ic.exp2_reach, np.exp2, np.float32(-1.0)),
-    (ic.exp2_reach, np.exp2, np.float32(np.inf))])
+    (ic.exp2_reach, np.exp2, np.float32(np.inf)), (ic.exp_reach, _wide_exp, np.float32(np.nan)),
+    (ic.exp_reach, _wide_exp, np.float32(-1.0)), (ic.exp_reach, _wide_exp, np.float32(np.inf))])
 def test_a_reach_probe_refuses_a_result_no_rounding_gives(probe, rounded, wrong):
-    """A lane's tanh or exp2 whose result at zero is no rounding of it (a quiet NaN, a tanh past 1, a negative
-    exp2, an infinite exp2 where 2^0 is 1) is refused before its reach is measured
-    (`interval_certificates.tanh_reach`, `exp2_reach`), never read as two billion grid steps; the function
-    rounded in fp32 is measured."""
+    """A lane's tanh, exp2 or exp whose result at zero is no rounding of it (a quiet NaN, a tanh past 1, a
+    negative exponential, an infinite one where its value at 0 is 1) is refused before its reach is measured
+    (`interval_certificates.tanh_reach`, `exp2_reach`, `exp_reach`), never read as two billion grid steps;
+    the function rounded in fp32 is measured."""
     def lane(x):
         return np.where(x == 0, wrong, rounded(x).astype(np.float32))
 

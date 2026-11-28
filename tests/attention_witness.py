@@ -30,6 +30,7 @@ its weights' or score cotangents' enclosures (row 6130)."""
 
 import dataclasses
 import functools
+from typing import NamedTuple
 
 import attention_oracle
 import numpy as np
@@ -39,11 +40,16 @@ from interval_certificates import (
     add,
     cast,
     dot,
+    exp,
     exp2,
     exp2_reach,
+    exp_flushes,
+    exp_reach,
     fp32,
     hull,
     mul,
+    natural_exp,
+    neg,
     point,
     tanh,
     tanh_reach,
@@ -51,7 +57,7 @@ from interval_certificates import (
 )
 from op_certificates import BFLOAT16, FLOAT32, nearest, stepped
 
-from dew.nn.kernels.templates import attention as template, attention_mosaic
+from dew.nn.kernels.templates import attention as template, attention_algebra as algebra, attention_mosaic
 from dew.nn.kernels.templates.attention import LOG2E
 
 
@@ -63,20 +69,26 @@ def walk_factor(width: int) -> float:
 @functools.cache
 def attention_lane() -> Lane:
     """The arithmetic an interpreted certify launch runs in: `ex2`'s reach over the step's exponents,
-    (-126, 0] (XLA's exp2 measured there, `exp2_reach`), and whether it flushes (`certified.lane`). Its
+    (-126, 0] (XLA's exp2 measured there, `exp2_reach`), `exp`'s over a row's natural differences
+    (`exp_reach`), and whether it flushes (`certified.lane`). Its
     products' column blocks are the witness's to read (`tiles`), not the lane's."""
     import jax
     import jax.numpy as jnp
     from certified import lane
 
+    def natural(x):
+        return jax.jit(jnp.exp)(jnp.asarray(x))
+
     reach = exp2_reach(lambda x: jax.jit(jnp.exp2)(jnp.asarray(x)), low=-126.0, high=0.0)
-    return Lane(reach, lane().flushes, 0, tanh_reach=tanh_reach(lambda x: jax.jit(jnp.tanh)(jnp.asarray(x))))
+    return Lane(reach, lane().flushes, 0, exp_reach=exp_reach(natural), exp_flushes=exp_flushes(natural),
+                tanh_reach=tanh_reach(lambda x: jax.jit(jnp.tanh)(jnp.asarray(x))))
 
 
 def summed(p: Iv, lane: Lane) -> Iv:
     """A row's fp32 sum of the weights within `p` in any order: their exact sums, widened by gamma_n of
-    their magnitudes (n the terms, each add rounded to nearest at fp32's unit), then on the fp32 grid."""
-    terms = p.lo.shape[-1]
+    their magnitudes (n the row's terms that may be nonzero, each add rounded to nearest at fp32's unit,
+    an add of an exact zero exact), then on the fp32 grid."""
+    terms = ((p.lo != 0) | (p.hi != 0)).sum(-1)
     unit = 2.0 ** -FLOAT32.precision
     gamma = terms * unit / (1 - terms * unit)
     magnitude = np.maximum(np.abs(p.lo), np.abs(p.hi)).sum(-1)
@@ -234,16 +246,18 @@ def spans_of(form: str, batch: int):
     return template.spans(SHAPE[1], SHAPE[1], batch, **stated)
 
 
-def operands(seed: int):
-    """bf16 queries, keys and values of SHAPE, drawn on the host in NumPy so a GPU tier's prepare computes
-    nothing on its compile-only device (row 9546); the keys scaled so the rows' maxima move across tiles."""
+def operands(seed: int, width: int = SHAPE[3]):
+    """bf16 queries, keys and values of SHAPE (`width` wide), drawn on the host in NumPy so a GPU tier's
+    prepare computes nothing on its compile-only device (row 9546); the keys scaled so the rows' maxima move
+    across tiles."""
     import jax.numpy as jnp
 
     rng = np.random.default_rng(seed)
     bf16 = np.dtype(jnp.bfloat16)
-    q = rng.standard_normal(SHAPE, dtype=np.float32).astype(bf16)
-    k = (2.0 * rng.standard_normal(SHAPE, dtype=np.float32)).astype(bf16)
-    v = rng.standard_normal(SHAPE, dtype=np.float32).astype(bf16)
+    shape = (*SHAPE[:3], width)
+    q = rng.standard_normal(shape, dtype=np.float32).astype(bf16)
+    k = (2.0 * rng.standard_normal(shape, dtype=np.float32)).astype(bf16)
+    v = rng.standard_normal(shape, dtype=np.float32).astype(bf16)
     return q, k, v
 
 
@@ -357,11 +371,12 @@ def backward_launched(query, key, value, dout, form: str, *, interpret: bool, si
     def program(q, k, v, do):
         spans = spans_of(form, q.shape[0])
         kept = template.Kept.SPLIT if accurate else template.Kept.OUTPUT
+        # The accurate form's logits natural, as the template's accurate form is (`template.ACCURATE`).
         out, *residuals = attention_mosaic.forward(q, k, v, spans, hooks_of(form), residuals=kept,
-                                                   interpret=interpret)
+                                                   natural=accurate, interpret=interpret)
         grads, rows, tiles = attention_mosaic.backward_certified(
-            q, k, v, spans, hooks_of(form), do, residuals=tuple(residuals), accurate=accurate,
-            interpret=interpret)
+            q, k, v, spans, hooks_of(form), do, residuals=tuple(residuals), natural=accurate,
+            accurate=accurate, interpret=interpret)
         # Whether one launch ran or two (`BackwardTiles.fused`), an output of the program, so a prepared
         # native run's stored program gives it too (no Python of it runs there).
         fused = jnp.asarray(tiles.fused, jnp.float32)
@@ -405,46 +420,43 @@ def backward_witnessed(query, key, value, dout, kept, records: dict, *, lane: La
     within two steps, `div.full`'s reach; tanh within its lane's reach), their weights `exp2` of their
     natural units, and each score cotangent times the hook's slope as JAX's vjp of it takes it on ones:
     `cap`, times `1 - t²` (`one_minus_square`, fused or not), over `cap` (none where not `sloped`: a fault's
-    witness, all else capped). The accurate form's (`records["accurate"]`): its cotangents fp32 at their
-    products as three bf16 parts summing to each exactly (`attention_algebra.formed_parts`), where the fast
-    form casts them to bf16 once, and its dQ as its pass forms it (`_accurate_dq`). For each gradient, the
+    witness, all else capped). The accurate form's (`records["accurate"]`), its logits natural (raw products
+    against their raw maximum, `Forward.raw`, but under a cap): its cotangents fp32 at their products as
+    three bf16 parts summing to each exactly (`attention_algebra.formed_parts`), where the fast form casts
+    them to bf16 once, and its dQ as its pass forms it (`_accurate_dq`). Every denominator a launch read is
+    held to the weights' own sum (`_unbounded_denominators`), a row outside refusing the gradients it
+    weighs. For each gradient, the
     entries held and those inside."""
     lane = attention_lane() if lane is None else lane
     lane = dataclasses.replace(lane, block=0)
     q, k, v, do = (np.asarray(np.asarray(x, np.float32), np.float64) for x in (query, key, value, dout))
     power, left = template.prescale(np.dtype(query.dtype), q.shape[3], None)
-    factor, grad_scale = float(np.float32(left * LOG2E)) * power, power * left
+    grad_scale = power * left
     accurate = bool(records["accurate"])
     held = {name: [] for name in ("dq", "dk", "dv")}
     for b in range(q.shape[0]):
         keeps = np.broadcast_to(kept, (q.shape[0], 1, *kept.shape[2:]))[b, 0]
         for h in range(q.shape[2]):
             kv = h * k.shape[2] // q.shape[2]
-            peak = fp32(mul(point(records["m"][b, h]), point(LOG2E)), lane)
-            total = records["l"][b, h]
             products = dot(point(q[b, :, h]), point(k[b, :, kv].T), lane)
-            below = Iv(-peak.hi[:, None], -peak.lo[:, None])
-            if softcap is None:
-                logits = mul(products, point(factor))
-                exponents = hull(fp32(add(logits, below), lane), fp32(add(fp32(logits, lane), below), lane))
-                slope = None
+            exponents, slope, natural = exponents_of(
+                products, records["m"][b, h], lane, natural=accurate, power=power, left=left,
+                softcap=softcap, sloped=sloped)
+            if natural is not None:
+                # The accurate form's weights natural exponentials: the forward's of its differences' exact
+                # products (`natural_exp`), its total's, and the backward's `exp` of their rounded ones
+                # (`attention_gradient.below`, no approximation), every other's.
+                forward = natural_exp(natural.forward, lane)
+                forward = Iv(np.where(keeps, forward.lo, 0.0), np.where(keeps, forward.hi, 0.0))
+                unnormalized = exp(natural.recomputed, lane)
+                unnormalized = Iv(np.where(keeps, unnormalized.lo, 0.0),
+                                  np.where(keeps, unnormalized.hi, 0.0))
             else:
-                folded = _divided(fp32(mul(products, point(grad_scale)), lane), softcap, lane)
-                bent = tanh(folded, lane)
-                natural = fp32(mul(bent, point(softcap)), lane)
-                logits = mul(natural, point(LOG2E))
-                exponents = hull(fp32(add(logits, below), lane), fp32(add(fp32(logits, lane), below), lane))
-                exponents = hull(exponents, fp32(mul(fp32(add(natural, Iv(-records["m"][b, h][:, None],
-                                                                          -records["m"][b, h][:, None])),
-                                                          lane), point(LOG2E)), lane))
-                square = hull(fp32(add(point(1.0), Iv(*(-x for x in reversed(fp32(mul(bent, bent), lane))))),
-                                   lane),
-                              fp32(mul(fp32(add(point(1.0), Iv(-bent.hi, -bent.lo)), lane),
-                                       fp32(add(point(1.0), bent), lane)), lane))
-                slope = _divided(fp32(mul(point(softcap), square), lane), softcap, lane) if sloped else None
-            exponents = Iv(np.where(keeps, np.minimum(exponents.lo, 0.0), 0.0),
-                           np.where(keeps, np.minimum(exponents.hi, 0.0), 0.0))
-            unnormalized = exp2(exponents, lane)
+                # A weight past one where its logit passes the stored maximum by a rounding: the forward's
+                # fold keeps its product's residual (`exp2(fma(s, c, -m))`, `attention_algebra`), the
+                # backward recomputes `logits - peak` unclamped (`attention_backward_algebra`).
+                exponents = Iv(np.where(keeps, exponents.lo, 0.0), np.where(keeps, exponents.hi, 0.0))
+                unnormalized = forward = exp2(exponents, lane)
 
             def over(denominators: np.ndarray, unnormalized: Iv = unnormalized, keeps=keeps) -> Iv:
                 # The weights over `denominators`, their reciprocal within two steps (`div.full`'s reach).
@@ -459,6 +471,13 @@ def backward_witnessed(query, key, value, dout, kept, records: dict, *, lane: La
             # The dQ launch's weights over the forward's denominator; the dK/dV launch's over its launch's own
             # (`BackwardRows.denominator`: two launches' the dQ pass's `T'`, `attention_gradient.dq_finish`;
             # a fused launch's the forward's), about the D it took (the refined one, or the fused launch's).
+            # Each held to the weights' own sum (`_unbounded_denominators`): the forward's an online walk's
+            # where the form is fast, two launches' `T'` the sum of the weights its dQ launch recomputes.
+            total = records["l"][b, h]
+            own = None if bool(records["fused"]) else records["denominator"][b, h]
+            outside = _unbounded_denominators(forward, unnormalized, exponents, keeps, total, own, lane,
+                                              online=not accurate)
+            unbounded = outside["total"] | outside["denominator"]
             weights = over(total)
             weighed = over(records["denominator"][b, h])
             pulled = dot(point(do[b, :, h]), point(v[b, :, kv].T), lane)
@@ -474,15 +493,104 @@ def backward_witnessed(query, key, value, dout, kept, records: dict, *, lane: La
                 cotangents = cast(cotangents, BFLOAT16)
                 dk = dot(Iv(cotangents.lo.T, cotangents.hi.T), point(q[b, :, h]), lane)
                 dq = _fast_dq(pulled, weights, slope, grad_scale, keeps, k[b, :, kv], records, b, h, lane)
-                for name, inside in _fast_rows(pulled, weights, unnormalized, keeps, do[b, :, h],
+                for name, inside in _fast_rows(pulled, weights, ~outside["denominator"], keeps, do[b, :, h],
                                                records["out"][b, :, h], v[b, :, kv], records, b, h,
                                                lane).items():
                     held.setdefault(name, []).append((np.ones(inside.shape, bool), inside))
+            weighs = (keeps & unbounded[:, None]).any(0)
             for name, found in (("dq", dq), ("dk", dk), ("dv", dv)):
                 stored = records[name][b, :, h if name == "dq" else kv]
-                held[name].append((np.ones(stored.shape, bool), within(stored, cast(found, BFLOAT16))))
+                read = unbounded if name == "dq" else weighs
+                inside = within(stored, cast(found, BFLOAT16)) & ~read[:, None]
+                held[name].append((np.ones(stored.shape, bool), inside))
     return {name: (np.concatenate([rows.ravel() for rows, _ in found]),
                    np.concatenate([inside.ravel() for _, inside in found])) for name, found in held.items()}
+
+
+class Natural(NamedTuple):
+    """An accurate launch's natural arguments to its weights' exponentials (`exponents_of`): the forward's,
+    exact (`natural_exp` scales its fp32 difference by the whole scale, its product's residual kept), and
+    those its backward recomputes, fp32."""
+
+    forward: Iv
+    recomputed: Iv
+
+
+def exponents_of(products: Iv, peak_m: np.ndarray, lane: Lane, *, natural: bool, power: float, left: float,
+               softcap: float | None, sloped: bool) -> tuple[Iv | None, Iv | None, Natural | None]:
+    """A row's weights' exponents against its stored maximum `peak_m` (`[Q]`) from its query's `products`
+    with each key (`[Q, K]`, unscaled), and under a cap the cotangents' slope (`backward_witnessed`): the
+    fast fold's, base 2, `products` times the scale and log2(e) (`template.prescale`'s power and left) less
+    the maximum in base 2, none natural; the natural accurate form's, none base 2, its natural differences
+    (`Natural`), as its backward recomputes them (`attention_algebra.exponent`), the prescaled query's raw
+    products (the power, exact) less their stored raw maximum, the difference scaled after it is taken by
+    the scale left (`Forward.raw`; the forward's that difference times the scale left exact), or past the
+    raw form's scales the scaled logits less the stored natural maximum; under a cap the hook's natural
+    logits, `cap tanh(fp32(s scale) / cap)`, its slope where `sloped`, the accurate form's natural
+    differences those logits less the stored maximum."""
+    grad_scale = power * left
+    peak = fp32(mul(point(peak_m), point(LOG2E)), lane)
+    below = Iv(-peak.hi[:, None], -peak.lo[:, None])
+    stored = point(peak_m[:, None])
+    if softcap is None and natural:
+        prescaled = mul(products, point(power))
+        low, high = algebra.RAW_SCALES
+        if low <= left <= high:
+            difference = fp32(add(prescaled, neg(stored)), lane)
+            difference = Iv(np.minimum(difference.lo, 0.0), np.minimum(difference.hi, 0.0))
+            logits = fp32(mul(difference, point(float(np.float32(left)))), lane)
+            exact = mul(difference, point(left))
+        else:
+            logits = fp32(add(fp32(mul(prescaled, point(float(np.float32(left)))), lane), neg(stored)), lane)
+            logits = exact = Iv(np.minimum(logits.lo, 0.0), np.minimum(logits.hi, 0.0))
+        return None, None, Natural(exact, logits)
+    if softcap is None:
+        logits = mul(products, point(float(np.float32(left * LOG2E)) * power))
+        return hull(fp32(add(logits, below), lane), fp32(add(fp32(logits, lane), below), lane)), None, None
+    folded = _divided(fp32(mul(products, point(grad_scale)), lane), softcap, lane)
+    bent = tanh(folded, lane)
+    capped = fp32(mul(bent, point(softcap)), lane)
+    square = hull(fp32(add(point(1.0), Iv(*(-x for x in reversed(fp32(mul(bent, bent), lane))))), lane),
+                  fp32(mul(fp32(add(point(1.0), Iv(-bent.hi, -bent.lo)), lane),
+                           fp32(add(point(1.0), bent), lane)), lane))
+    slope = _divided(fp32(mul(point(softcap), square), lane), softcap, lane) if sloped else None
+    if natural:
+        differences = fp32(add(capped, neg(stored)), lane)
+        differences = Iv(np.minimum(differences.lo, 0.0), np.minimum(differences.hi, 0.0))
+        return None, slope, Natural(differences, differences)
+    logits = mul(capped, point(LOG2E))
+    exponents = hull(fp32(add(logits, below), lane), fp32(add(fp32(logits, lane), below), lane))
+    exponents = hull(exponents, fp32(mul(fp32(add(capped, neg(stored)), lane), point(LOG2E)), lane))
+    return exponents, slope, None
+
+
+def _unbounded_denominators(forward: Iv, recomputed: Iv, exponents: Iv | None, keeps: np.ndarray,
+                            total: np.ndarray, denominator: np.ndarray | None, lane: Lane, *,
+                            online: bool) -> dict[str, np.ndarray]:
+    """The rows whose recorded denominators lie outside their unnormalized weights' fp32 sum
+    (`backward_witnessed`, by name: `"total"` and `"denominator"`, none where no `denominator`), a NaN outside
+    every bound (`within`): the forward's `total` the sum of its own
+    visible weights (`forward`), a dQ launch's own `denominator`, where two launches ran, the sum of the
+    weights it recomputes (`recomputed`, at the stored maximum). Each an fp32 row sum in any order
+    (`summed`: gamma_n of its terms, each add rounded to nearest); the forward's, where it walked `online`
+    (the fast form's), its terms each within its online error of itself (`certified.online_spread`, an
+    exp2 of the lane's reach), what underflow loses beside (four a key)."""
+    from certified import online_spread, underflow
+
+    def visible(weights: Iv) -> Iv:
+        return Iv(np.where(keeps, weights.lo, 0.0), np.where(keeps, weights.hi, 0.0))
+
+    row = summed(visible(forward), lane)
+    if online:
+        count, unit = keeps.shape[1], FLOAT32.unit_roundoff
+        shifted = np.minimum(exponents.lo, 0.0) * np.log(2.0)
+        spread = online_spread(shifted, count, 2 * unit * lane.reach, FLOAT32)
+        lost = (visible(forward).hi * spread).sum(-1) + 4 * count * underflow(FLOAT32, lane.flushes)
+        row = Iv(row.lo - lost, row.hi + lost)
+    outside = {"total": ~within(total, row), "denominator": np.zeros(total.shape, bool)}
+    if denominator is not None:
+        outside["denominator"] = ~within(denominator, summed(visible(recomputed), lane))
+    return outside
 
 
 def _centred(pulled: Iv, records: dict, b: int, h: int, lane: Lane, *, prior: bool = False) -> Iv:
@@ -537,14 +645,16 @@ def _fast_dq(pulled: Iv, weights: Iv, slope: Iv | None, grad_scale: float, keeps
     return fp32(mul(sums, Iv(ratio.lo[:, None], ratio.hi[:, None])), lane)
 
 
-def _fast_rows(pulled: Iv, weights: Iv, exponentials: Iv, keeps: np.ndarray, do: np.ndarray, out: np.ndarray,
-               values: np.ndarray, records: dict, b: int, h: int, lane: Lane) -> dict[str, np.ndarray]:
+def _fast_rows(pulled: Iv, weights: Iv, summed_own: np.ndarray, keeps: np.ndarray, do: np.ndarray,
+               out: np.ndarray, values: np.ndarray, records: dict, b: int, h: int, lane: Lane
+               ) -> dict[str, np.ndarray]:
     """The fast backward's rows of D (`template.BackwardRows`) held to enclosures of their own, apart from
     the gradients they centre (a launch that took and stated a wrong D refused): the prior `D - c` within
     `gamma` of its terms' magnitudes of `dO · O` less the chosen key's `dO · v_c` (exact, float64; 0 where
     it took none), and the anchor `c` within the same of its own, exactly 0 where it took none (the fast
     form's output residuals, `attention.output_split`); where two launches ran (the denominator
-    the dQ launch's own), that denominator within its exponentials' fp32 sum in any order, and the refined
+    the dQ launch's own), that denominator within its exponentials' fp32 sum in any order (`summed_own`,
+    `_unbounded_denominators`' verdict, the one the gradients it weighs take), and the refined
     `D - c` within `fl((D - c) + r)` of `dq_finish`'s refinement `r = fl(fl(R ratio) / fl(T' fl(1/T')))`,
     `R` the first pass's cotangents' fp32 sum; where one did (`records["fused"]`, the certify launch's
     tiles', never read off its rows: two launches may take the forward's denominator to the bit), the
@@ -570,8 +680,7 @@ def _fast_rows(pulled: Iv, weights: Iv, exponentials: Iv, keeps: np.ndarray, do:
         found["denominator"] = own == total
         found["delta"] = (records["delta"][b, h] == prior) & (records["lost"][b, h] == 0)
         return found
-    kept = Iv(np.where(keeps, exponentials.lo, 0.0), np.where(keeps, exponentials.hi, 0.0))
-    found["denominator"] = within(own, summed(kept, lane))
+    found["denominator"] = summed_own
     first = fp32(mul(weights, _centred(pulled, records, b, h, lane, prior=True)), lane)
     first = Iv(np.where(keeps, first.lo, 0.0), np.where(keeps, first.hi, 0.0))
     # `1 / T'` and `l / T'` each one division within `div.full`'s reach, as `dq_finish` forms them.
@@ -649,22 +758,22 @@ def _divided(numerator: Iv, divisor: float, lane: Lane) -> Iv:
     return Iv(lo, hi)
 
 
-def backward_operands(seed: int):
-    """`operands(seed)` and a bf16 cotangent of the output drawn beside them on the host (row 9546)."""
+def backward_operands(seed: int, width: int = SHAPE[3]):
+    """`operands(seed, width)` and a bf16 cotangent of the output drawn beside them on the host (row 9546)."""
     import jax.numpy as jnp
 
-    q, k, v = operands(seed)
+    q, k, v = operands(seed, width)
     rng = np.random.default_rng(seed + 7)
-    return q, k, v, rng.standard_normal(SHAPE, dtype=np.float32).astype(np.dtype(jnp.bfloat16))
+    return q, k, v, rng.standard_normal(q.shape, dtype=np.float32).astype(np.dtype(jnp.bfloat16))
 
 
 def assert_backward_witnessed(seed: int, form: str, *, interpret: bool, lane: Lane | None = None,
-                              accurate: bool = False) -> None:
+                              accurate: bool = False, width: int = SHAPE[3]) -> None:
     """Every gradient of the fast backward over draw `seed` under `form`, or the accurate one's (two
-    launches, `accurate`), inside its enclosure (`backward_witnessed`)."""
+    launches, `accurate`), `width` wide, inside its enclosure (`backward_witnessed`)."""
     import tier_wire
 
-    q, k, v, do = backward_operands(seed)
+    q, k, v, do = backward_operands(seed, width)
     records = backward_launched(q, k, v, do, form, interpret=interpret, accurate=accurate)
     if not interpret and tier_wire.preparing():
         return
@@ -735,6 +844,51 @@ def assert_equal_totals_held(*, interpret: bool, lane: Lane | None = None) -> No
         assert inside[rows].all(), f"{name}: {int((rows & ~inside).sum())} of {int(rows.sum())} outside"
 
 
+def assert_logit_past_its_maximum_held(*, interpret: bool, lane: Lane | None = None) -> None:
+    """Two launches (deterministic ops) over a causal call whose first row's one visible key's logit passes
+    the stored maximum by a rounding: its one product 1 x 180 at width 64, which the folded forward stores
+    as a maximum of 22.499998 and the backward recomputes as 22.5 (`logits - peak` unclamped). Its weight,
+    and so the dQ launch's own denominator, past one: its gradients and rows held, none refused."""
+    import jax.numpy as jnp
+    import tier_wire
+
+    bf16 = np.dtype(jnp.bfloat16)
+    _, _, value, dout = backward_operands(5)
+    query, key = np.zeros(SHAPE, bf16), np.zeros(SHAPE, bf16)
+    query[:, 0, :, 0], key[:, 0, :, 0] = 1, 180
+    records = backward_launched(query, key, value, dout, "causal", interpret=interpret,
+                                site="past its maximum")
+    if not interpret and tier_wire.preparing():
+        return
+    assert not records["fused"], "two launches ran"
+    held = backward_witnessed(query, key, value, dout, mask_of("causal"), records, lane=lane)
+    for name, (rows, inside) in held.items():
+        assert inside[rows].all(), f"{name}: {int((rows & ~inside).sum())} of {int(rows.sum())} outside"
+
+
+def assert_contracted_row_held(*, interpret: bool, lane: Lane | None = None) -> None:
+    """A full call whose every row's 512 products are one, 1 x 184320 at width 64: the forward's fold
+    stores a maximum of 33239.69 against a score of 23040, its FMA keeping the product's residual, so each
+    weight is 2^0.0019 and the denominator about 512.67, past the keys' count: the forward's states and the
+    backward's gradients and rows held, none refused. Native alone: an interpreted fold rounds its product
+    before the subtraction, its weights one."""
+    import jax.numpy as jnp
+    import tier_wire
+
+    bf16 = np.dtype(jnp.bfloat16)
+    _, _, value, dout = backward_operands(6)
+    query, key = np.zeros(SHAPE, bf16), np.zeros(SHAPE, bf16)
+    query[..., 0], key[..., 0] = 1, 184320
+    records = backward_launched(query, key, value, dout, "full", interpret=interpret, site="contracted row")
+    if not interpret and tier_wire.preparing():
+        return
+    # The case it is for reached: every denominator past the keys' count, the fold's FMA its residual's.
+    assert (records["l"] > SHAPE[1]).all(), f"no fold residual kept: {np.unique(records['l'])}"
+    held = backward_witnessed(query, key, value, dout, mask_of("full"), records, lane=lane)
+    for name, (rows, inside) in held.items():
+        assert inside[rows].all(), f"{name}: {int((rows & ~inside).sum())} of {int(rows.sum())} outside"
+
+
 def _exact_scores(query, key, value, dout, kept) -> np.ndarray:
     """The exact score cotangents `dS` `[B, H, Q, K]` of the call (`attention_oracle.float64_weights`,
     float64 on the CPU): `P (dP - D)` over sqrt(D)."""
@@ -764,10 +918,11 @@ def assert_backward_faults_refused(*, interpret: bool, lane: Lane | None = None)
     dV a sixty-fourth off, a causal call's gradients held as a full call's, and a capped call's dQ and dK
     held without the cap's slope (`sloped`; its dV held); the accurate form's at
     twice its scale and a sixty-fourth off alike, a dK of the exact score cotangents cast to one bf16 part
-    where the accurate form takes three (the same cotangents whole held), and the fast form's dQ and dK
-    held as the accurate form's (one part, about the first pass's D), and the fast form's D taken and
-    stated a sixty-fourth off (refused at its row). Every native program launches before any check (row
-    9546)."""
+    where the accurate form takes three (the same cotangents whole held), the fast form's dQ and dK held
+    as the accurate form's (one part, about the first pass's D), the fast form's D taken and stated a
+    sixty-fourth off (refused at its row), a dQ pass's denominator doubled with the dV it weighs halved, and
+    a fixed maximum's denominator past its fp32 row sum's bound, its masked keys no terms of it. Every
+    native program launches before any check (row 9546)."""
     import tier_wire
 
     q, k, v, do = backward_operands(3)
@@ -804,3 +959,27 @@ def assert_backward_faults_refused(*, interpret: bool, lane: Lane | None = None)
         assert bool(refused(backward_witnessed(q, k, v, do, mask, exact, lane=lane), "dk")) == wrong
     held = backward_witnessed(q, k, v, do, mask, dict(accurate, dq=causal["dq"], dk=causal["dk"]), lane=lane)
     assert refused(held, "dq") and refused(held, "dk")
+    # A dQ pass's denominator twice its own with the dV it weighs half its own, each consistent with the other
+    # (`dq_finish` doubling its total): refused by the denominators' bound on the weights' sum.
+    doubled = dict(accurate, denominator=accurate["denominator"] * 2, dv=accurate["dv"] / 2)
+    assert refused(backward_witnessed(q, k, v, do, mask, doubled, lane=lane), "dv")
+    # The first causal row's one key at its maximum: its denominator exactly 1, nudged by 2^-13 (within the
+    # fast walk's allowance, past a fixed maximum's sum), and NaN, each refusing its dQ.
+    for wrong in (1 + 2.0 ** -13, np.nan):
+        nudged = accurate["denominator"].copy()
+        nudged[0, 0, 0] = wrong
+        assert refused(backward_witnessed(q, k, v, do, mask, dict(accurate, denominator=nudged), lane=lane),
+                       "dq")
+    # A fixed maximum's row of 512 exact unit weights: its fp32 sum 512 held, and 512 + 3 2^-7, past an fp32
+    # row sum's gamma_n (512 + 2^-6) though within a tensor-core sum's twice that, refused; one such weight
+    # beside 511 masked keys, its sum 1 held and 1 + 2^-16 refused (an add of a masked zero no rounding);
+    # each as the forward's total and as the dQ pass's own denominator.
+    units, zeros = point(np.ones((1, 512))), point(np.zeros((1, 512)))
+    summing = attention_lane() if lane is None else lane
+    for live, recorded, wrong in ((512, 512.0, False), (512, 512.0 + 3 * 2.0 ** -7, True),
+                                  (1, 1.0, False), (1, 1.0 + 2.0 ** -16, True)):
+        exact, read = np.float32([live]), np.float32([recorded])
+        for total, denominator in ((read, exact), (exact, read)):
+            unbounded = _unbounded_denominators(units, units, zeros, np.arange(512)[None] < live, total,
+                                                denominator, summing, online=False)
+            assert list(unbounded["total"] | unbounded["denominator"]) == [wrong]
