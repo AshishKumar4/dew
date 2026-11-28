@@ -281,8 +281,8 @@ def test_a_subnormal_scale_survives_a_program_traced_for_a_gpu_and_lowered_for_a
     """A ternary product at a subnormal scale (`2**-127`, a row of one) traced where its scale's module reads
     the context placed on a GPU (`generation.placed_platform`, a CUDA host's) and lowered for a CPU, which
     flushes subnormals:
-    it returns `2**-127`, the lowered platform choosing the scale's software arm (`factored.flushing`, row
-    13569), not the traced one's multiply."""
+    it returns `2**-127`, the scale's exact arm (`factored.int8_epilogue`, row 13569), not a multiply the
+    traced platform's would flush."""
     values = np.zeros((256, 2), np.float32)
     values[0] = (1.0, -1.0)
     weights = formats.TernaryWeights.of(values, scale=np.float32(2.0 ** -127))
