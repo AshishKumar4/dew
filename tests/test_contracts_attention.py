@@ -21,6 +21,7 @@ from dew.nn.kernels.templates import (
     attention_quantized,
     merged,
 )
+from dew.nn.kernels.templates.narrowing import narrowing_settled
 from dew.nn.sharding import manual_map
 
 
@@ -218,13 +219,13 @@ def test_a_padded_merges_derivatives_are_the_laws(edge, taken):
 
 @pytest.mark.parametrize("edge", EDGES)
 def test_the_narrowing_settle_holds_every_order(edge):
-    """`attention.narrowing_settled` (a surrogate whose derivative is its quotient's on every entry): every
+    """`narrowing.narrowing_settled` (a surrogate whose derivative is its quotient's on every entry): every
     order finite wherever float64 is a normal float32 and the plain quotient is, the quotient's own, over
     drawn fp32 quotients of sums over a divisor of 3/2 as an fp16 output narrows them."""
     divisor = jnp.full((9,), 1.5, jnp.float32)
 
     def settled(out):
-        return template.narrowing_settled(out, out * divisor, divisor, jnp.float16)
+        return narrowing_settled(out, out * divisor, divisor, jnp.float16)
 
     def plain(out):
         return out
@@ -239,13 +240,13 @@ def test_the_narrowing_settle_holds_every_order(edge):
 
 
 def test_a_nudged_quotient_narrows_once_and_keeps_its_tangent():
-    """`attention.narrowing_settled` at an fp16 tie it nudges: the quotient 1 + 2^-11 formed of sums
+    """`narrowing.narrowing_settled` at an fp16 tie it nudges: the quotient 1 + 2^-11 formed of sums
     1 + 2^-11 - 2^-23 over a divisor 1 - 2^-24, whose exact value is below the tie, narrows to 1 as that
     value rounds once, and its tangent along the quotient is the quotient's own, 1 (the head review of
     fd1af38ac, F1: a nudged entry's tangent was none)."""
     tie = jnp.float32(1 + 2.0 ** -11)
     acc, divisor = jnp.float32(1 + 2.0 ** -11 - 2.0 ** -23), jnp.float32(1 - 2.0 ** -24)
-    settled, tangent = jax.jvp(lambda out: template.narrowing_settled(out, acc, divisor, jnp.float16), (tie,),
+    settled, tangent = jax.jvp(lambda out: narrowing_settled(out, acc, divisor, jnp.float16), (tie,),
                                (jnp.float32(1.0),))
     assert settled.astype(jnp.float16) == 1.0 and tangent == 1.0
 

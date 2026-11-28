@@ -51,10 +51,10 @@ from dew.nn.kernels.templates.attention import (
     dropped_reach,
     drops_in_place,
     kept,
-    narrowing_settled,
     saturated,
     within,
 )
+from dew.nn.kernels.templates.narrowing import narrowing_settled
 from dew.nn.precision import (
     correctly_rounded_divide,
     float32_einsum,
