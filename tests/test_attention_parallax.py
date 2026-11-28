@@ -1022,7 +1022,8 @@ def test_exp_scaleds_derivative_meets_its_powers_before_it_rounds():
     assert along(1.5, -2, 3 * 2.0 ** 126) == 9 * 2.0 ** 123
     assert pulled(1.5, -1, 1.5 * 2.0 ** -126) == 1.125 * 2.0 ** -126
     def along_exponent(z):
-        return jax.jvp(lambda e: attention_parallax.exp_scaled(z, e, 0), (jnp.float32(0.0),), (jnp.float32(1.0),))[1]
+        one, zero = jnp.float32(1.0), jnp.float32(0.0)
+        return jax.jvp(lambda e: attention_parallax.exp_scaled(z, e, 0), (zero,), (one,))[1]
 
     mixed = jax.jvp(along_exponent, (jnp.float32(2.0 ** -149),), (jnp.float32(1.0),))[1]
     assert float(mixed) == 1.0
