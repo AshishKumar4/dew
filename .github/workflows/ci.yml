@@ -173,7 +173,9 @@ jobs:
           sh '{artifacts}' > "$RUNNER_TEMP/listed.jsonl"
         listed=$(jq -r 'select(has("index") and .kind == "ok" and .exitCode == 0 and (.artifactsLost | not)
           and .artifacts != null) | .artifacts' "$RUNNER_TEMP/listed.jsonl")
-        generations=$( [ -n "$listed" ] && grep -E '^sm[0-9]+[a-z]?$' "$listed/listed" | xargs)
+        [ -n "$listed" ] && [ -r "$listed/listed" ] ||
+          { cat "$RUNNER_TEMP/listed.jsonl"; echo "the catalogue's listing kept no file"; exit 1; }
+        generations=$(grep -E '^sm[0-9]+[a-z]?$' "$listed/listed" | xargs || true)
         [ -n "$generations" ] || { cat "$RUNNER_TEMP/listed.jsonl"; echo "the catalogue listed no generation"; exit 1; }
         [ "$(grep -cv '^$' "$listed/listed")" = "$(echo $generations | wc -w)" ] ||
           { cat "$listed/listed"; echo "the catalogue listed a generation of no CUDA target's name"; exit 1; }
