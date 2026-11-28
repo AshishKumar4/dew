@@ -191,3 +191,34 @@ def test_a_balanced_tails_partials_are_budgeted_by_the_output_it_stores(out_dtyp
                        out_dtype=out_dtype, interpret=False, dense=True)
         assert tgmm.legal(ba, tile, target)
         assert bool(tgmm.balanced(ba, tile, target)) == admitted
+
+
+def test_a_two_turn_walk_stores_its_tiles_under_the_next_tiles_products():
+    """A B200's tcgen05 walk, whose tiles take two accumulator turns (`Tcgen05Rings.turns`: a tile's epilogue
+    stores it while the next tile's products fill the other turn), priced against the same walk at one turn
+    (its products, then its stores): over several waves unsplit, no longer and no shorter than either,
+    and shorter where its products outlast its reads and stores (its stores under them, its last wave's
+    drained after, row 14189); one wave, store-heavy, and a split (its partials summed after its walk), at
+    the one turn's price."""
+    import dataclasses
+
+    from dew.nn.kernels.templates.gemm import pricing, tiling
+
+    b200 = generation.gpu_target("sm100")
+    tiles = tiling.Tiles(128, 128, 64, 6, 1, warpgroups=1, family="tcgen05")
+
+    def walk_of(rows: int, extent: int, stored: int) -> "pricing.SplitWalk":
+        walk = pricing.split_walk(tiles, groups=1, rows=rows, depth=extent, width=extent, itemsizes=(2, 2),
+                                  stored=stored, multiprocessors=b200.multiprocessors,
+                                  step_seconds=pricing.step_seconds(tiles, b200, (2, 2), issued=jnp.bfloat16),
+                                  bandwidth=b200.memory_rate, launch_seconds=b200.launch_seconds, target=b200)
+        assert walk is not None and walk.turns == 2
+        return walk
+
+    deep = walk_of(16384, 8192, 2)
+    one_turn = dataclasses.replace(deep, turns=1)
+    assert deep.output > deep.wave
+    assert max(deep.walk(1), deep.stored) * deep.step_seconds <= deep.seconds(1) < one_turn.seconds(1)
+    for walk, splits in ((walk_of(64, 1024, 4), 1), (deep, 2)):
+        assert walk.seconds(splits) == dataclasses.replace(walk, turns=1).seconds(splits), splits
+    assert walk_of(64, 1024, 4).output <= walk_of(64, 1024, 4).wave

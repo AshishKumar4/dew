@@ -445,6 +445,9 @@ class SplitWalk:
     target: "generation.GpuTarget | None" = None
     """The GPU the walk runs on, whose scratch budget a split's partials stay within (`best_splits`,
     `within_split_budget`); None where none is stated."""
+    turns: int = 1
+    """The accumulator turns its family's tiles take (`Family.turns`): at two, a tile's epilogue stores it
+    while the next tile's products fill the other turn (`Tcgen05Rings`)."""
 
     def holds(self, splits: int) -> bool:
         """Whether `splits` slices' partials stay within their budget (`within_split_budget`): one slice
@@ -464,14 +467,17 @@ class SplitWalk:
         the part's peak: an RTX PRO 6000's dense 64 x 64 walks at two programs priced 0.21-0.23 of their
         measured time (M-FS-9), where an underfilled wave, one program a multiprocessor, runs at the whole
         rate."""
+        return max(self._walked(splits))
+
+    def _walked(self, splits: int) -> tuple[float, float]:
+        """The busiest program's walk at `splits` slices a tile (`walk`): its steps' products, and its
+        multiprocessor's share of the operands' stream, in steps."""
         programs = self.output * splits
         running = unit_cost.busiest_programs(programs, self.wave, self.multiprocessors)
-        slice_steps = -(-self.steps // splits)
-        busiest = running * slice_steps
         # The busiest multiprocessor's programs' shares of the operands, at its share of the memory's rate.
         stream = unit_cost.streamed(self.operand_bytes / programs, running, self.bandwidth,
                                     self.multiprocessors) / self.step_seconds
-        return max(busiest, stream)
+        return running * -(-self.steps // splits), stream
 
     def seconds(self, splits: int) -> float:
         """The call's time at `splits` slices a tile: its busiest program's walk, its epilogue's store of the
@@ -479,9 +485,18 @@ class SplitWalk:
         split, its partials' 2s passes over the output and their sum's launch. Priced at its walk alone, a
         GH200's input gradient of three 1024- and 4096-deep products chained through their fp32 output
         (each adding the last's in its epilogue) took 1.145 ms against the 0.955 its walks priced, where one
-        6144-deep product, its output stored once, took the 0.855 its walk's 0.790 priced (M-EM-70d)."""
+        6144-deep product, its output stored once, took the 0.855 its walk's 0.790 priced (M-EM-70d). Where
+        its tiles take two accumulator turns (`turns`) and a program walks several (more than one wave),
+        unsplit, each tile is stored while the next one's products fill the other turn: its products and its
+        last wave's stores after them, or, the longer, its operands' reads and its stores at the memory's
+        one rate (row 14189). One wave stores after its products as one turn does, and a split's partials
+        and their sum pass after its walk."""
         added = 2 * splits * self.passes + self.launch if splits > 1 else 0.0
-        return (self.walk(splits) + self.stored + added) * self.step_seconds
+        waves = unit_cost.spread(self.output * splits, self.wave)
+        if self.turns < 2 or waves < 2 or splits > 1:
+            return (self.walk(splits) + self.stored + added) * self.step_seconds
+        products, stream = self._walked(splits)
+        return max(products + self.stored / waves, stream + self.stored) * self.step_seconds
 
     def underfills(self, splits: int) -> bool:
         """Whether the call's programs at `splits` slices a tile fill less than one wave, so its time is its
@@ -513,7 +528,7 @@ def split_walk(tiles: "Tiles", *, groups: int, rows: int, depth: int, width: int
                      held * width * 4 / bandwidth / step_seconds,
                      0.0 if launch_seconds is None else launch_seconds / step_seconds,
                      held * width * stored / bandwidth / step_seconds,
-                     held * width * 4.0 if partial_bytes is None else partial_bytes, target)
+                     held * width * 4.0 if partial_bytes is None else partial_bytes, target, family.turns)
 
 
 def decode_contraction(tiles: "Tiles", target, *, rows: int, groups: int, depth: int, width: int,

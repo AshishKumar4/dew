@@ -2227,6 +2227,10 @@ class Family[Allocated, Opened, Accumulator](Issuer[Accumulator], Transport[Allo
     keys-first placement's, `placed.KEYS`); every other family's hold queries and walk the keys
     (`held_walked`)."""
 
+    turns = 1
+    """The accumulator turns its tiles take: one, its consumers store a tile once its products are done;
+    two, a tile's epilogue reads one turn while the next tile's products fill the other (`Tcgen05Rings`)."""
+
     @property
     def register_step(self) -> int:
         """The allocator's registers per thread in one step (`generation.Multiprocessor.register_step`,
