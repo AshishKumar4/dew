@@ -719,11 +719,12 @@ def test_a_large_value_direction_meets_lifted_terms_at_their_size(arm):
     output's tangent `-2^126`, plain fp32's, each lifted term met at its size before the direction
     (`attention_parallax._shifted`), where terms lifted by `2^60` met it first and overflowed (train
     1444's review)."""
-    *operands, spans = _witness((0.0, 0.0), (1.0, -1.0), (0.0, 0.0))
+    query, second, key, second_key, value, spans = _witness((0.0, 0.0), (1.0, -1.0), (0.0, 0.0))
     attend = attention_parallax.attend if arm == "walk" else attention_parallax.reference
     direction = jnp.broadcast_to(jnp.asarray([2.0 ** 126, -(2.0 ** 126)], jnp.float32)[None, :, None, None],
-                                 operands[4].shape)
-    _, tangent = jax.jvp(lambda value: attend(*operands[:4], value, spans), (operands[4],), (direction,))
+                                 value.shape)
+    _, tangent = jax.jvp(lambda value: attend(query, second, key, second_key, value, spans), (value,),
+                         (direction,))
     np.testing.assert_array_equal(np.asarray(tangent), np.full((1, 1, 1, 4), -(2.0 ** 126), np.float32))
 
 
@@ -732,11 +733,12 @@ def test_a_decay_past_int32_erases_no_dominant_term():
     weight 0, so the dominant logit's cotangent `g · (v - a)` is 0 and every key's too, its decay's power
     held before it is an integer (`attention_parallax._reach`), where it wrapped past `INT32_MIN`, erased
     `g · a` and read the dominant key's `1/2` (train 1444's review)."""
-    *operands, spans = _witness((0.0, -1488522240.0), (0.0, 0.0), (1.0, 2.0 ** -100))
-    out, pull = jax.vjp(lambda key: attention_parallax.attend(operands[0], operands[1], key, *operands[3:],
-                                                              spans), operands[2])
+    query, second, key, second_key, value, spans = _witness((0.0, -1488522240.0), (0.0, 0.0),
+                                                             (1.0, 2.0 ** -100))
+    out, pull = jax.vjp(lambda key: attention_parallax.attend(query, second, key, second_key, value, spans),
+                        key)
     (dkey,) = pull(jnp.ones_like(out))
-    np.testing.assert_array_equal(np.asarray(dkey), np.zeros(operands[2].shape, np.float32))
+    np.testing.assert_array_equal(np.asarray(dkey), np.zeros(key.shape, np.float32))
 
 
 @pytest.mark.mesh(devices=2)
@@ -747,7 +749,7 @@ def test_parallax_runs_under_a_checked_map_with_its_values_split_alone():
     seeded from the query alone failed the scan (train 1444's review)."""
     from jax.sharding import AxisType, PartitionSpec as P
 
-    mesh = jax.make_mesh((2,), ("data",), axis_types=(AxisType.Explicit,), devices=jax.devices()[:2])
+    mesh = jax.make_mesh((2,), ("data",), axis_types=(AxisType.Auto,), devices=jax.devices()[:2])
     spans = template.spans(8, 8, 1, causal=True)
 
     def per_batch(attend):

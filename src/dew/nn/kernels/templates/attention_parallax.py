@@ -51,9 +51,12 @@ product of one weight with one cotangent, value, key or query, is formed range-s
 is kept however far its factors lie apart; within one contraction (`dV = Σ w (1 - τ) g`, `dq`, `dk`, `dr`,
 `dk2`), terms whose magnitudes span more than fp32's range relative to the row's largest (an `e^-160`
 beside 1 under a cotangent of `2^127`) are held to the template's own attention and plain fp32 softmax
-attention, which lose them alike (no exponent tiers; row 14033). Every higher order differentiates the
-dense reference (`reference`), whose tails read as the plain formula's (row 14007): a lifted term meets
-a tangent or cotangent at its own size, its power taken first (`_shifted`).
+attention, which lose them alike (no exponent tiers; row 14033). The shared dots, `r · k2` and `g · v`, are
+taken at one power a row over the pairs it sees (`_row_bounds`): its largest visible dot held below `2^125`
+(`HELD`, the headroom threshold), a visible dot more than fp32's range below that largest held to plain
+fp32's parity (row 14033). Every higher order differentiates the dense reference (`reference`), whose tails
+read as the plain formula's (row 14007): a lifted term meets a tangent or cotangent at its own size, its
+power taken first (`_shifted`).
 
 It is XLA's alone: no launch of a Pallas mainloop (a GH200's Triton walk spilled at every backward tile and
 walked its forward 10 times the template's sdpa, M-NA-58b)."""
@@ -70,7 +73,7 @@ from jax.custom_derivatives import zero_from_primal
 
 from dew.algebra import means
 from dew.algebra.windows import Units
-from dew.nn.derivatives import KernelGlue, contracted
+from dew.nn.derivatives import KernelGlue, contracted, surrogate
 from dew.nn.kernels import generation
 from dew.nn.kernels.templates.attention import REFERENCE_PRECISION, KeySpans, dense, logit_scale, prescaled
 from dew.nn.precision import accurate_exp, float32_einsum, ln2_remainder, power2, two_sum
@@ -189,8 +192,6 @@ def _tiled(step: Callable, start, count: int):
     stacked, None where a step gives none."""
     carry, first = step(start, 0)
     carry, rest = jax.lax.scan(step, carry, jnp.arange(1, count))
-    if first is None:
-        return carry, None
     return carry, jax.tree.map(lambda one, more: jnp.concatenate([one[None], more]), first, rest)
 
 
@@ -257,20 +258,16 @@ def moments(logits: jax.Array, seconds: jax.Array, value: jax.Array, powers: jax
     before = jnp.maximum(jnp.minimum(units, 0), -60)
     taken = exp_scaled(apart / over, below, (before - power)[..., None])
 
-    def covariance(shift):
-        return (_shifted(weighed, taken, value * 0.5, shift)
-                - _shifted(_row_summed, taken, mean * 0.5, shift))
+    def covariance(terms, centred):
+        # `Σ ũ (v / 2 - a / 2)`, bilinear in the terms and the halved values and mean.
+        values, means = centred
+        return weighed(terms, values) - jnp.sum(terms, axis=-1)[..., None] * means
 
-    # Its power from the covariance at the lifted units, the covariance then formed at that power
-    # (`_spread`).
-    spread_power = _spread_power(jax.lax.stop_gradient(covariance(0)), units - before)
-    spread = covariance((units - before - spread_power)[..., None])
+    halves = (value * 0.5, mean * 0.5)
+    # Its power from the covariance at the lifted units, the covariance then taken to it whole (`_shifted`).
+    spread_power = _spread_power(jax.lax.stop_gradient(covariance(taken, halves)), units - before)
+    spread = _shifted(covariance, taken, halves, (units - before - spread_power)[..., None])
     return Moments(jnp.max(logits, axis=-1), total, mean, (hi, lo), spread, spread_power)
-
-
-def _row_summed(terms: jax.Array, rows: jax.Array) -> jax.Array:
-    """`Σ_k terms` of each row `[B, Hk, G, Q]` times its `rows` `[B, Hk, G, Q, Dv]`."""
-    return jnp.sum(terms, axis=-1)[..., None] * rows
 
 
 def _spread_power(covariance: jax.Array, power) -> jax.Array:
@@ -281,26 +278,34 @@ def _spread_power(covariance: jax.Array, power) -> jax.Array:
     return jnp.where(held, jnp.maximum(scaled + power, 0), 0)
 
 
-@functools.partial(jax.custom_jvp, nondiff_argnums=(0,))
-def _shifted(product: Callable, rows: jax.Array, by: jax.Array, shift) -> jax.Array:
-    """`product(rows, by) 2^shift`, `product` bilinear and `shift` integral, the power of a row (`rows`
-    `[..., K]` a row's terms, lifted for their products, `by` what they meet): its value the product's
-    before the power, so a lifted term keeps its product with a small value; its tangent each direction's
-    with the power taken first, `product(drows 2^shift, by) + product(rows 2^shift, dby)`, so a large
-    direction meets the terms at their own size: equal logits, second products `[1, -1]`, values 0 along
-    `[2^126, -2^126]` read the covariance's tangent `2^126`, where `2^60`-lifted terms met `2^125` before
-    their `2^-60` and overflowed (train 1444's review). Its tails' tangents so read as plain fp32's (Main's
-    ruling of 2026-11-27, row 14007)."""
+def _shifted_value(product: Callable, rows: jax.Array, by, shift) -> jax.Array:
+    """`product(rows, by) 2^shift`, its product formed before the power (`_shifted`)."""
     return power2(product(rows, by), shift)
 
 
-@_shifted.defjvp
-def _shifted_tangent(product: Callable, primals, tangents):
-    """`_shifted`'s tangent: each direction's with the power taken first."""
+def _shifted_tangent(product: Callable, primals, tangents, value) -> jax.Array:
+    """`_shifted`'s tangent: the rows' direction met by `by` before the power, as the value forms it (so its
+    pullback takes the power on a cotangent first, as autodiff of the value did); `by`'s direction met by
+    the rows at their own size, the power's negative part taken by the rows first and its positive part by
+    the direction."""
+    del value
     rows, by, shift = primals
     drows, dby, _ = tangents
-    taken = power2(rows, shift)
-    return _shifted(product, rows, by, shift), product(power2(drows, shift), by) + product(taken, dby)
+    low, high = jnp.minimum(shift, 0), jnp.maximum(shift, 0)
+    raised = jax.tree.map(lambda direction: power2(direction, high), dby)
+    return power2(product(drows, by), shift) + product(power2(rows, low), raised)
+
+
+_shifted = contracted("test_parallax_holds_every_order")(
+    surrogate(_shifted_value, _shifted_tangent, nondiff_argnums=(0,)))
+"""`product(rows, by) 2^shift` (`_shifted_value`), `product` bilinear in a row's terms `rows` `[..., K]`
+lifted for their products and what they meet, `by` (an array or a tuple of them), and `shift` the rows'
+integral power back: its value the product's before the power, so a lifted term keeps its product with a
+small value and terms that cancel do so before the power; a direction along `by` meets the terms at their
+own size (`_shifted_tangent`): equal logits, second products `[1, -1]`, values 0 along `[2^126, -2^126]`
+read the covariance's tangent `2^126`, where `2^60`-lifted terms met `2^125` before their `2^-60` and
+overflowed (train 1444's review). Its tails' tangents so read as plain fp32's (Main's ruling of
+2026-11-27, row 14007)."""
 
 
 def merged(held: Moments, tile: Moments, powers: jax.Array) -> Moments:
@@ -447,8 +452,8 @@ def _tile(call: _Call, start, width: int) -> tuple[jax.Array, jax.Array, jax.Arr
 
     seen = dense(call.spans, start + jnp.arange(width))[:, None, None]
     # A scale of 0 gives logits of 0, never an overflowing product times it (`inf · 0`, train 1444's review).
-    scaled = (jnp.zeros(seen.shape[:-1] + call.query.shape[3:4] + (width,), call.query.dtype)
-              if call.scale == 0 else products(call.query, key) * call.scale)
+    scaled = (jnp.zeros((*call.query.shape[:-1], width), call.query.dtype) if call.scale == 0
+              else products(call.query, key) * call.scale)
     logits = jnp.where(seen, scaled, -jnp.inf)
     seconds = jnp.where(seen, products(call.second, second_key), 0.0)
     return logits, seconds, value, (key, second_key)
