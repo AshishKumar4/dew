@@ -953,7 +953,7 @@ def reference_attention(query, key, value, *, mask=None, bias=None, sinks=None, 
     -0.7 times fp32's largest) and a written-out program its own (-inf, its
     dtype's least); None fills as flax does, its dtype's least, and -inf beside
     sinks. `excluded`, where `mask_fill` is None, weighs a masked key nothing
-    (-inf) and a row of no mass (every logit -inf) zero, as the template and the kernels
+    (-inf) and a masked row of no mass (every logit -inf) zero, as the template and the kernels
     exclude it: a visible key whose own logit is its dtype's least is never
     tied by a masked one, and a visible score that is not a number stays one.
     `range_safe` forms a scaled-after call's logits as the template takes them
@@ -1027,7 +1027,8 @@ def _weights(logits: jax.Array, *, mask, mask_fill, skipped, sinks, logit_floor,
     """`reference_attention`'s weights of its `logits` `[..., H, Q, K]`: masked (`mask_fill`, -inf beside
     `sinks` or where `excluded`), a walk's `skipped` keys -inf after, then softmaxed beside the sinks, from
     `logit_floor`, or from the row's own maximum, in fp32 at least where `wide` (`force_fp32_for_softmax`).
-    An `excluded` row of no mass (every logit -inf), sinkless and walked by none, weighs zero."""
+    An `excluded` row of no mass (every logit -inf) of a masked call, sinkless and walked by none, weighs
+    zero."""
     heads, length = logits.shape[-3], logits.shape[-2]
     empty = None
     if mask is not None:
@@ -1037,10 +1038,12 @@ def _weights(logits: jax.Array, *, mask, mask_fill, skipped, sinks, logit_floor,
         if mask_fill is None:
             mask_fill = -jnp.inf if sinks is not None or excluded else jnp.finfo(dtype).min
         logits = jnp.where(mask, logits, mask_fill)
-    if excluded and sinks is None and logit_floor is None and skipped is None:
-        # A row of no mass, every logit -inf (its keys masked, or a visible one's bias -inf), softmaxed over
-        # a dummy row of 0 (finite, its gradient none) and weighed zero after, as the template's guarded
-        # reduction weighs it; a visible NaN score is the NaN it is.
+    if excluded and mask is not None and sinks is None and logit_floor is None and skipped is None:
+        # A masked row of no mass, every logit -inf (its keys masked, or a visible one's bias -inf),
+        # softmaxed over a dummy row of 0 (finite, its gradient none) and weighed zero after, as the
+        # template's guarded reduction weighs it; a visible NaN score is the NaN it is. A call that hides no
+        # key keeps jax.nn's softmax op for op, which a program's own attention written out is equal to
+        # (`dew.algebra.recognize` proves it so; train 1473: guarded, an unmasked call was equal to none).
         empty = jnp.all(logits == -jnp.inf, axis=-1, keepdims=True)
         logits = jnp.where(empty, jnp.zeros((), logits.dtype), logits)
     if skipped is not None:
@@ -1500,8 +1503,12 @@ def _fused_attention(query, key, value, bias, mask, causal, sliding_window, impl
             held = dict(zip(rest, given, strict=True))
             visible = with_key_starts(with_key_lengths(None, lengths, key.shape[-3]), held.get("starts"),
                                       key.shape[-3])
+            # Range-safe as the kernel forms its logits, its query prescaled before its products
+            # (`decode_attention`'s `prescaled`): a query and keys of 2^64 at width 64 have finite logits
+            # of 2^125 there, which raw products took to +inf and a value tangent to NaN (train 1473's
+            # review of 0d5ebab6a3).
             return reference_attention(query, key, value, mask=visible, sinks=held.get("sinks"),
-                                       softcap=softcap, scale_logits=True)
+                                       softcap=softcap, scale_logits=True, range_safe=True)
 
         # The kernel has no derivative, so both modes differentiate the attention it stands in for, the
         # sinks among its operands, at the kernel's arithmetic (IEEE products for fp32 operands, 16-bit
