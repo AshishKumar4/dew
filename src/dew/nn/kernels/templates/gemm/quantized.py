@@ -16,7 +16,7 @@ import jax.numpy as jnp
 from flax.typing import PrecisionLike
 
 from dew.algebra import bits
-from dew.nn.float_bits import largest_magnitude
+from dew.nn.float_bits import largest_magnitude, magnitude_words
 from dew.nn.kernels import launches
 from dew.nn.kernels.templates import inline_forms, product as product_formats
 
@@ -65,20 +65,21 @@ def encode_tile(x: jax.Array, minifloat: bits.Minifloat) -> jax.Array:
 
 
 def _block_max(acc: jax.Array, block: int) -> jax.Array:
-    """Per-row maximum of `|acc|` over each `block`-column group, broadcast back to `acc.shape`: within a
-    kernel (or for a tile of no whole blocks, a launch identity's probe of a narrower one) one row reduction
-    a block (`_blocks_reduced`), elsewhere one reduction of the blocks' view."""
+    """Per-row maximum of `|acc|` over each `block`-column group, broadcast back to `acc.shape`, each
+    block's largest magnitude read on its words as every quantizer reads it (`float_bits.magnitude_words`):
+    a subnormal, an infinity and a NaN alike on every platform, in a kernel or out (train 1484's review: the
+    kernel's arm had reduced float magnitudes). Within a kernel (or for a tile of no whole blocks, a launch
+    identity's probe of a narrower one) one row reduction a block (`_blocks_reduced`), elsewhere one
+    reduction of the blocks' view (`float_bits.largest_magnitude`)."""
     rows, columns = acc.shape
     if _EPILOGUE_LAYOUT.get() is None and columns % block == 0:
-        # Each block's largest magnitude at the accumulator's own width, as every quantizer reads it
-        # (`float_bits.largest_magnitude`): a subnormal, an infinity and a NaN alike on every platform.
         return jnp.repeat(largest_magnitude(acc.reshape(rows, columns // block, block), -1), block, axis=1)
-    magnitude = jnp.abs(acc)
+    words = magnitude_words(acc)
     block_id = _block_ids(acc.shape, block)
-    peaks = jnp.zeros_like(acc)
-    for group, peak in enumerate(_blocks_reduced(magnitude, block, jnp.float32(0.0))):
+    peaks = jnp.zeros_like(words)
+    for group, peak in enumerate(_blocks_reduced(words, block, words.dtype.type(0))):
         peaks = jnp.where(block_id == group, jax.lax.broadcast_in_dim(peak, acc.shape, (0,)), peaks)
-    return peaks
+    return jax.lax.bitcast_convert_type(peaks, acc.dtype)
 
 
 def _block_ids(shape: tuple[int, ...], block: int) -> jax.Array:
