@@ -22,6 +22,7 @@ import contextlib
 import contextvars
 import dataclasses
 import functools
+import math
 import operator
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from typing import Any, NamedTuple, Self
@@ -329,6 +330,11 @@ def taken(active, step: Callable, *state):
     carried = [leaf for leaf, ref in zip(leaves, refs, strict=True) if not ref]
     return rebuilt(lax.cond(active, stepped, lambda *values: list(values), *carried))
 
+
+ACCUMULATOR_COLUMNS = 8
+"""The columns an MMA accumulator's register fragment holds together (mma.sync's n8, a warpgroup MMA's
+8-column tiles): a slice of the accumulator takes whole fragments (`Issuer.sliced_columns`), so an fp32
+staged chunk of 4 columns, whole TMA stores, is still none (`gemm.tiling.Tiles.staging_refusal`)."""
 
 HOOK_COLUMNS = 64
 """The columns of a register accumulator an epilogue's hook takes at a time (`Issuer.hook_columns`): whole
@@ -701,6 +707,14 @@ class Issuer[Accumulator](abc.ABC):
         """The columns its accumulator layout tiles a value in, which a tile's columns fill whole: mma.sync's
         warps along its columns (`specialized`), none finer elsewhere."""
         return 1
+
+    @property
+    def sliced_columns(self) -> int:
+        """The columns a slice of its accumulator comes in whole: its register fragments'
+        (`ACCUMULATOR_COLUMNS`) and its layout's atoms' (`atom_columns`): a staged chunk's
+        (`gemm.tiling.Tiles.staging_refusal`) and a merged partial's span (`across.merge_spans`), which a
+        layout casts to no tile otherwise (an 80-column span of mma.sync's 32-column atoms, row 14073)."""
+        return math.lcm(ACCUMULATOR_COLUMNS, self.atom_columns)
 
     @property
     def walked_rows(self) -> int:
@@ -2359,7 +2373,7 @@ class Family[Allocated, Opened, Accumulator](Issuer[Accumulator], Transport[Allo
         # A partial past what a merge reads ahead (a GEMM tile's) is merged a slice of its widest leaf's
         # columns at a time, its other leaves (a softmax merge's row statistics) read whole each slice, so the
         # running value and one slice are live, not two whole tiles (`across.merge_spans`).
-        widest, spans = across.merge_spans(summed, held, self.atom_columns)
+        widest, spans = across.merge_spans(summed, held, self.sliced_columns)
 
         def combined(running) -> None:
             def merged(chunk, running):

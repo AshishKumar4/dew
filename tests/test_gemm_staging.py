@@ -197,19 +197,20 @@ def test_a_refusal_at_a_fed_rings_least_depth_leaves_its_deeper_restaging_derive
 
 
 def test_a_partials_merge_slices_whole_atoms_of_its_family():
-    """`across.merge_spans` cuts a partial's widest leaf into spans of whole 8-column atoms and of its
-    family's atom (row 14073): 160 columns at mma.sync's 32-column atom in five spans of 32 (not two of 80,
-    which its layout casts to no tile); 96 columns at a 64-column atom, which no whole split holds, in one
-    span; and at an atom of one, the 8-column spans it took before."""
+    """`across.merge_spans` cuts a partial's widest leaf into spans of whole slices of its family
+    (`mosaic.Issuer.sliced_columns`, row 14073): 160 columns at mma.sync's 32 in five spans of 32 (not two of
+    80, which its layout casts to no tile); 96 columns at 64, which no whole split holds, in one span; 120
+    at a fragment's 8 in three of 40."""
     from dew.nn.kernels.templates import across
 
-    def spans(columns, held, atom):
-        return across.merge_spans(np.zeros((64, columns), np.float32), held, atom)
+    def spans(columns, held, unit):
+        return across.merge_spans(np.zeros((64, columns), np.float32), held, unit)
 
     over = 2 * across.MERGED_REGISTERS
     assert spans(160, over, 32) == (0, [(start, 32) for start in range(0, 160, 32)])
     assert spans(96, over, 64) == (None, [(0, None)])
-    assert spans(160, over, 1) == (0, [(0, 80), (80, 80)])
+    # At whole 8-column fragments 120 columns split in three, not two of 60.
+    assert spans(120, over, 8) == (0, [(0, 40), (40, 40), (80, 40)])
 
 
 def test_a_pinned_sm120_tile_whose_balanced_tail_merges_its_partials_lowers():

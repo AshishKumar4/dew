@@ -3,7 +3,6 @@ programs to arrive at a semaphore (`arrived`), and the consumer warpgroups' part
 order and stored once (`summing`, `summed_across`)."""
 
 import dataclasses
-import math
 from collections.abc import Callable
 
 import jax
@@ -202,20 +201,18 @@ tile's 8 and its two statistics' 1 each; a GEMM's 128 x 128 fp32 tile 128). One 
 waited each read behind the last one's combine, 0.49 us a slice (a 16-row decode's 49, M-DD-12)."""
 
 
-def merge_spans(summed, held: int, atom: int = 1) -> tuple[int | None, list[tuple[int, int | None]]]:
+def merge_spans(summed, held: int, unit: int) -> tuple[int | None, list[tuple[int, int | None]]]:
     """The place among a partial's leaves of its widest 2-D leaf and the column spans `(start, width)`
     `Family.fixed_up` merges it in: as few as bring its registers a thread (`held`) within
-    `MERGED_REGISTERS`, each a whole number of the layout's 8-column atoms and of the family's `atom`
-    (`Issuer.atom_columns`: mma.sync's 32 at one row warp, whose layout casts no 80-column span; row 14073)
-    dividing its columns; none and one whole span `(0, None)` where it already fits, has no 2-D leaf, or no
-    such split exists."""
+    `MERGED_REGISTERS`, each a whole number of the family's `unit` columns (`Issuer.sliced_columns`:
+    mma.sync's 32 at one row warp, whose layout casts no 80-column span; row 14073) dividing its columns;
+    none and one whole span `(0, None)` where it already fits, has no 2-D leaf, or no such split exists."""
     leaves = jax.tree.leaves(summed)
     tiles = [place for place, leaf in enumerate(leaves) if leaf.ndim == 2]
     if held <= MERGED_REGISTERS or not tiles:
         return None, [(0, None)]
     widest = max(tiles, key=lambda place: leaves[place].size)
     columns = leaves[widest].shape[1]
-    unit = math.lcm(8, atom)
     slices = -(-held // MERGED_REGISTERS)
     while slices < columns // unit and (columns % slices or (columns // slices) % unit):
         slices += 1
