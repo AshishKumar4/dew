@@ -58,6 +58,16 @@ if TYPE_CHECKING:
     from dew.sampling.solvers.common import Solver
 
 
+def refused_stores(destination: str | Path) -> None:
+    """Refuse an export to a store's location (`releases.refused_store`, row 14124) by every process of a
+    pool alike, each naming its own destination, before any other round of its export, any release its run
+    names fetched or a write: what `dew export` and `export_run` ask first."""
+    from dew.interop.releases import refused_store
+
+    for named_by in from_every_process(str(destination)):
+        refused_store(named_by)
+
+
 def export_run(run: SavedRun, destination: str | Path, *, ema: bool | None = None,
                mesh: MeshSpec | Mesh | None = None, layout: Layout | None = None,
                publishes: bool | None = None, staging: bool = False) -> None:
@@ -76,12 +86,9 @@ def export_run(run: SavedRun, destination: str | Path, *, ema: bool | None = Non
     saved run it holds (`HELD_FILE`); another replaces the release in one call (`ReleasePlan.write`).
     Every process returns once the release is published, the pool agreeing its commit (ledgers 2874,
     2992)."""
-    from dew.interop.releases import pooled_destination, refused_store
+    from dew.interop.releases import pooled_destination
 
-    # A store's location refused by every process of a pool alike, before any round of its export or a write
-    # (`refused_store`, row 14124), each process naming its own destination.
-    for named_by in from_every_process(str(destination)):
-        refused_store(named_by)
+    refused_stores(destination)
     named, shared = Path(destination), False
     if publishes is None:
         shared = (jax.process_count() > 1 and len(set(from_every_process(named.name))) == 1
