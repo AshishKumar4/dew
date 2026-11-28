@@ -448,6 +448,31 @@ def test_a_dry_prepares_row_is_red_for_each_cell_it_left_unprepared_that_mains_r
     assert graded(set(cells), code=1, kind=ci.grading.STALE)["kind"] == ci.grading.STALE
 
 
+def test_a_cell_moved_by_an_edit_above_it_is_main_s_cell_and_a_new_one_beside_it_is_new(ci):
+    """An unprepared cell is its test, its file and its label, at whatever line an edit above it moves it to
+    (prepares.py's `knowing`): three lines added above a test's cells move them from :83 to :86 and the row
+    stays green (train 1489 read them as new); a second cell of that test and file beside it is new, main's
+    one cell answering one of the run's alone; and a cell left twice at one where is one."""
+    name = "3.12:tests/test_gpu_attention.py#5/25@prepare-sm90"
+    test = "tests/test_gpu_attention.py::test_merged"
+
+    def graded(wheres, before):
+        records = [{"test": test, "where": where, "error": "lowered", "kind": "site"} for where in wheres]
+        found = {"name": name, "exitCode": 0, "output": ""}
+        [row] = ci.prepares.graded([found], {"tests/test_gpu_attention.py": records}, before, "sm90",
+                                   lambda named: ci.grading.owning(ci.parsed_row(named)[1]),
+                                   ci.grading.STALE, ci.tier_wire().CAPPED)
+        return row
+    main = {(test, "tests/test_gpu_attention.py:83", None, "site")}
+    assert graded(["tests/test_gpu_attention.py:86"], main)["exitCode"] == 0
+    assert graded(["tests/test_gpu_attention.py:86"] * 2, main)["exitCode"] == 0
+    beside = graded(["tests/test_gpu_attention.py:86", "tests/test_gpu_attention.py:120"], main)
+    assert beside["exitCode"] == 1
+    assert beside["new_unprepared"] == [f"{test} @ tests/test_gpu_attention.py:120"]
+    elsewhere = graded(["src/dew/nn/attention.py:86"], main)
+    assert elsewhere["new_unprepared"] == [f"{test} @ src/dew/nn/attention.py:86"]
+
+
 def test_a_cell_its_prepares_cap_left_is_named_and_counted_but_reds_no_row(ci):
     """A cell a dry prepare's cap left unprepared (tests/tier_wire.py's `CAPPED`, its where exactly) is named
     among its row's unprepared and counted apart (`capped`, its output; kept as the row is reused), but no

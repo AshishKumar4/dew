@@ -5,6 +5,7 @@ from the tests it left unprepared. The standard library alone, loaded by ci.py b
 `entries`, `before` and `run` itself (`ci`), whose test cache and lane's processes they run on."""
 
 import ast
+import collections
 import functools
 import json
 import math
@@ -319,13 +320,35 @@ def record_of(cell: Cell) -> dict:
     return {**record, "identity": identity(record)}
 
 
+def _placed(cell: Cell) -> tuple[str, str, str | None]:
+    """A cell's test, where and label, its where's file alone where it names a line of one (`path:83`): a
+    cell is the same cell wherever an edit above it moves its line (train 1489 read test_gpu_attention.py's
+    cells at :86 as new beside main's at :83, three lines added above them)."""
+    test, where, label, _ = cell
+    file, colon, line = where.rpartition(":")
+    return test, file if colon and line.isdigit() else where, label
+
+
 def knowing(cells: AbstractSet[Cell]) -> Callable[[Cell], bool]:
-    """Whether a baseline's `cells` hold a cell: by every field, or, where either side kept no kind (an older
-    record's), by its test, where and label alone; two kinds both stated and different are two cells. Each
-    answered by a set's lookup, the sets made once a baseline."""
-    placed = {cell[:3] for cell in cells}
-    unkinded = {cell[:3] for cell in cells if cell[3] is None}
-    return lambda cell: cell in cells or cell[:3] in unkinded or (cell[3] is None and cell[:3] in placed)
+    """Whether a baseline's `cells` hold a cell, each of them answering one cell of a run alone: by its test,
+    where (its file, at any line, `_placed`) and label, and its kind, or, where either side kept no kind (an
+    older record's), whatever its kind; two kinds both stated and different are two cells. A run that leaves
+    more cells of a test, file and label than main's left is answered for main's many alone, so a cell new
+    beside an old one in a file is never masked by it. A cell the run left twice (two reasons at one where) is
+    one cell, as a baseline's set keeps it."""
+    left = collections.Counter((_placed(cell), cell[3]) for cell in cells)
+    answered: dict[Cell, bool] = {}
+
+    def known(cell: Cell) -> bool:
+        if cell not in answered:
+            place, kind = _placed(cell), cell[3]
+            kinds = [each for each in (kind, None) if left[place, each]] if kind is not None else [
+                each for (where, each), count in left.items() if where == place and count]
+            if kinds:
+                left[place, kinds[0]] -= 1
+            answered[cell] = bool(kinds)
+        return answered[cell]
+    return known
 
 
 def identity(record: Mapping) -> str:
