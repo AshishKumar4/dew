@@ -1615,10 +1615,13 @@ def test_a_factored_product_split_three_ways_by_its_depth_runs_on_an_explicit_me
     cotangent = rng.integers(-3, 4, (8, 128)).astype(np.float32)
     mesh = jax.make_mesh((3,), ("tensor",), axis_types=(AxisType.Explicit,))
 
+    def run(rows, matrix, sizes, gather):
+        return gemm.gemm(rows, matrix, sizes, out_dtype=jnp.float32, precision=jax.lax.Precision.DEFAULT,
+                         gather=gather)
+
     def product(x, matrix):
-        return factored(functools.partial(gemm.decoded_product, interpret_on_cpu=False), (matrix, None, None),
-                        jnp.float32(1), x, wide=gemm.interpreted_wide(interpret_on_cpu=False),
-                        wide_operands=(matrix, None))
+        return factored(run, (matrix, None, None), jnp.float32(1), x,
+                        wide=gemm.interpreted_wide(interpret_on_cpu=False), wide_operands=(matrix, None))
 
     @jax.jit
     def pulled(x, matrix, cotangent):

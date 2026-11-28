@@ -817,18 +817,18 @@ def _packed_weight_rules(launch: grouped_quantized.MosaicWordPackedGmm, make_ban
                          interpret: bool, *, dense: bool, finite: bool = True):
     """Build `(forward, backward, portable)` rules for an inline-decoding packed weight product
     (`ternary_weight_product`, `window_product`) of operands `(rows, words, sizes, *rest)`, its bank
-    `make_bank(words, *rest)` (a window's meta among `rest`); callers wrap `linear_tangent` with
-    `contracted(...)`. Its rows' cotangent is the decoded matrix's products of the cotangent's bfloat16
-    parts where its weights are `finite` (a ternary code's), else its portable product's own transpose (XLA's,
-    the cotangent whole at the configured precision: a window's infinity times a part's zero would be NaN
-    where the one transpose reads it whole)."""
+    `make_bank(words, *rest)` (a window's meta among `rest`), held as given, grouped by the launch alone
+    (`as_groups`, row 14220); callers wrap `linear_tangent` with `contracted(...)`. Its rows' cotangent is
+    the decoded matrix's products of the cotangent's bfloat16 parts where its weights are `finite` (a
+    ternary code's), else its portable product's own transpose (XLA's, the cotangent whole at the configured
+    precision: a window's infinity times a part's zero would be NaN where one transpose reads it whole)."""
     def decoded(*bank) -> jax.Array:
-        [matrices, _] = decoded_operands(make_bank(*bank), None)
-        return matrices[0] if dense else matrices
+        return decoded_matrix(make_bank(*bank))
 
     def kernel(r: jax.Array, w: jax.Array, s: jax.Array, *rest, interpret: bool) -> jax.Array:
-        return launch(r, make_bank(w, *rest), s, (), (), None, None, None, out_dtype='float32',
-                      trans_rhs=False, interpret=interpret, dense=dense, exact_sums=False)
+        bank = make_bank(*map(as_groups, (w, *rest)))
+        return launch(r, bank, s, (), (), None, None, None, out_dtype='float32', trans_rhs=False,
+                      interpret=interpret, dense=dense, exact_sums=False)
 
     def portable(r: jax.Array, w: jax.Array, s: jax.Array, *rest) -> jax.Array:
         return xla_products.decoded_dot(r, decoded(w, *rest), None if dense else s)
@@ -853,21 +853,23 @@ def _packed_weight_rules(launch: grouped_quantized.MosaicWordPackedGmm, make_ban
         return tuple(leaves[index] for index in live)
     return forward, backward, portable
 
+def decoded_matrix(matrix) -> jax.Array:
+    """A packed matrix (`TernaryWeights` its codes unscaled, `NvFp4`, `Bf16Window`) decoded to bf16."""
+    return matrix.unscaled(jnp.bfloat16) if isinstance(matrix, TernaryWeights) else matrix.decoded()
+
+
 def decoded_operands(matrix, group_sizes: jax.Array | None) -> tuple:
-    """A packed matrix (`TernaryWeights` its codes unscaled, `NvFp4`, `Bf16Window`) decoded to bf16, beside
-    its group sizes: `factored`'s `prepared`, decoded once a rescue, where it runs."""
-    decoded = (matrix.unscaled(jnp.bfloat16) if isinstance(matrix, TernaryWeights)
-               else matrix.decoded())
-    return decoded, group_sizes
+    """`factored`'s `prepared`: a packed matrix decoded (`decoded_matrix`) beside its group sizes."""
+    return decoded_matrix(matrix), group_sizes
 
 
-def decoded_product(rows: jax.Array, matrix: jax.Array, group_sizes: jax.Array | None,
+def decoded_product(rows: jax.Array, matrix, group_sizes: jax.Array | None,
                     gather: jax.Array | None = None, *, interpret_on_cpu: bool) -> jax.Array:
-    """A packed matrix's portable product: bf16 `rows` (those `gather` reads, where given, read where they
-    lie: `gemm`'s `gather`) times its decoded bf16 `matrix` (grouped by `group_sizes`, or dense), each
-    product exact and summed in fp32."""
-    summed = gemm(rows, matrix, group_sizes, out_dtype=jnp.float32, precision=jax.lax.Precision.DEFAULT,
-                  interpret_on_cpu=interpret_on_cpu, gather=gather)
+    """A packed matrix's portable product: bf16 `rows` (`gather`'s where given, read where they lie) times
+    the packed `matrix` decoded here, so a derivative holds it packed (row 14220; grouped by `group_sizes`,
+    or dense), each product exact and summed in fp32."""
+    summed = gemm(rows, decoded_matrix(matrix), group_sizes, out_dtype=jnp.float32,
+                  precision=jax.lax.Precision.DEFAULT, interpret_on_cpu=interpret_on_cpu, gather=gather)
     assert isinstance(summed, jax.Array), "an unpaired product has one output"
     return summed
 
@@ -1129,22 +1131,18 @@ def nvfp4_product(lhs: jax.Array, matrix: NvFp4, group_sizes: jax.Array | None =
     bank = matrix if layer is None else matrix.layer(layer)
     rows = lhs.astype(jnp.bfloat16)
     launch = grouped_quantized.MosaicPackedGmm()
-    # The block scales frozen, as the tensor scale is: no derivative reaches a launch reading them.
-    words, scales = (jax.lax.stop_gradient(jnp.asarray(field if group_sizes is not None else field[None]))
-                     for field in (matrix.words, matrix.scales))
+    # Held as given, frozen and grouped where read (`_packed_launch`, `_layer_decoded`; row 14220).
+    words, scales = jnp.asarray(matrix.words), jnp.asarray(matrix.scales)
     count = rows.shape[0] if gather is None else gather.shape[0]
     sizes = jnp.asarray([count], jnp.int32) if group_sizes is None else group_sizes.astype(jnp.int32)
-    first = None
-    if layer is not None:
-        # The stack's every layer's matrices as one axis, the call's groups the layer's, from its first.
-        words, scales = (field.reshape(-1, *field.shape[2:]) for field in (words, scales))
-        first = jnp.asarray(layer, jnp.int32) * sizes.shape[0]
+    first = None if layer is None else jnp.asarray(layer, jnp.int32) * sizes.shape[0]
     def spec(array):
         return None if array is None else jax.ShapeDtypeStruct(jnp.shape(array), jnp.result_type(array))
 
     # The launch's matrix is the bank as it lies (`NvFp4`, each matrix's factor deferred to the epilogue):
-    # its words and block scales, its shape and dtype the bfloat16 matrices it decodes to.
-    bound = launch.bind(spec(rows), jax.tree.map(spec, _undeferred(words, scales)), spec(sizes), (), (), None,
+    # its words and block scales, grouped, its shape and dtype the bfloat16 matrices it decodes to.
+    banked = jax.eval_shape(lambda *fields: _undeferred(*map(as_groups, fields)), words, scales)
+    bound = launch.bind(spec(rows), banked, spec(sizes), (), (), None,
                         spec(first), spec(gather), out_dtype='float32', trans_rhs=False,
                         interpret=interpret_on_cpu, dense=group_sizes is None, exact_sums=True)
     tile = _planned(launch, bound)
@@ -1163,9 +1161,9 @@ def nvfp4_product(lhs: jax.Array, matrix: NvFp4, group_sizes: jax.Array | None =
     else:
         finished = None
         # Each product of two bfloat16 values is exact in fp32, so the default precision is the exact
-        # product's, whatever precision the program defaults to (`decoded_product`).
+        # product's, whatever precision the program defaults to (`decoded_product`, the bank decoded in it).
         product = functools.partial(decoded_product, interpret_on_cpu=interpret_on_cpu)
-        operands = (bank.decoded(), group_sizes, gather)
+        operands = (bank, group_sizes, gather)
     # The frozen tensor scale (a matrix's, its columns', a group's: each row its group's, in `factored`) and
     # the owed 2^8 apart, in one rounding (no scale past 2^120 overflowing them, train 1403's review).
     scale = jax.lax.stop_gradient(jnp.asarray(bank.scale, jnp.float32))
@@ -1237,14 +1235,16 @@ def _undeferred(words, scales) -> NvFp4:
 
 def _packed_launch(launch, rows, words, scales, sizes, gather, first, *sides, interpret: bool, dense: bool,
                    hooks: Hooks = NO_HOOKS) -> jax.Array:
-    """The packed launch of the rows (`gather`'s) by the matrices' words and block scales (a stack's layer's
-    from `first`) in fp32, each step's sums exact, through `hooks`' epilogue over `sides` where given."""
-    return launch(rows, _undeferred(words, scales), sizes, (), sides, None, first, gather, hooks=hooks,
+    """The packed launch of the rows (`gather`'s) by the matrices' words and block scales (grouped, frozen,
+    a stack's layer's from `first`) in fp32, its sums exact, through `hooks`' epilogue over any `sides`."""
+    bank = _undeferred(*(jax.lax.stop_gradient(as_groups(field)) for field in (words, scales)))
+    return launch(rows, bank, sizes, (), sides, None, first, gather, hooks=hooks,
                   out_dtype='float32', trans_rhs=False, interpret=interpret, dense=dense, exact_sums=True)
 
 
 def _layer_decoded(words, scales, sizes, first) -> jax.Array:
-    """The bank's matrices decoded, a stack's layer's alone (its groups' from `first`)."""
+    """The bank's matrices decoded (grouped, frozen), a stack's layer's alone (from `first`)."""
+    words, scales = (jax.lax.stop_gradient(as_groups(field)) for field in (words, scales))
     if first is not None:
         words, scales = (jax.lax.dynamic_slice_in_dim(each, first, len(sizes)) for each in (words, scales))
     return _undeferred(words, scales).decoded()

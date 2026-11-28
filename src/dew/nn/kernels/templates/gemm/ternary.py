@@ -16,7 +16,7 @@ from dew.nn import float_bits, precision
 from dew.nn.derivatives import KernelGlue, contracted, surrogate
 from dew.nn.kernels import gemm, generation, grouped_quantized, selection, xla_products
 from dew.nn.kernels.formats import TernaryWeights, scale_factor
-from dew.nn.kernels.templates.gemm import launched_whole
+from dew.nn.kernels.templates.gemm import as_groups, launched_whole
 from dew.nn.kernels.templates.gemm.factored import factored, int8_epilogue
 
 TERNARY_WEIGHT_ROW = "ledger 1464"
@@ -76,14 +76,19 @@ def ternary_weight_product(lhs: jax.Array, weights: TernaryWeights, group_sizes:
     dense = group_sizes is None
     if (dense and len(weights.shape) != 2) or (not dense and len(weights.shape) != 3):
         raise ValueError(f"ternary_weight_product weight rank mismatch for dense={dense}: {weights.shape}")
-    words = jnp.asarray(weights.words if not dense else weights.words[None])
+    # The words held as given across the product's derivative, grouped in it (`gemm._packed_weight_rules`,
+    # `as_groups`): a scan over layers forwards them, where it stacked each step's grouped copy (row 14220).
+    words = jnp.asarray(weights.words)
     sizes = jnp.asarray([lhs.shape[0]], jnp.int32) if dense else group_sizes.astype(jnp.int32)
     launch = MosaicTernaryPackedGmm()
 
     def _spec(operand):
         return jax.ShapeDtypeStruct(jnp.shape(operand), jnp.result_type(operand))
 
-    bank_spec = jax.tree.map(_spec, TernaryWeights(words, jnp.ones((), jnp.float32), weights.form))
+    def banked(words):
+        return TernaryWeights(as_groups(words), jnp.ones((), jnp.float32), weights.form)
+
+    bank_spec = jax.eval_shape(banked, words)
     bound = launch.bind(jax.ShapeDtypeStruct(lhs.shape, jnp.bfloat16), bank_spec, _spec(sizes), (), (),
                         None, None, None, out_dtype="float32", trans_rhs=False, interpret=interpret_on_cpu,
                         dense=dense, exact_sums=False)
@@ -93,6 +98,9 @@ def ternary_weight_product(lhs: jax.Array, weights: TernaryWeights, group_sizes:
         case = gemm.WordPackedCase(functools.partial(gemm._planned, launch, bound),
                                    launched_whole(lhs, words, sizes))
         mosaic = selection.select(TERNARY_WEIGHT, case).kernel == "mosaic"
+    # The codes alone, no scale (the rescue's decoded matrix's, `factored`, and the portable product's): a
+    # derivative rule closes over no differentiated value.
+    codes = (dataclasses.replace(weights, scale=jnp.ones((), jnp.float32)), group_sizes)
     if mosaic:
         one = jnp.ones((), jnp.float32)
         rules = gemm._packed_weight_rules(launch, lambda w: TernaryWeights(w, one, weights.form),
@@ -101,13 +109,11 @@ def ternary_weight_product(lhs: jax.Array, weights: TernaryWeights, group_sizes:
             generation.linear_tangent(*rules, live_cotangents=True, kind=KernelGlue()))
         operands = (words, sizes)
     else:
+        # The codes decoded in the product, its derivative's too: what it holds is the words (row 14220).
         product = functools.partial(gemm.decoded_product, interpret_on_cpu=interpret_on_cpu)
-        operands = (weights.unscaled(jnp.bfloat16), group_sizes)
+        operands = (codes[0], group_sizes)
     run = functools.partial(gemm._interpreted, product, interpret_on_cpu)
     wide = gemm.interpreted_wide(interpret_on_cpu)
-    # The codes alone for the rescue's decoded matrix, no scale: a derivative rule closes over no
-    # differentiated value.
-    codes = (dataclasses.replace(weights, scale=jnp.ones((), jnp.float32)), group_sizes)
 
     def run_dot(rows_bf16: jax.Array) -> jax.Array:
         return run(rows_bf16, *operands)

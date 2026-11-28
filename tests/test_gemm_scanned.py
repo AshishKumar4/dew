@@ -134,3 +134,96 @@ def test_a_scanned_projection_of_one_member_stacks_no_copy_of_its_weight():
     weights, copies = _scanned(jaxpr)
     assert (1, 128, 128) in weights
     assert len(copies) == 0, f"stacked copies (a step's, its weight's): {sorted(set(copies))}"
+
+
+def _reads_only(var, jaxpr, reads: set, carries: set) -> bool:
+    """Whether `var`, computed in `jaxpr`, reads some of `reads` and none of `carries` (a scan body's carried
+    activations): a value a scan's reverse pass could compute again from what the scan forwards."""
+    made = {out: eqn for eqn in jaxpr.eqns for out in eqn.outvars}
+    seen, pending, read = set(), [var], False
+    while pending:
+        each = pending.pop()
+        if not programs.computed(each) or each in seen:
+            continue
+        if each in carries:
+            return False
+        seen.add(each)
+        read = read or each in reads
+        pending.extend(made[each].invars if each in made else ())
+    return read and var in made
+
+
+def _bank_derived(jaxpr, bank: set) -> tuple[int, list[tuple[tuple[int, ...], str]]]:
+    """The scans anywhere in `jaxpr` that read a step of the stacked `bank` (its leaves' per-layer shapes and
+    dtypes), and each of their stacked outputs computed from those steps' bank leaves without the carried
+    activations (`_reads_only`) with as many entries as one of the leaves or more (the bank grouped again,
+    frozen or decoded): its shape and dtype, a step's."""
+    reading, found = 0, []
+    for eqn in programs.equations(jaxpr):
+        if eqn.primitive is not jax.lax.scan_p:
+            continue
+        body = programs.scan_body(eqn).jaxpr
+        constants, carried = scan_groups(eqn)
+        leaves = {var for var in body.invars[constants + carried:]
+                  if (_shape(var), str(getattr(var.aval, "dtype", ""))) in bank}
+        if not leaves:
+            continue
+        reading += 1
+        carries = set(body.invars[constants:constants + carried])
+        least = min(math.prod(_shape(var)) for var in leaves)
+        found.extend((_shape(out), str(getattr(out.aval, "dtype", ""))) for out in body.outvars[carried:]
+                     if math.prod(_shape(out)) >= least and _reads_only(out, body, leaves, carries))
+    return reading, found
+
+
+FROZEN = {"nvfp4 packed": ("nvfp4", {"nvfp4": "packed"}), "nvfp4 decoded": ("nvfp4", {"nvfp4": "xla"}),
+          "ternary packed": ("ternary", {"grouped_matmul": "mosaic"}),
+          "ternary decoded": ("ternary", {"grouped_matmul": "xla"}),
+          "window packed": ("window", {"grouped_matmul": "mosaic"}),
+          "window decoded": ("window", {"grouped_matmul": "xla"})}
+"""A frozen packed format and the route its product is named to (its kernel decoding the words in place, or
+its decoded matrix's product)."""
+
+
+@pytest.mark.parametrize(("packed", "chosen"), FROZEN.values(), ids=FROZEN)
+def test_a_scanned_frozen_packed_layer_stacks_no_copy_of_its_weight(packed, chosen):
+    """A scan over four layers' frozen packed weights (`formats.NvFp4`, `TernaryWeights`, `Bf16Window`, a
+    fine-tune's frozen base), each a dense 256 x 256 product of the rows it carries, its rows' gradient
+    traced for an H100 on each route: its reverse pass reads each layer's packed words as the scan forwards
+    them, no stacked output of the scan computed from a layer's weights alone; a dense bank given its one
+    group (`words[None]`) before the launch's derivative, or its decoded matrix the derivative's residual,
+    was a value the step made: the scan stacked every layer's grouped copy, or every layer in bfloat16, a
+    packed base's whole memory again (row 14220)."""
+    from dew.nn.kernels import formats, gemm
+
+    rng = np.random.default_rng(14220)
+    weights = [jnp.asarray(rng.standard_normal((256, 256)) / 16, jnp.float32) for _ in range(4)]
+    banks = [formats.NvFp4.quantized(w.astype(jnp.bfloat16)) if packed == "nvfp4"
+             else formats.TernaryWeights.of(w) if packed == "ternary"
+             else formats.Bf16Window.of(w.astype(jnp.bfloat16)) for w in weights]
+    stack = jax.tree.map(lambda *leaves: jnp.stack(leaves), *banks)
+
+    def product(rows, bank):
+        if packed == "nvfp4":
+            return gemm.nvfp4_product(rows, bank, None, out_dtype=jnp.float32)
+        if packed == "ternary":
+            return gemm.ternary_weight_product(rows, bank, None, quantize_activations=False,
+                                               out_dtype=jnp.float32)
+        return gemm.window_product(rows, bank, None, out_dtype=jnp.float32)
+
+    def loss(rows, stack):
+        def layer(rows, bank):
+            return product(rows, bank).astype(rows.dtype), None
+
+        return jnp.sum(jax.lax.scan(layer, rows, stack)[0].astype(jnp.float32))
+
+    rows = jnp.ones((64, 256), jnp.bfloat16)
+    with (generation.assumed("sm90", portable=True), generation.chosen(**chosen),
+          generation.routes() as routes):
+        jaxpr = jax.make_jaxpr(jax.grad(loss))(rows, stack).jaxpr
+    named = next(iter(chosen.values()))
+    assert any(route.kernel == named for route in routes), routes
+    bank = {(tuple(leaf.shape[1:]), str(leaf.dtype)) for leaf in jax.tree.leaves(stack) if leaf.ndim >= 3}
+    reading, copies = _bank_derived(jaxpr, bank)
+    assert reading, "a scan reads the bank's layers a step at a time"
+    assert len(copies) == 0, f"stacked from the bank (a step's): {sorted(set(copies))}"
